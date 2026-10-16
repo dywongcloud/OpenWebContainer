@@ -99,6 +99,29 @@ export interface ShellOptions {
     history: boolean;
 }
 
+/**
+ * One command started with `&`.
+ *
+ * The table itself belongs to the host -- `child.ts` keeps it on the shell and leaves the shell in
+ * `state.host`, so `jobs` and `wait` here read the very jobs the dispatcher's `&` started. This
+ * module never starts one: on a host that runs one command at a time nothing can run alongside the
+ * shell, so a job is "started" only in the sense that the shell no longer waits for it, and the
+ * host runs it when `wait` asks for it or when the line's foreground is through. A job this module
+ * marks done is a job the host no longer runs.
+ */
+export interface ShellJob {
+    /** The number `jobs` prints in `[1]`, and `%1` names. */
+    id: number;
+    /** The pid `&` printed, `$!` holds and `wait` takes as an argument. */
+    pid: number;
+    /** The command as it was written, for `jobs`. */
+    text: string;
+    /** Run to completion: `wait` no longer has anything to wait for. */
+    done: boolean;
+    /** The status it left, once it has run. */
+    exitCode: number;
+}
+
 export interface ShellState {
     /** One map per scope: index 0 is the global scope, each function call pushes one. */
     scopes: Map<string, ShellVar>[];
@@ -115,8 +138,14 @@ export interface ShellState {
     dirs: string[];
     /** `$?` */
     lastStatus: number;
-    /** `$!` -- always 0: this shell has no background jobs. */
+    /** `$!` -- the pid the last `&` printed, 0 before the first one. */
     lastBackgroundPid: number;
+    /**
+     * The background jobs `&` started, in the order it started them: `jobs` lists them and `wait`
+     * waits for them. Read out of the host's own table where the host keeps one, so the two are one
+     * table and not two; a state with no host keeps an empty one of its own.
+     */
+    readonly jobs: ShellJob[];
     /** `getopts` state: the 1-based word index and the character offset inside the current word. */
     optind: number;
     optchar: number;
@@ -3152,22 +3181,22 @@ export const IMPLEMENTED_BUILTINS: string[] = [
 
 const HELP: Record<string, string> = {
     alias: 'alias [-p] [name[=value] ...] -- define or list aliases',
-    bg: 'bg [job_spec ...] -- this shell has no background jobs',
+    bg: 'bg [job_spec ...] -- unsupported: this shell stops no job, so none can be resumed',
     bind: 'bind -- unsupported: this shell has no line editing',
     builtin: 'builtin [shell-builtin [arg ...]] -- run a shell builtin, bypassing functions',
     caller: 'caller [expr] -- print the current subroutine call stack',
     command: 'command [-pVv] command [arg ...] -- run a command, ignoring shell functions',
     declare: 'declare [-aAfFgilrtux] [-p] [name[=value] ...] -- declare variables and attributes',
     dirs: 'dirs [-clpv] [+N] [-N] -- display the directory stack',
-    disown: 'disown [-h] [-ar] [job_spec ...] -- this shell has no jobs to disown',
+    disown: 'disown [-h] [-ar] [job_spec ...] -- unsupported: this shell runs its own jobs and keeps them',
     eval: 'eval [arg ...] -- join the arguments and run them as a command',
     exec: 'exec [-cl] [-a name] [command [arguments]] -- replace the shell (documented limits apply)',
     export: 'export [-nf] [name[=value] ...] -- mark names for the environment of commands',
-    fg: 'fg [job_spec] -- this shell has no background jobs',
+    fg: 'fg [job_spec] -- unsupported: this shell has no terminal to bring a job to',
     getopts: 'getopts optstring name [arg] -- parse positional parameters as options',
     hash: 'hash [-lr] [-p pathname] [name ...] -- remember command locations',
     help: 'help [-s] [pattern ...] -- display information about builtin commands',
-    jobs: 'jobs [-lnprs] [jobspec ...] -- this shell has no background jobs',
+    jobs: 'jobs [-lnprs] [jobspec ...] -- list the jobs `&` started, running and done',
     let: 'let arg [arg ...] -- evaluate arithmetic expressions',
     local: 'local [option] name[=value] ... -- declare variables local to a function',
     mapfile: 'mapfile [-t] [-n count] [-s count] [-O origin] [array] -- read lines into an array',
@@ -3187,7 +3216,7 @@ const HELP: Record<string, string> = {
     umask: 'umask [-p] [-S] [mode] -- report or set the file creation mask',
     unalias: 'unalias [-a] name [name ...] -- remove aliases',
     unset: 'unset [-f] [-v] [name ...] -- remove variables or functions',
-    wait: 'wait [id ...] -- wait for background jobs; there are none',
+    wait: 'wait [id ...] -- wait for background jobs; with no id, for every one of them',
     which: 'which [-a] name ... -- print the file that would be executed'
 };
 
@@ -3655,9 +3684,65 @@ function popdBuiltin(ctx: CommandContext): CommandResult {
     return ok(state.dirs.map((dir) => abbreviateHome(state, dir)).join(' ') + '\n', state);
 }
 
+/**
+ * The job a `jobs` or `wait` argument names: `%2` is the second job, `%+` the newest and `%-` the
+ * one before it, and a bare number is a pid -- the one `&` printed and `$!` holds.
+ */
+function findJob(jobs: ShellJob[], name: string): ShellJob | undefined {
+    if (name.startsWith('%')) {
+        const spec = name.slice(1);
+        if (spec === '' || spec === '%' || spec === '+') return jobs[jobs.length - 1];
+        if (spec === '-') return jobs[jobs.length - 2];
+        const id = Number(spec);
+        return spec === '' || Number.isNaN(id) ? undefined : jobs.find((job) => job.id === id);
+    }
+    const pid = Number(name);
+    return name === '' || Number.isNaN(pid) ? undefined : jobs.find((job) => job.pid === pid);
+}
+
+/** The `+` and the `-` of `jobs`: the newest job is the current one, the one before it the previous. */
+function jobMarker(jobs: ShellJob[], job: ShellJob): string {
+    if (job === jobs[jobs.length - 1]) return '+';
+    if (job === jobs[jobs.length - 2]) return '-';
+    return ' ';
+}
+
+/**
+ * One line of `jobs`, in the columns a shell prints them in: `[1]+  Running                 echo a &`.
+ * A job that has run is reported `Done` and without the `&`, as a shell reports one.
+ */
+function jobLine(jobs: ShellJob[], job: ShellJob, long: boolean): string {
+    return `[${job.id}]${jobMarker(jobs, job)} ${long ? `${job.pid} ` : ' '}${(job.done ? 'Done' : 'Running').padEnd(24)}${job.text}${job.done ? '' : ' &'}\n`;
+}
+
 function jobsBuiltin(ctx: CommandContext): CommandResult {
-    void ctx;
-    return { stdout: '', stderr: '', exitCode: 0 };
+    const state = stateOf(ctx);
+    const jobs = state.jobs;
+    let long = false;
+    let pidOnly = false;
+    const specs: string[] = [];
+    for (const arg of ctx.args) {
+        if (arg === '-l') long = true;
+        else if (arg === '-p') pidOnly = true;
+        // `-r`, `-s` and `-n` narrow the list to running, stopped and newly changed jobs. This shell
+        // stops no job and keeps no notification history, so they narrow nothing; the dispatcher's
+        // own `jobs` reads the three the same way
+        else if (arg === '-r' || arg === '-s' || arg === '-n') continue;
+        else if (arg.length > 1 && arg.startsWith('-')) return failLine(`jobs: ${arg}: invalid option`, 2);
+        else specs.push(arg);
+    }
+    let listed = jobs;
+    if (specs.length > 0) {
+        listed = [];
+        for (const spec of specs) {
+            const job = findJob(jobs, spec);
+            if (job === undefined) return failLine(`jobs: ${spec}: no such job`, 1);
+            listed.push(job);
+        }
+    }
+    let out = '';
+    for (const job of listed) out += pidOnly ? `${job.pid}\n` : jobLine(jobs, job, long);
+    return ok(out, state);
 }
 
 function fgBuiltin(ctx: CommandContext): CommandResult {
@@ -3680,16 +3765,56 @@ function suspendBuiltin(ctx: CommandContext): CommandResult {
     return failLine('suspend: cannot suspend a shell that has no job control', 1);
 }
 
+/**
+ * Runs one job to completion, as a subshell: what it does to the directory, the variables and `$?`
+ * stays in it, and its output is what the caller prints. The job is left done, so the host's own
+ * run of it at the end of the line no longer runs it a second time.
+ */
+function runPendingJob(state: ShellState, job: ShellJob): { stdout: string; stderr: string; exitCode: number } {
+    const snapshot = snapshotState(state);
+    const savedIo = state.io;
+    try {
+        const result = runScript(state, job.text);
+        job.done = true;
+        job.exitCode = result.exitCode;
+        return result;
+    } finally {
+        state.io = savedIo;
+        restoreState(state, snapshot);
+    }
+}
+
 function waitBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
-    if (ctx.args.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
-    let status = 0;
+    const jobs = state.jobs;
+    let stdout = '';
+    let stderr = '';
+    if (ctx.args.length === 0) {
+        // no argument waits for every job, in the order it was started, and its status is 0 -- a
+        // shell reports what a job failed with only when the job is named
+        for (const job of jobs) {
+            if (job.done) continue;
+            const step = runPendingJob(state, job);
+            stdout += step.stdout;
+            stderr += step.stderr;
+        }
+        return { stdout, stderr, exitCode: 0 };
+    }
+    let exitCode = 0;
     for (const arg of ctx.args) {
         if (arg === '-n' || arg === '-f') continue;
-        writeErr(state, `wait: ${arg}: not a child of this shell\n`);
-        status = 127;
+        const job = findJob(jobs, arg);
+        if (job === undefined) {
+            stderr += `wait: ${arg}: not a child of this shell\n`;
+            exitCode = 127;
+            continue;
+        }
+        const step = job.done ? { stdout: '', stderr: '', exitCode: job.exitCode } : runPendingJob(state, job);
+        stdout += step.stdout;
+        stderr += step.stderr;
+        exitCode = step.exitCode;
     }
-    return { stdout: '', stderr: '', exitCode: status };
+    return { stdout, stderr, exitCode };
 }
 
 function bindBuiltin(ctx: CommandContext): CommandResult {
@@ -3797,6 +3922,8 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
     for (const [name, value] of Object.entries(env)) globals.set(name, { value, export: true });
     if (!globals.has('PWD')) globals.set('PWD', { value: cwd, export: true });
     if (!globals.has('PATH')) globals.set('PATH', { value: '/bin:/usr/bin', export: true });
+    /** The table of a state whose host keeps none: `child.ts` leaves its own in `state.host`. */
+    const ownJobs: ShellJob[] = [];
     const options: ShellOptions = {
         allexport: false,
         errexit: false,
@@ -3834,6 +3961,10 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
         dirs: [cwd],
         lastStatus: 0,
         lastBackgroundPid: 0,
+        get jobs(): ShellJob[] {
+            const host = this.host as { jobs?: ShellJob[] } | null | undefined;
+            return host?.jobs ?? ownJobs;
+        },
         optind: 1,
         optchar: 1,
         optarg: '',
