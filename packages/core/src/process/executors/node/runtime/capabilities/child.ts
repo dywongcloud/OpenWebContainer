@@ -358,6 +358,9 @@ interface ShellStep {
     exitCode: number;
 }
 
+/** A step that produced nothing, for the paths that run no command at all. */
+const EMPTY_STEP: ShellStep = { stdout: '', stderr: '', exitCode: 0 };
+
 interface SyncShell {
     ctx: CapabilityContext;
     cwd: string;
@@ -1257,7 +1260,12 @@ function assignVar(shell: SyncShell, name: string, value: string): string | null
     return null;
 }
 
-/** Runs a `$( )` or backquoted script in a shell of its own and strips the trailing newlines, as a shell does. */
+/**
+ * Runs a `$( )` or backquoted script in a shell of its own and strips the trailing newlines, as a
+ * shell does. The jobs it starts stay pending: what a substitution captures is what its own commands
+ * wrote, and a job nobody has waited for has written nothing yet -- it runs when the line that holds
+ * the substitution is through, so `$(jobs)` captures the list and not the output of the jobs in it.
+ */
 function runSubstitution(shell: SyncShell, script: string): { text: string; status: number } {
     const child: SyncShell = {
         ctx: shell.ctx,
@@ -1270,7 +1278,7 @@ function runSubstitution(shell: SyncShell, script: string): { text: string; stat
         jobs: shell.jobs,
         state: shell.state
     };
-    const step = shellLine(child, script);
+    const step = shellLine(child, script, true);
     // `cd` inside the substitution is the substitution's own, not the shell's
     if (child.state !== undefined) child.state.cwd = shell.cwd;
     return { text: step.stdout.replace(/\n+$/, ''), status: step.exitCode };
@@ -2165,6 +2173,17 @@ function runJob(shell: SyncShell, job: ShellJob): ShellStep {
 }
 
 /**
+ * Drops the jobs that have run out of the table. A shell keeps a job only while it has something to
+ * say about it: once `wait` has reaped it -- or the line's own flush has run it -- `jobs` lists it no
+ * more, which is why `cmd & wait; jobs` prints nothing where `cmd & jobs` prints one line.
+ */
+function reapJobs(shell: SyncShell): void {
+    const jobs = shell.jobs;
+    if (jobs === undefined) return;
+    for (let i = jobs.length - 1; i >= 0; i--) if (jobs[i].done) jobs.splice(i, 1);
+}
+
+/**
  * Runs every job of the line that has not run yet, in the order it was started. This is what a
  * background job means on a host that runs one command at a time: the command is not waited for
  * where it is written, and it is run -- with its output kept -- once the line's foreground is
@@ -2181,6 +2200,7 @@ function runPendingJobs(shell: SyncShell): ShellStep {
         stdout += step.stdout;
         stderr += step.stderr;
     }
+    reapJobs(shell);
     return { stdout, stderr, exitCode: 0 };
 }
 
@@ -2199,30 +2219,13 @@ function findJob(shell: SyncShell, name: string): ShellJob | undefined {
 }
 
 /**
- * `jobs` and `wait`, the two commands the job table answers. They are reached here rather than
- * through the builtin of `builtins.ts`, which knows of no jobs: its `jobs` prints nothing and its
- * `wait` knows no child, because the state it reads keeps no job table for the host to fill.
+ * `wait`, the one command of the job table a builtin cannot answer. The builtins of `builtins.ts`
+ * read the same table -- the state takes it out of `state.host`, which is this shell -- so their own
+ * `jobs` lists these very jobs in the columns a shell prints them in, and is reached like any other
+ * builtin. Running one is another matter: on a host that runs one command at a time a job runs only
+ * when something asks for it, and nothing in that module can ask this dispatcher to run one.
  */
-function shellJobControl(shell: SyncShell, command: string, args: string[]): ShellStep {
-    const jobs = jobsOf(shell);
-    if (command === 'jobs') {
-        let long = false;
-        let pidOnly = false;
-        for (const arg of args) {
-            if (arg === '-l') long = true;
-            else if (arg === '-p') pidOnly = true;
-            else if (arg === '-r' || arg === '-s' || arg === '-n') continue;
-        }
-        const current = jobs[jobs.length - 1];
-        const previous = jobs[jobs.length - 2];
-        const line = (job: ShellJob): string => {
-            if (pidOnly) return `${job.pid}\n`;
-            const marker = job === current ? '+' : job === previous ? '-' : ' ';
-            const state = job.done ? 'Done' : 'Running';
-            return `[${job.id}]${marker} ${long ? `${job.pid} ` : ''}${state.padEnd(24)}${job.text} &\n`;
-        };
-        return { stdout: jobs.map(line).join(''), stderr: '', exitCode: 0 };
-    }
+function shellWait(shell: SyncShell, args: string[]): ShellStep {
     // `wait`: no argument waits for every job, as it does in a shell, and its status is 0
     if (args.length === 0) return runPendingJobs(shell);
     let stdout = '';
@@ -2241,6 +2244,8 @@ function shellJobControl(shell: SyncShell, command: string, args: string[]): She
         stderr += step.stderr;
         exitCode = step.exitCode;
     }
+    // a job `wait` has reaped is a job `jobs` no longer lists, as it is in a shell
+    reapJobs(shell);
     return { stdout, stderr, exitCode };
 }
 
@@ -2293,10 +2298,15 @@ function runCompoundLine(shell: SyncShell, line: string): ShellStep {
 
 /**
  * ShellProcess.executeCommand for one command line: `;`, `&&` and `||`, with the exit status of the
- * last command that ran. `exit` stops the line, as it stops a shell. A `|` with a command missing
- * beside it is a syntax error the whole line fails on, before anything runs, as /bin/sh has it.
+ * last command that ran. `exit` stops the line, as it stops a shell -- not, however, when it is the
+ * command of a background segment: there it is the subshell the job runs in that ends, as it is in
+ * bash, and the line goes on. A `|` with a command missing beside it is a syntax error the whole
+ * line fails on, before anything runs, as /bin/sh has it.
+ *
+ * `deferPendingJobs` is for a command substitution, which is a shell of its own inside this one: it
+ * leaves the jobs it started for the line around it to run, so they are run after it, never in it.
  */
-function shellLine(shell: SyncShell, line: string): ShellStep {
+function shellLine(shell: SyncShell, line: string, deferPendingJobs = false): ShellStep {
     const body = stripComment(line);
     const syntax = syntaxErrorOf(body);
     if (syntax !== null) return { stdout: '', stderr: diagnostic(syntax), exitCode: 2 };
@@ -2325,7 +2335,8 @@ function shellLine(shell: SyncShell, line: string): ShellStep {
         // `$?` is what the last command left, for the expansions of the next one
         shell.lastStatus = exitCode;
         if (shell.state !== undefined) shell.state.lastStatus = exitCode;
-        if (rawText(segment.words[0]) === 'exit') break;
+        // `exit` ends the line -- but a backgrounded one ends only the subshell of its job
+        if (segment.background !== true && rawText(segment.words[0]) === 'exit') break;
         // `set -e`: a command that fails ends the line, unless it is an operand of `&&` or `||`
         const operand =
             segment.op === '&&' ||
@@ -2335,10 +2346,14 @@ function shellLine(shell: SyncShell, line: string): ShellStep {
     }
     // a job no one waited for cannot outlive the line on a host that runs one command at a time, so
     // it runs here, after the foreground is through: started late rather than never, and never before
-    const flushed = runPendingJobs(shell);
-    const trapped = runExitTrap(shell, { stdout: stdout + flushed.stdout, stderr: stderr + flushed.stderr, exitCode });
+    const flushed = deferPendingJobs ? EMPTY_STEP : runPendingJobs(shell);
+    const trapped = runExitTrap(
+        shell,
+        { stdout: stdout + flushed.stdout, stderr: stderr + flushed.stderr, exitCode },
+        deferPendingJobs
+    );
     // a job the EXIT trap itself started is run the same way
-    const afterTrap = runPendingJobs(shell);
+    const afterTrap = deferPendingJobs ? EMPTY_STEP : runPendingJobs(shell);
     return { stdout: trapped.stdout + afterTrap.stdout, stderr: trapped.stderr + afterTrap.stderr, exitCode: trapped.exitCode };
 }
 
@@ -2348,13 +2363,13 @@ function shellLine(shell: SyncShell, line: string): ShellStep {
  * in this dispatcher -- there are no signals, and no `DEBUG` or `ERR` hook -- so a trap set on one of
  * those is recorded and listed by `trap -p` and never runs.
  */
-function runExitTrap(shell: SyncShell, step: ShellStep): ShellStep {
+function runExitTrap(shell: SyncShell, step: ShellStep, deferPendingJobs = false): ShellStep {
     const state = shell.state;
     if (state === undefined) return step;
     const trap = state.traps.get('EXIT');
     if (trap === undefined || trap.reset || trap.ignore || trap.action === '') return step;
     state.traps.delete('EXIT');
-    const fired = shellLine(shell, trap.action);
+    const fired = shellLine(shell, trap.action, deferPendingJobs);
     return { stdout: step.stdout + fired.stdout, stderr: step.stderr + fired.stderr, exitCode: step.exitCode };
 }
 
@@ -2385,8 +2400,12 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
             return { stdout: '', stderr: '', exitCode: Number.isNaN(status) ? 0 : status };
         }
         if (command === 'history') return { stdout: '', stderr: '', exitCode: 0 };
-        // `jobs` and `wait` answer the job table this dispatcher keeps for `&`
-        if (command === 'jobs' || command === 'wait') return shellJobControl(shell, command, cmdArgs);
+        // `jobs` reads the job table this dispatcher keeps for `&` -- the state the builtins share
+        // takes it out of `state.host`, which is this shell -- so the builtin's own `jobs` answers it,
+        // in the columns a shell prints them in
+        if (command === 'jobs') return shellBuiltinModule(shell, command, cmdArgs);
+        // `wait` has to run a job, and running one is something only this dispatcher can do
+        if (command === 'wait') return shellWait(shell, cmdArgs);
         if (SHELL_BUILTINS.has(command)) return shellBuiltinWithRedirects(shell, command, cmdArgs);
         const version = externalVersion(command, cmdArgs);
         if (version !== null) return { stdout: version, stderr: '', exitCode: 0 };
