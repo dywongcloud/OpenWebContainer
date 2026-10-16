@@ -12,6 +12,13 @@ import {
     isUnsupported,
     unsupportedResult
 } from '../../../../../shell/commands/unsupported';
+import {
+    COMMANDS as SHELL_BUILTIN_UTILS,
+    createShellState,
+    setActiveState,
+    setRunner
+} from '../../../../../shell/commands/builtins';
+import type { ShellState } from '../../../../../shell/commands/builtins';
 import type { IFileSystem } from '../../../../../filesystem';
 import type { CommandContext, CommandResult, ShellCommand } from '../../../../../shell/commands/types';
 import { nodeSyncRunner, syncRunActive } from '../../pump';
@@ -355,6 +362,10 @@ interface SyncShell {
     cwd: string;
     env: Record<string, string>;
     input: string | null;
+    /** The state the builtins of `builtins.ts` share for this line: variables, aliases, the directory stack. */
+    state?: ShellState;
+    /** Set when a builtin ended the shell (`exec`, or an `exit` inside `eval`): no later command runs. */
+    stopped?: boolean;
 }
 
 const SHELL_BUILTINS = new Set(['echo', 'cat', 'pwd', 'ls', 'mkdir', 'rm', 'rmdir', 'touch', 'cd', 'cp', 'mv', 'true', 'false']);
@@ -370,9 +381,31 @@ const SHELL_MODULE_COMMANDS: Record<string, ShellCommand> = {
     ...FILE_UTILS,
     ...ARCHIVES,
     ...PROC_INFO,
+    ...SHELL_BUILTIN_UTILS,
     ...UNSUPPORTED_UTILS,
     ...UNSUPPORTED_COMMANDS
 };
+
+/** The names `builtins.ts` implements. Kept apart so their one state-carrying entry point is used. */
+const SHELL_BUILTIN_NAMES: Set<string> = new Set(Object.keys(SHELL_BUILTIN_UTILS));
+
+/**
+ * The callback `builtins.ts` runs a command it does not implement itself through: `command X`,
+ * `builtin echo`, `env FOO=1 cmd`, and every simple command of `eval`, `exec` and `source`. It is
+ * this dispatcher's own `shellCommand`, so a command reached from inside a builtin behaves exactly
+ * as it does typed on the line. Installed once, at load: one runtime, one dispatcher.
+ */
+setRunner((state, words, input) => {
+    const shell = state.host as SyncShell | undefined;
+    if (shell === undefined) return { stdout: '', stderr: `Command not found: ${words[0] ?? ''}`, exitCode: 127 };
+    const saved = shell.input;
+    shell.input = input;
+    try {
+        return shellCommand(shell, words);
+    } finally {
+        shell.input = saved;
+    }
+});
 
 /**
  * The file system a module command reads and writes through.
@@ -415,11 +448,124 @@ function moduleContext(shell: SyncShell, args: string[]): CommandContext {
 }
 
 /**
+ * The state a line's builtins share, created on the first builtin that needs one and kept on the
+ * shell for the rest of the line, so `export FOO=bar; declare -p FOO` behaves as it does in one
+ * shell. `host` is the module's free slot for the host: the runner installed above reads the shell
+ * back out of it.
+ */
+function shellStateFor(shell: SyncShell): ShellState {
+    let state = shell.state;
+    if (state === undefined) {
+        state = createShellState(shell.env, shell.cwd, fsForModules(shell.ctx.fileSystem, () => shell.cwd));
+        state.host = shell;
+        shell.state = state;
+    }
+    // `cd` moves the shell's directory; `pushd` moves the state's. The two are one directory.
+    state.cwd = shell.cwd;
+    return state;
+}
+
+/**
+ * `builtins.ts` binds one state at a time for the contexts a host builds itself (`setActiveState`).
+ * The previous one is restored afterwards, so a shell nested inside this one (a node child running
+ * `sh` synchronously) gets its own back.
+ */
+let activeShellState: ShellState | null = null;
+
+function withShellState<T>(state: ShellState, body: () => T): T {
+    const saved = activeShellState;
+    activeShellState = state;
+    setActiveState(state);
+    try {
+        return body();
+    } finally {
+        activeShellState = saved;
+        setActiveState(saved);
+    }
+}
+
+/** Carries the builtins' exported variables into the environment the other commands of the line run with. */
+function syncShellEnv(shell: SyncShell, state: ShellState): void {
+    const exported = state.env;
+    for (const name of Object.keys(shell.env)) if (!(name in exported)) delete shell.env[name];
+    for (const name of Object.keys(exported)) shell.env[name] = exported[name];
+}
+
+/** `exec` and an `exit` inside `eval` leave the script engine as a thrown signal, not a result. */
+function signalName(error: unknown): string {
+    return (error as { constructor?: { name?: string } } | null | undefined)?.constructor?.name ?? '';
+}
+
+/**
+ * One command out of `builtins.ts`. The handler is the module's own and is called with the ordinary
+ * module context; three things the other modules do not need are handled here.
+ *
+ *  - the state: bound for the duration of the call, and written back to the shell afterwards, so
+ *    the directory and the exported environment a builtin changed are what the next command sees;
+ *  - the module's output sink: a builtin may write with `writeOut`/`writeErr` instead of returning
+ *    (`type`, `alias`, `unalias`, `hash`, `wait`), so `state.io` is collected around the call and
+ *    joined to what the handler returned;
+ *  - the script engine's signals: `exec`, and an `exit` inside `eval`, end the line as they end a
+ *    shell, and carry their status with them.
+ */
+function shellBuiltinModule(shell: SyncShell, command: string, args: string[]): ShellStep {
+    const handler = SHELL_BUILTIN_UTILS[command];
+    const state = shellStateFor(shell);
+    const savedIo = state.io;
+    const savedBuffer = state.inputBuffer;
+    const savedCursor = state.inputCursor;
+    // `read` and `mapfile` take their lines out of the state's buffer, not out of the context
+    state.inputBuffer = shell.input ?? '';
+    state.inputCursor = 0;
+    state.io = { stdout: '', stderr: '' };
+    try {
+        return withShellState(state, () => {
+            let step: ShellStep;
+            try {
+                const result = handler(moduleContext(shell, args));
+                step = {
+                    stdout: state.io.stdout + result.stdout,
+                    stderr: state.io.stderr + result.stderr,
+                    exitCode: result.exitCode
+                };
+            } catch (error) {
+                if (isNotSupported(error)) throw error;
+                const name = signalName(error);
+                const code = (error as { code?: unknown } | null | undefined)?.code;
+                if (name === 'ExitSignal' || name === 'ReturnSignal') {
+                    shell.stopped = true;
+                    step = { stdout: state.io.stdout, stderr: state.io.stderr, exitCode: typeof code === 'number' ? code : 0 };
+                } else if (name === 'BreakSignal' || name === 'ContinueSignal') {
+                    step = { stdout: state.io.stdout, stderr: state.io.stderr, exitCode: 0 };
+                } else {
+                    step = {
+                        stdout: state.io.stdout,
+                        stderr: state.io.stderr + (error instanceof Error ? error.message : String(error)),
+                        exitCode: 1
+                    };
+                }
+            } finally {
+                if (state.execTarget !== null) shell.stopped = true;
+                shell.cwd = state.cwd;
+                syncShellEnv(shell, state);
+            }
+            return step;
+        });
+    } finally {
+        state.io = savedIo;
+        state.inputBuffer = savedBuffer;
+        state.inputCursor = savedCursor;
+    }
+}
+
+/**
  * One command out of a shell command module, or null when the name belongs to no module. The module
  * resolves its own paths from `cwd`, so nothing here normalises an argument: `archives.ts` refuses
  * a `..` member rather than rewriting it, and rewriting before the call would undo that.
  */
 function shellModuleCommand(shell: SyncShell, command: string, args: string[]): ShellStep | null {
+    // builtins.ts keeps state between commands, so it is reached through its own entry point
+    if (SHELL_BUILTIN_NAMES.has(command)) return shellBuiltinModule(shell, command, args);
     const handler = SHELL_MODULE_COMMANDS[command];
     if (handler === undefined) return null;
     try {
@@ -814,6 +960,8 @@ function shellLine(shell: SyncShell, line: string): ShellStep {
     let stdout = '';
     let stderr = '';
     for (let i = 0; i < segments.length; i++) {
+        // `exec` replaced the shell: nothing after it runs, whatever operator joins it
+        if (shell.stopped) break;
         const segment = segments[i];
         if (segment.op === '&&' && exitCode !== 0) continue;
         if (segment.op === '||' && exitCode === 0) continue;
@@ -823,7 +971,23 @@ function shellLine(shell: SyncShell, line: string): ShellStep {
         exitCode = step.exitCode;
         if (segment.words[0] === 'exit') break;
     }
-    return { stdout, stderr, exitCode };
+    return runExitTrap(shell, { stdout, stderr, exitCode });
+}
+
+/**
+ * `trap ACTION EXIT`: the action runs when the line ends, and the line's status is the status it had.
+ * The trap is removed first, so its own commands cannot fire it again. No other condition ever arises
+ * in this dispatcher -- there are no signals, and no `DEBUG` or `ERR` hook -- so a trap set on one of
+ * those is recorded and listed by `trap -p` and never runs.
+ */
+function runExitTrap(shell: SyncShell, step: ShellStep): ShellStep {
+    const state = shell.state;
+    if (state === undefined) return step;
+    const trap = state.traps.get('EXIT');
+    if (trap === undefined || trap.reset || trap.ignore || trap.action === '') return step;
+    state.traps.delete('EXIT');
+    const fired = shellLine(shell, trap.action);
+    return { stdout: step.stdout + fired.stdout, stderr: step.stderr + fired.stderr, exitCode: step.exitCode };
 }
 
 /** ShellProcess.executeCommand for one command, in the same order of dispatch. */
@@ -839,7 +1003,9 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         if (SHELL_BUILTINS.has(command)) return shellBuiltinWithRedirects(shell, command, cmdArgs);
         if (SHELL_EXTERNALS.has(command)) throw notSupportedSync(`the shell command ${command}`);
         if (command === 'node' || command === NODE_BINARY) return shellNode(shell, nodeInvocation(cmdArgs));
-        const PATH = shell.env.PATH;
+        // A builtin is never looked for on PATH, the way it never is in a shell: `.` is the source
+        // builtin, not the current directory, and `env` is not `/usr/bin/env`.
+        const PATH = SHELL_BUILTIN_NAMES.has(command) ? undefined : shell.env.PATH;
         if (PATH) {
             for (const dir of PATH.split(':')) {
                 const found = shell.ctx.fileSystem.resolvePath(command, dir);

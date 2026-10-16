@@ -337,3 +337,13 @@
 {"ts":1792121769481,"writer":"host","pid":87866,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
 {"ts":1792121769511,"writer":"host","pid":87867,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
 {"ts":1792121769561,"writer":"host","pid":87868,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122881058,"writer":"host","pid":35908,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122881097,"writer":"host","pid":35909,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122881133,"writer":"host","pid":35931,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122881950,"writer":"host","pid":36157,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122882000,"writer":"host","pid":36167,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122882043,"writer":"host","pid":36181,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122882081,"writer":"host","pid":36189,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122882116,"writer":"host","pid":36194,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122882182,"writer":"host","pid":36201,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
+{"ts":1792122882224,"writer":"host","pid":36210,"ppid":53576,"kind":"exec","verb":"nodejs","session_id":null,"dispatch_id":null,"task":null,"port":null,"root":"/Users/dylanwong/projects/OpenWebContainer"}
