@@ -9,6 +9,60 @@ interface CommandHistoryEntry {
     timestamp: Date;
 }
 
+/**
+ * Splits a command line into words the way a POSIX shell quotes them: single quotes keep everything,
+ * double quotes keep everything except \" \\ \$ \` and an escaped newline, a bare backslash escapes the
+ * next character, and adjacent quoted or plain pieces make one word. No expansion is done.
+ */
+export function splitCommandLine(line: string): string[] {
+    const words: string[] = [];
+    let word = '';
+    let inWord = false;
+    let i = 0;
+    while (i < line.length) {
+        const ch = line[i];
+        if (ch === ' ' || ch === '\t' || ch === '\n') {
+            if (inWord) {
+                words.push(word);
+                word = '';
+                inWord = false;
+            }
+            i++;
+        } else if (ch === "'") {
+            const close = line.indexOf("'", i + 1);
+            const stop = close === -1 ? line.length : close;
+            word += line.slice(i + 1, stop);
+            inWord = true;
+            i = stop + 1;
+        } else if (ch === '"') {
+            inWord = true;
+            i++;
+            while (i < line.length && line[i] !== '"') {
+                const next = line[i + 1];
+                if (line[i] === '\\' && next !== undefined && '"\\$`\n'.includes(next)) {
+                    if (next !== '\n') word += next;
+                    i += 2;
+                } else {
+                    word += line[i];
+                    i++;
+                }
+            }
+            i++;
+        } else if (ch === '\\') {
+            const next = line[i + 1];
+            if (next !== undefined && next !== '\n') word += next;
+            inWord = true;
+            i += 2;
+        } else {
+            word += ch;
+            inWord = true;
+            i++;
+        }
+    }
+    if (inWord) words.push(word);
+    return words;
+}
+
 export class ShellProcess extends Process {
     private shell: Shell;
     private prompt: string;
@@ -46,9 +100,12 @@ export class ShellProcess extends Process {
         try {
             // Handle initial command if provided in args
             if (this.filteredArgs.length > 0) {
-                const result = await this.executeCommand(this.filteredArgs.join(' '));
+                const commandLine = this.filteredArgs[0] === '-c'
+                    ? (this.filteredArgs[1] ?? '')
+                    : this.filteredArgs.join(' ');
+                const result = await this.executeCommand(commandLine);
                 if (result.stdout) {
-                    this.emitOutput(result.stdout + '\n');
+                    this.emitOutput(result.stdout.endsWith('\n') ? result.stdout : result.stdout + '\n');
                 }
                 if (result.stderr) {
                     this.emitError(result.stderr + '\n');
@@ -289,8 +346,7 @@ export class ShellProcess extends Process {
     }
 
     private async executeCommand(commandLine: string): Promise<ShellCommandResult> {
-        const args = commandLine.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
-        const processedArgs = args.map(arg => arg.replace(/^["'](.+)["']$/, '$1'));
+        const processedArgs = splitCommandLine(commandLine);
 
 
         if (processedArgs.length === 0) {
@@ -301,10 +357,13 @@ export class ShellProcess extends Process {
 
         // Handle built-in commands
         switch (command) {
-            case 'exit':
+            case 'exit': {
+                const status = Number.parseInt(cmdArgs[0] ?? '0', 10);
+                const exitCode = Number.isNaN(status) ? 0 : status;
                 this.running = false;
-                this._exitCode = 0;
-                return { stdout: '', stderr: '', exitCode: 0 };
+                this._exitCode = exitCode;
+                return { stdout: '', stderr: '', exitCode };
+            }
 
             case 'history':
                 const historyOutput = this.commandHistory
@@ -319,9 +378,13 @@ export class ShellProcess extends Process {
                     if(this.shell.hasCommand(command)) {
                         return await this.shell.execute(command, cmdArgs);
                     }
-                    else if (command === 'node') {
-                        const result = await this.spawnChild(command, cmdArgs);
-                        return result;
+                    else if (command === 'node' || command === 'npm' || command === 'npx') {
+                        return await this.spawnChild(
+                            command,
+                            cmdArgs,
+                            Object.fromEntries(this.env),
+                            this.shell.getWorkingDirectory()
+                        );
                     }
                     else{
                         // check if the command is in env PATH

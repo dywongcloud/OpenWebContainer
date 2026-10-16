@@ -33,6 +33,7 @@ export abstract class Process extends BrowserEventEmitter {
     private startTime?: Date;
     private endTime?: Date;
     private terminated: boolean = false;
+    private exitEmitted: boolean = false;
 
     constructor(
         pid: number,
@@ -145,8 +146,8 @@ export abstract class Process extends BrowserEventEmitter {
             await this.execute();
 
             if (!this.terminated) {
-                this._state = ProcessState.COMPLETED;
-                this._exitCode = 0;
+                this._exitCode = this._exitCode ?? 0;
+                this._state = this._exitCode === 0 ? ProcessState.COMPLETED : ProcessState.FAILED;
             }
         } catch (error: any) {
             this._state = ProcessState.FAILED;
@@ -154,7 +155,7 @@ export abstract class Process extends BrowserEventEmitter {
             this.emit(ProcessEvent.ERROR, { pid: this.pid, error });
         } finally {
             this.endTime = new Date();
-            this.emit(ProcessEvent.EXIT, {
+            this.emitExit({
                 pid: this.pid,
                 exitCode: this._exitCode,
                 uptime: this.uptime
@@ -174,11 +175,18 @@ export abstract class Process extends BrowserEventEmitter {
 
         await this.onTerminate();
 
-        this.emit(ProcessEvent.EXIT, {
+        this.emitExit({
             pid: this.pid,
             exitCode: this._exitCode,
             uptime: this.uptime
         });
+    }
+
+    /** Emits EXIT once: terminate() and the end of start() can both reach it. */
+    private emitExit(data: { pid: number; exitCode: number | null; uptime: number | null }): void {
+        if (this.exitEmitted) return;
+        this.exitEmitted = true;
+        this.emit(ProcessEvent.EXIT, data);
     }
 
     /**
@@ -196,14 +204,16 @@ export abstract class Process extends BrowserEventEmitter {
     protected async spawnChild(
         executable: string,
         args: string[] = [],
-        env: Record<string, string> = {}
+        env: Record<string, string> = {},
+        cwd?: string
     ): Promise<ChildProcessResult> {
         return new Promise((resolve) => {
             this.emit(ProcessEvent.SPAWN_CHILD, {
                 payload: {
                     executable,
                     args,
-                    env
+                    env,
+                    cwd
                 },
                 callback: resolve
             });

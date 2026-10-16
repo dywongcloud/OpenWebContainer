@@ -3,12 +3,17 @@ import { VirtualFileSystem } from "./filesystem/virtual-fs";
 import { ProcessManager } from "./process/manager";
 import { NodeProcessExecutor } from "./process/executors/node";
 import { ShellProcessExecutor } from "./process/executors/shell";
+import { NpmProcessExecutor } from "./process/executors/npm/executor";
+import { NodeProcess } from "./process/executors/node/process";
+import { RuntimeServices } from "./process/executors/node/runtime/services";
+import { VirtualNetwork } from "./network/virtual/hub";
 import { IFileSystem } from "./filesystem";
 import { ZenFSCore } from "./filesystem/zenfs-core";
 import { NetworkManager } from "network/manager";
 import { ServerType, VirtualServer } from "./network/types";
 import { NetworkStats } from "./network/types";
 import { HostRequest } from "process/executors/node/modules/network-module";
+import { setProcessHost } from "./shell/commands/procinfo";
 
 
 interface ProcessEventData {
@@ -28,6 +33,8 @@ export interface ContainerOptions {
 export interface SpawnOptions {
     cwd?: string;
     env?: Record<string, string>;
+    /** Runs synchronously before the process starts, so listeners see every event. */
+    beforeStart?: (process: Process) => void;
 }
 
 /**
@@ -39,13 +46,16 @@ export class OpenWebContainer {
     private processRegistry: ProcessRegistry;
     private outputCallbacks: ((output: string) => void)[] = [];
     readonly networkManager: NetworkManager;
+    private services: RuntimeServices;
     private debugMode: boolean;
     constructor(options: ContainerOptions = {}) {
         this.debugMode = options.debug || false;
         this.fileSystem = new ZenFSCore();
         this.processManager = new ProcessManager();
         this.processRegistry = new ProcessRegistry();
+        const network = new VirtualNetwork({ sinkFor: (pid) => this.guestSink(pid) });
         this.networkManager = new NetworkManager({
+            network,
             getProcess: (pid: number) => this.processManager.getProcess(pid),
             onServerListen:(port)=>{
                 if (options.onServerListen) {
@@ -59,16 +69,62 @@ export class OpenWebContainer {
             }
         });
 
+        this.services = {
+            network,
+            startProcess: (request) => this.spawn(request.executable, request.args, request.parentPid, {
+                cwd: request.cwd,
+                env: request.env,
+                beforeStart: request.beforeStart
+            }),
+            sinkFor: (pid) => this.guestSink(pid)
+        };
+
         // Register default process executors
         this.processRegistry.registerExecutor(
             'javascript',
-            new NodeProcessExecutor(this.fileSystem, this.networkManager)
+            new NodeProcessExecutor(this.fileSystem, this.networkManager, this.services)
         );
         this.processRegistry.registerExecutor(
             'shell',
             new ShellProcessExecutor(this.fileSystem)
         );
+        this.processRegistry.registerExecutor(
+            'npm',
+            new NpmProcessExecutor(this.fileSystem)
+        );
+        this.installProcessHost();
         this.debugLog('Container initialized');
+    }
+
+    /**
+     * The shell's process commands (`ps`, `top`, `kill`, `killall`, `pkill`, `watch`, `time`) read
+     * the container's one live process table through this host; it is installed once per container
+     * and nothing else uses it. `run` is left off: the host has no way to run a command line and
+     * wait for it synchronously, so `nice`, `nohup`, `time` and `watch` report that themselves.
+     */
+    private installProcessHost(): void {
+        setProcessHost({
+            list: () =>
+                this.listProcesses().map((process) => {
+                    const info = this.getProcessInfo(process);
+                    return {
+                        pid: info.pid,
+                        ppid: info.ppid ?? 0,
+                        command: [info.executablePath, ...info.args].join(' '),
+                        state: info.state
+                    };
+                }),
+            signal: (pid, name) => {
+                const process = this.getProcess(pid);
+                if (!process) return false;
+                // There is no job control in the container: every signal this shell can deliver ends
+                // the process, and the ones that only stop or continue it have nothing to act on.
+                if (!/^(TERM|KILL|INT|HUP|QUIT|USR1|USR2|ALRM|15|9|2|1|3|10|12|14)$/.test(name)) return false;
+                void process.terminate();
+                return true;
+            },
+            now: () => Date.now()
+        });
     }
     private debugLog(...args: any[]): void {
         if (this.debugMode) {
@@ -170,13 +226,16 @@ export class OpenWebContainer {
 
         // Add process to manager and start it
         this.processManager.addProcess(process);
+        options.beforeStart?.(process);
         process.start().catch(console.error);
         
         return process;
     }
     
     private setupProcessEventHandlers(process: Process): void {
+        // A child's output and errors are forwarded to its parent, which reports them; only root processes notify
         process.addEventListener(ProcessEvent.MESSAGE, (data: ProcessEventData) => {
+            if (process.parentPid !== undefined) return;
             if (data.stdout) {
                 this.notifyOutput(data.stdout);
             }
@@ -186,18 +245,26 @@ export class OpenWebContainer {
         });
 
         process.addEventListener(ProcessEvent.ERROR, (data: ProcessEventData) => {
+            if (process.parentPid !== undefined) return;
             if (data.error) {
                 this.notifyOutput(`Error: ${data.error.message}\n`);
             }
         });
 
         process.addEventListener(ProcessEvent.EXIT, (data) => {
+            if (process.parentPid !== undefined) return;
             if (data.exitCode) {
                 this.notifyOutput(`Process exited with code: ${data.exitCode}\n`);
             }
         });
         
     }
+    /** The running guest process behind a pid, as a delivery sink for the virtual network. */
+    private guestSink(pid: number): NodeProcess | undefined {
+        const process = this.processManager.getProcess(pid);
+        return process instanceof NodeProcess ? process : undefined;
+    }
+
     registerProcessExecutor(type: string, executor: ProcessExecutor): void {
         this.processRegistry.registerExecutor(type, executor);
     }
@@ -336,7 +403,8 @@ export class OpenWebContainer {
             const childProcess = await this.spawn(
                 payload.executable,
                 payload.args,
-                parentPid  // Pass parent PID
+                parentPid,  // Pass parent PID
+                { cwd: payload.cwd, env: payload.env }
             );
             childPid=childProcess.pid
 

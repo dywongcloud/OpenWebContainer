@@ -1,0 +1,4 @@
+id: owc-async-context-and-rejections
+subject: 'Async context and promise rejection gaps (witness dispatch 1792020333437-8-94a781f6aca1795d): AsyncLocalStorage keeps its store across setTimeout, promise then, nextTick and setImmediate but loses it across await (await null, await timer, await after a timer read undefined where Node keeps the store); unhandled promise rejection reporting absent (Node exits 1 at the rejection; OWC exits 0 and runs later timers). Classify each: fix in the guest if the engine exposes a hook (the QuickJS C API has JS_SetHostPromiseRejectionTracker; check whether quickjs-emscripten 0.31 exposes it), otherwise ENGINE with the exact missing hook named as evidence.'
+session_id: owc-r4
+status: pending
