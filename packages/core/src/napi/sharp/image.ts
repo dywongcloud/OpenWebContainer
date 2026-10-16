@@ -127,10 +127,20 @@ function kernelPass(image: Image, dstSize: number, horizontal: boolean, kernel: 
     const other = horizontal ? image.height : image.width;
     const ch = image.channels;
     const out = createImage(horizontal ? dstSize : other, horizontal ? other : dstSize, ch);
+    /**
+     * Where output pixel `d` samples the source, in source pixels.
+     *
+     * A reduction and an enlargement are not the same mapping, and mixing them up shifts every
+     * upscaled image by half a source pixel. Measured against sharp 0.33.5 on a 64x64 ramp whose red
+     * channel is 4*x (lanczos3 reproduces a ramp exactly, so out/4 reads the sampled position back):
+     * shrinking 64->32/48/24 lands on (d + 0.5) * scale - 0.5, while enlarging 64->128/256 lands on
+     * d * scale - 0.5 and 64->96/192/80/100 within one byte of it.
+     */
+    const centreOf = (d: number): number => (d + (scale >= 1 ? 0.5 : 0)) * scale - 0.5;
     const support = kernel.support * Math.max(1, scale);
     for (let o = 0; o < other; o++) {
         for (let d = 0; d < dstSize; d++) {
-            const center = (d + 0.5) * scale - 0.5;
+            const center = centreOf(d);
             const lo = Math.ceil(center - support);
             const hi = Math.floor(center + support);
             let wsum = 0;

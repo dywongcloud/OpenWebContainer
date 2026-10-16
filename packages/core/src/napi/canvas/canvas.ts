@@ -107,9 +107,24 @@ interface EncodeConfig {
     filters?: number;
 }
 
+/** The add-on's own limit: cairo_dimension_t is a 16-bit integer, so 32767 is the largest side. */
+const MAX_DIMENSION = 32767;
+
+/**
+ * What the add-on does with a dimension argument: ToUint32, so 3.7 truncates to 3, NaN and an
+ * infinity give 0, and a negative value wraps to a huge one that then fails the limit below --
+ * `createCanvas(-1, 4)` is refused with "Canvas width cannot exceed 32767" (measured).
+ */
+function toDimension(value: number): number {
+    const truncated = Math.trunc(value);
+    if (!isFinite(truncated)) return 0;
+    const wrapped = truncated % 4294967296;
+    return wrapped < 0 ? wrapped + 4294967296 : wrapped;
+}
+
 export class Canvas {
-    width: number;
-    height: number;
+    private w: number;
+    private h: number;
     readonly type = 'image';
 
     static readonly PNG_NO_FILTERS = 0;
@@ -122,19 +137,49 @@ export class Canvas {
 
     private surface: Surface;
 
-    constructor(width: number, height: number, type?: string) {
+    constructor(width?: number, height?: number, type?: string) {
         if (type !== undefined && type !== null && type !== 'image') {
             throw unsupported(
                 'canvas type ' + JSON.stringify(String(type)) + ' -- the shim renders image canvases only; ' +
                 'it has no cairo PDF or SVG surface'
             );
         }
-        const w = Math.floor(Number(width));
-        const h = Math.floor(Number(height));
-        if (!isFinite(w) || !isFinite(h) || w < 0 || h < 0) throw new RangeError('Canvas: width and height must be non-negative');
-        this.width = w;
-        this.height = h;
-        this.surface = new Surface(this.width, this.height);
+        // Both dimensions come from numbers, and the height is only read when the width was one:
+        // createCanvas() is 0x0, createCanvas('20', 30) is 0x0 and createCanvas(20, '30') is 20x0.
+        let w = 0;
+        let h = 0;
+        if (typeof width === 'number') {
+            w = toDimension(width);
+            if (typeof height === 'number') h = toDimension(height);
+        }
+        if (w > MAX_DIMENSION) throw new Error('Canvas width cannot exceed 32767');
+        if (h > MAX_DIMENSION) throw new Error('Canvas height cannot exceed 32767');
+        this.w = w;
+        this.h = h;
+        this.surface = new Surface(this.w, this.h);
+    }
+
+    /** Resizing: a number at most 32767 replaces the side, anything else is ignored (measured). */
+    get width(): number {
+        return this.w;
+    }
+
+    set width(value: number) {
+        if (typeof value !== 'number') return;
+        const next = toDimension(value);
+        if (next > MAX_DIMENSION) return;
+        this.w = next;
+    }
+
+    get height(): number {
+        return this.h;
+    }
+
+    set height(value: number) {
+        if (typeof value !== 'number') return;
+        const next = toDimension(value);
+        if (next > MAX_DIMENSION) return;
+        this.h = next;
     }
 
     get stride(): number {
@@ -213,7 +258,9 @@ export class Canvas {
             }
             return out;
         }
-        if (t === 'application/pdf') throw unsupported('PDF output -- the shim has no PDF surface');
+        // A PDF canvas has no PDF surface to write: the add-on recognises both PDF mime types and
+        // returns undefined for an image canvas, where the shim refuses with a named error.
+        if (t === 'application/pdf' || t === 'image/pdf') throw unsupported('PDF output -- the shim has no PDF surface');
         // Anything else, as the add-on does: no image, and no error either.
         return undefined;
     }
@@ -1014,7 +1061,8 @@ export class CanvasRenderingContext2d {
 
     /** A direct write, as the spec has it: no transform, no alpha or composite, but the clip does apply. */
     putImageData(imageData: ImageData, dx: number, dy: number, dirtyX?: number, dirtyY?: number, dirtyWidth?: number, dirtyHeight?: number): void {
-        if (!imageData) throw new TypeError('ImageData expected');
+        // The add-on checks the instance: a plain {width, height, data} is refused (measured).
+        if (!(imageData instanceof ImageData)) throw new TypeError('ImageData expected');
         const surface = this.canvas.pixels();
         let x0 = dirtyX === undefined ? 0 : Math.floor(Number(dirtyX));
         let y0 = dirtyY === undefined ? 0 : Math.floor(Number(dirtyY));

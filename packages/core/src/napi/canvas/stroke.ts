@@ -147,12 +147,17 @@ export function strokeOutline(path: readonly SubPath[], style: StrokeStyle): Sub
                 let dx = pts[i * 2] - pts[j * 2], dy = pts[i * 2 + 1] - pts[j * 2 + 1];
                 const len = Math.sqrt(dx * dx + dy * dy);
                 const cx = pts[i * 2], cy = pts[i * 2 + 1];
-                if (len === 0) continue;
-                dx /= len;
-                dy /= len;
+                if (len > 0) {
+                    dx /= len;
+                    dy /= len;
+                }
+                // A zero-length segment still paints a round cap: measured on the add-on,
+                // moveTo(10,10); lineTo(10,10); stroke() with lineWidth 8 and a round cap fills
+                // about 52 px, and that is how the glyph table draws a dot. A square cap has no
+                // direction to extend along, so it paints nothing, and a butt cap never does.
                 if (style.cap === 'round') {
                     emit(out, circle(cx, cy, hw));
-                } else if (style.cap === 'square') {
+                } else if (style.cap === 'square' && len > 0) {
                     const ex = cx + dx * hw, ey = cy + dy * hw;
                     const nx = -dy, ny = dx;
                     emit(out, [

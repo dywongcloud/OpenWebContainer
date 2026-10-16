@@ -29,6 +29,79 @@ let lastQuickJs: QuickJSAsyncWASMModule | undefined;
 class GuestFailure extends Error {}
 
 /**
+ * Guest-side tracking of promise rejections, installed once the bootstrap has built the API.
+ * The engine has no promise-rejection tracker to hook (quickjs-emscripten does not expose
+ * JS_SetHostPromiseRejectionTracker), so the runtime builds every promise through one subclass
+ * whose executor records a rejection, and `then` records that a rejection has a handler. The host
+ * asks, once the microtask queue is empty, whether one was left unhandled; that is the point at
+ * which Node throws it. A promise the engine builds itself -- the result of an async function --
+ * is not seen here, so a rejection only it knows about still goes unreported.
+ */
+const REJECTION_TRACKER_SRC = String.raw`
+(function (api) {
+  var Native = Promise;
+  var CELLS = new WeakMap();
+  var WATCHED = [];
+  var reported = false;
+
+  /* Every promise this runtime builds goes through here: new Promise, Promise.reject, the result
+     of then, catch and finally, and the results of all, race, any and allSettled -- the engine
+     builds each of them by constructing the species of the constructor it started from. */
+  class Tracked extends Native {
+    constructor(executor) {
+      var cell = { reason: undefined, rejected: false, handled: false };
+      super(function (resolve, reject) {
+        var wrapped = function (reason) {
+          cell.rejected = true;
+          cell.reason = reason;
+          WATCHED.push(cell);
+          reject(reason);
+        };
+        try {
+          executor(resolve, wrapped);
+        } catch (err) {
+          wrapped(err);
+        }
+      });
+      CELLS.set(this, cell);
+    }
+  }
+
+  Object.defineProperty(Native, Symbol.species, { get: function () { return Tracked; }, configurable: true });
+  Object.defineProperty(globalThis, 'Promise', { value: Tracked, writable: true, configurable: true });
+  /* A promise the engine built itself is still a Promise to code that asks one */
+  Object.defineProperty(Tracked, Symbol.hasInstance, { value: function (x) { return x instanceof Native; }, configurable: true });
+
+  var nativeThen = Native.prototype.then;
+  Native.prototype.then = function (onFulfilled, onRejected) {
+    /* a rejection handler on this promise, or a handler that forwards the rejection to the promise
+       then returns, means the rejection is not left unhandled */
+    if (typeof onRejected === 'function' || typeof onFulfilled === 'function') {
+      var cell = CELLS.get(this);
+      if (cell !== undefined) cell.handled = true;
+    }
+    return nativeThen.call(this, onFulfilled, onRejected);
+  };
+
+  /* The formatted reason of the first rejection left unhandled, or '' when there is none. */
+  api.takeUnhandledRejection = function () {
+    var first = null;
+    var rest = [];
+    for (var i = 0; i < WATCHED.length; i++) {
+      var cell = WATCHED[i];
+      if (cell.handled) continue;
+      if (first === null && !reported) first = cell;
+      else rest.push(cell);
+    }
+    WATCHED = rest;
+    if (first === null) return '';
+    reported = true;
+    return api.formatUncaught(first.reason);
+  };
+})(globalThis.__owc_api);
+`;
+
+/**
  * One `node` process: a QuickJS guest with a Node-compatible CommonJS/ESM loader, built-in
  * modules and a host-driven event loop. The process lives while anything holds a ref
  * (armed timers, in-flight host operations, open sockets and servers); process.exit, a
@@ -219,9 +292,20 @@ export class NodeProcess extends Process {
         bootstrap.dispose();
         host.dispose();
         this.api = api;
+        this.installRejectionTracker(context);
         bindVmRuntime(this.capabilityContext, runtime, context, api);
         this.builtinNames = new Set<string>(JSON.parse(this.callApiString('builtinNames')));
         return entryPath;
+    }
+
+    /**
+     * Installs the promise-rejection tracker into a freshly booted guest, before anything that
+     * can create a promise has run: every module the process loads from here builds its promises
+     * through it.
+     */
+    private installRejectionTracker(context: QuickJSContext): void {
+        const tracker = context.unwrapResult(context.evalCode(REJECTION_TRACKER_SRC, 'owc-rejections.js', { type: 'global' }));
+        tracker.dispose();
     }
 
     /** Runs an async capability; its envelope is settled back into the guest on a later macrotask. */
@@ -471,6 +555,8 @@ export class NodeProcess extends Process {
     }
 
     private requestExit(code: number): void {
+        // the first process.exit decides the status: a later one cannot change what the process already left with
+        if (this.exitRequested !== undefined) return;
         this.exitRequested = code;
         for (const handle of this.timers.values()) {
             clearTimeout(handle);
@@ -509,6 +595,8 @@ export class NodeProcess extends Process {
     private drainJobs(): void {
         const runtime = this.runtime!;
         for (;;) {
+            // process.exit ended the process: nothing of the guest runs after it, exactly as in Node
+            if (this.exitRequested !== undefined || this.stopped) return;
             const pending = this.callApi('drainTicks', []);
             const uncaught = this.context!.dump(pending);
             pending.dispose();
@@ -518,6 +606,10 @@ export class NodeProcess extends Process {
             const result = runtime.executePendingJobs(10000);
             if (result.error) throw this.guestFailure(result.error);
         }
+        if (this.exitRequested !== undefined || this.stopped) return;
+        // the queue is empty, which is where Node throws a rejection that nothing handled
+        const rejection = this.callApiString('takeUnhandledRejection');
+        if (rejection !== '') throw new GuestFailure(rejection);
     }
 
     private callApi(name: string, args: QuickJSHandle[]): QuickJSHandle {

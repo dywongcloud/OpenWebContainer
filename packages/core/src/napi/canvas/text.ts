@@ -207,6 +207,12 @@ export function layoutText(text: string, font: FontSpec, maxWidth?: number): Lai
         minX = minX * squeeze;
     }
     if (minX === Infinity) { minX = 0; maxX = 0; minY = 0; maxY = 0; }
+    else {
+        // The bounding box the add-on reports is the ink's, not the centrelines', so it is half a
+        // stem wider on every side.
+        const half = stemWidth(font) / 2;
+        minX -= half; maxX += half; minY -= half; maxY += half;
+    }
     const metrics: TextMetrics = {
         width: width,
         actualBoundingBoxAscent: maxY,
@@ -214,7 +220,7 @@ export function layoutText(text: string, font: FontSpec, maxWidth?: number): Lai
         actualBoundingBoxLeft: -minX,
         actualBoundingBoxRight: maxX,
         emHeightAscent: font.size * 0.8,
-        emHeightDescent: font.size * 0.3,
+        emHeightDescent: font.size * 0.25,
         fontBoundingBoxAscent: (ASCENT / UNITS_PER_EM) * font.size,
         fontBoundingBoxDescent: (DESCENT / UNITS_PER_EM) * font.size,
         alphabeticBaseline: 0

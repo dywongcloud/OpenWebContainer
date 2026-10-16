@@ -14,7 +14,8 @@
  * these three fails with ENOENT, as a file with no executor does in Node.
  *
  * What onData delivers. The child's stdout and its stderr, merged in the order they arrive, as
- * one stream, the way a pty merges them. The bytes are the container's own text encoded back to
+ * one stream, the way a pty merges them, with every newline turned into CR NL the way the line
+ * discipline of a terminal turns it. The bytes are the container's own text encoded back to
  * UTF-8: the pipes here carry strings, not bytes, so a program that wrote bytes that are not
  * UTF-8 has already been decoded by the host and cannot be recovered.
  *
@@ -143,6 +144,32 @@ function toNewline(data: string): string {
     return data.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+/**
+ * What a pty does to a newline on the way out. A program writes NL; the line discipline of the
+ * terminal turns it into CR NL (ONLCR), which is what the master side and everything reading it
+ * sees, so a line the container's child wrote as "a\n" arrives as "a\r\n". A CR the program wrote
+ * itself is left alone, so a program that already writes CR NL comes out as CR CR NL, as it does
+ * on a real terminal.
+ */
+function toCrlf(chunk: unknown): unknown {
+  if (typeof chunk === 'string') return chunk.indexOf('\n') < 0 ? chunk : chunk.replace(/\n/g, '\r\n');
+  const B = bufferOf();
+  if (B && (chunk instanceof Uint8Array || (typeof B.isBuffer === 'function' && B.isBuffer(chunk)))) {
+    const text = B.from(chunk).toString('utf8');
+    return text.indexOf('\n') < 0 ? chunk : B.from(text.replace(/\n/g, '\r\n'), 'utf8');
+  }
+  return chunk;
+}
+
+/**
+ * The exit code node-pty reports: a number, never null. The add-on reads waitpid and reports the
+ * exit status when the child exited and 0 when a signal ended it, with the signal beside it.
+ */
+function exitStatusCode(code: unknown): number {
+  const status = Number(code);
+  return code === undefined || code === null || !Number.isFinite(status) ? 0 : status;
+}
+
 function asBuffer(chunk: unknown): any {
     const B = bufferOf();
     if (B && typeof B.isBuffer === 'function' && B.isBuffer(chunk)) return chunk;
@@ -176,7 +203,7 @@ export function createAddon(env: PtyAddonEnv = {}): object {
 
     /**
      * pty.fork: starts the child and returns the master side. The callback is called once, with
-     * the exit code (null when a signal ended the child) and the signal, as the real add-on
+     * the exit code (0 when a signal ended the child) and the signal, as the real add-on
      * reports them.
      */
     function fork(
@@ -238,11 +265,12 @@ export function createAddon(env: PtyAddonEnv = {}): object {
         table()[fd] = record;
 
         const deliver = (chunk: unknown): void => {
+            const line = asBuffer(toCrlf(chunk));
             if (record.paused) {
-                record.queue.push(asBuffer(chunk));
+                record.queue.push(line);
                 return;
             }
-            emitter.emit('data', asBuffer(chunk));
+            emitter.emit('data', line);
         };
         if (child.stdout) child.stdout.on('data', deliver);
         if (child.stderr) child.stderr.on('data', deliver);
@@ -256,13 +284,12 @@ export function createAddon(env: PtyAddonEnv = {}): object {
             if (typeof onexit === 'function') onexit(code, signal);
         };
         child.on('exit', (code: unknown, signal: unknown) => {
-            const status = code === undefined || code === null ? null : Number(code);
-            finish(status, signalNumber(signal));
+            finish(exitStatusCode(code), signalNumber(signal));
         });
         // A spawn the host refused never reaches 'exit': its 'close' carries the errno.
         child.on('close', (code: unknown, signal: unknown) => {
             if (record.exited) return;
-            finish(typeof code === 'number' ? code : null, signalNumber(signal));
+            finish(exitStatusCode(code), signalNumber(signal));
         });
 
         // The container gives a child its pid asynchronously, after spawn has returned, so there is

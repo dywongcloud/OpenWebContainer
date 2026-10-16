@@ -41,12 +41,19 @@ import { optionsOf, unsupportedInput, unsupportedOption } from './options';
 import { JpegInfo, decodeJpeg, encodeJpeg, isJpeg } from './jpeg';
 import { PngInfo, decodePng, encodePng, isPng } from './png';
 
+/** The part of the Buffer constructor the add-on needs: a view on bytes that is also a Buffer. */
+interface BufferConstructorLike {
+    from(arrayBuffer: ArrayBuffer, byteOffset?: number, length?: number): Uint8Array;
+}
+
 /** The filesystem the container gives the add-on; only `read` and `write` are used. */
 export interface SharpAddonHost {
     fs?: {
         read?: (path: string) => Uint8Array | undefined;
         write?: (path: string, bytes: Uint8Array) => void;
     };
+    /** The guest's Buffer, so output can be handed back as a Buffer rather than a bare Uint8Array. */
+    Buffer?: BufferConstructorLike;
 }
 
 /** What the shim decoded, and everything sharp's metadata() reports about it. */
@@ -75,6 +82,17 @@ function bytesOf(value: unknown): Uint8Array {
     }
     if (value instanceof ArrayBuffer) return new Uint8Array(value);
     throw new Error('sharp: input buffer is not a typed array');
+}
+
+/**
+ * sharp's add-on resolves every buffer output with a Buffer, not a bare Uint8Array: lib/output.js
+ * hands the value straight to the caller, so `buf.toString('base64')` has to be a Buffer's, or it
+ * returns the bytes as a comma-separated list instead. The view is shared, never copied.
+ */
+function bufferOf(host: SharpAddonHost | undefined, bytes: Uint8Array): Uint8Array {
+    const ctor = host?.Buffer ?? (globalThis as { Buffer?: BufferConstructorLike }).Buffer;
+    if (!ctor || typeof ctor.from !== 'function') return bytes;
+    return ctor.from(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
 }
 
 function numberOption(options: Record<string, unknown>, key: string, fallback: number): number {
@@ -138,7 +156,7 @@ function decodedFromPng(image: Image, info: PngInfo, size: number): Decoded {
         image,
         format: 'png',
         size,
-        density: info.density,
+        density: densityOf(info.density),
         resolutionUnit: info.resolutionUnit,
         isProgressive: info.isProgressive,
         paletteBitDepth: info.paletteBitDepth,
@@ -149,12 +167,22 @@ function decodedFromPng(image: Image, info: PngInfo, size: number): Decoded {
     };
 }
 
+/**
+ * libvips gives every image it has loaded a resolution, defaulting to 72 dpi when the file carries
+ * none, so sharp's metadata() always has a density for a PNG or JPEG input and never for one it
+ * built itself (create, raw). Measured against sharp 0.33.5: a PNG and a JPEG with no pHYs and a
+ * JFIF with units 0 both report 72, while sharp({create:...}) and a raw buffer report none.
+ */
+function densityOf(density: number | undefined): number {
+    return typeof density === 'number' && isFinite(density) && density > 0 ? density : 72;
+}
+
 function decodedFromJpeg(image: Image, info: JpegInfo, size: number): Decoded {
     return {
         image,
         format: 'jpeg',
         size,
-        density: info.density,
+        density: densityOf(info.density),
         chromaSubsampling: info.chromaSubsampling,
         isProgressive: info.isProgressive,
         hasProfile: info.hasProfile,
@@ -362,9 +390,10 @@ export function createAddon(host: SharpAddonHost = {}): object {
     }
 
     function pipeline(options: unknown, callback: (err: Error | null, data?: unknown, info?: unknown) => void): void {
-        let data: Uint8Array;
+        let data: unknown;
         let info: Record<string, unknown>;
         let fileOut = '';
+        let bytes = new Uint8Array(0);
         try {
             const opts = optionsOf(options);
             const bad = unsupportedOption(opts);
@@ -377,15 +406,11 @@ export function createAddon(host: SharpAddonHost = {}): object {
             }
             const { image, cropLeft, cropTop } = applyOperations(decoded.image, opts);
             const encoded = encodeOutput(image, opts, decoded.format);
-            data = encoded.data;
+            bytes = encoded.data;
             fileOut = String(opts.fileOut ?? '');
-            if (fileOut !== '') {
-                if (!host || !host.fs || typeof host.fs.write !== 'function') throw noHostFileSystem();
-                host.fs.write(fileOut, data);
-            }
             info = {
                 format: encoded.format,
-                size: data.length,
+                size: bytes.length,
                 width: image.width,
                 height: image.height,
                 channels: image.channels,
@@ -394,6 +419,16 @@ export function createAddon(host: SharpAddonHost = {}): object {
             if (String(opts.canvas ?? 'crop') === 'crop' && (cropLeft !== 0 || cropTop !== 0)) {
                 info.cropOffsetLeft = cropLeft;
                 info.cropOffsetTop = cropTop;
+            }
+            if (fileOut !== '') {
+                if (!host || !host.fs || typeof host.fs.write !== 'function') throw noHostFileSystem();
+                host.fs.write(fileOut, bytes);
+                // A file write resolves with the info object, not the bytes: lib/output.js passes the
+                // add-on's first value to the caller unchanged, so toFile() gets {format,width,...},
+                // and a caller destructuring {width, height} off it sees undefined otherwise.
+                data = info;
+            } else {
+                data = bufferOf(host, bytes);
             }
         } catch (error) {
             callback(error as Error);

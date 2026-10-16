@@ -421,6 +421,31 @@ function upsampleComponent(
   const maxI = compW - 1;
   const maxJ = compH - 1;
 
+  /**
+   * libjpeg int_upsample: each sample is repeated hRatio times across and vRatio times down. This is
+   * what a component gets when no fancy upsampler takes it.
+   */
+  const replicate = (): Uint8Array => {
+    for (let y = 0; y < outH; y++) {
+      const row = Math.min(maxJ, (y / vRatio) | 0);
+      const o = row * planeW;
+      const d = y * outW;
+      for (let x = 0; x < outW; x++) {
+        out[d + x] = plane[o + Math.min(maxI, (x / hRatio) | 0)];
+      }
+    }
+    return out;
+  };
+
+  /*
+   * jdsample.c picks the fancy upsampler only while the component is more than two samples wide
+   * (`do_fancy && compptr->downsampled_width > 2`), and falls back to replication below that. A 4x4
+   * 4:2:0 image has a 2x2 chroma plane, so it replicates, while an 8x8 one has a 4x4 plane and
+   * blends: measured against sharp 0.33.5, a chroma checkerboard decodes identically from 8x8 up
+   * (max delta 0) and differs by up to 97 at 4x4, where only the four corners agree.
+   */
+  const fancy = compW > 2;
+
   if (hRatio === 1 && vRatio === 1) {
     for (let y = 0; y < outH; y++) {
       const s = y * planeW;
@@ -431,6 +456,7 @@ function upsampleComponent(
   }
 
   if (hRatio === 2 && vRatio === 2) {
+    if (!fancy) return replicate();
     /* libjpeg h2v2_fancy_upsample: separable 3/4 - 1/4 triangle filter */
     for (let y = 0; y < outH; y++) {
       const r0 = y >> 1;
@@ -456,6 +482,7 @@ function upsampleComponent(
   }
 
   if (hRatio === 2 && vRatio === 1) {
+    if (!fancy) return replicate();
     /* libjpeg h2v1_fancy_upsample */
     for (let y = 0; y < outH; y++) {
       const o0 = (y > maxJ ? maxJ : y) * planeW;
@@ -477,35 +504,8 @@ function upsampleComponent(
     return out;
   }
 
-  /* general clamped bilinear */
-  for (let y = 0; y < outH; y++) {
-    const cy = (y + 0.5) / vRatio - 0.5;
-    let fj = Math.floor(cy);
-    const ty = cy - fj;
-    let j1 = fj + 1;
-    if (fj < 0) fj = 0;
-    if (fj > maxJ) fj = maxJ;
-    if (j1 < 0) j1 = 0;
-    if (j1 > maxJ) j1 = maxJ;
-    const o0 = fj * planeW;
-    const o1 = j1 * planeW;
-    const d = y * outW;
-    for (let x = 0; x < outW; x++) {
-      const cx = (x + 0.5) / hRatio - 0.5;
-      let fi = Math.floor(cx);
-      const tx = cx - fi;
-      let i1 = fi + 1;
-      if (fi < 0) fi = 0;
-      if (fi > maxI) fi = maxI;
-      if (i1 < 0) i1 = 0;
-      if (i1 > maxI) i1 = maxI;
-      const a = plane[o0 + fi] * (1 - tx) + plane[o0 + i1] * tx;
-      const b = plane[o1 + fi] * (1 - tx) + plane[o1 + i1] * tx;
-      const v = a * (1 - ty) + b * ty + 0.5;
-      out[d + x] = v < 0 ? 0 : v > 255 ? 255 : v | 0;
-    }
-  }
-  return out;
+  /* Every other ratio (4:1:1, 4:2:4, ...) has no fancy upsampler in libjpeg: int_upsample repeats. */
+  return replicate();
 }
 
 /* ----------------------------------------------------------------- decode -- */
