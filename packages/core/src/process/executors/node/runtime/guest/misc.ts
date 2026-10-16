@@ -812,8 +812,102 @@ BF.module = function () {
 };
 
 BF.tty = function () {
+  var EE = requireBuiltin('events');
+  function recordOf(fd) {
+    var table = globalThis.__owcPtyFds;
+    return table ? table[fd] : undefined;
+  }
+  /*
+   * A stream over a pty fd: an fd the node-pty shim (src/napi/node-pty) registered in
+   * globalThis.__owcPtyFds when its fork() started a container child process. node-pty's
+   * lib/unixTerminal.js builds one of these around the fd its add-on returns and reads the child's
+   * output from it, and writes to it go through fs.write to the child's input.
+   *
+   * The container has no terminal, so this stream is not one: isTTY is false, and isatty below
+   * answers false for every fd. A fd that is not one of the shim's gives an inert stream, so
+   * new tty.ReadStream(0) does not fail.
+   */
+  function PtyReadStream(fd) {
+    var self = this;
+    var rec = recordOf(fd);
+    EE.call(this);
+    this.fd = fd;
+    this.isTTY = false;
+    this.readable = true;
+    this.writable = false;
+    this.columns = rec ? rec.cols : 80;
+    this.rows = rec ? rec.rows : 24;
+    this._encoding = undefined;
+    this._decoder = undefined;
+    this._paused = false;
+    this._destroyed = false;
+    if (rec) rec.socket = this;
+    this._onData = function (chunk) {
+      if (self._destroyed) return;
+      self.emit('data', self._encoding ? chunk.toString(self._encoding) : chunk);
+    };
+    if (rec) rec.emitter.on('data', this._onData);
+  }
+  PtyReadStream.prototype = Object.create(EE.prototype);
+  PtyReadStream.prototype.constructor = PtyReadStream;
+  PtyReadStream.prototype.setEncoding = function (encoding) {
+    this._encoding = encoding || undefined;
+    this._decoder = encoding ? {} : undefined;
+    return this;
+  };
+  PtyReadStream.prototype.pause = function () {
+    this._paused = true;
+    var rec = recordOf(this.fd);
+    if (rec) rec.paused = true;
+    return this;
+  };
+  PtyReadStream.prototype.resume = function () {
+    this._paused = false;
+    var rec = recordOf(this.fd);
+    if (rec) {
+      rec.paused = false;
+      while (rec.queue.length > 0) rec.emitter.emit('data', rec.queue.shift());
+    }
+    return this;
+  };
+  PtyReadStream.prototype.destroy = function () {
+    if (this._destroyed) return this;
+    this._destroyed = true;
+    this.readable = false;
+    var rec = recordOf(this.fd);
+    if (rec) {
+      try { rec.emitter.removeListener('data', this._onData); } catch (e) {}
+      if (rec.socket === this) rec.socket = null;
+    }
+    this.emit('close');
+    return this;
+  };
+  PtyReadStream.prototype.end = function () { return this; };
+  PtyReadStream.prototype.read = function () { return null; };
+  PtyReadStream.prototype.pipe = function (dest) {
+    var self = this;
+    this.on('data', function (chunk) {
+      try { dest.write(chunk); } catch (e) {}
+    });
+    return dest || self;
+  };
+  /* There is nothing to write to a terminal here: writes to a pty go through fs.write. */
+  function PtyWriteStream(fd) {
+    EE.call(this);
+    this.fd = fd;
+    this.isTTY = false;
+    this.writable = true;
+    this.columns = 80;
+    this.rows = 24;
+  }
+  PtyWriteStream.prototype = Object.create(EE.prototype);
+  PtyWriteStream.prototype.constructor = PtyWriteStream;
+  PtyWriteStream.prototype.write = function () { return false; };
+  PtyWriteStream.prototype.end = function () { return this; };
   return {
-    isatty: function () { return false; }
+    isatty: function () { return false; },
+    ReadStream: PtyReadStream,
+    WriteStream: PtyWriteStream
   };
 };
 

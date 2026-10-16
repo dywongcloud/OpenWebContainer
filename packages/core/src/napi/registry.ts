@@ -72,5 +72,38 @@ export const NAPI_SHIMS: readonly NapiShim[] = [
         name: 'better-sqlite3',
         binaries: ['better_sqlite3.node'],
         packages: { 'better-sqlite3': ['build/Release/better_sqlite3.node'] }
+    },
+    {
+        // node-pty 1.1.0: lib/utils.js loadNativeModule('pty') probes ../build/Release, ./build/Release,
+        // ../build/Debug, ./build/Debug and then ../prebuilds/<platform>-<arch>, from lib/. The guest
+        // reports linux-x64, and the package ships no linux prebuild, so all three are placeholders.
+        name: 'node-pty',
+        binaries: ['pty.node'],
+        packages: {
+            'node-pty': ['build/Release/pty.node', 'build/Debug/pty.node', 'prebuilds/linux-x64/pty.node']
+        }
+    },
+    {
+        name: 'canvas',
+        binaries: ['canvas.node'],
+        // canvas 3.x: bindings-style load resolves build/Release/canvas.node
+        packages: { canvas: ['build/Release/canvas.node'] }
+    },
+    {
+        // sharp 0.33.5: lib/sharp.js tries ../src/build/Release/sharp-<platform><libc>-<arch>.node, then
+        // ../src/build/Release/sharp-wasm32.node, then @img/sharp-<same>/sharp.node and then
+        // @img/sharp-wasm32/sharp.node. The guest's detect-libc finds no getconf, so runtimePlatformArch()
+        // ends up 'linuxnull-x64'; the plain prebuilt platform is listed as well in case that changes.
+        // The @img packages ship their own binary, so they need no placeholder; its basename is a binary
+        // here so that any of them reaches this shim even without one.
+        name: 'sharp',
+        binaries: ['sharp.node', 'sharp-linuxnull-x64.node', 'sharp-linux-x64.node', 'sharp-wasm32.node'],
+        packages: {
+            sharp: [
+                'src/build/Release/sharp-linuxnull-x64.node',
+                'src/build/Release/sharp-linux-x64.node',
+                'src/build/Release/sharp-wasm32.node'
+            ]
+        }
     }
 ];

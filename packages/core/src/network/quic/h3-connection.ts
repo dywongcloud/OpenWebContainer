@@ -464,6 +464,21 @@ export class Http3Connection extends Emitter {
         return this.requests.size;
     }
 
+    /**
+     * Request streams whose HTTP/3 exchange is not over yet: a stream that has received the peer's
+     * final message and closed its send side counts as done even before its stream object is torn
+     * down, so a close is not held up by stream bookkeeping that has yet to run.
+     */
+    get busyCount(): number {
+        let busy = 0;
+        for (const request of this.requests.values()) {
+            if (request.closed) continue;
+            if (request.recvEnded && request.sendState === 'done') continue;
+            busy++;
+        }
+        return busy;
+    }
+
     traceEvent(event: Record<string, unknown>): void {
         if (this.traceFn) this.traceFn({ role: this.role, ...event });
     }

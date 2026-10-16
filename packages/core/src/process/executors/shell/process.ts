@@ -92,7 +92,7 @@ export class ShellProcess extends Process {
         const oscMode = args.includes('--osc');
         this.filteredArgs = args.filter(arg => arg !== '--osc');
 
-        this.shell = new Shell(fileSystem, { oscMode, process: this,env: this.env });
+        this.shell = new Shell(fileSystem, { oscMode, process: this,env: this.env, cwd: this.cwd });
         this.prompt = oscMode ? '\x1b[1;32m$\x1b[0m ' : '$ ';
     }
 

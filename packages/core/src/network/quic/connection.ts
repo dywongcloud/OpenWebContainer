@@ -4,6 +4,7 @@ import { Emitter } from './emitter';
 import { PacketDropError, QuicError, TransportError, cryptoErrorCode } from './errors';
 import { decodeFrames, encodeFrames, isAckEliciting } from './frames';
 import type { FramePacketType, QuicFrame } from './frames';
+import { MAX_STREAMS_LIMIT } from './frames';
 import { MIN_INITIAL_DATAGRAM_SIZE, openPacket, parseDatagram, sealPacket, verifyRetry } from './packet';
 import type { PacketSpec, ParsedPacket } from './packet';
 import { PACKET_NUMBER_MAX, decodePacketNumber, packetNumberLength } from './packet-number';
@@ -39,11 +40,16 @@ import { varintLength } from './varint';
  * initial window); transport parameter exchange and the RFC 9000 Section 7.3 connection ID checks;
  * key discard (RFC 9001 Section 4.9); HANDSHAKE_DONE; the server's anti-amplification limit and
  * Initial padding (RFC 9000 Sections 8.1, 14.1); 1-RTT key update both ways (RFC 9001 Section 6);
- * bidirectional and unidirectional streams with flow control; Retry and Version Negotiation at the
+ * bidirectional and unidirectional streams with flow control, whose limits grow as data is consumed
+ * and as peer streams close (MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS); Retry and Version Negotiation at the
  * client; CONNECTION_CLOSE with closing and draining periods; the idle timeout.
  *
  * Not covered: 0-RTT, connection migration and path validation beyond answering PATH_CHALLENGE,
- * issuing extra connection IDs, stateless reset, ECN, pacing and congestion control.
+ * issuing extra connection IDs, stateless reset, ECN, and an application-limited marker (RFC 9002 A.6).
+ *
+ * Congestion control is NewReno with a pacer (RFC 9002 Sections 7.2, 7.3, 7.6 and 7.7): the window
+ * starts at ten datagrams, halves on entering a recovery period, drops to the minimum window on
+ * persistent congestion, and sends are spread over N * window / smoothed_rtt.
  */
 
 export type ConnectionState = 'handshake' | 'connected' | 'closing' | 'draining' | 'closed';
@@ -53,7 +59,7 @@ export const MAX_DATAGRAM_SIZE = 1200;
 /** Length of the connection IDs this endpoint issues. */
 export const LOCAL_CID_LENGTH = 8;
 const CRYPTO_BUFFER_LIMIT = 65536;
-const INITIAL_WINDOW = 10 * MAX_DATAGRAM_SIZE;
+/** No longer used for a limit: the congestion window lives in Recovery (RFC 9002 Section 7). */
 const MAX_BUFFERED_PACKETS = 16;
 /** Frame type codes, for CONNECTION_CLOSE frame type fields. */
 const FT = { ACK: 0x02, RESET_STREAM: 0x04, STOP_SENDING: 0x05, CRYPTO: 0x06, NEW_TOKEN: 0x07, STREAM: 0x08, MAX_STREAM_DATA: 0x11, NEW_CONNECTION_ID: 0x18, RETIRE_CONNECTION_ID: 0x19, HANDSHAKE_DONE: 0x1e } as const;
@@ -166,6 +172,7 @@ type FrameRecord =
     | { readonly kind: 'handshake_done' }
     | { readonly kind: 'max_data' }
     | { readonly kind: 'max_stream_data'; readonly streamId: number }
+    | { readonly kind: 'max_streams'; readonly bidirectional: boolean }
     | { readonly kind: 'retire_cid'; readonly sequence: bigint }
     | { readonly kind: 'ack'; readonly space: SpaceId };
 
@@ -271,6 +278,8 @@ export class QuicStream extends Emitter {
     resetSent: { errorCode: bigint; finalSize: number } | null = null;
     resetReceived: { errorCode: number; finalSize: number } | null = null;
     stopSendingSent: bigint | null = null;
+    /** This stream already released its slot in the peer's cumulative stream limit (RFC 9000 Section 4.6). */
+    limitReleased = false;
 
     constructor(
         private readonly connection: QuicConnection,
@@ -394,6 +403,14 @@ export class QuicConnection extends Emitter {
     private peerUniOpened = 0;
     private peerMaxStreamsBidi = 0;
     private peerMaxStreamsUni = 0;
+    /**
+     * The cumulative number of streams of each type the peer may open, advertised in the transport
+     * parameters and raised with MAX_STREAMS as peer streams close (RFC 9000 Sections 4.6 and 19.11).
+     */
+    private localMaxStreamsBidi: number;
+    private localMaxStreamsUni: number;
+    private pendingMaxStreamsBidi = false;
+    private pendingMaxStreamsUni = false;
     private peerMaxData = 0;
     private dataSent = 0;
     private localMaxData: number;
@@ -415,6 +432,8 @@ export class QuicConnection extends Emitter {
 
     private closeDeadline = 0;
     private lastCloseSent = -Infinity;
+    /** A CONNECTION_CLOSE of ours has reached the socket (RFC 9000 Section 10.2). */
+    private closeSent = false;
     private lastActivity: number;
     private timer: unknown = null;
     private timerDeadline = -1;
@@ -422,6 +441,8 @@ export class QuicConnection extends Emitter {
     private drainingEvents = false;
     private flushing = false;
     private flushScheduled = false;
+    /** The last flush stopped on the pacer, so a timer has to wake the next one. */
+    private pacingBlocked = false;
     private discardInitialAfterFlush = false;
     private discardHandshakeAfterFlush = false;
     private finished = false;
@@ -446,6 +467,8 @@ export class QuicConnection extends Emitter {
         this.rejectUnauthorized = config.rejectUnauthorized !== false;
         this.settings = { ...DEFAULT_TRANSPORT_SETTINGS, ...(config.transport ?? {}) };
         this.localMaxData = this.settings.initialMaxData;
+        this.localMaxStreamsBidi = this.settings.initialMaxStreamsBidi;
+        this.localMaxStreamsUni = this.settings.initialMaxStreamsUni;
         this.lastActivity = this.platform.now();
         const newSpace = (): ReceiveSpace => ({ recv: new PacketNumberSet(), largestRecv: null, largestRecvTime: null, ackPending: false, nextPn: 0n });
         this.spaces = { initial: newSpace(), handshake: newSpace(), application: newSpace() };
@@ -526,6 +549,9 @@ export class QuicConnection extends Emitter {
         const now = this.platform.now();
         this.enterClosing({ errorCode, reason, application: true, remote: false }, now);
         this.flush(now);
+        // A flush already in progress ignores this call (it re-enters), and a close that never reaches
+        // the wire leaves the peer waiting for its own idle timeout: try again on the next turn.
+        if (!this.closeSent) this.scheduleFlush();
         this.drainEvents();
     }
 
@@ -873,14 +899,24 @@ export class QuicConnection extends Emitter {
                 stream.peerMaxStreamData = Math.max(stream.peerMaxStreamData, toSafeNumber(frame.maximum));
                 return;
             }
-            case 'MAX_STREAMS':
-                if (frame.bidirectional) this.peerMaxStreamsBidi = Math.max(this.peerMaxStreamsBidi, toSafeNumber(frame.maximum));
-                else this.peerMaxStreamsUni = Math.max(this.peerMaxStreamsUni, toSafeNumber(frame.maximum));
+            case 'MAX_STREAMS': {
+                const maximum = toSafeNumber(frame.maximum);
+                if (frame.bidirectional) {
+                    if (maximum <= this.peerMaxStreamsBidi) return;
+                    this.peerMaxStreamsBidi = maximum;
+                } else {
+                    if (maximum <= this.peerMaxStreamsUni) return;
+                    this.peerMaxStreamsUni = maximum;
+                }
+                this.trace({ ev: 'max_streams', bidirectional: frame.bidirectional, maximum });
+                this.queueEvent(() => this.emit('streams', { bidirectional: frame.bidirectional, maximum }));
                 return;
+            }
             case 'DATA_BLOCKED':
             case 'STREAM_DATA_BLOCKED':
-            case 'STREAMS_BLOCKED':
                 return;
+            case 'STREAMS_BLOCKED':
+                return this.onStreamsBlocked(frame.bidirectional, frame.limit);
             case 'NEW_CONNECTION_ID':
                 return this.onNewConnectionId(frame);
             case 'RETIRE_CONNECTION_ID':
@@ -973,6 +1009,10 @@ export class QuicConnection extends Emitter {
                 return;
             case 'max_stream_data':
                 this.pendingMaxStreamData.add(record.streamId);
+                return;
+            case 'max_streams':
+                if (record.bidirectional) this.pendingMaxStreamsBidi = true;
+                else this.pendingMaxStreamsUni = true;
                 return;
             case 'retire_cid':
                 this.pendingRetire.push(record.sequence);
@@ -1157,6 +1197,7 @@ export class QuicConnection extends Emitter {
             stream.endEmitted = true;
             this.queueEvent(() => stream.emit('end'));
         }
+        if (stream.recvBuffer.complete) this.releaseStreamLimit(stream);
         if (!stream.recvBuffer.complete && stream.localMaxStreamData - stream.consumed < stream.localWindow / 2) {
             stream.localMaxStreamData = stream.consumed + stream.localWindow;
             this.pendingMaxStreamData.add(id);
@@ -1180,6 +1221,7 @@ export class QuicConnection extends Emitter {
         stream.resetReceived = { errorCode: toSafeNumber(frame.errorCode), finalSize };
         const info = stream.resetReceived;
         this.queueEvent(() => stream.emit('reset', info));
+        this.releaseStreamLimit(stream);
     }
 
     private onStopSending(frame: Extract<QuicFrame, { type: 'STOP_SENDING' }>): void {
@@ -1236,7 +1278,7 @@ export class QuicConnection extends Emitter {
             throw new QuicError(TransportError.STREAM_STATE_ERROR, `frame for locally initiated stream ${id} that was never opened`, BigInt(frameType));
         }
         const index = Math.floor(id / 4);
-        const limit = unidirectional ? this.settings.initialMaxStreamsUni : this.settings.initialMaxStreamsBidi;
+        const limit = unidirectional ? this.localMaxStreamsUni : this.localMaxStreamsBidi;
         if (index >= limit) throw new QuicError(TransportError.STREAM_LIMIT_ERROR, `stream ${id} exceeds the stream limit`, BigInt(frameType));
         const opened = unidirectional ? this.peerUniOpened : this.peerBidiOpened;
         for (let i = opened; i <= index; i++) {
@@ -1260,6 +1302,52 @@ export class QuicConnection extends Emitter {
         const local = ((id & 1) === 0) === this.isClient;
         // Our stream is "remote" from the peer's point of view, and the peer's stream is its "local" one.
         return toSafeNumber((local ? params.initial_max_stream_data_bidi_remote : params.initial_max_stream_data_bidi_local) ?? 0n);
+    }
+
+    // ------------------------------------------------------------------ stream limits (RFC 9000 Section 4.6)
+
+    /**
+     * A stream the peer opened is finished in both directions: its slot in the cumulative limit is
+     * given back and MAX_STREAMS is queued. RFC 9000 Section 4.6 leaves the schedule to the
+     * implementation and notes that limits might be raised as streams are closed; it also requires
+     * that credit not be withheld until the peer sends STREAMS_BLOCKED (Section 19.14).
+     */
+    private releaseStreamLimit(stream: QuicStream): void {
+        if (stream.locallyInitiated || stream.limitReleased) return;
+        const sendDone = stream.sendBuffer === null || stream.resetSent !== null || stream.sendBuffer.finished;
+        const recvDone = stream.recvBuffer === null || stream.resetReceived !== null || stream.recvBuffer.complete;
+        if (!sendDone || !recvDone) return;
+        stream.limitReleased = true;
+        const bidirectional = stream.bidirectional;
+        const current = bidirectional ? this.localMaxStreamsBidi : this.localMaxStreamsUni;
+        if (current >= Number(MAX_STREAMS_LIMIT)) return;
+        if (bidirectional) {
+            this.localMaxStreamsBidi = current + 1;
+            this.pendingMaxStreamsBidi = true;
+        } else {
+            this.localMaxStreamsUni = current + 1;
+            this.pendingMaxStreamsUni = true;
+        }
+        this.trace({ ev: 'stream_limit_released', stream: stream.id, maxStreams: current + 1, bidirectional });
+        this.scheduleFlush();
+    }
+
+    /** Raises the limit by one when the peer says it is blocked and we have given it no headroom. */
+    private onStreamsBlocked(bidirectional: boolean, limit: bigint): void {
+        const used = bidirectional ? this.peerBidiOpened : this.peerUniOpened;
+        const current = bidirectional ? this.localMaxStreamsBidi : this.localMaxStreamsUni;
+        const reported = toSafeNumber(limit);
+        if (reported < used || current > used) return;
+        if (current >= Number(MAX_STREAMS_LIMIT)) return;
+        if (bidirectional) {
+            this.localMaxStreamsBidi = current + 1;
+            this.pendingMaxStreamsBidi = true;
+        } else {
+            this.localMaxStreamsUni = current + 1;
+            this.pendingMaxStreamsUni = true;
+        }
+        this.trace({ ev: 'streams_blocked', bidirectional, limit: reported, maxStreams: current + 1 });
+        this.scheduleFlush();
     }
 
     // ------------------------------------------------------------------ Retry and Version Negotiation (client)
@@ -1325,24 +1413,38 @@ export class QuicConnection extends Emitter {
         this.flushScheduled = true;
         this.platform.defer(() => {
             this.flushScheduled = false;
-            if (!this.isOpen()) return;
+            // 'closing' still has a CONNECTION_CLOSE to send (RFC 9000 Section 10.2).
+            if (!this.isOpen() && this.state !== 'closing') return;
             this.flush(this.platform.now());
             this.drainEvents();
         });
     }
 
+    /** Whether the pacer lets another datagram out now (RFC 9002 Section 7.7); a close or a probe is never paced. */
+    private canSendNow(now: number): boolean {
+        if (this.state === 'closing' || this.probeSpaces.size > 0) return true;
+        return this.recovery.pacingDelay(now) === 0;
+    }
+
     private flush(now: number): void {
         if (this.flushing || this.state === 'draining' || this.state === 'closed') return;
         this.flushing = true;
+        this.pacingBlocked = false;
         try {
             if (this.keyUpdateRequested && this.canInitiateKeyUpdate()) this.initiateKeyUpdate();
             for (let i = 0; i < 256; i++) {
+                if (!this.canSendNow(now)) {
+                    this.pacingBlocked = true;
+                    break;
+                }
                 const datagram = this.buildDatagram(now);
                 if (datagram === null) break;
                 this.bytesSent += datagram.length;
                 this.stats.datagramsSent++;
                 this.sendDatagramFn(datagram);
+                this.recovery.onPacedSend(datagram.length, now);
                 if (this.state === 'closing') {
+                    this.closeSent = true;
                     this.lastCloseSent = now;
                     break;
                 }
@@ -1389,8 +1491,8 @@ export class QuicConnection extends Emitter {
             }
         }
         const probing = this.probeSpaces.size > 0;
-        // Not a congestion controller: new data waits while the initial window is in flight; ACKs and probes do not.
-        const congestionLimited = !closing && !probing && this.recovery.bytesInFlight >= INITIAL_WINDOW;
+        // RFC 9002 Section 7: new data waits while the congestion window is full; ACKs and probes do not.
+        const congestionLimited = !closing && !probing && !this.recovery.canSend();
         const built: BuiltPacket[] = [];
         let used = 0;
         for (const space of SPACE_IDS) {
@@ -1537,6 +1639,13 @@ export class QuicConnection extends Emitter {
         if (this.pendingMaxData) {
             if (add({ type: 'MAX_DATA', maximum: BigInt(this.localMaxData) }, { kind: 'max_data' })) this.pendingMaxData = false;
         }
+        // MAX_STREAMS (RFC 9000 Section 19.11): raise the cumulative stream limit as peer streams close.
+        if (this.pendingMaxStreamsBidi) {
+            if (add({ type: 'MAX_STREAMS', bidirectional: true, maximum: BigInt(this.localMaxStreamsBidi) }, { kind: 'max_streams', bidirectional: true })) this.pendingMaxStreamsBidi = false;
+        }
+        if (this.pendingMaxStreamsUni) {
+            if (add({ type: 'MAX_STREAMS', bidirectional: false, maximum: BigInt(this.localMaxStreamsUni) }, { kind: 'max_streams', bidirectional: false })) this.pendingMaxStreamsUni = false;
+        }
         for (const id of [...this.pendingMaxStreamData]) {
             const stream = this.streams.get(id);
             if (!stream || stream.recvBuffer === null || stream.recvBuffer.complete) {
@@ -1563,6 +1672,7 @@ export class QuicConnection extends Emitter {
             }
             if (!add({ type: 'RESET_STREAM', streamId: BigInt(id), errorCode: stream.resetSent.errorCode, finalSize: BigInt(stream.resetSent.finalSize) }, { kind: 'reset_stream', streamId: id })) break;
             this.pendingResets.delete(id);
+            this.releaseStreamLimit(stream);
         }
         // Round robin: each packet starts with the stream after the last one that got data.
         const order = [...this.streams.values()];
@@ -1591,6 +1701,8 @@ export class QuicConnection extends Emitter {
                     break;
                 }
                 served = true;
+                // The send side reaches its terminal state when the FIN goes out (RFC 9000 Section 3.3).
+                if (chunk.fin) this.releaseStreamLimit(stream);
             }
             if (served) this.streamCursor = index + 1;
         }
@@ -1639,6 +1751,7 @@ export class QuicConnection extends Emitter {
             const idle = this.effectiveIdleTimeout();
             if (idle !== null) take(this.lastActivity + idle);
             if (this.app.readPrevious !== null) take(this.app.readPreviousExpires);
+            if (this.pacingBlocked) take(this.recovery.pacingDeadline());
         }
         if (deadline === null) {
             this.cancelTimer();

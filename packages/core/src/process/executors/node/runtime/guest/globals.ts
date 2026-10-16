@@ -107,6 +107,18 @@ var NAPI_HOST = (function () {
           return undefined;
         }
       }
+    },
+    /*
+     * The container's own child processes, for the node-pty shim: it starts a shell (an interactive
+     * ShellProcess when it is given no arguments) or a node child and reads its output and exit,
+     * which is the closest thing the container has to a session on a terminal. Only spawn is
+     * exposed, and the module is looked up when it is called, so a process that never loads the
+     * add-on never loads child_process.
+     */
+    child: {
+      spawn: function (file, args, options) {
+        return requireBuiltin('child_process').spawn(file, args, options);
+      }
     }
   };
 })();
@@ -215,6 +227,25 @@ proc.memoryUsage = function () {
 };
 proc.cpuUsage = function () {
   return { user: 0, system: 0 };
+};
+/*
+ * Signals a child of this process, as Node does with the pids it knows. The container has no
+ * signals across processes: every name that ends a process ends it the same way (terminate), and
+ * the name is only reported back as the signal the child died of. A pid that is not a child of
+ * this process is not signalled, and false comes back rather than an error, because a container
+ * process cannot see processes that are not its own children.
+ */
+proc.kill = function (pid, signal) {
+  var name = signal === undefined || signal === null || signal === 0 || signal === '0' ? 'SIGTERM' : String(signal);
+  var num = Number(pid);
+  var table = globalThis.__owcPtyFds;
+  var record = table ? table[num] : undefined;
+  // An id of a pty stands for the child behind it: the container gives a child its pid after
+  // spawn has returned, so a pty has no process id to report when it is built.
+  if (record && record.child && record.child.pid !== undefined) {
+    return callCap('child.kill', { pid: Number(record.child.pid), signal: name }) === true;
+  }
+  return callCap('child.kill', { pid: num, signal: name }) === true;
 };
 proc.umask = function () {
   return 18;

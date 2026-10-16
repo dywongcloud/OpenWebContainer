@@ -42,6 +42,12 @@ export interface Http3ApiEnvironment {
 }
 
 const ERROR_CODES = { ...H3ErrorCode, ...QpackErrorCode };
+/**
+ * How long a graceful close waits after GOAWAY before it sends CONNECTION_CLOSE anyway. A session
+ * whose request streams never report themselves idle would otherwise send nothing at all, and the
+ * peer would learn of the close only from its own idle timeout.
+ */
+const GRACEFUL_CLOSE_GRACE_MS = 1500;
 
 /** Raises an error thrown by user code from an event listener asynchronously, as an uncaught exception would be in Node. */
 function rethrowLater(error: unknown): void {
@@ -523,6 +529,7 @@ export function createHttp3Api(env: Http3ApiEnvironment) {
         readonly streams = new Set<Http3Stream>();
         closing = false;
         closeArmed = false;
+        closeFallback: unknown = null;
         retryArmed = false;
 
         constructor(quic: QuicConnection, options: Http3Options, authority: Authority | null, server: Http3Server | null) {
@@ -546,6 +553,8 @@ export function createHttp3Api(env: Http3ApiEnvironment) {
             });
             this.h3.on('close', (info: CloseInfo) => this.onClose(info));
             this.h3.on('idle', () => this.maybeFinishClose());
+            // The peer raised our stream limit: requests that waited on it can go out now (RFC 9000 Section 4.6).
+            quic.on('streams', () => this.openBlocked());
             if (this.type === 'server') {
                 this.h3.on('request', (core: Http3RequestStream, event: HeadersEvent) => this.onRequest(core, event));
             }
@@ -590,9 +599,9 @@ export function createHttp3Api(env: Http3ApiEnvironment) {
         }
 
         /**
-         * Opens the request's stream, or queues it while the peer's stream limit is reached: like Node's
-         * http2 beyond the concurrency limit, the request waits, and goes out in order once the peer
-         * raises MAX_STREAMS (RFC 9000 Section 4.6).
+         * Opens queued requests in order until the peer's stream limit stops it. The QUIC layer reports
+         * the peer's MAX_STREAMS as a 'streams' event, and one of this session's requests closing reopens
+         * the queue; a timer of about one RTT covers a MAX_STREAMS that was lost (RFC 9002 Section 6.2.4).
          */
         startRequest(stream: Http3Stream, headers: OutgoingHeaders, endStream: boolean): void {
             this.blockedRequests.push({ stream, headers, endStream });
@@ -665,7 +674,7 @@ export function createHttp3Api(env: Http3ApiEnvironment) {
         }
 
         maybeFinishClose(): void {
-            if (this.closing && this.h3.requestCount === 0 && this.blockedRequests.length === 0) this.finishGracefulClose();
+            if (this.closing && this.h3.busyCount === 0 && this.blockedRequests.length === 0) this.finishGracefulClose();
         }
 
         onRequest(core: Http3RequestStream, event: HeadersEvent): void {
@@ -705,11 +714,21 @@ export function createHttp3Api(env: Http3ApiEnvironment) {
                 // The control stream is gone; closing anyway.
             }
             this.maybeFinishClose();
+            // The streams may never reach the bookkeeping that reports them idle (a stream whose Duplex
+            // is never destroyed, a request the peer never answers). GOAWAY is out, so bound the wait:
+            // the peer still has to see a CONNECTION_CLOSE rather than an idle timeout.
+            if (!this.closeArmed && this.closeFallback === null) {
+                this.closeFallback = env.setTimeout(() => {
+                    this.closeFallback = null;
+                    this.finishGracefulClose();
+                }, GRACEFUL_CLOSE_GRACE_MS);
+            }
         }
 
         finishGracefulClose(): void {
             if (this.closeArmed) return;
             this.closeArmed = true;
+            this.closeFallback = null;
             const rtt = this.quic.rtt.smoothed;
             const delay = Math.min(1000, Math.max(20, Math.ceil(3 * (Number.isFinite(rtt) ? rtt : 100))));
             env.setTimeout(() => {

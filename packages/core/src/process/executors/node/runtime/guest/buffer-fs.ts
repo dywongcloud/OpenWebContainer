@@ -1188,6 +1188,32 @@ BF.fs = function () {
     var found = fs.existsSync(p);
     queueMicrotask(function () { cb(found); });
   };
+  /*
+   * fs.write by descriptor. The file system here is path based and has no descriptors, except for
+   * the pty fds the node-pty shim registers in globalThis.__owcPtyFds: node-pty's
+   * lib/unixTerminal.js writes a pty's input with fs.write(fd, buffer, offset, callback), so a
+   * write to one of those fds goes to the child's stdin and reports the bytes it took. Any other
+   * fd is not open: EBADF, as Node reports for a descriptor it does not know.
+   */
+  fs.write = function (fd, buffer, offset, callback) {
+    var done = typeof callback === 'function' ? callback : null;
+    var table = globalThis.__owcPtyFds;
+    var rec = table && typeof fd === 'number' ? table[fd] : undefined;
+    if (rec === undefined || rec.write === undefined) {
+      var err = new Error('EBADF: bad file descriptor, write');
+      err.errno = -9;
+      err.code = 'EBADF';
+      err.syscall = 'write';
+      if (done) queueMicrotask(function () { done(err); });
+      else throw err;
+      return;
+    }
+    var bytes = ArrayBuffer.isView(buffer) ? Buf.from(buffer.buffer, buffer.byteOffset, buffer.byteLength) : Buf.from(String(buffer));
+    var from = Number(offset) > 0 ? Number(offset) : 0;
+    var text = bytes.slice(from).toString('utf8');
+    var written = rec.write(text);
+    if (done) queueMicrotask(function () { done(null, written); });
+  };
   return fs;
 };
 

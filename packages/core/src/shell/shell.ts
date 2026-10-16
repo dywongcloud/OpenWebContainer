@@ -10,6 +10,8 @@ interface ShellOptions {
     oscMode?: boolean;
     process: Process;
     env?: Map<string, string>;
+    /** The directory the shell starts in: the cwd of the process it runs in. */
+    cwd?: string;
 }
 
 
@@ -26,7 +28,7 @@ export class Shell implements IShell {
 
     constructor(fileSystem: IFileSystem, options: ShellOptions) {
         this.fileSystem = fileSystem;
-        this.currentDirectory = '/';
+        this.currentDirectory = options.cwd || '/';
         this.env = options.env || new Map([
             ['PATH', '/bin:/usr/bin'],
             ['HOME', '/home'],

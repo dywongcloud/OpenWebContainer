@@ -3,8 +3,8 @@ import type { AckRange } from './frames';
 /*
  * Loss detection and probe timeouts (RFC 9002 Sections 5, 6 and Appendix A), per packet number
  * space: RTT estimation, packet and time threshold loss detection, and the PTO timer with
- * exponential backoff. There is no congestion controller (RFC 9002 Section 7); the connection
- * only caps bytes in flight at the initial window.
+ * exponential backoff; plus the NewReno congestion controller (RFC 9002 Section 7) -- slow start,
+ * the recovery period, persistent congestion (Section 7.6) -- and a pacer (Section 7.7).
  */
 
 export type SpaceId = 'initial' | 'handshake' | 'application';
@@ -15,6 +15,25 @@ export const INITIAL_RTT = 333;
 export const GRANULARITY = 1;
 const PACKET_THRESHOLD = 3n;
 const TIME_THRESHOLD = 9 / 8;
+
+/** RFC 9002 Section 7: congestion window constants, in bytes. max_datagram_size is 1200 (connection.ts). */
+export const MAX_DATAGRAM_SIZE_FOR_CWND = 1200;
+/** RFC 9002 Section 7.2: ten times the maximum datagram size, capped at 14720 (RFC 6928); the cap does not bind. */
+export const INITIAL_WINDOW = 10 * MAX_DATAGRAM_SIZE_FOR_CWND;
+/** RFC 9002 Section 7.2: two times the maximum datagram size. */
+export const MINIMUM_WINDOW = 2 * MAX_DATAGRAM_SIZE_FOR_CWND;
+/** RFC 9002 Section 7.3.2: the slow start threshold is half the window on entering recovery. */
+const LOSS_REDUCTION_FACTOR = 0.5;
+/** RFC 9002 Section 7.6.1: persistent congestion spans three PTO periods. */
+const PERSISTENT_CONGESTION_THRESHOLD = 3;
+/** RFC 9002 Section 7.7: "a value for N that is small, but at least 1 (for example, 1.25)". */
+const PACING_N = 1.25;
+/**
+ * Floor on the gap the pacer puts between two datagrams, milliseconds. Pacing stops smoothing and
+ * becomes a throughput ceiling once the RTT is large enough that N * cwnd / srtt drops below
+ * max_datagram_size / this gap; the floor keeps a slow path from stalling a transfer outright.
+ */
+const MAX_PACING_INTERVAL = 10;
 
 export interface SentPacket<F> {
     readonly pn: bigint;
@@ -68,6 +87,14 @@ export class Recovery<F> {
     maxAckDelay = 25;
     ptoCount = 0;
     bytesInFlight = 0;
+    /** RFC 9002 Section 7.2: the congestion window, in bytes. */
+    congestionWindow = INITIAL_WINDOW;
+    /** The slow start threshold, in bytes; Infinity means "no threshold yet" (slow start). */
+    slowStartThreshold = Number.POSITIVE_INFINITY;
+    /** When the current recovery period started, or null outside one (RFC 9002 Section 7.3.2). */
+    recoveryStartTime: number | null = null;
+    /** Time the pacer allows the next datagram out (RFC 9002 Section 7.7). */
+    private nextSendTime = 0;
     private readonly spaces: Record<SpaceId, SpaceState<F>> = {
         initial: Recovery.emptySpace<F>(),
         handshake: Recovery.emptySpace<F>(),
@@ -126,6 +153,7 @@ export class Recovery<F> {
         if (largestNewlyAcked !== null && acked.some((packet) => packet.ackEliciting)) {
             this.updateRtt(now - largestNewlyAcked.timeSent, space === 'application' && handshakeConfirmed ? ackDelay : 0);
         }
+        for (const packet of acked) this.onPacketAcked(packet);
         const lost = this.detectLost(space, now);
         this.ptoCount = 0;
         return { acked, lost, largestNewlyAcked };
@@ -167,7 +195,99 @@ export class Recovery<F> {
                 state.lossTime = state.lossTime === null ? when : Math.min(state.lossTime, when);
             }
         }
+        // RFC 9002 A.7 / A.8: declaring packets lost is a congestion event (Section 7.3.2, 7.6).
+        this.congestionEvent(lost, now);
         return lost;
+    }
+
+    // ------------------------------------------------------------------ congestion control (RFC 9002 Section 7)
+
+    /** The congestion window, in bytes (RFC 9002 Section 7.2). */
+    get cwnd(): number {
+        return this.congestionWindow;
+    }
+
+    /** The slow start threshold, in bytes (RFC 9002 Section 7.3.1). */
+    get ssthresh(): number {
+        return this.slowStartThreshold;
+    }
+
+    /** Whether a packet sent at time falls inside the current recovery period (RFC 9002 Section 7.3.2). */
+    private inCongestionRecovery(time: number): boolean {
+        return this.recoveryStartTime !== null && time <= this.recoveryStartTime;
+    }
+
+    /** RFC 9002 Section 7.4: whether the congestion window still admits more bytes in flight. */
+    canSend(): boolean {
+        return this.bytesInFlight < this.congestionWindow;
+    }
+
+    /** RFC 9002 A.13 OnPacketAcked: grow the window, and end the recovery period once it is over. */
+    private onPacketAcked(packet: SentPacket<F>): void {
+        if (!packet.inFlight) return;
+        if (this.recoveryStartTime !== null && packet.timeSent > this.recoveryStartTime) this.recoveryStartTime = null;
+        if (this.inCongestionRecovery(packet.timeSent)) return;
+        if (this.congestionWindow < this.slowStartThreshold) {
+            // Slow start (Section 7.3.1).
+            this.congestionWindow += packet.size;
+        } else {
+            // Congestion avoidance (Section 7.3.1): one maximum datagram per window.
+            this.congestionWindow += (MAX_DATAGRAM_SIZE_FOR_CWND * packet.size) / this.congestionWindow;
+        }
+    }
+
+    /** RFC 9002 A.11 InPersistentCongestion: two losses a persistent congestion period apart. */
+    private inPersistentCongestion(lost: readonly SentPacket<F>[]): boolean {
+        if (!this.hasRttSample || lost.length < 2) return false;
+        const oldest = lost[0];
+        const newest = lost[lost.length - 1];
+        if (!oldest.ackEliciting || !newest.ackEliciting) return false;
+        const period = (this.smoothedRtt + Math.max(4 * this.rttVar, GRANULARITY) + this.maxAckDelay) * PERSISTENT_CONGESTION_THRESHOLD;
+        return newest.timeSent - oldest.timeSent > period;
+    }
+
+    /** RFC 9002 A.12 CongestionEvent, plus Section 7.6 on persistent congestion. */
+    private congestionEvent(lost: readonly SentPacket<F>[], now: number): void {
+        if (lost.length === 0) return;
+        let largestSent = lost[0].timeSent;
+        for (const packet of lost) if (packet.timeSent > largestSent) largestSent = packet.timeSent;
+        if (this.inPersistentCongestion(lost)) {
+            // Section 7.6.2: as after an RTO, drop to the minimum window.
+            this.recoveryStartTime = null;
+            this.congestionWindow = MINIMUM_WINDOW;
+            this.slowStartThreshold = MINIMUM_WINDOW;
+            return;
+        }
+        if (this.inCongestionRecovery(largestSent)) return;
+        this.recoveryStartTime = now;
+        this.slowStartThreshold = Math.floor(this.congestionWindow * LOSS_REDUCTION_FACTOR);
+        this.congestionWindow = Math.max(this.slowStartThreshold, MINIMUM_WINDOW);
+    }
+
+    // ------------------------------------------------------------------ pacing (RFC 9002 Section 7.7)
+
+    /** The pacing rate in bytes per millisecond: N * congestion_window / smoothed_rtt. */
+    pacingRate(): number {
+        const rtt = Math.max(this.smoothedRtt, 1);
+        return (PACING_N * this.congestionWindow) / rtt;
+    }
+
+    /** Milliseconds to wait before the next datagram may go out; 0 when it may go now. */
+    pacingDelay(now: number): number {
+        return this.nextSendTime <= now ? 0 : this.nextSendTime - now;
+    }
+
+    /** When pacingDelay is non-zero, the time to wake on. */
+    pacingDeadline(): number {
+        return this.nextSendTime;
+    }
+
+    /** Charges the pacer for one datagram: interval = size / rate, floored at MAX_PACING_INTERVAL. */
+    onPacedSend(size: number, now: number): void {
+        const interval = Math.min(size / Math.max(1, this.pacingRate()), MAX_PACING_INTERVAL);
+        // An idle sender does not build up credit: restart the clock when the debt is old.
+        if (this.nextSendTime < now) this.nextSendTime = now;
+        this.nextSendTime += interval;
     }
 
     /** The PTO period without backoff (RFC 9002 Section 6.2.1); max_ack_delay applies to Application Data only. */
