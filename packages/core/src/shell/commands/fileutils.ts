@@ -852,6 +852,8 @@ const find: ShellCommand = (ctx) => {
         node = { kind: 'and', left: node, right: { kind: 'pred', predicate: { kind: 'print', terminator: '\n' } } };
     }
 
+    if (parsed.deletes) return findDelete(ctx, roots, parsed, node);
+
     let stdout = '';
     let stderr = '';
     let exitCode = 0;
@@ -885,6 +887,91 @@ const find: ShellCommand = (ctx) => {
     return result(stdout, stderr, exitCode);
 };
 
+/** What one evaluation of the expression records for the run that asked for it. */
+interface EvalEnv {
+    /**
+     * True while `find` is only deciding what `-delete` and `-exec` would do. Nothing is unlinked
+     * and nothing is run: `-delete` records the entry and `-exec` records the invocation.
+     */
+    dryRun: boolean;
+    /** The entries `-delete` matched. */
+    toDelete: Entry[];
+    /** The `-exec ... ;` invocations the walk reached, in walk order. */
+    toExec: { words: string[]; shown: string }[];
+}
+
+interface DeletePlan {
+    toDelete: Entry[];
+    toExec: { words: string[]; shown: string }[];
+    batch: ExecBatchItem[];
+    stdout: string;
+}
+
+/**
+ * A `-delete` run, in two passes over every root.
+ *
+ * The decision to refuse is taken before anything is unlinked. The first pass walks each root and
+ * evaluates the expression with `dryRun`, which records what `-delete` and `-exec` would act on and
+ * unlinks nothing; the second removes those entries only when not one of them is a protected path.
+ * `find / -delete` therefore prints its one refusal and leaves the file system exactly as it found
+ * it, where it used to refuse the root and then empty it an entry at a time.
+ */
+function findDelete(ctx: CommandContext, roots: string[], parsed: ParsedFind, node: Node): CommandResult {
+    const plans: DeletePlan[] = [];
+    let stderr = '';
+    let exitCode = 0;
+    for (const root of roots) {
+        const path = resolveAt(ctx, root);
+        const shown = root.replace(/\/+$/, '') === '' ? '/' : root.replace(/\/+$/, '');
+        const walked = walkBottomUp(ctx.fs, path, shown);
+        if (walked.missing) {
+            stderr += `find: ${root}: No such file or directory\n`;
+            exitCode = 1;
+            continue;
+        }
+        const env: EvalEnv = { dryRun: true, toDelete: [], toExec: [] };
+        const batch: ExecBatchItem[] = [];
+        let stdout = '';
+        for (const entry of walked.entries) {
+            if (entry.depth < parsed.minDepth) continue;
+            const outcome = evaluate(ctx, node, entry, batch, env);
+            if (outcome.stderr !== '') stderr += outcome.stderr;
+            stdout += outcome.stdout;
+            if (outcome.exitCode !== 0) exitCode = outcome.exitCode;
+        }
+        plans.push({ toDelete: env.toDelete, toExec: env.toExec, batch, stdout });
+    }
+    for (const plan of plans) {
+        for (const entry of plan.toDelete) {
+            if (isProtected(entry.path, ctx.env)) {
+                return result('', `find: refusing to delete ${entry.shown}: it is the file system root\n`, 1);
+            }
+        }
+    }
+    let stdout = '';
+    for (const plan of plans) {
+        stdout += plan.stdout;
+        for (const entry of plan.toDelete) {
+            const outcome = deleteEntry(ctx, entry, { dryRun: false, toDelete: [], toExec: [] });
+            if (outcome.stderr !== '') stderr += outcome.stderr;
+            if (outcome.exitCode !== 0) exitCode = outcome.exitCode;
+        }
+        for (const item of plan.toExec) {
+            const run = execOnce(ctx, item.words, item.shown);
+            stdout += run.stdout;
+            if (run.stderr !== '') stderr += run.stderr;
+            if (run.exitCode !== 0) exitCode = run.exitCode;
+        }
+        if (plan.batch.length > 0) {
+            const run = execBatch(ctx, plan.batch);
+            stdout += run.stdout;
+            if (run.stderr !== '') stderr += run.stderr;
+            if (run.exitCode !== 0) exitCode = run.exitCode;
+        }
+    }
+    return result(stdout, stderr, exitCode);
+}
+
 interface EvalOutcome {
     stdout: string;
     stderr: string;
@@ -892,17 +979,23 @@ interface EvalOutcome {
     truth: boolean;
 }
 
-function evaluate(ctx: CommandContext, node: Node, entry: Entry, batch: ExecBatchItem[]): EvalOutcome {
+function evaluate(
+    ctx: CommandContext,
+    node: Node,
+    entry: Entry,
+    batch: ExecBatchItem[],
+    env: EvalEnv = { dryRun: false, toDelete: [], toExec: [] }
+): EvalOutcome {
     const none: EvalOutcome = { stdout: '', stderr: '', exitCode: 0, truth: false };
     switch (node.kind) {
         case 'not': {
-            const inner = evaluate(ctx, node.child, entry, batch);
+            const inner = evaluate(ctx, node.child, entry, batch, env);
             return { ...inner, truth: !inner.truth };
         }
         case 'and': {
-            const left = evaluate(ctx, node.left, entry, batch);
+            const left = evaluate(ctx, node.left, entry, batch, env);
             if (!left.truth) return left;
-            const right = evaluate(ctx, node.right, entry, batch);
+            const right = evaluate(ctx, node.right, entry, batch, env);
             return {
                 stdout: left.stdout + right.stdout,
                 stderr: left.stderr + right.stderr,
@@ -911,9 +1004,9 @@ function evaluate(ctx: CommandContext, node: Node, entry: Entry, batch: ExecBatc
             };
         }
         case 'or': {
-            const left = evaluate(ctx, node.left, entry, batch);
+            const left = evaluate(ctx, node.left, entry, batch, env);
             if (left.truth) return left;
-            const right = evaluate(ctx, node.right, entry, batch);
+            const right = evaluate(ctx, node.right, entry, batch, env);
             return {
                 stdout: left.stdout + right.stdout,
                 stderr: left.stderr + right.stderr,
@@ -922,11 +1015,17 @@ function evaluate(ctx: CommandContext, node: Node, entry: Entry, batch: ExecBatc
             };
         }
         case 'pred':
-            return evaluatePredicate(ctx, node.predicate, entry, batch);
+            return evaluatePredicate(ctx, node.predicate, entry, batch, env);
     }
 }
 
-function evaluatePredicate(ctx: CommandContext, predicate: Predicate, entry: Entry, batch: ExecBatchItem[]): EvalOutcome {
+function evaluatePredicate(
+    ctx: CommandContext,
+    predicate: Predicate,
+    entry: Entry,
+    batch: ExecBatchItem[],
+    env: EvalEnv
+): EvalOutcome {
     const base: EvalOutcome = { stdout: '', stderr: '', exitCode: 0, truth: true };
     switch (predicate.kind) {
         case 'option':
@@ -960,7 +1059,7 @@ function evaluatePredicate(ctx: CommandContext, predicate: Predicate, entry: Ent
         case 'print':
             return { stdout: entry.shown + predicate.terminator, stderr: '', exitCode: 0, truth: true };
         case 'delete':
-            return deleteEntry(ctx, entry);
+            return deleteEntry(ctx, entry, env);
         case 'exec': {
             // `+` collects every match into one invocation, `;` runs one invocation per match
             if (predicate.batched) {
@@ -968,12 +1067,22 @@ function evaluatePredicate(ctx: CommandContext, predicate: Predicate, entry: Ent
                 return base;
             }
             const substituted = predicate.words.map((word) => word.split('{}').join(entry.shown));
+            // A dry run records the invocation for the second pass instead of running it here
+            if (env.dryRun) {
+                env.toExec.push({ words: substituted, shown: entry.shown });
+                return base;
+            }
             return execOnce(ctx, substituted, entry.shown);
         }
     }
 }
 
-function deleteEntry(ctx: CommandContext, entry: Entry): EvalOutcome {
+function deleteEntry(ctx: CommandContext, entry: Entry, env: EvalEnv): EvalOutcome {
+    if (env.dryRun) {
+        // Recorded, not removed: the run decides whether to refuse before the first unlink.
+        env.toDelete.push(entry);
+        return { stdout: '', stderr: '', exitCode: 0, truth: true };
+    }
     if (isProtected(entry.path, ctx.env)) {
         return {
             stdout: '',
@@ -1657,6 +1766,12 @@ function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcom
 
         // unary
         if (isOption(word)) {
+            // A unary operator with no operand behind it is the one-argument form: `test -z ""`
+            // reaches here as a bare `-z`, because the shell's field splitting drops an empty word,
+            // and the host answers the one-argument form (true, because `-z` is not the empty
+            // string). Consuming an operand that is not there is what made `test -z ""` a usage
+            // error about an operator called `undefined`.
+            if (args[index + 1] === undefined) return { value: word !== '', next: index + 1 };
             let value: boolean;
             switch (word) {
                 case '-b':
@@ -3359,8 +3474,14 @@ function makeLink(
     }
     try {
         if (symbolic) {
-            // the file system has no symlink inode, so the node is an empty file with a recorded target
-            ctx.fs.writeFile(linkPath, '');
+            // The file system has no symlink inode, so the node is a file holding what its target
+            // holds, plus a recorded target for `stat`, `find -type l` and the archivers. Writing an
+            // empty file was the old answer and it satisfied nobody: `cat lnk` printed nothing and
+            // `ln -s` still reported success. A dangling target leaves the node empty, which is what
+            // a dangling link is.
+            const targetPath = resolveAt(ctx, target);
+            const content = readFileOrNone(ctx.fs, targetPath);
+            ctx.fs.writeFile(linkPath, content ?? '');
             metaOf(ctx.fs).links.set(clean(linkPath), target);
         } else {
             const targetPath = resolveAt(ctx, target);
@@ -3445,7 +3566,9 @@ const chown: ShellCommand = (ctx) => {
             setOwner(ctx.fs, target, { uid: uid ?? owner.uid, gid: gid ?? owner.gid });
         }
     }
-    return ok();
+    // Honest: the file system carries the owner this set, and nothing reads it back. Saying so is
+    // the whole difference between this and a silent no-op.
+    return result('', `chown: ownership is not enforced in this container: ${operands.slice(1).join(', ')} still belongs to root\n`, 0);
 };
 
 const CHMOD_USAGE =
@@ -3467,6 +3590,7 @@ const chmod: ShellCommand = (ctx) => {
     if (operands.length < 2) return fail(CHMOD_USAGE);
     const spec = operands[0];
 
+    const unreadable: string[] = [];
     for (const file of operands.slice(1)) {
         const path = resolveAt(ctx, file);
         const stat = statOf(ctx.fs, path);
@@ -3478,6 +3602,14 @@ const chmod: ShellCommand = (ctx) => {
             for (const entry of walkRoot(ctx.fs, path, path, Number.MAX_SAFE_INTEGER).entries) targets.push(entry.path);
         }
         for (const target of targets) setMode(ctx.fs, target, parsed);
+        // The mode this set is recorded, and nothing enforces it: the container has no permission
+        // model, so every read still succeeds. A mode that takes the owner's read bit away is the
+        // one a caller can see not being honoured, and saying so is what keeps `chmod 000 a.txt`
+        // from being a silent success.
+        if ((parsed & 0o400) === 0) unreadable.push(file);
+    }
+    if (unreadable.length > 0) {
+        return result('', `chmod: ${unreadable.join(', ')}: permissions are not enforced in this container; the file is still readable\n`, 0);
     }
     return ok();
 };

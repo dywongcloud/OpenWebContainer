@@ -24,6 +24,7 @@
 
 import type { ShellCommand, CommandContext, CommandResult } from './types';
 import { atPath, inputText } from './types';
+import { runWithRunner } from './builtins';
 
 /* ================================================================== *
  * 1. Process host
@@ -58,11 +59,21 @@ function hostOr(): ProcessHost | null {
 }
 
 function noHost(name: string): CommandResult {
-    return {
-        stdout: '',
-        stderr: `${name}: no process host is installed (call setProcessHost)\n`,
-        exitCode: 1
-    };
+    return fail(`${name}: no process host is installed (call setProcessHost)`, 1);
+}
+
+/**
+ * Runs the utility one of the four wrappers was given, or null when nothing can run it.
+ *
+ * The process host is asked first. A host that only lists processes has no `run` (`container.ts`
+ * installs none), so the wrapper falls back to the runner the shell installed through
+ * `builtins.ts`: those four exist to run something, and reporting that they cannot is what made
+ * `nice echo hi` print nothing and exit 127.
+ */
+function runCommand(ctx: CommandContext, words: string[]): CommandResult | null {
+    const h = hostOr();
+    if (h?.run) return h.run(words, ctx.input);
+    return runWithRunner(ctx, words, ctx.input ?? null);
 }
 
 /* ================================================================== *
@@ -695,11 +706,12 @@ const kill: ShellCommand = (ctx) => {
     for (const word of pids) {
         if (!/^\d+$/.test(word)) return fail(`kill: illegal process id: ${word}`, 2);
         const pid = Number(word);
+        // The host names the pid the way a shell's own `kill` does: `kill: (999999) - No such process`.
         if (signal === '0') {
-            if (!exists(pid)) { errors.push(`kill: ${pid}: No such process`); status = 1; }
+            if (!exists(pid)) { errors.push(`kill: (${pid}) - No such process`); status = 1; }
             continue;
         }
-        if (!h.signal(pid, signal)) { errors.push(`kill: ${pid}: No such process`); status = 1; }
+        if (!h.signal(pid, signal)) { errors.push(`kill: (${pid}) - No such process`); status = 1; }
     }
     return { stdout: '', stderr: errors.length ? errors.join('\n') + '\n' : '', exitCode: status };
 };
@@ -912,17 +924,14 @@ const nice: ShellCommand = (ctx) => {
     }
     const words = args.slice(i);
     if (words.length === 0) return fail(NICE_USAGE, 1);
+    const result = runCommand(ctx, words);
+    if (result === null) return noRunner('nice', words[0]);
     if (increment !== null && increment < 0) {
         // Lowering the priority needs privilege the container's single user does not have; the host
         // prints this and runs the utility anyway.
-        const h = hostOr();
-        const result = h?.run ? h.run(words, ctx.input) : null;
-        if (!result) return noRunner('nice', words[0]);
         return { ...result, stderr: 'nice: setpriority: Permission denied\n' + result.stderr };
     }
-    const h = hostOr();
-    if (!h?.run) return noRunner('nice', words[0]);
-    return h.run(words, ctx.input);
+    return result;
 };
 
 const NOHUP_USAGE = 'usage: nohup [--] utility [arguments]';
@@ -937,10 +946,10 @@ const nohup: ShellCommand = (ctx) => {
     }
     const words = args.slice(i);
     if (words.length === 0) return fail(NOHUP_USAGE, 127);
-    const h = hostOr();
-    if (!h?.run) return noRunner('nohup', words[0]);
+    const result = runCommand(ctx, words);
+    if (result === null) return noRunner('nohup', words[0]);
     // Output already goes to the shell's stdout, not a terminal, so nohup.out is never needed.
-    return h.run(words, ctx.input);
+    return result;
 };
 
 function bashTime(realMs: number): string {
@@ -966,13 +975,14 @@ const time: ShellCommand = (ctx) => {
     const words = args.slice(i);
     const h = hostOr();
     if (words.length === 0) return fail(TIME_USAGE, 2);
-    if (!h) {
-        // Shape only: real/user/sys, as the shell prints them. No host means nothing was run.
+    const clock = (): number => (h ? h.now() : Date.now());
+    const start = clock();
+    const result = runCommand(ctx, words);
+    if (result === null) {
+        // Shape only: real/user/sys, as the shell prints them. Nothing ran.
         return { stdout: '', stderr: posix ? posixTime(0) : bashTime(0), exitCode: 0 };
     }
-    const start = h.now();
-    const result = h.run ? h.run(words, ctx.input) : { stdout: '', stderr: '', exitCode: 0 };
-    const elapsed = Math.max(0, h.now() - start);
+    const elapsed = Math.max(0, clock() - start);
     return {
         stdout: result.stdout,
         stderr: (posix ? posixTime(elapsed) : bashTime(elapsed)) + result.stderr,
@@ -1026,10 +1036,9 @@ const watch: ShellCommand = (ctx) => {
     }
     const words = args.slice(i);
     if (words.length === 0) return fail(WATCH_USAGE.trimStart(), 1);
-    const h = hostOr();
-    if (!h?.run) return fail(`watch: ${words[0]}: cannot run a command: no runner is installed on the process host`, 1);
+    const result = runCommand(ctx, words);
+    if (result === null) return fail(`watch: ${words[0]}: cannot run a command: no runner is installed on the process host`, 1);
     // No terminal: there is nowhere to redraw to, so watch runs the command once and exits with it.
-    const result = h.run(words, ctx.input);
     const header = `Every ${interval.toFixed(1)}s: ${words.join(' ')}\n`;
     const body = result.stdout ? '\n' + result.stdout : '';
     return { stdout: title ? header + body : result.stdout, stderr: result.stderr, exitCode: result.exitCode };

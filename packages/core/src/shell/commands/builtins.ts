@@ -1956,11 +1956,46 @@ let RUNNER: SimpleCommandRunner = (_state, words) => ({
 /** Installs the callback `runScript` runs every simple command through. */
 export function setRunner(runner: SimpleCommandRunner): void {
     RUNNER = runner;
+    HAS_RUNNER = true;
 }
 
 /** The installed runner, so a host can chain to it. */
 export function getRunner(): SimpleCommandRunner {
     return RUNNER;
+}
+
+/** Set once a host has installed a runner; the default one only ever reports 127. */
+let HAS_RUNNER = false;
+
+/** True when a host has installed a runner with `setRunner`. */
+export function hasRunner(): boolean {
+    return HAS_RUNNER;
+}
+
+/**
+ * Runs one command through the installed runner, for a utility that is not itself a builtin.
+ *
+ * `nice`, `nohup`, `time` and `watch` in `procinfo.ts` exist to run something. They ask the process
+ * host first, and a host that only lists processes has no `run`, so they would otherwise report
+ * that they cannot run a command. The runner this falls back to is the shell's own dispatcher: it
+ * reads `state.host`, casts it to its own shell and dispatches the words through it, so the state
+ * it is handed carries the smallest object that answers every field that dispatch reads from a
+ * shell -- its file system, its directory, its environment, its input and its last status.
+ *
+ * Null when no host has installed a runner, which is the one case the caller must report itself.
+ */
+export function runWithRunner(ctx: CommandContext, words: string[], input: string | null): CommandResult | null {
+    if (!HAS_RUNNER) return null;
+    const shell = {
+        ctx: { fileSystem: ctx.fs },
+        cwd: ctx.cwd ?? '/',
+        env: ctx.env ?? {},
+        input: input ?? null,
+        lastStatus: 0
+    };
+    const state = createShellState(shell.env, shell.cwd, ctx.fs as unknown as ShellFs);
+    state.host = shell;
+    return RUNNER(state, words, input ?? null);
 }
 
 let ACTIVE: ShellState | null = null;

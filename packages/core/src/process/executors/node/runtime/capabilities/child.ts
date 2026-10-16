@@ -15,6 +15,7 @@ import {
     COMMANDS as SHELL_BUILTIN_UTILS,
     createShellState,
     evalArith,
+    runScript,
     setActiveState,
     setRunner
 } from '../../../../../shell/commands/builtins';
@@ -580,10 +581,10 @@ function shellModuleCommand(shell: SyncShell, command: string, args: string[]): 
     if (handler === undefined) return null;
     try {
         const result: CommandResult = handler(moduleContext(shell, args));
-        return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+        return { stdout: result.stdout, stderr: diagnostic(result.stderr), exitCode: result.exitCode };
     } catch (error) {
         if (isNotSupported(error)) throw error;
-        return { stdout: '', stderr: error instanceof Error ? error.message : String(error), exitCode: 1 };
+        return { stdout: '', stderr: diagnostic(error instanceof Error ? error.message : String(error)), exitCode: 1 };
     }
 }
 
@@ -653,7 +654,10 @@ function nodeRun(
 }
 
 function shellPath(shell: SyncShell, path: string): string {
-    return path.startsWith('/') ? path : `${shell.cwd}/${path}`.replace(/\/+/g, '/');
+    const joined = path.startsWith('/') ? path : `${shell.cwd}/${path}`.replace(/\/+/g, '/');
+    // `cd ./sub` leaves the shell in `/work/sub`, not in `/work/./sub`
+    const parts = joined.split('/').filter((part) => part !== '' && part !== '.');
+    return '/' + parts.join('/');
 }
 
 /** A node command inside the shell: its status and output become the shell command's. */
@@ -668,7 +672,7 @@ function shellBuiltin(shell: SyncShell, command: string, args: string[]): ShellS
     const fs = shell.ctx.fileSystem;
     const at = (path: string) => shellPath(shell, path);
     const ok = (stdout = ''): ShellStep => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr: string): ShellStep => ({ stdout: '', stderr, exitCode: 1 });
+    const fail = (stderr: string): ShellStep => ({ stdout: '', stderr: diagnostic(stderr), exitCode: 1 });
     try {
         switch (command) {
             case 'echo':
@@ -680,8 +684,20 @@ function shellBuiltin(shell: SyncShell, command: string, args: string[]): ShellS
             case 'cat': {
                 // no argument reads the child's input (Shell says 'No file specified'; Node reads stdin)
                 if (args.length === 0) return ok(shell.input ?? '');
-                const content = fs.readFile(at(args[0]));
-                return content === undefined ? fail(`File not found: ${args[0]}`) : ok(content);
+                let joined = '';
+                let missing: string | null = null;
+                for (const name of args) {
+                    let content: string | undefined;
+                    try {
+                        content = fs.readFile(at(name));
+                    } catch {
+                        content = undefined;
+                    }
+                    if (content === undefined) missing ??= name;
+                    else joined += content;
+                }
+                // as cat has it: the files it could read are written, the status is the failure
+                return missing === null ? ok(joined) : { stdout: joined, stderr: diagnostic(`File not found: ${missing}`), exitCode: 1 };
             }
             case 'pwd':
                 return ok(shell.cwd + '\n');
@@ -740,7 +756,7 @@ function shellBuiltinWithRedirects(shell: SyncShell, command: string, args: stri
     const redirects: { type: '>' | '>>'; file: string }[] = [];
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '>' || args[i] === '>>') {
-            if (i + 1 >= args.length) return { stdout: '', stderr: `Syntax error: missing file for redirection ${args[i]}`, exitCode: 1 };
+            if (i + 1 >= args.length) return { stdout: '', stderr: `Syntax error: missing file for redirection ${args[i]}`, exitCode: 2 };
             redirects.push({ type: args[i] as '>' | '>>', file: args[i + 1] });
             i++;
         } else {
@@ -799,7 +815,8 @@ function splitCommandList(line: string): ShellSegment[] {
             }
             text += line.slice(i, Math.min(end + 1, line.length));
             i = end + 1;
-        } else if (ch === ';') {
+        } else if (ch === ';' || ch === '\n') {
+            // a newline separates commands as `;` does, which is what makes a comment end there
             push();
             op = ';';
             i++;
@@ -823,6 +840,128 @@ function splitCommandList(line: string): ShellSegment[] {
     }
     push();
     return segments;
+}
+
+/**
+ * `#` starts a comment where it begins a word: everything from there to the end of the line is
+ * dropped, the operators in it included, so `echo a # b; c` runs one command. Inside quotes, and
+ * after a backslash, it is an ordinary character.
+ */
+function stripComment(line: string): string {
+    let text = line;
+    let atWordStart = true;
+    let i = 0;
+    while (i < text.length) {
+        const ch = text[i];
+        if (ch === '\\') {
+            i += 2;
+            atWordStart = false;
+            continue;
+        }
+        if (ch === "'" || ch === '"') {
+            const close = findQuoteClose(text, i, ch);
+            const stop = close === -1 ? text.length : close + 1;
+            i = stop;
+            atWordStart = false;
+            continue;
+        }
+        // a comment ends at the next newline, not at the end of the line: `a # c` + newline + `b`
+        if (ch === '#' && atWordStart) {
+            const nl = text.indexOf('\n', i);
+            text = nl === -1 ? text.slice(0, i) : text.slice(0, i) + text.slice(nl);
+            continue;
+        }
+        const span = constructSpan(text, i);
+        if (span !== -1) {
+            i = span;
+            atWordStart = false;
+            continue;
+        }
+        atWordStart = ch === ' ' || ch === '\t' || ch === '\n' || ch === ';' || ch === '|' || ch === '&' || ch === '(' || ch === ')';
+        i++;
+    }
+    return text;
+}
+
+/** The index of the `quote` closing the one at `start`, or -1 when the line ends first. */
+function findQuoteClose(text: string, start: number, quote: string): number {
+    let i = start + 1;
+    while (i < text.length) {
+        const ch = text[i];
+        if (quote === '"' && ch === '\\') {
+            i += 2;
+            continue;
+        }
+        if (ch === quote) return i;
+        i++;
+    }
+    return -1;
+}
+
+/**
+ * A line the shell cannot even parse: a quote, a `$( `, a `${ ` or a backquote that is never closed
+ * anywhere on it. `tokenizeLine` would quietly close all four at the end of the line and print the
+ * text; the host reports a syntax error and exits 2, which is what this returns.
+ */
+function syntaxErrorOf(line: string): string | null {
+    let i = 0;
+    while (i < line.length) {
+        const ch = line[i];
+        if (ch === '\\') {
+            i += 2;
+            continue;
+        }
+        if (ch === "'" || ch === '"') {
+            const close = findQuoteClose(line, i, ch);
+            if (close === -1) return `Syntax error: unexpected EOF while looking for matching ${ch === "'" ? "`''" : "`\"'"}`;
+            i = close + 1;
+            continue;
+        }
+        if (ch === '`') {
+            const end = findBacktick(line, i + 1);
+            if (end === -1) return 'Syntax error: unexpected EOF while looking for matching `` ` ``';
+            i = end + 1;
+            continue;
+        }
+        if (ch === '$' && line[i + 1] === '(') {
+            const arithmetic = line[i + 2] === '(';
+            const end = arithmetic ? matchArithmetic(line, i + 2) : matchParen(line, i + 1);
+            if (end === -1) return 'Syntax error: unexpected EOF while looking for matching `)\'';
+            i = end + 1;
+            continue;
+        }
+        if (ch === '$' && line[i + 1] === '{') {
+            const end = matchBrace(line, i + 1);
+            if (end === -1) return 'Syntax error: unexpected EOF while looking for matching `}\'';
+            i = end + 1;
+            continue;
+        }
+        i++;
+    }
+    return null;
+}
+
+/**
+ * The words a line has to be handed to the script engine of `builtins.ts` for: the reserved words
+ * that open a compound command (`if`, `for`, `while`, `until`, `case`, `{ }`, `( )`) and a function
+ * definition. Only the *first* word of a segment is looked at, so `echo {` and `find . -name "*.txt"`
+ * keep going through this dispatcher: there, `{` is an argument and the parser would expand the glob.
+ */
+const COMPOUND_KEYWORDS = new Set(['if', 'for', 'while', 'until', 'case', 'select']);
+/** `g()`, `f(){ ... }` and the same written with no space: a function definition. */
+const FUNCTION_DEFINITION = /^[A-Za-z_][A-Za-z0-9_]*\(\)/;
+const NAME_WORD = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function startsCompound(segment: ShellSegment): boolean {
+    const words = segment.words;
+    if (words.length === 0) return false;
+    const first = rawText(words[0]);
+    if (COMPOUND_KEYWORDS.has(first)) return true;
+    // `(echo hi)` and `{ echo a; }` are written with the brace or the parenthesis against the command
+    if (/^[({]/.test(first)) return true;
+    if (FUNCTION_DEFINITION.test(first)) return true;
+    // `g () { ... }`: the name, then the parenthesis as a word of its own (`g ()` gives `()`)
+    return NAME_WORD.test(first) && words.length > 1 && /^\(/.test(rawText(words[1]));
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -951,10 +1090,18 @@ function rawIs(word: RawWord, text: string): boolean {
 interface ExpandAtom {
     text: string;
     split: boolean;
+    /** The text came out of an unquoted piece, so pathname expansion applies to it. */
+    glob: boolean;
     /** The field before this one ends here. */
     before?: boolean;
     /** This field ends here, even where the next piece would otherwise join it. */
     after?: boolean;
+}
+
+/** One field of a word after expansion, and whether pathname expansion may still rewrite it. */
+interface ExpandedField {
+    text: string;
+    glob: boolean;
 }
 
 /** Where one expansion reports an error (`${x:?}`) and the status of a command substitution. */
@@ -1023,15 +1170,18 @@ function parameterAtoms(shell: SyncShell, name: string, split: boolean, out: Exp
     const params = positionalOf(shell);
     if (!split && name === '@') {
         for (let i = 0; i < params.length; i++) {
-            out.push({ text: params[i], split: false, before: i > 0, after: i < params.length - 1 });
+            out.push({ text: params[i], split: false, glob: false, before: i > 0, after: i < params.length - 1 });
         }
         return;
     }
-    out.push({ text: params.join(' '), split });
+    out.push({ text: params.join(' '), split, glob: split });
 }
 
-/** `NAME=value` in the shell's own variables, and in the environment where it is already exported. */
-function assignVar(shell: SyncShell, name: string, value: string): void {
+/**
+ * `NAME=value` in the shell's own variables, and in the environment where it is already exported.
+ * Returns the error of assigning to a read-only variable, which ends the line as it ends a shell.
+ */
+function assignVar(shell: SyncShell, name: string, value: string): string | null {
     const state = shellStateFor(shell);
     let existing: ShellVar | undefined;
     for (let i = state.scopes.length - 1; i >= 0; i--) {
@@ -1041,10 +1191,11 @@ function assignVar(shell: SyncShell, name: string, value: string): void {
             break;
         }
     }
-    if (existing?.readonly === true) return;
+    if (existing?.readonly === true) return `${name}: readonly variable`;
     const exported = existing?.export === true || (existing === undefined && Object.prototype.hasOwnProperty.call(shell.env, name));
     state.scopes[0].set(name, exported ? { value, export: true } : { value });
     if (exported) shell.env[name] = value;
+    return null;
 }
 
 /** Runs a `$( )` or backquoted script in a shell of its own and strips the trailing newlines, as a shell does. */
@@ -1207,10 +1358,13 @@ function expandText(shell: SyncShell, text: string, ctx: ExpandCtx): string {
 /** Expands one piece of a word into atoms. `split` says whether the result is subject to field splitting. */
 function expandInto(shell: SyncShell, text: string, split: boolean, out: ExpandAtom[], ctx: ExpandCtx): void {
     let literal = '';
+    let literalGlob = false;
     const flushLiteral = (): void => {
         if (literal !== '') {
-            out.push({ text: literal, split });
+            // a glob character only counts where it was written unquoted: `\*` is an ordinary `*`
+            out.push({ text: literal, split, glob: split && literalGlob });
             literal = '';
+            literalGlob = false;
         }
     };
     let i = 0;
@@ -1237,11 +1391,12 @@ function expandInto(shell: SyncShell, text: string, split: boolean, out: ExpandA
             flushLiteral();
             const run = runSubstitution(shell, unescapeBacktick(text.slice(i + 1, end)));
             ctx.substStatus = run.status;
-            out.push({ text: run.text, split });
+            out.push({ text: run.text, split, glob: split });
             i = end + 1;
             continue;
         }
         if (ch !== '$') {
+            if (ch === '*' || ch === '?' || ch === '[') literalGlob = true;
             literal += ch;
             i++;
             continue;
@@ -1251,7 +1406,14 @@ function expandInto(shell: SyncShell, text: string, split: boolean, out: ExpandA
             const end = matchArithmetic(text, i + 2);
             if (end !== -1) {
                 flushLiteral();
-                out.push({ text: String(arithmeticValue(shell, text.slice(i + 3, end - 1))), split });
+                const value = arithmeticValue(shell, text.slice(i + 3, end - 1));
+                // `1/0`: an expansion error, which ends the line as it ends a shell
+                if (value.error !== null) {
+                    ctx.error = value.error;
+                    ctx.code = 127;
+                    return;
+                }
+                out.push({ text: value.text, split, glob: split });
                 i = end + 1;
                 continue;
             }
@@ -1262,7 +1424,7 @@ function expandInto(shell: SyncShell, text: string, split: boolean, out: ExpandA
                 flushLiteral();
                 const run = runSubstitution(shell, text.slice(i + 2, end));
                 ctx.substStatus = run.status;
-                out.push({ text: run.text, split });
+                out.push({ text: run.text, split, glob: split });
                 i = end + 1;
                 continue;
             }
@@ -1271,7 +1433,10 @@ function expandInto(shell: SyncShell, text: string, split: boolean, out: ExpandA
             const end = matchBrace(text, i + 1);
             if (end !== -1) {
                 flushLiteral();
+                const from = out.length;
                 paramExpansion(shell, text.slice(i + 2, end), split, out, ctx);
+                if (ctx.error !== null) return;
+                for (let k = from; k < out.length; k++) out[k].glob = split;
                 i = end + 1;
                 continue;
             }
@@ -1279,14 +1444,14 @@ function expandInto(shell: SyncShell, text: string, split: boolean, out: ExpandA
         const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(i + 1));
         if (name !== null) {
             flushLiteral();
-            out.push({ text: valueOfName(shell, name[0]), split });
+            out.push({ text: valueOfName(shell, name[0]), split, glob: split });
             i += 1 + name[0].length;
             continue;
         }
         if (next !== undefined && '0123456789#@*?$!-'.includes(next)) {
             flushLiteral();
             if (next === '@' || next === '*') parameterAtoms(shell, next, split, out);
-            else out.push({ text: valueOfName(shell, next), split });
+            else out.push({ text: valueOfName(shell, next), split, glob: split });
             i += 2;
             continue;
         }
@@ -1297,24 +1462,25 @@ function expandInto(shell: SyncShell, text: string, split: boolean, out: ExpandA
 }
 
 /** `$(( ))`. The expression is the module's own evaluator, so the operators are the ones it already has. */
-function arithmeticValue(shell: SyncShell, expression: string): number | string {
+function arithmeticValue(shell: SyncShell, expression: string): { text: string; error: string | null } {
     try {
-        return evalArith(shellStateFor(shell), expression);
-    } catch {
-        return '';
+        return { text: String(evalArith(shellStateFor(shell), expression)), error: null };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { text: '', error: `${expression}: ${message}` };
     }
 }
 
 /** One `${...}`: the operators POSIX has, plus `${x/p/r}` and `${x:o:l}`. */
 function paramExpansion(shell: SyncShell, body: string, split: boolean, out: ExpandAtom[], ctx: ExpandCtx): void {
     const literal = (): void => {
-        out.push({ text: '${' + body + '}', split: false });
+        out.push({ text: '${' + body + '}', split: false, glob: false });
     };
     if (body.startsWith('#') && body.length > 1) {
         const name = parameterName(body.slice(1));
         if (name === null) return literal();
         const length = name === '@' || name === '*' ? positionalOf(shell).length : valueOfName(shell, name).length;
-        out.push({ text: String(length), split });
+        out.push({ text: String(length), split, glob: split });
         return;
     }
     const name = parameterName(body);
@@ -1326,7 +1492,7 @@ function paramExpansion(shell: SyncShell, body: string, split: boolean, out: Exp
     const word = (text: string): string => expandText(shell, text, ctx);
     if (rest === '') {
         if (name === '@' || name === '*') parameterAtoms(shell, name, split, out);
-        else out.push({ text: valueOfName(shell, name), split });
+        else out.push({ text: valueOfName(shell, name), split, glob: split });
         return;
     }
     const substring = /^:(-?\d+)(?::(-?\d+))?$/.exec(rest);
@@ -1335,34 +1501,39 @@ function paramExpansion(shell: SyncShell, body: string, split: boolean, out: Exp
         const value = scalar().split('');
         const start = from < 0 ? Math.max(0, value.length + from) : from;
         const count = substring[2] === undefined ? undefined : Number(substring[2]);
-        out.push({ text: (count === undefined ? value.slice(start) : count < 0 ? value.slice(start, value.length + count) : value.slice(start, start + count)).join(''), split });
+        out.push({ text: (count === undefined ? value.slice(start) : count < 0 ? value.slice(start, value.length + count) : value.slice(start, start + count)).join(''), split, glob: split });
         return;
     }
     if (rest.startsWith(':-')) {
-        out.push({ text: empty ? word(rest.slice(2)) : scalar(), split });
+        out.push({ text: empty ? word(rest.slice(2)) : scalar(), split, glob: split });
         return;
     }
     if (rest.startsWith('-') && rest[1] !== '}') {
-        out.push({ text: set ? scalar() : word(rest.slice(1)), split });
+        out.push({ text: set ? scalar() : word(rest.slice(1)), split, glob: split });
         return;
     }
     if (rest.startsWith(':=') || rest.startsWith('=')) {
         const value = rest.startsWith(':=') ? rest.slice(2) : rest.slice(1);
         if (empty) {
             const assigned = word(value);
-            assignVar(shell, name, assigned);
-            out.push({ text: assigned, split });
+            const refused = assignVar(shell, name, assigned);
+            if (refused !== null) {
+                ctx.error = refused;
+                ctx.code = 127;
+                return;
+            }
+            out.push({ text: assigned, split, glob: split });
         } else {
-            out.push({ text: scalar(), split });
+            out.push({ text: scalar(), split, glob: split });
         }
         return;
     }
     if (rest.startsWith(':+')) {
-        out.push({ text: empty ? '' : word(rest.slice(2)), split });
+        out.push({ text: empty ? '' : word(rest.slice(2)), split, glob: split });
         return;
     }
     if (rest.startsWith('+')) {
-        out.push({ text: set ? word(rest.slice(1)) : '', split });
+        out.push({ text: set ? word(rest.slice(1)) : '', split, glob: split });
         return;
     }
     if (rest.startsWith(':?') || rest.startsWith('?')) {
@@ -1372,31 +1543,48 @@ function paramExpansion(shell: SyncShell, body: string, split: boolean, out: Exp
             ctx.error = `${name}: ${message === '' ? 'parameter null or not set' : message}`;
             ctx.code = 127;
         } else {
-            out.push({ text: scalar(), split });
+            out.push({ text: scalar(), split, glob: split });
         }
         return;
     }
-    const trimmed = (operator: '#' | '%', pattern: string): string => {
+    /**
+     * `${x#p}` and `${x%p}`. A regular expression matches leftmost-first, which is the wrong
+     * direction for a shell's shortest match, so the cut points are tried in the order the operator
+     * means instead of being anchored: `#` takes the shortest matching prefix (the first cut from
+     * the left), `##` the longest, `%` the shortest matching suffix (the first cut from the right)
+     * and `%%` the longest. `${x%.*}` on `a.b.c` is `a.b`, not `a`.
+     */
+    const trimmed = (operator: '#' | '%', longest: boolean, pattern: string): string => {
         const source = scalar();
-        const regexp = patternRegExp(pattern, operator === '#' ? rest.startsWith('##') : rest.startsWith('%%'));
+        const regexp = patternRegExp(pattern, true);
         if (regexp === null) return source;
-        const anchored = new RegExp(operator === '#' ? '^' + regexp.source : regexp.source + '$');
-        return source.replace(anchored, '');
+        const whole = new RegExp('^(?:' + regexp.source + ')$');
+        const cuts: number[] = [];
+        if (operator === '#') {
+            for (let j = 0; j <= source.length; j++) cuts.push(j);
+            if (longest) cuts.reverse();
+            for (const j of cuts) if (whole.test(source.slice(0, j))) return source.slice(j);
+            return source;
+        }
+        for (let k = source.length; k >= 0; k--) cuts.push(k);
+        if (longest) cuts.reverse();
+        for (const k of cuts) if (whole.test(source.slice(k))) return source.slice(0, k);
+        return source;
     };
     if (rest.startsWith('##')) {
-        out.push({ text: trimmed('#', word(rest.slice(2))), split });
+        out.push({ text: trimmed('#', true, word(rest.slice(2))), split, glob: split });
         return;
     }
     if (rest.startsWith('#')) {
-        out.push({ text: trimmed('#', word(rest.slice(1))), split });
+        out.push({ text: trimmed('#', false, word(rest.slice(1))), split, glob: split });
         return;
     }
     if (rest.startsWith('%%')) {
-        out.push({ text: trimmed('%', word(rest.slice(2))), split });
+        out.push({ text: trimmed('%', true, word(rest.slice(2))), split, glob: split });
         return;
     }
     if (rest.startsWith('%')) {
-        out.push({ text: trimmed('%', word(rest.slice(1))), split });
+        out.push({ text: trimmed('%', false, word(rest.slice(1))), split, glob: split });
         return;
     }
     if (rest.startsWith('/')) {
@@ -1425,12 +1613,12 @@ function paramExpansion(shell: SyncShell, body: string, split: boolean, out: Exp
         const replacement = word(at === -1 ? '' : rest2.slice(at + 1));
         const regexp = patternRegExp(pattern, false);
         if (regexp === null) {
-            out.push({ text: scalar(), split });
+            out.push({ text: scalar(), split, glob: split });
             return;
         }
         const source = scalar();
         const flags = every ? 'g' : '';
-        out.push({ text: source.replace(new RegExp(anchor + regexp.source, flags), replacement.replace(/\$/g, '$$')), split });
+        out.push({ text: source.replace(new RegExp(anchor + regexp.source, flags), replacement.replace(/\$/g, '$$')), split, glob: split });
         return;
     }
     literal();
@@ -1440,41 +1628,150 @@ function paramExpansion(shell: SyncShell, body: string, split: boolean, out: Exp
  * One word's worth of fields. Field splitting happens here and only here: a run of white space that
  * came out of an unquoted expansion ends the field, and an empty unquoted expansion leaves none.
  */
-function assembleFields(atoms: ExpandAtom[]): string[] {
-    const fields: string[] = [];
+function assembleFields(atoms: ExpandAtom[]): ExpandedField[] {
+    const fields: ExpandedField[] = [];
     let cur = '';
+    let glob = false;
     let have = false;
+    const push = (): void => {
+        if (have) fields.push({ text: cur, glob });
+        cur = '';
+        glob = false;
+        have = false;
+    };
     for (const atom of atoms) {
-        if (atom.before === true && have) {
-            fields.push(cur);
-            cur = '';
-            have = false;
-        }
+        if (atom.before === true && have) push();
         if (atom.split) {
             const pieces = atom.text.split(IFS_SPLIT);
             for (let i = 0; i < pieces.length; i++) {
-                if (i > 0) {
-                    if (have) fields.push(cur);
-                    cur = '';
-                    have = false;
-                }
+                if (i > 0) push();
                 if (pieces[i] !== '') {
                     cur += pieces[i];
+                    glob = glob || atom.glob;
                     have = true;
                 }
             }
         } else {
             cur += atom.text;
+            glob = glob || atom.glob;
             have = true;
         }
-        if (atom.after === true && have) {
-            fields.push(cur);
-            cur = '';
-            have = false;
+        if (atom.after === true && have) push();
+    }
+    push();
+    return fields;
+}
+
+/* ----------------------------------------------------------------------------------------------
+ * Pathname expansion
+ *
+ * A field that came out of an unquoted piece holding a `*`, a `?` or a `[` is a pattern: it is
+ * replaced by the names it matches, and by itself when it matches none. As in a shell, `*` and `?`
+ * never cross a `/`, a name beginning with `.` is matched only by a pattern that begins with `.`,
+ * and a pattern ending in `/` matches directories only, with the `/` kept.
+ * -------------------------------------------------------------------------------------------- */
+
+/** The names a pattern component matches, as a regular expression; `*` and `?` never cross a `/`. */
+function componentRegExp(pattern: string): RegExp | null {
+    let source = '';
+    for (let i = 0; i < pattern.length; i++) {
+        const ch = pattern[i];
+        if (ch === '\\') {
+            source += escapeRegExp(pattern[i + 1] ?? '\\');
+            i++;
+        } else if (ch === '*') {
+            source += '[^/]*';
+        } else if (ch === '?') {
+            source += '[^/]';
+        } else if (ch === '[') {
+            let end = i + 1;
+            if (pattern[end] === '!' || pattern[end] === '^') end++;
+            if (pattern[end] === ']') end++;
+            while (end < pattern.length && pattern[end] !== ']') end += pattern[end] === '\\' ? 2 : 1;
+            if (end >= pattern.length) {
+                source += '\\[';
+            } else {
+                let body = pattern.slice(i + 1, end);
+                if (body.startsWith('!')) body = '^' + body.slice(1);
+                source += '[' + body + ']';
+                i = end;
+            }
+        } else {
+            source += escapeRegExp(ch);
         }
     }
-    if (have) fields.push(cur);
-    return fields;
+    try {
+        return new RegExp('^(?:' + source + ')$');
+    } catch {
+        return null;
+    }
+}
+
+/** The names `pattern` expands to, sorted as a shell sorts them, or null when it matches none. */
+function shellGlob(shell: SyncShell, pattern: string): string[] | null {
+    if (!/[*?[]/.test(pattern)) return null;
+    const fs = shell.ctx.fileSystem;
+    const absolute = pattern.startsWith('/');
+    const trailing = pattern.endsWith('/');
+    const parts = (absolute ? pattern.slice(1) : pattern).split('/');
+    if (trailing) parts.pop();
+    if (parts.length === 0) return null;
+    let dirs: string[] = [absolute ? '/' : shell.cwd];
+    let stems: string[] = [absolute ? '/' : ''];
+    for (let p = 0; p < parts.length; p++) {
+        const component = parts[p];
+        const last = p === parts.length - 1;
+        const regexp = /[*?[]/.test(component) ? componentRegExp(component) : null;
+        const nextDirs: string[] = [];
+        const nextStems: string[] = [];
+        const found: string[] = [];
+        for (let d = 0; d < dirs.length; d++) {
+            let entries: string[];
+            try {
+                entries = fs.listDirectory(dirs[d]);
+            } catch {
+                continue;
+            }
+            // `.` and `..` are real names a pattern beginning with `.` matches, as the host has it
+            const names = component.startsWith('.') ? ['.', '..', ...entries] : entries;
+            for (const name of names) {
+                if (name !== '.' && name !== '..' && name.startsWith('.') && !component.startsWith('.')) continue;
+                const matched = regexp === null ? name === component : regexp.test(name);
+                if (!matched) continue;
+                const stem = stems[d] + name;
+                if (!last) {
+                    const child = joinPath(dirs[d], name);
+                    if (isDirectory(fs, child)) {
+                        nextDirs.push(child);
+                        nextStems.push(stem + '/');
+                    }
+                    continue;
+                }
+                if (trailing) {
+                    if (isDirectory(fs, joinPath(dirs[d], name))) found.push(stem + '/');
+                } else {
+                    found.push(stem);
+                }
+            }
+        }
+        if (last) return found.length === 0 ? null : found.sort();
+        dirs = nextDirs;
+        stems = nextStems;
+        if (dirs.length === 0) return null;
+    }
+    return null;
+}
+
+function joinPath(dir: string, name: string): string {
+    return (dir.endsWith('/') ? dir : dir + '/') + name;
+}
+
+function isDirectory(fs: IFileSystem, path: string): boolean {
+    try {
+        return fs.isDirectory(path);
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -1487,12 +1784,25 @@ function expandCommandWords(shell: SyncShell, words: RawWord[], ctx: ExpandCtx):
     while (i < words.length && ASSIGNMENT_WORD.test(rawText(words[i]))) {
         const assignment = expandWordText(shell, words[i], ctx);
         const at = assignment.indexOf('=');
-        if (at > 0) assignVar(shell, assignment.slice(0, at), assignment.slice(at + 1));
+        if (at > 0) {
+            const refused = assignVar(shell, assignment.slice(0, at), assignment.slice(at + 1));
+            if (refused !== null) {
+                ctx.error = refused;
+                ctx.code = 127;
+                return null;
+            }
+        }
         i++;
     }
     if (i === words.length) return null;
     const fields: string[] = [];
-    for (let j = i; j < words.length; j++) fields.push(...assembleFields(expandParts(shell, words[j], ctx)));
+    for (let j = i; j < words.length; j++) {
+        for (const field of assembleFields(expandParts(shell, words[j], ctx))) {
+            // no match leaves the word as it was written, as it does in a shell
+            if (field.glob) fields.push(...(shellGlob(shell, field.text) ?? [field.text]));
+            else fields.push(field.text);
+        }
+    }
     return fields;
 }
 
@@ -1507,24 +1817,90 @@ function expandParts(shell: SyncShell, parts: ShellPart[], ctx: ExpandCtx): Expa
     const atoms: ExpandAtom[] = [];
     for (const part of parts) {
         if (part.expand) expandInto(shell, part.text, part.split, atoms, ctx);
-        else atoms.push({ text: part.text, split: false });
+        else atoms.push({ text: part.text, split: false, glob: false });
     }
     return atoms;
 }
 
-/** Removes a `2>&1` or `2>/dev/null` from a command's words and reports which of the two it was. */
-function takeStderrRedirect(words: RawWord[]): 'stdout' | 'null' | null {
-    for (let i = words.length - 1; i >= 0; i--) {
-        if (rawIs(words[i], '2>&1')) {
+/* ----------------------------------------------------------------------------------------------
+ * Redirection
+ *
+ * A redirection is an operator *and* a destination, and the two are resolved left to right before
+ * the command runs: `2>&1` points stderr at wherever stdout points at that moment, so `> f 2>&1`
+ * sends both to `f` while `2>&1 > f` leaves stderr on the terminal. `/dev/null` is a sink, not a
+ * container file, and a destination that cannot be opened fails the command with status 1 without
+ * running it, while an operator with no file after it is a syntax error, status 2, as the host has
+ * both.
+ * -------------------------------------------------------------------------------------------- */
+
+/** Where one descriptor of a command goes once its redirections are resolved. */
+type RedirectDest = { kind: 'stdout' } | { kind: 'stderr' } | { kind: 'null' } | { kind: 'file'; file: string; append: boolean };
+
+/** One `<`, `>`, `>>` or `N>&M` of a command, in the order it was written. */
+interface RedirectSpec {
+    kind: 'in' | 'out' | 'dup';
+    fd: number;
+    /** The descriptor a `dup` copies the destination of, at this point in the list. */
+    from?: number;
+    append?: boolean;
+    /** The file name as it was written; expanded when the redirection is resolved. */
+    file?: RawWord;
+}
+
+/** `>`, `>>`, `<`, `2>`, `2>>`, `1<` ... with the file standing as a word of its own. */
+const REDIRECT_OPERATOR = /^([0-9]?)(>>?|<)$/;
+/** `2>/dev/null`, `>out.txt`, `>>out.txt`, `<in.txt` ... : the file written against the operator. */
+const REDIRECT_ATTACHED = /^([0-9]?)(>>?|<)(.+)$/;
+/** `2>&1`, `1>&2`, `>&2` ... */
+const REDIRECT_DUP = /^([0-9]?)>&([0-9])$/;
+
+/** The text of a word that is one unquoted piece, so a bare `>` counts and a quoted one does not. */
+function operatorText(word: RawWord): string | null {
+    return word.length === 1 && word[0].expand ? word[0].text : null;
+}
+
+/** Removes every redirection from a command's words; `missing` names an operator with no file after it. */
+function takeRedirects(words: RawWord[]): { ops: RedirectSpec[]; missing: string | null } {
+    const ops: RedirectSpec[] = [];
+    for (let i = 0; i < words.length; i++) {
+        const text = operatorText(words[i]);
+        if (text === null) continue;
+        const dup = REDIRECT_DUP.exec(text);
+        if (dup !== null) {
             words.splice(i, 1);
-            return 'stdout';
+            i--;
+            ops.push({ kind: 'dup', fd: dup[1] === '' ? 1 : Number(dup[1]), from: Number(dup[2]) });
+            continue;
         }
-        if (rawIs(words[i], '2>/dev/null')) {
-            words.splice(i, 1);
-            return 'null';
+        const op = REDIRECT_OPERATOR.exec(text);
+        if (op !== null) {
+            if (i + 1 >= words.length) return { ops, missing: text };
+            const file = words[i + 1];
+            words.splice(i, 2);
+            i--;
+            ops.push({ kind: op[2] === '<' ? 'in' : 'out', fd: fdOf(op[1], op[2]), file, append: op[2] === '>>' });
+            continue;
         }
+        // `2>/dev/null` and `>out.txt`: the operator and the file are one word
+        const attached = REDIRECT_ATTACHED.exec(text);
+        if (attached === null) continue;
+        words.splice(i, 1);
+        i--;
+        ops.push({
+            kind: attached[2] === '<' ? 'in' : 'out',
+            fd: fdOf(attached[1], attached[2]),
+            // a redirect's file name is expanded but neither field-split nor globbed, as a shell has it
+            file: [{ text: attached[3], expand: true, split: false }],
+            append: attached[2] === '>>'
+        });
     }
-    return null;
+    return { ops, missing: null };
+}
+
+/** The descriptor a redirect names: 0 for a bare `<`, 1 for a bare `>` or `>>`. */
+function fdOf(digits: string, operator: string): number {
+    if (digits !== '') return Number(digits);
+    return operator === '<' ? 0 : 1;
 }
 
 /**
@@ -1542,28 +1918,12 @@ function splitPipeline(words: RawWord[]): RawWord[][] | null {
     return stages;
 }
 
-/** Removes a `< file` from a command's words; `missing` is the syntax error of a `<` with no file after it. */
-function takeInputRedirect(words: RawWord[]): { file: RawWord } | 'missing' | null {
-    const at = words.findIndex((word) => rawIs(word, '<'));
-    if (at === -1) return null;
-    if (at + 1 >= words.length) return 'missing';
-    const file = words[at + 1];
-    words.splice(at, 2);
-    return { file };
-}
-
-/** Removes every `> file` and `>> file` from a command's words; `missing` names a redirect with no file after it. */
-function takeOutputRedirects(words: string[]): { redirects: { type: '>' | '>>'; file: string }[]; missing: string | null } {
-    const redirects: { type: '>' | '>>'; file: string }[] = [];
-    for (let i = 0; i < words.length; i++) {
-        const word = words[i];
-        if (word !== '>' && word !== '>>') continue;
-        if (i + 1 >= words.length) return { redirects, missing: word };
-        redirects.push({ type: word as '>' | '>>', file: words[i + 1] });
-        words.splice(i, 2);
-        i--;
-    }
-    return { redirects, missing: null };
+/**
+ * A diagnostic as the shell writes one: with the newline that ends it, so `2>&1` puts it on stdout
+ * the way the host does. `runShell` adds the newline a command left out, and adds no second one.
+ */
+function diagnostic(text: string): string {
+    return text === '' || text.endsWith('\n') ? text : text + '\n';
 }
 
 /** The text `< file` feeds a command; a file that is not there fails the command, as a shell's does. */
@@ -1571,69 +1931,112 @@ function readShellInput(shell: SyncShell, file: string): { text: string; error: 
     try {
         const text = shell.ctx.fileSystem.readFile(shellPath(shell, file));
         return text === undefined ? { text: '', error: `No such file or directory: ${file}` } : { text, error: null };
-    } catch (error) {
-        return { text: '', error: error instanceof Error ? error.message : String(error) };
+    } catch {
+        // the file system's own message carries its absolute path; the shell names the file it was given
+        return { text: '', error: `No such file or directory: ${file}` };
     }
 }
 
-/** Writes what a command wrote to the files of its `>` and `>>`, as Shell.execute does for a built-in. */
-function applyOutputRedirects(shell: SyncShell, redirects: { type: '>' | '>>'; file: string }[], step: ShellStep): ShellStep {
-    if (step.exitCode !== 0 || redirects.length === 0) return step;
-    for (const redirect of redirects) {
+/** What a file holds, or undefined where it is not there or cannot be read. */
+function readFileOrUndefined(shell: SyncShell, file: string): string | undefined {
+    try {
+        return shell.ctx.fileSystem.readFile(file);
+    } catch {
+        return undefined;
+    }
+}
+
+/** Opens the destination of a `>` or `>>` before the command runs: `>` empties it, `>>` creates it. */
+function openRedirectFile(shell: SyncShell, dest: { file: string; append: boolean }): string | null {
+    const fs = shell.ctx.fileSystem;
+    try {
+        if (!dest.append || readFileOrUndefined(shell, dest.file) === undefined) fs.writeFile(dest.file, '');
+        return null;
+    } catch {
+        return `No such file or directory: ${dest.file}`;
+    }
+}
+
+/** Sends what a command wrote to stdout and to stderr to the destinations its redirections named. */
+function finishRedirects(shell: SyncShell, dest: (RedirectDest | null)[], step: ShellStep): ShellStep {
+    let stdout = '';
+    let stderr = '';
+    const write = (d: RedirectDest & { kind: 'file' }, text: string): void => {
+        if (text === '') return;
         try {
-            const file = shellPath(shell, redirect.file);
-            const fs = shell.ctx.fileSystem;
-            fs.writeFile(file, redirect.type === '>>' ? (fs.readFile(file) || '') + step.stdout : step.stdout);
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            return { stdout: '', stderr: `Failed to redirect to ${redirect.file}: ${message}`, exitCode: 1 };
+            const existing = d.append ? readFileOrUndefined(shell, d.file) ?? '' : '';
+            shell.ctx.fileSystem.writeFile(d.file, existing + text);
+        } catch {
+            /* a destination that closed under the command's feet is left as it is */
         }
+    };
+    const one = dest[1];
+    const two = dest[2];
+    // `> f 2>&1`: one destination, so the two streams reach it in the order the command wrote them
+    if (one !== null && one === two && one.kind === 'file') {
+        write(one, step.stdout + step.stderr);
+        return { stdout: '', stderr: '', exitCode: step.exitCode };
     }
-    return { stdout: '', stderr: '', exitCode: 0 };
-}
-
-/**
- * One command with its `>` and `>>` applied. A built-in keeps exactly what Shell.execute gives it
- * (shellBuiltinWithRedirects, untouched); every other command has the same redirects applied here,
- * so a module command writes its output to a file the way a built-in does.
- */
-function shellCommandRedirected(shell: SyncShell, words: string[]): ShellStep {
-    if (SHELL_BUILTINS.has(words[0])) return shellCommand(shell, words);
-    const rest = words.slice(1);
-    const { redirects, missing } = takeOutputRedirects(rest);
-    if (missing !== null) return { stdout: '', stderr: `Syntax error: missing file for redirection ${missing}`, exitCode: 1 };
-    if (redirects.length === 0) return shellCommand(shell, words);
-    return applyOutputRedirects(shell, redirects, shellCommand(shell, [words[0], ...rest]));
+    for (const fd of [1, 2] as const) {
+        const d = dest[fd];
+        const text = fd === 1 ? step.stdout : step.stderr;
+        if (d === null || d.kind === 'null') continue;
+        if (d.kind === 'stdout') stdout += text;
+        else if (d.kind === 'stderr') stderr += text;
+        else write(d, text);
+    }
+    return { stdout, stderr, exitCode: step.exitCode };
 }
 
 /**
  * One command of a pipeline, run with `input` as its standard input: its own `< file` wins over the
- * pipe, and its own `2>&1` or `2>/dev/null` applies to it alone, not to the pipeline.
+ * pipe, and its redirections apply to it alone, not to the pipeline.
  */
 function shellStage(shell: SyncShell, words: RawWord[], input: string | null): ShellStep {
     const stageWords = words.slice();
-    const errRedirect = takeStderrRedirect(stageWords);
-    const inRedirect = takeInputRedirect(stageWords);
-    if (inRedirect === 'missing') return { stdout: '', stderr: 'Syntax error: missing file for redirection <', exitCode: 1 };
+    const { ops, missing } = takeRedirects(stageWords);
+    if (missing !== null) return { stdout: '', stderr: diagnostic(`Syntax error: missing file for redirection ${missing}`), exitCode: 2 };
+    const ctx: ExpandCtx = { error: null, code: 0, substStatus: null };
+    // 0 is the command's input; 1 and 2 start as the shell's own two outputs
+    const dest: (RedirectDest | null)[] = [null, { kind: 'stdout' }, { kind: 'stderr' }];
     let stageInput = input;
-    if (inRedirect !== null) {
-        const file = expandWordText(shell, inRedirect.file, { error: null, code: 0, substStatus: null });
-        const read = readShellInput(shell, file);
-        if (read.error !== null) return { stdout: '', stderr: read.error, exitCode: 1 };
-        stageInput = read.text;
+    for (const op of ops) {
+        if (op.kind === 'dup') {
+            dest[op.fd] = dest[op.from ?? 1] ?? { kind: 'null' };
+            continue;
+        }
+        const file = expandWordText(shell, op.file as RawWord, ctx);
+        if (ctx.error !== null) {
+            shell.stopped = true;
+            return { stdout: '', stderr: diagnostic(ctx.error), exitCode: ctx.code };
+        }
+        if (op.kind === 'in') {
+            const read = readShellInput(shell, file);
+            if (read.error !== null) return { stdout: '', stderr: diagnostic(read.error), exitCode: 1 };
+            stageInput = read.text;
+            continue;
+        }
+        dest[op.fd] = file === '/dev/null' ? { kind: 'null' } : { kind: 'file', file: shellPath(shell, file), append: op.append === true };
+    }
+    for (const fd of [1, 2] as const) {
+        const d = dest[fd];
+        if (d === null || d.kind !== 'file') continue;
+        const failed = openRedirectFile(shell, d);
+        // the command never runs where a destination cannot be opened, as it never does in a shell
+        if (failed !== null) return { stdout: '', stderr: diagnostic(failed), exitCode: 1 };
     }
     const saved = shell.input;
     shell.input = stageInput;
     try {
-        const ctx: ExpandCtx = { error: null, code: 0, substStatus: null };
         const fields = expandCommandWords(shell, stageWords, ctx);
-        if (ctx.error !== null) return { stdout: '', stderr: ctx.error, exitCode: ctx.code };
+        if (ctx.error !== null) {
+            // `${x:?}` and an assignment to a read-only variable end the line, as they end a shell
+            shell.stopped = true;
+            return { stdout: '', stderr: diagnostic(ctx.error), exitCode: ctx.code };
+        }
         // a line of assignments and nothing else has no command to run
-        if (fields === null) return { stdout: '', stderr: '', exitCode: ctx.substStatus ?? 0 };
-        const step = shellCommandRedirected(shell, fields);
-        if (errRedirect === 'stdout') return { stdout: step.stderr + step.stdout, stderr: '', exitCode: step.exitCode };
-        if (errRedirect === 'null') return { stdout: step.stdout, stderr: '', exitCode: step.exitCode };
-        return step;
+        if (fields === null) return finishRedirects(shell, dest, { stdout: '', stderr: '', exitCode: ctx.substStatus ?? 0 });
+        return finishRedirects(shell, dest, shellCommand(shell, fields));
     } finally {
         shell.input = saved;
     }
@@ -1641,18 +2044,69 @@ function shellStage(shell: SyncShell, words: RawWord[], input: string | null): S
 
 /**
  * A pipeline: every command reads what the command before it wrote. The status is the last
- * command's, as POSIX has it without pipefail, and every command's error output is the pipeline's.
+ * command's, or the first that failed under `set -o pipefail`, and every command's error output is
+ * the pipeline's.
  */
 function shellPipeline(shell: SyncShell, stages: RawWord[][]): ShellStep {
     let input = shell.input;
     let stderr = '';
     let step: ShellStep = { stdout: '', stderr: '', exitCode: 0 };
+    let firstFailure: number | null = null;
     for (let i = 0; i < stages.length; i++) {
         step = shellStage(shell, stages[i], input);
         input = step.stdout;
+        if (step.exitCode !== 0 && firstFailure === null) firstFailure = step.exitCode;
         if (i < stages.length - 1) stderr += step.stderr;
     }
-    return { stdout: step.stdout, stderr: stderr + step.stderr, exitCode: step.exitCode };
+    const exitCode = shell.state?.options.pipefail === true && firstFailure !== null ? firstFailure : step.exitCode;
+    return { stdout: step.stdout, stderr: stderr + step.stderr, exitCode };
+}
+
+/**
+ * A line that opens with a compound command -- `if`, `for`, `while`, `until`, `case`, a `{ }` group,
+ * a `( )` subshell or a function definition -- handed to the script engine of `builtins.ts`, which
+ * already parses all of them. Every simple command it meets comes back through the runner installed
+ * at the top of this file, so the line keeps this dispatcher's own commands, its node execution and
+ * its 127 for an unknown name, and the engine keeps `set -e` and `set -o pipefail` inside the
+ * construct, which this loop cannot see.
+ */
+function runCompoundLine(shell: SyncShell, line: string): ShellStep {
+    const state = shellStateFor(shell);
+    const savedIo = state.io;
+    const savedBuffer = state.inputBuffer;
+    const savedCursor = state.inputCursor;
+    // `read` and `mapfile` take their lines out of the state's buffer, not out of the context
+    state.inputBuffer = shell.input ?? '';
+    state.inputCursor = 0;
+    state.io = { stdout: '', stderr: '' };
+    try {
+        const step = withShellState(state, () => {
+            try {
+                const result = runScript(state, line);
+                return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+            } catch (error) {
+                if (isNotSupported(error)) throw error;
+                return {
+                    stdout: state.io.stdout,
+                    stderr: state.io.stderr + (error instanceof Error ? error.message : String(error)),
+                    exitCode: 1
+                };
+            } finally {
+                if (state.execTarget !== null) shell.stopped = true;
+                shell.cwd = state.cwd;
+                syncShellEnv(shell, state);
+            }
+        });
+        // runScript has already run the EXIT trap; drop it so runExitTrap cannot run it a second time
+        state.traps.delete('EXIT');
+        shell.lastStatus = step.exitCode;
+        state.lastStatus = step.exitCode;
+        return step;
+    } finally {
+        state.io = savedIo;
+        state.inputBuffer = savedBuffer;
+        state.inputCursor = savedCursor;
+    }
 }
 
 /**
@@ -1661,16 +2115,20 @@ function shellPipeline(shell: SyncShell, stages: RawWord[][]): ShellStep {
  * beside it is a syntax error the whole line fails on, before anything runs, as /bin/sh has it.
  */
 function shellLine(shell: SyncShell, line: string): ShellStep {
-    const segments = splitCommandList(line).filter((segment) => segment.words.length > 0);
+    const body = stripComment(line);
+    const syntax = syntaxErrorOf(body);
+    if (syntax !== null) return { stdout: '', stderr: diagnostic(syntax), exitCode: 2 };
+    const segments = splitCommandList(body).filter((segment) => segment.words.length > 0);
     const pipelines: (RawWord[][] | null)[] = segments.map((segment) => splitPipeline(segment.words));
     if (pipelines.some((pipeline) => pipeline === null)) {
-        return { stdout: '', stderr: 'Syntax error: a command is missing beside `|`', exitCode: 2 };
+        return { stdout: '', stderr: diagnostic('Syntax error: a command is missing beside `|`'), exitCode: 2 };
     }
+    if (segments.some(startsCompound)) return runCompoundLine(shell, body);
     let exitCode = 0;
     let stdout = '';
     let stderr = '';
     for (let i = 0; i < segments.length; i++) {
-        // `exec` replaced the shell: nothing after it runs, whatever operator joins it
+        // `exec` replaced the shell, or an expansion error ended it: nothing after it runs
         if (shell.stopped) break;
         const segment = segments[i];
         if (segment.op === '&&' && exitCode !== 0) continue;
@@ -1683,6 +2141,12 @@ function shellLine(shell: SyncShell, line: string): ShellStep {
         shell.lastStatus = exitCode;
         if (shell.state !== undefined) shell.state.lastStatus = exitCode;
         if (rawText(segment.words[0]) === 'exit') break;
+        // `set -e`: a command that fails ends the line, unless it is an operand of `&&` or `||`
+        const operand =
+            segment.op === '&&' ||
+            segment.op === '||' ||
+            (i + 1 < segments.length && (segments[i + 1].op === '&&' || segments[i + 1].op === '||'));
+        if (!operand && shell.state?.options.errexit === true && exitCode !== 0) break;
     }
     return runExitTrap(shell, { stdout, stderr, exitCode });
 }
@@ -1724,7 +2188,7 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
                 const found = shell.ctx.fileSystem.resolvePath(command, dir);
                 if (shell.ctx.fileSystem.fileExists(found)) {
                     if (found.endsWith('.js')) return shellNode(shell, { file: found, args: cmdArgs });
-                    return { stdout: '', stderr: `No executor found for: ${found}`, exitCode: 1 };
+                    return { stdout: '', stderr: diagnostic(`No executor found for: ${found}`), exitCode: 1 };
                 }
             }
         }
@@ -1750,7 +2214,7 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         }
         const moduleStep = shellModuleCommand(shell, command, cmdArgs);
         if (moduleStep !== null) return moduleStep;
-        return { stdout: '', stderr: `Command not found: ${command}`, exitCode: 127 };
+        return { stdout: '', stderr: diagnostic(`Command not found: ${command}`), exitCode: 127 };
     } catch (error) {
         if (isNotSupported(error)) throw error;
         return { stdout: '', stderr: error instanceof Error ? error.message : String(error), exitCode: 1 };
@@ -1772,7 +2236,8 @@ function runShell(
     return {
         status: step.exitCode,
         stdout: step.stdout,
-        stderr: step.stderr ? step.stderr + '\n' : ''
+        // `sh` ends a diagnostic with a newline; a command that wrote its own already ends in one
+        stderr: step.stderr === '' || step.stderr.endsWith('\n') ? step.stderr : step.stderr + '\n'
     };
 }
 

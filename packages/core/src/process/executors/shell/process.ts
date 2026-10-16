@@ -93,6 +93,13 @@ export class ShellProcess extends Process {
         this.filteredArgs = args.filter(arg => arg !== '--osc');
 
         this.shell = new Shell(fileSystem, { oscMode, process: this,env: this.env, cwd: this.cwd });
+        this.shell.setHistorySink(() => ({
+            stdout: this.commandHistory
+                .map((entry, index) => `${index + 1}: [${entry.timestamp.toISOString()}] ${entry.command}`)
+                .join('\n'),
+            stderr: '',
+            exitCode: 0
+        }));
         this.prompt = oscMode ? '\x1b[1;32m$\x1b[0m ' : '$ ';
     }
 
@@ -345,9 +352,17 @@ export class ShellProcess extends Process {
         this.cursorPosition = newLine.length;
     }
 
+    /**
+     * One line, run by the same script engine the container's other shell runs `sh -c <line>` with.
+     *
+     * The engine is synchronous, so a command that only a child process can run -- `node`, `npm`,
+     * `npx`, a file found on PATH, a script behind a shebang, and the network commands of the
+     * registry -- is spawned on a line of its own, where the shell can wait for it, before the line
+     * reaches the engine. Everything else -- the operators, pipes, redirections and expansions, and
+     * every built-in and utility -- is the engine's, and is what the other path runs.
+     */
     private async executeCommand(commandLine: string): Promise<ShellCommandResult> {
         const processedArgs = splitCommandLine(commandLine);
-
 
         if (processedArgs.length === 0) {
             return { stdout: '', stderr: '', exitCode: 0 };
@@ -355,77 +370,87 @@ export class ShellProcess extends Process {
 
         const [command, ...cmdArgs] = processedArgs;
 
-        // Handle built-in commands
-        switch (command) {
-            case 'exit': {
-                const status = Number.parseInt(cmdArgs[0] ?? '0', 10);
-                const exitCode = Number.isNaN(status) ? 0 : status;
-                this.running = false;
-                this._exitCode = exitCode;
-                return { stdout: '', stderr: '', exitCode };
+        if (!this.shell.isCompound(commandLine)) {
+            const spawned = await this.spawnOneCommand(command, cmdArgs);
+            if (spawned !== undefined) {
+                this.rememberStopped(spawned.exitCode);
+                return spawned;
             }
+        }
 
-            case 'history':
-                const historyOutput = this.commandHistory
-                    .map((entry, index) =>
-                        `${index + 1}: [${entry.timestamp.toISOString()}] ${entry.command}`)
-                    .join('\n');
-                return { stdout: historyOutput, stderr: '', exitCode: 0 };
+        const result = this.shell.executeLine(commandLine);
+        if (this.shell.stopped) {
+            this.running = false;
+            this._exitCode = result.exitCode;
+        }
+        return result;
+    }
 
-            default:
-                // Try to execute as a program
-                try {
-                    if(this.shell.hasCommand(command)) {
-                        return await this.shell.execute(command, cmdArgs);
-                    }
-                    else if (command === 'node' || command === 'npm' || command === 'npx') {
-                        return await this.spawnChild(
-                            command,
-                            cmdArgs,
-                            Object.fromEntries(this.env),
-                            this.shell.getWorkingDirectory()
-                        );
-                    }
-                    else{
-                        // check if the command is in env PATH
-                        let PATH= this.env.get('PATH');
-                        if (PATH) {
-                            const paths = PATH.split(':');
-                            for (const path of paths) {
-                                const executablePath = this.fileSystem.resolvePath(command,path);
-                                if (this.fileSystem.fileExists(executablePath)) {
-                                    return await this.spawnChild(executablePath, cmdArgs);
-                                }
-                            }
-                        }
-                        // check for shebang
-                        let content = this.fileSystem.readFile(command);
-                        if (content) {
-                            const shebang = content.match(/^#!(.*)/);
-                            if (shebang) {
-                                const interpreterName = shebang[1];
-                                let name = interpreterName.split(" ")[0]
-                                if (name=='/usr/bin/env'){
-                                    let tokens = interpreterName.split(" ")
-                                    if (tokens.length==1)
-                                        throw "executor not specified"
-                                    let newCommand=tokens[1]
-                                    return await this.spawnChild(newCommand, [command, ...cmdArgs]);
-                                }
-                            }
-                        }
-                    }
+    /** `exit` on a line of its own: the status it gave is the shell's. */
+    private rememberStopped(_exitCode: number): void {
+        if (!this.shell.stopped) return;
+        this.running = false;
+        this._exitCode = this.shell.stoppedCode;
+    }
 
-                    
-                    // Execute through shell
-                    return await this.shell.execute(command, cmdArgs);
-                } catch (error: any) {
-                    return {
-                        stdout: '',
-                        stderr: error.message,
-                        exitCode: 1
-                    };
+    /**
+     * Runs a command that only a child process can run, or returns undefined when the command is not
+     * one of those and the line belongs to the script engine.
+     */
+    private async spawnOneCommand(command: string, cmdArgs: string[]): Promise<ShellCommandResult | undefined> {
+        try {
+            if (this.shell.isSpawnedCommand(command)) {
+                return await this.spawnChild(
+                    command,
+                    cmdArgs,
+                    Object.fromEntries(this.env),
+                    this.shell.getWorkingDirectory()
+                );
+            }
+            if (this.shell.hasExternalCommand(command)) {
+                return await this.shell.executeExternal(command, cmdArgs);
+            }
+            // A built-in or a utility is never looked for on PATH, the way it never is in a shell
+            if (this.shell.hasCommand(command)) return undefined;
+            // check if the command is in env PATH
+            let PATH = this.env.get('PATH');
+            if (PATH) {
+                const paths = PATH.split(':');
+                for (const path of paths) {
+                    const executablePath = this.fileSystem.resolvePath(command, path);
+                    if (this.fileSystem.fileExists(executablePath)) {
+                        return await this.spawnChild(executablePath, cmdArgs);
+                    }
                 }
+            }
+            // check for shebang: a name that is not a file to read is not one, and says so by throwing
+            let content: string | undefined;
+            try {
+                content = this.fileSystem.readFile(command);
+            } catch {
+                content = undefined;
+            }
+            if (content) {
+                const shebang = content.match(/^#!(.*)/);
+                if (shebang) {
+                    const interpreterName = shebang[1];
+                    let name = interpreterName.split(" ")[0]
+                    if (name == '/usr/bin/env') {
+                        let tokens = interpreterName.split(" ")
+                        if (tokens.length == 1)
+                            throw "executor not specified"
+                        let newCommand = tokens[1]
+                        return await this.spawnChild(newCommand, [command, ...cmdArgs]);
+                    }
+                }
+            }
+            return undefined;
+        } catch (error: any) {
+            return {
+                stdout: '',
+                stderr: error.message,
+                exitCode: 1
+            };
         }
     }
 }

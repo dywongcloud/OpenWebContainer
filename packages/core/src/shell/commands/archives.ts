@@ -239,6 +239,21 @@ function extended(fs: Fs): Record<string, unknown> {
 
 /** The bytes of a file, or undefined when there is no such file. */
 function readBinary(fs: Fs, path: string): Uint8Array | undefined {
+    const bytes = rawBytes(fs, path);
+    if (bytes === undefined) return undefined;
+    const text = textOf(fs, path);
+    // A shell `>` or `>>` writes a command's output through the *text* writer, so a binary stream
+    // parked in the file is its UTF-8 encoding, not the bytes themselves: `gzip -c a.txt > a.gz`
+    // stored 61 bytes where the stream is 43. `bytesToText` is the identity on well-formed UTF-8
+    // and parks every other byte, so it reproduces the text reading exactly when, and only when,
+    // the file holds encoded text -- in which case `textToBytes` is the exact inverse and recovers
+    // the stream. When it does not, the file holds raw bytes and those are the answer.
+    if (text !== undefined && bytesToText(bytes) === text) return textToBytes(text);
+    return bytes;
+}
+
+/** The bytes a file holds, through whichever byte-typed reader the file system offers. */
+function rawBytes(fs: Fs, path: string): Uint8Array | undefined {
     try {
         const bytes = fs.readBytes(path);
         if (bytes !== undefined) return bytes;
@@ -256,6 +271,15 @@ function readBinary(fs: Fs, path: string): Uint8Array | undefined {
     }
     const text = fs.readFile(path);
     return text === undefined ? undefined : textToBytes(text);
+}
+
+/** The text a file holds, or undefined when it cannot be read as text. */
+function textOf(fs: Fs, path: string): string | undefined {
+    try {
+        return fs.readFile(path);
+    } catch {
+        return undefined;
+    }
 }
 
 /** Writes bytes to a file, preferring the byte-typed writers over the text-typed one. */

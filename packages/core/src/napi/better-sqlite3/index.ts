@@ -14,10 +14,13 @@
  * literally. Where the C++ relies on V8 pending exceptions (was_js_error), the shim stores the
  * JavaScript error and rethrows it after SQLite has unwound.
  *
- * Files: database files are read and written through a whole-file fs API (readFileSync,
- * writeFileSync, existsSync, statSync, unlinkSync, realpathSync), which is what the OWC guest fs
- * provides; open files are held in memory, shared by every connection of this add-on instance, and
- * written back on xSync, on unlock below RESERVED and on the last close.
+ * Files: database files are read and written as whole files. The host hands createAddon() the narrow
+ * NAPI_HOST.fs surface (read/write/append/rename/unlink/mkdir/rmdir/readdir/stat -- the same one
+ * src/napi/leveldown/fs.ts documents); a node:fs-like object is accepted as well, so the shim also
+ * runs under Node unchanged. Either is adapted to one whole-file API below: readFileSync,
+ * writeFileSync, existsSync, statSync, unlinkSync, and no realpathSync, which the host surface has
+ * no equivalent of. Open files are held in memory, shared by every connection of this add-on
+ * instance, and written back on xSync, on unlock below RESERVED and on the last close.
  */
 // The engine is a generated CommonJS module (module.exports = createSqliteEngine).
 import createSqliteEngine from './sqlite3-engine.cjs';
@@ -33,9 +36,81 @@ export interface AddonFs {
   realpathSync?(path: string): string;
 }
 
+/**
+ * What the container actually provides (NAPI_HOST.fs in runtime/guest/globals.ts): byte-level
+ * operations over the virtual filesystem, resolved against the guest's cwd, with no encodings,
+ * streams or descriptors. See src/napi/leveldown/fs.ts for the contract each one keeps:
+ * read() returns undefined for a missing file, stat() returns 'file'/'dir'/undefined, write()
+ * replaces the whole file and fails when a parent directory is missing, unlink() of a missing file
+ * is not an error. There is no size and no realpath.
+ */
+export interface NapiHostFs {
+  read(path: string): Uint8Array | undefined;
+  write(path: string, bytes: Uint8Array): void;
+  append(path: string, bytes: Uint8Array): void;
+  rename(from: string, to: string): void;
+  unlink(path: string): void;
+  mkdir(path: string): void;
+  rmdir(path: string): void;
+  readdir(path: string): string[] | undefined;
+  stat(path: string): string | undefined;
+}
+
 export interface AddonEnv {
-  fs?: AddonFs;
+  fs?: AddonFs | NapiHostFs;
   cwd?: () => string;
+}
+
+/* The host surface is not node:fs, and node:fs is not the host surface; tell the two apart by the
+ * one operation only node:fs spells this way. */
+function isNodeFsLike(fs: any): boolean {
+  return typeof fs.readFileSync === 'function' && typeof fs.writeFileSync === 'function';
+}
+
+function enoent(path: string): Error {
+  const e: any = new Error("ENOENT: no such file or directory, open '" + path + "'");
+  e.code = 'ENOENT';
+  e.errno = -2;
+  e.syscall = 'open';
+  e.path = path;
+  return e;
+}
+
+/** Adapts either filesystem to the whole-file API the VFS below is written against. */
+function asAddonFs(fs: any): AddonFs {
+  if (isNodeFsLike(fs)) return fs as AddonFs;
+  const h = fs as NapiHostFs;
+  return {
+    readFileSync(path: string): Uint8Array {
+      const bytes = h.read(path);
+      if (bytes === undefined || bytes === null) throw enoent(path);
+      return bytes;
+    },
+    writeFileSync(path: string, data: Uint8Array): void {
+      h.write(path, data instanceof Uint8Array ? data : new Uint8Array(data));
+    },
+    existsSync(path: string): boolean {
+      return h.stat(path) !== undefined;
+    },
+    statSync(path: string): { size: number; isFile(): boolean; isDirectory(): boolean } {
+      const kind = h.stat(path);
+      if (kind === undefined) throw enoent(path);
+      const isDirectory = kind === 'dir';
+      const st: { size: number; isFile(): boolean; isDirectory(): boolean } = {
+        size: 0, isFile: () => !isDirectory, isDirectory: () => isDirectory,
+      };
+      // The host surface has no size. SQLite only asks for it to tell an empty database from a
+      // missing one, so read it on demand rather than on every stat of a large file.
+      Object.defineProperty(st, 'size', {
+        get: () => { const bytes = h.read(path); return bytes === undefined || bytes === null ? 0 : bytes.length; },
+        enumerable: true, configurable: true,
+      });
+      return st;
+    },
+    unlinkSync(path: string): void { h.unlink(path); },
+    // No realpathSync: the host resolves a path the way fullPathname() already does, lexically
+    // against the guest's cwd, so the lexical absolute path is its realpath here.
+  };
 }
 
 declare const requireBuiltin: ((name: string) => unknown) | undefined;
@@ -279,7 +354,7 @@ export function createAddon(env: AddonEnv = {}): object {
   }
 
   const BufferCtor: any = (globalThis as any).Buffer;
-  let fsImpl: AddonFs | null = env.fs || null;
+  let fsImpl: AddonFs | null = env.fs ? asAddonFs(env.fs) : null;
   const getFs = (): AddonFs => fsImpl || (fsImpl = resolveBuiltin('fs') as AddonFs);
   const getCwd = env.cwd || (() => (globalThis as any).process.cwd());
 
