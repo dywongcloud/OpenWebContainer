@@ -25,6 +25,8 @@
 import type { ShellCommand, CommandContext, CommandResult } from './types';
 import { atPath, inputText } from './types';
 import { runWithRunner } from './builtins';
+import { createShellState, runScript } from './builtins';
+import type { ShellFs } from './builtins';
 
 /* ================================================================== *
  * 1. Process host
@@ -936,16 +938,21 @@ const nice: ShellCommand = (ctx) => {
 
 const NOHUP_USAGE = 'usage: nohup [--] utility [arguments]';
 
+/**
+ * The measured host reports a `nohup` usage error with status 127; GNU coreutils reports 125. The
+ * container reports 1, so that no command it implements ever ends in 127, which is the status a
+ * name it does not have reports with. The text is the host's, unchanged.
+ */
 const nohup: ShellCommand = (ctx) => {
     const args = ctx.args;
-    if (args.length === 0) return fail(NOHUP_USAGE, 127);
+    if (args.length === 0) return fail(NOHUP_USAGE, 1);
     let i = 0;
     while (i < args.length && args[i].startsWith('-') && args[i] !== '-') {
         if (args[i] === '--') { i++; break; }
-        return fail(`nohup: illegal option -- ${args[i].slice(1).charAt(0)}\n${NOHUP_USAGE}`, 127);
+        return fail(`nohup: illegal option -- ${args[i].slice(1).charAt(0)}\n${NOHUP_USAGE}`, 1);
     }
     const words = args.slice(i);
-    if (words.length === 0) return fail(NOHUP_USAGE, 127);
+    if (words.length === 0) return fail(NOHUP_USAGE, 1);
     const result = runCommand(ctx, words);
     if (result === null) return noRunner('nohup', words[0]);
     // Output already goes to the shell's stdout, not a terminal, so nohup.out is never needed.
@@ -1491,6 +1498,309 @@ const xclip: ShellCommand = (ctx) => {
 };
 
 /* ================================================================== *
+ * 17b. uname, uptime, w, pgrep, timeout and sh
+ * ================================================================== */
+
+/**
+ * The container's own identity, as the guest's own `os` reports it: `os.type()` is Linux,
+ * `os.release()` is 6.0.0 and `os.arch()` is x64, which `uname -m` spells `x86_64`. The host this
+ * was measured on is macOS and prints its own; the shape -- one line, the fields space-separated,
+ * `-a` in the order `s n r v m` -- is the host's.
+ */
+const OWC_SYSNAME = 'Linux';
+const OWC_RELEASE = '6.0.0';
+const OWC_VERSION = '#1 SMP OpenWebContainer 6.0.0';
+const OWC_MACHINE = 'x86_64';
+
+const UNAME_USAGE = 'usage: uname [-amnoprsv]';
+
+const uname: ShellCommand = (ctx) => {
+    let wanted = '';
+    for (const arg of ctx.args) {
+        if (!arg.startsWith('-') || arg === '-') return fail(`uname: illegal option -- ${arg.charAt(1)}\n${UNAME_USAGE}`, 1);
+        for (const ch of arg.slice(1)) {
+            // `-o` is not a field this uname reports; the measured host accepts it and prints the
+            // default, which is what happens here: it selects nothing.
+            if (ch === 'o') continue;
+            if (!'amnprsv'.includes(ch)) return fail(`uname: illegal option -- ${ch}\n${UNAME_USAGE}`, 1);
+            if (!wanted.includes(ch)) wanted += ch;
+        }
+    }
+    const host = hostnameOf(ctx);
+    const fields: Record<string, string> = {
+        s: OWC_SYSNAME,
+        n: host,
+        r: OWC_RELEASE,
+        v: OWC_VERSION,
+        m: OWC_MACHINE,
+        p: OWC_MACHINE
+    };
+    const order = wanted.includes('a') ? 'snrvm' : wanted;
+    const shown = (order === '' ? 's' : order).split('').map((ch) => fields[ch]);
+    return out(shown.join(' '));
+};
+
+/** `1:32`, `37 days,  1:32` or `0 mins`: the duration the host `uptime` prints after `up `. */
+function upDuration(ms: number): string {
+    const safe = Number.isFinite(ms) && ms > 0 ? ms : 0;
+    const minutes = Math.floor(safe / 60000);
+    const days = Math.floor(minutes / 1440);
+    const hours = Math.floor((minutes % 1440) / 60);
+    if (days > 0) return `${days} day${days === 1 ? '' : 's'},  ${hours}:${String(minutes % 60).padStart(2, '0')}`;
+    if (hours > 0) return `${hours}:${String(minutes % 60).padStart(2, '0')}`;
+    return `${minutes} min${minutes === 1 ? '' : 's'}`;
+}
+
+/**
+ * The line `uptime` and the head of `w` print. The container has no boot clock and no load, so the
+ * duration is 0 and the three averages are 0.00: reported, never invented.
+ */
+function uptimeLine(ctx: CommandContext, users: number): string {
+    const now = new Date();
+    const clock = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    return `${clock}  up ${upDuration(0)}, ${users} user${users === 1 ? '' : 's'}, load averages: 0.00 0.00 0.00`;
+}
+
+const UPTIME_USAGE = 'usage: uptime';
+
+const uptime: ShellCommand = (ctx) => {
+    // The host ignores the operands it is given and always prints the one line.
+    for (const arg of ctx.args) {
+        if (arg.startsWith('-') && arg !== '-') return fail(`uptime: illegal option -- ${arg.slice(1, 2)}\n${UPTIME_USAGE}`, 1);
+    }
+    return out(uptimeLine(ctx, 1));
+};
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/**
+ * The `LOGIN@` column: `Thu15` inside the last week, `08Oct26` before that. Both shapes were read
+ * off the host.
+ */
+function loginAt(at: number): string {
+    const then = new Date(at);
+    if (Date.now() - at < 7 * 24 * 60 * 60 * 1000) {
+        return `${WEEKDAYS[then.getDay()]}${String(then.getHours()).padStart(2, '0')}`;
+    }
+    return `${String(then.getDate()).padStart(2, '0')}${MONTHS[then.getMonth()]}${String(then.getFullYear() % 100).padStart(2, '0')}`;
+}
+
+const W_HEADER = 'USER       TTY      FROM    LOGIN@  IDLE WHAT';
+
+const wCommand: ShellCommand = (ctx) => {
+    let header = true;
+    let onlyMine = false;
+    let idleOnly = false;
+    const names: string[] = [];
+    for (const arg of ctx.args) {
+        if (arg === 'am' || arg === 'i') continue;
+        if (arg.startsWith('-') && arg !== '-') {
+            for (const ch of arg.slice(1)) {
+                if (ch === 'h') header = false;
+                else if (ch === 'u') idleOnly = true;
+                else if (ch === 'm') onlyMine = true;
+                else if ('fis'.includes(ch)) continue;
+                else return fail(`w: illegal option -- ${ch}\nusage: w [-fhimsu] [user]`, 1);
+            }
+            continue;
+        }
+        names.push(arg);
+    }
+    const session_ = session(ctx);
+    if (names.length > 0 && !names.includes(OWC_USER)) {
+        return out(header ? uptimeLine(ctx, 1) + '\n' + W_HEADER + '\n' : '');
+    }
+    // `-u` sorts the idle time to the front of each row; with one session there is nothing to sort.
+    if (idleOnly || onlyMine) { /* the container's one session is always the one asked for */ }
+    const row =
+        padRight(session_.name, 9) + '  ' +
+        padRight(session_.line, 7) + '  ' +
+        padRight('-', 7) + ' ' +
+        padRight(loginAt(session_.at), 7) + ' ' +
+        pad('-', 6) + ' ' +
+        '-';
+    const text = (header ? uptimeLine(ctx, 1) + '\n' + W_HEADER + '\n' : '') + row + '\n';
+    return out(text);
+};
+
+const PGREP_USAGE = [
+    'usage: pgrep [-Lfilnoqvx] [-d delim] [-F pidfile] [-G gid]',
+    '             [-P ppid] [-U uid] [-g pgrp] [-t tty] [-u euid]',
+    '             pattern ...'
+].join('\n');
+
+/** The name `pgrep` matches against without `-f`: the first word of the command. */
+function procName(command: string): string {
+    const first = command.trim().split(/\s+/)[0] ?? '';
+    return first.slice(first.lastIndexOf('/') + 1);
+}
+
+const pgrep: ShellCommand = (ctx) => {
+    const args = ctx.args;
+    let listNames = false;
+    let full = false;
+    let exact = false;
+    let newest = false;
+    let oldest = false;
+    let invert = false;
+    let countOnly = false;
+    let quiet = false;
+    let delimiter = '\n';
+    let i = 0;
+    while (i < args.length && args[i].startsWith('-') && args[i] !== '-') {
+        const arg = args[i];
+        if (arg === '--') { i++; break; }
+        for (const ch of arg.slice(1)) {
+            if (ch === 'l') listNames = true;
+            else if (ch === 'f') full = true;
+            else if (ch === 'x') exact = true;
+            else if (ch === 'n') newest = true;
+            else if (ch === 'o') oldest = true;
+            else if (ch === 'v') invert = true;
+            else if (ch === 'c') countOnly = true;
+            else if (ch === 'q') quiet = true;
+            else if (ch === 'i') continue;
+            else if (ch === 'd') { delimiter = args[i + 1] ?? '\n'; i++; }
+            else if ('GPUsgUt'.includes(ch)) { i++; }
+            else return fail(`pgrep: illegal option -- ${ch}\n${PGREP_USAGE}`, 2);
+        }
+        i++;
+    }
+    const patterns = args.slice(i);
+    if (patterns.length === 0) return fail(PGREP_USAGE, 2);
+    const h = hostOr();
+    if (h === null) return noHost('pgrep');
+    let matched: { pid: number; name: string; command: string }[] = [];
+    for (const pattern of patterns) {
+        let re: RegExp;
+        try {
+            re = new RegExp(exact ? `^${pattern}$` : pattern);
+        } catch {
+            return fail(`pgrep: ${pattern}: invalid regular expression`, 2);
+        }
+        const found = h.list().filter((p) => re.test(full ? p.command : procName(p.command)));
+        for (const p of found) {
+            if (matched.some((m) => m.pid === p.pid)) continue;
+            matched.push({ pid: p.pid, name: procName(p.command), command: p.command });
+        }
+    }
+    if (invert) {
+        const all = h.list();
+        matched = all
+            .filter((p) => !matched.some((m) => m.pid === p.pid))
+            .map((p) => ({ pid: p.pid, name: procName(p.command), command: p.command }));
+    }
+    if (newest) matched = matched.slice(-1);
+    if (oldest) matched = matched.slice(0, 1);
+    if (quiet) return { stdout: '', stderr: '', exitCode: matched.length === 0 ? 1 : 0 };
+    if (countOnly) {
+        return { stdout: String(matched.length) + '\n', stderr: '', exitCode: matched.length === 0 ? 1 : 0 };
+    }
+    if (matched.length === 0) return { stdout: '', stderr: '', exitCode: 1 };
+    const text = matched.map((m) => (listNames ? `${m.pid} ${m.name}` : String(m.pid))).join(delimiter) + '\n';
+    return { stdout: text, stderr: '', exitCode: 0 };
+};
+
+const TIMEOUT_USAGE = 'usage: timeout [-s signal | --signal=signal] [-k duration] [--preserve-status]\n' +
+    '               [--foreground] [-v] duration command [arg ...]';
+
+/** `5`, `5s`, `2m`, `1h`, `1d`: the duration `timeout` takes, in milliseconds. */
+function timeoutMs(word: string): number | null {
+    const match = /^(\d+(?:\.\d+)?)([smhd]?)$/.exec(word);
+    if (match === null) return null;
+    const factors: Record<string, number> = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+    return Number(match[1]) * (match[2] === '' ? 1000 : factors[match[2]]);
+}
+
+const timeout: ShellCommand = (ctx) => {
+    const args = ctx.args;
+    let i = 0;
+    while (i < args.length && args[i].startsWith('-') && args[i] !== '-') {
+        const arg = args[i];
+        if (arg === '--') { i++; break; }
+        if (arg === '-s' || arg === '--signal') { i += 2; continue; }
+        if (arg.startsWith('--signal=')) { i++; continue; }
+        if (arg === '-k' || arg === '--kill-after') { i += 2; continue; }
+        if (arg.startsWith('--kill-after=')) { i++; continue; }
+        if (arg === '--preserve-status' || arg === '--foreground' || arg === '-v' || arg === '--verbose') { i++; continue; }
+        if (arg === '--help') return out(TIMEOUT_USAGE);
+        return fail(`timeout: illegal option -- ${arg.slice(1, 2)}\n${TIMEOUT_USAGE}`, 1);
+    }
+    const duration = args[i];
+    if (duration === undefined) return fail(TIMEOUT_USAGE, 125);
+    const ms = timeoutMs(duration);
+    if (ms === null) return fail(`timeout: invalid time interval '${duration}'\n${TIMEOUT_USAGE}`, 125);
+    const words = args.slice(i + 1);
+    if (words.length === 0) return fail(TIMEOUT_USAGE, 125);
+    const result = runCommand(ctx, words);
+    if (result === null) return noRunner('timeout', words[0]);
+    // The container runs a command to completion before it returns, so no command is still running
+    // when its duration expires: the utility reports the command's own status, and never 124.
+    return result;
+};
+
+const SH_USAGE = 'usage: sh [-c string | -s | file] [argument ...]';
+
+/**
+ * `sh`: a new shell over the same file system, directory and environment.
+ *
+ * The context carries none of the script engine's state, so a fresh one is built for the script --
+ * which is what `sh` really starts -- and the shell object the installed runner reads `host` for is
+ * rebuilt from the context, the way `runWithRunner` does it. Variables and the working directory
+ * therefore do not leak back to the shell that ran `sh`, exactly as they do not across a real one.
+ */
+function runShScript(ctx: CommandContext, source: string, name: string, positional: string[]): CommandResult {
+    const state = createShellState(ctx.env ?? {}, ctx.cwd ?? '/', ctx.fs as unknown as ShellFs);
+    state.shellName = name;
+    state.positional = positional;
+    state.host = {
+        ctx: { fileSystem: ctx.fs },
+        cwd: ctx.cwd ?? '/',
+        env: ctx.env ?? {},
+        input: ctx.input ?? null,
+        lastStatus: 0
+    };
+    const run = runScript(state, source);
+    return { stdout: run.stdout, stderr: run.stderr, exitCode: run.exitCode };
+}
+
+const sh: ShellCommand = (ctx) => {
+    const args = ctx.args;
+    let i = 0;
+    let errexit = false;
+    let nounset = false;
+    let mode: 'c' | 's' | null = null;
+    while (i < args.length && args[i].startsWith('-') && args[i] !== '-') {
+        const arg = args[i];
+        if (arg === '-c') { mode = 'c'; i++; break; }
+        if (arg === '-s') { mode = 's'; i++; break; }
+        for (const ch of arg.slice(1)) {
+            if (ch === 'e') errexit = true;
+            else if (ch === 'u') nounset = true;
+            else return fail(`sh: illegal option -- ${ch}\n${SH_USAGE}`, 2);
+        }
+        i++;
+    }
+    // `-e` and `-u` are carried into the script as a `set` line, so the script's own state has them.
+    const preamble = errexit || nounset
+        ? `set ${[errexit ? '-e' : '', nounset ? '-u' : ''].filter((flag) => flag !== '').join(' ')}\n`
+        : '';
+    if (mode === 'c') {
+        const source = args[i];
+        if (source === undefined) return fail(`sh: -c: option requires an argument\n${SH_USAGE}`, 2);
+        const rest = args.slice(i + 1);
+        return runShScript(ctx, preamble + source, rest[0] ?? 'sh', rest.slice(1));
+    }
+    if (mode === 's') return runShScript(ctx, preamble + (ctx.input ?? ''), 'sh', args.slice(i));
+    if (i >= args.length) return runShScript(ctx, preamble + (ctx.input ?? ''), 'sh', []);
+    const file = args[i];
+    const path = atPath(ctx, file);
+    const text = tryRead(ctx, path);
+    if (text === undefined) return fail(`sh: ${file}: No such file or directory`, 127);
+    return runShScript(ctx, preamble + text, file, args.slice(i + 1));
+};
+
+/* ================================================================== *
  * 18. Table
  * ================================================================== */
 
@@ -1518,5 +1828,11 @@ export const COMMANDS: Record<string, ShellCommand> = {
     more: pagerCommand('more'),
     man,
     open,
-    xclip
+    xclip,
+    uname,
+    uptime,
+    w: wCommand,
+    pgrep,
+    timeout,
+    sh
 };

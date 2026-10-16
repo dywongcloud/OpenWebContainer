@@ -408,22 +408,29 @@ export class OpenWebContainer {
             );
             childPid=childProcess.pid
 
+            let stdout = '';
+            let stderr = '';
+
             // Set up event handlers for the child process
             childProcess.addEventListener(ProcessEvent.MESSAGE, (data: ProcessEventData) => {
                 parentProcess.emit(ProcessEvent.MESSAGE, { ...data });
+                /* the parent sees the child's output as it arrives; the caller of spawnChild also
+                   gets it in the result, so a lifecycle script's failure can be reported with its cause */
+                if (data.stdout) stdout += data.stdout;
+                if (data.stderr) stderr += data.stderr;
             });
 
             childProcess.addEventListener(ProcessEvent.ERROR, (data: ProcessEventData) => {
                 if (data.error) {
                     parentProcess.emit(ProcessEvent.MESSAGE, { stderr: data.error.message + '\n' });
-                    
+                    stderr += data.error.message + '\n';
                 }
             });
 
             childProcess.addEventListener(ProcessEvent.EXIT, (data) => {
                 callback({
-                    stdout:"",
-                    stderr:"",
+                    stdout,
+                    stderr,
                     exitCode: data.exitCode ?? 1
                 });
 

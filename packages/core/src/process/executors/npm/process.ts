@@ -1,5 +1,5 @@
 import { IFileSystem } from '../../../filesystem';
-import { InstallSpec, NpmInstaller, parseInstallSpec } from '../../../npm/installer';
+import { InstallSpec, NpmInstaller, parseInstallSpec, ScriptRunResult } from '../../../npm/installer';
 import { NpmRegistry } from '../../../npm/registry';
 import { Process, ProcessType } from '../../base';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../node/runtime/resolver';
@@ -106,9 +106,9 @@ export class NpmProcess extends Process {
     }
 
     /** A lifecycle script runs as a node child in its package directory; its exit code decides whether the install fails. */
-    private async runLifecycleScript(args: string[], cwd: string, env: Record<string, string>): Promise<number> {
+    private async runLifecycleScript(args: string[], cwd: string, env: Record<string, string>): Promise<ScriptRunResult> {
         const result = await this.spawnChild('node', args, { ...Object.fromEntries(this.env), ...env }, cwd);
-        return result.exitCode ?? 1;
+        return { exitCode: result.exitCode ?? 1, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
     }
 
     private init(): number {

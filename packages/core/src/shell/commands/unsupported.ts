@@ -1797,6 +1797,10 @@ export const UNSUPPORTED: Record<string, string> = {
     vmstat: 'the container has no kernel memory or CPU counters to report',
     perf: 'the container has no hardware performance counters to read',
 
+    /* nothing to enumerate: no open-file table, no removable media */
+    lsof: 'the container keeps no table of open files: the file system is written through, never held open by a process',
+    eject: 'the container has no removable media and no drive to eject one from',
+
     /* interactive, or a foreign desktop */
     tmux: 'the container has no terminal to multiplex: the shell runs one line at a time',
     vi: 'the container has no interactive editor: there is no terminal and input arrives a line at a time',

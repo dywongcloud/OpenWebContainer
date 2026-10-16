@@ -1754,8 +1754,15 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             value = state.positional.join((getVar(state, 'IFS') ?? ' ')[0] ?? ' ');
             set = state.positional.length > 0;
         } else if (/^[0-9]$/.test(name)) {
-            value = state.positional[Number(name) - 1];
-            set = value !== undefined;
+            // `$0` is the name the shell was started as, not a positional: `sh -c 'echo $0' nm a1`
+            // prints `nm`, and `$1` is then `a1`.
+            if (name === '0') {
+                value = state.shellName;
+                set = true;
+            } else {
+                value = state.positional[Number(name) - 1];
+                set = value !== undefined;
+            }
         } else if (name.length === 1 && '?$!#-'.includes(name)) {
             value = specialValue(state, name);
             set = value !== undefined;

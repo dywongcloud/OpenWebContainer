@@ -16,6 +16,7 @@
  */
 import type { CommandContext, CommandResult, ShellCommand } from './types';
 import { atPath, inputText } from './types';
+import { deflateSync, inflateSync } from 'fflate';
 
 /** The file system as the context hands it to a command. */
 type Fs = CommandContext['fs'];
@@ -3833,6 +3834,791 @@ const df: ShellCommand = (ctx) => {
 
 /* ----------------------------------------------------------------- the table */
 
+/*
+ * dir, tac, nl, unexpand, dd and zip.
+ *
+ * `dir` is `ls -C -b`; its column layout was measured against GNU coreutils 9.10 (`gdir`) on the
+ * host and reproduced exactly: the largest number of columns whose total width is *strictly* less
+ * than the line length (80 when COLUMNS is unset), filled column-major, each cell padded to its
+ * column's width, and a separator of one tab when a tab lands on the next cell's column and two
+ * spaces otherwise.
+ *
+ * `dd` and `zip` are the two that carry bytes. The shell hands a command a string and takes a
+ * string back, so a byte string is carried as text by the same rule `archives.ts` documents: a byte
+ * that is not part of a well-formed UTF-8 sequence becomes a private-use code point at 0xf700+b,
+ * which makes text -> bytes -> text the identity on every byte string.
+ */
+
+/** `ls -b`: a backslash escape for a space and for every non-graphic character. */
+function escapeEntryName(name: string): string {
+    let out = '';
+    for (const ch of name) {
+        const code = ch.codePointAt(0) as number;
+        if (ch === '\\') out += '\\\\';
+        else if (ch === ' ') out += '\\ ';
+        else if (ch === '\n') out += '\\n';
+        else if (ch === '\t') out += '\\t';
+        else if (ch === '\r') out += '\\r';
+        else if (code < 0x20 || code === 0x7f) out += '\\' + code.toString(8).padStart(3, '0');
+        else out += ch;
+    }
+    return out;
+}
+
+/** `-F`: a classifier after the name, as `ls -F` writes one. */
+function classify(fs: Fs, path: string, name: string): string {
+    if (isDir(fs, path)) return name + '/';
+    if (name.endsWith('.js')) return name + '*';
+    return name;
+}
+
+/** The names `dir` prints for one operand: the entries of a directory, or the file itself. */
+function dirNamesFor(fs: Fs, path: string, all: boolean): string[] {
+    if (isDir(fs, path)) {
+        const names = dirEntries(fs, path);
+        return all ? names : names.filter((name) => !name.startsWith('.'));
+    }
+    return [path.slice(path.lastIndexOf('/') + 1)];
+}
+
+/** The column-major layout GNU `ls -C` prints, with its tab-or-two-spaces separator. */
+function columnLayout(cells: string[], lineLength: number): string {
+    if (cells.length === 0) return '';
+    let columns = 1;
+    for (let c = 1; c <= cells.length; c++) {
+        const rows = Math.ceil(cells.length / c);
+        const widths: number[] = [];
+        for (let col = 0; col < c; col++) {
+            let width = 0;
+            for (let row = 0; row < rows; row++) {
+                const at = col * rows + row;
+                if (at < cells.length) width = Math.max(width, cells[at].length);
+            }
+            widths.push(width);
+        }
+        let total = widths.reduce((sum, width) => sum + width, 0) + 2 * (c - 1);
+        if (total >= lineLength && c > 1) break;
+        columns = c;
+    }
+    const rows = Math.ceil(cells.length / columns);
+    const widths: number[] = [];
+    for (let col = 0; col < columns; col++) {
+        let width = 0;
+        for (let row = 0; row < rows; row++) {
+            const at = col * rows + row;
+            if (at < cells.length) width = Math.max(width, cells[at].length);
+        }
+        widths.push(width);
+    }
+    let out = '';
+    for (let row = 0; row < rows; row++) {
+        let line = '';
+        for (let col = 0; col < columns; col++) {
+            const at = col * rows + row;
+            if (at >= cells.length) continue;
+            if (col > 0) {
+                const target = line.length + 0;
+                const tabStop = Math.ceil((target + 1) / 8) * 8;
+                line += tabStop === target + 2 ? '\t' : '  ';
+            }
+            line += cells[at].padEnd(widths[col]);
+        }
+        out += line + '\n';
+    }
+    return out;
+}
+
+const DIR_USAGE = 'usage: dir [-1aAbCdFfr] [file ...]';
+
+const dir: ShellCommand = (ctx) => {
+    const args = ctx.args;
+    let oneLine = false;
+    let all = false;
+    let classifyNames = false;
+    let onlyDir = false;
+    let reverse = false;
+    const operands: string[] = [];
+    let noMoreOptions = false;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (!noMoreOptions && arg === '--') { noMoreOptions = true; continue; }
+        if (!noMoreOptions && isOption(arg)) {
+            for (const ch of arg.slice(1)) {
+                if (ch === '1') oneLine = true;
+                else if (ch === 'a' || ch === 'A') all = true;
+                else if (ch === 'b') continue; // `dir` is `ls -C -b`: escapes are always applied
+                else if (ch === 'C') oneLine = false;
+                else if (ch === 'd') onlyDir = true;
+                else if (ch === 'F') classifyNames = true;
+                else if (ch === 'r') reverse = true;
+                else return fail(`dir: invalid option -- '${ch}'\n${DIR_USAGE}`, 2);
+            }
+            continue;
+        }
+        operands.push(arg);
+    }
+    const targets = operands.length === 0 ? ['.'] : operands;
+    const lineLength = Number.parseInt(ctx.env.COLUMNS ?? '', 10);
+    const width = Number.isFinite(lineLength) && (lineLength as number) > 0 ? (lineLength as number) : 80;
+    let stdout = '';
+    let stderr = '';
+    let exitCode = 0;
+    let printed = 0;
+    for (const target of targets) {
+        const path = resolveAt(ctx, target);
+        if (!exists(ctx.fs, path)) {
+            stderr += `dir: cannot access '${target}': No such file or directory\n`;
+            exitCode = 2;
+            continue;
+        }
+        const listed: { name: string; path: string }[] = onlyDir || !isDir(ctx.fs, path)
+            ? [{ name: path.slice(path.lastIndexOf('/') + 1), path }]
+            : dirNamesFor(ctx.fs, path, all).map((name) => ({ name, path: joinPath(path, name) }));
+        const ordered = listed.slice().sort((a, b) => cmpStr(a.name, b.name));
+        if (reverse) ordered.reverse();
+        const cells = ordered.map((entry) => {
+            const shown = classifyNames ? classify(ctx.fs, entry.path, entry.name) : entry.name;
+            return escapeEntryName(shown);
+        });
+        if (targets.length > 1) stdout += (printed > 0 ? '\n' : '') + target + ':\n';
+        stdout += oneLine ? cells.map((cell) => cell + '\n').join('') : columnLayout(cells, width);
+        printed++;
+    }
+    return result(stdout, stderr, exitCode);
+};
+
+const TAC_USAGE = 'usage: tac [-b] [-r] [-s separator] [file ...]';
+
+const tac: ShellCommand = (ctx) => {
+    const args = ctx.args;
+    let separator = '\n';
+    let before = false;
+    let regex = false;
+    let noMoreOptions = false;
+    const operands: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (!noMoreOptions && arg === '--') { noMoreOptions = true; continue; }
+        if (!noMoreOptions && isOption(arg)) {
+            if (arg === '-b' || arg === '--before') { before = true; continue; }
+            if (arg === '-r' || arg === '--regex') { regex = true; continue; }
+            if (arg === '-s' || arg === '--separator') { separator = args[i + 1] ?? ''; i++; continue; }
+            if (arg.startsWith('--separator=')) { separator = arg.slice('--separator='.length); continue; }
+            return fail(`tac: invalid option -- ${arg.slice(1, 2)}\n${TAC_USAGE}`, 1);
+        }
+        operands.push(arg);
+    }
+    /** Splits on the separator, keeping empty records the way the trailing separator makes them. */
+    const splitRecords = (text: string): string[] => {
+        if (regex) return text.split(new RegExp(separator));
+        return text.split(separator);
+    };
+    let stdout = '';
+    let stderr = '';
+    let exitCode = 0;
+    const sources = operands.length === 0
+        ? [{ name: '-', text: ctx.input ?? '' }]
+        : operands.map((name) => ({ name, text: readFileOrNone(ctx.fs, resolveAt(ctx, name)) }));
+    for (const source of sources) {
+        if (source.text === undefined) {
+            stderr += `tac: ${source.name}: No such file or directory\n`;
+            exitCode = 1;
+            continue;
+        }
+        const parts = splitRecords(source.text);
+        const trailing = parts.length > 0 && parts[parts.length - 1] === '';
+        const records = trailing ? parts.slice(0, -1) : parts;
+        if (records.length === 0) continue; // empty input: `tac` prints nothing at all
+        records.reverse();
+        if (before) stdout += records.map((record) => separator + record).join('') + (trailing ? '' : separator);
+        else stdout += records.join(separator) + (trailing ? separator : '');
+    }
+    return result(stdout, stderr, exitCode);
+};
+
+const NL_USAGE = 'usage: nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num]\n' +
+    '          [-n format] [-s sep] [-v startnum] [-w width] [file]';
+
+/** `nl`'s body-numbering styles: which lines are counted. */
+const nlNumbered: Record<string, (line: string) => boolean> = {
+    a: () => true,
+    t: (line) => line !== '',
+    n: () => false
+};
+
+const nl: ShellCommand = (ctx) => {
+    const args = ctx.args;
+    let style = 't';
+    let format = 'rn';
+    let sep = '\t';
+    let start = 1;
+    let incr = 1;
+    let width = 6;
+    let noMoreOptions = false;
+    const operands: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (!noMoreOptions && arg === '--') { noMoreOptions = true; continue; }
+        if (!noMoreOptions && isOption(arg)) {
+            if (arg === '-p') { style = 'a'; continue; }
+            const flag = arg.slice(1, 2);
+            const value = arg.length > 2 ? arg.slice(2) : (args[i + 1] ?? '');
+            if ('bdnfhilsvw'.includes(flag)) {
+                if (arg.length <= 2) i++;
+                if (flag === 'b') style = value;
+                else if (flag === 'n') format = value;
+                else if (flag === 's') sep = value;
+                else if (flag === 'v') start = Number.parseInt(value, 10);
+                else if (flag === 'i') incr = Number.parseInt(value, 10);
+                else if (flag === 'w') width = Number.parseInt(value, 10);
+                else if (flag === 'd') continue; // a two-character delimiter pair: only the default is supported
+                else continue; // -f, -h and -l: header and footer numbering, not supported
+                continue;
+            }
+            return fail(`nl: illegal option -- ${arg.slice(1, 2)}\n${NL_USAGE}`, 1);
+        }
+        operands.push(arg);
+    }
+    if (nlNumbered[style] === undefined) return fail(`nl: invalid line numbering type: '${style}'\n${NL_USAGE}`, 1);
+    if (!['ln', 'rn', 'rz'].includes(format)) return fail(`nl: invalid line numbering format: '${format}'\n${NL_USAGE}`, 1);
+    if (!Number.isFinite(start) || !Number.isFinite(incr) || !Number.isFinite(width)) {
+        return fail(`nl: invalid numeric argument\n${NL_USAGE}`, 1);
+    }
+    const numbered = nlNumbered[style];
+    let stdout = '';
+    let stderr = '';
+    let exitCode = 0;
+    const sources = operands.length === 0
+        ? [{ name: '-', text: ctx.input ?? '' }]
+        : operands.map((name) => ({ name, text: readFileOrNone(ctx.fs, resolveAt(ctx, name)) }));
+    let counter = start;
+    for (const source of sources) {
+        if (source.text === undefined) {
+            stderr += `nl: ${source.name}: No such file or directory\n`;
+            exitCode = 1;
+            continue;
+        }
+        const lines = source.text.split('\n');
+        const trailing = lines.length > 0 && lines[lines.length - 1] === '';
+        const body = trailing ? lines.slice(0, -1) : lines;
+        for (const line of body) {
+            if (numbered(line)) {
+                const text = String(counter);
+                const field = format === 'ln'
+                    ? text.padEnd(width)
+                    : format === 'rz'
+                        ? text.padStart(width, '0')
+                        : text.padStart(width);
+                stdout += field + sep + line + '\n';
+                counter += incr;
+            } else {
+                stdout += ' '.repeat(width) + sep + line + '\n';
+            }
+        }
+    }
+    return result(stdout, stderr, exitCode);
+};
+
+const UNEXPAND_USAGE = 'usage: unexpand [-a] [-t tablist] [file ...]';
+
+/** The tab stops a `-t` list names: `-t 4`, `-t 1,3`, `-t 8,+4`. The last value repeats. */
+function tabStops(list: string): number[] {
+    const stops: number[] = [];
+    let at = 0;
+    for (const part of list.split(',')) {
+        if (part === '') continue;
+        const relative = part.startsWith('+');
+        const value = Number.parseInt(relative ? part.slice(1) : part, 10);
+        if (!Number.isFinite(value) || value <= 0) continue;
+        at = relative ? at + value : value;
+        stops.push(at);
+    }
+    return stops.length === 0 ? [8] : stops;
+}
+
+/** The first tab stop after `column`; the last stop's difference repeats for a short list. */
+function nextTabStop(stops: number[], column: number): number {
+    for (const stop of stops) if (stop > column) return stop;
+    if (stops.length === 1) return Math.ceil((column + 1) / stops[0]) * stops[0];
+    const step = stops[stops.length - 1] - (stops.length > 1 ? stops[stops.length - 2] : 0);
+    const last = stops[stops.length - 1];
+    return last + Math.ceil((column + 1 - last) / step) * step;
+}
+
+const unexpand: ShellCommand = (ctx) => {
+    const args = ctx.args;
+    let allBlanks = false;
+    let stops = [8];
+    let noMoreOptions = false;
+    const operands: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (!noMoreOptions && arg === '--') { noMoreOptions = true; continue; }
+        if (!noMoreOptions && isOption(arg)) {
+            if (arg === '-a' || arg === '--all') { allBlanks = true; continue; }
+            if (arg === '-t' || arg === '--tabs') { stops = tabStops(args[i + 1] ?? ''); i++; continue; }
+            if (arg.startsWith('--tabs=')) { stops = tabStops(arg.slice('--tabs='.length)); continue; }
+            if (/^-\d/.test(arg)) { stops = tabStops(arg.slice(1)); continue; }
+            return fail(`unexpand: illegal option -- ${arg.slice(1, 2)}\n${UNEXPAND_USAGE}`, 1);
+        }
+        operands.push(arg);
+    }
+    const convertLine = (line: string): string => {
+        let out = '';
+        let column = 0;
+        let i = 0;
+        while (i < line.length) {
+            const ch = line[i];
+            if (ch === '\t') {
+                const stop = nextTabStop(stops, column);
+                const gap = stop - column;
+                out += gap >= 2 ? '\t' : ' '.repeat(gap);
+                column = stop;
+                i++;
+                continue;
+            }
+            if (ch === ' ') {
+                let j = i;
+                while (j < line.length && line[j] === ' ') j++;
+                let remaining = j - i;
+                // Without -a only the blanks that lead the line are converted, as on the host.
+                const leading = out === '';
+                if (allBlanks || leading) {
+                    for (;;) {
+                        const stop = nextTabStop(stops, column);
+                        const need = stop - column;
+                        if (need >= 2 && remaining >= need) {
+                            out += '\t';
+                            remaining -= need;
+                            column = stop;
+                        } else break;
+                    }
+                }
+                out += ' '.repeat(remaining);
+                column += remaining;
+                i = j;
+                continue;
+            }
+            out += ch;
+            column++;
+            i++;
+        }
+        return out;
+    };
+    let stdout = '';
+    let stderr = '';
+    let exitCode = 0;
+    const sources = operands.length === 0
+        ? [{ name: '-', text: ctx.input ?? '' }]
+        : operands.map((name) => ({ name, text: readFileOrNone(ctx.fs, resolveAt(ctx, name)) }));
+    for (const source of sources) {
+        if (source.text === undefined) {
+            stderr += `unexpand: ${source.name}: No such file or directory\n`;
+            exitCode = 1;
+            continue;
+        }
+        const lines = source.text.split('\n');
+        const trailing = lines.length > 0 && lines[lines.length - 1] === '';
+        const body = trailing ? lines.slice(0, -1) : lines;
+        if (body.length === 0) continue; // empty input: `unexpand` prints nothing at all
+        stdout += body.map(convertLine).join('\n') + (trailing ? '\n' : '');
+    }
+    return result(stdout, stderr, exitCode);
+};
+
+/* ------------------------------------------------------------------- bytes */
+
+const HIGH_BYTE_ORIGIN = 0xf700;
+
+/** Bytes as the shell's text streams carry them, by the rule `archives.ts` documents. */
+function bytesToText(bytes: Uint8Array): string {
+    let out = '';
+    for (let i = 0; i < bytes.length;) {
+        const byte = bytes[i];
+        let width = 0;
+        let code = 0;
+        if (byte < 0x80) { width = 1; code = byte; }
+        else if ((byte & 0xe0) === 0xc0) { width = 2; code = byte & 0x1f; }
+        else if ((byte & 0xf0) === 0xe0) { width = 3; code = byte & 0x0f; }
+        else if ((byte & 0xf8) === 0xf0) { width = 4; code = byte & 0x07; }
+        let valid = width > 0 && i + width <= bytes.length;
+        for (let k = 1; valid && k < width; k++) valid = (bytes[i + k] & 0xc0) === 0x80;
+        if (valid) {
+            for (let k = 1; k < width; k++) code = (code << 6) | (bytes[i + k] & 0x3f);
+            if (code >= HIGH_BYTE_ORIGIN && code < HIGH_BYTE_ORIGIN + 0x100) valid = false;
+        }
+        if (valid && width > 0 && code >= 0x20) {
+            out += String.fromCodePoint(code);
+            i += width;
+        } else {
+            out += String.fromCharCode(HIGH_BYTE_ORIGIN + byte);
+            i++;
+        }
+    }
+    return out;
+}
+
+/** The inverse of `bytesToText`: text as the bytes it carries. */
+function textToBytes(text: string): Uint8Array {
+    const out: number[] = [];
+    for (const ch of text) {
+        const code = ch.codePointAt(0) as number;
+        if (code >= HIGH_BYTE_ORIGIN && code < HIGH_BYTE_ORIGIN + 0x100) out.push(code - HIGH_BYTE_ORIGIN);
+        else if (code < 0x80) out.push(code);
+        else if (code < 0x800) { out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f)); }
+        else if (code < 0x10000) { out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)); }
+        else { out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)); }
+    }
+    return new Uint8Array(out);
+}
+
+/** The bytes of a file, or undefined when it is not there. */
+function readBytes(fs: Fs, path: string): Uint8Array | undefined {
+    const text = readFileOrNone(fs, path);
+    return text === undefined ? undefined : textToBytes(text);
+}
+
+/* ----------------------------------------------------------------------- dd */
+
+/** `bs=4k`: one number and an optional multiplier, as `dd` reads one. */
+function ddSize(word: string): number | null {
+    const match = /^(\d+)([cwbkKMG]?)$/.exec(word);
+    if (match === null) return null;
+    const value = Number(match[1]);
+    const factors: Record<string, number> = { c: 1, w: 2, b: 512, k: 1024, K: 1024, M: 1024 * 1024, G: 1024 * 1024 * 1024 };
+    return value * (match[2] === '' ? 1 : factors[match[2]]);
+}
+
+/** The two device names `dd` can answer for over the virtual file system, and nothing else. */
+function ddDevice(name: string): { kind: 'null' | 'stdin' | 'stdout' } | undefined {
+    if (name === '/dev/null') return { kind: 'null' };
+    if (name === '/dev/stdin') return { kind: 'stdin' };
+    if (name === '/dev/stdout') return { kind: 'stdout' };
+    return undefined;
+}
+
+const DD_USAGE = 'usage: dd [operand ...]\n' +
+    'operands: if=file of=file bs=n [ibs=n] [obs=n] [count=n] [skip=n] [seek=n] [status=none|noxfer|xfer]';
+
+const dd: ShellCommand = (ctx) => {
+    const operands: Record<string, string> = {};
+    for (const arg of ctx.args) {
+        const at = arg.indexOf('=');
+        if (at <= 0) return fail(`dd: unknown operand ${arg}\n${DD_USAGE}`, 1);
+        operands[arg.slice(0, at)] = arg.slice(at + 1);
+    }
+    let input: Uint8Array;
+    const source = operands['if'];
+    if (source === undefined) {
+        input = textToBytes(ctx.input ?? '');
+    } else {
+        const device = ddDevice(source);
+        if (device !== undefined) {
+            if (device.kind === 'stdin') input = textToBytes(ctx.input ?? '');
+            else if (device.kind === 'null') input = new Uint8Array(0);
+            else return fail(`dd: ${source}: is not a file this container can read\n${DD_USAGE}`, 1);
+        } else if (source.startsWith('/dev/')) {
+            return fail(`dd: ${source}: no such device in this container: the container has no device files\n${DD_USAGE}`, 1);
+        } else {
+            const bytes = readBytes(ctx.fs, resolveAt(ctx, source));
+            if (bytes === undefined) return fail(`dd: ${source}: No such file or directory`, 1);
+            input = bytes;
+        }
+    }
+    const ibs = operands['ibs'] !== undefined ? ddSize(operands['ibs']) : null;
+    const bs = operands['bs'] !== undefined ? ddSize(operands['bs']) : null;
+    if ((operands['ibs'] !== undefined && ibs === null) || (operands['bs'] !== undefined && bs === null)) {
+        return fail(`dd: invalid number '${operands['ibs'] ?? operands['bs']}'`, 1);
+    }
+    const inSize = bs ?? ibs ?? 512;
+    const outSize = bs ?? (operands['obs'] !== undefined ? ddSize(operands['obs']) : null) ?? 512;
+    if (outSize === null || outSize <= 0) return fail(`dd: invalid number '${operands['obs']}'`, 1);
+    if (inSize <= 0) return fail(`dd: invalid number '${operands['bs'] ?? operands['ibs']}'`, 1);
+    const skip = operands['skip'] !== undefined ? ddSize(operands['skip']) : null;
+    const count = operands['count'] !== undefined ? ddSize(operands['count']) : null;
+    if (skip === null && operands['skip'] !== undefined) return fail(`dd: invalid number '${operands['skip']}'`, 1);
+    if (count === null && operands['count'] !== undefined) return fail(`dd: invalid number '${operands['count']}'`, 1);
+    let bytes = skip !== null && skip > 0 ? input.slice(Math.min(skip * inSize, input.length)) : input;
+    if (count !== null) bytes = bytes.slice(0, count * inSize);
+    const status = operands['status'] ?? 'xfer';
+    const started = Date.now();
+    const destination = operands['of'];
+    if (destination === undefined) {
+        /* stdout */
+    } else {
+        const device = ddDevice(destination);
+        if (device !== undefined) {
+            if (device.kind === 'stdout') { /* stdout */ }
+            else if (device.kind === 'stdin') return fail(`dd: ${destination}: cannot write to standard input`, 1);
+            else { /* /dev/null: discarded */ }
+        } else if (destination.startsWith('/dev/')) {
+            return fail(`dd: ${destination}: no such device in this container: the container has no device files\n${DD_USAGE}`, 1);
+        } else {
+            try {
+                ctx.fs.writeFile(resolveAt(ctx, destination), bytesToText(bytes));
+            } catch (error) {
+                return fail(`dd: ${destination}: ${error instanceof Error ? error.message : String(error)}`, 1);
+            }
+        }
+    }
+    const seconds = Math.max(0, (Date.now() - started) / 1000);
+    const full = Math.floor(bytes.length / inSize);
+    const partial = bytes.length % inSize === 0 ? 0 : 1;
+    const fullOut = Math.floor(bytes.length / outSize);
+    const partialOut = bytes.length % outSize === 0 ? 0 : 1;
+    let stderr = '';
+    if (status !== 'none') {
+        stderr += `${full}+${partial} records in\n${fullOut}+${partialOut} records out\n`;
+        if (status !== 'noxfer') {
+            const rate = seconds === 0 ? 0 : Math.floor(bytes.length / seconds);
+            stderr += `${bytes.length} bytes transferred in ${seconds.toFixed(6)} secs (${rate} bytes/sec)\n`;
+        }
+    }
+    const writesToStdout = destination === undefined || ddDevice(destination)?.kind === 'stdout';
+    return result(writesToStdout ? bytesToText(bytes) : '', stderr, 0);
+};
+
+/* ---------------------------------------------------------------------- zip */
+
+const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let value = i;
+        for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+        table[i] = value >>> 0;
+    }
+    return table;
+})();
+
+function crc32(bytes: Uint8Array): number {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+/** MS-DOS date and time, which is what a zip entry carries. */
+function dosTime(mtimeMs: number): { time: number; date: number } {
+    const at = new Date(Number.isFinite(mtimeMs) && mtimeMs > 0 ? mtimeMs : Date.now());
+    return {
+        time: (at.getHours() << 11) | (at.getMinutes() << 5) | Math.floor(at.getSeconds() / 2),
+        date: ((at.getFullYear() - 1980) << 9) | ((at.getMonth() + 1) << 5) | at.getDate()
+    };
+}
+
+interface ZipMember {
+    name: string;
+    bytes: Uint8Array;
+    mtimeMs: number;
+}
+
+/** The members an existing archive already holds, read out of its central directory. */
+function zipMembersOf(bytes: Uint8Array): ZipMember[] {
+    const members: ZipMember[] = [];
+    let at = -1;
+    for (let i = bytes.length - 22; i >= 0 && i >= bytes.length - 65558; i--) {
+        if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x05 && bytes[i + 3] === 0x06) { at = i; break; }
+    }
+    if (at < 0) return members;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let offset = view.getUint32(at + 16, true);
+    const count = view.getUint16(at + 10, true);
+    for (let i = 0; i < count; i++) {
+        if (offset + 46 > bytes.length) break;
+        if (bytes[offset] !== 0x50 || bytes[offset + 1] !== 0x4b) break;
+        const method = view.getUint16(offset + 10, true);
+        const compressedSize = view.getUint32(offset + 20, true);
+        const nameLength = view.getUint16(offset + 28, true);
+        const extraLength = view.getUint16(offset + 30, true);
+        const commentLength = view.getUint16(offset + 32, true);
+        const localAt = view.getUint32(offset + 42, true);
+        const name = bytesToText(bytes.subarray(offset + 46, offset + 46 + nameLength));
+        offset += 46 + nameLength + extraLength + commentLength;
+        if (localAt + 30 > bytes.length) continue;
+        const localView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const localNameLength = localView.getUint16(localAt + 26, true);
+        const localExtra = localView.getUint16(localAt + 28, true);
+        const dataAt = localAt + 30 + localNameLength + localExtra;
+        const data = bytes.subarray(dataAt, Math.min(dataAt + compressedSize, bytes.length));
+        let plain = data;
+        if (method === 8) {
+            try { plain = inflateSync(data); } catch { plain = data; }
+        } else if (method !== 0) {
+            continue;
+        }
+        members.push({ name, bytes: plain, mtimeMs: Date.now() });
+    }
+    return members;
+}
+
+/** One zip archive, written with STORED or DEFLATE members exactly as the host writes them. */
+function zipArchive(members: ZipMember[]): Uint8Array {
+    const nameBytes = members.map((member) => textToBytes(member.name));
+    const compressed = members.map((member) => {
+        if (member.bytes.length === 0) return { method: 0, data: member.bytes };
+        let deflated: Uint8Array | null = null;
+        try {
+            deflated = deflateSync(member.bytes, { level: 6 });
+        } catch {
+            deflated = null;
+        }
+        return deflated !== null && deflated.length < member.bytes.length
+            ? { method: 8, data: deflated }
+            : { method: 0, data: member.bytes };
+    });
+    const parts: Uint8Array[] = [];
+    const offsets: number[] = [];
+    let offset = 0;
+    for (let i = 0; i < members.length; i++) {
+        const member = members[i];
+        const { method, data } = compressed[i];
+        const stamp = dosTime(member.mtimeMs);
+        const crc = crc32(member.bytes);
+        const head = new Uint8Array(30 + nameBytes[i].length);
+        const view = new DataView(head.buffer);
+        view.setUint32(0, 0x04034b50, true);
+        view.setUint16(4, 20, true);
+        view.setUint16(6, 0, true);
+        view.setUint16(8, method, true);
+        view.setUint16(10, stamp.time, true);
+        view.setUint16(12, stamp.date, true);
+        view.setUint32(14, crc, true);
+        view.setUint32(18, data.length, true);
+        view.setUint32(22, member.bytes.length, true);
+        view.setUint16(26, nameBytes[i].length, true);
+        view.setUint16(28, 0, true);
+        head.set(nameBytes[i], 30);
+        offsets.push(offset);
+        parts.push(head, data);
+        offset += head.length + data.length;
+    }
+    const centralStart = offset;
+    let central = 0;
+    for (let i = 0; i < members.length; i++) {
+        const member = members[i];
+        const { method, data } = compressed[i];
+        const stamp = dosTime(member.mtimeMs);
+        const crc = crc32(member.bytes);
+        const head = new Uint8Array(46 + nameBytes[i].length);
+        const view = new DataView(head.buffer);
+        view.setUint32(0, 0x02014b50, true);
+        view.setUint16(4, 20, true);
+        view.setUint16(6, 20, true);
+        view.setUint16(8, 0, true);
+        view.setUint16(10, method, true);
+        view.setUint16(12, stamp.time, true);
+        view.setUint16(14, stamp.date, true);
+        view.setUint32(16, crc, true);
+        view.setUint32(20, data.length, true);
+        view.setUint32(24, member.bytes.length, true);
+        view.setUint16(28, nameBytes[i].length, true);
+        view.setUint32(42, offsets[i], true);
+        head.set(nameBytes[i], 46);
+        parts.push(head);
+        central += head.length;
+    }
+    const end = new Uint8Array(22);
+    const endView = new DataView(end.buffer);
+    endView.setUint32(0, 0x06054b50, true);
+    endView.setUint16(8, members.length, true);
+    endView.setUint16(10, members.length, true);
+    endView.setUint32(12, central, true);
+    endView.setUint32(16, centralStart, true);
+    parts.push(end);
+    const total = parts.reduce((sum, part) => sum + part.length, 0);
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const part of parts) { out.set(part, at); at += part.length; }
+    return out;
+}
+
+const ZIP_USAGE = 'usage: zip [-qr] archive.zip [file ...]';
+
+const zip: ShellCommand = (ctx) => {
+    const args = ctx.args;
+    let quiet = false;
+    let recurse = false;
+    let noMoreOptions = false;
+    const operands: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (!noMoreOptions && arg === '--') { noMoreOptions = true; continue; }
+        if (!noMoreOptions && isOption(arg)) {
+            for (const ch of arg.slice(1)) {
+                if (ch === 'q') quiet = true;
+                else if (ch === 'r') recurse = true;
+                else return fail(`zip: invalid option -- '${ch}'\n${ZIP_USAGE}`, 2);
+            }
+            continue;
+        }
+        operands.push(arg);
+    }
+    // No operands at all: the host compresses its standard input to its standard output.
+    if (operands.length === 0) {
+        const bytes = textToBytes(ctx.input ?? '');
+        const archive = zipArchive([{ name: '-', bytes, mtimeMs: Date.now() }]);
+        return result(bytesToText(archive), quiet ? '' : '  adding: - (deflated 0%)\n', 0);
+    }
+    const archiveName = operands[0];
+    const paths = operands.slice(1);
+    if (paths.length === 0) return result(`\nzip error: Nothing to do! (${archiveName})\n`, '', 12);
+    const archivePath = resolveAt(ctx, archiveName);
+    const existing = readBytes(ctx.fs, archivePath);
+    const kept = existing === undefined ? [] : zipMembersOf(existing);
+    const known = new Set(kept.map((member) => member.name));
+    const members: ZipMember[] = [];
+    let stdout = '';
+    let stderr = '';
+    let exitCode = 0;
+    for (const path of paths) {
+        const root = resolveAt(ctx, path);
+        if (!exists(ctx.fs, root)) {
+            stdout += `\tzip warning: name not matched: ${path}\n`;
+            exitCode = 12;
+            continue;
+        }
+        const files = recurse && isDir(ctx.fs, root)
+            ? walkRoot(ctx.fs, root, root, Infinity).entries.filter((entry) => entry.type === 'file')
+            : [statOf(ctx.fs, root)].filter((entry): entry is Entry => entry !== undefined && entry.type === 'file');
+        if (files.length === 0) {
+            stdout += `\tzip warning: name not matched: ${path}\n`;
+            exitCode = 12;
+            continue;
+        }
+        for (const entry of files) {
+            const bytes = readBytes(ctx.fs, entry.path);
+            if (bytes === undefined) {
+                stdout += `\tzip warning: name not matched: ${path}\n`;
+                exitCode = 12;
+                continue;
+            }
+            // The member name is the path as it was given, the way the host names it: `zip -r a.zip
+            // sub` stores `sub/x.txt`, and `zip -r a.zip .` stores `x.txt`.
+            const base = path.replace(/\/+$/, '');
+            const rel = entry.path.slice(root.length + 1);
+            const bare = base === '' || base === '.' ? '' : (base.startsWith('/') ? base.slice(1) : base) + '/';
+            let name = entry.path === root ? base.split('/').pop() ?? entry.path : bare + rel;
+            if (name.startsWith('/')) name = name.slice(1);
+            const deflated = bytes.length === 0 ? null : (() => {
+                try { return deflateSync(bytes, { level: 6 }); } catch { return null; }
+            })();
+            const shrunk = deflated !== null && deflated.length < bytes.length;
+            const saved = shrunk ? Math.round(100 * (1 - deflated.length / bytes.length)) : 0;
+            const verb = known.has(name) ? 'updating' : 'adding';
+            if (!quiet) stdout += `  ${verb}: ${name} (${shrunk ? 'deflated' : 'stored'} ${saved}%)\n`;
+            members.push({ name, bytes, mtimeMs: entry.mtimeMs });
+        }
+    }
+    if (members.length === 0) return result(stdout + `\nzip error: Nothing to do! (${archiveName})\n`, stderr, 12);
+    const merged = kept.filter((member) => !members.some((next) => next.name === member.name)).concat(members);
+    const archive = zipArchive(merged);
+    try {
+        ctx.fs.writeFile(archivePath, bytesToText(archive));
+    } catch (error) {
+        return fail(`zip: ${archiveName}: ${error instanceof Error ? error.message : String(error)}`, 1);
+    }
+    return result(stdout, stderr, exitCode);
+};
+
 export const COMMANDS: Record<string, ShellCommand> = {
     find,
     xargs,
@@ -3858,5 +4644,11 @@ export const COMMANDS: Record<string, ShellCommand> = {
     chown,
     chmod,
     du,
-    df
+    df,
+    dir,
+    tac,
+    nl,
+    unexpand,
+    dd,
+    zip
 };

@@ -19,10 +19,56 @@ export function unsupportedError(name: string, reason: string): Error {
     return error;
 }
 
+/**
+ * The wrapper in sodium-native 5 hands every buffer to the binding as its backing ArrayBuffer followed
+ * by a byte offset and a byte length, so a call that looks like four typed arrays arrives as twelve
+ * arguments. Fold each (ArrayBuffer, offset, length) triple back into one view before the binding sees
+ * it, which is what the add-on receives on Node: the add-on's own parameters are typed arrays.
+ */
+function foldBufferTriples(args: IArguments): unknown[] {
+    const folded: unknown[] = [];
+    let index = 0;
+    while (index < args.length) {
+        const value = args[index];
+        const offset = args[index + 1];
+        const length = args[index + 2];
+        if (value instanceof ArrayBuffer && typeof offset === 'number' && typeof length === 'number') {
+            folded.push(new Uint8Array(value, offset, length));
+            index += 3;
+            continue;
+        }
+        folded.push(value);
+        index++;
+    }
+    return folded;
+}
+
 /** A binding function as Napi::Function::New makes it: no name, length 0, any arguments. */
-export function napiFunction(impl: (args: IArguments) => unknown): Function {
+/** Rebuild the arguments object the bindings expect from the folded values. */
+function asArguments(values: unknown[]): IArguments {
+    const rebuilt: { [index: number]: unknown; length: number } = { length: values.length };
+    for (let i = 0; i < values.length; i++) rebuilt[i] = values[i];
+    return rebuilt as unknown as IArguments;
+}
+
+/**
+ * The add-on's crypto_ bindings return a status the caller checks, and sodium-native 5 throws
+ * "status: undefined" when a binding returns nothing. Return 0 for those: success, which is what the
+ * add-on returns, and leave the bindings that legitimately return a value alone.
+ */
+function withStatus(impl: (args: IArguments) => unknown): (args: IArguments) => unknown {
+    return function (args: IArguments): unknown {
+        const result = impl(args);
+        return result === undefined ? 0 : result;
+    };
+}
+
+export function napiFunction(impl: (args: IArguments) => unknown, name?: string): Function {
+    const bound = name && name.startsWith('crypto_') ? withStatus(impl) : impl;
     const fn = function () {
-        return impl(arguments);
+        const args =
+            arguments.length && arguments[0] instanceof ArrayBuffer ? asArguments(foldBufferTriples(arguments)) : arguments;
+        return bound(args);
     };
     Object.defineProperty(fn, 'name', { value: '' });
     return fn;

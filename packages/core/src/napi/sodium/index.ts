@@ -99,8 +99,22 @@ const KX_SESSIONKEYBYTES = 32;
 /** The nonce of randombytes_buf_deterministic, which libsodium spells out in randombytes.c. */
 const DETERMINISTIC_NONCE = new Uint8Array([0x4c, 0x69, 0x62, 0x73, 0x6f, 0x64, 0x69, 0x75, 0x6d, 0x44, 0x52, 0x47]);
 
-function randombytes_buf(args: IArguments): undefined {
+function randombytes_buf(args: IArguments): undefined | Uint8Array {
     argv(args, 1, 'randombytes_buf');
+    // Two shapes: randombytes_buf(size) hands back a new buffer, and randombytes_buf(buf) fills one. The
+    // wrapper in sodium-native 5 also passes the backing ArrayBuffer with an offset and a length.
+    if (typeof args[0] === 'number') {
+        const size = uint32(args[0], 'size');
+        const generated = allocBuffer(size);
+        generated.set(randomValues(size));
+        return generated;
+    }
+    if (args[0] instanceof ArrayBuffer) {
+        const offset = uint32(args[1], 'byteOffset');
+        const length = uint32(args[2], 'byteLength');
+        new Uint8Array(args[0], offset, length).set(randomValues(length));
+        return undefined;
+    }
     const buf = typedArray(args[0], 'buf');
     buf.set(randomValues(buf.length));
     return undefined;
@@ -123,6 +137,71 @@ function randombytes_random(): number {
 function randombytes_uniform(args: IArguments): number {
     argv(args, 1, 'randombytes_uniform');
     return uniform(uint32(args[0], 'upper_bound'));
+}
+
+/*
+ * The guarded heap. The container cannot place guard pages around an allocation and cannot lock it, so
+ * sodium_malloc returns an ordinary zero-filled Buffer, sodium_free zeroes it, and sodium_mprotect_*
+ * and sodium_mlock do nothing and report success. These are hardening operations: they do not change
+ * any computed value, and refusing them throws at module load in packages such as sodium-native 3.x,
+ * which would take the caller down before it runs. The reason is printed once so it is not silent.
+ */
+const GUARDED_HEAP_NOTE =
+    'sodium-native: the container has no guarded heap and cannot lock memory, so sodium_malloc returns an ordinary zero-filled Buffer and sodium_mprotect_* and sodium_mlock do nothing';
+let guardedHeapWarned = false;
+
+function warnGuardedHeap(): void {
+    if (guardedHeapWarned) return;
+    guardedHeapWarned = true;
+    const console = (globalThis as { console?: { warn?: (message: string) => void } }).console;
+    try {
+        console?.warn?.(GUARDED_HEAP_NOTE);
+    } catch {
+        /* no console to warn on */
+    }
+}
+
+function allocBuffer(size: number): Uint8Array {
+    const BufferCtor = (globalThis as { Buffer?: { alloc(size: number): Uint8Array } }).Buffer;
+    return typeof BufferCtor?.alloc === 'function' ? BufferCtor.alloc(size) : new Uint8Array(size);
+}
+
+function sodium_malloc(args: IArguments): Uint8Array {
+    argv(args, 1, 'sodium_malloc');
+    warnGuardedHeap();
+    return allocBuffer(uint32(args[0], 'size'));
+}
+
+function sodium_free(args: IArguments): undefined {
+    argv(args, 1, 'sodium_free');
+    warnGuardedHeap();
+    typedArray(args[0], 'buf').fill(0);
+    return undefined;
+}
+
+function sodiumMprotect(name: string): (args: IArguments) => undefined {
+    return function (args: IArguments): undefined {
+        argv(args, 1, name);
+        typedArray(args[0], 'buf');
+        warnGuardedHeap();
+        return undefined;
+    };
+}
+
+function sodium_mlock(args: IArguments): number {
+    argv(args, 2, 'sodium_mlock');
+    typedArray(args[0], 'buf');
+    uint32(args[1], 'len');
+    warnGuardedHeap();
+    return 0;
+}
+
+function sodium_munlock(args: IArguments): number {
+    argv(args, 2, 'sodium_munlock');
+    typedArray(args[0], 'buf');
+    uint32(args[1], 'len');
+    warnGuardedHeap();
+    return 0;
 }
 
 function sodium_memzero(args: IArguments): undefined {
@@ -447,7 +526,9 @@ function crypto_generichash(args: IArguments): undefined {
     assertMinLength(out.length, GENERICHASH_BYTES_MIN, 'out', 'crypto_generichash_BYTES_MIN');
     assertMaxLength(out.length, GENERICHASH_BYTES_MAX, 'out', 'crypto_generichash_BYTES_MAX');
     const key = args.length > 2 ? typedArray(args[2], 'key') : optionalTypedArray(undefined, 'key');
-    if (args.length > 2) {
+    // A zero-length key hashes without one, which is what libsodium does with a NULL key; the wrapper in
+    // sodium-native 5 passes an empty key when the caller gives none.
+    if (args.length > 2 && key.length !== 0) {
         throws(key.length < GENERICHASH_KEYBYTES_MIN, 'key');
         assertMaxLength(key.length, GENERICHASH_KEYBYTES_MAX, 'key', 'crypto_generichash_KEYBYTES_MAX');
     }
@@ -859,7 +940,14 @@ const IMPLEMENTED: Readonly<Record<string, (args: IArguments) => unknown>> = {
     sodium_is_zero,
     sodium_memcmp,
     sodium_memzero,
-    sodium_sub
+    sodium_sub,
+    sodium_malloc,
+    sodium_free,
+    sodium_mprotect_noaccess: sodiumMprotect('sodium_mprotect_noaccess'),
+    sodium_mprotect_readonly: sodiumMprotect('sodium_mprotect_readonly'),
+    sodium_mprotect_readwrite: sodiumMprotect('sodium_mprotect_readwrite'),
+    sodium_mlock,
+    sodium_munlock
 };
 
 /** Why the add-on's remaining functions are not computed here. */
@@ -913,13 +1001,6 @@ const UNSUPPORTED_REASONS: Readonly<Record<string, string>> = {
     crypto_stream_salsa20_xor_init: 'streaming state is a native struct in a caller-owned buffer',
     crypto_stream_salsa20_xor_update: 'streaming state is a native struct in a caller-owned buffer',
     crypto_stream_salsa20_xor_final: 'streaming state is a native struct in a caller-owned buffer',
-    sodium_mlock: 'no memory protection in the guest',
-    sodium_munlock: 'no memory protection in the guest',
-    sodium_malloc: 'no guarded heap in the guest',
-    sodium_free: 'no guarded heap in the guest',
-    sodium_mprotect_noaccess: 'no memory protection in the guest',
-    sodium_mprotect_readonly: 'no memory protection in the guest',
-    sodium_mprotect_readwrite: 'no memory protection in the guest',
     sodium_pad: 'not part of the shimmed surface',
     sodium_unpad: 'not part of the shimmed surface'
 };
@@ -935,7 +1016,7 @@ export function createAddon(): object {
     for (const name of SODIUM_FUNCTION_NAMES) {
         const impl = IMPLEMENTED[name];
         addon[name] = impl
-            ? napiFunction(impl)
+            ? napiFunction(impl, name)
             : napiFunction(() => {
                   throw unsupportedError(name, UNSUPPORTED_REASONS[name] || DEFAULT_UNSUPPORTED_REASON);
               });

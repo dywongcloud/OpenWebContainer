@@ -18,8 +18,14 @@ export interface InstallReport {
     added: string[];
 }
 
-/** Runs `node` with `args` in `cwd`, with extra environment variables; resolves to the exit code. */
-export type ScriptRunner = (args: string[], cwd: string, env: Record<string, string>) => Promise<number>;
+/** What a lifecycle script did: the exit code npm decides the install on, and the output npm prints when it failed. */
+export interface ScriptRunResult {
+    exitCode: number;
+    output: string;
+}
+
+/** Runs `node` with `args` in `cwd`, with extra environment variables; resolves to what the script did. */
+export type ScriptRunner = (args: string[], cwd: string, env: Record<string, string>) => Promise<ScriptRunResult>;
 
 interface Edge {
     requesterDir: string;
@@ -207,9 +213,17 @@ export class NpmInstaller {
                     this.log(`skipped ${event} script of ${name}@${version}: only "node <file>" and "node -e <code>" run in this runtime`);
                     continue;
                 }
-                const exitCode = await this.runScript(args, dir, env);
+                const result = await this.runScript(args, dir, env);
+                const exitCode = result.exitCode;
                 if (exitCode !== 0) {
-                    throw Object.assign(new Error(`npm error code ${exitCode}\nnpm error path ${dir}\nnpm error command failed\nnpm error command sh -c ${command}`), { exitCode });
+                    /* npm prints the failing script's own output as npm error lines, so the install
+                       failure names its cause (a binary this container cannot spawn, say) instead of
+                       leaving only an exit code beside a stack the reader has to go and find. */
+                    const cause = scriptErrorLines(result.output);
+                    throw Object.assign(
+                        new Error(`npm error code ${exitCode}\nnpm error path ${dir}\nnpm error command failed\nnpm error command sh -c ${command}${cause}`),
+                        { exitCode }
+                    );
                 }
             }
         }
@@ -308,6 +322,16 @@ export class NpmInstaller {
         const name = root.split('/').filter(Boolean).pop() || 'project';
         this.writeManifest(root, { name, version: '1.0.0' });
     }
+}
+
+/** The cause lines of a failed script's output as npm error lines: the messages, not their stack frames. */
+function scriptErrorLines(output: string): string {
+    const lines = output
+        .replace(/\r/g, '')
+        .split('\n')
+        .filter((line) => line.trim() !== '' && !/^\s/.test(line));
+    if (lines.length === 0) return '';
+    return '\n' + lines.slice(-6).map((line) => `npm error ${line}`).join('\n');
 }
 
 /** The range npm writes to package.json for a spec: ranges as given, exact versions and tags as ^resolved. */

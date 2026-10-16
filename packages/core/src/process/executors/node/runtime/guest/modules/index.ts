@@ -13,6 +13,7 @@ import { SRC as HTTP2_SRC } from './http2';
 import { SRC as WEB_STREAMS_SRC } from './web-streams';
 import { SRC as WEB_EVENTS_SRC } from './web-events';
 import { SRC as INTL_SRC } from './intl';
+import { SRC as UNDICI_SRC } from './undici';
 import { NAPI_SRCS } from './napi';
 
 /** Module families, each defining its built-ins as BF.<name> factories. Order matters only for globals. */
@@ -32,5 +33,6 @@ export const MODULE_SRCS: string[] = [
     WEB_EVENTS_SRC,
     WEB_STREAMS_SRC,
     INTL_SRC,
+    UNDICI_SRC,
     ...NAPI_SRCS
 ];

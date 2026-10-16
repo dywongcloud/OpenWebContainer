@@ -371,6 +371,40 @@ interface SyncShell {
     state?: ShellState;
     /** Set when a builtin ended the shell (`exec`, or an `exit` inside `eval`): no later command runs. */
     stopped?: boolean;
+    /** The background jobs of this line: `cmd &` adds one, `jobs` lists them and `wait` runs them. */
+    jobs?: ShellJob[];
+}
+
+/**
+ * One command started with `&`.
+ *
+ * The guest runs as one synchronous call on the host, so nothing can run alongside the shell: a job
+ * is *started* only in the sense that the shell no longer waits for it -- its words are kept here
+ * and run either by `wait`, or when the line's own foreground commands are through. It is never
+ * dropped, and it never waits on host work that cannot finish inside the call: a job that would
+ * block fails with the same ERR_NOT_SUPPORTED the foreground path gives.
+ */
+interface ShellJob {
+    /** The number `jobs` prints in `[1]`, and `%1` names. */
+    id: number;
+    /** The pid `&` prints and `$!` holds. */
+    pid: number;
+    /** The command as it was written, for `jobs`. */
+    text: string;
+    /** The pipeline to run, its `|` already split out. */
+    stages: RawWord[][];
+    /** Run to completion: `wait` no longer has anything to wait for. */
+    done: boolean;
+    /** The status it left, once it has run. */
+    exitCode: number;
+}
+
+/** Pids of background jobs, counted apart from the container's own processes and from sync children. */
+let nextBackgroundPid = 62000;
+
+/** The jobs of this shell, made on the first one. */
+function jobsOf(shell: SyncShell): ShellJob[] {
+    return (shell.jobs ??= []);
 }
 
 const SHELL_BUILTINS = new Set(['echo', 'cat', 'pwd', 'ls', 'mkdir', 'rm', 'rmdir', 'touch', 'cd', 'cp', 'mv', 'true', 'false']);
@@ -782,18 +816,21 @@ function shellBuiltinWithRedirects(shell: SyncShell, command: string, args: stri
 interface ShellSegment {
     words: RawWord[];
     op: ';' | '&&' | '||' | null;
+    /** Ended by a trailing `&`: started as a background job, and `$?` after it is 0 whatever it leaves. */
+    background: boolean;
 }
 
 /**
- * Splits a command line on `;`, `&&` and `||`. A quoted run holds an operator, so it is copied
- * whole. A trailing operator leaves a final segment with no command, which the runner skips.
+ * Splits a command line on `;`, `&&`, `||` and a lone `&`. A quoted run holds an operator, so it is
+ * copied whole. A trailing operator leaves a final segment with no command, which the runner skips.
  */
 function splitCommandList(line: string): ShellSegment[] {
     const segments: ShellSegment[] = [];
     let text = '';
     let op: ';' | '&&' | '||' | null = null;
-    const push = (): void => {
-        segments.push({ words: tokenizeLine(text), op });
+    const push = (background = false): void => {
+        const words = tokenizeLine(text);
+        if (words.length > 0) segments.push({ words, op, background });
         text = '';
     };
     let i = 0;
@@ -824,6 +861,12 @@ function splitCommandList(line: string): ShellSegment[] {
             push();
             op = ch === '&' ? '&&' : '||';
             i += 2;
+        } else if (ch === '&' && isBackgroundAmp(line, i)) {
+            // a lone & ends the command before it and starts it in the background; what follows runs
+            // whatever that command leaves, so it joins the next one the way `;` does
+            push(true);
+            op = ';';
+            i++;
         } else {
             // a `$( )` or backquoted construct holds an operator too
             const span = constructSpan(line, i);
@@ -832,8 +875,10 @@ function splitCommandList(line: string): ShellSegment[] {
                 i = span;
                 continue;
             }
-            // a lone & (a background job) is not an operator this shell runs; a lone | is left
-            // in the words here and splits the command into a pipeline in splitPipeline
+            // a lone & (a background job) is not split out of the text here: `2>&1` and `>&2` hold
+            // one too, so it is recognised as a word after tokenizing, where the quoting is known.
+            // A lone | is left in the words here and splits the command into a pipeline in
+            // splitPipeline
             text += ch;
             i++;
         }
@@ -1086,6 +1131,19 @@ function rawIs(word: RawWord, text: string): boolean {
     return word.length === 1 && word[0].expand && word[0].text === text;
 }
 
+/**
+ * True for the `&` at `i`, which ends a command in the background. One that belongs to a redirection
+ * is not one: `2>&1` and `>&2` write it next to a `>`, and `&>file` opens with it. Neither is a `&&`,
+ * which the branch above has already taken. A quoted run, a `$( )`, a `${ }` and a backquoted
+ * construct are copied whole before this is ever reached, so the `&` one of those holds is safe.
+ */
+function isBackgroundAmp(line: string, i: number): boolean {
+    const before = line[i - 1];
+    const after = line[i + 1];
+    if (after === '>' || after === '<') return false;
+    return before !== '>' && before !== '<';
+}
+
 /** What a word expands to: `text` plus `split` (field splitting applies) and, for `"$@"`, the field boundary. */
 interface ExpandAtom {
     text: string;
@@ -1151,8 +1209,9 @@ function valueOfName(shell: SyncShell, name: string): string {
             return String(positionalOf(shell).length);
         case '$':
             return '1';
+        // `$!`: the pid the last `&` printed, now that this shell starts background jobs
         case '!':
-            return '0';
+            return String(shell.state?.lastBackgroundPid ?? 0);
         case '-':
             return '';
         default:
@@ -1207,6 +1266,8 @@ function runSubstitution(shell: SyncShell, script: string): { text: string; stat
         input: shell.input,
         name: shell.name,
         lastStatus: shell.lastStatus,
+        // one job table: a job a substitution started is the shell's own, and `wait` can wait for it
+        jobs: shell.jobs,
         state: shell.state
     };
     const step = shellLine(child, script);
@@ -2062,6 +2123,127 @@ function shellPipeline(shell: SyncShell, stages: RawWord[][]): ShellStep {
     return { stdout: step.stdout, stderr: stderr + step.stderr, exitCode };
 }
 
+/** The command as `jobs` prints it: the words of every stage, joined as they were written. */
+function jobText(stages: RawWord[][]): string {
+    return stages.map((stage) => stage.map(rawText).join(' ')).join(' | ');
+}
+
+/**
+ * `cmd &`: records the job and prints the line a shell prints for one, without running it. The
+ * shell's own `$?` after it is 0, as it is after any command it does not wait for, and `$!` is the
+ * pid it printed.
+ */
+function startBackgroundJob(shell: SyncShell, stages: RawWord[][]): ShellStep {
+    const jobs = jobsOf(shell);
+    const id = jobs.reduce((high, job) => Math.max(high, job.id), 0) + 1;
+    const job: ShellJob = { id, pid: nextBackgroundPid++, text: jobText(stages), stages, done: false, exitCode: 0 };
+    jobs.push(job);
+    // `$!` lives in the state the builtins share, so it is the same pid `wait` and `$!` see
+    shellStateFor(shell).lastBackgroundPid = job.pid;
+    return { stdout: `[${id}] ${job.pid}\n`, stderr: '', exitCode: 0 };
+}
+
+/** Runs one job to completion. A job is a subshell: what it does to the directory and to `$?` stays in it. */
+function runJob(shell: SyncShell, job: ShellJob): ShellStep {
+    const savedCwd = shell.cwd;
+    const savedStatus = shell.lastStatus;
+    const savedStopped = shell.stopped;
+    try {
+        const step = shellPipeline(shell, job.stages);
+        job.done = true;
+        job.exitCode = step.exitCode;
+        return step;
+    } finally {
+        shell.cwd = savedCwd;
+        shell.lastStatus = savedStatus;
+        shell.stopped = savedStopped;
+        if (shell.state !== undefined) {
+            shell.state.cwd = savedCwd;
+            shell.state.lastStatus = savedStatus;
+        }
+    }
+}
+
+/**
+ * Runs every job of the line that has not run yet, in the order it was started. This is what a
+ * background job means on a host that runs one command at a time: the command is not waited for
+ * where it is written, and it is run -- with its output kept -- once the line's foreground is
+ * through, or the moment `wait` asks for it.
+ */
+function runPendingJobs(shell: SyncShell): ShellStep {
+    const jobs = shell.jobs;
+    if (jobs === undefined) return { stdout: '', stderr: '', exitCode: 0 };
+    let stdout = '';
+    let stderr = '';
+    for (const job of jobs) {
+        if (job.done) continue;
+        const step = runJob(shell, job);
+        stdout += step.stdout;
+        stderr += step.stderr;
+    }
+    return { stdout, stderr, exitCode: 0 };
+}
+
+/** The job `wait` or `jobs` names: `%2` is the second job, a bare number is a pid. */
+function findJob(shell: SyncShell, name: string): ShellJob | undefined {
+    const jobs = jobsOf(shell);
+    if (name.startsWith('%')) {
+        const spec = name.slice(1);
+        const last = jobs[jobs.length - 1];
+        if (spec === '+' || spec === '%' || spec === '') return last;
+        if (spec === '-') return jobs[jobs.length - 2];
+        return jobs.find((job) => job.id === Number(spec));
+    }
+    const pid = Number(name);
+    return Number.isNaN(pid) ? undefined : jobs.find((job) => job.pid === pid);
+}
+
+/**
+ * `jobs` and `wait`, the two commands the job table answers. They are reached here rather than
+ * through the builtin of `builtins.ts`, which knows of no jobs: its `jobs` prints nothing and its
+ * `wait` knows no child, because the state it reads keeps no job table for the host to fill.
+ */
+function shellJobControl(shell: SyncShell, command: string, args: string[]): ShellStep {
+    const jobs = jobsOf(shell);
+    if (command === 'jobs') {
+        let long = false;
+        let pidOnly = false;
+        for (const arg of args) {
+            if (arg === '-l') long = true;
+            else if (arg === '-p') pidOnly = true;
+            else if (arg === '-r' || arg === '-s' || arg === '-n') continue;
+        }
+        const current = jobs[jobs.length - 1];
+        const previous = jobs[jobs.length - 2];
+        const line = (job: ShellJob): string => {
+            if (pidOnly) return `${job.pid}\n`;
+            const marker = job === current ? '+' : job === previous ? '-' : ' ';
+            const state = job.done ? 'Done' : 'Running';
+            return `[${job.id}]${marker} ${long ? `${job.pid} ` : ''}${state.padEnd(24)}${job.text} &\n`;
+        };
+        return { stdout: jobs.map(line).join(''), stderr: '', exitCode: 0 };
+    }
+    // `wait`: no argument waits for every job, as it does in a shell, and its status is 0
+    if (args.length === 0) return runPendingJobs(shell);
+    let stdout = '';
+    let stderr = '';
+    let exitCode = 0;
+    for (const arg of args) {
+        if (arg === '-n' || arg === '-f') continue;
+        const job = findJob(shell, arg);
+        if (job === undefined) {
+            stderr += `wait: ${arg}: not a child of this shell\n`;
+            exitCode = 127;
+            continue;
+        }
+        const step = job.done ? { stdout: '', stderr: '', exitCode: job.exitCode } : runJob(shell, job);
+        stdout += step.stdout;
+        stderr += step.stderr;
+        exitCode = step.exitCode;
+    }
+    return { stdout, stderr, exitCode };
+}
+
 /**
  * A line that opens with a compound command -- `if`, `for`, `while`, `until`, `case`, a `{ }` group,
  * a `( )` subshell or a function definition -- handed to the script engine of `builtins.ts`, which
@@ -2133,7 +2315,10 @@ function shellLine(shell: SyncShell, line: string): ShellStep {
         const segment = segments[i];
         if (segment.op === '&&' && exitCode !== 0) continue;
         if (segment.op === '||' && exitCode === 0) continue;
-        const step = shellPipeline(shell, pipelines[i] as RawWord[][]);
+        const step =
+            segment.background === true
+                ? startBackgroundJob(shell, pipelines[i] as RawWord[][])
+                : shellPipeline(shell, pipelines[i] as RawWord[][]);
         stdout += step.stdout;
         stderr += step.stderr;
         exitCode = step.exitCode;
@@ -2148,7 +2333,13 @@ function shellLine(shell: SyncShell, line: string): ShellStep {
             (i + 1 < segments.length && (segments[i + 1].op === '&&' || segments[i + 1].op === '||'));
         if (!operand && shell.state?.options.errexit === true && exitCode !== 0) break;
     }
-    return runExitTrap(shell, { stdout, stderr, exitCode });
+    // a job no one waited for cannot outlive the line on a host that runs one command at a time, so
+    // it runs here, after the foreground is through: started late rather than never, and never before
+    const flushed = runPendingJobs(shell);
+    const trapped = runExitTrap(shell, { stdout: stdout + flushed.stdout, stderr: stderr + flushed.stderr, exitCode });
+    // a job the EXIT trap itself started is run the same way
+    const afterTrap = runPendingJobs(shell);
+    return { stdout: trapped.stdout + afterTrap.stdout, stderr: trapped.stderr + afterTrap.stderr, exitCode: trapped.exitCode };
 }
 
 /**
@@ -2167,6 +2358,23 @@ function runExitTrap(shell: SyncShell, step: ShellStep): ShellStep {
     return { stdout: step.stdout + fired.stdout, stderr: step.stderr + fired.stderr, exitCode: step.exitCode };
 }
 
+/** The version `curl --version` and `wget --version` report: the one in packages/core/package.json. */
+const CONTAINER_VERSION = '0.1.0';
+
+/**
+ * `curl --version` and `wget --version`: the two words of `SHELL_EXTERNALS` that name no request,
+ * so they can be answered without a network. What is printed is the container's own version of the
+ * two, and it says so: a fetch here is `fetch`, not a libcurl or a GNU build, and a line that only
+ * looks like the host's would be a lie. Anything else -- a URL, an option, no argument at all --
+ * falls through to the honest failure it gives today.
+ */
+function externalVersion(command: string, args: string[]): string | null {
+    if (command !== 'curl' && command !== 'wget') return null;
+    if (args.length === 0 || !args.every((arg) => arg === '--version' || arg === '-V')) return null;
+    if (command === 'curl') return `curl ${CONTAINER_VERSION} (OpenWebContainer)\nProtocols: http https\nFeatures: fetch\n`;
+    return `Wget ${CONTAINER_VERSION} (OpenWebContainer)\n`;
+}
+
 /** ShellProcess.executeCommand for one command, in the same order of dispatch. */
 function shellCommand(shell: SyncShell, words: string[]): ShellStep {
     if (words.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
@@ -2177,7 +2385,11 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
             return { stdout: '', stderr: '', exitCode: Number.isNaN(status) ? 0 : status };
         }
         if (command === 'history') return { stdout: '', stderr: '', exitCode: 0 };
+        // `jobs` and `wait` answer the job table this dispatcher keeps for `&`
+        if (command === 'jobs' || command === 'wait') return shellJobControl(shell, command, cmdArgs);
         if (SHELL_BUILTINS.has(command)) return shellBuiltinWithRedirects(shell, command, cmdArgs);
+        const version = externalVersion(command, cmdArgs);
+        if (version !== null) return { stdout: version, stderr: '', exitCode: 0 };
         if (SHELL_EXTERNALS.has(command)) throw notSupportedSync(`the shell command ${command}`);
         if (command === 'node' || command === NODE_BINARY) return shellNode(shell, nodeInvocation(cmdArgs));
         // A builtin is never looked for on PATH, the way it never is in a shell: `.` is the source
