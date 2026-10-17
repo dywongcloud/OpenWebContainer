@@ -22,10 +22,10 @@ export class NodeResolver {
 
     resolve(specifier: string, fromDir: string, mode: ResolveMode): string | undefined {
         if (specifier.startsWith('/')) {
-            return this.resolveAsPath(normalizeAbsolute(specifier), mode);
+            return this.resolveAsPath(normalizeAbsolute(specifier), mode, mode === 'import');
         }
         if (isRelativeSpecifier(specifier)) {
-            return this.resolveAsPath(normalizeAbsolute(joinPaths(fromDir, specifier)), mode);
+            return this.resolveAsPath(normalizeAbsolute(joinPaths(fromDir, specifier)), mode, mode === 'import');
         }
         if (specifier.startsWith('#')) {
             return this.resolveImportsField(specifier, fromDir, mode);
@@ -61,9 +61,15 @@ export class NodeResolver {
             || /^(?:await\s|(?:const|let|var)\s+[^=\n]+=\s*await\s)/m.test(code);
     }
 
-    private resolveAsPath(target: string, mode: ResolveMode): string | undefined {
+    /**
+     * Resolves a path as a file. `exactOnly` is the ESM rule for a relative or absolute specifier:
+     * the path names the file itself, so no extension is added, no directory index is read and no
+     * "main" is consulted -- the same specifier that Node would fail to find fails here too.
+     */
+    private resolveAsPath(target: string, mode: ResolveMode, exactOnly = false): string | undefined {
         const direct = this.fileSystem.statPath(target);
         if (direct?.type === 'file') return target;
+        if (exactOnly) return undefined;
         for (const ext of FILE_EXTENSIONS) {
             if (this.fileSystem.statPath(target + ext)?.type === 'file') return target + ext;
         }

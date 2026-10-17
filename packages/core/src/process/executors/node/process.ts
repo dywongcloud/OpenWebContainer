@@ -440,9 +440,13 @@ export class NodeProcess extends Process {
             `globalThis.__owc_esm_registry[${token}] = __owc_ns;\n`;
         const result = context.evalCode(source, `${file}?owc-require`, { type: 'module' });
         if (result.error) {
-            const failure = String(context.dump(result.error));
+            const dumped = context.dump(result.error) as { message?: unknown } | string | null | undefined;
             result.error.dispose();
-            return failure;
+            // the engine dumps a thrown guest error as an object; require() reports its message,
+            // not the object the dump would stringify to
+            if (typeof dumped === 'string') return dumped;
+            if (dumped !== null && typeof dumped === 'object' && typeof dumped.message === 'string') return dumped.message;
+            return String(dumped);
         }
         result.value.dispose();
         this.drainJobs();
@@ -686,7 +690,12 @@ export class NodeProcess extends Process {
      * unchanged.
      */
     private esmSource(source: string, file: string, isMain: boolean): string {
-        const prepared = prepareEsmSource(source, file, isMain);
+        const duplicate = duplicateModuleBinding(source, file);
+        if (duplicate !== undefined) throw new GuestFailure(duplicate);
+        const prepared = prepareEsmSource(source, file, isMain, (spec) => {
+            const found = this.resolver.resolve(spec, dirnameOf(file), 'import');
+            return found === undefined ? undefined : toFileUrl(found);
+        });
         if (!CLASS_ELEMENT_CANDIDATE.test(prepared)) return prepared;
         const sourceArg = this.context!.newString(prepared);
         let rewritten: string;
@@ -729,12 +738,26 @@ export class NodeProcess extends Process {
     private normalizeModule(baseName: string | undefined, requestedName: string): string | { error: Error } {
         const missingAttribute = requestedName.endsWith(MISSING_ATTRIBUTE_MARK);
         const spec = missingAttribute ? requestedName.slice(0, -MISSING_ATTRIBUTE_MARK.length) : requestedName;
+        if (spec.startsWith(ERROR_MODULE_PREFIX)) return spec;
         const bare = spec.startsWith('node:') ? spec.slice('node:'.length) : spec;
         if (this.builtinNames.has(bare)) return `builtin:${bare}`;
         const baseDir = baseName && baseName.startsWith('/') ? dirnameOf(baseName) : (this.cwd ?? '/');
         const found = this.resolver.resolve(spec, baseDir, 'import');
         if (!found) {
-            this.lastResolveError = new Error(`Cannot find module '${spec}'${baseName ? ` imported from ${baseName}` : ''}`);
+            const scheme = unsupportedScheme(spec);
+            // Node reports a specifier no loader can read as an unsupported scheme, and one that
+            // resolves to no file as ERR_MODULE_NOT_FOUND; the code is what user code branches on.
+            const code = scheme === undefined ? 'ERR_MODULE_NOT_FOUND' : 'ERR_UNSUPPORTED_ESM_URL_SCHEME';
+            // Node names the module it looked for by its absolute path, and a bare specifier by itself
+            const target = spec.startsWith('/') ? normalizeAbsolute(spec)
+                : spec === '.' || spec === '..' || spec.startsWith('./') || spec.startsWith('../')
+                    ? normalizeAbsolute(joinPaths(baseDir, spec))
+                    : spec;
+            const message = scheme === undefined
+                ? `Cannot find module '${target}'${baseName ? ` imported from ${baseName}` : ''}`
+                : `Only URLs with a scheme in: file, data, and node are supported by the default ESM loader. Received protocol '${scheme}'`;
+            this.lastResolveError = Object.assign(new Error(message), { code });
+            this.setImportFailureCode(code);
             return { error: this.lastResolveError };
         }
         if (missingAttribute) {
@@ -745,6 +768,24 @@ export class NodeProcess extends Process {
             }));
         }
         return found;
+    }
+
+    /**
+     * Publishes the code of the import failure the host just raised. The engine rebuilds a loader
+     * error as a plain Error and drops everything else on it, so the code travels through the guest
+     * instead: the wrapper the ES module source puts around every dynamic import reads it back and
+     * sets it on the rejection.
+     */
+    private setImportFailureCode(code: string): void {
+        const context = this.context;
+        if (context === undefined) return;
+        try {
+            const value = context.newString(code);
+            context.setProp(context.global, "__owc_import_failure", value);
+            value.dispose();
+        } catch {
+            // a guest that is already gone cannot carry the code; the message still reports it
+        }
     }
 
     /**
@@ -1143,23 +1184,86 @@ function destructuringDeclaration(tokens: JsToken[], exportIndex: number, names:
     }
 }
 
-function isJsonAttributeClause(tokens: JsToken[], from: number, to: number): boolean {
-    for (let k = from; k + 2 < to; k++) {
+/** The `key: 'value'` pairs of an attribute clause, in source order. */
+function attributeEntries(tokens: JsToken[], from: number, to: number): { name: string; value: string }[] {
+    const entries: { name: string; value: string }[] = [];
+    for (let k = from; k < to; k++) {
         const key = tokens[k];
         if (key.t !== 'id' && key.t !== 'str') continue;
-        const name = key.t === 'str' ? cookString(key) : key.v;
-        if (name === 'type' && isPunc(tokens[k + 1], ':') && tokens[k + 2].t === 'str' && cookString(tokens[k + 2]) === 'json') return true;
+        if (!isPunc(tokens[k + 1], ':')) continue;
+        const value = tokens[k + 2];
+        if (value === undefined || value.t !== 'str') continue;
+        entries.push({ name: key.t === 'str' ? cookString(key) : key.v, value: cookString(value) });
+        k += 2;
     }
-    return false;
+    return entries;
+}
+
+/**
+ * The Node error an import attribute clause raises: an attribute that is not `type`, or a type the
+ * loader does not support, is ERR_IMPORT_ATTRIBUTE_UNSUPPORTED, and `type: 'json'` on a module that
+ * is not JSON is ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE. `with { type: 'json' }` on a .json module
+ * is accepted, and a specifier that resolves to nothing is left to fail as ERR_MODULE_NOT_FOUND.
+ */
+function importAttributeFailure(
+    attributes: { name: string; value: string }[],
+    specText: string,
+    url: string | undefined
+): { code: string; message: string } | undefined {
+    if (url === undefined) return undefined;
+    for (const attribute of attributes) {
+        if (attribute.name !== 'type') {
+            return { code: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', message: `Import attribute "${attribute.name}" with value "${attribute.value}" is not supported in ${url}` };
+        }
+        if (attribute.value !== 'json') {
+            return { code: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', message: `Import attribute "type" with value "${attribute.value}" is not supported in ${url}` };
+        }
+    }
+    if (attributes.some(attribute => attribute.name === 'type') && !specText.endsWith('.json')) {
+        return { code: 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE', message: `Module "${url}" is not of type "json"` };
+    }
+    return undefined;
+}
+
+/** The names an import declaration binds, so a module replacing its specifier still links. */
+function importBindingNames(tokens: JsToken[], i: number): string[] {
+    const names: string[] = [];
+    if (isPunc(tokens[i + 1], '*')) return names;
+    const namedFrom = isPunc(tokens[i + 1], '{') ? i + 1
+        : isId(tokens[i + 1], 'as') || isPunc(tokens[i + 2], ',') ? (tokens[i + 3] !== undefined && isPunc(tokens[i + 3], '{') ? i + 3 : -1)
+        : -1;
+    if (tokens[i + 1]?.t === 'id' && !isId(tokens[i + 1], 'from')) names.push(tokens[i + 1].v);
+    if (namedFrom < 0) return names;
+    const close = matchingClose(tokens, namedFrom);
+    if (close < 0) return names;
+    for (let k = namedFrom + 1; k < close; k++) {
+        const tok = tokens[k];
+        if (tok.t !== 'id') continue;
+        if (isId(tokens[k + 1], 'as') && tokens[k + 2]?.t === 'id') {
+            names.push(tokens[k + 2].v);
+            k += 2;
+        } else {
+            names.push(tok.v);
+        }
+    }
+    return names;
 }
 
 /**
  * Rewrites the attribute clause of a static import or export-from declaration at `i`: a
- * `with { type: 'json' }` clause is removed (the engine cannot parse it); a .json specifier
- * without one gets the missing-attribute mark. The legacy `assert` clause is left alone, as
- * Node 24 rejects it at parse time.
+ * `with { type: 'json' }` clause is removed (the engine cannot parse it); a clause Node rejects
+ * makes the declaration import a module that throws the Node error, so the failure carries the
+ * right code instead of being ignored; a .json specifier without a clause gets the
+ * missing-attribute mark. The legacy `assert` clause is left alone, as Node 24 rejects it at parse
+ * time.
  */
-function rewriteModuleSpecifier(tokens: JsToken[], src: string, i: number, edits: SourceEdit[]): void {
+function rewriteModuleSpecifier(
+    tokens: JsToken[],
+    src: string,
+    i: number,
+    edits: SourceEdit[],
+    resolveUrl: (spec: string) => string | undefined
+): void {
     let specIndex = -1;
     if (tokens[i].v === 'import') {
         if (tokens[i + 1]?.t === 'str') {
@@ -1184,8 +1288,24 @@ function rewriteModuleSpecifier(tokens: JsToken[], src: string, i: number, edits
     const after = tokens[specIndex + 1];
     if (isId(after, 'with') && isPunc(tokens[specIndex + 2], '{')) {
         const close = matchingClose(tokens, specIndex + 2);
-        if (close > 0 && isJsonAttributeClause(tokens, specIndex + 3, close)) {
-            edits.push({ start: after.s, end: tokens[close].e, text: '' });
+        if (close > 0) {
+            const specText = cookString(spec);
+            const failure = importAttributeFailure(attributeEntries(tokens, specIndex + 3, close), specText, resolveUrl(specText));
+            if (failure === undefined) {
+                edits.push({ start: after.s, end: tokens[close].e, text: '' });
+            } else {
+                const info = {
+                    code: failure.code,
+                    message: failure.message,
+                    ctor: 'TypeError',
+                    exports: tokens[i].v === 'import' ? importBindingNames(tokens, i) : [],
+                };
+                edits.push({
+                    start: spec.s,
+                    end: tokens[close].e,
+                    text: JSON.stringify(ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify(info))),
+                });
+            }
         }
         return;
     }
@@ -1202,7 +1322,12 @@ function rewriteModuleSpecifier(tokens: JsToken[], src: string, i: number, edits
  * `export const { a } = ...` (a binding pattern the engine does not export) becomes a plain
  * declaration followed by an explicit export list.
  */
-function prepareEsmSource(source: string, file: string, isMain: boolean): string {
+function prepareEsmSource(
+    source: string,
+    file: string,
+    isMain: boolean,
+    resolveUrl: (spec: string) => string | undefined
+): string {
     if (!/\b(?:import|export)\b/.test(source)) return source;
     const tokens = tokenizeJs(source);
     const edits: SourceEdit[] = [];
@@ -1218,17 +1343,21 @@ function prepareEsmSource(source: string, file: string, isMain: boolean): string
                 i += 2;
             } else if (isPunc(next, '(')) {
                 const close = matchingClose(tokens, i + 1);
-                if (close > 0) {
+                // `import` is a legal class and object method name, so a parameter list followed by
+                // a body is a definition, not a dynamic import: rewriting it would break the module.
+                if (close > 0 && !isPunc(tokens[close + 1], '{')) {
+                    // the wrapper restores the code the engine drops from a loader error
+                    edits.push({ start: tok.s, end: tok.s, text: 'globalThis.__owc_importWrap(' });
                     edits.push({ start: next.e, end: next.e, text: 'globalThis.__owc_importArg(' });
-                    edits.push({ start: tokens[close].s, end: tokens[close].s, text: ')' });
+                    edits.push({ start: tokens[close].s, end: tokens[close].s, text: `, ${JSON.stringify(file)}))` });
                 }
             } else if (next !== undefined && (next.t === 'str' || next.t === 'id' || isPunc(next, '*') || isPunc(next, '{'))) {
-                rewriteModuleSpecifier(tokens, source, i, edits);
+                rewriteModuleSpecifier(tokens, source, i, edits, resolveUrl);
             }
         } else if (tok.v === 'export') {
             const next = tokens[i + 1];
             if (isPunc(next, '*') || isPunc(next, '{')) {
-                rewriteModuleSpecifier(tokens, source, i, edits);
+                rewriteModuleSpecifier(tokens, source, i, edits, resolveUrl);
             } else if (isId(next, 'const') || isId(next, 'let') || isId(next, 'var')) {
                 const names: string[] = [];
                 let pattern = false;
@@ -1259,11 +1388,110 @@ function prepareEsmSource(source: string, file: string, isMain: boolean): string
     return out;
 }
 
+/** True when the token can begin a declaration: at the start of a statement, after `export`, or after a newline ends one. */
+function startsDeclaration(tokens: JsToken[], i: number): boolean {
+    const prev = tokens[i - 1];
+    return prev === undefined || isPunc(prev, ';') || isPunc(prev, '}') || isId(prev, 'export') || isId(prev, 'default') || tokens[i].nl;
+}
+
+/** The 1-based line and column of `index` in `source`. */
+function lineColumnOf(source: string, index: number): { line: number; column: number } {
+    let line = 1;
+    let lineStart = 0;
+    for (let k = 0; k < index && k < source.length; k++) {
+        if (source[k] === '\n') {
+            line++;
+            lineStart = k + 1;
+        }
+    }
+    return { line, column: index - lineStart + 1 };
+}
+
+/**
+ * The SyntaxError Node gives for a module that binds one name twice at its top level, already
+ * formatted the way the process prints a failure; undefined when no name is bound twice.
+ * QuickJS accepts a name brought in by an import and declared again by the module itself, and
+ * accepts a redeclaration inside a block, so only names bound at module scope are counted.
+ * `var` and `function` redeclaration stays legal, as it is in Node.
+ */
+function duplicateModuleBinding(source: string, file: string): string | undefined {
+    const tokens = tokenizeJs(source);
+    const lexical = new Set<string>();
+    const hoisted = new Set<string>();
+    let depth = 0;
+    let paren = 0;
+    for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i];
+        if (tok.t === 'punc') {
+            if (tok.v === '{') depth++;
+            else if (tok.v === '}') depth--;
+            else if (tok.v === '(' || tok.v === '[') paren++;
+            else if (tok.v === ')' || tok.v === ']') paren--;
+            continue;
+        }
+        if (tok.t !== 'id' || depth !== 0 || paren !== 0 || !startsDeclaration(tokens, i)) continue;
+        if (isPunc(tokens[i - 1], '.') || isPunc(tokens[i - 1], '?.')) continue;
+        const names: string[] = [];
+        let lexicalBinding = true;
+        if (tok.v === 'import') {
+            if (isPunc(tokens[i + 1], '(') || isPunc(tokens[i + 1], '.')) continue;
+            names.push(...importBindingNames(tokens, i));
+        } else if (tok.v === 'function' || tok.v === 'class') {
+            const name = tokens[i + 1];
+            if (name === undefined || name.t !== 'id') continue;
+            names.push(name.v);
+            lexicalBinding = tok.v === 'class';
+        } else if (tok.v === 'const' || tok.v === 'let' || tok.v === 'var') {
+            lexicalBinding = tok.v !== 'var';
+            let k = i + 1;
+            for (;;) {
+                try {
+                    k = parseBindingTarget(tokens, k, names);
+                } catch (error) {
+                    if (!(error instanceof BindingPatternError)) throw error;
+                    break;
+                }
+                if (isPunc(tokens[k], '=')) k = skipExpression(tokens, k + 1);
+                if (!isPunc(tokens[k], ',')) break;
+                k++;
+            }
+        } else {
+            continue;
+        }
+        for (const name of names) {
+            // a lexical name is never rebound; a var or function name is, by another var or function
+            if (lexical.has(name) || (lexicalBinding && hoisted.has(name))) {
+                const at = lineColumnOf(source, tok.s);
+                return `SyntaxError: Identifier '${name}' has already been declared\n    at ${file}:${at.line}:${at.column}`;
+            }
+            if (lexicalBinding) lexical.add(name);
+            else hoisted.add(name);
+        }
+    }
+    return undefined;
+}
+
 /** The module source for a recorded error: evaluating it throws the error with its Node code. */
 function errorModuleSource(name: string): string {
-    const info = JSON.parse(decodeURIComponent(name.slice(ERROR_MODULE_PREFIX.length))) as { code: string; message: string };
-    // the default export exists so that a static import links; evaluation of the module then throws
-    return `export default undefined;\nthrow Object.assign(new TypeError(${JSON.stringify(info.message)}), { code: ${JSON.stringify(info.code)} });\n`;
+    const info = JSON.parse(decodeURIComponent(name.slice(ERROR_MODULE_PREFIX.length))) as { code: string; message: string; ctor?: string; exports?: string[] };
+    const ctor = info.ctor === 'Error' ? 'Error' : 'TypeError';
+    // the default export, and every name the importing declaration binds, exist so that a static
+    // import links; evaluation of the module then throws, which is where Node raises these errors
+    let source = 'export default undefined;\n';
+    for (const key of info.exports ?? []) {
+        if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) && !RESERVED_WORDS.has(key) && key !== 'default' && !key.startsWith('__owc')) {
+            source += `export const ${key} = undefined;\n`;
+        }
+    }
+    return source + `throw Object.assign(new ${ctor}(${JSON.stringify(info.message)}), { code: ${JSON.stringify(info.code)} });\n`;
+}
+
+/** A URL scheme no ESM loader can read, as Node names it; undefined for a path, a relative specifier or file, data and node. */
+function unsupportedScheme(spec: string): string | undefined {
+    const match = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(spec);
+    if (match === null) return undefined;
+    const scheme = match[1].toLowerCase();
+    return scheme === 'file' || scheme === 'data' || scheme === 'node' ? undefined : scheme + ':';
 }
 
 function toFileUrl(file: string): string {

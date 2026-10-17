@@ -356,15 +356,69 @@ function importMetaOf(filename, isMain) {
   return meta;
 }
 
-function importArgOf(spec, options) {
+function importUrlOf(spec, filename) {
+  var base = dirnameOf(typeof filename === 'string' && filename !== '' ? filename : host.cwd() + '/x');
+  var found = host.resolve(String(spec), base, 'import');
+  return found ? fileUrlOf(found) : undefined;
+}
+
+/* The module name of a module whose evaluation throws a recorded error: the host builds the module
+   from it, so an import Node rejects throws the error Node throws, code included. */
+function errorModuleOf(info) {
+  return 'owc-error:' + encodeURIComponent(JSON.stringify(info));
+}
+
+/* Import attributes on a dynamic import, the way Node reads them: an attribute that is not "type",
+   or a type the loader does not support, is ERR_IMPORT_ATTRIBUTE_UNSUPPORTED; "type": "json" on a
+   module that is not JSON is ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE; a .json module imported
+   without "type": "json" is ERR_IMPORT_ATTRIBUTE_MISSING. A specifier that resolves to nothing is
+   left alone, so it fails as a missing module, as it does in Node. */
+function importArgOf(spec, options, filename) {
   var s = String(spec);
-  if (s.slice(-5) !== '.json') return s;
-  var type = options && options.with ? options.with.type : undefined;
-  return type === 'json' ? s : s + ATTRIBUTE_MISSING;
+  var attrs = options && typeof options === 'object' && options.with && typeof options.with === 'object' ? options.with : null;
+  var isJson = s.slice(-5) === '.json';
+  var url = importUrlOf(s, filename);
+  if (attrs !== null && url !== undefined) {
+    var keys = Object.keys(attrs);
+    var failure = null;
+    var typeJson = false;
+    for (var k = 0; k < keys.length && failure === null; k++) {
+      var value = attrs[keys[k]];
+      if (keys[k] !== 'type') {
+        failure = { code: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', ctor: 'TypeError', message: 'Import attribute ' + JSON.stringify(keys[k]) + ' with value ' + JSON.stringify(String(value)) + ' is not supported in ' + url };
+      } else if (value !== 'json') {
+        failure = { code: 'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', ctor: 'TypeError', message: 'Import attribute "type" with value ' + JSON.stringify(String(value)) + ' is not supported in ' + url };
+      } else {
+        typeJson = true;
+      }
+    }
+    if (failure === null && typeJson && !isJson) {
+      failure = { code: 'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE', ctor: 'TypeError', message: 'Module ' + JSON.stringify(url) + ' is not of type "json"' };
+    }
+    if (failure !== null) return errorModuleOf(failure);
+  }
+  if (isJson && !(attrs !== null && attrs.type === 'json')) return s + ATTRIBUTE_MISSING;
+  return s;
+}
+
+/* The engine rebuilds a module loader error as a plain Error and drops everything else that was on
+   it, so the host publishes the code of the failure it raised and this wrapper sets it back on the
+   rejection: a module that resolves to no file carries ERR_MODULE_NOT_FOUND, and a specifier no
+   loader can read carries ERR_UNSUPPORTED_ESM_URL_SCHEME. */
+function importWrap(promise) {
+  return promise.then(null, function (err) {
+    var code = globalThis.__owc_import_failure;
+    globalThis.__owc_import_failure = undefined;
+    if (typeof code === 'string' && err !== null && typeof err === 'object' && err.code === undefined) {
+      try { err.code = code; } catch (e) { /* a frozen error keeps the message it already has */ }
+    }
+    throw err;
+  });
 }
 
 Object.defineProperty(globalThis, '__owc_importMeta', { value: importMetaOf, writable: true, configurable: true });
 Object.defineProperty(globalThis, '__owc_importArg', { value: importArgOf, writable: true, configurable: true });
+Object.defineProperty(globalThis, '__owc_importWrap', { value: importWrap, writable: true, configurable: true });
 
 var api = {
   drainTicks: function () {
