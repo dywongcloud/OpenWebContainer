@@ -109,6 +109,40 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
 - **A trailing newline.** The container writes a command's stderr exactly as the command left it; the host
   adds one only where the text has none.
 
+### ⚠️ `node` with no arguments: the REPL, and where it differs from host node
+
+`node` with no arguments starts a REPL instead of throwing. It reads `process.stdin`, writes to
+`process.stdout` with the `> ` prompt and the `| ` continuation, and ends the process with status 0 when
+the REPL closes — the `.exit` keyword, or the end of its input (Ctrl-D, on a terminal that delivers it).
+`container.spawn('node', [])` starts the same REPL; a caller feeds it with `process.writeInput()`.
+
+The same expressions through both, measured against this machine's `node -i` (v24.15.0):
+
+| input | host node | container |
+| --- | --- | --- |
+| `typeof process` | `'object'` | `'object'` |
+| `require("path").join("a","b")` | `'a/b'` | `'a/b'` |
+| `1+1` | `2` | `2` |
+| `}` | the line, a caret, then `Uncaught SyntaxError: Unexpected token '}'` | `Uncaught SyntaxError: expecting ')'` |
+| `undefined` | `undefined` | `undefined` |
+| `const x = 5` | `undefined` | `undefined` |
+| `x` | `5` | `5` |
+| `_`, the last result | `5` | `5` |
+
+Recorded rather than fixed:
+
+- **No welcome banner.** Host node prints `Welcome to Node.js v24.15.0.` and `Type ".help" for more
+  information.` above the first prompt; this one prints the prompt only.
+- **A syntax error prints its message alone.** Host node echoes the offending line and a caret under the
+  token. QuickJS reports its own message, and the REPL has no source line to echo.
+- **No line editing.** Arrow keys, history, Backspace and tab completion do nothing: the REPL reads whole
+  lines, and an editing key is dropped rather than echoed into the session.
+- **Ctrl-D arrives only where the terminal sends it.** The playground's xterm pane drops every Ctrl key
+  before it reaches the shell (`apps/playground/src/components/Terminal/index.tsx`), so Ctrl-D and Ctrl-C
+  never reach the REPL there; `.exit` is the way out. `process.writeInput('\x04')` ends the session.
+- **A spawned child's output is written twice** — once as it is produced, and once more from the result
+  the shell gets back. That predates the REPL: `sh -c 'node -e "console.log(1)"'` also prints `1` twice.
+
 ### 📋 Upcoming Features
 
 - Additional shell commands
