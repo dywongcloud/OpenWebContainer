@@ -775,6 +775,43 @@ export const SRC = String.raw`
           });
         })(names[i]);
       }
+
+      /*
+       * The rest of the runtime's globals: a fresh context has only its own intrinsics, so a REPL
+       * started in one answers typeof WebAssembly as 'undefined' while Node's answers 'object'.
+       * Each name the guest actually has is proxied, and assigning to one makes it an ordinary
+       * property of the session, as in Node.
+       */
+      var REPL_GLOBALS = ['WebAssembly', 'Buffer', 'fetch', 'URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate', 'queueMicrotask', 'AbortController', 'AbortSignal', 'Event', 'EventTarget', 'CustomEvent', 'MessageChannel', 'MessagePort', 'MessageEvent', 'Blob', 'File', 'DOMException', 'structuredClone', 'performance', 'process', 'globalThis', 'global', 'atob', 'btoa', 'require'];
+      for (var g = 0; g < REPL_GLOBALS.length; g++) {
+        (function (name) {
+          if (name in sb || !(name in globalThis)) return;
+          Object.defineProperty(sb, name, {
+            configurable: true,
+            enumerable: false,
+            get: function () { return globalThis[name]; },
+            set: function (v) {
+              Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true });
+            }
+          });
+        })(REPL_GLOBALS[g]);
+      }
+
+      /* Node's REPL can require: it resolves against the working directory, as a file there would. */
+      if (!('require' in sb)) {
+        try {
+          var moduleBuiltin = requireBuiltin('module');
+          var cwd = globalThis.process && typeof globalThis.process.cwd === 'function' ? globalThis.process.cwd() : '/';
+          if (moduleBuiltin && typeof moduleBuiltin.createRequire === 'function') {
+            Object.defineProperty(sb, 'require', {
+              configurable: true,
+              enumerable: false,
+              writable: true,
+              value: moduleBuiltin.createRequire(cwd + '/.repl.js')
+            });
+          }
+        } catch (requireError) { /* no require in this session; the rest of the context still works */ }
+      }
     }
 
     function helpText(commands) {
