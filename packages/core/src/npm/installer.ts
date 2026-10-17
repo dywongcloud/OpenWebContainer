@@ -5,6 +5,7 @@ import { NpmRegistry, PackageVersion, selectVersion } from './registry';
 import { lockKey, LockTreeNode, writeLockfile } from './lockfile';
 import { PlatformFields, platformDescription, platformMismatch } from './platform';
 import { INSTALL_SCRIPT_EVENTS, nodeArguments } from './lifecycle';
+import { nativeExecutable } from './native';
 import { extractTarGz } from './tar';
 import { writeNapiPlaceholders } from '../napi/placeholders';
 
@@ -249,6 +250,16 @@ export class NpmInstaller {
             for (const event of INSTALL_SCRIPT_EVENTS) {
                 const command = scripts[event];
                 if (typeof command !== 'string' || command.trim() === '') continue;
+                const binary = nativeExecutable(this.fileSystem, dir, manifest);
+                if (binary !== undefined) {
+                    /* The script exists to run that binary, so running it can only fail: refuse
+                       first and name the executable, which is the fact the reader needs, instead of
+                       letting the failure surface as a crash inside a postinstall nobody reads. */
+                    throw Object.assign(
+                        new Error(`npm error code ENOEXEC\nnpm error path ${dir}\nnpm error command sh -c ${command}\nnpm error ${name}@${version} runs the native executable ${binary} in its ${event} script; this container executes JavaScript only`),
+                        { exitCode: 126 }
+                    );
+                }
                 const args = nodeArguments(command);
                 if (args === undefined || this.runScript === undefined) {
                     this.log(`skipped ${event} script of ${name}@${version}: only "node <file>" and "node -e <code>" run in this runtime`);
