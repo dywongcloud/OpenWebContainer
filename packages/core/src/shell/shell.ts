@@ -544,7 +544,10 @@ export class Shell implements IShell {
         const PATH = BUILTIN_NAMES.has(command) ? undefined : this.shellState.env.PATH;
         if (!PATH) return undefined;
         for (const dir of PATH.split(':')) {
-            const found = this.fileSystem.resolvePath(command, dir);
+            /* the name is joined against the directory: fs.resolvePath answers a relative name from
+               the file system root, never from the base it is given */
+            const base = dir.endsWith('/') ? dir.slice(0, -1) : dir;
+            const found = this.fileSystem.normalizePath(`${base}/${command}`);
             if (this.fileSystem.fileExists(found)) return found;
         }
         return undefined;
@@ -582,14 +585,32 @@ export class Shell implements IShell {
                 case 'cat': {
                     // no argument reads the standard input, as it does in a shell
                     if (args.length === 0) return ok(input ?? '');
-                    const content = fs.readFile(at(args[0]));
-                    return content === undefined ? fail(`File not found: ${args[0]}`) : ok(content);
+                    let joined = '';
+                    for (const name of args) {
+                        const content = fs.readFile(at(name));
+                        if (content === undefined) return fail(`File not found: ${name}`);
+                        joined += content;
+                    }
+                    return ok(joined);
                 }
                 case 'pwd':
                     return ok(this.shellState.cwd + '\n');
                 case 'ls': {
-                    const entries = fs.listDirectory(at(args[0] || this.shellState.cwd));
-                    return ok(entries.length > 0 ? entries.join('\n') + '\n' : '');
+                    // A directory operand lists the names in it; a file operand -- every name a glob
+                    // such as `ls *.txt` expands to -- prints its own name, as it does in a shell.
+                    const operands = args.filter((arg) => !arg.startsWith('-'));
+                    const names: string[] = [];
+                    if (operands.length === 0) {
+                        names.push(...this.lsNames(at(this.shellState.cwd)));
+                    } else {
+                        for (const operand of operands) {
+                            const path = at(operand);
+                            if (this.isDirectorySafe(path)) names.push(...this.lsNames(path));
+                            else if (this.fileExistsSafe(path)) names.push(operand);
+                            else return fail(`ls: ${operand}: No such file or directory`);
+                        }
+                    }
+                    return ok(names.length > 0 ? names.join('\n') + '\n' : '');
                 }
                 case 'mkdir': {
                     if (args.length === 0) return fail('No directory specified');
@@ -647,6 +668,11 @@ export class Shell implements IShell {
         }
     }
 
+    /** The names `ls` prints for one directory: sorted, and without the dot files, as a shell has it. */
+    private lsNames(path: string): string[] {
+        return this.fileSystem.listDirectory(path).filter((name) => !name.startsWith('.')).sort();
+    }
+
     /** `mkdir -p`: the directory and every directory above it. */
     private createDirectoryTree(path: string): void {
         const parts = path.split('/').filter((part) => part !== '');
@@ -662,6 +688,15 @@ export class Shell implements IShell {
     private isDirectorySafe(path: string): boolean {
         try {
             return this.fileSystem.isDirectory(path);
+        } catch {
+            return false;
+        }
+    }
+
+    /** `fileExists` as a question: a path `ls` cannot stat is not there. */
+    private fileExistsSafe(path: string): boolean {
+        try {
+            return this.fileSystem.fileExists(path);
         } catch {
             return false;
         }

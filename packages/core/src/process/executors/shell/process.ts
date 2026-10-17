@@ -63,6 +63,37 @@ export function splitCommandLine(line: string): string[] {
     return words;
 }
 
+/**
+ * The file PATH names for `command`: the directory and the name joined, not `fs.resolvePath`, which
+ * answers a relative name from the file system root and never from the base it is given.
+ */
+function joinOnPath(fileSystem: IFileSystem, dir: string, command: string): string {
+    const base = dir.endsWith('/') ? dir.slice(0, -1) : dir;
+    return fileSystem.normalizePath(`${base}/${command}`);
+}
+
+/**
+ * The interpreter the shebang of `file` names -- `node` for `#!/usr/bin/env node` -- or undefined
+ * when the file has no shebang, so the caller can run the file itself.
+ */
+function shebangInterpreter(fileSystem: IFileSystem, file: string): string | undefined {
+    let content: string | undefined;
+    try {
+        content = fileSystem.readFile(file);
+    } catch {
+        return undefined;
+    }
+    const match = content === undefined ? null : /^#!(.*)/.exec(content);
+    if (match === null) return undefined;
+    const tokens = match[1].trim().split(/\s+/).filter(token => token !== '');
+    const first = tokens[0];
+    if (first === undefined) return undefined;
+    if (first.endsWith('/env') || first === 'env') {
+        return tokens.slice(1).find(token => !token.startsWith('-'));
+    }
+    return first.split('/').pop();
+}
+
 export class ShellProcess extends Process {
     private shell: Shell;
     private prompt: string;
@@ -415,12 +446,20 @@ export class ShellProcess extends Process {
             // check if the command is in env PATH
             let PATH = this.env.get('PATH');
             if (PATH) {
-                const paths = PATH.split(':');
-                for (const path of paths) {
-                    const executablePath = this.fileSystem.resolvePath(command, path);
-                    if (this.fileSystem.fileExists(executablePath)) {
-                        return await this.spawnChild(executablePath, cmdArgs);
-                    }
+                for (const path of PATH.split(':')) {
+                    const executablePath = joinOnPath(this.fileSystem, path, command);
+                    if (!this.fileSystem.fileExists(executablePath)) continue;
+                    /* A file on PATH is run the way the kernel runs it: through the interpreter its
+                       shebang names. A node_modules/.bin shim is one -- a `node` script with no
+                       executor of its own -- so a script that calls an installed bin by name works. */
+                    const interpreter = shebangInterpreter(this.fileSystem, executablePath);
+                    const spawnArgs = interpreter === undefined ? cmdArgs : [executablePath, ...cmdArgs];
+                    return await this.spawnChild(
+                        interpreter ?? executablePath,
+                        spawnArgs,
+                        Object.fromEntries(this.env),
+                        this.shell.getWorkingDirectory()
+                    );
                 }
             }
             // check for shebang: a name that is not a file to read is not one, and says so by throwing

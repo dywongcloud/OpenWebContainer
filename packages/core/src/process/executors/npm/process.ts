@@ -1,10 +1,23 @@
 import { IFileSystem } from '../../../filesystem';
 import { InstallSpec, NpmInstaller, parseInstallSpec, ScriptRunResult } from '../../../npm/installer';
 import { NpmRegistry } from '../../../npm/registry';
+import {
+    LIFECYCLE_COMMANDS,
+    NPM_VERSION,
+    findPackageRoot,
+    missingScriptMessage,
+    parseScriptArgs,
+    readManifest,
+    scriptCommandLine,
+    scriptEvents,
+    scriptFailureMessage,
+    scriptHeader,
+    scriptLabel,
+    scriptList,
+    scriptPath
+} from '../../../npm/scripts';
 import { Process, ProcessType } from '../../base';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../node/runtime/resolver';
-
-const NPM_VERSION = '10.9.0';
 
 const USAGE = [
     'Usage: npm <command>',
@@ -12,6 +25,8 @@ const USAGE = [
     'Commands supported by this runtime:',
     '  npm install [<pkg>[@range] ...] [-D|--save-dev] [--no-save]   aliases: i, add',
     '  npm init [-y]',
+    '  npm run [<script> [-- <args>]] [--if-present]                 alias: run-script',
+    '  npm test | npm start | npm stop | npm restart',
     '',
     'npx [-y] [-p <pkg>] <command|pkg[@range]> [args...]',
     ''
@@ -70,9 +85,12 @@ export class NpmProcess extends Process {
                 return 0;
             case 'run':
             case 'run-script':
+                return this.runScript(rest);
             case 'test':
-                this.emitError(`npm ${command} is not supported by this runtime: lifecycle scripts do not run here\n`);
-                return 1;
+            case 'start':
+            case 'stop':
+            case 'restart':
+                return this.runScript(rest, LIFECYCLE_COMMANDS[command]);
             default:
                 this.emitError(`Unknown command: "${command}"\n`);
                 return 1;
@@ -101,6 +119,53 @@ export class NpmProcess extends Process {
             this.emitOutput(`up to date in ${seconds}s\n`);
         } else {
             this.emitOutput(`\nadded ${report.added.length} package${report.added.length === 1 ? '' : 's'} in ${seconds}s\n`);
+        }
+        return 0;
+    }
+
+    /**
+     * `npm run <script>` and the lifecycle commands: each script runs through the shell, in the
+     * package directory, with every node_modules/.bin in front of PATH, and the status of the
+     * script that fails is the status npm exits with.
+     */
+    private async runScript(args: string[], event?: string): Promise<number> {
+        const { name, ifPresent, extra } = parseScriptArgs(args, event);
+        const packageDir = findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/');
+        const manifest = readManifest(this.fileSystem, packageDir);
+        if (manifest === undefined) {
+            this.emitError(`npm error code ENOENT\nnpm error enoent Could not read package.json in ${packageDir}\n`);
+            return 1;
+        }
+        const label = scriptLabel(manifest, packageDir);
+        const scripts = (manifest.scripts ?? {}) as Record<string, unknown>;
+
+        if (name === undefined) {
+            this.emitOutput(scriptList(label, scripts));
+            return 0;
+        }
+        if (typeof scripts[name] !== 'string') {
+            if (ifPresent) return 0;
+            this.emitError(missingScriptMessage(name));
+            return 1;
+        }
+
+        const PATH = scriptPath(this.fileSystem, packageDir, Object.fromEntries(this.env).PATH);
+        for (const step of scriptEvents(name, scripts)) {
+            const command = String(scripts[step]);
+            const line = scriptCommandLine(scripts, step, name, extra);
+            this.emitOutput(scriptHeader(label, step, line));
+            const result = await this.spawnChild('sh', ['-c', line], {
+                ...Object.fromEntries(this.env),
+                PATH,
+                npm_package_name: String(manifest.name ?? ''),
+                npm_package_version: String(manifest.version ?? ''),
+                npm_package_json: joinPaths(packageDir, 'package.json'),
+                npm_lifecycle_event: step
+            }, packageDir);
+            const exitCode = result.exitCode ?? 1;
+            if (exitCode === 0) continue;
+            this.emitError(scriptFailureMessage(label, step, command, exitCode));
+            return exitCode;
         }
         return 0;
     }

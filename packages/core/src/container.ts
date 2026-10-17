@@ -399,45 +399,51 @@ export class OpenWebContainer {
 
            
 
+            let stdout = '';
+            let stderr = '';
+
             // Spawn the child process
             const childProcess = await this.spawn(
                 payload.executable,
                 payload.args,
                 parentPid,  // Pass parent PID
-                { cwd: payload.cwd, env: payload.env }
+                {
+                    cwd: payload.cwd,
+                    env: payload.env,
+                    /* A child can finish its whole line -- a shell running one script -- inside the
+                       call that starts it, so its listeners are installed before it starts and not
+                       after the await above returns, which would drop everything it wrote. */
+                    beforeStart: (child) => {
+                        // Set up event handlers for the child process
+                        child.addEventListener(ProcessEvent.MESSAGE, (data: ProcessEventData) => {
+                            parentProcess.emit(ProcessEvent.MESSAGE, { ...data });
+                            /* the parent sees the child's output as it arrives; the caller of spawnChild also
+                               gets it in the result, so a lifecycle script's failure can be reported with its cause */
+                            if (data.stdout) stdout += data.stdout;
+                            if (data.stderr) stderr += data.stderr;
+                        });
+
+                        child.addEventListener(ProcessEvent.ERROR, (data: ProcessEventData) => {
+                            if (data.error) {
+                                parentProcess.emit(ProcessEvent.MESSAGE, { stderr: data.error.message + '\n' });
+                                stderr += data.error.message + '\n';
+                            }
+                        });
+
+                        child.addEventListener(ProcessEvent.EXIT, (data) => {
+                            callback({
+                                stdout,
+                                stderr,
+                                exitCode: data.exitCode ?? 1
+                            });
+
+                            // Clean up the process
+                            this.processManager.removeProcess(child.pid);
+                        });
+                    }
+                }
             );
             childPid=childProcess.pid
-
-            let stdout = '';
-            let stderr = '';
-
-            // Set up event handlers for the child process
-            childProcess.addEventListener(ProcessEvent.MESSAGE, (data: ProcessEventData) => {
-                parentProcess.emit(ProcessEvent.MESSAGE, { ...data });
-                /* the parent sees the child's output as it arrives; the caller of spawnChild also
-                   gets it in the result, so a lifecycle script's failure can be reported with its cause */
-                if (data.stdout) stdout += data.stdout;
-                if (data.stderr) stderr += data.stderr;
-            });
-
-            childProcess.addEventListener(ProcessEvent.ERROR, (data: ProcessEventData) => {
-                if (data.error) {
-                    parentProcess.emit(ProcessEvent.MESSAGE, { stderr: data.error.message + '\n' });
-                    stderr += data.error.message + '\n';
-                }
-            });
-
-            childProcess.addEventListener(ProcessEvent.EXIT, (data) => {
-                callback({
-                    stdout,
-                    stderr,
-                    exitCode: data.exitCode ?? 1
-                });
-
-                // Clean up the process
-                this.processManager.removeProcess(childProcess.pid);
-            });
-
 
         } catch (error: any) {
             if (childPid){

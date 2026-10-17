@@ -22,6 +22,21 @@ import {
 import type { ShellState, ShellVar } from '../../../../../shell/commands/builtins';
 import type { IFileSystem } from '../../../../../filesystem';
 import type { CommandContext, CommandResult, ShellCommand } from '../../../../../shell/commands/types';
+import {
+    LIFECYCLE_COMMANDS,
+    NPM_VERSION,
+    findPackageRoot,
+    missingScriptMessage,
+    parseScriptArgs,
+    readManifest,
+    scriptCommandLine,
+    scriptEvents,
+    scriptFailureMessage,
+    scriptHeader,
+    scriptLabel,
+    scriptList,
+    scriptPath
+} from '../../../../../npm/scripts';
 import { nodeSyncRunner, syncRunActive } from '../../pump';
 import type { SyncChildResult } from '../../pump';
 
@@ -500,6 +515,18 @@ function shellStateFor(shell: SyncShell): ShellState {
     if (state === undefined) {
         state = createShellState(shell.env, shell.cwd, fsForModules(shell.ctx.fileSystem, () => shell.cwd));
         state.host = shell;
+        // The engine (builtins.ts) cannot start a job itself without importing the capability layer, so
+        // a lone `&` inside a compound command is registered through this callback. Returning null makes
+        // the engine run the pipeline in the foreground rather than invent a job.
+        state.startJob = (_state: ShellState, source: string) => {
+            const segment = splitCommandList(source)[0];
+            if (segment === undefined) return null;
+            const stages = splitPipeline(segment.words);
+            if (stages === null) return null;
+            startBackgroundJob(shell, stages);
+            const jobs = jobsOf(shell);
+            return jobs.length === 0 ? null : jobs[jobs.length - 1];
+        };
         if (shell.name !== undefined) state.shellName = shell.name;
         shell.state = state;
     }
@@ -739,8 +766,21 @@ function shellBuiltin(shell: SyncShell, command: string, args: string[]): ShellS
             case 'pwd':
                 return ok(shell.cwd + '\n');
             case 'ls': {
-                const entries = fs.listDirectory(at(args[0] || shell.cwd));
-                return ok(entries.length > 0 ? entries.join('\n') + '\n' : '');
+                // A directory operand lists the names in it; a file operand -- every name `ls *.txt`
+                // expands to -- prints its own name, as it does in a shell.
+                const operands = args.filter((arg) => !arg.startsWith('-'));
+                const names: string[] = [];
+                if (operands.length === 0) {
+                    names.push(...lsNames(fs, shell.cwd));
+                } else {
+                    for (const operand of operands) {
+                        const path = at(operand);
+                        if (isDirectory(fs, path)) names.push(...lsNames(fs, path));
+                        else if (fs.fileExists(path)) names.push(operand);
+                        else return { stdout: '', stderr: diagnostic(`ls: ${operand}: No such file or directory`), exitCode: 2 };
+                    }
+                }
+                return ok(names.length > 0 ? names.join('\n') + '\n' : '');
             }
             case 'mkdir':
                 if (args.length === 0) return fail('No directory specified');
@@ -1843,6 +1883,11 @@ function isDirectory(fs: IFileSystem, path: string): boolean {
     }
 }
 
+/** The names `ls` prints for one directory: sorted, and without the dot files, as the host has it. */
+function lsNames(fs: IFileSystem, dir: string): string[] {
+    return fs.listDirectory(dir).filter((name) => !name.startsWith('.')).sort();
+}
+
 /**
  * The fields one simple command runs with. Leading `NAME=value` words are assignments, not a
  * command: they go into the shell's variables, and a line that is nothing but assignments has no
@@ -1867,9 +1912,12 @@ function expandCommandWords(shell: SyncShell, words: RawWord[], ctx: ExpandCtx):
     const fields: string[] = [];
     for (let j = i; j < words.length; j++) {
         for (const field of assembleFields(expandParts(shell, words[j], ctx))) {
-            // no match leaves the word as it was written, as it does in a shell
-            if (field.glob) fields.push(...(shellGlob(shell, field.text) ?? [field.text]));
-            else fields.push(field.text);
+            // `set -f` turns pathname expansion off; otherwise no match leaves the word as written
+            if (field.glob && shell.state?.options.noglob !== true) {
+                fields.push(...(shellGlob(shell, field.text) ?? [field.text]));
+            } else {
+                fields.push(field.text);
+            }
         }
     }
     return fields;
@@ -2390,6 +2438,78 @@ function externalVersion(command: string, args: string[]): string | null {
     return `Wget ${CONTAINER_VERSION} (OpenWebContainer)\n`;
 }
 
+/** The first line of `file`, or undefined when it cannot be read. */
+function readFirstLine(fs: IFileSystem, file: string): string | undefined {
+    try {
+        return fs.readFile(file);
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * `npm` in a synchronous call, reached from a line that names it and from `spawnSync('npm', ...)`.
+ *
+ * `npm run` and the lifecycle commands run the package's script here, in the shell engine already
+ * on the stack, so a script of shell commands and `node` files works where the container's own npm
+ * process -- which is asynchronous end to end -- cannot be stepped. A command that has to reach the
+ * registry (`npm install`, `npx`) still cannot: it waits on host work this call cannot complete, and
+ * says so rather than answering with a status that means nothing.
+ */
+function npmCommand(shell: SyncShell, args: string[]): ShellStep {
+    const [sub, ...rest] = args;
+    if (sub === '-v' || sub === '--version' || sub === 'version') {
+        return { stdout: NPM_VERSION + '\n', stderr: '', exitCode: 0 };
+    }
+    const event = LIFECYCLE_COMMANDS[sub ?? ''];
+    if (sub !== 'run' && sub !== 'run-script' && event === undefined) {
+        throw notSupportedSync(`the shell command npm ${sub ?? ''}`.trim());
+    }
+    const { name, ifPresent, extra } = parseScriptArgs(rest, event);
+    const packageDir = findPackageRoot(shell.ctx.fileSystem, shell.cwd) ?? shell.cwd;
+    const manifest = readManifest(shell.ctx.fileSystem, packageDir);
+    if (manifest === undefined) {
+        return { stdout: '', stderr: diagnostic(`npm error code ENOENT\nnpm error enoent Could not read package.json in ${packageDir}`), exitCode: 1 };
+    }
+    const label = scriptLabel(manifest, packageDir);
+    const scripts = (manifest.scripts ?? {}) as Record<string, unknown>;
+    if (name === undefined) return { stdout: scriptList(label, scripts), stderr: '', exitCode: 0 };
+    if (typeof scripts[name] !== 'string') {
+        if (ifPresent) return EMPTY_STEP;
+        return { stdout: '', stderr: diagnostic(missingScriptMessage(name)), exitCode: 1 };
+    }
+    const PATH = scriptPath(shell.ctx.fileSystem, packageDir, shell.env.PATH);
+    let stdout = '';
+    for (const step of scriptEvents(name, scripts)) {
+        const command = String(scripts[step]);
+        const line = scriptCommandLine(scripts, step, name, extra);
+        stdout += scriptHeader(label, step, line);
+        /* one shell per script, as npm has: the directory, the exported variables and `$?` of one
+           script are its own, and only PATH and the npm_package_* names carry over. */
+        const child: SyncShell = {
+            ctx: shell.ctx,
+            cwd: packageDir,
+            env: {
+                ...shell.env,
+                PATH,
+                npm_package_name: String(manifest.name ?? ''),
+                npm_package_version: String(manifest.version ?? ''),
+                npm_package_json: `${packageDir === '/' ? '' : packageDir}/package.json`,
+                npm_lifecycle_event: step
+            },
+            input: shell.input,
+            lastStatus: shell.lastStatus
+        };
+        const result = shellLine(child, line);
+        stdout += result.stdout;
+        if (result.exitCode !== 0) {
+            return { stdout, stderr: diagnostic(result.stderr + scriptFailureMessage(label, step, command, result.exitCode)), exitCode: result.exitCode };
+        }
+        stdout += result.stderr;
+    }
+    return { stdout, stderr: '', exitCode: 0 };
+}
+
 /** ShellProcess.executeCommand for one command, in the same order of dispatch. */
 function shellCommand(shell: SyncShell, words: string[]): ShellStep {
     if (words.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
@@ -2409,6 +2529,7 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         if (SHELL_BUILTINS.has(command)) return shellBuiltinWithRedirects(shell, command, cmdArgs);
         const version = externalVersion(command, cmdArgs);
         if (version !== null) return { stdout: version, stderr: '', exitCode: 0 };
+        if (command === 'npm') return npmCommand(shell, cmdArgs);
         if (SHELL_EXTERNALS.has(command)) throw notSupportedSync(`the shell command ${command}`);
         if (command === 'node' || command === NODE_BINARY) return shellNode(shell, nodeInvocation(cmdArgs));
         // A builtin is never looked for on PATH, the way it never is in a shell: `.` is the source
@@ -2416,11 +2537,18 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         const PATH = SHELL_BUILTIN_NAMES.has(command) ? undefined : shell.env.PATH;
         if (PATH) {
             for (const dir of PATH.split(':')) {
-                const found = shell.ctx.fileSystem.resolvePath(command, dir);
-                if (shell.ctx.fileSystem.fileExists(found)) {
-                    if (found.endsWith('.js')) return shellNode(shell, { file: found, args: cmdArgs });
-                    return { stdout: '', stderr: diagnostic(`No executor found for: ${found}`), exitCode: 1 };
-                }
+                // joined against the directory: fs.resolvePath answers a relative name from the root
+                const base = dir.endsWith('/') ? dir.slice(0, -1) : dir;
+                const found = shell.ctx.fileSystem.normalizePath(`${base}/${command}`);
+                if (!shell.ctx.fileSystem.fileExists(found)) continue;
+                if (found.endsWith('.js')) return shellNode(shell, { file: found, args: cmdArgs });
+                // a node_modules/.bin shim: a node script with no .js name, run through its shebang
+                const content = readFirstLine(shell.ctx.fileSystem, found);
+                const shebang = content === undefined ? null : /^#!(.*)/.exec(content);
+                const tokens = shebang === null ? [] : shebang[1].trim().split(/\s+/);
+                const interpreter = tokens[0] === '/usr/bin/env' ? tokens.slice(1).find((t) => !t.startsWith('-')) : tokens[0]?.split('/').pop();
+                if (interpreter === 'node') return shellNode(shell, { file: found, args: cmdArgs });
+                return { stdout: '', stderr: diagnostic(`No executor found for: ${found}`), exitCode: 1 };
             }
         }
         let content: string | undefined;
@@ -2489,6 +2617,10 @@ function runSyncCommand(
     }
     if (file === 'node' || file === NODE_BINARY) return nodeRun(ctx, nodeInvocation(argv), env, cwd, timeoutMs, killSignal);
     if (file.endsWith('.js')) return nodeRun(ctx, { file, args: argv }, env, cwd, timeoutMs, killSignal);
+    if (file === 'npm' || file === 'npx') {
+        const step = npmCommand({ ctx, cwd, env, input, lastStatus: 0 }, argv);
+        return { pid: nextSyncPid++, status: step.exitCode, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
+    }
     throw new Error(`No executor found for: ${file}`);
 }
 

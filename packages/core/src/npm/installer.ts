@@ -2,6 +2,7 @@ import semver from 'semver';
 import { IFileSystem } from '../filesystem';
 import { NodeResolver, dirnameOf, joinPaths, normalizeAbsolute } from '../process/executors/node/runtime/resolver';
 import { NpmRegistry, PackageVersion, selectVersion } from './registry';
+import { lockKey, LockTreeNode, writeLockfile } from './lockfile';
 import { PlatformFields, platformDescription, platformMismatch } from './platform';
 import { INSTALL_SCRIPT_EVENTS, nodeArguments } from './lifecycle';
 import { extractTarGz } from './tar';
@@ -32,6 +33,8 @@ interface Edge {
     name: string;
     range?: string;
     optional: boolean;
+    /** Reached through a devDependencies entry: the lockfile marks the packages it leads to dev. */
+    dev: boolean;
     /** A peer dependency of a top-level package: wanted only while no copy is visible from the root. */
     peer?: boolean;
 }
@@ -62,8 +65,14 @@ export class NpmInstaller {
     async addPackages(projectDir: string, specs: InstallSpec[], save: SaveTarget): Promise<InstallReport> {
         const root = normalizeAbsolute(projectDir);
         this.ensureManifest(root);
-        const edges: Edge[] = specs.map(spec => ({ requesterDir: root, name: spec.name, range: spec.range, optional: false }));
-        const { added, resolved } = await this.installTree(root, edges);
+        const edges: Edge[] = specs.map(spec => ({
+            requesterDir: root,
+            name: spec.name,
+            range: spec.range,
+            optional: false,
+            dev: save === 'devDependencies'
+        }));
+        const { added, resolved, nodes } = await this.installTree(root, edges);
         if (save !== 'none') {
             const manifest = this.readManifest(root) ?? {};
             const field = (manifest[save] ?? {}) as Record<string, string>;
@@ -73,6 +82,7 @@ export class NpmInstaller {
             manifest[save] = field;
             this.writeManifest(root, manifest);
         }
+        this.writeLock(root, nodes);
         return { added };
     }
 
@@ -82,25 +92,54 @@ export class NpmInstaller {
         this.ensureManifest(root);
         const manifest = this.readManifest(root) ?? {};
         const edges: Edge[] = [];
-        for (const field of ['dependencies', 'devDependencies'] as const) {
-            for (const [name, range] of Object.entries((manifest[field] ?? {}) as Record<string, string>)) {
-                edges.push({ requesterDir: root, name, range, optional: false });
-            }
+        for (const [name, range] of Object.entries((manifest.dependencies ?? {}) as Record<string, string>)) {
+            edges.push({ requesterDir: root, name, range, optional: false, dev: false });
+        }
+        for (const [name, range] of Object.entries((manifest.devDependencies ?? {}) as Record<string, string>)) {
+            edges.push({ requesterDir: root, name, range, optional: false, dev: true });
         }
         for (const [name, range] of Object.entries((manifest.optionalDependencies ?? {}) as Record<string, string>)) {
-            edges.push({ requesterDir: root, name, range, optional: true });
+            edges.push({ requesterDir: root, name, range, optional: true, dev: false });
         }
-        const { added } = await this.installTree(root, edges);
+        const { added, nodes } = await this.installTree(root, edges);
+        this.writeLock(root, nodes);
         return { added };
     }
 
-    private async installTree(root: string, initial: Edge[]): Promise<{ added: string[]; resolved: Map<string, string> }> {
+    /** `package-lock.json` for the tree just installed, in npm's lockfileVersion 3 layout. */
+    private writeLock(root: string, nodes: LockTreeNode[]): void {
+        writeLockfile(this.fileSystem, root, this.readManifest(root) ?? {}, nodes);
+    }
+
+    private async installTree(root: string, initial: Edge[]): Promise<{ added: string[]; resolved: Map<string, string>; nodes: LockTreeNode[] }> {
         const added: string[] = [];
         const resolved = new Map<string, string>();
         const installedDirs: string[] = [];
         const queue: Edge[] = [...initial];
         const seen = new Set<string>();
         const skipped = new Set<string>();
+        /* One entry per package directory, as the lockfile records it. A package several edges
+           reach is dev (or optional) only when every edge that reaches it is. */
+        const nodes = new Map<string, LockTreeNode>();
+        const record = (dir: string, edge: Edge, version?: PackageVersion) => {
+            const key = lockKey(root, dir);
+            const manifest = this.readManifest(dir) ?? {};
+            const known = nodes.get(key);
+            if (known === undefined) {
+                nodes.set(key, {
+                    key,
+                    version: typeof manifest.version === 'string' ? manifest.version : version?.version ?? '',
+                    resolved: version?.dist.tarball,
+                    integrity: version?.dist.integrity,
+                    dev: edge.dev,
+                    optional: edge.optional,
+                    manifest
+                });
+                return;
+            }
+            known.dev = known.dev && edge.dev;
+            known.optional = known.optional && edge.optional;
+        };
 
         while (queue.length > 0) {
             const edge = queue.shift()!;
@@ -118,9 +157,10 @@ export class NpmInstaller {
             if (edge.peer && visible !== undefined) continue;
             const isRootRequest = edge.requesterDir === root;
             const adopt = (copy: InstalledCopy) => {
+                record(copy.dir, edge);
                 if (isRootRequest) resolved.set(edge.name, copy.version);
-                this.enqueueDependencies(copy.dir, queue);
-                if (isRootRequest) this.enqueuePeers(copy.dir, root, queue);
+                this.enqueueDependencies(copy.dir, queue, edge.dev);
+                if (isRootRequest) this.enqueuePeers(copy.dir, root, queue, edge.dev);
             };
             const range = spec.range;
             const reusable = visible !== undefined && (
@@ -158,12 +198,13 @@ export class NpmInstaller {
             await this.installPackage(target, version);
             added.push(`${edge.name}@${version.version}`);
             installedDirs.push(target);
+            record(target, edge, version);
             if (isRootRequest) resolved.set(edge.name, version.version);
-            this.enqueueDependencies(target, queue, version);
-            if (isRootRequest) this.enqueuePeers(target, root, queue);
+            this.enqueueDependencies(target, queue, edge.dev, version);
+            if (isRootRequest) this.enqueuePeers(target, root, queue, edge.dev);
         }
         await this.runInstallScripts(installedDirs);
-        return { added, resolved };
+        return { added, resolved, nodes: [...nodes.values()] };
     }
 
     /** Root requests replace the hoisted copy; transitive conflicts nest under the requester. */
@@ -173,27 +214,27 @@ export class NpmInstaller {
         return joinPaths(edge.requesterDir, 'node_modules', edge.name);
     }
 
-    private enqueueDependencies(packageDir: string, queue: Edge[], known?: PackageVersion): void {
+    private enqueueDependencies(packageDir: string, queue: Edge[], dev: boolean, known?: PackageVersion): void {
         const manifest = known
             ? { dependencies: known.dependencies, optionalDependencies: known.optionalDependencies }
             : this.readManifest(packageDir);
         if (!manifest) return;
         for (const [name, range] of Object.entries((manifest.dependencies ?? {}) as Record<string, string>)) {
-            queue.push({ requesterDir: packageDir, name, range, optional: false });
+            queue.push({ requesterDir: packageDir, name, range, optional: false, dev });
         }
         for (const [name, range] of Object.entries((manifest.optionalDependencies ?? {}) as Record<string, string>)) {
-            queue.push({ requesterDir: packageDir, name, range, optional: true });
+            queue.push({ requesterDir: packageDir, name, range, optional: true, dev });
         }
     }
 
     /** npm 7+ installs a top-level package's peer dependencies that the root does not provide yet. */
-    private enqueuePeers(packageDir: string, root: string, queue: Edge[]): void {
+    private enqueuePeers(packageDir: string, root: string, queue: Edge[], dev: boolean): void {
         const manifest = this.readManifest(packageDir);
         if (!manifest) return;
         const meta = (manifest.peerDependenciesMeta ?? {}) as Record<string, { optional?: boolean }>;
         for (const [name, range] of Object.entries((manifest.peerDependencies ?? {}) as Record<string, string>)) {
             if (meta[name]?.optional) continue;
-            queue.push({ requesterDir: root, name, range, optional: false, peer: true });
+            queue.push({ requesterDir: root, name, range, optional: false, dev, peer: true });
         }
     }
 
