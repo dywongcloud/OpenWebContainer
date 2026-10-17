@@ -8,7 +8,9 @@
  * across the boundary whenever an export is called or an import calls back into guest
  * code. So guest writes to `memory.buffer` are visible to the module from the next call
  * on, and the module's writes are visible to the guest as soon as a call returns -- but
- * not in between, since there is one copy per call, not per byte.
+ * not in between, since there is one copy per call, not per byte. The copy is made in
+ * chunks, so a large heap never exists twice at once; that changes nothing about when a
+ * write becomes visible, only how much is live during the copy.
  *
  * Plain JavaScript inside a String.raw snippet, evaluated by the bootstrap with `host`
  * in scope.
@@ -63,6 +65,28 @@ export const WASM_SRC = String.raw`
     throw new TypeError('WebAssembly: the argument must be a BufferSource');
   }
 
+  /*
+   * One piece of a memory copy. The host asks for pieces of this size when it syncs, and the
+   * guest asks for the same when it seeds a shadow: a piece is small enough to allocate next
+   * to a memory already this big, a whole memory is not.
+   */
+  var CHUNK = 1048576;
+
+  /*
+   * A wasm export takes numbers, and the JS API coerces anything else: ToNumber, then NaN
+   * becomes 0. Doing it here rather than shipping the arguments across as JSON keeps the
+   * heap out of it -- emscripten hands its Module object to a queued callback, and that
+   * object carries a typed array view over every byte of a memory this size.
+   */
+  function wasmArgs (args) {
+    var out = [];
+    for (var i = 0; i < args.length; i++) {
+      var value = Number(args[i]);
+      out.push(value === value ? value : 0);
+    }
+    return JSON.stringify(out);
+  }
+
   /* Live objects by host id, so the host's sync callbacks can find them. */
   var MEM = Object.create(null);
   var TAB = Object.create(null);
@@ -100,9 +124,13 @@ export const WASM_SRC = String.raw`
   function bindMemory (id) {
     var memory = Object.create(Memory.prototype);
     memory.__id = id;
-    var bytes = W.memoryRead(id);
-    memory.__buffer = new ArrayBuffer(bytes ? bytes.byteLength : 0);
-    if (bytes) new Uint8Array(memory.__buffer).set(new Uint8Array(bytes));
+    var size = unwrap(W.memoryPages(id)) * 65536;
+    memory.__buffer = new ArrayBuffer(size);
+    for (var off = 0; off < size; off += CHUNK) {
+      var part = W.memoryRead(id, off, Math.min(CHUNK, size - off));
+      if (!part || part.byteLength === 0) break;
+      new Uint8Array(memory.__buffer, off, part.byteLength).set(new Uint8Array(part));
+    }
     MEM[id] = memory;
     return memory;
   }
@@ -168,7 +196,7 @@ export const WASM_SRC = String.raw`
   /** A wasm function the host holds: calling it goes through the host, with memory synced. */
   function hostFunction (instanceId, fnId) {
     var call = function () {
-      return unwrap(W.fnCall(fnId, JSON.stringify(Array.prototype.slice.call(arguments)), instanceId));
+      return unwrap(W.fnCall(fnId, wasmArgs(arguments), instanceId));
     };
     Object.defineProperty(call, 'name', { value: 'wasm-function', configurable: true });
     return call;
@@ -195,20 +223,32 @@ export const WASM_SRC = String.raw`
    * The host's two sync callbacks. Only memory needs them: a table or global the guest
    * writes goes straight through to the host, while a write into the memory shadow is
    * invisible until it is copied.
+   *
+   * A memory is copied a chunk at a time, so a large heap is never live twice: onPull
+   * answers with the bytes at (offset, length) and onPush writes the bytes it is handed
+   * back at offset, growing the shadow when a chunk runs past its end. The chunk is a
+   * fresh ArrayBuffer each time -- the host copies it out of this heap anyway.
    */
   var PULL = 0;
   var PUSH = 0;
-  function onPull (kind, id) {
+  function onPull (kind, id, offset, length) {
     if (kind !== 'mem') return undefined;
     var memory = MEM[id];
-    return memory ? memory.__buffer : undefined;
+    if (!memory) return undefined;
+    var size = memory.__buffer.byteLength;
+    var start = typeof offset === 'number' && offset > 0 ? Math.min(offset, size) : 0;
+    var end = typeof length === 'number' && length > 0 ? Math.min(size, start + length) : size;
+    var out = new Uint8Array(Math.max(0, end - start));
+    if (out.length > 0) out.set(new Uint8Array(memory.__buffer, start, out.length));
+    return out.buffer;
   }
-  function onPush (kind, id, payload) {
+  function onPush (kind, id, offset, payload) {
     if (kind !== 'mem') return undefined;
     var memory = MEM[id];
     if (!memory || !payload) return undefined;
-    memory.__resize(payload.byteLength);
-    new Uint8Array(memory.__buffer).set(new Uint8Array(payload));
+    var start = typeof offset === 'number' && offset > 0 ? offset : 0;
+    if (start + payload.byteLength > memory.__buffer.byteLength) memory.__resize(start + payload.byteLength);
+    if (payload.byteLength > 0) new Uint8Array(memory.__buffer, start, payload.byteLength).set(new Uint8Array(payload));
     return undefined;
   }
   function syncIds () {
@@ -267,7 +307,7 @@ export const WASM_SRC = String.raw`
   function wrapExport (instanceId, entry) {
     if (entry.kind === 'function') {
       var fn = function () {
-        return unwrap(W.call(instanceId, entry.name, JSON.stringify(Array.prototype.slice.call(arguments))));
+        return unwrap(W.call(instanceId, entry.name, wasmArgs(arguments)));
       };
       Object.defineProperty(fn, 'name', { value: entry.name, configurable: true });
       return fn;

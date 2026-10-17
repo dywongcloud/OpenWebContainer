@@ -14,7 +14,10 @@ import { QuickJSContext, QuickJSHandle } from 'quickjs-emscripten';
  * shadow of the same size, and the two are made equal at every call boundary: whenever control
  * crosses between guest and host -- an export being called, or an import calling back into
  * guest code -- the bytes are copied across. Inside one wasm call the module sees ordinary
- * host memory and runs at full speed; the copy is O(memory size) per boundary crossing.
+ * host memory and runs at full speed; the copy is O(memory size) per boundary crossing. The
+ * copy is made in chunks rather than in one piece, so the peak is one memory plus a chunk and
+ * not two whole memories -- a chunk is what the guest engine can allocate, a whole memory
+ * twice over is not.
  *
  * Everything else follows from that. A module compiles and links here. Its exports are host
  * functions the guest reaches through `call`. Its imports are guest values: functions the host
@@ -89,8 +92,7 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
         copy.set(view);
         lifetime.dispose();
         return copy;
-    };
-    const bufferHandle = (bytes: Uint8Array): QuickJSHandle => context.newArrayBuffer(bytes.buffer as ArrayBuffer);
+    };    const bufferHandle = (bytes: Uint8Array): QuickJSHandle => context.newArrayBuffer(bytes.buffer as ArrayBuffer);
 
     const retainedHandle = (id: number): QuickJSHandle | undefined => {
         const handle = context.getProp(retained, String(id));
@@ -139,20 +141,37 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
 
     // --- memory sync --------------------------------------------------------------------
 
+    /**
+     * The size of one piece of a memory sync.
+     *
+     * The two sides are made equal by copying the memory across, and a copy of the whole thing
+     * costs a second memory's worth of bytes for the duration of the copy: with sql.js that is
+     * 32-128 MB at once, which the guest engine cannot allocate. Moving the memory in pieces
+     * keeps the peak at one memory plus one chunk, and the semantics are unchanged because the
+     * pieces cover the memory end to end. Measured against 256 KiB and 4 MiB at 16-2048 pages,
+     * 1 MiB is within noise of the faster of the two at every size while keeping the piece
+     * small: 4 MiB halves the number of crossings but doubles what is live during the copy.
+     */
+    const SYNC_CHUNK_BYTES = 1048576;
+
     const ensurePages = (memory: WebAssembly.Memory, byteLength: number) => {
         const wanted = Math.ceil(byteLength / 65536);
         const current = memory.buffer.byteLength / 65536;
         if (wanted > current) memory.grow(wanted - current);
     };
 
-    const pullFromGuest = (record: InstanceRecord, kind: SyncKind, id: number): unknown => {
+    const pullFromGuest = (record: InstanceRecord, kind: SyncKind, id: number, offset: number, length: number): unknown => {
         const target = retainedHandle(record.pull);
         if (!target) return undefined;
         const kindHandle = context.newString(kind);
         const idHandle = context.newNumber(id);
-        const result = context.callFunction(target, context.undefined, kindHandle, idHandle);
+        const offsetHandle = context.newNumber(offset);
+        const lengthHandle = context.newNumber(length);
+        const result = context.callFunction(target, context.undefined, kindHandle, idHandle, offsetHandle, lengthHandle);
         kindHandle.dispose();
         idHandle.dispose();
+        offsetHandle.dispose();
+        lengthHandle.dispose();
         target.dispose();
         if (result.error) {
             result.error.dispose();
@@ -168,15 +187,17 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
         return value;
     };
 
-    const pushToGuest = (record: InstanceRecord, kind: SyncKind, id: number, make: () => QuickJSHandle) => {
+    const pushToGuest = (record: InstanceRecord, kind: SyncKind, id: number, offset: number, make: () => QuickJSHandle) => {
         const target = retainedHandle(record.push);
         if (!target) return;
         const kindHandle = context.newString(kind);
         const idHandle = context.newNumber(id);
+        const offsetHandle = context.newNumber(offset);
         const payload = make();
-        const result = context.callFunction(target, context.undefined, kindHandle, idHandle, payload);
+        const result = context.callFunction(target, context.undefined, kindHandle, idHandle, offsetHandle, payload);
         kindHandle.dispose();
         idHandle.dispose();
+        offsetHandle.dispose();
         payload.dispose();
         target.dispose();
         if (result.error) result.error.dispose();
@@ -186,28 +207,47 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
     /** A view over the memory's bytes. newArrayBuffer copies into the guest, so no extra copy here. */
     const hostMemoryBytes = (memory: WebAssembly.Memory): Uint8Array => new Uint8Array(memory.buffer);
 
+    /** One piece of the memory, copied out: a view would hand the guest the whole buffer. */
+    const hostMemoryChunk = (memory: WebAssembly.Memory, offset: number, length: number): Uint8Array =>
+        new Uint8Array(memory.buffer, offset, length).slice();
+
     /**
      * guest -> host, before the host runs wasm or an import. Tables and globals need no sync:
      * the guest writes them through to the host as it sets them. Memory is the one thing the
      * guest can change invisibly, by writing into its shadow.
+     *
+     * The shadow is read one chunk at a time and each chunk is written straight into the host
+     * memory, so at most one chunk exists outside the two memories. A chunk shorter than the
+     * one asked for means the shadow ended, which is also how a zero-page memory ends.
      */
     const syncIn = (record: InstanceRecord) => {
         for (const id of record.memories) {
             const memory = memories.get(id);
-            const bytes = pullFromGuest(record, 'mem', id);
-            if (!memory || !(bytes instanceof Uint8Array)) continue;
-            ensurePages(memory, bytes.length);
-            const view = new Uint8Array(memory.buffer);
-            view.set(bytes.subarray(0, Math.min(bytes.length, view.length)));
+            if (!memory) continue;
+            let offset = 0;
+            while (true) {
+                const bytes = pullFromGuest(record, 'mem', id, offset, SYNC_CHUNK_BYTES);
+                if (!(bytes instanceof Uint8Array) || bytes.length === 0) break;
+                if (offset + bytes.length > memory.buffer.byteLength) ensurePages(memory, offset + bytes.length);
+                const view = new Uint8Array(memory.buffer);
+                const room = Math.max(0, view.length - offset);
+                if (room > 0) view.set(bytes.subarray(0, Math.min(bytes.length, room)), offset);
+                offset += bytes.length;
+                if (bytes.length < SYNC_CHUNK_BYTES) break;
+            }
         }
     };
 
-    /** host -> guest, after wasm has run. */
+    /** host -> guest, after wasm has run, a chunk at a time. */
     const syncOut = (record: InstanceRecord) => {
         for (const id of record.memories) {
             const memory = memories.get(id);
             if (!memory) continue;
-            pushToGuest(record, 'mem', id, () => bufferHandle(hostMemoryBytes(memory)));
+            const total = memory.buffer.byteLength;
+            for (let offset = 0; offset < total; offset += SYNC_CHUNK_BYTES) {
+                const length = Math.min(SYNC_CHUNK_BYTES, total - offset);
+                pushToGuest(record, 'mem', id, offset, () => bufferHandle(hostMemoryChunk(memory, offset, length)));
+            }
         }
     };
 
@@ -349,27 +389,32 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
         return ok({ id, exports });
     });
 
-    /** An import function: pull the guest's state in, call it, push the host's state back out. */
+    /**
+     * An import function: the module is calling out, so the memory goes the other way round
+     * from an export -- the guest is shown what the module has written before the callback
+     * runs, and what the guest writes comes back into the module before the module resumes.
+     * A function taken out of a table runs here, on the host memory, so only the way back
+     * needs a sync.
+     */
     const wrapImport = (record: InstanceRecord, id: number) => {
         const hostFn = hostFns.get(id);
         if (hostFn) {
             return (...args: number[]) => {
-                syncIn(record);
                 const value = hostFn(...args);
                 syncOut(record);
                 return value;
             };
         }
         return (...args: number[]) => {
-            syncIn(record);
+            syncOut(record);
             let value: unknown;
             try {
                 value = callGuest(id, args.map((arg) => context.newNumber(arg)));
             } catch (error) {
-                syncOut(record);
+                syncIn(record);
                 throw error;
             }
-            syncOut(record);
+            syncIn(record);
             return typeof value === 'number' ? value : 0;
         };
     };
@@ -420,11 +465,19 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
             return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
         }
     });
-    /** Returns the host memory's bytes as an ArrayBuffer, or undefined for an unknown id. */
-    define('memoryRead', (id) => {
+    /**
+     * Returns the host memory's bytes as an ArrayBuffer, or undefined for an unknown id. With an
+     * offset and a length it returns just that piece: the guest seeds a shadow for a memory the
+     * module created from these, and seeding a large one in one piece costs a second memory.
+     */
+    define('memoryRead', (id, offset, length) => {
         const memory = memories.get(number(id));
         if (!memory) return context.undefined;
-        return bufferHandle(hostMemoryBytes(memory));
+        if (context.typeof(offset) !== 'number') return bufferHandle(hostMemoryBytes(memory));
+        const total = memory.buffer.byteLength;
+        const start = Math.max(0, Math.min(total, Math.floor(number(offset))));
+        const size = Math.max(0, Math.min(total - start, Math.floor(number(length))));
+        return bufferHandle(hostMemoryChunk(memory, start, size));
     });
     define('memoryWrite', (id, bytes) => {
         const memory = memories.get(number(id));
