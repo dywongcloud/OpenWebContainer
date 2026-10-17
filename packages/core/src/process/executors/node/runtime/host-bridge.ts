@@ -3,6 +3,7 @@ import { IFileSystem } from '../../../../filesystem';
 import { NodeResolver, ResolveMode, dirnameOf } from './resolver';
 import { base64ToBytes, bytesToBase64 } from '../../../../utils/bytes';
 import { CapabilityEnvelope } from './capabilities/types';
+import { installWasmBridge } from './wasm-host';
 
 export interface HostBridgeDeps {
     fileSystem: IFileSystem;
@@ -156,6 +157,11 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         deps.holdRef(context.getNumber(delta));
         return context.undefined;
     });
+
+    // WebAssembly: the guest engine has none, so modules compile and run here.
+    const wasm = installWasmBridge(context);
+    context.setProp(host, 'wasm', wasm);
+    wasm.dispose();
 
     return host;
 }

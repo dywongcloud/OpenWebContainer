@@ -6,6 +6,7 @@ import { UTIL_ASSERT_SRC } from './guest/util-assert';
 import { BUFFER_FS_SRC } from './guest/buffer-fs';
 import { MISC_SRC } from './guest/misc';
 import { GLOBALS_SRC } from './guest/globals';
+import { WASM_SRC } from './guest/wasm';
 import { MODULE_SRCS } from './guest/modules';
 
 /**
@@ -22,6 +23,7 @@ export const BOOTSTRAP_SRC = [
     UTIL_ASSERT_SRC,
     BUFFER_FS_SRC,
     MISC_SRC,
+    WASM_SRC,
     GLOBALS_SRC,
     ...MODULE_SRCS,
     'Object.defineProperty(globalThis, "__owc_api", { value: api, enumerable: false });',
