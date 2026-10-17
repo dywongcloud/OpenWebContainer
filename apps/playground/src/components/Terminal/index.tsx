@@ -48,22 +48,26 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 			fitAddon.fit();
 
 			term.onKey(({ key, domEvent }) => {
-				switch (domEvent.keyCode) {
-					case 38: // Up arrow
+				/* The key is named by the event, never by keyCode alone. A keyCode is shared between a
+			   cursor key and a character on some layouts and in synthetic key events, and reading
+			   40 as ArrowDown turns a `(` typed inside a quoted argument into a request to rewrite
+			   the line, which truncates the command being typed and leaves its quoting unbalanced. */
+			switch (domEvent.key) {
+					case "ArrowUp":
 						onCommandRef.current("\x1b[A");
 						break;
-					case 40: // Down arrow
+					case "ArrowDown":
 						onCommandRef.current("\x1b[B");
 						break;
-					case 13: // Enter
+					case "Enter":
 						onCommandRef.current("\r");
 						break;
-					case 8: // Backspace
+					case "Backspace":
 						onCommandRef.current("\b");
 						break;
 					default:
-						if (!domEvent.ctrlKey && !domEvent.altKey && key.length === 1) {
-							onCommandRef.current(key);
+						if (!domEvent.ctrlKey && !domEvent.altKey && (domEvent.key.length === 1 || key.length === 1)) {
+							onCommandRef.current(domEvent.key.length === 1 ? domEvent.key : key);
 						}
 						break;
 				}

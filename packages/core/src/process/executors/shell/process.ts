@@ -2,6 +2,7 @@ import { Process } from '../../base/process';
 import { Shell } from '../../../shell';
 import { ProcessEvent, ProcessState, ProcessType } from '../../base';
 import { IFileSystem } from '../../../filesystem';
+import type { NetworkHandle } from '../../../shell/commands/types';
 import { ShellCommandResult } from '../../../shell';
 
 interface CommandHistoryEntry {
@@ -102,6 +103,12 @@ export class ShellProcess extends Process {
     private filteredArgs: string[];
     private commandHistory: CommandHistoryEntry[] = [];
     private historyIndex: number = -1;
+    /**
+     * The line being typed, kept the first time Up moves off it, so Down can hand it back. Null
+     * while the cursor sits on the current line: Down is then a no-op, never a request to replace
+     * what is being typed with an empty line.
+     */
+    private draftLine: string | null = null;
 
     // Add readline state
     private cursorPosition: number = 0;
@@ -116,14 +123,16 @@ export class ShellProcess extends Process {
         fileSystem: IFileSystem,
         parentPid?: number,
         cwd?: string,
-        env?: Map<string, string>
+        env?: Map<string, string>,
+        /** A read of the container's virtual network, passed on to the shell for its commands. */
+        network?: NetworkHandle
     ) {
         super(pid, ProcessType.SHELL, executablePath, args, parentPid,cwd,env);
         this.fileSystem = fileSystem;
         const oscMode = args.includes('--osc');
         this.filteredArgs = args.filter(arg => arg !== '--osc');
 
-        this.shell = new Shell(fileSystem, { oscMode, process: this,env: this.env, cwd: this.cwd });
+        this.shell = new Shell(fileSystem, { oscMode, process: this,env: this.env, cwd: this.cwd, network });
         this.shell.setHistorySink(() => ({
             stdout: this.commandHistory
                 .map((entry, index) => `${index + 1}: [${entry.timestamp.toISOString()}] ${entry.command}`)
@@ -146,7 +155,9 @@ export class ShellProcess extends Process {
                     this.emitOutput(result.stdout.endsWith('\n') ? result.stdout : result.stdout + '\n');
                 }
                 if (result.stderr) {
-                    this.emitError(result.stderr + '\n');
+                    // the newline stdout gets only when it has none: a command's own diagnostics end
+                    // in one already, and a second turned every error line into a blank line after it
+                    this.emitError(result.stderr.endsWith('\n') ? result.stderr : result.stderr + '\n');
                 }
                 this._exitCode = result.exitCode;
                 return;
@@ -291,6 +302,7 @@ export class ShellProcess extends Process {
         // Reset current line and show new prompt
         this.currentLine = '';
         this.cursorPosition = 0;
+        this.draftLine = null;
         this.emitOutput(this.prompt);
     }
 
@@ -314,19 +326,27 @@ export class ShellProcess extends Process {
 
     private handleUpArrow(): void {
         if (this.historyIndex > 0) {
+            if (this.draftLine === null && this.historyIndex >= this.commandHistory.length) {
+                this.draftLine = this.currentLine;
+            }
             this.historyIndex--;
             this.updateInputLine(this.commandHistory[this.historyIndex].command);
         }
     }
 
     private handleDownArrow(): void {
+        /* Down only means something once Up has moved the cursor off the line being typed. Before
+           that it is a no-op, the way it is in /bin/sh: it never replaces a line the user is still
+           typing -- quoting and all -- with an empty one. */
+        if (this.draftLine === null) return;
         if (this.historyIndex < this.commandHistory.length - 1) {
             this.historyIndex++;
             this.updateInputLine(this.commandHistory[this.historyIndex].command);
-        } else {
-            this.historyIndex = this.commandHistory.length;
-            this.updateInputLine('');
+            return;
         }
+        this.historyIndex = this.commandHistory.length;
+        this.updateInputLine(this.draftLine);
+        this.draftLine = null;
     }
 
     private handleLeftArrow(): void {
@@ -346,6 +366,7 @@ export class ShellProcess extends Process {
     private handleCtrlC(): void {
         this.currentLine = '';
         this.cursorPosition = 0;
+        this.draftLine = null;
         this.emitOutput('^C\n' + this.prompt);
     }
 
@@ -363,6 +384,7 @@ export class ShellProcess extends Process {
         const after = this.currentLine.slice(this.cursorPosition);
         this.currentLine = before + char + after;
         this.cursorPosition++;
+        this.draftLine = null;
 
         // Update display
         this.emitOutput(char);
