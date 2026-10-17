@@ -1,6 +1,6 @@
 import { IFileSystem } from '../../../filesystem';
 import { NetworkManager } from '../../../network/manager';
-import { Process, ProcessEvent, ProcessState, ProcessType } from '../../base';
+import { Process, ProcessEvent, ProcessState, ProcessType, processOf } from '../../base';
 import { QuickJSAsyncWASMModule, QuickJSContext, QuickJSHandle, QuickJSRuntime, newQuickJSAsyncWASMModuleFromVariant } from 'quickjs-emscripten';
 import variant from "@jitl/quickjs-singlefile-browser-release-asyncify"
 import { BOOTSTRAP_SRC } from './runtime/bootstrap';
@@ -146,6 +146,11 @@ export class NodeProcess extends Process {
     private services: RuntimeServices;
     private resolver: NodeResolver;
     private evalSource?: string;
+    /** `node` with no file: the run is a REPL on the guest's stdin and stdout. */
+    private readonly repl: boolean;
+    /** The working directory this process is in: `process.chdir` moves it, and everything that
+     * resolves a relative path (require, fs, spawned children) reads it from here. */
+    private currentCwd: string;
     private quickJs?: QuickJSAsyncWASMModule;
     private runtime?: QuickJSRuntime;
     private context?: QuickJSContext;
@@ -189,6 +194,8 @@ export class NodeProcess extends Process {
             processEnv.set(key, value);
         }
         super(pid, ProcessType.JAVASCRIPT, executablePath, args, parentPid, cwd, processEnv);
+        this.repl = executablePath === '[repl]';
+        this.currentCwd = cwd || '/';
         this.fileSystem = fileSystem;
         this.networkManager = networkManager;
         this.services = services;
@@ -196,7 +203,7 @@ export class NodeProcess extends Process {
         this.evalSource = evalSource;
         this.capabilityContext = {
             pid,
-            cwd: () => this.cwd ?? '/',
+            cwd: () => this.currentCwd,
             env: () => Object.fromEntries(this.env),
             fileSystem,
             resolver: this.resolver,
@@ -213,9 +220,32 @@ export class NodeProcess extends Process {
         };
     }
 
+    /**
+     * process.chdir. Returns '' once the directory is the working one, or the code Node reports:
+     * ENOENT when nothing is there, ENOTDIR when what is there is not a directory. Everything that
+     * resolves a relative path afterwards -- require, fs, a spawned child -- reads currentCwd.
+     */
+    private changeDirectory(target: string): string {
+        const raw = String(target ?? '');
+        const resolved = raw.startsWith('/')
+            ? normalizeAbsolute(raw)
+            : normalizeAbsolute(joinPaths(this.currentCwd, raw));
+        let type: string | undefined;
+        try {
+            type = this.fileSystem.statPath(resolved)?.type;
+        } catch {
+            type = undefined;
+        }
+        if (type === undefined) return 'ENOENT';
+        if (type !== 'dir') return 'ENOTDIR';
+        this.currentCwd = resolved;
+        return '';
+    }
+
     async execute(): Promise<void> {
         let code = 1;
         try {
+            this.claimParentTerminal();
             const entryPath = await this.bootGuest();
             this.startEntry(entryPath);
             await this.runEventLoop();
@@ -260,6 +290,65 @@ export class NodeProcess extends Process {
         this.wakeIfIdle();
     }
 
+    /**
+     * A REPL takes over the terminal of the process that started it: the shell hands it every
+     * keystroke instead of editing a line of its own, the way a foreground job owns a terminal.
+     */
+    private claimParentTerminal(): void {
+        if (!this.repl || this.parentPid === undefined) return;
+        processOf(this.parentPid)?.adoptInteractiveChild(this);
+    }
+
+    /**
+     * Terminal input for the guest. Only a REPL reads it: what the terminal sends reaches the
+     * guest's process.stdin, which is where `repl.start` reads from. Any other run keeps the base
+     * behaviour, so a child that is written to and never reads is exactly as it was.
+     */
+    writeInput(input: string): void {
+        if (!this.repl) {
+            super.writeInput(input);
+            return;
+        }
+        if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
+        if (input === '\x04') {
+            // Ctrl-D ends the input, as it does on a terminal: the REPL sees end of file and closes
+            this.pushToGuest('endStdin', []);
+            return;
+        }
+        const text = this.replInput(input);
+        if (text === undefined) return;
+        this.pushToGuest('pushStdin', [text]);
+    }
+
+    /**
+     * What of a keystroke a REPL can use: text and newlines. A key that edits a line -- an arrow,
+     * Backspace, a function key -- means nothing to a REPL that reads whole lines, so it is dropped
+     * rather than echoed into the session.
+     */
+    private replInput(input: string): string | undefined {
+        let text = '';
+        for (const ch of input) {
+            const code = ch.charCodeAt(0);
+            if (code === 0x0d || code === 0x0a) text += '\n';
+            else if (code === 0x09 || (code >= 0x20 && code !== 0x7f)) text += ch;
+        }
+        return text === '' ? undefined : text;
+    }
+
+    /** Runs one guest-side input call and drains the jobs it queues. */
+    private pushToGuest(name: string, args: string[]): void {
+        if (this.context === undefined) return;
+        try {
+            const handles = args.map((text) => this.context!.newString(text));
+            this.callApi(name, handles).dispose();
+            for (const handle of handles) handle.dispose();
+            this.drainJobs();
+        } catch (error) {
+            this.fatalError = error;
+        }
+        this.wakeIfIdle();
+    }
+
     /** Keep-alive accounting (VirtualSink): the event loop runs while the count is positive. */
     holdRef(delta: number): void {
         this.refs = Math.max(0, this.refs + delta);
@@ -267,7 +356,7 @@ export class NodeProcess extends Process {
     }
 
     private resolveEntry(): string {
-        const cwd = this.cwd ?? '/';
+        const cwd = this.currentCwd;
         const spec = this.executablePath.startsWith('/') ? this.executablePath : './' + this.executablePath;
         const found = this.resolver.resolve(spec, cwd, 'require');
         if (!found) throw new Error(`Cannot find module '${normalizeAbsolute(joinPaths(cwd, this.executablePath))}'`);
@@ -286,7 +375,8 @@ export class NodeProcess extends Process {
 
     /** Everything after the module load has no suspension point, so a synchronous run boots through it too. */
     private bootWith(QuickJS: QuickJSAsyncWASMModule): string | undefined {
-        const entryPath = this.evalSource === undefined ? this.resolveEntry() : undefined;
+        // a REPL has no file to resolve: its input is the terminal, not a script
+        const entryPath = this.evalSource === undefined && !this.repl ? this.resolveEntry() : undefined;
         this.quickJs = QuickJS;
         const runtime = QuickJS.newRuntime();
         this.runtime = runtime;
@@ -307,7 +397,8 @@ export class NodeProcess extends Process {
             pid: this.pid,
             argv,
             env: Object.fromEntries(this.env),
-            cwd: () => this.cwd ?? '/',
+            cwd: () => this.currentCwd,
+            chdir: (path) => this.changeDirectory(path),
             now: () => performance.now(),
             emitStdout: (text) => this.emitGuestOutput({ stdout: text }),
             emitStderr: (text) => this.emitGuestOutput({ stderr: text }),
@@ -491,6 +582,8 @@ export class NodeProcess extends Process {
             const source = this.context!.newString(this.evalSource);
             this.callApi('runEval', [source]).dispose();
             source.dispose();
+        } else if (this.repl) {
+            this.startRepl();
         } else if (entryPath !== undefined && this.resolver.isESM(entryPath)) {
             this.runEsmEntry(entryPath);
         } else {
@@ -499,6 +592,16 @@ export class NodeProcess extends Process {
             file.dispose();
         }
         this.drainJobs();
+    }
+
+    /**
+     * `node` with no file: a REPL on the guest's own stdin and stdout. The session holds a ref, so
+     * the event loop waits for it instead of ending the process at once; closing the REPL is what
+     * ends the process, with the status the REPL left.
+     */
+    private startRepl(): void {
+        this.holdRef(1);
+        this.callApi('startRepl', []).dispose();
     }
 
     private runEsmEntry(entryPath: string): void {
@@ -774,7 +877,7 @@ export class NodeProcess extends Process {
         if (spec.startsWith(ERROR_MODULE_PREFIX)) return spec;
         const bare = spec.startsWith('node:') ? spec.slice('node:'.length) : spec;
         if (this.builtinNames.has(bare)) return `builtin:${bare}`;
-        const baseDir = baseName && baseName.startsWith('/') ? dirnameOf(baseName) : (this.cwd ?? '/');
+        const baseDir = baseName && baseName.startsWith('/') ? dirnameOf(baseName) : this.currentCwd;
         const found = this.resolver.resolve(spec, baseDir, 'import');
         if (!found) {
             const scheme = unsupportedScheme(spec);

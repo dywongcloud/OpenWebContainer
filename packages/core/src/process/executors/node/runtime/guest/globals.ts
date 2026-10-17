@@ -182,9 +182,27 @@ proc.exitCode = undefined;
 proc.cwd = function () {
   return host.cwd();
 };
-proc.chdir = function () {
-  throw new Error('process.chdir is not supported by this runtime');
-};
+  /*
+   * process.chdir moves the process's working directory, as it does in Node: the host owns it, so
+   * a relative path is resolved against the current one, and what comes back is '' or the error
+   * code Node would report. Everything that resolves a relative path afterwards -- require, fs, a
+   * spawned child -- reads the new directory.
+   */
+  proc.chdir = function (dir) {
+    if (typeof dir !== 'string') {
+      var bad = new TypeError('The "directory" argument must be of type string. Received ' + (dir === null ? 'null' : typeof dir));
+      bad.code = 'ERR_INVALID_ARG_TYPE';
+      throw bad;
+    }
+    var failure = host.chdir(dir);
+    if (failure === '') return undefined;
+    var error = new Error(failure + ': ' + (failure === 'ENOTDIR' ? 'not a directory' : 'no such file or directory') + ', chdir \'' + dir + '\'');
+    error.code = failure;
+    error.errno = failure === 'ENOTDIR' ? -20 : -2;
+    error.syscall = 'chdir';
+    error.path = dir;
+    throw error;
+  };
 proc.exit = function (code) {
   var fallback = typeof proc.exitCode === 'number' ? proc.exitCode : 0;
   var finalCode = code === undefined ? fallback : Number(code);
@@ -279,18 +297,48 @@ proc.stdout = makeStdioStream(function (text) {
 proc.stderr = makeStdioStream(function (text) {
   host.stderr(text);
 });
-/* stdin has no input source in this runtime: it is an empty stream, so readers see end of input */
+/* stdin has no input source unless the host feeds one. It is a stream that ends at once, so a
+   reader sees end of input -- except in a REPL, where the host keeps it open and pushes into it
+   what the terminal sends, and closes it when the terminal is done. */
+var stdinStream = null;
+var stdinOpen = false;
+function stdinOf() {
+  if (stdinStream === null) {
+    var Readable = requireBuiltin('stream').Readable;
+    stdinStream = new Readable({ read: function () {} });
+    stdinStream.isTTY = false;
+    // text in, text out: a pushed chunk reaches a reader as the string it was written as
+    stdinStream.setEncoding('utf8');
+    if (!stdinOpen) stdinStream.push(null);
+  }
+  return stdinStream;
+}
 Object.defineProperty(proc, 'stdin', {
   configurable: true,
   get: function () {
-    var Readable = requireBuiltin('stream').Readable;
-    var input = new Readable({ read: function () {} });
-    input.push(null);
-    input.isTTY = false;
+    var input = stdinOf();
     Object.defineProperty(proc, 'stdin', { value: input, configurable: true, writable: true });
     return input;
   }
 });
+/* Keeps stdin open for a REPL: nothing has read it yet, so it can still be fed. */
+api.openStdin = function () {
+  stdinOpen = true;
+  return stdinOf();
+};
+/* One chunk of terminal input, pushed into the stream a REPL reads. */
+api.pushStdin = function (text) {
+  if (!stdinOpen) return false;
+  stdinOf().push(typeof text === 'string' ? text : String(text));
+  return true;
+};
+/* End of terminal input: Ctrl-D, or a terminal that closed. The reader sees end of file. */
+api.endStdin = function () {
+  if (!stdinOpen) return false;
+  stdinOpen = false;
+  stdinOf().push(null);
+  return true;
+};
 globalThis.process = proc;
 BF.process = function () {
   return proc;

@@ -12,6 +12,8 @@ export interface HostBridgeDeps {
     argv: string[];
     env: Record<string, string>;
     cwd: () => string;
+    /** Changes the process's working directory; returns '' or an fs error code. */
+    chdir: (path: string) => string;
     now: () => number;
     emitStdout: (text: string) => void;
     emitStderr: (text: string) => void;
@@ -96,6 +98,11 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
     })));
 
     define('cwd', () => context.newString(deps.cwd()));
+    /**
+     * process.chdir: the working directory lives on the host, so the guest asks for the change
+     * and gets back '' or the error code Node would report (ENOENT, ENOTDIR).
+     */
+    define('chdir', (path) => context.newString(deps.chdir(text(path))));
     define('pid', () => context.newNumber(deps.pid));
     define('argvJSON', () => context.newString(JSON.stringify(deps.argv)));
     define('envJSON', () => context.newString(JSON.stringify(deps.env)));
