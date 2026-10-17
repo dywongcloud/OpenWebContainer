@@ -12,10 +12,38 @@
 const PREVIEW_PATH_PREFIX = '/__owc/preview/';
 const PREVIEW_PATTERN = /^\/__owc\/preview\/(\d+)(\/.*)?$/;
 const REQUEST_MESSAGE = 'owc-preview-request';
+const PORTS_MESSAGE = 'owc-preview-ports';
 const REQUEST_TIMEOUT_MS = 25000;
 const CLIENT_POLL_MS = 250;
+/*
+ * When no page claims the port, the request is only probably wrong: a server that has not
+ * finished starting, or a page that never advertised, still deserves an answer. Those
+ * candidates get a short budget instead of the full deadline, so asking for a port nothing
+ * serves fails in seconds rather than after 25 of them.
+ */
+const FALLBACK_TIMEOUT_MS = 4000;
+const NO_CLIENT_TIMEOUT_MS = 10000;
 const NULL_BODY_STATUSES = [204, 205, 304];
 const DROPPED_RESPONSE_HEADERS = ['connection', 'keep-alive', 'transfer-encoding', 'content-length'];
+
+/**
+ * Which window is serving which ports. Several tabs can each run their own container,
+ * and two of them may well listen on the same port number, so a request has to reach
+ * the page that actually owns the listener rather than whichever window happens to be
+ * focused. Each page advertises its live ports; entries are dropped when the client
+ * disappears and replaced on every advertisement.
+ */
+const clientPorts = new Map();
+
+self.addEventListener('message', (event) => {
+  const data = event.data || {};
+  if (data.type !== PORTS_MESSAGE) return;
+  const ports = Array.isArray(data.ports) ? data.ports.filter((port) => Number.isInteger(port)) : [];
+  if (event.source && typeof event.source.id === 'string') {
+    if (ports.length === 0) clientPorts.delete(event.source.id);
+    else clientPorts.set(event.source.id, new Set(ports));
+  }
+});
 
 class GatewayError extends Error {
   constructor(status, message) {
@@ -56,16 +84,33 @@ async function handlePreview(request, url) {
   try {
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
     const body = hasBody ? bytesToBase64(new Uint8Array(await request.arrayBuffer())) : null;
-    const client = await findClient(deadline);
-    const reply = await askClient(client, {
-      id: self.crypto.randomUUID(),
-      port,
-      method: request.method,
-      path,
-      headers: headersToObject(request.headers),
-      body,
-    }, deadline);
-    return responseFromReply(reply, port);
+    const found = await findClients(port, deadline);
+    let lastError = null;
+    const budget = found.advertised ? deadline : Math.min(deadline, Date.now() + FALLBACK_TIMEOUT_MS);
+    for (const client of found.clients) {
+      if (Date.now() >= budget) break;
+      try {
+        const reply = await askClient(client, {
+          id: self.crypto.randomUUID(),
+          port,
+          method: request.method,
+          path,
+          headers: headersToObject(request.headers),
+          body,
+        }, Math.min(deadline, budget));
+        return responseFromReply(reply, port);
+      } catch (error) {
+        // Another page may serve the same port; keep going until the deadline.
+        lastError = error;
+      }
+    }
+    if (lastError instanceof GatewayError) {
+      return textResponse(lastError.status, lastError.message);
+    }
+    return textResponse(
+      502,
+      'Preview failed: ' + (lastError && lastError.message ? lastError.message : String(lastError))
+    );
   } catch (error) {
     if (error instanceof GatewayError) {
       return textResponse(error.status, error.message);
@@ -74,16 +119,35 @@ async function handlePreview(request, url) {
   }
 }
 
-// Prefer a focused window; otherwise any window of this origin. Wait for one to appear
-// until the deadline, so a page that is reloading still gets the request.
-async function findClient(deadline) {
+/**
+ * Windows that advertise `port`, focused first, then the rest. When no page claims the
+ * port, fall back to any window so an unadvertised or still-starting server is not
+ * answered with an immediate failure -- `advertised` says which of the two came back, so
+ * the caller can give the fallback a shorter budget. If there is no window at all, wait
+ * for one, so a page that is reloading still gets the request.
+ */
+async function findClients(port, deadline) {
   for (;;) {
     const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    // Drop the ports of pages that have gone: a client id that is no longer open would
+    // otherwise keep claiming its ports forever.
+    const open = new Set(clients.map((client) => client.id));
+    for (const id of Array.from(clientPorts.keys())) {
+      if (!open.has(id)) clientPorts.delete(id);
+    }
     if (clients.length > 0) {
-      return clients.find((client) => client.focused) || clients[0];
+      const serving = clients.filter((client) => {
+        const ports = clientPorts.get(client.id);
+        return ports !== undefined && ports.has(port);
+      });
+      const pool = serving.length > 0 ? serving : clients;
+      return {
+        clients: [...pool].sort((left, right) => Number(right.focused) - Number(left.focused)),
+        advertised: serving.length > 0
+      };
     }
     const remaining = deadline - Date.now();
-    if (remaining <= 0) {
+    if (remaining <= 0 || REQUEST_TIMEOUT_MS - remaining >= NO_CLIENT_TIMEOUT_MS) {
       throw new GatewayError(504, 'No OpenWebContainer page is open to serve this preview.');
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(CLIENT_POLL_MS, remaining)));

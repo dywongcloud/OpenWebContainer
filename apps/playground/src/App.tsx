@@ -8,7 +8,7 @@ import { FileExplorer } from "./components/FileExplorer";
 import { useFileTree } from "./hooks/useFileTree";
 import { FolderOpen, Terminal as TerminalIcon, Code, Loader2, Save } from "lucide-react";
 import { useShell } from "./hooks/useShell";
-import { previewUrl, startPreviewGateway } from "./preview/gateway";
+import { previewUrl, setPreviewPorts, startPreviewGateway } from "./preview/gateway";
 
 export default function App() {
 	const { ready: containerReady, container, servers } = useContainer();
@@ -94,6 +94,9 @@ server.listen(PORT, () => {
 	useEffect(() => {
 		if (servers) {
 			console.log(servers);
+			// Tell the service worker which ports this tab serves, so previews reach this tab
+			// even when several tabs are open with servers on the same port number.
+			setPreviewPorts(servers);
 		}
 	}, [servers]);
 

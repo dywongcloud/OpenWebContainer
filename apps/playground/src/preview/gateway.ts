@@ -14,7 +14,32 @@
 const PREVIEW_PREFIX = '/__owc/preview';
 const SERVICE_WORKER_URL = '/owc-sw.js';
 const REQUEST_MESSAGE = 'owc-preview-request';
+const PORTS_MESSAGE = 'owc-preview-ports';
 const LOCAL_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
+
+/**
+ * Ports this page's container is serving. The service worker routes a preview by port,
+ * so a page that never says what it is serving may never be asked, and a stale entry
+ * would keep sending requests to a server that has gone away.
+ */
+let advertisedPorts: number[] = [];
+
+function advertisePorts(): void {
+	const controller = navigator.serviceWorker && navigator.serviceWorker.controller;
+	if (!controller) return;
+	try {
+		controller.postMessage({ type: PORTS_MESSAGE, ports: advertisedPorts });
+	} catch {
+		/* the worker is not ready; the next advertisement will reach it */
+	}
+}
+
+let previewPortsSink: ((ports: number[]) => void) | null = null;
+
+/** Tell the gateway which ports this page's container serves, so previews are routed here. */
+export function setPreviewPorts(ports: number[]): void {
+	if (previewPortsSink) previewPortsSink(ports);
+}
 
 export interface PreviewRequest {
 	method: string;
@@ -40,6 +65,7 @@ interface PreviewMessage {
 // Module-level so repeated starts (for example React StrictMode effects) share one listener.
 let activeHandler: PreviewHandler | null = null;
 let listening = false;
+let controllerBound = false;
 
 /** Browser URL for a server inside the container, for example previewUrl(3070, "/hello"). */
 export function previewUrl(port: number, path: string = "/"): string {
@@ -57,7 +83,19 @@ export async function startPreviewGateway(handle: PreviewHandler): Promise<(() =
 		if (activeHandler === handle) {
 			activeHandler = null;
 		}
+		setPreviewPorts([]);
 	};
+
+	/** Tell the gateway which ports this page's container serves, so previews are routed here. */
+	function setPreviewPorts(ports: number[]): void {
+		const next = Array.from(new Set(ports.filter((port) => Number.isInteger(port)))).sort((a, b) => a - b);
+		if (next.length === advertisedPorts.length && next.every((port, index) => port === advertisedPorts[index])) {
+			return;
+		}
+		advertisedPorts = next;
+		advertisePorts();
+	}
+	previewPortsSink = setPreviewPorts;
 
 	if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) {
 		console.warn("[preview] Service workers are not supported here; the preview gateway is disabled.");
@@ -79,6 +117,12 @@ export async function startPreviewGateway(handle: PreviewHandler): Promise<(() =
 		console.warn("[preview] Service worker registration failed.", error);
 		stop();
 		return null;
+	}
+	// Say what this page serves, and say it again if the worker is replaced.
+	advertisePorts();
+	if (!controllerBound) {
+		navigator.serviceWorker.addEventListener("controllerchange", advertisePorts);
+		controllerBound = true;
 	}
 	return stop;
 }
