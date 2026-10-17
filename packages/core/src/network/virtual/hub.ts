@@ -105,6 +105,23 @@ export class VirtualNetworkError extends Error {
     }
 }
 
+/** One end of a connection, as `ifconfig` prints it. */
+function endpointText(endpoint: Endpoint): string {
+    return `${displayAddress(endpoint.address)}:${endpoint.port}`;
+}
+
+/** What the hub is carrying at one instant: its bindings, its connections and its name table. */
+export interface HubState {
+    /** Every address a binding or a connection holds, deduplicated and sorted. */
+    addresses: string[];
+    /** The TCP listeners and UDP sockets the hub holds, in the order it took them. */
+    listeners: { protocol: VirtualProtocol; address: string; port: number }[];
+    /** The connections that are open, each as its two ends. */
+    connections: { local: string; remote: string }[];
+    /** The names `registerHost` gave it. */
+    hosts: { name: string; address: string }[];
+}
+
 export class VirtualNetwork {
     private listeners = new Map<number, Listener>();
     private udpSockets = new Map<number, Listener>();
@@ -319,6 +336,32 @@ export class VirtualNetwork {
     }
 
     /** Resolves an endpoint's pid to its sink (or the host sink for HOST_PID). */
+    /**
+     * The hub as `ifconfig` reads it: the bindings, the connections and the names it holds at this
+     * instant, in the order it took them. Nothing here is counted, averaged or remembered -- these
+     * are the tables themselves, so a number read from this is a number the hub really holds.
+     */
+    hubState(): HubState {
+        const addresses = new Set<string>();
+        const bindings = [...this.listeners.values(), ...this.udpSockets.values()].sort((a, b) => a.id - b.id);
+        const listeners = bindings.map((entry) => {
+            const address = displayAddress(entry.address);
+            addresses.add(address);
+            return { protocol: entry.protocol, address, port: entry.port };
+        });
+        const connections = [...this.connections.values()]
+            .filter((connection) => connection.remote !== undefined && !connection.closed)
+            .sort((a, b) => a.id - b.id)
+            .map((connection) => {
+                const peer = connection.remote as Connection;
+                addresses.add(displayAddress(connection.local.address));
+                addresses.add(displayAddress(peer.local.address));
+                return { local: endpointText(connection.local), remote: endpointText(peer.local) };
+            });
+        const hosts = [...this.hosts.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([name, address]) => ({ name, address }));
+        return { addresses: [...addresses].sort(), listeners, connections, hosts };
+    }
+
     private sinkOf(pid: number): VirtualSink | undefined {
         return pid === HOST_PID ? this.hostSink : this.deps.sinkFor(pid);
     }

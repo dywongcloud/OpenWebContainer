@@ -8,6 +8,7 @@ import { COMMANDS as PROC_INFO } from '../../../../../shell/commands/procinfo';
 import {
     COMMANDS as UNSUPPORTED_UTILS,
     UNSUPPORTED_COMMANDS,
+    curlUsageResult,
     isUnsupported,
     unsupportedResult
 } from '../../../../../shell/commands/unsupported';
@@ -2530,6 +2531,15 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         const version = externalVersion(command, cmdArgs);
         if (version !== null) return { stdout: version, stderr: '', exitCode: 0 };
         if (command === 'npm') return npmCommand(shell, cmdArgs);
+        // `curl` that names no URL has nothing to wait for: its own usage failure, with its own
+        // status 2, so a synchronous caller gets what the utility would answer rather than the
+        // blanket refusal a command that needs the network gets.
+        if (command === 'curl') {
+            const withoutNetwork = curlUsageResult(cmdArgs);
+            if (withoutNetwork !== null) {
+                return { stdout: withoutNetwork.stdout, stderr: withoutNetwork.stderr, exitCode: withoutNetwork.exitCode };
+            }
+        }
         if (SHELL_EXTERNALS.has(command)) throw notSupportedSync(`the shell command ${command}`);
         if (command === 'node' || command === NODE_BINARY) return shellNode(shell, nodeInvocation(cmdArgs));
         // A builtin is never looked for on PATH, the way it never is in a shell: `.` is the source
@@ -2619,6 +2629,15 @@ function runSyncCommand(
     if (file.endsWith('.js')) return nodeRun(ctx, { file, args: argv }, env, cwd, timeoutMs, killSignal);
     if (file === 'npm' || file === 'npx') {
         const step = npmCommand({ ctx, cwd, env, input, lastStatus: 0 }, argv);
+        return { pid: nextSyncPid++, status: step.exitCode, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
+    }
+    // `spawnSync('curl', ['--version'])`, `execFileSync('ls', ['-l'])` and every other name the
+    // container's own synchronous shell can run: one dispatch for all three synchronous calls, the
+    // way all three look up one PATH on a host. A name the shell has no command for stays a failed
+    // spawn, as it stays one on a host.
+    if (SHELL_BUILTINS.has(file) || SHELL_BUILTIN_NAMES.has(file) || SHELL_EXTERNALS.has(file)
+        || isUnsupported(file) || SHELL_MODULE_COMMANDS[file] !== undefined) {
+        const step = shellCommand({ ctx, cwd, env, input, lastStatus: 0 }, [file, ...argv]);
         return { pid: nextSyncPid++, status: step.exitCode, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
     }
     throw new Error(`No executor found for: ${file}`);

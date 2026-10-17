@@ -25,6 +25,7 @@ import {
 } from './commands/builtins';
 import type { ShellState } from './commands/builtins';
 import type { CommandContext, CommandResult, ShellCommand } from './commands/types';
+import type { NetworkHandle } from './commands/types';
 
 interface ShellOptions {
     oscMode?: boolean;
@@ -32,6 +33,8 @@ interface ShellOptions {
     env?: Map<string, string>;
     /** The directory the shell starts in: the cwd of the process it runs in. */
     cwd?: string;
+    /** A read of the container's virtual network, for the commands that list what it holds. */
+    network?: NetworkHandle;
 }
 
 /**
@@ -106,6 +109,8 @@ export class Shell implements IShell {
     private shellState: ShellState;
     /** The file system the module commands read and write through. */
     private moduleFs: IFileSystem;
+    /** A read of the container's virtual network, handed to every command that asks for one. */
+    private network: NetworkHandle | undefined;
     /** What `history` prints; the shell process owns the list and installs this. */
     private historySink: (() => ShellCommandResult) | undefined;
     /** Set by `exit`: no later command of the line runs, and the shell process stops. */
@@ -125,6 +130,7 @@ export class Shell implements IShell {
         ]);
         this.process = options.process;
         this.oscMode = options.oscMode || false;
+        this.network = options.network;
         this.commandRegistry = new CommandRegistry();
         this.moduleFs = this.fsForModules();
         this.shellState = createShellState(Object.fromEntries(this.env), this.currentDirectory, this.moduleFs);
@@ -189,7 +195,8 @@ export class Shell implements IShell {
             cwd: this.shellState.cwd,
             env: this.shellState.env,
             input,
-            fs: this.moduleFs
+            fs: this.moduleFs,
+            network: this.network
         };
     }
 

@@ -4119,30 +4119,55 @@ const nl: ShellCommand = (ctx) => {
     return result(stdout, stderr, exitCode);
 };
 
-const UNEXPAND_USAGE = 'usage: unexpand [-a] [-t tablist] [file ...]';
+const UNEXPAND_USAGE = 'usage: unexpand [-a | -t tablist] [file ...]';
 
-/** The tab stops a `-t` list names: `-t 4`, `-t 1,3`, `-t 8,+4`. The last value repeats. */
-function tabStops(list: string): number[] {
+/**
+ * The tab stops a `-t` list names: `-t 4`, `-t 1,3`.
+ *
+ * What repeats is decided by the length of the list, the way the host decides it: one value names a
+ * stop every that many columns for as far as the line runs, while two or more name the stops
+ * themselves and name none past the last of them, so `unexpand -t 1,3` leaves the blanks after
+ * column 3 as blanks where `unexpand -t 4` tabulates every fourth column to the end of the line.
+ *
+ * Null for a list the host itself refuses: a part that is not a number, or one written in the
+ * relative form (`+4`, `/2`) that belongs to another `unexpand` than the one this host runs.
+ */
+function tabStops(list: string): number[] | null {
     const stops: number[] = [];
     let at = 0;
     for (const part of list.split(',')) {
-        if (part === '') continue;
-        const relative = part.startsWith('+');
-        const value = Number.parseInt(relative ? part.slice(1) : part, 10);
-        if (!Number.isFinite(value) || value <= 0) continue;
-        at = relative ? at + value : value;
+        if (part === '') return null;
+        if (part.startsWith('+') || part.startsWith('/')) return null;
+        const value = Number.parseInt(part, 10);
+        if (!Number.isFinite(value) || value <= 0) return null;
+        at = value;
         stops.push(at);
     }
-    return stops.length === 0 ? [8] : stops;
+    return stops.length === 0 ? null : stops;
 }
 
-/** The first tab stop after `column`; the last stop's difference repeats for a short list. */
-function nextTabStop(stops: number[], column: number): number {
-    for (const stop of stops) if (stop > column) return stop;
+/** The first tab stop after `column`, or null where a list of two or more names none past it. */
+function nextTabStop(stops: number[], column: number): number | null {
+    // one value: every multiple of it is a stop, so there is always a next one
     if (stops.length === 1) return Math.ceil((column + 1) / stops[0]) * stops[0];
-    const step = stops[stops.length - 1] - (stops.length > 1 ? stops[stops.length - 2] : 0);
-    const last = stops[stops.length - 1];
-    return last + Math.ceil((column + 1 - last) / step) * step;
+    for (const stop of stops) if (stop > column) return stop;
+    return null;
+}
+
+/**
+ * Whether `remaining` blanks at a stop `gap` columns away become one more tab: the host's own rule,
+ * as it measures against it.
+ *
+ * A repeating list tabulates a blank run that reaches the next stop and has a blank left over, or
+ * that lands exactly on a stop two or more columns away: one blank one column short of a stop stays
+ * a blank, which is why `unexpand -t 1` prints one tab fewer than it has blanks and one space.
+ * A list of two or more stops is blunter: it tabulates every stop the run reaches, whether the run
+ * covers the whole gap or not, so `unexpand -t 1,3` prints two tabs for two blanks.
+ */
+function blanksBecomeTab(repeating: boolean, gap: number, remaining: number): boolean {
+    if (remaining <= 0) return false;
+    if (!repeating) return true;
+    return remaining > gap || (remaining === gap && gap >= 2);
 }
 
 const unexpand: ShellCommand = (ctx) => {
@@ -4151,18 +4176,31 @@ const unexpand: ShellCommand = (ctx) => {
     let stops = [8];
     let noMoreOptions = false;
     const operands: string[] = [];
+    const tablist = (word: string): boolean => {
+        const parsed = tabStops(word);
+        if (parsed === null) return false;
+        stops = parsed;
+        return true;
+    };
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
         if (!noMoreOptions && arg === '--') { noMoreOptions = true; continue; }
         if (!noMoreOptions && isOption(arg)) {
-            if (arg === '-a' || arg === '--all') { allBlanks = true; continue; }
-            if (arg === '-t' || arg === '--tabs') { stops = tabStops(args[i + 1] ?? ''); i++; continue; }
-            if (arg.startsWith('--tabs=')) { stops = tabStops(arg.slice('--tabs='.length)); continue; }
-            if (/^-\d/.test(arg)) { stops = tabStops(arg.slice(1)); continue; }
+            if (arg === '-a') { allBlanks = true; continue; }
+            if (arg === '-t') {
+                if (!tablist(args[i + 1] ?? '')) return fail('unexpand: bad tab stop spec', 1);
+                i++;
+                continue;
+            }
+            if (/^-\d/.test(arg)) {
+                if (!tablist(arg.slice(1))) return fail('unexpand: bad tab stop spec', 1);
+                continue;
+            }
             return fail(`unexpand: illegal option -- ${arg.slice(1, 2)}\n${UNEXPAND_USAGE}`, 1);
         }
         operands.push(arg);
     }
+    const repeating = stops.length === 1;
     const convertLine = (line: string): string => {
         let out = '';
         let column = 0;
@@ -4170,10 +4208,10 @@ const unexpand: ShellCommand = (ctx) => {
         while (i < line.length) {
             const ch = line[i];
             if (ch === '\t') {
+                // a tab already in the input keeps its own advance: to the next stop, or nowhere
                 const stop = nextTabStop(stops, column);
-                const gap = stop - column;
-                out += gap >= 2 ? '\t' : ' '.repeat(gap);
-                column = stop;
+                out += '\t';
+                column = stop === null ? column + 1 : stop;
                 i++;
                 continue;
             }
@@ -4186,12 +4224,11 @@ const unexpand: ShellCommand = (ctx) => {
                 if (allBlanks || leading) {
                     for (;;) {
                         const stop = nextTabStop(stops, column);
-                        const need = stop - column;
-                        if (need >= 2 && remaining >= need) {
-                            out += '\t';
-                            remaining -= need;
-                            column = stop;
-                        } else break;
+                        if (stop === null) break;
+                        if (!blanksBecomeTab(repeating, stop - column, remaining)) break;
+                        out += '\t';
+                        remaining = Math.max(0, remaining - (stop - column));
+                        column = stop;
                     }
                 }
                 out += ' '.repeat(remaining);
@@ -4533,8 +4570,19 @@ function zipArchive(members: ZipMember[]): Uint8Array {
 
 const ZIP_USAGE = 'usage: zip [-qr] archive.zip [file ...]';
 
+/**
+ * The version `zip --version` reports: the container's own, as `curl --version` reports its own.
+ *
+ * The host's banner names Info-ZIP, a compiler and a build date, none of which this `zip` is: what
+ * is printed here names the writer it really is, fflate's deflate at level 6, and stops there. A
+ * line that only looked like the host's would be a line about a program that is not running.
+ */
+const ZIP_VERSION = '0.1.0';
+const ZIP_VERSION_BANNER = `zip ${ZIP_VERSION} (OpenWebContainer)\nCompiled with: fflate (deflate, level 6)\n` + '\n';
+
 const zip: ShellCommand = (ctx) => {
     const args = ctx.args;
+    if (args.includes('--version')) return result(ZIP_VERSION_BANNER, '', 0);
     let quiet = false;
     let recurse = false;
     let noMoreOptions = false;
@@ -4617,6 +4665,23 @@ const zip: ShellCommand = (ctx) => {
         return fail(`zip: ${archiveName}: ${error instanceof Error ? error.message : String(error)}`, 1);
     }
     return result(stdout, stderr, exitCode);
+};
+
+/** The usage lines this module publishes, by command name. `man` prints them as synopses. */
+export const USAGE: Record<string, string> = {
+    find: FIND_USAGE,
+    xargs: XARGS_USAGE,
+    date: DATE_USAGE,
+    install: INSTALL_USAGE,
+    ln: LN_USAGE,
+    chmod: CHMOD_USAGE,
+    du: DU_USAGE,
+    dir: DIR_USAGE,
+    tac: TAC_USAGE,
+    nl: NL_USAGE,
+    unexpand: UNEXPAND_USAGE,
+    dd: DD_USAGE,
+    zip: ZIP_USAGE
 };
 
 export const COMMANDS: Record<string, ShellCommand> = {

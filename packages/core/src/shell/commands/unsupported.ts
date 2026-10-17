@@ -1767,48 +1767,67 @@ function cmdOpenssl(ctx: CommandContext): CommandResult {
 /**
  * Every name here gets one line naming what the container lacks and exit status 1: never 127
  * 'Command not found', never a crash, and never a success that did not happen.
+ *
+ * The line carries a code after the name, so a caller that greps the message for a reason and a
+ * caller that matches on a code both get one: `[ERR_NO_RAW_SOCKET]` and the words after it say the
+ * same thing, and the code is stable while the wording is not. The codes are named the way the
+ * rest of this file names a failure (`ETIMEDOUT`, `ENOTFOUND`, `ERR_INVALID_URL`): a name a reader
+ * can search for, not a number to look up.
+ *
+ * The message goes to stderr, and that is the whole of the decision behind it. It is a diagnostic:
+ * the command produced no output, so stdout stays empty and `cmd > file`, `cmd | grep` and
+ * `$(cmd)` all see nothing rather than a sentence. The playground terminal is one xterm that prints
+ * both streams of the shell it runs, so the reason reaches the reader either way.
  */
-export const UNSUPPORTED: Record<string, string> = {
+export interface Unsupported {
+    /** The named code the report carries. */
+    code: string;
+    /** Why the container cannot have this utility, in one line that names the missing capability. */
+    reason: string;
+}
+
+export const UNSUPPORTED: Record<string, Unsupported> = {
     /* network: no raw sockets, no interfaces */
-    ping: 'the container has no raw sockets, so it cannot send ICMP echo requests',
-    dig: 'the container has no DNS resolver and no UDP sockets, so it cannot send a query',
-    traceroute: 'the container has no raw sockets, so it cannot send or receive ICMP',
-    nc: 'the container has no TCP or UDP sockets, so it cannot connect or listen',
-    netstat: 'the container has no socket table to report',
-    ss: 'the container has no socket table to report',
-    ip: 'the container has no network interfaces to configure or report',
-    ifconfig: 'the container has no network interfaces to configure or report',
-    nft: 'the container has no kernel packet filter to program',
+    ping: { code: 'ERR_NO_RAW_SOCKET', reason: 'the container has no raw sockets, so it cannot send ICMP echo requests' },
+    dig: { code: 'ERR_NO_DNS_RESOLVER', reason: 'the container has no DNS resolver and no UDP sockets, so it cannot send a query' },
+    traceroute: { code: 'ERR_NO_RAW_SOCKET', reason: 'the container has no raw sockets, so it cannot send or receive ICMP' },
+    nc: { code: 'ERR_NO_SOCKET_API', reason: 'the container has no TCP or UDP sockets, so it cannot connect or listen' },
+    netstat: { code: 'ERR_NO_SOCKET_TABLE', reason: 'the container has no socket table to report' },
+    ss: { code: 'ERR_NO_SOCKET_TABLE', reason: 'the container has no socket table to report' },
+    ip: { code: 'ERR_NO_NETWORK_INTERFACES', reason: 'the container has no network interfaces to configure: its virtual network is one loopback range with no interface of its own' },
+    nft: { code: 'ERR_NO_PACKET_FILTER', reason: 'the container has no kernel packet filter to program' },
 
     /* privileged: no host OS */
-    systemctl: 'there is no init system: the container is one JavaScript process, not an OS',
-    cron: 'there is no cron daemon: nothing runs while the shell is not running',
-    crontab: 'there is no cron daemon to install a table into',
-    chroot: 'there is no host OS: the container cannot change its own root',
-    su: 'the container is single-user and has no user database to switch with',
-    sudo: 'the container is single-user and has no privilege to raise',
-    usermod: 'the container has no user database to modify',
-    groupadd: 'the container has no group database to modify',
-    groupdel: 'the container has no group database to modify',
+    systemctl: { code: 'ERR_NO_INIT_SYSTEM', reason: 'there is no init system: the container is one JavaScript process, not an OS' },
+    cron: { code: 'ERR_NO_DAEMON', reason: 'there is no cron daemon: nothing runs while the shell is not running' },
+    crontab: { code: 'ERR_NO_CRON_DAEMON', reason: 'there is no cron daemon to install a table into' },
+    chroot: { code: 'ERR_NO_HOST_OS', reason: 'there is no host OS: the container cannot change its own root' },
+    su: { code: 'ERR_NO_USER_DATABASE', reason: 'the container is single-user and has no user database to switch with' },
+    sudo: { code: 'ERR_NO_PRIVILEGE', reason: 'the container is single-user and has no privilege to raise' },
+    usermod: { code: 'ERR_NO_USER_DATABASE', reason: 'the container has no user database to modify' },
+    groupadd: { code: 'ERR_NO_GROUP_DATABASE', reason: 'the container has no group database to modify' },
+    groupdel: { code: 'ERR_NO_GROUP_DATABASE', reason: 'the container has no group database to modify' },
+
+    /* packaging: no dpkg */
+    dh: { code: 'ERR_NO_DEBHELPER', reason: 'the container ships no debhelper: there is no dpkg to build a Debian package with' },
 
     /* hardware: nothing to measure */
-    lspci: 'the container has no PCI bus to enumerate',
-    iostat: 'the container has no block devices to report I/O for',
-    vmstat: 'the container has no kernel memory or CPU counters to report',
-    perf: 'the container has no hardware performance counters to read',
+    lspci: { code: 'ERR_NO_PCI_BUS', reason: 'the container has no PCI bus to enumerate' },
+    iostat: { code: 'ERR_NO_BLOCK_DEVICES', reason: 'the container has no block devices to report I/O for' },
+    vmstat: { code: 'ERR_NO_KERNEL_COUNTERS', reason: 'the container has no kernel memory or CPU counters to report' },
+    perf: { code: 'ERR_NO_PERF_COUNTERS', reason: 'the container has no hardware performance counters to read' },
 
     /* nothing to enumerate: no open-file table, no removable media */
-    lsof: 'the container keeps no table of open files: the file system is written through, never held open by a process',
-    eject: 'the container has no removable media and no drive to eject one from',
+    lsof: { code: 'ERR_NO_OPEN_FILE_TABLE', reason: 'the container keeps no table of open files: the file system is written through, never held open by a process' },
+    eject: { code: 'ERR_NO_REMOVABLE_MEDIA', reason: 'the container has no removable media and no drive to eject one from' },
 
     /* interactive, or a foreign desktop */
-    tmux: 'the container has no terminal to multiplex: the shell runs one line at a time',
-    vi: 'the container has no interactive editor: there is no terminal and input arrives a line at a time',
-    import: 'the container has no X display to capture',
-    xclip: 'the container has no X selection to read or write',
-    open: 'the container cannot open a file on the host desktop',
-    write: 'the container has no other users and no terminals to write to',
-    man: 'the container ships no manual pages'
+    tmux: { code: 'ERR_NO_TERMINAL', reason: 'the container has no terminal to multiplex: the shell runs one line at a time' },
+    vi: { code: 'ERR_NO_INTERACTIVE_EDITOR', reason: 'the container has no interactive editor: there is no terminal and input arrives a line at a time' },
+    import: { code: 'ERR_NO_X_DISPLAY', reason: 'the container has no X display to capture' },
+    xclip: { code: 'ERR_NO_X_SELECTION', reason: 'the container has no X selection to read or write' },
+    open: { code: 'ERR_NO_DESKTOP', reason: 'the container cannot open a file on the host desktop' },
+    write: { code: 'ERR_NO_OTHER_USERS', reason: 'the container has no other users and no terminals to write to' }
 };
 
 /** True when `name` is a utility the container cannot have. */
@@ -1818,9 +1837,9 @@ export function isUnsupported(name: string): boolean {
 
 /** The line an unsupported utility reports, and the status it reports with (1). */
 export function unsupportedResult(name: string): CommandResult {
-    const reason = UNSUPPORTED[name];
-    if (reason === undefined) return fail(`${name}: Command not found`, 127);
-    return fail(`${name}: not supported on this runtime: ${reason}`);
+    const entry = UNSUPPORTED[name];
+    if (entry === undefined) return fail(`${name}: Command not found`, 127);
+    return fail(`${name}: [${entry.code}] not supported on this runtime: ${entry.reason}`);
 }
 
 /** The same outcome as a handler, so a dispatcher can merge it into its table in one line. */
@@ -1829,7 +1848,414 @@ export const UNSUPPORTED_COMMANDS: Record<string, ShellCommand> = Object.fromEnt
 );
 
 /* ================================================================== *
- * 5. The table
+ * 5. curl and wget: a real request, through the host's fetch
+ * ================================================================== */
+
+/**
+ * The one outbound HTTP path the container has, and the one `curl` and `wget` use: the host's
+ * `fetch`, the same call the guest's `http.fetch` capability makes in
+ * process/executors/node/runtime/capabilities/http.ts. There is no socket to open and no resolver to
+ * query, so what the browser refuses -- an origin that sends no CORS header, a certificate it will
+ * not accept, a name that does not resolve -- arrives as one TypeError and is reported as exactly
+ * that, never dressed up as a response.
+ *
+ * A request is asynchronous, so neither utility is in `COMMANDS`: a handler there is synchronous
+ * (shell/commands/types.ts) and cannot wait for one. They are exported for the dispatcher that can
+ * wait -- the shell's external-command registry -- and both answer with the same `CommandResult`.
+ */
+
+/** The version `curl --version` and `wget --version` report: the one in packages/core/package.json. */
+const NET_VERSION = '0.1.0';
+
+/** Upper bound for one request, from start to the last body byte: the `http.fetch` capability's. */
+const NET_TIMEOUT_MS = 30000;
+
+/** Headers a browser fetch refuses, or that describe the transport rather than the message. */
+const NET_TRANSPORT_HEADERS = new Set(['host', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'content-length', 'upgrade', 'te', 'trailer', 'expect']);
+
+/** A failure with a name. The code is what the utility's exit status is chosen from. */
+function netFailure(code: string, message: string): Error {
+    return Object.assign(new Error(message), { code });
+}
+
+/** A command line this utility refuses to act on, as opposed to a request that failed. */
+function usageFailure(message: string): Error {
+    return netFailure('ERR_USAGE', message);
+}
+
+/** The named code an error carries, or ERR_UNKNOWN when it carries none. */
+function netCode(error: unknown): string {
+    const code = (error as { code?: unknown } | null | undefined)?.code;
+    return typeof code === 'string' ? code : 'ERR_UNKNOWN';
+}
+
+/** The one request. */
+interface NetRequest {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body?: string;
+}
+
+/** The one response: its status, its headers and its body as the bytes that arrived. */
+interface NetResponse {
+    status: number;
+    statusText: string;
+    headers: Record<string, string>;
+    bytes: Uint8Array;
+    url: string;
+}
+
+/** The URL as a request will use it: a bare host gets the `http://` both utilities default to. */
+function netAbsolute(url: string): string {
+    return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url) ? url : `http://${url}`;
+}
+
+/**
+ * One request, run by the host's fetch with the rules the `http.fetch` capability uses: a transport
+ * header is dropped rather than sent, redirects are followed, and the whole thing is abandoned after
+ * NET_TIMEOUT_MS. It either returns a response or throws with a name; it never returns a response it
+ * did not receive.
+ */
+async function netFetch(request: NetRequest): Promise<NetResponse> {
+    if (typeof fetch !== 'function') {
+        throw netFailure('ERR_NO_FETCH', 'no fetch is available, so the container cannot make an outbound request');
+    }
+    const absolute = netAbsolute(request.url);
+    let target: URL;
+    try {
+        target = new URL(absolute);
+    } catch {
+        throw netFailure('ERR_INVALID_URL', `Invalid URL: ${request.url}`);
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+        throw netFailure('ERR_INVALID_PROTOCOL', `Protocol "${target.protocol}" not supported. Expected "http:" or "https:"`);
+    }
+    const method = request.method.toUpperCase();
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(request.headers)) {
+        if (NET_TRANSPORT_HEADERS.has(name.toLowerCase())) continue;
+        try {
+            headers.append(name, value);
+        } catch {
+            // a value the browser refuses is dropped, the way fetch drops it
+        }
+    }
+    const body = request.body === undefined || method === 'GET' || method === 'HEAD' ? undefined : request.body;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NET_TIMEOUT_MS);
+    try {
+        const response = await fetch(target.href, { method, headers, body, redirect: 'follow', signal: controller.signal });
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const received: Record<string, string> = {};
+        response.headers.forEach((value, name) => {
+            if (name !== 'set-cookie') received[name] = value;
+        });
+        return { status: response.status, statusText: response.statusText, headers: received, bytes, url: response.url };
+    } catch (error) {
+        if (controller.signal.aborted) {
+            throw netFailure('ETIMEDOUT', `request to ${target.href} timed out after ${NET_TIMEOUT_MS} ms`);
+        }
+        if (error instanceof TypeError) {
+            // the browser reports name resolution, TLS and CORS failures the same way
+            throw netFailure('ENOTFOUND', `getaddrinfo ENOTFOUND ${target.hostname}: the browser could not complete the request (name resolution, TLS or CORS)`);
+        }
+        throw netFailure('ECONNRESET', error instanceof Error ? error.message : String(error));
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** The status `curl` reports for a named failure: its own, where it has one. */
+function curlStatus(code: string): number {
+    switch (code) {
+        case 'ERR_INVALID_URL': return 3;
+        case 'ETIMEDOUT': return 28;
+        case 'ENOTFOUND': return 6;
+        case 'ECONNRESET': return 56;
+        default: return 1;
+    }
+}
+
+/** The status `wget` reports for a named failure. */
+function wgetStatus(code: string): number {
+    switch (code) {
+        case 'ETIMEDOUT': return 4;
+        case 'ENOTFOUND': return 4;
+        case 'ECONNRESET': return 4;
+        default: return 1;
+    }
+}
+
+/** The response head as it goes to stdout for `-i` and `-I`. */
+function netHead(response: NetResponse): string {
+    let out = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
+    for (const [name, value] of Object.entries(response.headers)) out += `${name}: ${value}\r\n`;
+    return out + '\r\n';
+}
+
+/** True when `headers` already carries `name`, whatever case it was written in. */
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+    return Object.keys(headers).some((key) => key.toLowerCase() === name);
+}
+
+/** The file, and the bytes written to it: what a shell command needs of the container to save a body. */
+export interface NetWriter {
+    /** A path argument, resolved against the directory the command runs in. */
+    resolve(path: string): string;
+    /** The bytes of a response, written to a file as bytes. */
+    writeBytes(path: string, bytes: Uint8Array): void;
+}
+
+/* ---- curl ---- */
+
+interface CurlSpec {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body?: string;
+    /** `-o`: the file the body is written to, or `-` for stdout. Undefined when stdout is the target. */
+    output?: string;
+    head: boolean;
+    include: boolean;
+}
+
+/** The curl options that take the next word as their argument. */
+const CURL_VALUED = new Set(['-o', '-X', '-H', '-d']);
+
+/** The wget options that take the next word as their argument. */
+const WGET_VALUED = new Set(['-O']);
+
+/** One option and the text that followed it inside the same word, if any did. */
+interface NetOption {
+    option: string;
+    /** The rest of the word, when the option was written with its argument attached. */
+    inline?: string;
+}
+
+/**
+ * The options one word carries, the way both utilities read them: `-sS` is `-s` and `-S`, `-oFILE`
+ * is `-o` with FILE, `--output=FILE` is `--output` with FILE, and a cluster ends where the first
+ * option that takes an argument begins. A word that is not an option at all comes back whole, so
+ * the caller decides it is a URL.
+ */
+function netOptions(word: string, valued: Set<string>): NetOption[] {
+    if (word === '-' || !word.startsWith('-')) return [{ option: word }];
+    if (word.startsWith('--')) {
+        const equals = word.indexOf('=');
+        return equals > 0 ? [{ option: word.slice(0, equals), inline: word.slice(equals + 1) }] : [{ option: word }];
+    }
+    if (!/^-[a-zA-Z]+$/.test(word)) return [{ option: word }];
+    const letters = word.slice(1);
+    const out: NetOption[] = [];
+    for (let i = 0; i < letters.length; i++) {
+        const option = `-${letters[i]}`;
+        out.push({ option, inline: letters.slice(i + 1) });
+        if (valued.has(option)) break;
+    }
+    return out;
+}
+
+/**
+ * The curl options this container's curl has, and nothing else: an option it does not implement is
+ * refused with a name rather than read and ignored, because a request made with a flag that was
+ * silently dropped is a request the caller did not ask for.
+ */
+function parseCurlArgs(args: string[]): CurlSpec {
+    const spec: CurlSpec = { url: '', method: '', headers: {}, head: false, include: false };
+    let index = 0;
+    while (index < args.length) {
+        const arg = args[index];
+        const apply = (option: string, inline?: string): void => {
+            const value = (): string => {
+                if (inline !== undefined && inline !== '') return inline;
+                const next = args[index + 1];
+                if (next === undefined) throw usageFailure(`option ${option} requires an argument`);
+                index += 1;
+                return next;
+            };
+            switch (option) {
+                // no progress meter is ever written, so -s has nothing to silence, and errors always go
+                // to stderr, so -S has nothing to enable: both are accepted and neither changes anything.
+                case '-s': case '--silent': case '-S': case '--show-error': break;
+                case '-o': case '--output': spec.output = value(); break;
+                case '-X': case '--request': spec.method = value(); break;
+                case '-H': case '--header': {
+                    const header = value();
+                    const colon = header.indexOf(':');
+                    if (colon <= 0) throw usageFailure(`header "${header}" has no name before its colon`);
+                    spec.headers[header.slice(0, colon).trim()] = header.slice(colon + 1).trim();
+                    break;
+                }
+                case '-d': case '--data': case '--data-raw': case '--data-ascii': {
+                    const data = value();
+                    spec.body = spec.body === undefined ? data : `${spec.body}&${data}`;
+                    break;
+                }
+                case '-I': case '--head': spec.head = true; break;
+                case '-i': case '--include': spec.include = true; break;
+                default: throw usageFailure(`option ${option} is not supported on this runtime`);
+            }
+        };
+        if (arg.startsWith('-')) {
+            for (const { option, inline } of netOptions(arg, CURL_VALUED)) apply(option, inline);
+        } else {
+            if (spec.url !== '') throw usageFailure('only one URL per invocation is supported');
+            spec.url = arg;
+        }
+        index += 1;
+    }
+    if (spec.url === '') throw usageFailure('no URL specified');
+    if (spec.method === '') spec.method = spec.head ? 'HEAD' : spec.body === undefined ? 'GET' : 'POST';
+    if (spec.body !== undefined && !hasHeader(spec.headers, 'content-type')) {
+        spec.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
+    return spec;
+}
+
+/**
+ * `curl` at the point where it has not reached the network yet, and a caller that cannot reach it.
+ *
+ * Two invocations need no request: `--version`, which names no URL, and one the argument parser
+ * refuses -- no URL at all, an unsupported option, a header with no name -- which is a usage failure
+ * with `curl`'s own status 2. Both are answered here, in the container's own words. An invocation
+ * that does name a URL returns null: that is a request, and only the asynchronous `curl` can make
+ * one, because a synchronous child has no way to wait for host work.
+ */
+export function curlUsageResult(args: string[]): CommandResult | null {
+    if (args.length > 0 && args.every((arg) => arg === '--version' || arg === '-V')) {
+        return ok(`curl ${NET_VERSION} (OpenWebContainer)\nProtocols: http https\nFeatures: fetch\n`);
+    }
+    try {
+        parseCurlArgs(args);
+    } catch (error) {
+        return fail(`curl: ${message(error)}`, netCode(error) === 'ERR_USAGE' ? 2 : 1);
+    }
+    return null;
+}
+
+/**
+ * `curl`: one request, its body to stdout or to `-o`. A response that arrived is never reported as a
+ * failure, and a request that did not is never reported as a success: every non-zero status here is
+ * either a named failure of the request or an HTTP status of 400 and above.
+ */
+export async function curlCommand(args: string[], io: NetWriter): Promise<CommandResult> {
+    const withoutNetwork = curlUsageResult(args);
+    if (withoutNetwork !== null) return withoutNetwork;
+    const spec = parseCurlArgs(args);
+    let response: NetResponse;
+    try {
+        response = await netFetch({ url: spec.url, method: spec.method, headers: spec.headers, body: spec.body });
+    } catch (error) {
+        const status = curlStatus(netCode(error));
+        return fail(`curl: (${status}) ${message(error)}`, status);
+    }
+    const body = new TextDecoder().decode(response.bytes);
+    const stdout = (spec.include || spec.head ? netHead(response) : '') + (spec.head ? '' : body);
+    if (response.status >= 400) {
+        const reason = `curl: (22) The requested URL returned error: ${response.status} ${response.statusText}`;
+        if (spec.output !== undefined && spec.output !== '-') return fail(reason, 22);
+        return { stdout, stderr: `${reason}\n`, exitCode: 22 };
+    }
+    if (spec.output !== undefined && spec.output !== '-') {
+        try {
+            io.writeBytes(io.resolve(spec.output), response.bytes);
+        } catch (error) {
+            return fail(`curl: (23) ${message(error)}`, 23);
+        }
+        return ok();
+    }
+    return { stdout, stderr: '', exitCode: 0 };
+}
+
+/* ---- wget ---- */
+
+interface WgetSpec {
+    url: string;
+    /** `-O`: the file the body is written to, or `-` for stdout. Undefined means the URL's own name. */
+    output?: string;
+    quiet: boolean;
+}
+
+function parseWgetArgs(args: string[]): WgetSpec {
+    const spec: WgetSpec = { url: '', quiet: false };
+    let index = 0;
+    while (index < args.length) {
+        const arg = args[index];
+        const apply = (option: string, inline?: string): void => {
+            const value = (): string => {
+                if (inline !== undefined && inline !== '') return inline;
+                const next = args[index + 1];
+                if (next === undefined) throw usageFailure(`option ${option} requires an argument`);
+                index += 1;
+                return next;
+            };
+            switch (option) {
+                case '-q': case '--quiet': spec.quiet = true; break;
+                case '-O': case '--output-document': spec.output = value(); break;
+                default: throw usageFailure(`option ${option} is not supported on this runtime`);
+            }
+        };
+        if (arg.startsWith('-')) {
+            for (const { option, inline } of netOptions(arg, WGET_VALUED)) apply(option, inline);
+        } else {
+            if (spec.url !== '') throw usageFailure('only one URL per invocation is supported');
+            spec.url = arg;
+        }
+        index += 1;
+    }
+    if (spec.url === '') throw usageFailure('no URL specified');
+    return spec;
+}
+
+/** The file `wget URL` saves to when no `-O` names one: the last segment of the path, index.html if none. */
+function wgetName(url: string): string {
+    let pathname: string;
+    try {
+        pathname = new URL(netAbsolute(url)).pathname;
+    } catch {
+        pathname = url;
+    }
+    const trimmed = pathname.replace(/\/+$/, '');
+    const last = trimmed.split('/').pop() ?? '';
+    return last === '' ? 'index.html' : last;
+}
+
+/** `wget`: one GET, its body to `-O` or to the file the URL names. `-O -` writes to stdout. */
+export async function wgetCommand(args: string[], io: NetWriter): Promise<CommandResult> {
+    if (args.length > 0 && args.every((arg) => arg === '--version' || arg === '-V')) {
+        return ok(`Wget ${NET_VERSION} (OpenWebContainer)\n`);
+    }
+    let spec: WgetSpec;
+    try {
+        spec = parseWgetArgs(args);
+    } catch (error) {
+        return fail(`wget: ${message(error)}`, netCode(error) === 'ERR_USAGE' ? 2 : 1);
+    }
+    let response: NetResponse;
+    try {
+        response = await netFetch({ url: spec.url, method: 'GET', headers: {} });
+    } catch (error) {
+        return fail(`wget: ${message(error)}`, wgetStatus(netCode(error)));
+    }
+    if (response.status >= 400) {
+        return fail(`wget: server returned error: ${response.status} ${response.statusText}`, 8);
+    }
+    if (spec.output === '-') {
+        return { stdout: new TextDecoder().decode(response.bytes), stderr: '', exitCode: 0 };
+    }
+    const path = io.resolve(spec.output ?? wgetName(spec.url));
+    try {
+        io.writeBytes(path, response.bytes);
+    } catch (error) {
+        return fail(`wget: ${message(error)}`, 3);
+    }
+    // nothing here invents a transfer rate or a time: the byte count is the one thing measured
+    return { stdout: '', stderr: spec.quiet ? '' : `wget: saved ${response.bytes.length} bytes to ${path}\n`, exitCode: 0 };
+}
+
+/* ================================================================== *
+ * 6. The table
  * ================================================================== */
 
 export const COMMANDS: Record<string, ShellCommand> = {

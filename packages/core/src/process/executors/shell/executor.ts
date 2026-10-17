@@ -2,9 +2,10 @@ import { IFileSystem } from '../../../filesystem';
 import { ProcessExecutor } from '../base';
 import { ShellProcess } from './process';
 import { ChildProcessPayload, Process } from '../../base';
+import type { NetworkHandle } from '../../../shell/commands/types';
 
 export class ShellProcessExecutor implements ProcessExecutor {
-    constructor(private fileSystem: IFileSystem) { }
+    constructor(private fileSystem: IFileSystem, private network?: NetworkHandle) { }
 
     canExecute(executable: string): boolean {
         return executable === 'sh';
@@ -26,7 +27,8 @@ export class ShellProcessExecutor implements ProcessExecutor {
             this.fileSystem,
             parantPid,
             payload.cwd,
-            env
+            env,
+            this.network
         );
     }
 }

@@ -2489,8 +2489,16 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
                 plan.stderrTo = { kind: 'file', file: target, append: redirect.op === '&>>' };
                 break;
             case '>&':
-                if (target === '2') plan.stdoutTo = { kind: 'err' };
-                else if (target === '1') plan.stdoutTo = { kind: 'out' };
+                /* A duplicate copies the destination the named descriptor has *now*, not where it
+                   started: `> f 2>&1` sends both to `f`, while `2>&1 > f` leaves stderr on the
+                   terminal. `2>&1` on a bare line therefore copies stdout's own destination. */
+                if (target === '2') {
+                    if (redirect.fd === 2) plan.stderrTo = { ...plan.stderrTo };
+                    else plan.stdoutTo = { ...plan.stderrTo };
+                } else if (target === '1') {
+                    if (redirect.fd === 2) plan.stderrTo = { ...plan.stdoutTo };
+                    else plan.stdoutTo = { ...plan.stdoutTo };
+                } else if (redirect.fd === 2) plan.stderrTo = { kind: 'file', file: target };
                 else plan.stdoutTo = { kind: 'file', file: target };
                 break;
             case '<&':
@@ -2501,16 +2509,29 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
     return plan;
 }
 
+/**
+ * `/dev/null` as a redirection names it: a sink, not a file in the tree.
+ *
+ * The container has no `/dev` to hold it, and a redirect that tried to open it there failed with
+ * ENOENT on '/dev' before the command ran at all. What is written to the sink is discarded and what
+ * is read from it is empty, which is what the host's own `/dev/null` does; no directory is created
+ * and nothing else in the tree learns the name.
+ */
+const NULL_DEVICE = '/dev/null';
+
 function readInputFile(state: ShellState, file: string): string {
     const fs = state.fs;
     if (!fs) return '';
-    return fs.readFile(resolvePath(state, file)) ?? '';
+    const path = resolvePath(state, file);
+    if (path === NULL_DEVICE) return '';
+    return fs.readFile(path) ?? '';
 }
 
 function writeOutputFile(state: ShellState, file: string, text: string, append: boolean): void {
     const fs = state.fs;
     if (!fs) throw new Error(`Failed to redirect to ${file}: no file system`);
     const path = resolvePath(state, file);
+    if (path === NULL_DEVICE) return;
     try {
         fs.writeFile(path, append ? (fs.readFile(path) ?? '') + text : text);
     } catch (error) {

@@ -4,6 +4,7 @@
  *   ps  top  kill  killall  pkill  nice  nohup  time  watch
  *   hostname  who  whoami  users  groups  tty  sync
  *   locate  slocate  vdir  less  more  man  open  xclip
+ *   clear  ifconfig
  *
  * Two things shape this file.
  *
@@ -12,11 +13,13 @@
  *     the orchestrator with `setProcessHost`. `types.ts` is untouched. Everything else runs on the
  *     context alone.
  *
- *  2. The container has no terminals, no utmp, no X server, no desktop and no man pages. The
- *     terminal-shaped utilities keep the host's option surface and exit codes and degrade in a
- *     documented way: `less`/`more` are pass-through pagers, `tty` reports "not a tty", `man` finds
- *     no pages, `open` and `xclip` report the missing desktop/display. Each decision is recorded
- *     next to the command and in MANIFEST.md.
+ *  2. The container has no terminals, no utmp, no X server and no desktop. The terminal-shaped
+ *     utilities keep the host's option surface and exit codes and degrade in a documented way:
+ *     `less`/`more` are pass-through pagers, `tty` reports "not a tty", `open` and `xclip` report the
+ *     missing desktop/display. `man` has pages after all -- one per command this container
+ *     implements, assembled from the usage line that command already prints -- and answers the
+ *     host's own "No manual entry for <name>" for anything else. Each decision is recorded next to
+ *     the command and in MANIFEST.md.
  *
  * Output shapes (column headers, field widths, sort order, exit codes, usage text) were measured
  * against the host utilities on macOS; the values printed are the container's own.
@@ -24,7 +27,11 @@
 
 import type { ShellCommand, CommandContext, CommandResult } from './types';
 import { atPath, inputText } from './types';
+import type { HubState } from '../../network/virtual/hub';
 import { runWithRunner } from './builtins';
+import { HELP, IMPLEMENTED_BUILTINS } from './builtins';
+import { USAGE as TEXT_USAGE, COMMANDS as TEXT_UTILS } from './textutils';
+import { USAGE as FILE_USAGE, COMMANDS as FILE_UTILS } from './fileutils';
 import { createShellState, runScript } from './builtins';
 import type { ShellFs } from './builtins';
 
@@ -738,9 +745,11 @@ function matchesName(p: Proc, name: string, useRegex: boolean, ignoreCase: boole
     return ignoreCase ? comm.toLowerCase() === name.toLowerCase() : comm === name;
 }
 
+const KILLALL_USAGE_TEXT = 'KILLALL_USAGE_TEXT';
+
 const killall: ShellCommand = (ctx) => {
     const args = ctx.args;
-    if (args.length === 0) return fail('usage: killall [-delmsvqz] [-help] [-I] [-u user] [-t tty] [-c procname] [-SIGNAL] [procname ...]', 1);
+    if (args.length === 0) return fail(KILLALL_USAGE_TEXT, 1);
     let signal = 'TERM';
     let useRegex = false;
     let ignoreCase = false;
@@ -751,7 +760,7 @@ const killall: ShellCommand = (ctx) => {
         const a = args[i];
         if (a === '--') { i++; while (i < args.length) names.push(args[i++]); break; }
         if (a === '-l') return out(signalList(true, 17)); // the host splits its list after 17 names
-        if (a === '-help') return fail('usage: killall [-delmsvqz] [-help] [-I] [-u user] [-t tty] [-c procname] [-SIGNAL] [procname ...]', 1);
+        if (a === '-help') return fail(KILLALL_USAGE_TEXT, 1);
         if (a.startsWith('-') && a !== '-') {
             const body = a.slice(1);
             if (/^[A-Za-z]/.test(body) && !/^(u|t|c|s|m|I|q|v|d|e|z|l)$/.test(body)) {
@@ -783,7 +792,7 @@ const killall: ShellCommand = (ctx) => {
         names.push(a);
         i++;
     }
-    if (names.length === 0) return fail('usage: killall [-delmsvqz] [-help] [-I] [-u user] [-t tty] [-c procname] [-SIGNAL] [procname ...]', 1);
+    if (names.length === 0) return fail(KILLALL_USAGE_TEXT, 1);
     const h = hostOr();
     if (!h) return noHost('killall');
     const procs = procsOf(h);
@@ -1391,9 +1400,117 @@ const MAN_USAGE = [
 ].join('\n');
 
 /**
- * The container ships no manual pages. `man` keeps the host's option surface and exit codes and
- * reports "No manual entry" for every page, which is exactly what the host says for a page it does
- * not have.
+ * The synopsis `man` prints for a name: a line some command of this container already prints.
+ *
+ * Nothing here was written for `man`. An entry is either the usage line of the module that
+ * implements the command, or the one-line help `help <name>` carries for a builtin; the last two
+ * groups are what shell.ts implements itself, read off its own `runShellBuiltin`.
+ */
+function manSynopsis(): Record<string, string> {
+    return {
+    ps: PS_USAGE,
+    top: TOP_USAGE,
+    kill: KILL_USAGE,
+    killall: KILLALL_USAGE_TEXT,
+    pkill: PKILL_USAGE,
+    nice: NICE_USAGE,
+    nohup: NOHUP_USAGE,
+    time: TIME_USAGE,
+    watch: WATCH_USAGE,
+    hostname: HOSTNAME_USAGE,
+    who: WHO_USAGE,
+    whoami: WHOAMI_USAGE,
+    users: USERS_USAGE,
+    groups: GROUPS_USAGE,
+    tty: TTY_USAGE,
+    locate: LOCATE_USAGE,
+    slocate: LOCATE_USAGE,
+    vdir: VDIR_USAGE,
+    man: MAN_USAGE,
+    uname: UNAME_USAGE,
+    uptime: UPTIME_USAGE,
+    pgrep: PGREP_USAGE,
+    timeout: TIMEOUT_USAGE,
+    sh: SH_USAGE,
+    ...TEXT_USAGE,
+    ...FILE_USAGE,
+    // shell.ts, case by case: it takes no options except the ones below
+    echo: 'echo [arg ...]',
+    cat: 'cat [file]',
+    pwd: 'pwd',
+    ls: 'ls [directory]',
+    mkdir: 'mkdir [-p] directory ...',
+    rm: 'rm [-r] file ...',
+    rmdir: 'rmdir directory',
+    touch: 'touch file',
+    cd: 'cd [directory]',
+    cp: 'cp source destination',
+    mv: 'mv source destination',
+    true: 'true',
+    false: 'false',
+    clear: 'clear',
+    ifconfig: 'ifconfig [-a] [interface]'
+    };
+}
+
+/** Every name this container implements: the modules' own tables and the shell's own builtins. */
+function manImplemented(): Set<string> {
+    return new Set([
+        ...Object.keys(COMMANDS),
+        ...Object.keys(TEXT_UTILS),
+        ...Object.keys(FILE_UTILS),
+        ...IMPLEMENTED_BUILTINS,
+        'echo', 'cat', 'pwd', 'ls', 'mkdir', 'rm', 'rmdir', 'touch', 'cd', 'cp', 'mv', 'true', 'false'
+    ]);
+}
+
+/** Indents a usage block four spaces, the way a manual page sets a synopsis under its heading. */
+function indentBlock(text: string): string {
+    const body = text
+        .replace(/^usage:[ \t]*/i, '')
+        .replace(/^(?:[ \t]*\n)+/, '')
+        .replace(/\n$/, '');
+    return (
+        body
+            .split('\n')
+            .map((line) => (line === '' ? '' : `    ${line}`))
+            .join('\n') + '\n'
+    );
+}
+
+/**
+ * The manual page for one name, or null when this container has none for it. A page is only ever
+ * text this container already publishes: no option is listed that the command does not implement.
+ */
+function manPage(name: string): string | null {
+    const help = HELP[name];
+    if (help !== undefined) {
+        const split = help.indexOf(' -- ');
+        const args = split === -1 ? '' : help.slice(0, split).trim();
+        const description = split === -1 ? help : help.slice(split + 4).trim();
+        // `help` writes the name as part of the arguments, so it is not written twice
+        const synopsis = args === name || args.startsWith(`${name} `) ? args : `${name} ${args}`.trimEnd();
+        return `NAME\n    ${name} - ${description}\n\nSYNOPSIS\n    ${synopsis}\n\n`;
+    }
+    const usage = manSynopsis()[name];
+    if (usage !== undefined) {
+        return `NAME\n    ${name}\n\nSYNOPSIS\n${indentBlock(usage)}\n`;
+    }
+    if (manImplemented().has(name)) {
+        return (
+            `NAME\n    ${name}\n\nSYNOPSIS\n    ${name} [argument ...]\n\n` +
+            `DESCRIPTION\n    ${name} is implemented by this container, which publishes no synopsis\n` +
+            `    for it: only the options it implements are accepted.\n\n`
+        );
+    }
+    return null;
+}
+
+/**
+ * `man`: a page for every command this container implements, and the host's own answer -- "No manual
+ * entry for <name>", status 1 -- for one it does not. The container ships no manual pages, so a page
+ * is assembled from the command's own usage line and the `help` builtin's one-liner; nothing is
+ * written for `man` alone and no option is documented that the command does not take.
  */
 const man: ShellCommand = (ctx) => {
     const args = ctx.args;
@@ -1415,7 +1532,98 @@ const man: ShellCommand = (ctx) => {
     }
     if (pages.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
     if (keyword) return fail(`${pages[0]}: nothing appropriate`, 1);
-    return fail(`No manual entry for ${pages.join(' ')}`, 1);
+    const found: string[] = [];
+    const missing: string[] = [];
+    for (const page of pages) {
+        const text = manPage(page);
+        if (text === null) missing.push(page);
+        else found.push(text);
+    }
+    return {
+        stdout: found.join(''),
+        stderr: missing.length === 0 ? '' : `No manual entry for ${missing.join(' ')}\n`,
+        exitCode: missing.length === 0 ? 0 : 1
+    };
+};
+
+/* ================================================================== *
+ * 15b. clear
+ * ================================================================== */
+
+/**
+ * The bytes `clear` writes: erase the scrollback, home the cursor, erase the screen. Measured from
+ * the host's `clear` on a terminal named by `TERM=xterm` -- the sequence an xterm terminal, which is
+ * what the playground is, reads as "clear". It is written to stdout whatever stdout is: a pipe or a
+ * file receives the same bytes and is none the worse for them, which is all a non-terminal can ask.
+ */
+const CLEAR_SEQUENCE = '\u001b[3J\u001b[H\u001b[2J';
+
+/** `clear`: no options, because this container's `clear` takes none. */
+const clear: ShellCommand = (ctx) => {
+    if (ctx.args.length > 0) return fail(`clear: illegal option -- ${ctx.args[0].replace(/^-/, '')}`, 1);
+    return { stdout: CLEAR_SEQUENCE, stderr: '', exitCode: 0 };
+};
+
+/* ================================================================== *
+ * 15c. ifconfig
+ * ================================================================== */
+
+/**
+ * One interface block, built from the hub state `ifconfig` was handed.
+ *
+ * `VirtualNetwork` is loopback-only: `isLocal` accepts the wildcard, `127.0.0.1` and every `127.*`
+ * address, and a bind anywhere else fails EADDRNOTAVAIL while a connect fails ENETUNREACH. That
+ * range, 127.0.0.0/8, is the whole of what the container can address, so it is one interface and it
+ * is a loopback, and the name `lo` is the one a host gives that interface -- the hub itself names
+ * nothing. `::1` resolves in the hub's name table but `isLocal` rejects it, so no IPv6 address is
+ * claimed here either.
+ *
+ * The `inet` lines and the two lists under them are the hub's own tables read at this instant: the
+ * addresses it is carrying on a binding or an open connection, the listeners and sockets it holds
+ * and the connections that are open. Nothing here is counted, averaged or invented -- a number
+ * printed is a number the hub really holds, and a hub that holds nothing prints the loopback alone.
+ *
+ * Where the shell was given no hub to read, that is what is printed too, and it is the reason: the
+ * container's network state lives in the hub, and a list written here instead would be a list no
+ * code in the container ever held.
+ */
+function ifconfigBlock(state: HubState | null): string {
+    if (state === null) return 'lo: <UP,LOOPBACK>\n\tinet 127.0.0.1 netmask 255.0.0.0\n';
+    const addresses = state.addresses.length === 0 ? ['127.0.0.1'] : state.addresses;
+    let out = 'lo: <UP,LOOPBACK>\n';
+    for (const address of addresses) {
+        out += `\tinet ${address} netmask ${address.startsWith('127.') ? '255.0.0.0' : '0.0.0.0'}\n`;
+    }
+    out += '\tstatus: active\n';
+    if (state.listeners.length > 0) {
+        out += '\tlisteners:\n';
+        for (const entry of state.listeners) out += `\t\t${entry.address}:${entry.port} (${entry.protocol})\n`;
+    }
+    if (state.connections.length > 0) {
+        out += '\tconnections:\n';
+        for (const entry of state.connections) out += `\t\t${entry.local} -> ${entry.remote}\n`;
+    }
+    return out;
+}
+
+/** `ifconfig`: `-a` and one interface name, the two things this container can answer. */
+const ifconfig: ShellCommand = (ctx) => {
+    const names: string[] = [];
+    for (const arg of ctx.args) {
+        if (arg === '-a' || arg === '--all') continue;
+        if (arg.startsWith('-') && arg !== '-') {
+            for (const c of arg.slice(1)) {
+                if (c === 'a') continue;
+                return fail(`ifconfig: illegal option -- ${c}\n${'usage: ifconfig [-a] [interface]'}\n`, 1);
+            }
+            continue;
+        }
+        names.push(arg);
+    }
+    for (const name of names) {
+        if (name !== 'lo') return fail(`ifconfig: interface ${name} does not exist`, 1);
+    }
+    return { stdout: ifconfigBlock(ctx.network === undefined ? null : ctx.network()), stderr: '', exitCode: 0 };
 };
 
 /* ================================================================== *
@@ -1712,17 +1920,58 @@ function timeoutMs(word: string): number | null {
     return Number(match[1]) * (match[2] === '' ? 1000 : factors[match[2]]);
 }
 
+/** The signals a `-s` may name, with the numbers the status of a killed command is built from. */
+const SIGNAL_NUMBERS: Record<string, number> = { HUP: 1, INT: 2, QUIT: 3, KILL: 9, ALRM: 14, TERM: 15, USR1: 30, USR2: 31 };
+
+/** The number of the signal a `-s` names: `TERM`, `SIGKILL`, `9`. Null for one the host has not. */
+function signalNumber(word: string): number | null {
+    if (/^\d+$/.test(word)) return Number(word);
+    return SIGNAL_NUMBERS[word.toUpperCase().replace(/^SIG/, '')] ?? null;
+}
+
+/**
+ * `timeout`: the duration, then the command, and the status of one that ran over its duration.
+ *
+ * A command here runs to completion before anything looks at the clock, because there is nothing
+ * else it can do: the container has no signal to deliver and no way to interrupt a command that is
+ * still running. So the deadline is measured *after* the command, on the wall clock, and a command
+ * that took longer than the duration it was given reports the status the host's `timeout` reports
+ * for one it killed at that instant -- 124, or 128 plus the signal for a `-s` or a
+ * `--preserve-status`. What is not the same is the run itself: the host kills the command at the
+ * deadline and this one finishes it, so its output here is the whole output, not the part it had
+ * written when the deadline passed.
+ */
 const timeout: ShellCommand = (ctx) => {
     const args = ctx.args;
     let i = 0;
+    let signal = 15;
+    let signalGiven = false;
+    let preserve = false;
+    let verbose = false;
     while (i < args.length && args[i].startsWith('-') && args[i] !== '-') {
         const arg = args[i];
         if (arg === '--') { i++; break; }
-        if (arg === '-s' || arg === '--signal') { i += 2; continue; }
-        if (arg.startsWith('--signal=')) { i++; continue; }
+        if (arg === '-s' || arg === '--signal') {
+            const number = signalNumber(args[i + 1] ?? '');
+            if (number === null) return fail(`timeout: invalid signal ${args[i + 1] ?? ''}\n${TIMEOUT_USAGE}`, 125);
+            signal = number;
+            signalGiven = true;
+            i += 2;
+            continue;
+        }
+        if (arg.startsWith('--signal=')) {
+            const number = signalNumber(arg.slice('--signal='.length));
+            if (number === null) return fail(`timeout: invalid signal ${arg.slice('--signal='.length)}\n${TIMEOUT_USAGE}`, 125);
+            signal = number;
+            signalGiven = true;
+            i++;
+            continue;
+        }
         if (arg === '-k' || arg === '--kill-after') { i += 2; continue; }
         if (arg.startsWith('--kill-after=')) { i++; continue; }
-        if (arg === '--preserve-status' || arg === '--foreground' || arg === '-v' || arg === '--verbose') { i++; continue; }
+        if (arg === '--preserve-status') { preserve = true; i++; continue; }
+        if (arg === '--foreground') { i++; continue; }
+        if (arg === '-v' || arg === '--verbose') { verbose = true; i++; continue; }
         if (arg === '--help') return out(TIMEOUT_USAGE);
         return fail(`timeout: illegal option -- ${arg.slice(1, 2)}\n${TIMEOUT_USAGE}`, 1);
     }
@@ -1732,11 +1981,15 @@ const timeout: ShellCommand = (ctx) => {
     if (ms === null) return fail(`timeout: invalid time interval '${duration}'\n${TIMEOUT_USAGE}`, 125);
     const words = args.slice(i + 1);
     if (words.length === 0) return fail(TIMEOUT_USAGE, 125);
+    const startedAt = Date.now();
     const result = runCommand(ctx, words);
+    const elapsed = Date.now() - startedAt;
     if (result === null) return noRunner('timeout', words[0]);
-    // The container runs a command to completion before it returns, so no command is still running
-    // when its duration expires: the utility reports the command's own status, and never 124.
-    return result;
+    if (elapsed < ms) return result;
+    const status = signalGiven || preserve ? 128 + signal : 124;
+    const name = Object.keys(SIGNAL_NUMBERS).find((key) => SIGNAL_NUMBERS[key] === signal) ?? String(signal);
+    const note = verbose ? `timeout: sending signal ${name} to command ‘${words[0]}’\n` : '';
+    return { stdout: result.stdout, stderr: result.stderr + note, exitCode: status };
 };
 
 const SH_USAGE = 'usage: sh [-c string | -s | file] [argument ...]';
@@ -1834,5 +2087,7 @@ export const COMMANDS: Record<string, ShellCommand> = {
     w: wCommand,
     pgrep,
     timeout,
-    sh
+    sh,
+    clear,
+    ifconfig
 };

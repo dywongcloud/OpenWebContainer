@@ -86,7 +86,9 @@ export class OpenWebContainer {
         );
         this.processRegistry.registerExecutor(
             'shell',
-            new ShellProcessExecutor(this.fileSystem)
+            /* the shell's `ifconfig` and anything else that lists the network reads the hub live, at
+               the moment the command runs, through this handle */
+            new ShellProcessExecutor(this.fileSystem, () => network.hubState())
         );
         this.processRegistry.registerExecutor(
             'npm',

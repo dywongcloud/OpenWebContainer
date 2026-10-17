@@ -56,7 +56,7 @@ The architecture consists of three main layers:
   - Timers, `process.nextTick`, `process.exit` and exit codes, driven by a host event loop
   - `node -e <source>`
   - Console output integration
-  - `WebAssembly`: `compile`, `instantiate`, `validate`, `Module`, `Instance`, `Memory`, `Table` and `Global`, with `CompileError`, `LinkError` and `RuntimeError`. The engine has no WebAssembly of its own, so a module is compiled and run by the host and the guest gets objects that behave like the real ones; a `Memory` keeps a shadow of the bytes that is copied across the boundary on every call, so a guest write into `memory.buffer` is visible to the module from the next call on, and the module's writes are visible as soon as a call returns, but not in between. The copy is one per call, not per byte, so a module that makes very many calls over a very large memory pays for it
+  - `WebAssembly`: `compile`, `instantiate`, `validate`, `Module`, `Instance`, `Memory`, `Table` and `Global`, with `CompileError`, `LinkError` and `RuntimeError`. The engine has no WebAssembly of its own, so a module is compiled and run by the host and the guest gets objects that behave like the real ones; a `Memory` keeps a shadow of the bytes that is copied across the boundary in 1 MiB chunks on every call, so a guest write into `memory.buffer` is visible to the module from the next call on, and the module's writes are visible as soon as a call returns, but not in between. The copy is one per call, not per byte, so a module that makes very many calls over a very large memory pays for it
 
 - **Previews**
   - Playground preview URLs (`/__owc/preview/<port>/...`) are answered by a service worker that forwards each request to the container's HTTP server on that port
@@ -74,6 +74,41 @@ The architecture consists of three main layers:
   - Virtual TCP/UDP network, HTTP and preview routing are implemented (see above)
   - Still open: HTTP/3, sandbox security review (HTTP keep-alive works)
 
+### ⚠️ Shell divergences from the host that are recorded rather than fixed
+
+Each of these was measured by running the same command line on the host's `/bin/sh` and in the container
+and diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
+
+- **`zip --version`** prints the container's own banner (`zip 0.1.0 (OpenWebContainer)`, compiled with
+  fflate's deflate at level 6) and exits 0. The host's banner names Info-ZIP 3.0, Apple's compiler and a
+  build date -- a program that is not the one running here, so a line that only looked like the host's
+  would be a line about something else.
+- **`curl --version`** and **`wget --version`**, in the shell and from `execSync`/`spawnSync`, print the
+  container's own version the same way. The host's names libcurl 8.7.1, its protocol list and its
+  feature list; this one prints `fetch`.
+- **`execSync('curl <url>')` still refuses.** A synchronous child has no way to wait for the host work a
+  request needs, so it reports that rather than a status that means nothing. A `curl` that names no URL
+  has nothing to wait for and does answer: the container's own usage failure, with curl's status 2.
+- **`ifconfig`** lists the virtual network hub's own state, read live through the command context: the
+  loopback interface, and under it every address, listener and connection the hub holds at that moment.
+  The host lists its physical interfaces (`lo0`, `en0`, `awdl0`, ...). The container has no NICs, no
+  hardware address, no MTU and no packet counters, so none of those lines can exist here.
+- **`lspci`, and the other hardware utilities that report a named reason, exit 1; the host has no `lspci`
+  at all and its shell exits 127.** `lspci 2>/dev/null` therefore prints nothing and leaves 1, where the
+  host leaves 127. The redirection itself is fixed: `/dev/null` is a sink.
+- **`/dev/null` in a redirection is a sink, not a file.** What is written to it is discarded and what is
+  read from it is empty. No `/dev` directory is created and nothing else in the tree learns the name.
+- **`timeout` measures its deadline after the command, not during it.** The container has no signal to
+  deliver and no way to interrupt a command that is still running, so the command finishes and the wall
+  clock decides: one that ran over its duration reports 124, or 128 plus the signal for `-s` or
+  `--preserve-status`, but it ran to completion -- its output is the whole output, not the part it had
+  written when the deadline passed.
+- **`unexpand -t` with a list whose stops are adjacent (`-t 1,2`, `-t 2,3`) does not reproduce the host's
+  own behaviour.** Lists whose stops are two or more columns apart (`-t 1,3`, `-t 4,8`) do, for every
+  blank-run length measured. The host's list parser treats the degenerate case in a way this one does not.
+- **A trailing newline.** The container writes a command's stderr exactly as the command left it; the host
+  adds one only where the text has none.
+
 ### 📋 Upcoming Features
 
 - Additional shell commands
@@ -82,7 +117,7 @@ The architecture consists of three main layers:
 - HTTP/2: `http2` does not send server push (`pushStream` reports `ERR_HTTP2_PUSH_UNSUPPORTED`) and has no `respondWithFile`/`respondWithFD`, ALTSVC or ORIGIN frames, h2c `Upgrade` from HTTP/1.1, `allowHTTP1`, or session and stream timeouts. HTTP/3 over QUIC is not started
 - Guest-side `fetch` is not implemented: the global rejects. `undici` works instead: its HTTP/1 client runs because llhttp is WebAssembly, and it reaches a server inside the container (verified: a 200 over `http://127.0.0.1`)
 - `zlib` native handle protocol: pngjs's synchronous decoder reads `zlib.Inflate` internals (`_handle`, `_processChunk`) and fails; the public `zlib` APIs work
-- `sql.js` does not run yet: the WebAssembly bridge copies a whole memory across the boundary on every call, and sql.js's heap is large enough that those copies exhaust the engine. `hash-wasm` and `cheerio` do run and match Node byte for byte
+- `sql.js`, `hash-wasm` and `cheerio` all run and match Node byte for byte. A memory crosses the boundary in 1 MiB chunks, so peak stays at about one memory plus a chunk; a module that makes very many calls over a very large memory still pays one copy per call
 - Native addons: a compiled binary cannot run, so `process.versions.napi`, `process.dlopen` and a `.node` require serve a JavaScript reimplementation from `src/napi`: `bcrypt`, `sodium-native`, `better-sqlite3` (SQLite 3.47.0 transpiled to plain JS), `leveldown` and `rocksdb`, `node-pty`, `canvas` and `sharp`. `sodium_malloc` returns an ordinary zero-filled Buffer, and `sodium_mprotect_*` and `sodium_mlock` are no-ops: the container has no guarded heap and cannot lock memory, so libsodium's memory hardening is unavailable, though computed values are unaffected. `esbuild` ships a Go binary rather than an add-on
 - Utilities a browser container cannot have report it instead of exiting 127: `ping`, `dig`, `traceroute`, `nc`, `netstat`, `ss`, `ip`, `ifconfig`, `nft`, `systemctl`, `cron`, `crontab`, `chroot`, `su`, `sudo`, `usermod`, `groupadd`, `groupdel`, `lspci`, `iostat`, `vmstat`, `perf`, `tmux`, `vi`, `import`, `xclip`, `open`, `write` and `man` each write `<name>: not supported on this runtime: <reason>` and exit 1; `make` (variables, pattern rules, `.PHONY`, automatic variables), `bc` (arbitrary precision, `scale`, `sqrt`, `ibase`/`obase`) and an `openssl` subset (`dgst` with md5/sha1/sha224/sha256/sha384/sha512 and `-hmac`, those digests as shorthand commands, `rand -hex/-base64`, `version`) are implemented
 - The shell now provides the POSIX utilities as JavaScript over the virtual file system: the text filters (`grep`, `sed`, `awk`, `cut`, `sort`, `tr`, `paste`, `uniq`, `wc`, `head`, `tail`, `join`, `comm`, `diff`, `fmt`, `pr`, `tabs`), the file utilities (`find`, `xargs`, `stat`, `date`, `printf`, `expr`, `test`, `seq`, `base64`, `base32`, `xxd`, `split`, `install`, `ln`, `chown`, `chmod`, `du`, `df`, `tee`, `sleep`, `yes`, `basename`, `dirname`), the archives (`gzip`, `gunzip`, `zcat`, `compress`, `uncompress`, `tar`, `cpio`; no `bzip2` or `xz` codec is available), the shell builtins (`set`, `export`, `alias`, `type`, `trap`, `read`, `pushd`/`popd`, `source`) and the operators `;`, `&&`, `||`, `|`, `<`, `>`, `>>`, `2>&1` and `2>/dev/null`

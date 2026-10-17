@@ -6,6 +6,16 @@
  * through the virtual file system given to it, and it never spawns a child.
  */
 import type { IFileSystem } from '../../filesystem/types';
+import type { HubState } from '../../network/virtual/hub';
+
+/**
+ * A read of the container's virtual network hub, taken at the moment a command asks for it.
+ *
+ * A command carries this rather than a snapshot of the state, because the hub changes while the shell
+ * runs: `ifconfig` on the next line of a script must see the binding the line before it made. Null
+ * where the shell has no hub to read, which a command says rather than printing a state it invented.
+ */
+export type NetworkHandle = () => HubState | null;
 
 /** What a command is given: its arguments, the shell's state, its standard input and the file system. */
 export interface CommandContext {
@@ -19,6 +29,8 @@ export interface CommandContext {
     input: string | null;
     /** The virtual file system of the container running the command. */
     fs: IFileSystem;
+    /** The container's virtual network, or undefined where the shell was given none. */
+    network?: NetworkHandle;
 }
 
 /** What a command returns. Exit codes follow the utility's convention: 0 success, 1 or 2 failure. */
