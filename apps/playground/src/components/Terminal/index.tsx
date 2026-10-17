@@ -65,6 +65,24 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 					case "Backspace":
 						onCommandRef.current("\b");
 						break;
+				/* Ctrl-C interrupts and Ctrl-D ends input: without them a REPL cannot be interrupted
+				   or left, because the guest only ever sees keystrokes. */
+				case "c":
+				case "C":
+					if (domEvent.ctrlKey && !domEvent.altKey) {
+						onCommandRef.current("\x03");
+						break;
+					}
+					onCommandRef.current(domEvent.key);
+					break;
+				case "d":
+				case "D":
+					if (domEvent.ctrlKey && !domEvent.altKey) {
+						onCommandRef.current("\x04");
+						break;
+					}
+					onCommandRef.current(domEvent.key);
+					break;
 					default:
 						if (!domEvent.ctrlKey && !domEvent.altKey && (domEvent.key.length === 1 || key.length === 1)) {
 							onCommandRef.current(domEvent.key.length === 1 ? domEvent.key : key);
