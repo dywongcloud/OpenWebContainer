@@ -42,14 +42,22 @@ const REJECTION_TRACKER_SRC = String.raw`
   var Native = Promise;
   var CELLS = new WeakMap();
   var WATCHED = [];
-  var reported = false;
 
   /* Every promise this runtime builds goes through here: new Promise, Promise.reject, the result
      of then, catch and finally, and the results of all, race, any and allSettled -- the engine
      builds each of them by constructing the species of the constructor it started from. */
   class Tracked extends Native {
     constructor(executor) {
-      var cell = { reason: undefined, rejected: false, handled: false };
+      var owner = globalThis.process;
+      var cell = {
+        reason: undefined,
+        rejected: false,
+        handled: false,
+        promise: null,
+        /* the domain the promise was built in: Node sends the rejection of a promise a domain owns
+           to that domain, even when the domain has already been left by the time it is detected */
+        domain: owner !== undefined && owner !== null && owner.domain !== undefined ? owner.domain : null
+      };
       super(function (resolve, reject) {
         var wrapped = function (reason) {
           cell.rejected = true;
@@ -64,6 +72,7 @@ const REJECTION_TRACKER_SRC = String.raw`
         }
       });
       CELLS.set(this, cell);
+      cell.promise = this;
     }
   }
 
@@ -83,20 +92,44 @@ const REJECTION_TRACKER_SRC = String.raw`
     return nativeThen.call(this, onFulfilled, onRejected);
   };
 
-  /* The formatted reason of the first rejection left unhandled, or '' when there is none. */
+  function listenerCountOf(emitter, type) {
+    if (emitter === null || emitter === undefined) return 0;
+    if (typeof emitter.listenerCount === 'function') return emitter.listenerCount(type);
+    if (typeof emitter.listeners === 'function') return emitter.listeners(type).length;
+    return 0;
+  }
+
+  /* A rejection nothing handled goes to the domain that owns the promise first, then to an
+     unhandledRejection listener on process, and only then ends the process: the formatted reason
+     of the first one that reaches that point, or '' when none does. */
   api.takeUnhandledRejection = function () {
-    var first = null;
-    var rest = [];
+    var found = [];
     for (var i = 0; i < WATCHED.length; i++) {
-      var cell = WATCHED[i];
-      if (cell.handled) continue;
-      if (first === null && !reported) first = cell;
-      else rest.push(cell);
+      if (!WATCHED[i].handled) found.push(WATCHED[i]);
     }
-    WATCHED = rest;
-    if (first === null) return '';
-    reported = true;
-    return api.formatUncaught(first.reason);
+    WATCHED = [];
+    if (found.length === 0) return '';
+    var proc = globalThis.process;
+    for (var j = 0; j < found.length; j++) {
+      var cell = found[j];
+      var dom = cell.domain;
+      if (listenerCountOf(dom, 'error') > 0) {
+        if (cell.reason !== null && typeof cell.reason === 'object') {
+          try {
+            Object.defineProperty(cell.reason, 'domain', { value: dom, writable: true, configurable: true });
+            cell.reason.domainThrown = false;
+          } catch (e) { /* a frozen reason keeps the properties it already has */ }
+        }
+        dom.emit('error', cell.reason);
+        continue;
+      }
+      if (listenerCountOf(proc, 'unhandledRejection') > 0) {
+        proc.emit('unhandledRejection', cell.reason, cell.promise);
+        continue;
+      }
+      return api.formatUncaught(cell.reason);
+    }
+    return '';
   };
 })(globalThis.__owc_api);
 `;
