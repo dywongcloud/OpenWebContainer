@@ -232,6 +232,12 @@ BF['zlib'] = function () {
     };
   }
 
+  /*
+   * Brotli and zstd are not implemented here, by decision: the only pure-JS brotli on npm is a
+   * ~2.2 MB package, and zstd compression has no small pure-JS implementation (fzstd, 65 KB, is
+   * decompress-only). Both belong to the WebAssembly bridge as codec modules, which is where the
+   * container already carries large native code. Until they land there these stay unavailable.
+   */
   function unsupportedSync(name) {
     return function () {
       throw notSupported(name);

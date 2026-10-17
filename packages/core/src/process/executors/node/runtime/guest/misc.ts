@@ -375,7 +375,7 @@ BF.crypto = function () {
     return err;
   }
 
-  /* exports this runtime does not implement (ciphers, Diffie-Hellman, key generation): present so modules load, and they fail clearly when called */
+  /* exports this runtime does not implement (Diffie-Hellman, key generation): present so modules load, and they fail clearly when called */
   function featureUnavailable(name) {
     var err = new Error(name + ' is not available in this runtime');
     err.code = 'ERR_FEATURE_UNAVAILABLE';
@@ -755,6 +755,105 @@ BF.crypto = function () {
     subtle: subtle
   };
 
+  /*
+   * createCipheriv and createDecipheriv. The cipher itself runs on the host (@noble/ciphers); the
+   * guest keeps the id and the surface Node's callers use. Errors the host raises are rebuilt with
+   * the constructor Node uses, which the capability envelope cannot carry.
+   */
+  function cipherCap(op, args) {
+    try {
+      return callCap(op, args);
+    } catch (err) {
+      var Ctor = err && err.owcErrorClass === 'RangeError' ? RangeError : err && err.owcErrorClass === 'TypeError' ? TypeError : Error;
+      var again = new Ctor(err && err.message !== undefined ? err.message : String(err));
+      if (err && err.code !== undefined && !err.owcUncoded) again.code = err.code;
+      if (err && err.errno !== undefined) again.errno = err.errno;
+      throw again;
+    }
+  }
+
+  function cipherStateError(message) {
+    var err = new Error(message);
+    err.code = 'ERR_CRYPTO_INVALID_STATE';
+    return err;
+  }
+
+  function cipherBytes(data, encoding, name) {
+    return typeof data === 'string' ? Buf.from(data, encoding || 'utf8') : toBytes(data, undefined, name);
+  }
+
+  function cipherKeyBytes(key) {
+    var state = keyStateOf(key, 'key');
+    if (state !== undefined) {
+      if (state.type !== 'secret') throw asymmetricUnavailable('createCipheriv');
+      return state.bytes;
+    }
+    return cipherBytes(key, undefined, 'key');
+  }
+
+  function Cipher(algorithm, direction, id, aead) {
+    this._algorithm = algorithm;
+    this._direction = direction;
+    this._id = id;
+    this._aead = aead;
+    this._finalized = false;
+    this._tag = undefined;
+  }
+
+  Cipher.prototype.update = function (data, inputEncoding, outputEncoding) {
+    if (this._finalized) throw new Error('Trying to add data in unsupported state');
+    var bytes = cipherBytes(data, inputEncoding, 'data');
+    var out = Buf.from(cipherCap('crypto.cipher.update', { id: this._id, data: bytes.toString('base64') }), 'base64');
+    return typeof outputEncoding === 'string' ? out.toString(outputEncoding) : out;
+  };
+
+  Cipher.prototype.final = function (outputEncoding) {
+    if (this._finalized) throw cipherStateError('Invalid state');
+    this._finalized = true;
+    var result = cipherCap('crypto.cipher.final', { id: this._id });
+    if (result.tag !== undefined) this._tag = Buf.from(result.tag, 'base64');
+    var out = Buf.from(result.data, 'base64');
+    return typeof outputEncoding === 'string' ? out.toString(outputEncoding) : out;
+  };
+
+  Cipher.prototype.setAutoPadding = function (autoPadding) {
+    cipherCap('crypto.cipher.setAutoPadding', { id: this._id, on: autoPadding !== false });
+    return this;
+  };
+
+  Cipher.prototype.setAAD = function (buffer, options) {
+    var aad = cipherBytes(buffer, typeof options === 'string' ? options : undefined, 'buffer');
+    cipherCap('crypto.cipher.setAAD', { id: this._id, aad: aad.toString('base64') });
+    return this;
+  };
+
+  /* Node puts getAuthTag on a cipher and setAuthTag on a decipher, and neither on the other. */
+  function cipherGetAuthTag() {
+    if (!this._aead || !this._finalized || this._tag === undefined) throw cipherStateError('Invalid state for operation getAuthTag');
+    return this._tag;
+  }
+
+  function decipherSetAuthTag(buffer, inputEncoding) {
+    var tag = cipherBytes(buffer, inputEncoding, 'buffer');
+    cipherCap('crypto.cipher.setAuthTag', { id: this._id, tag: tag.toString('base64') });
+    return this;
+  }
+
+  function createCipher(direction) {
+    return function (algorithm, key, iv, options) {
+      var opened = cipherCap('crypto.cipher.open', {
+        algorithm: String(algorithm),
+        direction: direction,
+        key: cipherKeyBytes(key).toString('base64'),
+        iv: iv === null || iv === undefined ? null : cipherBytes(iv, undefined, 'iv').toString('base64')
+      });
+      var cipher = new Cipher(String(algorithm), direction, opened.id, opened.aead === true);
+      if (direction === 'decrypt') cipher.setAuthTag = decipherSetAuthTag;
+      else cipher.getAuthTag = cipherGetAuthTag;
+      return cipher;
+    };
+  }
+
   return {
     randomBytes: randomBytes,
     randomUUID: randomUUID,
@@ -787,11 +886,11 @@ BF.crypto = function () {
       RSA_PSS_SALTLEN_MAX_SIGN: -2,
       RSA_PSS_SALTLEN_AUTO: -2
     },
-    getCiphers: function () { return []; },
+    getCiphers: function () { return callCap('crypto.ciphers'); },
     sign: function sign(algorithm, data, key, callback) { throw featureUnavailable('sign'); },
     verify: function verify(algorithm, data, key, signature, callback) { throw featureUnavailable('verify'); },
-    createCipheriv: unavailable('createCipheriv'),
-    createDecipheriv: unavailable('createDecipheriv'),
+    createCipheriv: createCipher('encrypt'),
+    createDecipheriv: createCipher('decrypt'),
     diffieHellman: unavailable('diffieHellman'),
     generateKeyPair: unavailable('generateKeyPair'),
     privateDecrypt: unavailable('privateDecrypt'),
