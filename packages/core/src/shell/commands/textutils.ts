@@ -10,6 +10,55 @@
  */
 import { ShellCommand, CommandContext, CommandResult, atPath, inputText } from './types';
 
+/* The usage line each of these commands prints when it is given nothing to do, named once so the
+ * command and `man` (shell/commands/procinfo.ts) print the same text. */
+const GREP_USAGE =
+    'usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz] [-A num] [-B num] [-C[num]]\n' +
+    '\t[-e pattern] [-f file] [--binary-files=value] [--color=when]\n' +
+    '\t[--context[=num]] [--directories=action] [--label] [--line-buffered]\n' +
+    '\t[--null] [pattern] [file ...]\n';
+const AWK_USAGE = "usage: awk [-F fs] [-v var=value] [-f progfile | 'prog'] [file ...]\n";
+const CUT_USAGE = 'usage: cut -b list [-n] [file ...]\n       cut -c list [file ...]\n       cut -f list [-s] [-w | -d delim] [file ...]\n';
+const TR_USAGE = 'usage: tr [-Ccsu] string1 string2\n       tr [-Ccu] -d string1\n       tr [-Ccu] -s string1\n       tr [-Ccu] -ds string1 string2\n';
+const PASTE_USAGE = 'usage: paste [-s] [-d delimiters] file ...\n';
+const COMM_USAGE = 'usage: comm [-123i] file1 file2\n';
+const JOIN_USAGE = 'usage: join [-a fileno | -v fileno ] [-e string] [-1 field] [-2 field]\n' +
+    '            [-o list] [-t char] file1 file2\n';
+const DIFF_USAGE = [
+    'usage: diff [-aBbdilpTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]',
+    '            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]',
+    '            [-I pattern] [-F pattern] [-L label] file1 file2',
+    '       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]',
+    '            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]',
+    '            [-F pattern] -C number file1 file2',
+    '       diff [-aBbdiltw] [-I pattern] [--ignore-case] [--no-ignore-case]',
+    '            [--normal] [--strip-trailing-cr] [--tabsize] -D string file1 file2',
+    '       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]',
+    '            [--no-ignore-case] [--normal] [--tabsize] [--strip-trailing-cr]',
+    '            [-F pattern] -U number file1 file2',
+    '       diff [-aBbdilNPprsTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]',
+    '            [--no-ignore-case] [--normal] [--tabsize] [-I pattern] [-L label]',
+    '            [-F pattern] [-S name] [-X file] [-x pattern] dir1 dir2',
+    '       diff [-aBbditwW] [--expand-tabs] [--ignore-all-blanks]',
+    '            [--ignore-blank-lines] [--ignore-case] [--minimal]',
+    '            [--no-ignore-file-name-case] [--strip-trailing-cr]',
+    '            [--suppress-common-lines] [--tabsize] [--text] [--width]',
+    '            -y | --side-by-side file1 file2',
+    '       diff [--help] [--version]'
+].join('\n') + '\n';
+
+/** The usage lines this module publishes, by command name. `man` prints them as synopses. */
+export const USAGE: Record<string, string> = {
+    grep: GREP_USAGE,
+    awk: AWK_USAGE,
+    cut: CUT_USAGE,
+    tr: TR_USAGE,
+    paste: PASTE_USAGE,
+    comm: COMM_USAGE,
+    join: JOIN_USAGE,
+    diff: DIFF_USAGE
+};
+
 /* ------------------------------------------------------------------ *
  * Result helpers
  * ------------------------------------------------------------------ */
@@ -212,6 +261,12 @@ function posixReToJs(pattern: string, extended: boolean, anchorsAnywhere = false
         if (c === '$') {
             const atEnd = i === n - 1;
             outText += extended || anchorsAnywhere || atEnd ? '$' : '\\$';
+            i++;
+            continue;
+        }
+        if (c === '.') {
+            // `.` matches any character in a BRE and in an ERE alike; only `\.` is a literal dot.
+            outText += '.';
             i++;
             continue;
         }
@@ -421,10 +476,7 @@ const cmdGrep: ShellCommand = (ctx: CommandContext): CommandResult => {
     }
     if (patterns.length === 0) {
         return err(
-            'usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz] [-A num] [-B num] [-C[num]]\n' +
-                '\t[-e pattern] [-f file] [--binary-files=value] [--color=when]\n' +
-                '\t[--context[=num]] [--directories=action] [--label] [--line-buffered]\n' +
-                '\t[--null] [pattern] [file ...]\n',
+            GREP_USAGE,
             2
         );
     }
@@ -2827,7 +2879,7 @@ const cmdAwk: ShellCommand = (ctx: CommandContext): CommandResult => {
 
     if (program === '') {
         if (files.length === 0) {
-            return err("usage: awk [-F fs] [-v var=value] [-f progfile | 'prog'] [file ...]\n", 1);
+            return err(AWK_USAGE, 1);
         }
         program = files[0];
         files.shift();
@@ -3087,7 +3139,7 @@ const cmdCut: ShellCommand = (ctx: CommandContext): CommandResult => {
                 ? 'f'
                 : null;
     if (mode === null || listText === undefined) {
-        return err('usage: cut -b list [-n] [file ...]\n       cut -c list [file ...]\n       cut -f list [-s] [-w | -d delim] [file ...]\n', 1);
+        return err(CUT_USAGE, 1);
     }
     let delim = '\t';
     const delimArg = lastValue(scanned.values, 'd');
@@ -3440,8 +3492,7 @@ const cmdTr: ShellCommand = (ctx: CommandContext): CommandResult => {
     const scanned = scanFlags(ctx.args, 0, spec);
     const complement = hasFlag(scanned.flags, 'c') || hasFlag(scanned.flags, 'C');
     const operands = scanned.operands;
-    const usageText =
-        'usage: tr [-Ccsu] string1 string2\n       tr [-Ccu] -d string1\n       tr [-Ccu] -s string1\n       tr [-Ccu] -ds string1 string2\n';
+    const usageText = TR_USAGE;
     const squeeze = hasFlag(scanned.flags, 's');
     const del = hasFlag(scanned.flags, 'd');
     const needed = del && !squeeze ? 1 : squeeze && !del ? 1 : 2;
@@ -3517,7 +3568,7 @@ const cmdPaste: ShellCommand = (ctx: CommandContext): CommandResult => {
     const delims = unescapeDelims(lastValue(scanned.values, 'd') ?? '\t').split('');
     const files = scanned.operands;
     if (files.length === 0) {
-        return err('usage: paste [-s] [-d delimiters] file ...\n', 1);
+        return err(PASTE_USAGE, 1);
     }
     const columns: string[][] = [];
     if (files.length === 0) {
@@ -3839,7 +3890,7 @@ const cmdComm: ShellCommand = (ctx: CommandContext): CommandResult => {
     const show = [!hasFlag(scanned.flags, '1'), !hasFlag(scanned.flags, '2'), !hasFlag(scanned.flags, '3')];
     const ignoreCase = hasFlag(scanned.flags, 'i');
     if (scanned.operands.length < 2) {
-        return err('usage: comm [-123i] file1 file2\n', 1);
+        return err(COMM_USAGE, 1);
     }
     const first = readOne(ctx, scanned.operands[0]);
     const second = readOne(ctx, scanned.operands[1]);
@@ -3965,8 +4016,7 @@ const cmdJoin: ShellCommand = (ctx: CommandContext): CommandResult => {
 
     if (files.length < 2) {
         return err(
-            'usage: join [-a fileno | -v fileno ] [-e string] [-1 field] [-2 field]\n' +
-                '            [-o list] [-t char] file1 file2\n',
+            JOIN_USAGE,
             1
         );
     }
@@ -4370,28 +4420,7 @@ const cmdDiff: ShellCommand = (ctx: CommandContext): CommandResult => {
 
     if (operands.length < 2) {
         return err(
-            [
-                'usage: diff [-aBbdilpTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]',
-                '            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]',
-                '            [-I pattern] [-F pattern] [-L label] file1 file2',
-                '       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]',
-                '            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]',
-                '            [-F pattern] -C number file1 file2',
-                '       diff [-aBbdiltw] [-I pattern] [--ignore-case] [--no-ignore-case]',
-                '            [--normal] [--strip-trailing-cr] [--tabsize] -D string file1 file2',
-                '       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]',
-                '            [--no-ignore-case] [--normal] [--tabsize] [--strip-trailing-cr]',
-                '            [-F pattern] -U number file1 file2',
-                '       diff [-aBbdilNPprsTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]',
-                '            [--no-ignore-case] [--normal] [--tabsize] [-I pattern] [-L label]',
-                '            [-F pattern] [-S name] [-X file] [-x pattern] dir1 dir2',
-                '       diff [-aBbditwW] [--expand-tabs] [--ignore-all-blanks]',
-                '            [--ignore-blank-lines] [--ignore-case] [--minimal]',
-                '            [--no-ignore-file-name-case] [--strip-trailing-cr]',
-                '            [--suppress-common-lines] [--tabsize] [--text] [--width]',
-                '            -y | --side-by-side file1 file2',
-                '       diff [--help] [--version]',
-            ].join('\n') + '\n',
+            DIFF_USAGE,
             2
         );
     }

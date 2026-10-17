@@ -46,6 +46,15 @@ export type SimpleCommandRunner = (
     input: string | null
 ) => { stdout: string; stderr: string; exitCode: number };
 
+/**
+ * `cmd &` where this engine parsed the `&` -- inside an `if`, a `for`, a `while`, a `case`, a group
+ * or a subshell, which is every `&` the host's own line splitter never sees. Registering one is the
+ * host's to do: the table `jobs` and `wait` read is the host's, and so are the words a job is run
+ * from. It is handed the pipeline as it was written and answers with the job it registered, or with
+ * null where it can neither parse nor run it.
+ */
+export type BackgroundJobStarter = (state: ShellState, source: string) => ShellJob | null;
+
 export interface ShellVar {
     value: string;
     /** Exported into the environment of the commands that run (`export`, `declare -x`). */
@@ -146,6 +155,13 @@ export interface ShellState {
      * table and not two; a state with no host keeps an empty one of its own.
      */
     readonly jobs: ShellJob[];
+    /**
+     * How a `&` this engine parsed starts a job: `child.ts` installs the host's own
+     * `startBackgroundJob` here. Left unset -- a host that keeps no job table, or one that has not
+     * wired this -- a `&` runs its command in the foreground instead: waited for, so the command is
+     * late rather than lost, and never a job `jobs` would have to invent.
+     */
+    startJob?: BackgroundJobStarter;
     /** `getopts` state: the 1-based word index and the character offset inside the current word. */
     optind: number;
     optchar: number;
@@ -183,12 +199,20 @@ function escapeRegex(text: string): string {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** `starCrossesSlash` is true for `case` patterns, false for pathname expansion. */
-function globToRegExp(pattern: string, starCrossesSlash: boolean): RegExp {
+/**
+ * `starCrossesSlash` is true for `case` patterns, false for pathname expansion. `quoted` marks the
+ * characters that came out of quoted text -- `'*.txt'`, `"*.txt"` and `"$x"` -- which are literal:
+ * a quoted `*` is a `*` to match, never a pattern.
+ */
+function globToRegExp(pattern: string, starCrossesSlash: boolean, quoted?: boolean[]): RegExp {
     let out = '';
     const star = starCrossesSlash ? '.*' : '[^/]*';
     for (let i = 0; i < pattern.length; i++) {
         const ch = pattern[i];
+        if (quoted?.[i] === true) {
+            out += escapeRegex(ch);
+            continue;
+        }
         if (ch === '*') {
             out += star;
         } else if (ch === '?') {
@@ -232,8 +256,10 @@ function globMatch(pattern: string, text: string, starCrossesSlash: boolean): bo
     return globToRegExp(pattern, starCrossesSlash).test(text);
 }
 
-function hasGlobChars(text: string): boolean {
+/** True when `text` holds a pattern character that was not quoted: a quoted one is literal. */
+function hasGlobChars(text: string, quoted?: boolean[]): boolean {
     for (let i = 0; i < text.length; i++) {
+        if (quoted?.[i] === true) continue;
         const ch = text[i];
         if (ch === '*' || ch === '?') return true;
         if (ch === '[') {
@@ -244,62 +270,157 @@ function hasGlobChars(text: string): boolean {
     return false;
 }
 
-/** Pathname expansion of one field. With no match the field survives unchanged (nullglob is off). */
-function expandGlob(state: ShellState, field: string): string[] {
-    const fs = state.fs;
-    if (!fs || !hasGlobChars(field)) return [field];
-    const slash = field.lastIndexOf('/');
-    const dir = slash === -1 ? '.' : field.slice(0, slash) || '/';
-    const base = slash === -1 ? field : field.slice(slash + 1);
-    const prefix = slash === -1 ? '' : field.slice(0, slash + 1);
-    if (!base) return [field];
-    let entries: string[];
-    try {
-        entries = fs.listDirectory(resolvePath(state, dir));
-    } catch {
-        return [field];
+/** The components of a pattern, split on the unquoted `/`: in `'a/b'` the slash is one name. */
+function patternComponents(field: string, quoted?: boolean[]): { text: string; quoted: boolean[] }[] {
+    const parts: { text: string; quoted: boolean[] }[] = [];
+    const mask = quoted ?? [];
+    let start = 0;
+    for (let i = 0; i < field.length; i++) {
+        if (field[i] === '/' && mask[i] !== true) {
+            parts.push({ text: field.slice(start, i), quoted: mask.slice(start, i) });
+            start = i + 1;
+        }
     }
-    const re = globToRegExp(base, false);
-    const hidden = base.startsWith('.');
-    const matched = entries.filter((entry) => (hidden || !entry.startsWith('.')) && re.test(entry)).sort();
-    if (matched.length === 0) return [field];
-    return matched.map((entry) => prefix + entry);
+    parts.push({ text: field.slice(start), quoted: mask.slice(start) });
+    return parts;
 }
 
-/** Field splitting on IFS. Whitespace IFS characters collapse; the default IFS is ' \t\n'. */
-function splitFields(text: string, quoted: boolean[], ifs: string): string[] {
+/** `isDirectory` as a question: a path that is not there is not a directory. */
+function isDir(fs: NonNullable<ShellState['fs']>, path: string): boolean {
+    try {
+        return fs.isDirectory(path);
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Pathname expansion of one field, one path component at a time: a pattern that carries a slash
+ * expands its directory part first, then the name inside each directory that part reached. With no
+ * match the field survives unchanged (nullglob is off), and so does a field whose pattern
+ * characters were all quoted: `echo '*.txt'` prints `*.txt`, which is what keeps
+ * `find . -name "*.txt"` working.
+ */
+function expandGlob(state: ShellState, field: string, quoted?: boolean[]): string[] {
+    const fs = state.fs;
+    if (!fs || !hasGlobChars(field, quoted)) return [field];
+    const absolute = field.startsWith('/');
+    const trailing = field.endsWith('/');
+    const parts = patternComponents(field, quoted);
+    // A leading `/` is the root the walk starts from, and a trailing one only asks for directories.
+    if (absolute) parts.shift();
+    if (trailing) parts.pop();
+    if (parts.length === 0) return [field];
+    let dirs: string[] = [absolute ? '/' : resolvePath(state, '.')];
+    let stems: string[] = [absolute ? '/' : ''];
+    for (let p = 0; p < parts.length; p++) {
+        const part = parts[p];
+        const last = p === parts.length - 1;
+        const re = hasGlobChars(part.text, part.quoted) ? globToRegExp(part.text, false, part.quoted) : null;
+        const nextDirs: string[] = [];
+        const nextStems: string[] = [];
+        const found: string[] = [];
+        for (let d = 0; d < dirs.length; d++) {
+            const dir = dirs[d];
+            let entries: string[];
+            try {
+                entries = fs.listDirectory(dir);
+            } catch {
+                continue;
+            }
+            // `.` and `..` are names a pattern beginning with `.` matches, as the host has it
+            const names = part.text.startsWith('.') ? ['.', '..', ...entries] : entries;
+            for (const name of names) {
+                if (name !== '.' && name !== '..' && name.startsWith('.') && !part.text.startsWith('.')) continue;
+                const matched = re === null ? name === part.text : re.test(name);
+                if (!matched) continue;
+                const stem = stems[d] + name;
+                if (!last) {
+                    const child = joinName(dir, name);
+                    if (isDir(fs, child)) {
+                        nextDirs.push(child);
+                        nextStems.push(stem + '/');
+                    }
+                    continue;
+                }
+                if (trailing) {
+                    if (isDir(fs, joinName(dir, name))) found.push(stem + '/');
+                } else {
+                    found.push(stem);
+                }
+            }
+        }
+        if (last) return found.length === 0 ? [field] : found.sort();
+        dirs = nextDirs;
+        stems = nextStems;
+        if (dirs.length === 0) return [field];
+    }
+    return [field];
+}
+
+/** One name under `dir`, with a single `/` between them. */
+function joinName(dir: string, name: string): string {
+    return (dir.endsWith('/') ? dir : dir + '/') + name;
+}
+
+/** One field after splitting, with the quoting of each of its characters. */
+interface SplitField {
+    text: string;
+    /** Per character: it came out of quoted text, so pathname expansion reads it as a literal. */
+    quoted: boolean[];
+}
+
+/**
+ * Field splitting on IFS, keeping which characters came out of quoted text: a `*`, `?` or `[` that
+ * was quoted is a literal character, and only an unquoted one makes the field a pattern. Whitespace
+ * IFS characters collapse; the default IFS is ' \t\n'.
+ */
+function splitFieldsQuoted(text: string, quoted: boolean[], ifs: string): SplitField[] {
     const ws: string[] = [...ifs].filter((ch) => ch === ' ' || ch === '\t' || ch === '\n');
     if (ws.length === 0) {
-        const parts: string[] = [];
+        const fields: SplitField[] = [];
         let cur = '';
+        let curQuoted: boolean[] = [];
         for (let i = 0; i < text.length; i++) {
             if (!quoted[i] && ifs.includes(text[i])) {
-                parts.push(cur);
+                fields.push({ text: cur, quoted: curQuoted });
                 cur = '';
-            } else cur += text[i];
+                curQuoted = [];
+            } else {
+                cur += text[i];
+                curQuoted.push(quoted[i] === true);
+            }
         }
-        parts.push(cur);
-        return parts;
+        fields.push({ text: cur, quoted: curQuoted });
+        return fields;
     }
-    const fields: string[] = [];
+    const fields: SplitField[] = [];
     let cur = '';
+    let curQuoted: boolean[] = [];
     let started = false;
     for (let i = 0; i < text.length; i++) {
         const isWs = ws.includes(text[i]);
         const isOther = ifs.includes(text[i]) && !isWs;
         if (!quoted[i] && (isWs || isOther)) {
             if (started) {
-                fields.push(cur);
+                fields.push({ text: cur, quoted: curQuoted });
                 cur = '';
+                curQuoted = [];
                 started = false;
             }
             continue;
         }
         cur += text[i];
+        curQuoted.push(quoted[i] === true);
         started = true;
     }
-    if (started) fields.push(cur);
+    if (started) fields.push({ text: cur, quoted: curQuoted });
     return fields;
+}
+
+/** Field splitting on IFS. Whitespace IFS characters collapse; the default IFS is ' \t\n'. */
+function splitFields(text: string, quoted: boolean[], ifs: string): string[] {
+    return splitFieldsQuoted(text, quoted, ifs).map((field) => field.text);
 }
 
 /** Single-quote style, the way `set`, `alias` and `declare -p` print values. */
@@ -787,6 +908,10 @@ interface Node {
     commands: Command[];
     /** The operator joining this pipeline to the one before it. */
     op: '&&' | '||' | null;
+    /** `&` after the pipeline: the shell does not wait for it, and the host starts it as a job. */
+    background?: boolean;
+    /** The pipeline as it was written: the source a job started from it is handed to run. */
+    source?: string;
 }
 
 /** Words bash reserves: in command position they end the construct instead of naming a command. */
@@ -1219,8 +1344,10 @@ class Parser {
                 continue;
             }
             if (this.here() === '&') {
-                // a background job; this shell has none, so the `&` is dropped
+                // `cmd &`: the shell does not wait for the pipeline, and the host starts it as a job
                 this.pos++;
+                const last = nodes[nodes.length - 1];
+                if (last !== undefined) last.background = true;
                 continue;
             }
             if (this.atTerminator(terminators)) break;
@@ -1236,6 +1363,7 @@ class Parser {
     private parsePipelineWithOp(op: '&&' | '||' | null): Node {
         let bang = false;
         this.skipSpace(false);
+        const start = this.pos;
         if (this.keywordAt(this.pos, '!')) {
             this.pos += 1;
             bang = true;
@@ -1252,7 +1380,7 @@ class Parser {
             }
             break;
         }
-        return { bang, commands, op };
+        return { bang, commands, op, source: this.src.slice(start, this.pos).trim() };
     }
 
     private parseCommand(): Command {
@@ -1818,10 +1946,10 @@ function expandWord(state: ShellState, word: Word): string[] {
     expandParts(state, word, false, target);
     if (target.text.includes(FIELD_MARK)) return target.text.split(FIELD_MARK);
     const ifs = getVar(state, 'IFS');
-    const fields = splitFields(target.text, target.quoted, ifs === undefined ? ' \t\n' : ifs);
-    if (state.options.noglob) return fields;
+    const fields = splitFieldsQuoted(target.text, target.quoted, ifs === undefined ? ' \t\n' : ifs);
+    if (state.options.noglob) return fields.map((field) => field.text);
     const out: string[] = [];
-    for (const field of fields) out.push(...expandGlob(state, field));
+    for (const field of fields) out.push(...expandGlob(state, field.text, field.quoted));
     return out;
 }
 
@@ -2115,7 +2243,36 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null):
     return status;
 }
 
+/**
+ * A pipeline the shell does not wait for: `cmd &`, where the `&` is one this engine parsed.
+ *
+ * The job is the host's to start. The table `jobs` and `wait` read is the host's -- `state.jobs`
+ * takes it out of `state.host` -- and so are the words a job is run from, so `state.startJob` is
+ * asked to register it and this module only prints the line a shell prints for the one it got back,
+ * which is what a shell prints too. The status of a command the shell did not wait for is 0.
+ *
+ * Null where the foreground path must have the pipeline instead: a pipeline that is not all simple
+ * commands (`{ echo a; } &` is a job the host's own splitter cannot re-read from its source), one
+ * with no source to hand over, a state with nothing installed to start one, or a host that declined
+ * the source it was given. Waited for, such a command is late rather than lost -- and no job is ever
+ * invented for a table that cannot run it.
+ */
+function startBackgroundNode(state: ShellState, node: Node): number | null {
+    const source = node.source;
+    if (source === undefined || source === '' || state.startJob === undefined) return null;
+    for (const command of node.commands) if (command.t !== 'simple') return null;
+    const job = state.startJob(state, source);
+    if (job === null || job === undefined) return null;
+    state.lastBackgroundPid = job.pid;
+    writeOut(state, `[${job.id}] ${job.pid}\n`);
+    return 0;
+}
+
 function runNode(state: ShellState, node: Node, input: string | null): number {
+    if (node.background === true) {
+        const backgrounded = startBackgroundNode(state, node);
+        if (backgrounded !== null) return backgrounded;
+    }
     const protectedInner = node.bang || node.commands.length > 1;
     if (protectedInner) state.protectedDepth++;
     const statuses: number[] = [];
@@ -3179,7 +3336,11 @@ export const IMPLEMENTED_BUILTINS: string[] = [
     'umask', 'unalias', 'unset', 'wait', 'which'
 ].sort();
 
-const HELP: Record<string, string> = {
+/**
+ * The one line `help <name>` prints for each builtin: its arguments, then ` -- `, then what it does.
+ * Exported because `man` prints the same text as a manual page (shell/commands/procinfo.ts).
+ */
+export const HELP: Record<string, string> = {
     alias: 'alias [-p] [name[=value] ...] -- define or list aliases',
     bg: 'bg [job_spec ...] -- unsupported: this shell stops no job, so none can be resumed',
     bind: 'bind -- unsupported: this shell has no line editing',
