@@ -947,6 +947,167 @@ BF.fs = function () {
     return name;
   };
 
+  /*
+   * Descriptors. The file system behind these calls is path based, so a descriptor is a small
+   * integer handle over a byte buffer: 'r' starts from the file's bytes, 'w' starts empty and
+   * truncates the file at once, 'a' starts from the file's bytes with the position at the end, and
+   * a descriptor opened for writing pushes its buffer through the ordinary write path when it is
+   * synced and again when it is closed. create-next-app writes every file this way: openSync,
+   * writeSync, fsyncSync, closeSync, then chmodSync and chownSync on the temporary file.
+   */
+  var VALID_FLAGS = ['r', 'r+', 'rs', 'sr', 'rs+', 'sr+', 'w', 'wx', 'w+', 'wx+', 'xw', 'xw+', 'a', 'ax', 'a+', 'ax+', 'xa', 'xa+'];
+
+  function badFlagError(flags) {
+    var err = new TypeError("The argument 'flags' is invalid. Received '" + String(flags) + "'");
+    err.code = 'ERR_INVALID_ARG_VALUE';
+    return err;
+  }
+
+  function badFdError(syscall) {
+    var err = new Error('EBADF: bad file descriptor, ' + syscall);
+    err.errno = -9;
+    err.code = 'EBADF';
+    err.syscall = syscall;
+    return err;
+  }
+
+  // Node accepts r, w and a with + (read and write), x (exclusive) and s (sync) modifiers: the
+  // first r/w/a letter decides the mode, so 'wx' writes and 'ax+' appends and reads.
+  function flagLetter(flags) {
+    var f = String(flags);
+    return f.charAt(0) === 'r' || f.charAt(0) === 'w' || f.charAt(0) === 'a' ? f.charAt(0) : f.charAt(1);
+  }
+
+  var DESCRIPTORS = {};
+  var nextDescriptor = 3;
+
+  function descriptorOf(fd, syscall) {
+    var rec = typeof fd === 'number' ? DESCRIPTORS[fd] : undefined;
+    if (rec === undefined) throw badFdError(syscall);
+    return rec;
+  }
+
+  function writeBytes(data, encoding) {
+    if (typeof data === 'string') return encodeString(data, encoding || 'utf8');
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    throw new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView');
+  }
+
+  function flushDescriptor(rec, syscall) {
+    if (!rec.dirty) return;
+    check(host.writeBase64(rec.path, encodeBase64(rec.bytes)), syscall, rec.path);
+    rec.dirty = false;
+  }
+
+  fs.openSync = function (p, flags, mode) {
+    var f = flags === undefined || flags === null ? 'r' : String(flags);
+    if (VALID_FLAGS.indexOf(f) < 0) throw badFlagError(flags);
+    var file = toPathString(p);
+    var letter = flagLetter(f);
+    var writable = letter === 'w' || letter === 'a';
+    var st = statOf(file);
+    var isDir = !!(st && st.type === 'dir');
+    if (writable) {
+      if (isDir) throw fsError('EISDIR', 'open', file);
+      if (letter === 'w' || !st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file);
+    } else if (!st) {
+      throw fsError('ENOENT', 'open', file);
+    }
+    var bytes = letter === 'w' || !st || isDir ? new Uint8Array(0) : readBytesOf(file);
+    var fd = nextDescriptor++;
+    // The pty fds the node-pty shim hands out start at 1000; never hand a file one of those.
+    while (DESCRIPTORS[fd] !== undefined || (globalThis.__owcPtyFds && globalThis.__owcPtyFds[fd] !== undefined)) fd = nextDescriptor++;
+    DESCRIPTORS[fd] = {
+      path: file,
+      flags: f,
+      bytes: bytes,
+      position: letter === 'a' ? bytes.length : 0,
+      writable: writable,
+      readable: letter === 'r' || f.indexOf('+') >= 0,
+      isDir: isDir,
+      dirty: writable
+    };
+    return fd;
+  };
+
+  fs.writeSync = function (fd, data, position, encoding) {
+    var rec = descriptorOf(fd, 'write');
+    if (!rec.writable) throw badFdError('write');
+    var bytes;
+    var at;
+    var explicit;
+    if (typeof data === 'string') {
+      bytes = writeBytes(data, typeof encoding === 'string' ? encoding : typeof position === 'string' ? position : 'utf8');
+      at = typeof position === 'number' ? position : rec.position;
+      explicit = typeof position === 'number';
+    } else {
+      // writeSync(fd, buffer[, offset[, length[, position]]])
+      var view = writeBytes(data);
+      var offset = typeof position === 'number' ? position : 0;
+      var length = typeof encoding === 'number' ? encoding : view.length - offset;
+      bytes = view.subarray(offset, offset + length);
+      at = typeof arguments[4] === 'number' ? arguments[4] : rec.position;
+      explicit = typeof arguments[4] === 'number';
+    }
+    if (bytes.length === 0) return 0;
+    if (at + bytes.length > rec.bytes.length) {
+      var grown = new Uint8Array(at + bytes.length);
+      grown.set(rec.bytes, 0);
+      rec.bytes = grown;
+    }
+    rec.bytes.set(bytes, at);
+    if (!explicit) rec.position = at + bytes.length;
+    rec.dirty = true;
+    return bytes.length;
+  };
+
+  fs.readSync = function (fd, buffer, offset, length, position) {
+    var rec = descriptorOf(fd, 'read');
+    if (!rec.readable) throw badFdError('read');
+    if (rec.isDir) throw fsError('EISDIR', 'read', rec.path);
+    var opts = offset && typeof offset === 'object' ? offset : null;
+    var off = opts ? opts.offset || 0 : typeof offset === 'number' ? offset : 0;
+    var len = opts ? (opts.length === undefined ? buffer.length - off : opts.length)
+      : (typeof length === 'number' ? length : buffer.length - off);
+    var at = opts ? (typeof opts.position === 'number' ? opts.position : rec.position)
+      : (typeof position === 'number' ? position : rec.position);
+    var available = rec.bytes.length - at;
+    if (available <= 0 || len <= 0) return 0;
+    var n = Math.min(len, available, buffer.length - off);
+    var target = ArrayBuffer.isView(buffer) ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength) : buffer;
+    for (var i = 0; i < n; i++) target[off + i] = rec.bytes[at + i];
+    if (!explicitRead(offset, length, position)) rec.position = at + n;
+    return n;
+  };
+
+  function explicitRead(offset, length, position) {
+    if (offset && typeof offset === 'object') return typeof offset.position === 'number';
+    return typeof position === 'number';
+  }
+
+  fs.fsyncSync = function (fd) {
+    flushDescriptor(descriptorOf(fd, 'fsync'), 'fsync');
+  };
+
+  fs.closeSync = function (fd) {
+    var rec = descriptorOf(fd, 'close');
+    flushDescriptor(rec, 'close');
+    delete DESCRIPTORS[fd];
+  };
+
+  // The file system has no owners or permission bits to set, so these only have to report the
+  // error Node would for a path that is not there.
+  fs.chmodSync = function (p, mode) {
+    var file = toPathString(p);
+    if (!statOf(file)) throw fsError('ENOENT', 'chmod', file);
+  };
+
+  fs.chownSync = function (p, uid, gid) {
+    var file = toPathString(p);
+    if (!statOf(file)) throw fsError('ENOENT', 'chown', file);
+  };
+
   /* read streams read the file once and push it in highWaterMark-sized chunks; write streams append each chunk */
   fs.createReadStream = function (p, opts) {
     var Readable = requireBuiltin('stream').Readable;
@@ -1193,26 +1354,33 @@ BF.fs = function () {
    * the pty fds the node-pty shim registers in globalThis.__owcPtyFds: node-pty's
    * lib/unixTerminal.js writes a pty's input with fs.write(fd, buffer, offset, callback), so a
    * write to one of those fds goes to the child's stdin and reports the bytes it took. Any other
-   * fd is not open: EBADF, as Node reports for a descriptor it does not know.
+   * fd goes through the descriptor layer above, which reports EBADF for one it does not know.
    */
-  fs.write = function (fd, buffer, offset, callback) {
-    var done = typeof callback === 'function' ? callback : null;
+  fs.write = function (fd, buffer, offset, length, position, callback) {
+    // The callback is the last argument whatever the form: fs.write(fd, buffer[, offset[, length[,
+    // position]]], cb) and fs.write(fd, string[, position[, encoding]], cb).
+    var last = arguments.length > 1 ? arguments[arguments.length - 1] : undefined;
+    var done = typeof last === 'function' ? last : null;
     var table = globalThis.__owcPtyFds;
     var rec = table && typeof fd === 'number' ? table[fd] : undefined;
-    if (rec === undefined || rec.write === undefined) {
-      var err = new Error('EBADF: bad file descriptor, write');
-      err.errno = -9;
-      err.code = 'EBADF';
-      err.syscall = 'write';
-      if (done) queueMicrotask(function () { done(err); });
-      else throw err;
+    if (rec !== undefined && rec.write !== undefined) {
+      var bytes = ArrayBuffer.isView(buffer) ? Buf.from(buffer.buffer, buffer.byteOffset, buffer.byteLength) : Buf.from(String(buffer));
+      var from = Number(offset) > 0 ? Number(offset) : 0;
+      var written = rec.write(bytes.slice(from).toString('utf8'));
+      if (done) queueMicrotask(function () { done(null, written); });
       return;
     }
-    var bytes = ArrayBuffer.isView(buffer) ? Buf.from(buffer.buffer, buffer.byteOffset, buffer.byteLength) : Buf.from(String(buffer));
-    var from = Number(offset) > 0 ? Number(offset) : 0;
-    var text = bytes.slice(from).toString('utf8');
-    var written = rec.write(text);
-    if (done) queueMicrotask(function () { done(null, written); });
+    var args = Array.prototype.slice.call(arguments, 1);
+    if (done) args.pop();
+    var error = null;
+    var count = 0;
+    try {
+      count = fs.writeSync.apply(fs, [fd].concat(args));
+    } catch (err) {
+      error = err;
+    }
+    if (done) queueMicrotask(function () { done(error, count); });
+    else if (error) throw error;
   };
   return fs;
 };
