@@ -23,12 +23,13 @@ export class NodeProcessExecutor implements ProcessExecutor {
         let evalSource: string | undefined;
 
         const cwd = payload.cwd || '/';
-        // `node <script> [args]` or `node -e <source> [args]`; a .js executable runs directly
+        // `node <script> [args]`, `node -e <source> [args]`, `node` alone (a REPL), or a .js executable
         if (executablePath === 'node') {
             if (args.length === 0) {
-                throw new Error('No JavaScript file specified');
-            }
-            if (args[0] === '-e' || args[0] === '--eval') {
+                /* Node starts a REPL when it is given no file; it does not complain. The sentinel is
+                   read the way `[eval]` is: no file is resolved for it. */
+                executablePath = '[repl]';
+            } else if (args[0] === '-e' || args[0] === '--eval') {
                 if (args.length < 2) throw new Error(`${args[0]} requires an argument`);
                 evalSource = args[1];
                 executablePath = '[eval]';

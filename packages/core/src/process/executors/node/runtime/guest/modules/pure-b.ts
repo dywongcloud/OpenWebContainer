@@ -720,6 +720,23 @@ export const SRC = String.raw`
 
   // ---- repl ----
 
+  /*
+   * "node" with no file: a REPL on this process's own stdin and stdout, in a context of its own.
+   * stdin is opened rather than ended, so what the terminal sends reaches it; closing the REPL --
+   * the .exit keyword, or the end of the input -- ends the process, as it does in Node.
+   */
+  api.startRepl = function () {
+    var proc = globalThis.process;
+    var server = requireBuiltin('repl').start({
+      input: api.openStdin(),
+      output: proc.stdout,
+      prompt: '> ',
+      terminal: true
+    });
+    server.on('exit', function () { host.exit(0); });
+    return true;
+  };
+
   BF['repl'] = function () {
     var EventEmitter = requireBuiltin('events');
     var vm = requireBuiltin('vm');
@@ -809,7 +826,7 @@ export const SRC = String.raw`
       var proc = typeof process === 'object' && process !== null ? process : undefined;
       this.input = options.input || (proc ? proc.stdin : undefined) || new EventEmitter();
       this.output = options.output || (proc ? proc.stdout : undefined) || { write: function () { return true; } };
-      this.terminal = false;
+      this.terminal = options.terminal === true;
       this.useGlobal = options.useGlobal === true;
       this.ignoreUndefined = options.ignoreUndefined === true;
       this.writer = typeof options.writer === 'function' ? options.writer : replWriter;
@@ -940,6 +957,19 @@ export const SRC = String.raw`
       var repl = this;
       var input = this.input;
       if (!input || typeof input.on !== 'function') return;
+      /* A terminal writes back what is typed, and nothing else does it for a REPL whose stdin is
+         one: without this the characters a user types never appear. A newline comes back as the
+         pair a terminal sends, so the cursor reaches the start of the next line. */
+      if (this.terminal) {
+        var echo = function (chunk) {
+          if (repl._closed) return;
+          repl._writeOut(String(chunk).replace(/\r\n?|\n/g, '\r\n'));
+        };
+        input.on('data', echo);
+        this._detach = function () {
+          if (typeof input.removeListener === 'function') input.removeListener('data', echo);
+        };
+      }
       var readline = requireBuiltin('readline');
       if (readline && typeof readline.createInterface === 'function') {
         var rl = readline.createInterface(input, undefined, undefined, false);
@@ -948,6 +978,7 @@ export const SRC = String.raw`
         this._rl = rl;
         return;
       }
+      var detach = this._detach;
       var pending = '';
       var onData = function (chunk) {
         if (repl._closed) return;
@@ -974,6 +1005,7 @@ export const SRC = String.raw`
       input.on('data', onData);
       input.on('end', onEnd);
       this._detach = function () {
+        if (detach !== null) detach();
         if (typeof input.removeListener === 'function') {
           input.removeListener('data', onData);
           input.removeListener('end', onEnd);
