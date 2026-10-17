@@ -568,6 +568,7 @@ BF['http'] = function () {
       this._failed = false;
       this._closeEmitted = false;
       this._bodyParts = [];
+      this._pendingWrites = [];
       this._timeoutMs = 0;
       var headers = target.headers || {};
       var names = Object.keys(headers);
@@ -579,13 +580,41 @@ BF['http'] = function () {
       if (target.timeout) this.setTimeout(target.timeout);
       if (this._virtual) this._connect();
     }
+    /* The agent owns the socket: it hands over an idle one, opens one while the pool is under
+       maxSockets, or queues this request until a socket frees up */
     _connect() {
       var agent = this._target.agent;
-      var pooled = agent && agent.keepAlive ? agent._takeFreeSocket(this._poolKey()) : undefined;
-      var socket = pooled || this._openSocket();
-      this.reusedSocket = pooled !== undefined;
+      if (agent && typeof agent.addRequest === 'function') {
+        agent.addRequest(this, this._poolOptions());
+        return;
+      }
+      this.onSocket(this._openSocket());
+    }
+    _poolOptions() {
+      return Object.assign({ host: this._target.hostname, port: this._target.port }, this._tlsOptions() || {});
+    }
+    /* Bytes written before the agent assigns a socket wait in _pendingWrites */
+    _out(chunk) {
+      if (this._socket) this._socket.write(chunk);
+      else this._pendingWrites.push(chunk);
+    }
+    onSocket(socket) {
+      if (this._socket === socket) return;
       this._attach(socket);
       if (this._timeoutMs) socket.setTimeout(this._timeoutMs);
+      var waiting = this._pendingWrites;
+      this._pendingWrites = [];
+      for (var i = 0; i < waiting.length; i++) socket.write(waiting[i]);
+      var req = this;
+      // Node assigns the socket on a later tick, so a 'socket' listener added after request() sees it
+      queueMicrotask(function () { req.emit('socket', socket); });
+    }
+    /* Node asks for keep-alive whenever the agent can reuse the socket: a keep-alive agent, or one
+       with a finite maxSockets whose sockets go back into the pool instead of being abandoned */
+    _agentKeepsAlive() {
+      var agent = this._target.agent;
+      if (!agent) return false;
+      return agent.keepAlive || agent.maxSockets !== Infinity;
     }
     /* https: the connection is tls.connect with the request's TLS options and Node's default servername */
     _tlsOptions() {
@@ -606,12 +635,14 @@ BF['http'] = function () {
       return requireBuiltin('tls').connect(Object.assign({}, tlsOpts, where));
     }
     _poolKey() {
-      return this._target.agent.getName(Object.assign({ host: this._target.hostname, port: this._target.port }, this._tlsOptions() || {}));
+      return this._target.agent.getName(this._poolOptions());
     }
     /* Wires the response parser and this request's listeners to a socket, new or pooled */
     _attach(socket) {
       var req = this;
       this._socket = socket;
+      this.socket = socket;
+      this.connection = socket;
       this._released = false;
       this._parser = new MessageParser(false, this.method, {
         onHead: function (head) { req._onHead(head); },
@@ -671,22 +702,31 @@ BF['http'] = function () {
       this._res = res;
       this.emit('response', res);
     }
+    /* 'close' is delivered once: the stream's own emission on destroy must not repeat ours */
+    emit(type) {
+      if (type === 'close') {
+        if (this._closeDelivered) return false;
+        this._closeDelivered = true;
+      }
+      return super.emit.apply(this, arguments);
+    }
     _onEnd() {
       this._done = true;
       if (this._res) {
         this._res.complete = true;
         this._res.push(null);
       }
-      if (this._keepsAlive()) {
-        this._release();
-      } else {
-        this._destroySocket();
-      }
+      // settled on a later tick, so the response's 'end' reaches its listeners before this request closes
+      var req = this;
+      queueMicrotask(function () {
+        if (req._keepsAlive()) req._release();
+        else req._destroySocket();
+      });
     }
-    /* The socket may serve another request: keep-alive agent, no close from either side, a framed (not close-delimited) body */
+    /* The socket may serve another request: an agent that reuses sockets, no close from either side, a framed (not close-delimited) body */
     _keepsAlive() {
       var agent = this._target.agent;
-      if (!agent || !agent.keepAlive || !this._res || !this._socket || this._socket.destroyed) return false;
+      if (!agent || !this._agentKeepsAlive() || !this._res || !this._socket || this._socket.destroyed) return false;
       if (!this._parser || this._parser.mode === 'eof') return false;
       var sent = hasOwn(this._hdr, 'connection') ? String(this._hdr.connection.value).toLowerCase() : '';
       if (sent.indexOf('close') >= 0 || sent.indexOf('upgrade') >= 0) return false;
@@ -750,7 +790,7 @@ BF['http'] = function () {
       if (this._target.setHost !== false && !hasOwn(hdr, 'host')) lines.push('Host: ' + this._hostHeader);
       lines = lines.concat(this._headerLines());
       if (hasOwn(hdr, 'connection')) lines.push('Connection: ' + String(hdr.connection.value));
-      else lines.push(this._target.agent && this._target.agent.keepAlive ? 'Connection: keep-alive' : 'Connection: close');
+      else lines.push(this._agentKeepsAlive() ? 'Connection: keep-alive' : 'Connection: close');
       var hasLength = hasOwn(hdr, 'content-length');
       var hasEncoding = hasOwn(hdr, 'transfer-encoding');
       if (hasEncoding && /chunked/i.test(String(hdr['transfer-encoding'].value))) {
@@ -763,15 +803,15 @@ BF['http'] = function () {
           lines.push('Transfer-Encoding: chunked');
         }
       }
-      this._socket.write(Buffer.from(lines.join('\r\n') + '\r\n\r\n', 'latin1'));
+      this._out(Buffer.from(lines.join('\r\n') + '\r\n\r\n', 'latin1'));
     }
     _write(chunk, encoding, callback) {
       if (this._virtual) {
         this._sendHead(null);
         if (this._chunked) {
-          if (chunk.length > 0) this._socket.write(Buffer.concat([Buffer.from(chunk.length.toString(16) + '\r\n', 'latin1'), chunk, Buffer.from('\r\n', 'latin1')]));
+          if (chunk.length > 0) this._out(Buffer.concat([Buffer.from(chunk.length.toString(16) + '\r\n', 'latin1'), chunk, Buffer.from('\r\n', 'latin1')]));
         } else {
-          this._socket.write(chunk);
+          this._out(chunk);
         }
       } else {
         this._bodyParts.push(chunk);
@@ -781,7 +821,7 @@ BF['http'] = function () {
     _final(callback) {
       if (this._virtual) {
         this._sendHead(0);
-        if (this._chunked) this._socket.write(Buffer.from('0\r\n\r\n', 'latin1'));
+        if (this._chunked) this._out(Buffer.from('0\r\n\r\n', 'latin1'));
         callback();
         return;
       }
@@ -870,6 +910,7 @@ BF['http'] = function () {
       this.maxFreeSockets = (options && options.maxFreeSockets) || 256;
       this.maxTotalSockets = (options && options.maxTotalSockets) || Infinity;
       this.scheduling = (options && options.scheduling) || 'lifo';
+      this.totalSocketCount = 0;
       this.sockets = Object.create(null);
       this.freeSockets = Object.create(null);
       this.requests = Object.create(null);
@@ -889,9 +930,114 @@ BF['http'] = function () {
     createConnection(options, callback) {
       return net.connect(options, callback);
     }
-    /* A finished socket waits here for the next request to the same name. Idle sockets are unref'd, so they never keep the process alive. */
+    /* Node's addRequest: an idle socket serves the request at once, a new one is opened while the
+       name stays under maxSockets, and the rest wait in requests[name] until a socket frees up */
+    addRequest(req, options) {
+      var name = this.getName(options);
+      var pooled = this._takeFreeSocket(name);
+      if (pooled) {
+        req.reusedSocket = true;
+        this._track(name, pooled, options);
+        req.onSocket(pooled);
+        return;
+      }
+      if (!this._canOpen(name)) {
+        var queue = this.requests[name] || (this.requests[name] = []);
+        queue.push(req);
+        return;
+      }
+      this.createSocket(req, options);
+    }
+    /* A name never holds more than maxSockets connections at once, busy and idle counted together */
+    _canOpen(name) {
+      var busy = this.sockets[name] ? this.sockets[name].length : 0;
+      var idle = this.freeSockets[name] ? this.freeSockets[name].length : 0;
+      if (busy + idle >= this.maxSockets) return false;
+      if (this.maxTotalSockets !== Infinity && this.totalSocketCount >= this.maxTotalSockets) return false;
+      return true;
+    }
+    createSocket(req, options) {
+      var socket = req._openSocket();
+      this._track(this.getName(options), socket, options);
+      req.onSocket(socket);
+      return socket;
+    }
+    _track(name, socket, options) {
+      var list = this.sockets[name] || (this.sockets[name] = []);
+      if (list.indexOf(socket) >= 0) return;
+      list.push(socket);
+      this.totalSocketCount += 1;
+      socket._agentOptions = options;
+      var self = this;
+      if (!socket._agentClose) {
+        socket._agentClose = function () { self.removeSocket(socket, options); };
+        socket.on('close', socket._agentClose);
+      }
+    }
+    _untrack(name, socket) {
+      var list = this.sockets[name];
+      if (list) {
+        var index = list.indexOf(socket);
+        if (index >= 0) {
+          list.splice(index, 1);
+          this.totalSocketCount -= 1;
+        }
+        if (list.length === 0) delete this.sockets[name];
+      }
+      if (socket._agentClose) {
+        socket.removeListener('close', socket._agentClose);
+        socket._agentClose = null;
+      }
+    }
+    removeSocket(socket, options) {
+      var name = this.getName(options);
+      this._untrack(name, socket);
+      this._dropFree(name, socket);
+      this._drain(name, options);
+    }
+    /* Requests that waited for a socket: an idle one is handed over first, then a new one while the pool has room */
+    _drain(name, options) {
+      var queue = this.requests[name];
+      if (!queue) return;
+      while (queue.length > 0) {
+        var req = queue[0];
+        if (req.destroyed || req._failed) {
+          queue.shift();
+          continue;
+        }
+        var pooled = this._takeFreeSocket(name);
+        if (pooled) {
+          queue.shift();
+          req.reusedSocket = true;
+          this._track(name, pooled, options);
+          req.onSocket(pooled);
+          continue;
+        }
+        if (!this._canOpen(name)) break;
+        queue.shift();
+        this.createSocket(req, options);
+      }
+      if (queue.length === 0) delete this.requests[name];
+    }
+    /* A finished socket waits here for the next request to the same name, as Node's 'free' handler does */
     _releaseSocket(name, socket) {
+      var options = socket._agentOptions || {};
+      this._untrack(name, socket);
+      this.emit('free', socket, options);
+      var queue = this.requests[name];
+      if (queue && queue.length > 0) {
+        var req = queue.shift();
+        if (queue.length === 0) delete this.requests[name];
+        this._track(name, socket, options);
+        req.reusedSocket = true;
+        req.onSocket(socket);
+        return;
+      }
       var list = this.freeSockets[name] || (this.freeSockets[name] = []);
+      if (list.length >= this.maxFreeSockets) {
+        socket.destroy();
+        return;
+      }
       list.push(socket);
       socket.setTimeout(0);
       socket.unref();
@@ -907,7 +1053,6 @@ BF['http'] = function () {
         timeout: drop
       };
       for (var key in socket._agentWatch) socket.on(key, socket._agentWatch[key]);
-      this.emit('free', socket, {});
     }
     _takeFreeSocket(name) {
       var list = this.freeSockets[name];
