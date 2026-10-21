@@ -798,21 +798,36 @@ BF.fs = function () {
   }
 
   // Node checks the type of a range bound first, then that it is an integer within the safe range.
+  function describeFsArg(value) {
+    if (value === undefined) return 'undefined';
+    if (value === null) return 'null';
+    if (typeof value === 'function') return 'function ' + value.name;
+    if (typeof value === 'object') return 'an instance of ' + ((value.constructor && value.constructor.name) || 'Object');
+    if (typeof value === 'string') return "type string ('" + value + "')";
+    return 'type ' + typeof value + ' (' + String(value) + ')';
+  }
+
+  function fsArgErr(Kind, code, message) {
+    var err = new Kind(message);
+    err.code = code;
+    return err;
+  }
+
   function checkRange(value, name) {
     if (typeof value !== 'number') {
-      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "' + name + '" argument must be of type number. Received ' + describeArg(value));
+      throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "' + name + '" argument must be of type number. Received ' + describeFsArg(value));
     }
     if (value !== Math.floor(value)) {
-      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be an integer. Received ' + value);
+      throw fsArgErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be an integer. Received ' + value);
     }
     if (value < 0 || value > 9007199254740991) {
-      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be >= 0 && <= 9007199254740991. Received ' + value);
+      throw fsArgErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be >= 0 && <= 9007199254740991. Received ' + value);
     }
     return value;
   }
 
   function owcRange(name, mustBe, value) {
-    return bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be ' + mustBe + '. Received ' + value);
+    return fsArgErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be ' + mustBe + '. Received ' + value);
   }
 
   /* The descriptor layer's path based view has no inodes, so a symlink is recorded against the
@@ -870,6 +885,12 @@ BF.fs = function () {
   Dirent.prototype.isFIFO = function () { return false; };
   Dirent.prototype.isSocket = function () { return false; };
   Object.defineProperty(Dirent.prototype, Symbol.toStringTag, { value: 'Dirent', configurable: true });
+
+  // A path recorded as a symlink is reported as one by readdir and opendir, as Node does.
+  function direntStatsOf(abs) {
+    var st = statOf(abs) || { type: 'file', size: 0, mtimeMs: 0 };
+    return SYMLINKS[abs] !== undefined ? { type: 'link', size: st.size, mtimeMs: st.mtimeMs } : st;
+  }
 
   function makeDirent(name, st, parentPath) {
     return new Dirent(name, parentPath, st.type === 'link' ? 'link' : (st.type === 'dir' ? 'dir' : 'file'));
@@ -949,11 +970,18 @@ BF.fs = function () {
     return makeStats(st, opts, SYMLINKS[file] !== undefined);
   };
 
+  // Node names both ends of a symlink in its error: 'symlink '<target>' -> '<link>''.
+  function symlinkError(code, from, to) {
+    var err = fsError(code, 'symlink', to);
+    err.message = code + ': ' + DESCRIPTIONS[code] + ', symlink ' + "'" + from + "' -> '" + to + "'";
+    return err;
+  }
+
   fs.symlinkSync = function (target, linkPath) {
     var from = toPathString(target);
     var to = toPathString(linkPath);
-    if (!statOf(from)) throw fsError('ENOENT', 'symlink', from);
-    if (statOf(to)) throw fsError('EEXIST', 'symlink', to);
+    if (!statOf(from)) throw symlinkError('ENOENT', from, to);
+    if (statOf(to)) throw symlinkError('EEXIST', from, to);
     check(host.writeBase64(to, encodeBase64(readBytesOf(from))), 'symlink', to);
     SYMLINKS[to] = from;
   };
@@ -983,8 +1011,7 @@ BF.fs = function () {
       var names = sortedEntries(file);
       if (!withTypes) return names;
       return names.map(function (name) {
-        var child = statOf(P.join(file, name));
-        return makeDirent(name, child || { type: 'file' }, base);
+        return makeDirent(name, direntStatsOf(P.join(file, name)), base);
       });
     }
     // Node's recursive listing is breadth first: one directory's entries in sorted order, then the next level.
@@ -995,7 +1022,7 @@ BF.fs = function () {
       var kids = sortedEntries(cur.abs);
       for (var k = 0; k < kids.length; k++) {
         var childAbs = P.join(cur.abs, kids[k]);
-        var childSt = statOf(childAbs) || { type: 'file' };
+        var childSt = direntStatsOf(childAbs);
         var childRel = cur.rel === '' ? kids[k] : cur.rel + '/' + kids[k];
         out.push(withTypes ? makeDirent(kids[k], childSt, cur.str) : childRel);
         if (childSt.type === 'dir') queue.push({ abs: childAbs, str: P.join(cur.str, kids[k]), rel: childRel });
@@ -1511,6 +1538,7 @@ BF.fs = function () {
   };
 
   fs.Dir = Dir;
+  fs.Dirent = Dirent;
 
   fs.opendirSync = function (p) {
     var file = toPathString(p);
@@ -1519,8 +1547,7 @@ BF.fs = function () {
     if (st.type !== 'dir') throw fsError('ENOTDIR', 'opendir', file);
     var base = typeof p === 'string' ? p : file;
     var entries = sortedEntries(file).map(function (name) {
-      var child = statOf(P.join(file, name));
-      return makeDirent(name, child || { type: 'file' }, base);
+      return makeDirent(name, direntStatsOf(P.join(file, name)), base);
     });
     return new Dir(base, entries);
   };

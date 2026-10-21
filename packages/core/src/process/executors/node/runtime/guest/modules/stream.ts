@@ -203,7 +203,7 @@ function owcBuildStreamCore() {
   function makeReadableState(options, isDuplex) {
     var opts = options || {};
     var objectMode = !!(opts.objectMode || (isDuplex && opts.readableObjectMode));
-    return {
+    var state = {
       objectMode: objectMode,
       highWaterMark: pickHighWaterMark(opts, isDuplex ? 'readableHighWaterMark' : null, objectMode),
       buffer: [],
@@ -235,6 +235,18 @@ function owcBuildStreamCore() {
       encoding: null,
       defaultEncoding: opts.defaultEncoding || 'utf8'
     };
+    /* Node keeps the constructor's encoding verbatim ('utf-8' stays 'utf-8') while setEncoding
+       stores the decoder's normalised name; the option is validated here, at construction. */
+    if (opts.encoding !== undefined && opts.encoding !== null) {
+      state.decoder = createDecoder(opts.encoding);
+      state.encoding = opts.encoding;
+    }
+    return state;
+  }
+
+  // The encoding a stream decodes with, normalised; null when it delivers buffers.
+  function stateEncodingName(state) {
+    return state.decoder ? state.decoder.encoding : null;
   }
 
   function makeWritableState(options, isDuplex) {
@@ -480,9 +492,9 @@ function owcBuildStreamCore() {
     if (!state.objectMode) {
       if (typeof chunk === 'string') {
         encoding = encoding || state.defaultEncoding;
-        if (state.encoding !== encoding) {
+        if (stateEncodingName(state) !== encoding) {
           if (addToFront && state.encoding) {
-            chunk = Buf.from(chunk, encoding).toString(state.encoding);
+            chunk = Buf.from(chunk, encoding).toString(stateEncodingName(state));
           } else {
             chunk = Buf.from(chunk, encoding);
             encoding = '';
@@ -961,10 +973,12 @@ function owcBuildStreamCore() {
     return createReadableIterator(this);
   };
 
-  Readable.prototype.toArray = async function () {
+  Readable.prototype.toArray = async function (options) {
+    var signal = checkOperatorOptions(options);
     var out = [];
     var iterator = this[Symbol.asyncIterator]();
     for (;;) {
+      if (signal !== undefined && signal !== null && signal.aborted) throw abortErrorFor(signal);
       var step = await iterator.next();
       if (step.done) break;
       out.push(step.value);
@@ -1082,18 +1096,49 @@ function owcBuildStreamCore() {
     if (typeof fn !== 'function') throw argTypeError('fn', 'of type function', fn);
   }
 
-  function checkLimit(limit) {
-    if (typeof limit !== 'number' || Number.isNaN(limit) || limit < 0) {
-      throw owcErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "limit" is out of range. It must be >= 0. Received ' + limit);
+  // Node names the reducer 'reducer' and the signal property 'options.signal' in every operator.
+  function checkOperatorOptions(options) {
+    if (options !== undefined && typeof options !== 'object') throw argTypeError('options', 'of type object', options);
+    var signal = options === undefined || options === null ? undefined : options.signal;
+    checkSignalProp(signal);
+    return signal;
+  }
+
+  function checkSignalProp(signal) {
+    if (signal === undefined || signal === null) return;
+    if (!signal || typeof signal !== 'object' || !('aborted' in signal)) {
+      throw owcErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "options.signal" property must be an instance of AbortSignal.' + describeReceived(signal));
     }
-    return limit;
+  }
+
+  // A step taken while the signal is already aborted fails at once with the signal's abort error.
+  function abortStep(signal) {
+    if (signal !== undefined && signal !== null && signal.aborted) {
+      return Promise.reject(abortErrorFor(signal));
+    }
+    return null;
+  }
+
+  /* Node coerces the limit with Number(): '2' is 2 and 'abc', null, undefined and NaN are all 0,
+     while anything negative (including the string '-1') is out of range. The reported name is
+     "number", not "limit", and the reported value is the coerced one. */
+  function limitOf(limit) {
+    var n = Number(limit);
+    if (Number.isNaN(n)) return 0;
+    if (n < 0) {
+      throw owcErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "number" is out of range. It must be >= 0. Received ' + n);
+    }
+    return n;
   }
 
   Readable.prototype.map = function (fn, options) {
     checkOperatorFn(fn);
+    var signal = checkOperatorOptions(options);
     var inner = this[Symbol.asyncIterator]();
-    var signal = options && options.signal;
     return operatorStream(function () {
+      var aborted = abortStep(signal);
+      if (aborted !== null) return aborted;
       return inner.next().then(function (step) {
         if (step.done) return step;
         return Promise.resolve(fn(step.value, { signal: signal })).then(function (v) {
@@ -1107,9 +1152,11 @@ function owcBuildStreamCore() {
 
   Readable.prototype.filter = function (fn, options) {
     checkOperatorFn(fn);
+    var signal = checkOperatorOptions(options);
     var inner = this[Symbol.asyncIterator]();
-    var signal = options && options.signal;
     var pull = function () {
+      var aborted = abortStep(signal);
+      if (aborted !== null) return aborted;
       return inner.next().then(function (step) {
         if (step.done) return step;
         return Promise.resolve(fn(step.value, { signal: signal })).then(function (keep) {
@@ -1149,29 +1196,31 @@ function owcBuildStreamCore() {
     });
   };
 
-  Readable.prototype.drop = function (limit) {
+  Readable.prototype.drop = function (limit, options) {
+    var signal = checkOperatorOptions(options);
+    var toDrop = limitOf(limit);
     var inner = this[Symbol.asyncIterator]();
-    var toDrop = checkLimit(limit);
     var pull = function () {
-      if (toDrop > 0) {
-        toDrop--;
-        return inner.next().then(function (step) {
-          return step.done ? step : pull();
-        });
-      }
-      return inner.next();
+      var aborted = abortStep(signal);
+      if (aborted !== null) return aborted;
+      return inner.next().then(function (step) {
+        if (step.done) return step;
+        return toDrop-- > 0 ? pull() : step;
+      });
     };
     return operatorStream(pull, function (value) {
       return inner.return(value);
     });
   };
 
-  Readable.prototype.take = function (limit) {
+  Readable.prototype.take = function (limit, options) {
+    var signal = checkOperatorOptions(options);
+    var left = limitOf(limit);
     var inner = this[Symbol.asyncIterator]();
-    var left = checkLimit(limit);
     return operatorStream(function () {
-      if (left <= 0) return Promise.resolve({ value: undefined, done: true });
-      left--;
+      var aborted = abortStep(signal);
+      if (aborted !== null) return aborted;
+      if (left-- <= 0) return Promise.resolve({ value: undefined, done: true });
       return inner.next();
     }, function (value) {
       return inner.return(value);
@@ -1180,9 +1229,10 @@ function owcBuildStreamCore() {
 
   Readable.prototype.forEach = async function (fn, options) {
     checkOperatorFn(fn);
+    var signal = checkOperatorOptions(options);
     var inner = this[Symbol.asyncIterator]();
-    var signal = options && options.signal;
     for (;;) {
+      if (signal !== undefined && signal !== null && signal.aborted) throw abortErrorFor(signal);
       var step = await inner.next();
       if (step.done) return undefined;
       await fn(step.value, { signal: signal });
@@ -1228,8 +1278,9 @@ function owcBuildStreamCore() {
     }
   };
 
-  Readable.prototype.reduce = async function (fn, initialValue) {
-    checkOperatorFn(fn);
+  Readable.prototype.reduce = async function (fn, initialValue, options) {
+    if (typeof fn !== 'function') throw argTypeError('reducer', 'of type function', fn);
+    checkOperatorOptions(options);
     var inner = this[Symbol.asyncIterator]();
     var hasInitial = arguments.length > 1;
     var acc = initialValue;
@@ -1243,6 +1294,9 @@ function owcBuildStreamCore() {
         acc = await fn(acc, step.value, {});
       }
     }
+    if (!hasInitial) {
+      throw owcErr(TypeError, 'ERR_MISSING_ARGS', 'Reduce of an empty stream requires an initial value');
+    }
     return acc;
   };
 
@@ -1253,6 +1307,13 @@ function owcBuildStreamCore() {
     },
     set: function (value) {
       if (this._readableState) this._readableState.readable = !!value;
+    },
+    configurable: true
+  });
+  Object.defineProperty(Readable.prototype, 'readableEncoding', {
+    get: function () {
+      var r = this._readableState;
+      return r && r.encoding !== undefined ? r.encoding : null;
     },
     configurable: true
   });
@@ -1972,10 +2033,191 @@ function owcBuildStreamCore() {
   function pipelineStart(args, callback, opts) {
     if (args.length === 1 && Array.isArray(args[0])) args = args[0];
     if (args.length < 2) throw owcErr(TypeError, 'ERR_MISSING_ARGS', 'The "streams" argument must be specified');
-    for (var i = 0; i < args.length; i++) {
-      if (!isStreamLike(args[i])) throw argBodyError(args[i]);
-    }
+    for (var i = 0; i < args.length; i++) args[i] = pipelineBody(args[i]);
     return pipelineImpl(args, callback, opts);
+  }
+
+  // compose and pipeline both take non-stream bodies: a function becomes a Duplex over its async
+  // generator, and a bare (async) iterable becomes a Readable over it.
+  function pipelineBody(value) {
+    if (isStreamLike(value)) return value;
+    if (typeof value === 'function') return funcToDuplex(value);
+    if (value && (typeof value[Symbol.asyncIterator] === 'function' || typeof value[Symbol.iterator] === 'function')) {
+      return Readable.from(value);
+    }
+    throw argBodyError(value);
+  }
+
+  function readableTrait(value) {
+    return !!value && typeof value === 'object' && value.readable !== false && typeof value.read === 'function';
+  }
+
+  function writableTrait(value) {
+    return !!value && typeof value === 'object' && value.writable !== false && typeof value.write === 'function';
+  }
+
+  function traitName(value) {
+    if (value && value.constructor && value.constructor.name) return 'an instance of ' + value.constructor.name;
+    return String(value);
+  }
+
+  function traitError(index, value, reason) {
+    return owcErr(TypeError, 'ERR_INVALID_ARG_VALUE',
+      "The argument 'streams[" + index + "]' must be " + reason + '. Received ' + traitName(value));
+  }
+
+  // Duplex.from(fn): the writable side feeds the generator's argument, the readable side yields it.
+  function funcToDuplex(fn) {
+    if (typeof fn !== 'function') return fn;
+    var source = new PassThrough({ objectMode: true });
+    var iterator = fn(source);
+    if (!iterator || typeof iterator.next !== 'function') throw argBodyError(fn);
+    var duplex = new Duplex({
+      objectMode: true,
+      write: function (chunk, encoding, callback) {
+        if (source.write(chunk, encoding)) callback();
+        else source.once('drain', callback);
+      },
+      final: function (callback) {
+        source.end();
+        callback();
+      },
+      read: function () {
+        pull();
+      }
+    });
+    var pulling = false;
+    function pull() {
+      if (pulling) return;
+      pulling = true;
+      Promise.resolve(iterator.next()).then(function (step) {
+        pulling = false;
+        if (step.done) duplex.push(null);
+        else duplex.push(step.value);
+      }, function (err) {
+        pulling = false;
+        duplex.destroy(err);
+      });
+    }
+    return duplex;
+  }
+
+  function duplexFrom(value) {
+    if (typeof value === 'function') return funcToDuplex(value);
+    if (isStreamLike(value)) {
+      var readable = readableTrait(value);
+      var writable = writableTrait(value);
+      if (readable && writable) return value;
+      var wrapper = new Duplex({
+        objectMode: !!(value.readableObjectMode || value.writableObjectMode),
+        readable: readable,
+        writable: writable
+      });
+      if (readable) {
+        value.on('end', function () {
+          wrapper.push(null);
+        });
+        value.on('readable', function () {
+          wrapper._read();
+        });
+        wrapper._read = function () {
+          for (;;) {
+            var chunk = value.read();
+            if (chunk === null) return;
+            if (!wrapper.push(chunk)) return;
+          }
+        };
+      }
+      if (writable) {
+        wrapper._write = function (chunk, encoding, callback) {
+          if (value.write(chunk, encoding)) callback();
+          else value.once('drain', callback);
+        };
+        wrapper._final = function (callback) {
+          value.end(callback);
+        };
+      }
+      return wrapper;
+    }
+    return pipelineBody(value);
+  }
+
+  function compose() {
+    var streams = Array.prototype.slice.call(arguments);
+    if (streams.length === 0) throw owcErr(TypeError, 'ERR_MISSING_ARGS', 'The "streams" argument must be specified');
+    if (streams.length === 1) return duplexFrom(streams[0]);
+    if (typeof streams[0] === 'function') streams[0] = funcToDuplex(streams[0]);
+    var last = streams.length - 1;
+    if (typeof streams[last] === 'function') streams[last] = funcToDuplex(streams[last]);
+    for (var n = 0; n < streams.length; n++) {
+      var item = streams[n];
+      if (!item || typeof item !== 'object') continue;
+      if (n < last && !readableTrait(item)) throw traitError(n, item, 'readable');
+      if (n > 0 && !writableTrait(item)) throw traitError(n, item, 'writable');
+    }
+    var head = streams[0];
+    var tail = streams[last];
+    var writable = writableTrait(head);
+    var readable = readableTrait(tail);
+    var d = new Duplex({
+      writableObjectMode: !!(head && head.writableObjectMode),
+      readableObjectMode: !!(tail && tail.readableObjectMode),
+      writable: writable,
+      readable: readable
+    });
+    var ondrain = null;
+    var onfinish = null;
+    var onreadable = null;
+    for (var i = 1; i < streams.length; i++) linkPipe(streams[i - 1], streams[i]);
+    if (writable) {
+      d._write = function (chunk, encoding, callback) {
+        if (head.write(chunk, encoding)) callback();
+        else ondrain = callback;
+      };
+      d._final = function (callback) {
+        head.end();
+        onfinish = callback;
+      };
+      head.on('drain', function () {
+        if (ondrain) {
+          var cb = ondrain;
+          ondrain = null;
+          cb();
+        }
+      });
+      head.on('finish', function () {
+        if (onfinish) {
+          var cb = onfinish;
+          onfinish = null;
+          cb();
+        }
+      });
+    }
+    if (readable) {
+      tail.on('readable', function () {
+        if (onreadable) {
+          var cb = onreadable;
+          onreadable = null;
+          cb();
+        }
+      });
+      tail.on('end', function () {
+        if (!d.destroyed) d.push(null);
+      });
+      d._read = function () {
+        for (;;) {
+          var chunk = tail.read();
+          if (chunk === null) {
+            onreadable = d._read;
+            return;
+          }
+          if (!d.push(chunk)) return;
+        }
+      };
+    } else {
+      d._read = function () {};
+    }
+    return d;
   }
 
   function pipeline() {
@@ -1992,6 +2234,7 @@ function owcBuildStreamCore() {
       var last = args[args.length - 1];
       if (last && typeof last === 'object' && !isStreamLike(last) && !Array.isArray(last)) opts = args.pop();
       return new Promise(function (resolve, reject) {
+        checkSignalProp(opts === null || opts === undefined ? undefined : opts.signal);
         pipelineStart(args, function (err) {
           if (err) reject(err);
           else resolve();
@@ -2082,6 +2325,7 @@ function owcBuildStreamCore() {
   Stream.getDefaultHighWaterMark = getDefaultHighWaterMark;
   Stream.setDefaultHighWaterMark = setDefaultHighWaterMark;
   Stream.addAbortSignal = addAbortSignal;
+  Stream.compose = compose;
   Stream.isReadable = streamIsReadable;
   Stream.isWritable = streamIsWritable;
   Stream.isErrored = streamIsErrored;
