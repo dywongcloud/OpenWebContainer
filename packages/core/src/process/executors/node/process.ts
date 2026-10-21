@@ -169,6 +169,8 @@ export class NodeProcess extends Process {
     private evalSource?: string;
     /** `node` with no file: the run is a REPL on the guest's stdin and stdout. */
     private readonly repl: boolean;
+    /** The guest keeps process.stdin open: a child spawned with a pipe on fd 0, or a REPL. */
+    private readonly stdinPiped: boolean;
     /** The working directory this process is in: `process.chdir` moves it, and everything that
      * resolves a relative path (require, fs, spawned children) reads it from here. */
     private currentCwd: string;
@@ -220,6 +222,10 @@ export class NodeProcess extends Process {
         }
         super(pid, ProcessType.JAVASCRIPT, executablePath, args, parentPid, cwd, processEnv);
         this.repl = executablePath === '[repl]';
+        /* A child spawned with a pipe on fd 0: the parent may still write, so the guest keeps
+           process.stdin open until the host ends it. Set by the spawning capability and dropped by
+           the guest at bootstrap, before any user code runs. */
+        this.stdinPiped = env.OWC_STDIN === 'pipe' || this.repl;
         this.currentCwd = cwd || '/';
         this.fileSystem = fileSystem;
         this.networkManager = networkManager;
@@ -332,13 +338,19 @@ export class NodeProcess extends Process {
     }
 
     /**
-     * Terminal input for the guest. Only a REPL reads it: what the terminal sends reaches the
-     * guest's process.stdin, which is where `repl.start` reads from. Any other run keeps the base
-     * behaviour, so a child that is written to and never reads is exactly as it was.
+     * Terminal input for the guest. A run with a stdin pipe -- a REPL, or a child the parent writes
+     * to -- reads it: what is written reaches the guest's process.stdin, which is where a REPL and
+     * a `process.stdin.on('data')` reader both read from. Any other run keeps the base behaviour, so
+     * a child that is written to and never reads is exactly as it was.
      */
     writeInput(input: string): void {
         if (!this.repl) {
-            super.writeInput(input);
+            if (!this.stdinPiped) {
+                super.writeInput(input);
+                return;
+            }
+            if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
+            this.pushToGuest('pushStdin', [input]);
             return;
         }
         if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
@@ -350,6 +362,16 @@ export class NodeProcess extends Process {
         const text = this.replInput(input);
         if (text === undefined) return;
         this.pushToGuest('pushStdin', [text]);
+    }
+
+    /**
+     * End of input on a stdin pipe: the parent closed its end, or the process that held it exited.
+     * The reader sees end of file, as it does in Node.
+     */
+    endStdin(): void {
+        if (!this.stdinPiped) return;
+        if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
+        this.pushToGuest('endStdin', []);
     }
 
     /**
@@ -604,8 +626,11 @@ export class NodeProcess extends Process {
             `globalThis.__owc_esm_registry = globalThis.__owc_esm_registry || Object.create(null);\n` +
             `globalThis.__owc_esm_registry[${token}] = __owc_ns;\n`;
         const result = context.evalCode(source, `${file}?owc-require`, { type: 'module' });
+        // the engine rebuilds a loader error as a plain Error and drops what was on it, so the code
+        // of a failure inside the graph travels through the guest: read it back for the record
+        const published = this.takeImportFailureCode();
         if (result.error) {
-            const failure = this.requireFailureOf(result.error);
+            const failure = this.requireFailureOf(result.error, published);
             result.error.dispose();
             return failure;
         }
@@ -619,7 +644,7 @@ export class NodeProcess extends Process {
             if (state.type === 'pending') {
                 pending = true;
             } else if (state.type === 'rejected') {
-                failure = this.requireFailureOf(state.error);
+                failure = this.requireFailureOf(state.error, this.takeImportFailureCode());
                 state.error.dispose();
             }
             // the fulfilled value is the promise's own; disposing it here frees what the guest reads
@@ -635,8 +660,11 @@ export class NodeProcess extends Process {
         return '';
     }
 
-    /** The failure record for a require() of an ES module: the error's own name, message and code. */
-    private requireFailureOf(error: QuickJSHandle): string {
+    /**
+     * The failure record for a require() of an ES module: the error's own name, message and code,
+     * with the code the failing import published when the error itself carries none.
+     */
+    private requireFailureOf(error: QuickJSHandle, publishedCode = ''): string {
         const context = this.context!;
         let name = '';
         let message = '';
@@ -653,7 +681,25 @@ export class NodeProcess extends Process {
                 handle.dispose();
             }
         }
-        return JSON.stringify({ name: name === '' ? 'Error' : name, message, code });
+        return JSON.stringify({ name: name === '' ? 'Error' : name, message, code: code === '' ? publishedCode : code });
+    }
+
+    /** The code the last failed import published on the guest, cleared as it is read. */
+    private takeImportFailureCode(): string {
+        const context = this.context!;
+        try {
+            const handle = context.getProp(context.global, '__owc_import_failure');
+            try {
+                return context.typeof(handle) === 'string' ? context.getString(handle) : '';
+            } finally {
+                handle.dispose();
+                const cleared = context.undefined;
+                context.setProp(context.global, '__owc_import_failure', cleared);
+                cleared.dispose();
+            }
+        } catch {
+            return '';
+        }
     }
 
     private startEntry(entryPath: string | undefined): void {
