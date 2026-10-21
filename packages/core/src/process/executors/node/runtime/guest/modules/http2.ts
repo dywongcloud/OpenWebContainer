@@ -2602,7 +2602,15 @@ BF['http2'] = function () {
       }
       if (this._applyRemoteSettings(fresh) === false) return undefined;
       this._sendFrame(T.SETTINGS, F.ACK, 0, null);
-      this.emit('remoteSettings', publicSettings(this._remoteSettings));
+      /* Node raises remoteSettings only when somebody is listening: with no listener the settings
+         are applied and the frame is acknowledged exactly the same, but no event is raised, so a
+         session that only reads session.remoteSettings sees no difference either way. */
+      /* Node raises remoteSettings only when somebody is listening: with no listener the settings
+         are applied and the frame is acknowledged exactly the same, but no event is raised, so a
+         session that only reads session.remoteSettings sees no difference either way. */
+      if (this.listenerCount('remoteSettings') > 0) {
+        this.emit('remoteSettings', publicSettings(this._remoteSettings));
+      }
       this._flushAll();
       this._startQueuedStreams();
       return undefined;
