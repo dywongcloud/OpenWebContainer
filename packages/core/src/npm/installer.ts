@@ -51,15 +51,9 @@ interface InstalledCopy {
  * which is what lets one request serve every edge that needs it.
  */
 type Plan = {
-    kind: 'adopt';
-    edge: Edge;
-    dir: string;
-    placed: string;
-} | {
     kind: 'resolve';
     edge: Edge;
     spec: { name: string; range?: string };
-    visible?: InstalledCopy;
     isRootRequest: boolean;
     packument?: Packument;
     version?: PackageVersion;
@@ -82,8 +76,12 @@ interface Action {
 /** Registry requests kept in flight at once. Measured against the registry: past about eight, more requests in flight move the same bytes slower, not faster. */
 const REQUEST_CONCURRENCY = 8;
 
-/** Tarballs downloaded at once. Downloads overlap while one package is being extracted, which is the part that cannot overlap. */
-const INSTALL_CONCURRENCY = 8;
+/**
+ * Tarballs downloaded at once. Downloads overlap while one package is being extracted, which is the
+ * part that cannot overlap; four is where that overlap is paid for, because a package in flight holds
+ * its tarball, its inflated archive and every entry of it at once.
+ */
+const INSTALL_CONCURRENCY = 4;
 
 /**
  * Installs package trees into a virtual `node_modules`: dependencies are hoisted to the
@@ -204,27 +202,17 @@ export class NpmInstaller {
                 if (seen.has(requestKey)) continue;
                 seen.add(requestKey);
 
+                /* Nothing about the tree is asked yet: whether this edge adopts a copy the tree
+                   already has depends on what the edges before it place, and that is decided in one
+                   pass below, once every packument of the wave is in. */
                 const spec = parseDependencySpec(edge.name, edge.range);
                 if (spec === undefined) {
                     this.log(`skipping ${edge.name}@${edge.range}: only registry versions are supported`);
                     continue;
                 }
-
-                const visible = this.findVisibleCopy(edge.requesterDir, edge.name, claimed);
-                if (edge.peer && visible !== undefined) continue;
-                const isRootRequest = edge.requesterDir === root;
-                const range = spec.range;
-                const reusable = visible !== undefined && (
-                    (range === undefined && !isRootRequest) ||
-                    (range !== undefined && semver.validRange(range) !== null && semver.satisfies(visible.version, range))
-                );
-                if (reusable) {
-                    plans.push({ kind: 'adopt', edge, dir: visible!.dir, placed: visible!.version });
-                    continue;
-                }
                 /* One request per package name, however many edges of the wave ask for it. */
                 wanted.add(spec.name);
-                plans.push({ kind: 'resolve', edge, spec, visible, isRootRequest });
+                plans.push({ kind: 'resolve', edge, spec, isRootRequest: edge.requesterDir === root });
             }
 
             /* The requests are started by the limiter, not by the loop above: a wave of a few hundred
@@ -235,7 +223,6 @@ export class NpmInstaller {
                 await packument.then(() => undefined, () => undefined);
             });
             for (const plan of plans) {
-                if (plan.kind === 'adopt') continue;
                 plan.packument = await packuments.get(plan.spec.name)!;
             }
 
@@ -245,7 +232,6 @@ export class NpmInstaller {
             const libc: { name: string; version: string }[] = [];
             const asked = new Set<string>();
             for (const plan of plans) {
-                if (plan.kind === 'adopt') continue;
                 const version = selectVersion(plan.packument!, plan.spec.range);
                 plan.version = version;
                 if (platformMismatch(version) !== undefined) continue;
@@ -261,20 +247,28 @@ export class NpmInstaller {
                 await manifest.then(() => undefined, () => undefined);
             });
             for (const plan of plans) {
-                if (plan.kind === 'adopt' || plan.version === undefined) continue;
-                plan.manifest = manifests.get(`${plan.spec.name}@${plan.version.version}`);
+                plan.manifest = manifests.get(`${plan.spec.name}@${plan.version!.version}`);
             }
 
+            /* One pass, in the order npm reaches them: what an edge sees is what the edges before it
+               in this wave placed, so a package the whole wave needs is placed once, at the root. */
             const installs: { target: string; version: PackageVersion }[] = [];
             const actions: Action[] = [];
             for (const plan of plans) {
                 const { edge } = plan;
-                if (plan.kind === 'adopt') {
-                    actions.push({ edge, dir: plan.dir, placed: plan.placed });
+                const isRootRequest = plan.isRootRequest;
+                const visible = this.findVisibleCopy(edge.requesterDir, edge.name, claimed);
+                if (edge.peer && visible !== undefined) continue;
+                const range = plan.spec.range;
+                const reusable = visible !== undefined && (
+                    (range === undefined && !isRootRequest) ||
+                    (range !== undefined && semver.validRange(range) !== null && semver.satisfies(visible.version, range))
+                );
+                if (reusable) {
+                    actions.push({ edge, dir: visible!.dir, placed: visible!.version });
                     continue;
                 }
                 const version = plan.version!;
-                const visible = plan.visible;
                 if (visible !== undefined && visible.version === version.version) {
                     actions.push({ edge, dir: visible.dir, placed: visible.version });
                     continue;
