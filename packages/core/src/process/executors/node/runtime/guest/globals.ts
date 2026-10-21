@@ -603,13 +603,19 @@ globalThis.crypto = nodeCrypto.webcrypto;
     return webFetch;
   }
   globalThis.fetch = function fetch(target, options) {
+    var signal = (options && options.signal) || (target && target.signal);
     return undici().fetch(target, options).then(null, function (cause) {
+      /* An abort is not a transport failure: Node rejects with the signal's own reason, a
+         DOMException AbortError or TimeoutError, and never wraps it in 'fetch failed'. */
+      if (signal && signal.aborted) throw signal.reason !== undefined ? signal.reason : cause;
+      /* a Request that cannot be used is the caller's error, not a transport failure */
+      if (cause && cause.owcNotTransport) throw cause;
       var failed = new TypeError('fetch failed');
       failed.cause = cause;
       throw failed;
     });
   };
-  ['Headers', 'Request', 'Response', 'WebSocket'].forEach(function (name) {
+  ['Headers', 'Request', 'Response', 'FormData', 'WebSocket'].forEach(function (name) {
     Object.defineProperty(globalThis, name, {
       get: function () { return undici()[name]; },
       // an assignment replaces the lazy getter with the value, so a package that installs its own

@@ -35,16 +35,108 @@ function transport(target, options) {
 }
 
 /* undici takes method, headers and body; http takes method, headers and a stream it is handed the body on. */
+function headersToObject(headers) {
+  var out = {};
+  if (!headers) return out;
+  if (headers instanceof Headers) {
+    headers.forEach(function (value, key) { out[key] = value; });
+    return out;
+  }
+  for (var key in headers) out[key] = headers[key];
+  return out;
+}
+
+function headerHas(headers, name) {
+  if (!headers) return false;
+  if (headers instanceof Headers) return headers.has(name);
+  for (var key in headers) if (String(key).toLowerCase() === name) return true;
+  return false;
+}
+
 function httpOptions(options) {
   var opts = {};
   if (!options) return opts;
   for (var key in options) {
+    /* body is put on the wire separately and signal drives the abort below; neither is an http option */
     if (key === 'body' || key === 'dispatcher' || key === 'maxRedirections' || key === 'onInfo' || key === 'throwOnError') continue;
+    if (key === 'signal' || key === 'headers' || key === 'method') continue;
     opts[key] = options[key];
   }
-  if (options.headers) opts.headers = options.headers;
+  if (options.headers) opts.headers = headersToObject(options.headers);
   if (options.method) opts.method = options.method;
   return opts;
+}
+
+/* ---- bodies ----
+ *
+ * Node derives Content-Type from the kind of body it is handed: a string goes out as
+ * text/plain;charset=UTF-8, a URLSearchParams as form-urlencoded and a FormData as multipart with a
+ * boundary it picks. A Content-Type the caller set on the request wins over the derived one.
+ */
+var MULTIPART_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+function isBlobLike(value) {
+  return globalThis.Blob !== undefined && value instanceof globalThis.Blob;
+}
+
+function multipartQuote(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+}
+
+function multipartOf(form) {
+  var bytes = requireBuiltin('crypto').randomBytes(24);
+  var boundary = '----formdata-owc-';
+  for (var i = 0; i < bytes.length; i++) boundary += MULTIPART_CHARS[bytes[i] % MULTIPART_CHARS.length];
+  var parts = [];
+  var entries = form._entries;
+  var at = 0;
+  function step() {
+    if (at >= entries.length) {
+      /* the epilogue: the closing delimiter follows the CRLF that ended the last part */
+      parts.push(Buffer.from('--' + boundary + '--\r\n', 'utf8'));
+      return Promise.resolve({ payload: Buffer.concat(parts), contentType: 'multipart/form-data; boundary=' + boundary });
+    }
+    var entry = entries[at++];
+    var head = '--' + boundary + '\r\nContent-Disposition: form-data; name="' + multipartQuote(entry.name) + '"';
+    if (isBlobLike(entry.value)) {
+      var file = entry.value;
+      head += '; filename="' + multipartQuote(file.name === undefined || file.name === '' ? 'blob' : file.name) +
+        '"\r\nContent-Type: ' + (file.type || 'application/octet-stream');
+    }
+    parts.push(Buffer.from(head + '\r\n\r\n', 'utf8'));
+    if (isBlobLike(entry.value)) {
+      return Promise.resolve(entry.value.arrayBuffer()).then(function (buf) {
+        parts.push(Buffer.from(new Uint8Array(buf)));
+        parts.push(Buffer.from('\r\n', 'utf8'));
+        return step();
+      });
+    }
+    parts.push(Buffer.from(String(entry.value), 'utf8'));
+    parts.push(Buffer.from('\r\n', 'utf8'));
+    return step();
+  }
+  return step();
+}
+
+function bodyBytes(body) {
+  if (body === undefined || body === null) return Promise.resolve(null);
+  /* a stream needs the duplex option Node requires for one; sending its String() would be garbage */
+  if (typeof body.pipe === 'function') {
+    return Promise.reject(new TypeError('RequestInit: duplex option is required when sending a body.'));
+  }
+  if (typeof body === 'string') return Promise.resolve({ payload: Buffer.from(body, 'utf8'), contentType: 'text/plain;charset=UTF-8' });
+  if (body instanceof FormData) return multipartOf(body);
+  if (globalThis.URLSearchParams !== undefined && body instanceof globalThis.URLSearchParams) {
+    return Promise.resolve({ payload: Buffer.from(String(body), 'utf8'), contentType: 'application/x-www-form-urlencoded;charset=UTF-8' });
+  }
+  if (Buffer.isBuffer(body)) return Promise.resolve({ payload: body });
+  if (body instanceof Uint8Array) {
+    return Promise.resolve({ payload: Buffer.from(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)) });
+  }
+  if (isBlobLike(body)) {
+    return Promise.resolve(body.arrayBuffer()).then(function (buf) { return { payload: Buffer.from(new Uint8Array(buf)) }; });
+  }
+  return Promise.resolve({ payload: Buffer.from(String(body), 'utf8') });
 }
 
 function bodyOf(chunks) {
@@ -58,21 +150,39 @@ function bodyOf(chunks) {
   };
 }
 
-/* request(url, options) -> { statusCode, headers, body }, as undici's request resolves. */
+/* request(url, options) -> { statusCode, headers, body }, as undici's request resolves. An
+   options.signal aborts it: the socket is destroyed and the promise rejects with the signal's own
+   reason, the way Node rejects an aborted fetch. */
 function request(target, options) {
-  return new Promise(function (resolve, reject) {
-    var mod = transport(target, options);
-    var req = mod.request(target, httpOptions(options), function (res) {
-      var chunks = [];
-      res.on('data', function (chunk) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); });
-      res.on('end', function () {
-        resolve({ statusCode: res.statusCode, statusText: res.statusMessage, headers: res.headers, body: bodyOf(chunks) });
+  return bodyBytes(options && options.body !== undefined ? options.body : null).then(function (prepared) {
+    return new Promise(function (resolve, reject) {
+      var mod = transport(target, options);
+      var opts = httpOptions(options);
+      if (prepared && prepared.contentType && !headerHas(opts.headers, 'content-type')) {
+        opts.headers = headersToObject(opts.headers);
+        opts.headers['content-type'] = prepared.contentType;
+      }
+      var req = mod.request(target, opts, function (res) {
+        var chunks = [];
+        res.on('data', function (chunk) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); });
+        res.on('end', function () {
+          resolve({ statusCode: res.statusCode, statusText: res.statusMessage, headers: res.headers, body: bodyOf(chunks) });
+        });
+        res.on('error', reject);
       });
-      res.on('error', reject);
+      req.on('error', reject);
+      var signal = options && options.signal;
+      if (signal && typeof signal.addEventListener === 'function') {
+        var onAbort = function () {
+          reject(signal.reason !== undefined ? signal.reason : new Error('This operation was aborted'));
+          try { req.destroy(); } catch (destroyError) {}
+        };
+        if (signal.aborted) { onAbort(); return; }
+        signal.addEventListener('abort', onAbort);
+      }
+      if (prepared && prepared.payload !== null && prepared.payload !== undefined) req.end(prepared.payload);
+      else req.end();
     });
-    req.on('error', reject);
-    var body = options && options.body !== undefined && options.body !== null ? options.body : null;
-    if (body !== null) req.end(body); else req.end();
   });
 }
 
@@ -126,6 +236,62 @@ Headers.prototype.forEach = function (fn) {
   for (var key in this.map) fn(this.map[key], key, this);
 };
 
+/* ---- FormData ----
+ *
+ * Node defines FormData as a global beside fetch. Entries keep their order and their kind: a string
+ * stays a string, a Blob or File stays itself, and a Blob appended with a filename becomes a File
+ * the way undici's does. fetch encodes one as multipart/form-data.
+ */
+function FormData() {
+  if (!(this instanceof FormData)) {
+    throw new TypeError('Failed to construct \'FormData\': Please use the \'new\' operator.');
+  }
+  this._entries = [];
+}
+FormData.prototype.append = function (name, value, filename) {
+  var File = globalThis.File;
+  if (File !== undefined && filename !== undefined && isBlobLike(value) && !(value instanceof File)) {
+    value = new File([value], String(filename), { type: value.type });
+  }
+  this._entries.push({ name: String(name), value: value });
+};
+FormData.prototype.set = function (name, value, filename) {
+  this.delete(name);
+  this.append(name, value, filename);
+};
+FormData.prototype.get = function (name) {
+  var entries = this._entries;
+  for (var i = 0; i < entries.length; i++) if (entries[i].name === String(name)) return entries[i].value;
+  return null;
+};
+FormData.prototype.getAll = function (name) {
+  return this._entries.filter(function (entry) { return entry.name === String(name); })
+    .map(function (entry) { return entry.value; });
+};
+FormData.prototype.has = function (name) {
+  return this._entries.some(function (entry) { return entry.name === String(name); });
+};
+FormData.prototype.delete = function (name) {
+  this._entries = this._entries.filter(function (entry) { return entry.name !== String(name); });
+};
+FormData.prototype.forEach = function (fn, thisArg) {
+  var self = this;
+  this._entries.forEach(function (entry) {
+    fn.call(thisArg === undefined ? self : thisArg, entry.value, entry.name, self);
+  });
+};
+FormData.prototype.entries = function () {
+  return this._entries.map(function (entry) { return [entry.name, entry.value]; })[Symbol.iterator]();
+};
+FormData.prototype.keys = function () {
+  return this._entries.map(function (entry) { return entry.name; })[Symbol.iterator]();
+};
+FormData.prototype.values = function () {
+  return this._entries.map(function (entry) { return entry.value; })[Symbol.iterator]();
+};
+FormData.prototype[Symbol.iterator] = FormData.prototype.entries;
+Object.defineProperty(FormData.prototype, Symbol.toStringTag, { value: 'FormData', configurable: true });
+
 function Response(body, init) {
   init = init || {};
   this.status = init.status === undefined ? 200 : init.status;
@@ -145,11 +311,52 @@ function Request(target, options) {
   this.url = String(target && target.href !== undefined ? target.href : target);
   this.method = (options.method || 'GET').toUpperCase();
   this.headers = options.headers instanceof Headers ? options.headers : new Headers(options.headers);
+  this._body = options.body === undefined || options.body === null ? null : options.body;
+  this._used = false;
 }
+Object.defineProperty(Request.prototype, 'bodyUsed', {
+  get: function () { return this._used; },
+  configurable: true
+});
+Request.prototype.text = function () {
+  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  this._used = true;
+  var body = this._body;
+  if (body === null) return Promise.resolve('');
+  if (typeof body === 'string') return Promise.resolve(body);
+  if (isBlobLike(body)) return Promise.resolve(body.text());
+  return Promise.resolve(String(body));
+};
+Request.prototype.json = function () {
+  return this.text().then(function (text) { return JSON.parse(text); });
+};
+Request.prototype.arrayBuffer = function () {
+  return this.text().then(function (text) { return Buffer.from(text, 'utf8'); });
+};
+Request.prototype.clone = function () {
+  var copy = new Request(this.url, { method: this.method, headers: this.headers, body: this._body });
+  copy._used = this._used;
+  return copy;
+};
 
+/* fetch(target, options): target is a URL string, a URL, or a Request -- a Request carries its own
+   method, headers and body, and an option given beside it overrides the one the Request holds. */
 function fetch(target, options) {
+  var init = options || {};
+  if (target instanceof Request) {
+    if (target._used) {
+      /* not a transport failure, so it travels out of fetch exactly as Node reports it */
+      var used = new TypeError('Cannot construct a Request with a Request object that has already been used.');
+      Object.defineProperty(used, 'owcNotTransport', { value: true });
+      return Promise.reject(used);
+    }
+    init = { method: target.method, headers: target.headers, body: target._body };
+    for (var key in options) init[key] = options[key];
+    target._used = true;
+    target = target.url;
+  }
   var url = String(target && target.href !== undefined ? target.href : target);
-  return request(url, options).then(function (res) {
+  return request(url, init).then(function (res) {
     return res.body.text().then(function (text) {
       return new Response(text, { status: res.statusCode, statusText: res.statusText, headers: res.headers, url: url });
     });
@@ -535,6 +742,7 @@ BF['undici'] = function () {
     interceptors: interceptors,
     errors: errors,
     Headers: Headers,
+    FormData: FormData,
     Response: Response,
     Request: Request
   };
