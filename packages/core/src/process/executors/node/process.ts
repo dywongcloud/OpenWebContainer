@@ -12,6 +12,7 @@ import { errorEnvelope, invokeAsync, invokeSync } from './runtime/capabilities/d
 import { CAPABILITIES } from './runtime/capabilities/index';
 import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs } from './pump';
+import type { NodeFlagAnswer } from './flags';
 import type { SyncChildRequest, SyncChildResult } from './pump';
 
 const RESERVED_WORDS = new Set([
@@ -22,11 +23,11 @@ const RESERVED_WORDS = new Set([
     'public', 'await', 'arguments', 'eval'
 ]);
 
-/** The QuickJS module the last boot loaded: a synchronous child boots on it, since it cannot await a new load. */
-let lastQuickJs: QuickJSAsyncWASMModule | undefined;
-
 /** A failure inside guest code, already formatted the way Node prints it. */
 class GuestFailure extends Error {}
+
+/** The QuickJS module the last boot loaded: a synchronous child boots on it, since it cannot await a new load. */
+let lastQuickJs: QuickJSAsyncWASMModule | undefined;
 
 /**
  * How long a guest may run without reaching the host before it is treated as a runaway and stopped.
@@ -169,12 +170,16 @@ export class NodeProcess extends Process {
     private evalSource?: string;
     /** `node` with no file: the run is a REPL on the guest's stdin and stdout. */
     private readonly repl: boolean;
-    /** The guest keeps process.stdin open: a child spawned with a pipe on fd 0, or a REPL. */
+    /** A guest that reads one -- a REPL, or a child the parent writes to -- keeps process.stdin open. */
     private readonly stdinPiped: boolean;
+    /** Written by the host, not taken by the guest yet: a write can arrive before the guest boots. */
+    private stdinQueue: string[] = [];
+    /** The host closed the write end; the guest has been told. */
+    private stdinEnded = false;
+    private stdinClosed = false;
     /** The working directory this process is in: `process.chdir` moves it, and everything that
      * resolves a relative path (require, fs, spawned children) reads it from here. */
     private currentCwd: string;
-    private quickJs?: QuickJSAsyncWASMModule;
     private runtime?: QuickJSRuntime;
     private context?: QuickJSContext;
     private api?: QuickJSHandle;
@@ -199,6 +204,11 @@ export class NodeProcess extends Process {
     private syncTasks: (() => void)[] = [];
     /** Milliseconds of guest execution with no host call in it before the guest is stopped; 0 is none. */
     private guestBudgetMs: number;
+    /**
+     * What `node` answers for a line of flags of its own -- `node --version`, `node --nope`. Such a
+     * run never reaches the guest: no QuickJS runtime is built for it, and no file is looked for.
+     */
+    private readonly flagAnswer?: NodeFlagAnswer;
 
     constructor(
         pid: number,
@@ -210,7 +220,8 @@ export class NodeProcess extends Process {
         parentPid?: number,
         cwd?: string,
         env: Record<string, string> = {},
-        evalSource?: string
+        evalSource?: string,
+        flagAnswer?: NodeFlagAnswer
     ) {
         const processEnv = new Map<string, string>([
             ['PATH', '/bin:/usr/bin'],
@@ -232,6 +243,7 @@ export class NodeProcess extends Process {
         this.services = services;
         this.resolver = new NodeResolver(fileSystem);
         this.evalSource = evalSource;
+        this.flagAnswer = flagAnswer;
         this.guestBudgetMs = services.guestBudgetMs ?? DEFAULT_GUEST_BUDGET_MS;
         this.capabilityContext = {
             pid,
@@ -277,11 +289,16 @@ export class NodeProcess extends Process {
     async execute(): Promise<void> {
         let code = 1;
         try {
-            this.claimParentTerminal();
-            const entryPath = await this.bootGuest();
-            this.startEntry(entryPath);
-            await this.runEventLoop();
-            code = this.finishProcess();
+            if (this.flagAnswer !== undefined) {
+                // `node --version`, `node --nope`: the answer is the flags', and no guest is booted
+                code = this.answerFlags();
+            } else {
+                this.claimParentTerminal();
+                const entryPath = await this.bootGuest();
+                this.startEntry(entryPath);
+                await this.runEventLoop();
+                code = this.finishProcess();
+            }
         } catch (error) {
             code = this.handleFatal(error);
         } finally {
@@ -293,6 +310,18 @@ export class NodeProcess extends Process {
             this._exitCode = code;
             this._state = code === 0 ? ProcessState.COMPLETED : ProcessState.FAILED;
         }
+    }
+
+    /**
+     * Writes the answer `node` gave for a line of its own flags and returns the status that answer
+     * carries. Nothing of the guest exists on such a run: no runtime was built, no file resolved,
+     * so there is nothing to boot, to drain or to dispose.
+     */
+    private answerFlags(): number {
+        const answer = this.flagAnswer!;
+        if (answer.stdout !== undefined) this.emitOutput(answer.stdout);
+        if (answer.stderr !== undefined) this.emitError(answer.stderr);
+        return answer.exitCode;
     }
 
     protected async onTerminate(): Promise<void> {
@@ -349,8 +378,8 @@ export class NodeProcess extends Process {
                 super.writeInput(input);
                 return;
             }
-            if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
-            this.pushToGuest('pushStdin', [input]);
+            this.stdinQueue.push(input);
+            this.flushStdin();
             return;
         }
         if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
@@ -369,9 +398,25 @@ export class NodeProcess extends Process {
      * The reader sees end of file, as it does in Node.
      */
     endStdin(): void {
-        if (!this.stdinPiped) return;
-        if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
-        this.pushToGuest('endStdin', []);
+        if (!this.stdinPiped || this.stdinEnded) return;
+        this.stdinEnded = true;
+        this.flushStdin();
+    }
+
+    /**
+     * Hands the guest what the host has written to its stdin. A write can reach a child before its
+     * guest has booted -- a parent's `child.stdin.write` right after spawn -- so what arrives early
+     * waits here and is pushed the moment the guest can take it.
+     */
+    private flushStdin(): void {
+        if (this.context === undefined || this.stopped || this.exitRequested !== undefined) return;
+        while (this.stdinQueue.length > 0) {
+            this.pushToGuest('pushStdin', [this.stdinQueue.shift() as string]);
+        }
+        if (this.stdinEnded && !this.stdinClosed) {
+            this.stdinClosed = true;
+            this.pushToGuest('endStdin', []);
+        }
     }
 
     /**
@@ -423,10 +468,17 @@ export class NodeProcess extends Process {
     /**
      * Creates the QuickJS runtime and the guest, and resolves the entry. The first await comes
      * before any failure can happen, so the parent always sees this process's exit events.
+     *
+     * The QuickJS module this builds is a WebAssembly instance of about 30 MB of host external
+     * memory plus the bytes of its binary, and the process keeps no reference to it once the guest
+     * is gone: a module held per process is that much memory held for every process the container
+     * has ever run, which is a container that only ever grows.
      */
     private async bootGuest(): Promise<string | undefined> {
         const QuickJS = await newQuickJSAsyncWASMModuleFromVariant(variant);
-        lastQuickJs = QuickJS;
+        /* The module a synchronous child boots on: such a child runs inside the capability call
+           that spawned it and cannot await a load of its own. The container drops it on dispose. */
+        // EXPERIMENT-B: no services reference
         return this.bootWith(QuickJS);
     }
 
@@ -434,7 +486,6 @@ export class NodeProcess extends Process {
     private bootWith(QuickJS: QuickJSAsyncWASMModule): string | undefined {
         // a REPL has no file to resolve: its input is the terminal, not a script
         const entryPath = this.evalSource === undefined && !this.repl ? this.resolveEntry() : undefined;
-        this.quickJs = QuickJS;
         const runtime = QuickJS.newRuntime();
         this.runtime = runtime;
         runtime.setModuleLoader(
@@ -479,6 +530,8 @@ export class NodeProcess extends Process {
         bindVmRuntime(this.capabilityContext, runtime, context, api);
         armVmBudget(this.capabilityContext, this.guestBudgetMs);
         this.builtinNames = new Set<string>(JSON.parse(this.callApiString('builtinNames')));
+        // a parent that wrote before this guest existed is answered now, before the entry runs
+        this.flushStdin();
         return entryPath;
     }
 
@@ -529,7 +582,12 @@ export class NodeProcess extends Process {
         enterSyncRun();
         const result: { status: number | null; signal: string | null; timedOut: boolean; blocked?: string } = { status: 1, signal: null, timedOut: false };
         try {
-            const QuickJS = lastQuickJs;
+            // a line of node's own flags answers itself here too, as it does in an asynchronous run
+            if (this.flagAnswer !== undefined) {
+                result.status = this.answerFlags();
+                return result;
+            }
+            const QuickJS = this.services.quickJsModule;
             if (QuickJS === undefined) throw new Error('no QuickJS module is loaded');
             this.startEntry(this.bootWith(QuickJS));
             const blocked = this.pumpSync(deadline);
@@ -996,7 +1054,7 @@ export class NodeProcess extends Process {
      * quickjs-emscripten 0.32 it reads an uninitialized module pointer.
      */
     private parsesAsModule(source: string, file: string): boolean {
-        const runtime = this.quickJs!.newRuntime();
+        const runtime = this.services.quickJsModule!.newRuntime();
         runtime.setModuleLoader((name) => {
             if (name === PARSE_CHECK_STOP) return { error: new Error(PARSE_CHECK_STOP) };
             return name === file ? source : '';

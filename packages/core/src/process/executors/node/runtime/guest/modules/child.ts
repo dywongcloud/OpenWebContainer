@@ -22,11 +22,9 @@
  * child that waits on asynchronous host work (network, a grandchild, a promise-returning capability) cannot be
  * stepped there, so the call reports ERR_NOT_SUPPORTED with the output written so far.
  *
- * Known gaps. Only node, *.js and sh executables start through the container; other commands run through exec
- * or through spawn with shell: true. Writes to a node child's stdin are accepted but never read, because
- * Process.writeInput feeds only shell processes, and a synchronous node child is given no input. There is no
- * SCM_RIGHTS handle passing, no cluster networking (servers are not shared between workers), and
- * BroadcastChannel is in-process only.
+ * Known gaps. A child's stdout and stderr are read as a whole after the child ends, not streamed as
+ * they are written. There is no SCM_RIGHTS handle passing, no cluster networking (servers are not
+ * shared between workers), and BroadcastChannel is in-process only.
  */
 export const SRC = String.raw`
 var cpState = {
@@ -422,6 +420,10 @@ function cpSpawnCore(child, file, argv, options, extra) {
   child._cpTimer = null;
   child._cpPending = [];
   child._cpQueue = [];
+  /* Node gives a child its pid the moment spawn returns; the container's own spawn settles on a later
+     turn, so the pid is taken from the host now and the child is registered under it when it starts. */
+  var reserved = callCap('child.reservePid', {});
+  child.pid = Number(reserved.pid);
   var stream = requireBuiltin('stream');
   if (stdio.modes[1] === 'pipe') child.stdout = new stream.Readable({ read: function () {} });
   if (stdio.modes[2] === 'pipe') child.stderr = new stream.Readable({ read: function () {} });
@@ -431,6 +433,13 @@ function cpSpawnCore(child, file, argv, options, extra) {
         var text = String(chunk);
         cpPost(child, function () {
           callCap('child.stdin', { pid: child.pid, data: text });
+        });
+        done();
+      },
+      /* The parent's end of file is the child's: a reader there sees end of input, as in Node. */
+      final: function (done) {
+        cpPost(child, function () {
+          callCap('child.stdinEnd', { pid: child.pid });
         });
         done();
       }
@@ -448,6 +457,7 @@ function cpSpawnCore(child, file, argv, options, extra) {
   cpRefChild(child, true);
   if (ipc || extra.kind === 'worker') cpHookParentExit();
   callOp('child.spawn', {
+    pid: child.pid,
     file: exe,
     args: list,
     cwd: cwd,
@@ -482,6 +492,8 @@ function cpSpawnedOk(child, pid) {
 function cpSpawnFailed(child, error) {
   child._cpExited = true;
   child.connected = false;
+  // a child that never started has no pid, as in Node
+  child.pid = undefined;
   if (child._cpTimer) clearTimeout(child._cpTimer);
   cpRefChild(child, false);
   var errno = error && typeof error.errno === 'number' ? error.errno : -2;

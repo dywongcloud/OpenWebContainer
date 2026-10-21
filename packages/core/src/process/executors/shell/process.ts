@@ -115,6 +115,9 @@ export class ShellProcess extends Process {
     private lineBuffer: string[] = [];
 
     private fileSystem: IFileSystem;
+    /** The command of this line was a child process: its output reached the terminal as it ran, so the
+     *  result's own copy of that output is not written again. */
+    private liveChildOutput = false;
 
     constructor(
         pid: number,
@@ -151,10 +154,13 @@ export class ShellProcess extends Process {
                     ? (this.filteredArgs[1] ?? '')
                     : this.filteredArgs.join(' ');
                 const result = await this.executeCommand(commandLine);
-                if (result.stdout) {
+                /* A child process wrote its output to this shell as it ran and the shell's terminal
+                   saw it there; writing what the result collected as well would print it twice. */
+                const live = this.liveChildOutput;
+                if (result.stdout && !live) {
                     this.emitOutput(result.stdout.endsWith('\n') ? result.stdout : result.stdout + '\n');
                 }
-                if (result.stderr) {
+                if (result.stderr && !live) {
                     // the newline stdout gets only when it has none: a command's own diagnostics end
                     // in one already, and a second turned every error line into a blank line after it
                     this.emitError(result.stderr.endsWith('\n') ? result.stderr : result.stderr + '\n');
@@ -284,14 +290,15 @@ export class ShellProcess extends Process {
             // Execute command
             const result = await this.executeCommand(commandLine);
 
-            // Handle output
-            if (result.stdout) {
+            // Handle output: a child process already wrote its own to the terminal as it ran
+            const live = this.liveChildOutput;
+            if (result.stdout && !live) {
                 this.emitOutput(result.stdout);
                 if (!result.stdout.endsWith('\n')) {
                     this.emitOutput('\n');
                 }
             }
-            if (result.stderr) {
+            if (result.stderr && !live) {
                 this.emitError(result.stderr);
                 if (!result.stderr.endsWith('\n')) {
                     this.emitOutput('\n');
@@ -416,6 +423,7 @@ export class ShellProcess extends Process {
      */
     private async executeCommand(commandLine: string): Promise<ShellCommandResult> {
         const processedArgs = splitCommandLine(commandLine);
+        this.liveChildOutput = false;
 
         if (processedArgs.length === 0) {
             return { stdout: '', stderr: '', exitCode: 0 };
@@ -453,6 +461,9 @@ export class ShellProcess extends Process {
     private async spawnOneCommand(command: string, cmdArgs: string[]): Promise<ShellCommandResult | undefined> {
         try {
             if (this.shell.isSpawnedCommand(command)) {
+                /* A child process writes to this shell's output as it runs, so the result's copy is
+                   not written again: `sh -c 'node x.js'` printed every line twice otherwise. */
+                this.liveChildOutput = true;
                 return await this.spawnChild(
                     command,
                     cmdArgs,

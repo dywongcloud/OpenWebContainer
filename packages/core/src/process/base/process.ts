@@ -146,6 +146,12 @@ export abstract class Process extends BrowserEventEmitter {
         });
     }
 
+    /**
+     * End of input on this process's stdin pipe, for a process that reads one: a reader there sees
+     * end of file. A process that reads no input -- a shell's own line editor -- ends nothing.
+     */
+    endStdin(): void { }
+
     protected async readInput(): Promise<string> {
         // If there's input in the buffer, return it immediately
         if (this.inputBuffer.length > 0) {

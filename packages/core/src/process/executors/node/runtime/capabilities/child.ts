@@ -1,6 +1,7 @@
 import { Process, ProcessEvent, ProcessState } from '../../../../base';
 import { CapabilityContext, CapabilityHandler } from './types';
-import { printEvalSource } from '../eval-source';
+import { nodeFlagAnswer, printScriptArg } from '../../flags';
+import type { NodeFlagAnswer } from '../../flags';
 import { COMMANDS as TEXT_UTILS } from '../../../../../shell/commands/textutils';
 import { COMMANDS as FILE_UTILS } from '../../../../../shell/commands/fileutils';
 import { COMMANDS as ARCHIVES } from '../../../../../shell/commands/archives';
@@ -64,6 +65,7 @@ interface ChildRecord {
     parent: CapabilityContext;
     /** The parent guest target that receives this child's events. */
     target: number;
+    stdin: StdioMode;
     stdout: StdioMode;
     stderr: StdioMode;
     pid?: number;
@@ -156,55 +158,12 @@ function deliverFrame(ctx: CapabilityContext, pid: number, target: number, frame
     setTimeout(() => ctx.services.sinkFor(pid)?.deliver(target, 'ipc', frame), 0);
 }
 
-const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
-    const registry = registryFor(ctx);
-    const file = String(args.file);
-    const argv: string[] = Array.isArray(args.args) ? args.args.map(String) : [];
-    const env: Record<string, string> = args.env ? { ...args.env } : childEnvOf(ctx);
-    if (args.ipc) {
-        env.OWC_IPC_KIND = String(args.ipcKind);
-        env.OWC_IPC_DATA = JSON.stringify({ ...args.ipcData, token: args.token });
-    }
-    const stdio: unknown[] = Array.isArray(args.stdio) ? args.stdio : [];
-    const record: ChildRecord = {
-        token: String(args.token),
-        kind: String(args.kind),
-        parent: ctx,
-        target: Number(args.target),
-        stdout: modeOf(stdio[1]),
-        stderr: modeOf(stdio[2]),
-        connected: Boolean(args.ipc),
-        queue: [],
-        exited: false
-    };
-    registry.pending.set(record.token, record);
-    const child = await ctx.services
-        .startProcess({
-            parentPid: ctx.pid,
-            executable: file,
-            args: argv,
-            cwd: typeof args.cwd === 'string' ? args.cwd : ctx.cwd(),
-            env
-        })
-        .catch((error: unknown) => {
-            registry.pending.delete(record.token);
-            throw spawnFailure(error, file, argv);
-        });
-    record.process = child;
-    record.pid = child.pid;
-    registry.pending.delete(record.token);
-    registry.byPid.set(child.pid, record);
-
-    if (child.state !== ProcessState.RUNNING && child.state !== ProcessState.CREATED) {
-        // The process finished inside spawn, before these listeners existed, so its EXIT was never seen.
-        // Its output emitted in that window is not recoverable; the exit is reported now.
-        record.exited = true;
-        record.connected = false;
-        registry.byPid.delete(child.pid);
-        const code = child.exitCode ?? 0;
-        later(() => record.parent.deliver(record.target, 'ev', { k: 'exit', code, signal: null }));
-        return { pid: child.pid };
-    }
+/**
+ * Everything a child emits is routed to its parent. Installed in startProcess's beforeStart, so the
+ * first slice of the child -- a shell that runs one command and exits -- is seen: attaching after the
+ * spawn settles loses everything that child wrote before then.
+ */
+function attachChildListeners(record: ChildRecord, child: Process): void {
     child.addEventListener(ProcessEvent.MESSAGE, (data: { stdout?: string; stderr?: string }) => {
         if (record.exited) return;
         if (data.stdout !== undefined) routeOutput(record, 1, data.stdout);
@@ -221,11 +180,79 @@ const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
         if (record.exited) return;
         record.exited = true;
         record.connected = false;
-        registry.byPid.delete(child.pid);
+        registryByPidOf(record).delete(child.pid);
         const signal = record.killSignal ?? null;
         const code = signal === null ? (data.exitCode ?? 0) : null;
         later(() => record.parent.deliver(record.target, 'ev', { k: 'exit', code, signal }));
     });
+}
+
+/** The pid table of the container this record belongs to: a process is unregistered from where it was registered. */
+function registryByPidOf(record: ChildRecord): Map<number, ChildRecord> {
+    return registryFor(record.parent).byPid;
+}
+
+const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
+    const registry = registryFor(ctx);
+    const file = String(args.file);
+    const argv: string[] = Array.isArray(args.args) ? args.args.map(String) : [];
+    const env: Record<string, string> = args.env ? { ...args.env } : childEnvOf(ctx);
+    if (args.ipc) {
+        env.OWC_IPC_KIND = String(args.ipcKind);
+        env.OWC_IPC_DATA = JSON.stringify({ ...args.ipcData, token: args.token });
+    }
+    const stdio: unknown[] = Array.isArray(args.stdio) ? args.stdio : [];
+    /* A node child whose stdin is a pipe keeps process.stdin open until the parent ends it, as Node
+       does: the guest reads OWC_STDIN at bootstrap and drops it from the environment before user code. */
+    if (modeOf(stdio[0]) === 'pipe' && (file === 'node' || file.endsWith('.js'))) env.OWC_STDIN = 'pipe';
+    const record: ChildRecord = {
+        token: String(args.token),
+        kind: String(args.kind),
+        parent: ctx,
+        target: Number(args.target),
+        stdin: modeOf(stdio[0]),
+        stdout: modeOf(stdio[1]),
+        stderr: modeOf(stdio[2]),
+        connected: Boolean(args.ipc),
+        queue: [],
+        exited: false
+    };
+    registry.pending.set(record.token, record);
+    const reserved = Number(args.pid);
+    const child = await ctx.services
+        .startProcess({
+            parentPid: ctx.pid,
+            executable: file,
+            args: argv,
+            cwd: typeof args.cwd === 'string' ? args.cwd : ctx.cwd(),
+            env,
+            pid: Number.isInteger(reserved) && reserved > 0 ? reserved : undefined,
+            beforeStart: (started) => {
+                record.process = started;
+                record.pid = started.pid;
+                registry.pending.delete(record.token);
+                registry.byPid.set(started.pid, record);
+                attachChildListeners(record, started);
+            }
+        })
+        .catch((error: unknown) => {
+            registry.pending.delete(record.token);
+            throw spawnFailure(error, file, argv);
+        });
+    record.process = child;
+    record.pid = child.pid;
+    registry.pending.delete(record.token);
+    registry.byPid.set(child.pid, record);
+
+    if (!record.exited && child.state !== ProcessState.RUNNING && child.state !== ProcessState.CREATED) {
+        // The process finished inside spawn, before even beforeStart ran, so its EXIT was never seen.
+        // Its output emitted in that window is not recoverable; the exit is reported now.
+        record.exited = true;
+        record.connected = false;
+        registry.byPid.delete(child.pid);
+        const code = child.exitCode ?? 0;
+        later(() => record.parent.deliver(record.target, 'ev', { k: 'exit', code, signal: null }));
+    }
     return { pid: child.pid };
 };
 
@@ -241,7 +268,7 @@ const killChild: CapabilityHandler = (args, ctx) => {
     return true;
 };
 
-/** Writes to a child's stdin. Only shell processes read Process input; node children do not (documented gap). */
+/** Writes to a child's stdin: a shell process reads Process input, a node child reads process.stdin. */
 const stdinWrite: CapabilityHandler = (args, ctx) => {
     const record = registryFor(ctx).byPid.get(Number(args.pid));
     if (!record || record.exited || !record.process || record.parent.pid !== ctx.pid) return false;
@@ -252,6 +279,21 @@ const stdinWrite: CapabilityHandler = (args, ctx) => {
         return false;
     }
 };
+
+/** The parent closed the child's stdin: the child's process.stdin sees end of file, as it does in Node. */
+const stdinEnd: CapabilityHandler = (args, ctx) => {
+    const record = registryFor(ctx).byPid.get(Number(args.pid));
+    if (!record || record.exited || !record.process || record.parent.pid !== ctx.pid) return false;
+    try {
+        record.process.endStdin();
+        return true;
+    } catch {
+        return false;
+    }
+};
+
+/** Takes the pid a child will have, so child_process can report it the moment spawn returns, as Node does. */
+const reservePid: CapabilityHandler = (args, ctx) => ({ pid: syncRunActive() ? nextSyncPid++ : ctx.services.reservePid() });
 
 /** Called by a child guest at bootstrap: records its IPC target and flushes frames queued before it attached. */
 const ipcAttach: CapabilityHandler = (args, ctx) => {
@@ -313,10 +355,18 @@ const disconnectSelf: CapabilityHandler = (_args, ctx) => {
     return true;
 };
 
-/** Parent guest is exiting: worker threads are terminated, and IPC children are disconnected, as Node does. */
+/** Parent guest is exiting: worker threads are terminated, a piped stdin sees end of file, and IPC children are disconnected, as Node does. */
 const parentExit: CapabilityHandler = (_args, ctx) => {
     for (const record of registryFor(ctx).byPid.values()) {
         if (record.parent.pid !== ctx.pid || record.exited || !record.process) continue;
+        // the write end of a pipe closes with the process that holds it: a reader left waiting never waits
+        if (record.stdin === 'pipe') {
+            try {
+                record.process.endStdin();
+            } catch {
+                // the child may have gone already
+            }
+        }
         if (record.kind === 'worker') {
             if (record.process.state === ProcessState.RUNNING) {
                 record.killSignal = 'SIGTERM';
@@ -410,8 +460,14 @@ interface ShellJob {
     pid: number;
     /** The command as it was written, for `jobs`. */
     text: string;
-    /** The pipeline to run, its `|` already split out. */
+    /** The pipeline to run, its `|` already split out. Empty for a compound job, which has `line`. */
     stages: RawWord[][];
+    /**
+     * The whole line of a compound job -- `{ echo a; } &`, `for i in 1 2; do echo $i; done &` -- which
+     * this dispatcher's own splitter cannot re-read: the script engine of `builtins.ts` parses it
+     * again when the job is run. Undefined for a job of plain commands, which runs from `stages`.
+     */
+    line?: string;
     /** Run to completion: `wait` no longer has anything to wait for. */
     done: boolean;
     /** The status it left, once it has run. */
@@ -517,16 +573,20 @@ function shellStateFor(shell: SyncShell): ShellState {
         state = createShellState(shell.env, shell.cwd, fsForModules(shell.ctx.fileSystem, () => shell.cwd));
         state.host = shell;
         // The engine (builtins.ts) cannot start a job itself without importing the capability layer, so
-        // a lone `&` inside a compound command is registered through this callback. Returning null makes
+        // a `&` inside a compound command is registered through this callback. Returning null makes
         // the engine run the pipeline in the foreground rather than invent a job.
         state.startJob = (_state: ShellState, source: string) => {
-            const segment = splitCommandList(source)[0];
+            const segments = splitCommandList(source);
+            /* A compound command -- `{ echo a; } &`, `for i in 1 2; do echo $i; done &` -- is handed
+               over whole: this dispatcher's own splitter reads a line of `;`-separated segments and
+               cannot put one construct back together from them, so the job keeps the text and the
+               script engine parses it again when the job is run. */
+            if (segments.some(segmentStartsCompound)) return startBackgroundJob(shell, [], source);
+            const segment = segments[0];
             if (segment === undefined) return null;
             const stages = splitPipeline(segment.words);
             if (stages === null) return null;
-            startBackgroundJob(shell, stages);
-            const jobs = jobsOf(shell);
-            return jobs.length === 0 ? null : jobs[jobs.length - 1];
+            return startBackgroundJob(shell, stages);
         };
         if (shell.name !== undefined) state.shellName = shell.name;
         shell.state = state;
@@ -677,15 +737,18 @@ function syncSpawnError(error: unknown, file: string, argv: string[]): SyncError
 }
 
 /** The file and arguments a node command runs, as NodeProcessExecutor reads them. */
-function nodeInvocation(argv: string[]): { file: string; args: string[]; evalSource?: string } {
+function nodeInvocation(argv: string[]): { file: string; args: string[]; evalSource?: string; flagAnswer?: NodeFlagAnswer } {
+    /* The flags node answers for itself -- `--version`, one it does not know -- are answered before
+       anything is read as a file, here as they are on the command line. */
+    const answered = nodeFlagAnswer(argv);
+    if (answered !== undefined) return { file: '[flags]', args: [], flagAnswer: answered };
     if (argv.length === 0) throw new Error('No JavaScript file specified');
     if (argv[0] === '-e' || argv[0] === '--eval') {
         if (argv.length < 2) throw new Error(`${argv[0]} requires an argument`);
         return { file: '[eval]', args: argv.slice(2), evalSource: argv[1] };
     }
     if (argv[0] === '-p' || argv[0] === '--print') {
-        if (argv.length < 2) throw new Error(`${argv[0]} requires an argument`);
-        return { file: '[eval]', args: argv.slice(2), evalSource: printEvalSource(argv[1]) };
+        return { file: '[eval]', args: argv.slice(2), evalSource: printScriptArg(argv) };
     }
     return { file: argv[0], args: argv.slice(1) };
 }
@@ -693,15 +756,24 @@ function nodeInvocation(argv: string[]): { file: string; args: string[]; evalSou
 /** One node child run to completion. The caller decides what a blocked or timed-out run means. */
 function nodeRun(
     ctx: CapabilityContext,
-    invocation: { file: string; args: string[]; evalSource?: string },
+    invocation: { file: string; args: string[]; evalSource?: string; flagAnswer?: NodeFlagAnswer },
     env: Record<string, string>,
     cwd: string,
     timeoutMs: number,
-    killSignal: string
+    killSignal: string,
+    /** The whole of spawnSync's `input`: the child reads it on stdin and then sees end of file. */
+    input: string | null
 ): SyncChildResult & { pid: number } {
     const runner = nodeSyncRunner.run;
     if (runner === undefined) throw notSupportedSync('a node child');
     const pid = nextSyncPid++;
+    if (invocation.flagAnswer !== undefined) {
+        const answer = invocation.flagAnswer;
+        return { pid, status: answer.exitCode, signal: null, stdout: answer.stdout ?? '', stderr: answer.stderr ?? '', timedOut: false };
+    }
+    /* The input travels in the environment the guest reads at bootstrap and drops before user code:
+       a synchronous run has no host to push into it later, so it is all there from the start. */
+    if (input !== null && input !== '') env.OWC_STDIN_INPUT = input;
     const result = runner({
         pid,
         parentPid: ctx.pid,
@@ -727,7 +799,7 @@ function shellPath(shell: SyncShell, path: string): string {
 
 /** A node command inside the shell: its status and output become the shell command's. */
 function shellNode(shell: SyncShell, invocation: { file: string; args: string[]; evalSource?: string }): ShellStep {
-    const run = nodeRun(shell.ctx, invocation, shell.env, shell.cwd, 0, 'SIGTERM');
+    const run = nodeRun(shell.ctx, invocation, shell.env, shell.cwd, 0, 'SIGTERM', null);
     if (run.blocked !== undefined) throw notSupportedSync(`the shell command ${invocation.file}, which waits on ${run.blocked}`);
     return { stdout: run.stdout, stderr: run.stderr, exitCode: run.status ?? 1 };
 }
@@ -766,23 +838,11 @@ function shellBuiltin(shell: SyncShell, command: string, args: string[]): ShellS
             }
             case 'pwd':
                 return ok(shell.cwd + '\n');
-            case 'ls': {
-                // A directory operand lists the names in it; a file operand -- every name `ls *.txt`
-                // expands to -- prints its own name, as it does in a shell.
-                const operands = args.filter((arg) => !arg.startsWith('-'));
-                const names: string[] = [];
-                if (operands.length === 0) {
-                    names.push(...lsNames(fs, shell.cwd));
-                } else {
-                    for (const operand of operands) {
-                        const path = at(operand);
-                        if (isDirectory(fs, path)) names.push(...lsNames(fs, path));
-                        else if (fs.fileExists(path)) names.push(operand);
-                        else return { stdout: '', stderr: diagnostic(`ls: ${operand}: No such file or directory`), exitCode: 2 };
-                    }
-                }
-                return ok(names.length > 0 ? names.join('\n') + '\n' : '');
-            }
+            case 'ls':
+            case 'touch':
+                /* The file utilities own these two, as they do in the shell: `ls -l` and `ls -a`
+                   read a name's mode and owner, and `touch a b c` has to reach every operand. */
+                return (FILE_UTILS[command] as ShellCommand)(moduleContext(shell, args));
             case 'mkdir':
                 if (args.length === 0) return fail('No directory specified');
                 fs.createDirectory(at(args[0]));
@@ -798,10 +858,6 @@ function shellBuiltin(shell: SyncShell, command: string, args: string[]): ShellS
             case 'rmdir':
                 if (args.length === 0) return fail('No directory specified');
                 fs.deleteDirectory(at(args[0]));
-                return ok();
-            case 'touch':
-                if (args.length === 0) return fail('No file specified');
-                fs.writeFile(at(args[0]), '');
                 return ok();
             case 'cd': {
                 const target = args[0] || '/';
@@ -1012,6 +1068,14 @@ function syntaxErrorOf(line: string): string | null {
             i = end + 1;
             continue;
         }
+        if (ch === '&' && line[i + 1] !== '&') {
+            /* `cmd &; cmd` is a syntax error in bash: the `&` already ended the command, so nothing
+               is left for the `;` to separate. A `&` of a redirect (`2>&1`) is never one of these --
+               what follows it is the descriptor, not a `;`. */
+            let after = i + 1;
+            while (after < line.length && (line[after] === ' ' || line[after] === '\t')) after++;
+            if (line[after] === ';') return "Syntax error: `&' cannot be followed by `;'";
+        }
         if (ch === '$' && line[i + 1] === '(') {
             const arithmetic = line[i + 2] === '(';
             const end = arithmetic ? matchArithmetic(line, i + 2) : matchParen(line, i + 1);
@@ -1031,18 +1095,21 @@ function syntaxErrorOf(line: string): string | null {
 }
 
 /**
- * The words a line has to be handed to the script engine of `builtins.ts` for: the reserved words
+ * The words a command has to be handed to the script engine of `builtins.ts` for: the reserved words
  * that open a compound command (`if`, `for`, `while`, `until`, `case`, `{ }`, `( )`) and a function
- * definition. Only the *first* word of a segment is looked at, so `echo {` and `find . -name "*.txt"`
- * keep going through this dispatcher: there, `{` is an argument and the parser would expand the glob.
+ * definition. Only the *first* word is looked at, so `echo {` and `find . -name "*.txt"` keep going
+ * through this dispatcher: there, `{` is an argument and the parser would expand the glob.
+ *
+ * The first word of *every* stage of a pipeline is looked at, not only the line's: `echo a |
+ * while read v; do ...; done` is a compound line whose first word is `echo`, and the `while` on the
+ * right of the `|` is one only the engine parses.
  */
-const COMPOUND_KEYWORDS = new Set(['if', 'for', 'while', 'until', 'case', 'select']);
+const COMPOUND_KEYWORDS = new Set(['if', 'for', 'while', 'until', 'case', 'select', 'function']);
 /** `g()`, `f(){ ... }` and the same written with no space: a function definition. */
 const FUNCTION_DEFINITION = /^[A-Za-z_][A-Za-z0-9_]*\(\)/;
 const NAME_WORD = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-function startsCompound(segment: ShellSegment): boolean {
-    const words = segment.words;
+function startsCompound(words: RawWord[]): boolean {
     if (words.length === 0) return false;
     const first = rawText(words[0]);
     if (COMPOUND_KEYWORDS.has(first)) return true;
@@ -1051,6 +1118,13 @@ function startsCompound(segment: ShellSegment): boolean {
     if (FUNCTION_DEFINITION.test(first)) return true;
     // `g () { ... }`: the name, then the parenthesis as a word of its own (`g ()` gives `()`)
     return NAME_WORD.test(first) && words.length > 1 && /^\(/.test(rawText(words[1]));
+}
+
+/** True when any stage of the segment's pipeline opens a compound command. */
+function segmentStartsCompound(segment: ShellSegment): boolean {
+    const stages = splitPipeline(segment.words);
+    if (stages === null) return false;
+    return stages.some(startsCompound);
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -2186,18 +2260,70 @@ function jobText(stages: RawWord[][]): string {
 }
 
 /**
- * `cmd &`: records the job and prints the line a shell prints for one, without running it. The
- * shell's own `$?` after it is 0, as it is after any command it does not wait for, and `$!` is the
- * pid it printed.
+ * `cmd &`: records the job and runs nothing, as a shell that does not wait for the command runs
+ * nothing where it stands. `line` is the whole text of a compound job (`{ echo a; } &`), which is
+ * run through the script engine when something asks for it; a job of plain commands runs from
+ * `stages`. The shell's own `$?` after it is 0, as it is after any command it does not wait for,
+ * and `$!` is the pid of the job.
+ *
+ * Nothing is printed: bash prints `[1] 12345` only in an interactive shell, and a line handed to
+ * `sh -c` -- which is every line here -- gets no such line from it.
  */
-function startBackgroundJob(shell: SyncShell, stages: RawWord[][]): ShellStep {
+function startBackgroundJob(shell: SyncShell, stages: RawWord[][], line?: string): ShellJob {
     const jobs = jobsOf(shell);
     const id = jobs.reduce((high, job) => Math.max(high, job.id), 0) + 1;
-    const job: ShellJob = { id, pid: nextBackgroundPid++, text: jobText(stages), stages, done: false, exitCode: 0 };
+    const job: ShellJob = {
+        id,
+        pid: nextBackgroundPid++,
+        text: line === undefined ? jobText(stages) : line,
+        stages,
+        line,
+        done: false,
+        exitCode: 0
+    };
     jobs.push(job);
     // `$!` lives in the state the builtins share, so it is the same pid `wait` and `$!` see
     shellStateFor(shell).lastBackgroundPid = job.pid;
-    return { stdout: `[${id}] ${job.pid}\n`, stderr: '', exitCode: 0 };
+    return job;
+}
+
+/**
+ * The parts of the engine's state a compound job may change and the line around it must not see. A
+ * job is a subshell in bash, so what it does to the variables, the functions and the options stays
+ * in it -- `f(){ echo fn; } & wait; f` is `f: command not found`, and `{ g=2; } & wait` leaves `g`
+ * as the line before it set it -- while everything it inherits, `g` included, is still there when it
+ * starts.
+ */
+function snapshotEngineState(state: ShellState) {
+    return {
+        scopes: state.scopes.map((scope) => new Map([...scope].map(([name, variable]) => [name, { ...variable }]))),
+        functions: [...state.functions],
+        aliases: [...state.aliases]
+    };
+}
+
+function restoreEngineState(state: ShellState, saved: ReturnType<typeof snapshotEngineState>): void {
+    state.scopes.length = 0;
+    for (const scope of saved.scopes) state.scopes.push(scope);
+    state.functions.clear();
+    for (const [name, body] of saved.functions) state.functions.set(name, body);
+    state.aliases.clear();
+    for (const [name, value] of saved.aliases) state.aliases.set(name, value);
+}
+
+/**
+ * A compound job, run as the subshell bash runs it in. The engine's state is put back afterwards, so
+ * the line around the job keeps its own variables and functions. A job the job itself started stays
+ * in the table: the line's own flush runs it, as the shell runs the child of a subshell it waits for.
+ */
+function runCompoundJob(shell: SyncShell, line: string): ShellStep {
+    const state = shellStateFor(shell);
+    const saved = snapshotEngineState(state);
+    try {
+        return runCompoundLine(shell, line);
+    } finally {
+        restoreEngineState(state, saved);
+    }
 }
 
 /** Runs one job to completion. A job is a subshell: what it does to the directory and to `$?` stays in it. */
@@ -2206,7 +2332,7 @@ function runJob(shell: SyncShell, job: ShellJob): ShellStep {
     const savedStatus = shell.lastStatus;
     const savedStopped = shell.stopped;
     try {
-        const step = shellPipeline(shell, job.stages);
+        const step = job.line === undefined ? shellPipeline(shell, job.stages) : runCompoundJob(shell, job.line);
         job.done = true;
         job.exitCode = step.exitCode;
         return step;
@@ -2284,8 +2410,12 @@ function shellWait(shell: SyncShell, args: string[]): ShellStep {
         if (arg === '-n' || arg === '-f') continue;
         const job = findJob(shell, arg);
         if (job === undefined) {
-            stderr += `wait: ${arg}: not a child of this shell\n`;
-            exitCode = 127;
+            /* bash says which of the three went wrong: a job spec that names no job, a number that is
+               no child of the shell, or a word that is neither a pid nor a job spec. */
+            if (arg.startsWith('%')) stderr += `wait: ${arg}: no such job\n`;
+            else if (/^[0-9]+$/.test(arg)) stderr += `wait: pid ${arg} is not a child of this shell\n`;
+            else stderr += `wait: \`${arg}': not a pid or valid job spec\n`;
+            exitCode = arg.startsWith('%') || /^[0-9]+$/.test(arg) ? 127 : 1;
             continue;
         }
         const step = job.done ? { stdout: '', stderr: '', exitCode: job.exitCode } : runJob(shell, job);
@@ -2364,7 +2494,12 @@ function shellLine(shell: SyncShell, line: string, deferPendingJobs = false): Sh
     if (pipelines.some((pipeline) => pipeline === null)) {
         return { stdout: '', stderr: diagnostic('Syntax error: a command is missing beside `|`'), exitCode: 2 };
     }
-    if (segments.some(startsCompound)) return runCompoundLine(shell, body);
+    if (segments.some(segmentStartsCompound)) {
+        /* A compound line ends the same way any other does: the jobs it started -- `{ echo a; } &`
+           is one -- are run once its own commands are through, and the EXIT trap fires after them. */
+        const step = runCompoundLine(shell, body);
+        return endOfLine(shell, step.stdout, step.stderr, step.exitCode, deferPendingJobs);
+    }
     let exitCode = 0;
     let stdout = '';
     let stderr = '';
@@ -2374,10 +2509,14 @@ function shellLine(shell: SyncShell, line: string, deferPendingJobs = false): Sh
         const segment = segments[i];
         if (segment.op === '&&' && exitCode !== 0) continue;
         if (segment.op === '||' && exitCode === 0) continue;
-        const step =
-            segment.background === true
-                ? startBackgroundJob(shell, pipelines[i] as RawWord[][])
-                : shellPipeline(shell, pipelines[i] as RawWord[][]);
+        let step: ShellStep;
+        if (segment.background === true) {
+            // nothing runs where the `&` stands, and nothing is printed for it: see startBackgroundJob
+            startBackgroundJob(shell, pipelines[i] as RawWord[][]);
+            step = EMPTY_STEP;
+        } else {
+            step = shellPipeline(shell, pipelines[i] as RawWord[][]);
+        }
         stdout += step.stdout;
         stderr += step.stderr;
         exitCode = step.exitCode;
@@ -2393,8 +2532,21 @@ function shellLine(shell: SyncShell, line: string, deferPendingJobs = false): Sh
             (i + 1 < segments.length && (segments[i + 1].op === '&&' || segments[i + 1].op === '||'));
         if (!operand && shell.state?.options.errexit === true && exitCode !== 0) break;
     }
-    // a job no one waited for cannot outlive the line on a host that runs one command at a time, so
-    // it runs here, after the foreground is through: started late rather than never, and never before
+    return endOfLine(shell, stdout, stderr, exitCode, deferPendingJobs);
+}
+
+/**
+ * The end of a line: a job no one waited for cannot outlive the line on a host that runs one command
+ * at a time, so it runs here, after the foreground is through -- started late rather than never, and
+ * never before. Then the EXIT trap, and then a job the trap itself started.
+ */
+function endOfLine(
+    shell: SyncShell,
+    stdout: string,
+    stderr: string,
+    exitCode: number,
+    deferPendingJobs: boolean
+): ShellStep {
     const flushed = deferPendingJobs ? EMPTY_STEP : runPendingJobs(shell);
     const trapped = runExitTrap(
         shell,
@@ -2625,8 +2777,8 @@ function runSyncCommand(
         const step = runShell(ctx, argv, env, cwd, input, file);
         return { pid: nextSyncPid++, status: step.status, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
     }
-    if (file === 'node' || file === NODE_BINARY) return nodeRun(ctx, nodeInvocation(argv), env, cwd, timeoutMs, killSignal);
-    if (file.endsWith('.js')) return nodeRun(ctx, { file, args: argv }, env, cwd, timeoutMs, killSignal);
+    if (file === 'node' || file === NODE_BINARY) return nodeRun(ctx, nodeInvocation(argv), env, cwd, timeoutMs, killSignal, input);
+    if (file.endsWith('.js')) return nodeRun(ctx, { file, args: argv }, env, cwd, timeoutMs, killSignal, input);
     if (file === 'npm' || file === 'npx') {
         const step = npmCommand({ ctx, cwd, env, input, lastStatus: 0 }, argv);
         return { pid: nextSyncPid++, status: step.exitCode, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
@@ -2723,6 +2875,8 @@ export const CHILD_CAPABILITIES: Record<string, CapabilityHandler> = {
     'child.spawn': spawnChild,
     'child.kill': killChild,
     'child.stdin': stdinWrite,
+    'child.stdinEnd': stdinEnd,
+    'child.reservePid': reservePid,
     'child.ipcAttach': ipcAttach,
     'child.sendToParent': sendToParent,
     'child.sendToChild': sendToChild,

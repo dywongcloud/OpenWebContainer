@@ -39,6 +39,8 @@ export interface ContainerOptions {
 export interface SpawnOptions {
     cwd?: string;
     env?: Record<string, string>;
+    /** The pid the process takes, already taken from the manager; the next pid when it is left out. */
+    pid?: number;
     /** Runs synchronously before the process starts, so listeners see every event. */
     beforeStart?: (process: Process) => void;
 }
@@ -80,9 +82,11 @@ export class OpenWebContainer {
             startProcess: (request) => this.spawn(request.executable, request.args, request.parentPid, {
                 cwd: request.cwd,
                 env: request.env,
+                pid: request.pid,
                 beforeStart: request.beforeStart
             }),
             sinkFor: (pid) => this.guestSink(pid),
+            reservePid: () => this.processManager.getNextPid(),
             guestBudgetMs: options.guestBudgetMs
         };
 
@@ -213,17 +217,54 @@ export class OpenWebContainer {
     /**
      * Process operations
      */
+    /**
+     * How a file with no executor of its own runs: through the interpreter its shebang names, with the
+     * file as that interpreter's first argument -- `#!/usr/bin/env node` runs `node <file> <args>`, the
+     * way the kernel runs it. A `node_modules/.bin` shim is such a file: a node script with no .js
+     * name, so no executor claims it and a spawn of it reported ENOENT. Undefined when the name has an
+     * executor already, is not a file, or names an interpreter the container cannot run.
+     */
+    private shebangInvocation(executable: string, args: string[], cwd: string): { executable: string; args: string[] } | undefined {
+        if (this.processRegistry.findExecutor(executable) !== undefined) return undefined;
+        const path = executable.startsWith('/')
+            ? this.fileSystem.normalizePath(executable)
+            : this.fileSystem.normalizePath(`${cwd.replace(/\/+$/, '')}/${executable}`);
+        let content: string | undefined;
+        try {
+            content = this.fileSystem.readFile(path);
+        } catch {
+            return undefined;
+        }
+        if (content === undefined) return undefined;
+        const match = /^#!([^\n]*)/.exec(content);
+        if (match === null) return undefined;
+        const tokens = match[1].trim().split(/\s+/).filter((token) => token !== '');
+        if (tokens.length === 0) return undefined;
+        const interpreter = tokens[0] === 'env' || tokens[0].endsWith('/env')
+            ? tokens.slice(1).find((token) => !token.startsWith('-'))
+            : tokens[0].split('/').pop();
+        if (interpreter === undefined || interpreter === '') return undefined;
+        if (this.processRegistry.findExecutor(interpreter) === undefined) return undefined;
+        return { executable: interpreter, args: [path, ...args] };
+    }
+
     async spawn(executablePath: string, args: string[] = [], parentPid?: number,options: SpawnOptions = {}): Promise<Process> {
-        const executor = this.processRegistry.findExecutor(executablePath);
+        const cwd = options.cwd || '/';
+        /* A file with no executor of its own -- a node_modules/.bin shim is one, a `node` script with
+           no .js name -- runs through the interpreter its shebang names, the way the kernel runs it. */
+        const shebang = this.shebangInvocation(executablePath, args, cwd);
+        const executable = shebang?.executable ?? executablePath;
+        const argv = shebang?.args ?? args;
+        const executor = this.processRegistry.findExecutor(executable);
         if (!executor) {
             throw new Error(`No executor found for: ${executablePath}`);
         }
 
-        const pid = this.processManager.getNextPid();
+        const pid = options.pid ?? this.processManager.getNextPid();
         const process = await executor.execute({
-            executable: executablePath,
-            args,
-            cwd: options.cwd || '/',
+            executable,
+            args: argv,
+            cwd,
             env: options.env || {}
         }, pid, parentPid);
 
@@ -480,6 +521,11 @@ export class OpenWebContainer {
 
         // Kill all processes
         await this.processManager.killAll();
+
+        /* The QuickJS module the guests booted on is a whole WebAssembly instance: dropping the
+           container's reference to it is what lets the host take its memory back, the same way the
+           processes above are dropped. */
+        this.services.quickJsModule = undefined;
 
         // Clear output callbacks
         this.outputCallbacks = [];
