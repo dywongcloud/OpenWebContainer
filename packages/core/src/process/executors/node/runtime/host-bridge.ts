@@ -3,6 +3,7 @@ import { IFileSystem } from '../../../../filesystem';
 import { NodeResolver, ResolveMode, dirnameOf } from './resolver';
 import { base64ToBytes, bytesToBase64 } from '../../../../utils/bytes';
 import { CapabilityEnvelope } from './capabilities/types';
+import type { MaybeAsync } from './capabilities/dispatch';
 import { installWasmBridge } from './wasm-host';
 
 export interface HostBridgeDeps {
@@ -20,8 +21,13 @@ export interface HostBridgeDeps {
     exit: (code: number) => void;
     setTimer: (id: number, ms: number) => void;
     clearTimer: (id: number) => void;
-    /** Synchronous capability call; returns an envelope. */
-    capability: (op: string, argsJson: string) => CapabilityEnvelope;
+    /**
+     * Synchronous capability call; returns an envelope -- or a promise of one, when the capability has
+     * to wait on host work of its own and the guest is meant to suspend on it. QuickJS hands a promise
+     * a host function returns to Asyncify, which unwinds the guest's stack and rewinds it when the
+     * promise settles, so the guest stays inside the statement that called.
+     */
+    capability: (op: string, argsJson: string) => MaybeAsync<CapabilityEnvelope>;
     /**
      * Synchronous capability call over the binary channel: `bytes` is the payload, taken straight out
      * of the guest heap, so nothing encodes or decodes it. The JSON arguments carry metadata only.
@@ -59,6 +65,23 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
     const host = context.newObject();
     const define = (name: string, impl: (...args: QuickJSHandle[]) => QuickJSHandle) => {
         const fn = context.newFunction(name, (...args: QuickJSHandle[]) => {
+            deps.onHostCall?.();
+            return impl(...args);
+        });
+        context.setProp(host, name, fn);
+        fn.dispose();
+    };
+    /**
+     * The one host call that can suspend. QuickJS takes a promise a host function returns as a request
+     * to unwind: `newAsyncifiedFunction` is `newFunction` at runtime, and its type admits only a
+     * function that always promises, which would suspend on every call. This one promises only when
+     * the capability does, so the ordinary synchronous answer stays synchronous.
+     */
+    const defineSuspendable = (name: string, impl: (...args: QuickJSHandle[]) => QuickJSHandle | Promise<QuickJSHandle>) => {
+        const asyncified = context as unknown as {
+            newFunction(name: string, impl: (...args: QuickJSHandle[]) => QuickJSHandle | Promise<QuickJSHandle>): QuickJSHandle;
+        };
+        const fn = asyncified.newFunction(name, (...args: QuickJSHandle[]) => {
             deps.onHostCall?.();
             return impl(...args);
         });
@@ -150,7 +173,19 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         deps.clearTimer(context.getNumber(id));
         return context.undefined;
     });
-    define('cap', (op, args) => context.newString(JSON.stringify(deps.capability(text(op), text(args)))));
+    /**
+     * A synchronous capability. One that answers a promise instead of an envelope has host work of its
+     * own to wait for, and the promise is handed to QuickJS as this function's result: Asyncify unwinds
+     * the guest's stack there and rewinds it when the promise settles, so the guest stays inside the
+     * statement that called and sees the envelope as the call's own answer.
+     */
+    defineSuspendable('cap', (op, args) => {
+        const envelope = deps.capability(text(op), text(args));
+        if (envelope instanceof Promise) {
+            return envelope.then((settled) => context.newString(JSON.stringify(settled)));
+        }
+        return context.newString(JSON.stringify(envelope));
+    });
     /**
      * The binary channel. The third argument is a guest ArrayBuffer: `getArrayBuffer` hands back a
      * view over the bytes the runtime copied out of the guest heap, and it is freed with its

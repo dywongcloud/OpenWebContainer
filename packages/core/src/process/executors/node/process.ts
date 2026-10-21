@@ -8,10 +8,11 @@ import { installHostBridge } from './runtime/host-bridge';
 import { NodeResolver, dirnameOf, isPathSpecifier, joinPaths, normalizeAbsolute, withoutUrlSuffix } from './runtime/resolver';
 import { RuntimeServices } from './runtime/services';
 import { CapabilityContext, CapabilityEnvelope } from './runtime/capabilities/types';
-import { errorEnvelope, invokeAsync, invokeSync, invokeSyncBytes } from './runtime/capabilities/dispatch';
+import { errorEnvelope, invokeAsync, invokeSync, invokeSyncBytes, invokeSyncMaybe } from './runtime/capabilities/dispatch';
+import type { MaybeAsync } from './runtime/capabilities/dispatch';
 import { CAPABILITIES } from './runtime/capabilities/index';
 import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbindVmRuntime, yieldVmSlice } from './runtime/capabilities/vm';
-import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs } from './pump';
+import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs, syncRunActive } from './pump';
 import type { NodeFlagAnswer } from './flags';
 import type { SyncChildRequest, SyncChildResult } from './pump';
 
@@ -25,6 +26,99 @@ const RESERVED_WORDS = new Set([
 
 /** A failure inside guest code, already formatted the way Node prints it. */
 class GuestFailure extends Error {}
+
+/**
+ * The pieces of a QuickJS context the unwind-aware calls need. `quickjs-emscripten` keeps them
+ * protected, and the variant that supplies them is pinned in packages/core/package.json.
+ */
+interface GuestFfi {
+    ctx: { value: number };
+    rt: { value: number };
+    memory: {
+        /** The malloc'd cell holding the argument handles: freed once the call has answered. */
+        toPointerArray(handles: QuickJSHandle[]): { value: number; dispose(): void };
+        newMutablePointerArray(length: number): { value: { ptr: number; typedArray: Int32Array }; dispose(): void };
+        heapValueHandle(ptr: number): QuickJSHandle;
+    };
+    ffi: {
+        QTS_ResolveException(ctx: number, valuePtr: number): number;
+        QTS_FreeValuePointer(ctx: number, valuePtr: number): void;
+    };
+    module: {
+        /** The fourth argument is what matters: see `unwindAwareCall`. */
+        cwrap(name: string, returnType: string, argTypes: string[], opts?: object): (...args: number[]) => number | Promise<number>;
+    };
+}
+
+/** One guest call, in the shape `context.callFunction` answers with: a value, or the error thrown. */
+interface GuestCallResult {
+    error?: QuickJSHandle;
+    value?: QuickJSHandle;
+}
+
+/**
+ * An Emscripten export that can unwind, bound through the route that keeps the unwind.
+ *
+ * The guest runs on an Asyncify build, so a host function a guest called synchronously may suspend:
+ * the wasm stack is saved, the host finishes its work, and the stack is rewound so the guest goes on
+ * inside the very statement that called. `cwrap` hides that: when every argument of an export is a
+ * number it hands back the raw wasm export, which answers a suspended call with a dummy value and
+ * drops the promise that would settle when the guest resumes. An options argument -- even an empty
+ * one -- keeps the wrapper around the export instead, and that wrapper turns an unwind into a promise
+ * while leaving an ordinary call the plain synchronous answer it has always been. (Its `async` option
+ * would promise on every call, which is the one thing this cannot have: a guest step that always
+ * suspends is a guest that can never be stepped synchronously again.)
+ */
+function unwindAwareCall(guest: GuestFfi, name: string, argTypes: string[]): (...args: number[]) => number | Promise<number> {
+    return guest.module.cwrap(name, 'number', argTypes, {});
+}
+
+function guestCallResult(guest: GuestFfi, resultPtr: number): GuestCallResult {
+    const errorPtr = guest.ffi.QTS_ResolveException(guest.ctx.value, resultPtr);
+    if (errorPtr) {
+        guest.ffi.QTS_FreeValuePointer(guest.ctx.value, resultPtr);
+        return { error: guest.memory.heapValueHandle(errorPtr) };
+    }
+    return { value: guest.memory.heapValueHandle(resultPtr) };
+}
+
+/** `context.callFunction`, on a route that keeps an unwind: a promise only when the guest suspended. */
+function callFunctionMaybe(context: QuickJSContext, fn: QuickJSHandle, thisVal: QuickJSHandle, args: QuickJSHandle[]): MaybeAsync<GuestCallResult> {
+    const guest = context as unknown as GuestFfi;
+    const call = unwindAwareCall(guest, 'QTS_Call', ['number', 'number', 'number', 'number', 'number']);
+    /* The argument cells are freed once the call is answered, not as soon as it returns: a call that
+       suspended answers on the rewind, and the guest's own handles have to live that long. */
+    const pointers = guest.memory.toPointerArray(args);
+    const raw = call(guest.ctx.value, fn.value, thisVal.value, args.length, pointers.value);
+    const finish = (resultPtr: number): GuestCallResult => {
+        const result = guestCallResult(guest, resultPtr);
+        pointers.dispose();
+        return result;
+    };
+    return raw instanceof Promise ? raw.then(finish) : finish(raw);
+}
+
+/** `runtime.executePendingJobs`, on the same route: one promise job may itself suspend the guest. */
+function executePendingJobsMaybe(context: QuickJSContext, limit: number): MaybeAsync<GuestCallResult> {
+    const guest = context as unknown as GuestFfi;
+    const run = unwindAwareCall(guest, 'QTS_ExecutePendingJob', ['number', 'number', 'number']);
+    const ctxOut = guest.memory.newMutablePointerArray(1);
+    const raw = run(guest.rt.value, limit, ctxOut.value.ptr);
+    const finish = (valuePtr: number): GuestCallResult => {
+        // the cell is malloc'd, so it still reads what the job wrote once the guest has rewound
+        const noJobRan = ctxOut.value.typedArray[0] === 0;
+        ctxOut.dispose();
+        const result = guest.memory.heapValueHandle(valuePtr);
+        /* What the job answered is the count of jobs run, and it is the job's exception instead:
+           the two are told apart the way `runtime.executePendingJobs` tells them apart. */
+        if (noJobRan || context.typeof(result) === 'number') {
+            result.dispose();
+            return { value: undefined };
+        }
+        return { error: result };
+    };
+    return raw instanceof Promise ? raw.then(finish) : finish(raw);
+}
 
 /**
  * An ArrayBuffer holding exactly `bytes`, which QuickJS can take as one value: `newArrayBuffer`
@@ -212,6 +306,15 @@ export class NodeProcess extends Process {
     private syncTimedOut = false;
     /** Deliveries from children that finished inside this run, taken by the pump in order. */
     private syncTasks: (() => void)[] = [];
+    /**
+     * The guest is suspended: a synchronous capability unwound its stack and the host is finishing
+     * the work it asked for. A second call into the module while it is unwound aborts it -- Asyncify
+     * rejects a call made in the unwinding state -- so every other step waits here until the guest
+     * is rewound, and this process's own wasm module is its own, which is why no other process is
+     * held up by it.
+     */
+    private guestSuspended = false;
+    private guestWaiting: (() => void | Promise<void>)[] = [];
     /** Milliseconds of guest execution with no host call in it before the guest is stopped; 0 is none. */
     private guestBudgetMs: number;
     /**
@@ -324,7 +427,7 @@ export class NodeProcess extends Process {
             } else {
                 this.claimParentTerminal();
                 const entryPath = await this.bootGuest();
-                this.startEntry(entryPath);
+                this.startEntryGated(entryPath);
                 await this.runEventLoop();
                 code = this.finishProcess();
             }
@@ -369,22 +472,11 @@ export class NodeProcess extends Process {
     /** Delivery into this guest from the virtual network or a capability (VirtualSink). */
     deliver(targetId: number, name: string, payload: unknown): void {
         if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
-        try {
-            const id = this.context.newNumber(targetId);
-            const eventName = this.context.newString(name);
-            const body = this.context.newString(JSON.stringify(payload === undefined ? null : payload));
-            try {
-                this.callApi('deliver', [id, eventName, body]).dispose();
-            } finally {
-                id.dispose();
-                eventName.dispose();
-                body.dispose();
-            }
-            this.drainJobs();
-        } catch (error) {
-            this.fatalError = error;
-        }
-        this.wakeIfIdle();
+        this.guestOperation('deliver', () => [
+            this.context!.newNumber(targetId),
+            this.context!.newString(name),
+            this.context!.newString(JSON.stringify(payload === undefined ? null : payload))
+        ]);
     }
 
     /**
@@ -395,24 +487,12 @@ export class NodeProcess extends Process {
      */
     deliverBytes(targetId: number, name: string, bytes: Uint8Array, meta?: unknown): void {
         if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
-        try {
-            const id = this.context.newNumber(targetId);
-            const eventName = this.context.newString(name);
-            const body = this.context.newString(JSON.stringify(meta === undefined ? null : meta));
-            const data = this.context.newArrayBuffer(exactArrayBuffer(bytes));
-            try {
-                this.callApi('deliver', [id, eventName, body, data]).dispose();
-            } finally {
-                id.dispose();
-                eventName.dispose();
-                body.dispose();
-                data.dispose();
-            }
-            this.drainJobs();
-        } catch (error) {
-            this.fatalError = error;
-        }
-        this.wakeIfIdle();
+        this.guestOperation('deliver', () => [
+            this.context!.newNumber(targetId),
+            this.context!.newString(name),
+            this.context!.newString(JSON.stringify(meta === undefined ? null : meta)),
+            this.context!.newArrayBuffer(exactArrayBuffer(bytes))
+        ]);
     }
 
     /**
@@ -495,18 +575,7 @@ export class NodeProcess extends Process {
     /** Runs one guest-side input call and drains the jobs it queues. */
     private pushToGuest(name: string, args: string[]): void {
         if (this.context === undefined) return;
-        try {
-            const handles = args.map((text) => this.context!.newString(text));
-            try {
-                this.callApi(name, handles).dispose();
-            } finally {
-                for (const handle of handles) handle.dispose();
-            }
-            this.drainJobs();
-        } catch (error) {
-            this.fatalError = error;
-        }
-        this.wakeIfIdle();
+        this.guestOperation(name, () => args.map((text) => this.context!.newString(text)));
     }
 
     /** Keep-alive accounting (VirtualSink): the event loop runs while the count is positive. */
@@ -569,7 +638,9 @@ export class NodeProcess extends Process {
             exit: (exitCode) => this.requestExit(exitCode),
             setTimer: (id, ms) => this.armTimer(id, ms),
             clearTimer: (id) => this.disarmTimer(id),
-            capability: (op, argsJson) => invokeSync(op, argsJson, this.capabilityContext),
+            capability: (op, argsJson) => this.invokeCapability(op, argsJson),
+            /* Bytes ride along for the payload-heavy calls -- a file write, a socket send -- and none
+               of those has host work of its own to wait for, so this route stays a synchronous one. */
             capabilityBytes: (op, argsJson, bytes) => invokeSyncBytes(op, argsJson, bytes, this.capabilityContext),
             startOperation: (op, argsJson, opId) => this.startOperation(op, argsJson, opId),
             holdRef: (delta) => this.holdRef(delta),
@@ -715,17 +786,10 @@ export class NodeProcess extends Process {
     private settleOperation(opId: number, envelope: CapabilityEnvelope): void {
         this.holdRef(-1);
         if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
-        try {
-            const id = this.context.newNumber(opId);
-            const body = this.context.newString(JSON.stringify(envelope));
-            this.callApi('settle', [id, body]).dispose();
-            id.dispose();
-            body.dispose();
-            this.drainJobs();
-        } catch (error) {
-            this.fatalError = error;
-        }
-        this.wakeIfIdle();
+        this.guestOperation('settle', () => [
+            this.context!.newNumber(opId),
+            this.context!.newString(JSON.stringify(envelope))
+        ]);
     }
 
     /**
@@ -817,29 +881,46 @@ export class NodeProcess extends Process {
         }
     }
 
-    private startEntry(entryPath: string | undefined): void {
+    private startEntry(entryPath: string | undefined): void | Promise<void> {
+        let started: void | Promise<void>;
         if (this.evalSource !== undefined) {
             const source = this.context!.newString(this.evalSource);
-            try {
-                this.callApi('runEval', [source]).dispose();
-            } finally {
-                source.dispose();
-            }
+            started = this.guestCall('runEval', [source]);
         } else if (this.repl) {
             this.startRepl();
+            started = this.drainJobs();
         } else if (entryPath !== undefined && this.resolver.isESM(entryPath)) {
             this.runEsmEntry(entryPath);
+            started = this.drainJobs();
         } else {
             const file = this.context!.newString(entryPath!);
-            /* an interruption throws out of the call: the handle still has to go, or the object it
-               holds is one QuickJS reports as still live when the runtime is freed */
-            try {
-                this.callApi('runMain', [file]).dispose();
-            } finally {
-                file.dispose();
-            }
+            started = this.guestCall('runMain', [file]);
         }
-        this.drainJobs();
+        return started;
+    }
+
+    /**
+     * A capability the guest called synchronously.
+     *
+     * One whose handler has host work of its own to wait for -- `npm install` reaching the registry
+     * -- answers with a promise, and the guest suspends on it rather than refusing: the wasm stack
+     * unwinds, the host finishes the work, and the guest resumes inside the statement that called.
+     * Inside a synchronous child's own run that is impossible: the child's wasm call sits inside the
+     * parent's, one unwind cannot cover both, and the parent's call would have to answer before the
+     * child's promise could settle. There the promise stays the refusal it has always been.
+     */
+    private invokeCapability(op: string, argsJson: string): MaybeAsync<CapabilityEnvelope> {
+        return syncRunActive()
+            ? invokeSync(op, argsJson, this.capabilityContext)
+            : invokeSyncMaybe(op, argsJson, this.capabilityContext);
+    }
+
+    /**
+     * Sets the entry running on the guest's own gate: a script whose first statement suspends is no
+     * different from one that suspends later, and the process's own steps wait behind it either way.
+     */
+    private startEntryGated(entryPath: string | undefined): void {
+        this.guestStep(() => this.startEntry(entryPath));
     }
 
     /**
@@ -889,9 +970,12 @@ export class NodeProcess extends Process {
         return 1;
     }
 
-    /** Runs until no ref is held, process.exit runs, a fatal error occurs, or the process is stopped. */
+    /** Runs until no ref is held, process.exit runs, a fatal error occurs, or the process is stopped.
+     *  A suspended guest holds the loop on its own: it is inside a statement that has not finished,
+     *  and disposing the runtime under it would free the stack the rewind still needs. */
     private async runEventLoop(): Promise<void> {
-        while (this.refs > 0 && this.exitRequested === undefined && this.fatalError === undefined && !this.stopped) {
+        while (this.exitRequested === undefined && this.fatalError === undefined && !this.stopped
+               && (this.refs > 0 || this.guestSuspended)) {
             await new Promise<void>((resolve) => {
                 this.idleWaiter = resolve;
             });
@@ -923,7 +1007,8 @@ export class NodeProcess extends Process {
             this.wakeIfIdle();
             return;
         }
-        try {
+        // a timer of a synchronous child fires on the pump's own step, where nothing can suspend
+        if (this.syncMode) {
             const idArg = this.context!.newNumber(id);
             try {
                 this.callApi('fire', [idArg]).dispose();
@@ -931,18 +1016,62 @@ export class NodeProcess extends Process {
                 idArg.dispose();
             }
             this.drainJobs();
-        } catch (error) {
-            this.fatalError = error;
+            return;
         }
-        this.wakeIfIdle();
+        this.guestOperation('fire', () => [this.context!.newNumber(id)]);
     }
 
     private wakeIfIdle(): void {
+        // a suspended guest is not idle: it is inside a statement that has not finished yet
+        if (this.guestSuspended) return;
         const done = this.refs === 0 || this.exitRequested !== undefined || this.fatalError !== undefined || this.stopped;
         if (!done) return;
         const waiter = this.idleWaiter;
         this.idleWaiter = undefined;
         waiter?.();
+    }
+
+    /**
+     * Runs one step that touches the guest. A step can suspend it -- a synchronous capability with
+     * host work of its own -- and while it does, every later step queues behind it: the module
+     * cannot be called again until the guest is rewound.
+     */
+    private guestStep(step: () => void | Promise<void>): void {
+        if (this.guestSuspended) {
+            this.guestWaiting.push(step);
+            return;
+        }
+        let outcome: void | Promise<void>;
+        try {
+            outcome = step();
+        } catch (error) {
+            this.fatalError = error;
+            this.wakeIfIdle();
+            return;
+        }
+        if (!(outcome instanceof Promise)) {
+            this.wakeIfIdle();
+            return;
+        }
+        this.guestSuspended = true;
+        outcome.then(
+            () => this.resumeGuest(),
+            (error) => {
+                this.fatalError = error;
+                this.resumeGuest();
+            }
+        );
+    }
+
+    /** The suspended step is through: the guest is whole again, and whatever waited on it runs now. */
+    private resumeGuest(): void {
+        this.guestSuspended = false;
+        const next = this.guestWaiting.shift();
+        if (next === undefined) {
+            this.wakeIfIdle();
+            return;
+        }
+        this.guestStep(next);
     }
 
     private requestExit(code: number): void {
@@ -983,26 +1112,65 @@ export class NodeProcess extends Process {
      * the promise queue as one batch, as Node orders them. An exception that escaped a callback
      * arrives from the guest as text and ends the process.
      */
-    private drainJobs(): void {
+    /**
+     * The guest's own drain, which may suspend: a promise job that reaches a synchronous capability
+     * with host work to do unwinds, and the rest of the drain runs when the guest resumes.
+     */
+    private drainJobs(): void | Promise<void> {
+        return this.drainFrom(false);
+    }
+
+    /**
+     * One stretch of the drain. `ticked` says the `drainTicks` of this round has already run, so a
+     * stretch resumed from a suspension goes on to the jobs it was about to run rather than asking
+     * again -- which would never reach them, and would spin forever.
+     */
+    private drainFrom(ticked: boolean): void | Promise<void> {
         const runtime = this.runtime!;
         for (;;) {
             // process.exit ended the process: nothing of the guest runs after it, exactly as in Node
             if (this.exitRequested !== undefined || this.stopped) return;
-            const pending = this.callApi('drainTicks', []);
-            const uncaught = this.context!.dump(pending);
-            pending.dispose();
-            if (typeof uncaught === 'string') throw new GuestFailure(uncaught);
+            if (!ticked) {
+                const pending = this.callApiMaybe('drainTicks', []);
+                if (pending instanceof Promise) {
+                    return pending.then((handle) => {
+                        this.checkDrained(handle);
+                        return this.drainFrom(true);
+                    });
+                }
+                this.checkDrained(pending);
+            }
+            ticked = false;
             if (!runtime.hasPendingJob()) break;
             // the promise queue drains as one batch, as V8 does; ticks queued by those jobs wait for the batch
-            const result = runtime.executePendingJobs(10000);
+            const result = executePendingJobsMaybe(this.context!, 10000);
+            if (result instanceof Promise) {
+                return result.then((settled) => {
+                    if (settled.error) throw this.guestFailure(settled.error);
+                    return this.drainFrom(false);
+                });
+            }
             if (result.error) throw this.guestFailure(result.error);
         }
         if (this.exitRequested !== undefined || this.stopped) return;
         // the queue is empty, which is where Node throws a rejection that nothing handled
-        const rejection = this.callApiString('takeUnhandledRejection');
+        const rejection = this.callApiStringMaybe('takeUnhandledRejection');
+        if (rejection instanceof Promise) {
+            return rejection.then((text) => {
+                if (text !== '') throw new GuestFailure(text);
+            });
+        }
         if (rejection !== '') throw new GuestFailure(rejection);
     }
 
+    /** What `drainTicks` answered: a string is the uncaught exception the guest's own formatter made. */
+    private checkDrained(pending: QuickJSHandle): void {
+        const uncaught = this.context!.dump(pending);
+        pending.dispose();
+        if (typeof uncaught === 'string') throw new GuestFailure(uncaught);
+    }
+
+    /** The synchronous guest call, for the runs that cannot suspend (boot, and a synchronous child). */
     private callApi(name: string, args: QuickJSHandle[]): QuickJSHandle {
         const context = this.context!;
         const api = this.api!;
@@ -1016,11 +1184,90 @@ export class NodeProcess extends Process {
         }
     }
 
+    /**
+     * A guest call that may suspend. The promise only appears when the guest unwound -- a
+     * capability answering with host work of its own -- and it settles with the handle the call
+     * returns once the guest has resumed inside the statement that made it.
+     */
+    private callApiMaybe(name: string, args: QuickJSHandle[]): MaybeAsync<QuickJSHandle> {
+        const context = this.context!;
+        const api = this.api!;
+        const fn = context.getProp(api, name);
+        let result: MaybeAsync<GuestCallResult>;
+        try {
+            result = callFunctionMaybe(context, fn, api, args);
+        } catch (error) {
+            fn.dispose();
+            throw error;
+        }
+        if (!(result instanceof Promise)) {
+            fn.dispose();
+            if (result.error) throw this.guestFailure(result.error);
+            return result.value as QuickJSHandle;
+        }
+        return result.then(
+            (settled) => {
+                fn.dispose();
+                if (settled.error) throw this.guestFailure(settled.error);
+                return settled.value as QuickJSHandle;
+            },
+            (error) => {
+                fn.dispose();
+                throw error;
+            }
+        );
+    }
+
     private callApiString(name: string, args: QuickJSHandle[] = []): string {
         const value = this.callApi(name, args);
         const text = this.context!.getString(value);
         value.dispose();
         return text;
+    }
+
+    private callApiStringMaybe(name: string, args: QuickJSHandle[] = []): MaybeAsync<string> {
+        const value = this.callApiMaybe(name, args);
+        if (!(value instanceof Promise)) {
+            const text = this.context!.getString(value);
+            value.dispose();
+            return text;
+        }
+        return value.then((handle) => {
+            const text = this.context!.getString(handle);
+            handle.dispose();
+            return text;
+        });
+    }
+
+    /**
+     * One guest call, then the drain of the jobs it queued, with the argument handles held until the
+     * call has answered: a call that suspends answers on the rewind, and its handles have to live
+     * that long. Returns a promise only when the guest suspended.
+     */
+    private guestCall(name: string, handles: QuickJSHandle[]): void | Promise<void> {
+        const sent = this.callApiMaybe(name, handles);
+        const release = () => {
+            for (const handle of handles) handle.dispose();
+        };
+        if (sent instanceof Promise) {
+            return sent.then((handle) => {
+                handle.dispose();
+                release();
+                return this.drainJobs();
+            }, (error) => {
+                release();
+                throw error;
+            });
+        }
+        sent.dispose();
+        release();
+        return this.drainJobs();
+    }
+
+    /** One step that touches the guest, run now or queued behind a suspended one: see `guestStep`. */
+    private guestOperation(name: string, build: () => QuickJSHandle[]): void {
+        if (this.context === undefined) return;
+        this.guestStep(() => this.guestCall(name, build()));
     }
 
     /** Formats a guest exception with the guest's own formatter, then disposes the handle. */

@@ -41,6 +41,9 @@ import {
 } from '../../../../../npm/scripts';
 import { nodeSyncRunner, syncRunActive } from '../../pump';
 import type { SyncChildResult } from '../../pump';
+import { InstallSpec, NpmInstaller, parseInstallSpec } from '../../../../../npm/installer';
+import type { SaveTarget } from '../../../../../npm/installer';
+import { NpmRegistry } from '../../../../../npm/registry';
 
 /*
  * Host half of child_process, worker_threads and cluster. The guest half is ../guest/modules/child.ts.
@@ -2625,15 +2628,17 @@ function readFirstLine(fs: IFileSystem, file: string): string | undefined {
  *
  * `npm run` and the lifecycle commands run the package's script here, in the shell engine already
  * on the stack, so a script of shell commands and `node` files works where the container's own npm
- * process -- which is asynchronous end to end -- cannot be stepped. A command that has to reach the
- * registry (`npm install`, `npx`) still cannot: it waits on host work this call cannot complete, and
- * says so rather than answering with a status that means nothing.
+ * process -- which is asynchronous end to end -- cannot be stepped. `npm install` is answered by
+ * `npmInstallStep`, which suspends the guest while the host installs; `npm uninstall` is answered
+ * here, without leaving the call; every other command that has to reach the registry still cannot,
+ * and says so rather than answering with a status that means nothing.
  */
 function npmCommand(shell: SyncShell, args: string[]): ShellStep {
     const [sub, ...rest] = args;
     if (sub === '-v' || sub === '--version' || sub === 'version') {
         return { stdout: NPM_VERSION + '\n', stderr: '', exitCode: 0 };
     }
+    if (sub !== undefined && REMOVE_SUBCOMMANDS.has(sub)) return npmRemove(shell, args);
     const event = LIFECYCLE_COMMANDS[sub ?? ''];
     if (sub !== 'run' && sub !== 'run-script' && event === undefined) {
         throw notSupportedSync(`the shell command npm ${sub ?? ''}`.trim());
@@ -2681,6 +2686,135 @@ function npmCommand(shell: SyncShell, args: string[]): ShellStep {
         stdout += result.stderr;
     }
     return { stdout, stderr: '', exitCode: 0 };
+}
+
+/** `npm install <spec...>`: what npm reads out of the words after the subcommand. */
+function installRequest(args: string[]): { specs: InstallSpec[]; save: SaveTarget } {
+    let save: SaveTarget = 'dependencies';
+    const specs: InstallSpec[] = [];
+    for (const arg of args) {
+        if (arg === '-D' || arg === '--save-dev') save = 'devDependencies';
+        else if (arg === '-P' || arg === '--save-prod' || arg === '-S' || arg === '--save') save = 'dependencies';
+        else if (arg === '--no-save') save = 'none';
+        else if (arg.startsWith('-')) continue;
+        else specs.push(parseInstallSpec(arg));
+    }
+    return { specs, save };
+}
+
+/** The npm subcommands that remove a package: every alias npm itself gives `npm uninstall`. */
+const REMOVE_SUBCOMMANDS = new Set(['uninstall', 'unlink', 'remove', 'rm', 'un']);
+
+/** Where a project's own files sit: `package.json`, and the `node_modules` beside it. */
+function projectFile(dir: string, name: string): string {
+    return `${dir === '/' ? '' : dir}/${name}`;
+}
+
+/**
+ * `npm uninstall <name...>`.
+ *
+ * Nothing here reaches the registry -- it reads and writes the project's own files -- so it answers
+ * inside the synchronous call, without suspending the guest. What npm does beyond this is prune the
+ * dependencies the removed package brought with it and nothing else wanted; they are left in place,
+ * which costs disk and changes nothing a later install resolves.
+ */
+function npmRemove(shell: SyncShell, args: string[]): ShellStep {
+    const rest = args.slice(1);
+    if (rest.includes('-g') || rest.includes('--global')) {
+        return { stdout: '', stderr: diagnostic('npm error code EUNSUPPORTED\nnpm error Global installs are not supported by this runtime'), exitCode: 1 };
+    }
+    const names = rest.filter((arg) => !arg.startsWith('-'));
+    const packageDir = findPackageRoot(shell.ctx.fileSystem, shell.cwd) ?? shell.cwd;
+    const started = performance.now();
+    let removed = 0;
+    for (const name of names) {
+        const dir = projectFile(packageDir, `node_modules/${name}`);
+        if (shell.ctx.fileSystem.statPath(dir)?.type !== 'dir') continue;
+        shell.ctx.fileSystem.removePath(dir, true);
+        removed += 1;
+    }
+    if (removed > 0 && !rest.includes('--no-save')) {
+        const manifest = readManifest(shell.ctx.fileSystem, packageDir);
+        if (manifest !== undefined) {
+            for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+                const entries = manifest[field];
+                if (entries === null || typeof entries !== 'object') continue;
+                for (const name of names) delete (entries as Record<string, unknown>)[name];
+            }
+            shell.ctx.fileSystem.writeFile(projectFile(packageDir, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
+        }
+        /* The lockfile records the whole tree, so the entry of what is gone is dropped from it: a
+           later install reads it back and would otherwise keep the package in the tree. */
+        const lockPath = projectFile(packageDir, 'package-lock.json');
+        try {
+            const text = shell.ctx.fileSystem.readFile(lockPath);
+            const lock = JSON.parse(text ?? '{}');
+            const packages = lock?.packages;
+            if (packages !== null && typeof packages === 'object') {
+                for (const name of names) delete packages[`node_modules/${name}`];
+                shell.ctx.fileSystem.writeFile(lockPath, JSON.stringify(lock, null, 2) + '\n');
+            }
+        } catch {
+            // no lockfile, or one that does not parse: nothing of it to drop
+        }
+    }
+    const seconds = ((performance.now() - started) / 1000).toFixed(1);
+    if (removed === 0) return { stdout: `up to date in ${seconds}s\n`, stderr: '', exitCode: 0 };
+    return { stdout: `removed ${removed} package${removed === 1 ? '' : 's'} in ${seconds}s\n`, stderr: '', exitCode: 0 };
+}
+
+/** The npm subcommands that install, and so the ones that have to reach the registry. */
+const INSTALL_SUBCOMMANDS = new Set(['install', 'i', 'add']);
+
+/**
+ * `npm install` inside a synchronous call, as a step the caller can wait on.
+ *
+ * The install fetches from the registry, which nothing inside a synchronous call can wait for on its
+ * own -- the host thread is the thread the call is blocking. So this is the one place a synchronous
+ * capability answers with a promise instead of a result: the guest's stack unwinds on it (see
+ * `callFunctionMaybe` in process.ts), the host installs, and the guest resumes inside the very
+ * `spawnSync` that asked. The statement after that call has not run yet when the promise settles,
+ * which is the whole of what a synchronous call means.
+ *
+ * Where the guest cannot unwind, undefined comes back and the caller gives the refusal it has always
+ * given. That is the case of a synchronous child: its own wasm call sits inside the one that spawned
+ * it, one unwind cannot cover both, and the outer call would have to answer before this promise
+ * could settle -- which would mean answering before the install had happened.
+ *
+ * Install scripts are not run. One runs a node child, and a child cannot be started while the guest
+ * is unwound; skipping is what the installer already does with a script this runtime cannot run, and
+ * it says so on the step's own output.
+ */
+function npmInstallStep(shell: SyncShell, args: string[]): Promise<ShellStep> | undefined {
+    const [sub, ...rest] = args;
+    if (sub === undefined || !INSTALL_SUBCOMMANDS.has(sub)) return undefined;
+    if (syncRunActive()) return undefined;
+    if (rest.includes('-g') || rest.includes('--global')) {
+        return Promise.resolve({ stdout: '', stderr: diagnostic('npm error code EUNSUPPORTED\nnpm error Global installs are not supported by this runtime'), exitCode: 1 });
+    }
+    const { specs, save } = installRequest(rest);
+    return (async () => {
+        let stdout = '';
+        const log = (line: string) => {
+            stdout += line + '\n';
+        };
+        const installer = new NpmInstaller(shell.ctx.fileSystem, new NpmRegistry(), log);
+        const started = performance.now();
+        try {
+            const report = specs.length > 0
+                ? await installer.addPackages(shell.cwd, specs, save)
+                : await installer.installManifest(shell.cwd);
+            const seconds = ((performance.now() - started) / 1000).toFixed(1);
+            stdout += report.added.length === 0
+                ? `up to date in ${seconds}s\n`
+                : `\nadded ${report.added.length} package${report.added.length === 1 ? '' : 's'} in ${seconds}s\n`;
+            return { stdout, stderr: '', exitCode: 0 };
+        } catch (error) {
+            const failure = error as { exitCode?: unknown; message?: unknown };
+            const stderr = typeof failure?.message === 'string' ? failure.message : String(error);
+            return { stdout, stderr: diagnostic(stderr), exitCode: typeof failure?.exitCode === 'number' ? failure.exitCode : 1 };
+        }
+    })();
 }
 
 /** ShellProcess.executeCommand for one command, in the same order of dispatch. */
@@ -2782,6 +2916,11 @@ function runShell(
     };
 }
 
+/** One completed shell step as a synchronous run: the pid npm and the shell commands get, and no signal. */
+function syncStep(step: ShellStep): SyncRun {
+    return { pid: nextSyncPid++, status: step.exitCode, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
+}
+
 /** Runs an executable to completion. A spawn that cannot start (no executor, bad invocation) throws. */
 function runSyncCommand(
     ctx: CapabilityContext,
@@ -2792,7 +2931,7 @@ function runSyncCommand(
     timeoutMs: number,
     killSignal: string,
     input: string | null
-): SyncRun {
+): SyncRun | Promise<SyncRun> {
     if (file === 'sh' || file === '/bin/sh') {
         const step = runShell(ctx, argv, env, cwd, input, file);
         return { pid: nextSyncPid++, status: step.status, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
@@ -2800,8 +2939,13 @@ function runSyncCommand(
     if (file === 'node' || file === NODE_BINARY) return nodeRun(ctx, nodeInvocation(argv), env, cwd, timeoutMs, killSignal, input);
     if (file.endsWith('.js')) return nodeRun(ctx, { file, args: argv }, env, cwd, timeoutMs, killSignal, input);
     if (file === 'npm' || file === 'npx') {
-        const step = npmCommand({ ctx, cwd, env, input, lastStatus: 0 }, argv);
-        return { pid: nextSyncPid++, status: step.exitCode, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
+        const shell: SyncShell = { ctx, cwd, env, input, lastStatus: 0 };
+        // `npm install` is the one command here that can suspend the guest instead of refusing
+        const install = file === 'npm' ? npmInstallStep(shell, argv) : undefined;
+        if (install !== undefined) {
+            return install.then(syncStep);
+        }
+        return syncStep(npmCommand(shell, argv));
     }
     // `spawnSync('curl', ['--version'])`, `execFileSync('ls', ['-l'])` and every other name the
     // container's own synchronous shell can run: one dispatch for all three synchronous calls, the
@@ -2810,7 +2954,7 @@ function runSyncCommand(
     if (SHELL_BUILTINS.has(file) || SHELL_BUILTIN_NAMES.has(file) || SHELL_EXTERNALS.has(file)
         || isUnsupported(file) || SHELL_MODULE_COMMANDS[file] !== undefined) {
         const step = shellCommand({ ctx, cwd, env, input, lastStatus: 0 }, [file, ...argv]);
-        return { pid: nextSyncPid++, status: step.exitCode, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
+        return syncStep(step);
     }
     throw new Error(`No executor found for: ${file}`);
 }
@@ -2824,13 +2968,16 @@ function spawnChildNow(args: Record<string, any>, ctx: CapabilityContext): { pid
     const cwd = typeof args.cwd === 'string' ? args.cwd : ctx.cwd();
     const stdio: unknown[] = Array.isArray(args.stdio) ? args.stdio : [];
     const target = Number(args.target);
-    let run: SyncRun;
+    let run: SyncRun | Promise<SyncRun>;
     try {
         run = runSyncCommand(ctx, file, argv, env, cwd, 0, 'SIGTERM', null);
     } catch (error) {
         if (isNotSupported(error)) throw error;
         throw spawnFailure(error, file, argv);
     }
+    /* A synchronous child's own wasm call sits inside the one that spawned it, so nothing here can
+       suspend: `npmInstallStep` answers undefined in that case, which is what keeps this a run. */
+    if (run instanceof Promise) throw notSupportedSync(`the child ${file}, which waits on host work,`);
     if (run.blocked !== undefined) throw notSupportedSync(`the child, which waits on ${run.blocked},`);
     const stdoutMode = modeOf(stdio[1]);
     const stderrMode = modeOf(stdio[2]);
@@ -2844,7 +2991,7 @@ function spawnChildNow(args: Record<string, any>, ctx: CapabilityContext): { pid
 }
 
 /** child.spawnSync: one executable run to completion inside this call, reported the way Node's spawnSync reports it. */
-const spawnSyncChild: CapabilityHandler = (args, ctx): SyncOutcome => {
+const spawnSyncChild: CapabilityHandler = (args, ctx): SyncOutcome | Promise<SyncOutcome> => {
     const file = String(args.file);
     const argv: string[] = Array.isArray(args.args) ? args.args.map(String) : [];
     const env: Record<string, string> = args.env ? { ...args.env } : childEnvOf(ctx);
@@ -2856,7 +3003,34 @@ const spawnSyncChild: CapabilityHandler = (args, ctx): SyncOutcome => {
     const stdoutMode = modeOf(stdio[1]);
     const stderrMode = modeOf(stdio[2]);
 
-    let run: SyncRun;
+    /** What the call reports for a run that is finished, whether it finished now or after a suspend. */
+    const report = (run: SyncRun): SyncOutcome => {
+        let error: SyncErrorInfo | null = null;
+        let status = run.status;
+        let signal = run.signal;
+        if (run.blocked !== undefined) {
+            error = { code: 'ERR_NOT_SUPPORTED', message: notSupportedSync(`the child, which waits on ${run.blocked},`).message };
+            status = null;
+            signal = null;
+        } else if (run.timedOut) {
+            error = { code: 'ETIMEDOUT', message: `spawnSync ${file} ETIMEDOUT`, errno: -110, syscall: `spawnSync ${file}`, path: file, spawnargs: argv };
+            status = null;
+            signal = killSignal;
+        }
+        if (stdoutMode === 'inherit' && run.stdout) ctx.output({ stdout: run.stdout });
+        if (stderrMode === 'inherit' && run.stderr) ctx.output({ stderr: run.stderr });
+        return {
+            pid: run.pid,
+            spawned: true,
+            status,
+            signal,
+            stdout: stdoutMode === 'pipe' ? run.stdout : null,
+            stderr: stderrMode === 'pipe' ? run.stderr : null,
+            error
+        };
+    };
+
+    let run: SyncRun | Promise<SyncRun>;
     try {
         run = runSyncCommand(ctx, file, argv, env, cwd, timeoutMs, killSignal, input);
     } catch (error) {
@@ -2865,30 +3039,9 @@ const spawnSyncChild: CapabilityHandler = (args, ctx): SyncOutcome => {
         }
         return { pid: 0, spawned: false, status: null, signal: null, stdout: null, stderr: null, error: syncSpawnError(error, file, argv) };
     }
-
-    let error: SyncErrorInfo | null = null;
-    let status = run.status;
-    let signal = run.signal;
-    if (run.blocked !== undefined) {
-        error = { code: 'ERR_NOT_SUPPORTED', message: notSupportedSync(`the child, which waits on ${run.blocked},`).message };
-        status = null;
-        signal = null;
-    } else if (run.timedOut) {
-        error = { code: 'ETIMEDOUT', message: `spawnSync ${file} ETIMEDOUT`, errno: -110, syscall: `spawnSync ${file}`, path: file, spawnargs: argv };
-        status = null;
-        signal = killSignal;
-    }
-    if (stdoutMode === 'inherit' && run.stdout) ctx.output({ stdout: run.stdout });
-    if (stderrMode === 'inherit' && run.stderr) ctx.output({ stderr: run.stderr });
-    return {
-        pid: run.pid,
-        spawned: true,
-        status,
-        signal,
-        stdout: stdoutMode === 'pipe' ? run.stdout : null,
-        stderr: stderrMode === 'pipe' ? run.stderr : null,
-        error
-    };
+    /* A run that came back as a promise suspended the guest: the install is under way and this is
+       answered the moment it is, still inside the statement that asked for it. */
+    return run instanceof Promise ? run.then(report) : report(run);
 };
 
 export const CHILD_CAPABILITIES: Record<string, CapabilityHandler> = {

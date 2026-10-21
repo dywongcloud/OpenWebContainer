@@ -33,6 +33,13 @@ export function errorEnvelope(error: unknown): CapabilityEnvelope {
     };
 }
 
+/**
+ * A value that is a promise only when the work it stands for could not be answered now: a
+ * synchronous capability that has to wait on the host returns one, so the guest can suspend
+ * instead of refusing.
+ */
+export type MaybeAsync<T> = T | Promise<T>;
+
 function handlerFor(op: string) {
     const handler = CAPABILITIES[op];
     if (!handler) {
@@ -67,6 +74,34 @@ function invokeWith(op: string, argsJson: string, context: CapabilityContext, by
     } catch (error) {
         return errorEnvelope(error);
     }
+}
+
+/**
+ * Runs a synchronous capability that is allowed to suspend.
+ *
+ * A handler that returns a promise has work only the host can finish -- `npm install` reaching the
+ * registry -- and no way to finish it inside this call. The promise is passed back to the caller
+ * unchanged instead of being turned into an error: the guest's synchronous call unwinds on it (see
+ * `callFunctionMaybe` in process.ts) and resumes, still inside the same statement, when it settles.
+ * Where the caller cannot unwind, `invokeSync` is the route, and the promise stays the refusal it
+ * has always been.
+ */
+export function invokeSyncMaybe(op: string, argsJson: string, context: CapabilityContext): MaybeAsync<CapabilityEnvelope> {
+    const handler = CAPABILITIES[op];
+    if (!handler) return errorEnvelope(Object.assign(new Error(`unknown capability ${op}`), { code: 'ERR_UNKNOWN_CAPABILITY' }));
+    let value: unknown;
+    try {
+        value = handler(JSON.parse(argsJson), context);
+    } catch (error) {
+        return errorEnvelope(error);
+    }
+    if (value instanceof Promise) {
+        return value.then(
+            (settled) => ({ ok: true, value: settled === undefined ? null : settled }),
+            (error) => errorEnvelope(error)
+        );
+    }
+    return { ok: true, value: value === undefined ? null : value };
 }
 
 /**
