@@ -104,42 +104,99 @@ function decodeUtf8(bytes, start, end) {
   return parts.join('');
 }
 
+var B64_PAIRS = null;
+var B64_DEC = null;
+
+/* Two base64 characters per 12 bits, built once: encoding then concatenates two short strings
+   per three bytes instead of pushing one character at a time into an array as long as the output. */
+function b64Pairs() {
+  if (B64_PAIRS !== null) return B64_PAIRS;
+  var p = new Array(4096);
+  for (var i = 0; i < 4096; i++) p[i] = B64_ALPHABET.charAt(i >> 6) + B64_ALPHABET.charAt(i & 63);
+  B64_PAIRS = p;
+  return p;
+}
+
+/* Character code to its 6-bit value, -1 for anything that is not base64: decoding then looks a
+   character up instead of scanning the 64-character alphabet for every one of them. */
+function b64DecTable() {
+  if (B64_DEC !== null) return B64_DEC;
+  var t = new Array(256);
+  for (var i = 0; i < 256; i++) t[i] = -1;
+  for (var j = 0; j < 64; j++) t[B64_ALPHABET.charCodeAt(j)] = j;
+  t[45] = 62;
+  t[95] = 63;
+  B64_DEC = t;
+  return t;
+}
+
 function encodeBase64(bytes) {
-  var out = [];
+  var p = b64Pairs();
+  var len = bytes.length;
+  var rem = len % 3;
+  var full = len - rem;
+  var parts = [];
+  var part = '';
+  var groups = 0;
   var i = 0;
-  for (; i + 2 < bytes.length; i += 3) {
-    var n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
-    out.push(B64_ALPHABET.charAt((n >> 18) & 63), B64_ALPHABET.charAt((n >> 12) & 63), B64_ALPHABET.charAt((n >> 6) & 63), B64_ALPHABET.charAt(n & 63));
+  var n;
+  while (i < full) {
+    n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+    part += p[n >> 12] + p[n & 4095];
+    i += 3;
+    if (++groups === 1024) { parts.push(part); part = ''; groups = 0; }
   }
-  var rem = bytes.length - i;
   if (rem === 1) {
-    var n1 = bytes[i] << 16;
-    out.push(B64_ALPHABET.charAt((n1 >> 18) & 63), B64_ALPHABET.charAt((n1 >> 12) & 63), '==');
+    n = bytes[i] << 16;
+    part += p[n >> 12] + '==';
   } else if (rem === 2) {
-    var n2 = (bytes[i] << 16) | (bytes[i + 1] << 8);
-    out.push(B64_ALPHABET.charAt((n2 >> 18) & 63), B64_ALPHABET.charAt((n2 >> 12) & 63), B64_ALPHABET.charAt((n2 >> 6) & 63), '=');
+    n = (bytes[i] << 16) | (bytes[i + 1] << 8);
+    part += p[n >> 12] + B64_ALPHABET.charAt((n >> 6) & 63) + '=';
   }
-  return out.join('');
+  parts.push(part);
+  return parts.join('');
 }
 
 function decodeBase64(str) {
-  var out = [];
+  var t = b64DecTable();
+  var len = str.length;
+  var out = new Uint8Array(((len + 3) >> 2) * 3);
+  var o = 0;
+  var i = 0;
+  /* Four whole characters at a time, while every one of them is a base64 character. */
+  var limit = len - 3;
+  while (i < limit) {
+    var a = str.charCodeAt(i);
+    var b = str.charCodeAt(i + 1);
+    var c = str.charCodeAt(i + 2);
+    var d = str.charCodeAt(i + 3);
+    if (a > 255 || b > 255 || c > 255 || d > 255) break;
+    var v0 = t[a];
+    var v1 = t[b];
+    var v2 = t[c];
+    var v3 = t[d];
+    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) break;
+    var n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+    out[o++] = (n >> 16) & 0xff;
+    out[o++] = (n >> 8) & 0xff;
+    out[o++] = n & 0xff;
+    i += 4;
+  }
+  /* The rest: padding, newlines and url-safe characters, one character at a time. */
   var buf = 0;
   var bits = 0;
-  for (var i = 0; i < str.length; i++) {
-    var c = str.charAt(i);
-    var v = B64_ALPHABET.indexOf(c);
-    if (c === '-') v = 62;
-    else if (c === '_') v = 63;
+  for (; i < len; i++) {
+    var code = str.charCodeAt(i);
+    var v = code < 256 ? t[code] : -1;
     if (v < 0) continue;
     buf = ((buf << 6) | v) & 0xffffff;
     bits += 6;
     if (bits >= 8) {
       bits -= 8;
-      out.push((buf >> bits) & 0xff);
+      out[o++] = (buf >> bits) & 0xff;
     }
   }
-  return new Uint8Array(out);
+  return o === out.length ? out : out.subarray(0, o);
 }
 
 function encodeHex(bytes) {
