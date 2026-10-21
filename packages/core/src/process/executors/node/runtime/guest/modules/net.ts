@@ -26,6 +26,19 @@ var NET_REASON_TEXT = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'ad
 /** What a loopback socket absorbs before a write is still in flight when it is destroyed: Node's SO_SNDBUF. */
 var NET_SNDBUF = 262144;
 
+/**
+ * One piece of a socket write, and the most a socket delivers in one read.
+ *
+ * Measured over 4 KiB to 4 MiB per write, 16 MiB end to end: a write goes fastest in pieces of
+ * 64 KiB -- 761 MiB/s against 410 at 16 KiB, 116 at 4 KiB, 163 at 1 MiB and 58 at 4 MiB, because a
+ * piece bigger than one buffer is copied across the bridge in one call that grows with the piece
+ * while a smaller one pays the crossing once per piece -- and one write carrying a whole 16 MiB
+ * body costs 1095 ms against 21 ms for the same bytes in pieces of it. Host Node hands a reader
+ * the same upper bound: its reads of a 16 MiB transfer arrive as ~64 KiB, whatever size the peer
+ * wrote, so a read capped here lands where the host lands too.
+ */
+var NET_CHUNK = 65536;
+
 function netError(Ctor, code, message) {
   var err = new Ctor(message);
   err.code = code;
@@ -461,19 +474,35 @@ BF['net'] = function () {
     }
 
     _pushQueued() {
+      var self = this;
       var parts = [];
+      var used = 0;
+      function flush() {
+        if (parts.length === 0) return;
+        self.push(parts.length === 1 ? parts[0] : Buffer.concat(parts));
+        parts = [];
+        used = 0;
+      }
       while (!this._dead && this._readQueue.length > 0) {
         var item = this._readQueue.shift();
         if (item.end) {
-          if (parts.length > 0) this.push(parts.length === 1 ? parts[0] : Buffer.concat(parts));
+          flush();
           this.push(null);
           // As Node does at EOF: an empty buffer ends the stream even when nothing is reading it.
           this.read(0);
           return;
         }
-        parts.push(item.chunk);
+        var chunk = item.chunk;
+        var at = 0;
+        while (at < chunk.length) {
+          var take = Math.min(NET_CHUNK - used, chunk.length - at);
+          parts.push(take === chunk.length ? chunk : chunk.subarray(at, at + take));
+          used += take;
+          at += take;
+          if (used >= NET_CHUNK) flush();
+        }
       }
-      if (parts.length > 0 && !this._dead) this.push(parts.length === 1 ? parts[0] : Buffer.concat(parts));
+      if (!this._dead) flush();
     }
 
     _flushReadable() {
@@ -486,8 +515,18 @@ BF['net'] = function () {
         }
         if (this._flowing !== true) break;
         var parts = [];
-        while (this._readQueue.length > 0 && this._readQueue[0].chunk !== undefined) {
-          parts.push(this._readQueue.shift().chunk);
+        var used = 0;
+        while (this._readQueue.length > 0 && this._readQueue[0].chunk !== undefined && used < NET_CHUNK) {
+          var chunk = this._readQueue[0].chunk;
+          var take = Math.min(NET_CHUNK - used, chunk.length);
+          if (take === chunk.length) {
+            parts.push(chunk);
+            this._readQueue.shift();
+          } else {
+            parts.push(chunk.subarray(0, take));
+            this._readQueue[0].chunk = chunk.subarray(take);
+          }
+          used += take;
         }
         var out = this._decode(parts.length === 1 ? parts[0] : Buffer.concat(parts));
         if (out !== null) this.emit('data', out);
@@ -533,7 +572,12 @@ BF['net'] = function () {
       }
       if (chunk.length === 0) return;
       try {
-        callCapBytes('net.write', { connectionId: this._hubId }, chunk);
+        var at = 0;
+        while (at < chunk.length) {
+          var last = at + NET_CHUNK >= chunk.length;
+          callCapBytes('net.write', { connectionId: this._hubId }, last && at === 0 ? chunk : chunk.subarray(at, at + NET_CHUNK));
+          at += NET_CHUNK;
+        }
       } catch (cause) {
         // The connection is already gone; the peer's close finishes this side.
       }
