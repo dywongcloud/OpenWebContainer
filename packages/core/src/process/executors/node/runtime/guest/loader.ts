@@ -37,8 +37,22 @@ function dirnameOf(p) {
   return i <= 0 ? '/' : p.slice(0, i);
 }
 
-function moduleNotFound(id) {
-  var err = new Error("Cannot find module '" + id + "'");
+/* The files a require came from, as Node lists them under a resolution failure: the module that
+   made the require first, then the one that required it, and so on up to the entry. A require with
+   no module behind it -- one the host made, or one made from a path with no file of its own -- has
+   no stack, as it has in Node. */
+function requireStackOf(parent) {
+  var names = [];
+  var cursor = parent;
+  while (cursor !== null && cursor !== undefined) {
+    names.push(cursor.filename || cursor.id);
+    cursor = cursor.parent;
+  }
+  return names.length === 0 ? '' : '\nRequire stack:\n- ' + names.join('\n- ');
+}
+
+function moduleNotFound(id, parent) {
+  var err = new Error("Cannot find module '" + id + "'" + requireStackOf(parent));
   err.code = 'MODULE_NOT_FOUND';
   return err;
 }
@@ -47,17 +61,17 @@ function moduleNotFound(id) {
    "exports" map defines no such subpath, which Node reports as ERR_PACKAGE_PATH_NOT_EXPORTED in
    require() as well as in import(), naming the package.json that defines the map; or an exports
    target that names a file which is not there, which Node names by that path. */
-function notFoundError(id, fromDir) {
+function notFoundError(id, fromDir, parent) {
   var info = null;
   try { info = JSON.parse(host.resolveFailure(String(id), fromDir, 'require')); } catch (e) { info = null; }
-  if (info === null || typeof info !== 'object') return moduleNotFound(id);
+  if (info === null || typeof info !== 'object') return moduleNotFound(id, parent);
   if (info.kind === 'not-exported') {
     var err = new Error("Package subpath '" + info.subpath + "' is not defined by \"exports\" in " + info.packageDir + '/package.json');
     err.code = 'ERR_PACKAGE_PATH_NOT_EXPORTED';
     return err;
   }
-  if (info.kind === 'missing' && typeof info.file === 'string') return moduleNotFound(info.file);
-  return moduleNotFound(id);
+  if (info.kind === 'missing' && typeof info.file === 'string') return moduleNotFound(info.file, parent);
+  return moduleNotFound(id, parent);
 }
 
 /* The file whose code is running, for the one piece of code that carries no file of its own: a
@@ -136,7 +150,7 @@ Module._resolveFilename = function _resolveFilename(request, parent, isMain, opt
   if (isBuiltinName(request)) return stripNodePrefix(request);
   var base = parent && parent.path ? parent.path : host.cwd();
   var found = host.resolve(String(request), base, 'require');
-  if (!found) throw notFoundError(String(request), base);
+  if (!found) throw notFoundError(String(request), base, parent);
   return found;
 };
 Module._load = function _load(request, parent, isMain) {
@@ -166,7 +180,7 @@ function makeRequire(mod) {
   req.resolve = function resolve(id) {
     if (isBuiltinName(id)) return stripNodePrefix(id);
     var found = host.resolve(String(id), mod.path, 'require');
-    if (!found) throw notFoundError(id, mod.path);
+    if (!found) throw notFoundError(id, mod.path, mod);
     return found;
   };
   req.cache = MODULE_CACHE;
@@ -191,7 +205,7 @@ function requireFrom(parent, id) {
   }
   var base = parent && parent.path ? parent.path : host.cwd();
   var filename = host.resolve(id, base, 'require');
-  if (!filename) throw notFoundError(id, base);
+  if (!filename) throw notFoundError(id, base, parent);
   return loadCJS(filename, parent, false).exports;
 }
 
@@ -445,6 +459,18 @@ function createRequireFor(filename) {
   return makeRequire(new Module(path, null));
 }
 
+/* The REPL's own require. It resolves from the working directory, the way a file there would, but
+   Node names the module it resolves from '<repl>', and that is the name a resolution failure prints
+   in its require stack: '- <repl>' under the message, and nothing else. */
+var REPL_MODULE = '<repl>';
+
+function createReplRequire(directory) {
+  var mod = new Module(String(directory) + '/x', null);
+  mod.id = REPL_MODULE;
+  mod.filename = REPL_MODULE;
+  return makeRequire(mod);
+}
+
 /* import.meta and import attributes: the host rewrites ES module sources to call these two */
 var IMPORT_META = Object.create(null);
 var ATTRIBUTE_MISSING = '\u0001owc-attr-missing';
@@ -581,6 +607,10 @@ var api = {
   },
   exportsOf: function (id, builtin) {
     return builtin ? requireBuiltin(id) : loadCJS(id, null, false).exports;
+  },
+  /* the REPL's require: see createReplRequire */
+  createReplRequire: function (directory) {
+    return createReplRequire(directory);
   },
   /* the host compiles ES modules itself, so it asks for the compatibility rewrite here; the source comes back unchanged when nothing applies */
   compatRewrite: function (source) {

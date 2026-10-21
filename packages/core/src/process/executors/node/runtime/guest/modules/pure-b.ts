@@ -884,18 +884,14 @@ export const SRC = String.raw`
         })(REPL_GLOBALS[g]);
       }
 
-      /* Node's REPL can require: it resolves against the working directory, as a file there would. */
+      /* Node's REPL can require: it resolves against the working directory, as a file there would,
+         and names the module it resolves from '<repl>', which is what a failure to resolve prints
+         in its require stack. */
       if (!('require' in sb)) {
         try {
-          var moduleBuiltin = requireBuiltin('module');
           var cwd = globalThis.process && typeof globalThis.process.cwd === 'function' ? globalThis.process.cwd() : '/';
-          if (moduleBuiltin && typeof moduleBuiltin.createRequire === 'function') {
-            Object.defineProperty(sb, 'require', {
-              configurable: true,
-              enumerable: false,
-              writable: true,
-              value: moduleBuiltin.createRequire(cwd + '/.repl.js')
-            });
+          if (typeof api.createReplRequire === 'function') {
+            Object.defineProperty(sb, 'require', { configurable: true, enumerable: false, writable: true, value: api.createReplRequire(cwd) });
           }
         } catch (requireError) { /* no require in this session; the rest of the context still works */ }
       }

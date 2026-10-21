@@ -942,8 +942,12 @@ export class NodeProcess extends Process {
         const result = context.evalCode(source, entryPath, { type: 'module' });
         if (result.error) throw this.guestFailure(result.error);
         const promise = result.value;
-        this.drainJobs();
+        /* The drain can end the process -- an unhandled rejection, a fatal error -- and it throws
+           when it does. The module's evaluation promise is a handle the host owns, and one it still
+           holds when the runtime is freed keeps its object live, which is what QuickJS asserts on
+           at teardown (`list_empty(&rt->gc_obj_list)`): it is freed on the way out either way. */
         try {
+            this.drainJobs();
             const state = context.getPromiseState(promise);
             if (state.type === 'rejected') throw this.guestFailure(state.error);
         } catch (error) {
