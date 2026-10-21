@@ -10,7 +10,7 @@ import { RuntimeServices } from './runtime/services';
 import { CapabilityContext, CapabilityEnvelope } from './runtime/capabilities/types';
 import { errorEnvelope, invokeAsync, invokeSync } from './runtime/capabilities/dispatch';
 import { CAPABILITIES } from './runtime/capabilities/index';
-import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, yieldVmSlice } from './runtime/capabilities/vm';
+import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbindVmRuntime, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs } from './pump';
 import type { NodeFlagAnswer } from './flags';
 import type { SyncChildRequest, SyncChildResult } from './pump';
@@ -180,6 +180,7 @@ export class NodeProcess extends Process {
     /** The working directory this process is in: `process.chdir` moves it, and everything that
      * resolves a relative path (require, fs, spawned children) reads it from here. */
     private currentCwd: string;
+    private quickJs?: QuickJSAsyncWASMModule;
     private runtime?: QuickJSRuntime;
     private context?: QuickJSContext;
     private api?: QuickJSHandle;
@@ -209,6 +210,8 @@ export class NodeProcess extends Process {
      * run never reaches the guest: no QuickJS runtime is built for it, and no file is looked for.
      */
     private readonly flagAnswer?: NodeFlagAnswer;
+    /** The module a synchronous child boots on; see the constructor. Undefined for every other process. */
+    private readonly bootModule?: QuickJSAsyncWASMModule;
 
     constructor(
         pid: number,
@@ -221,7 +224,13 @@ export class NodeProcess extends Process {
         cwd?: string,
         env: Record<string, string> = {},
         evalSource?: string,
-        flagAnswer?: NodeFlagAnswer
+        flagAnswer?: NodeFlagAnswer,
+        /**
+         * The QuickJS module a synchronous child boots on: the module of the process that spawned
+         * it. Such a child runs to completion inside the capability call that spawned it and cannot
+         * await a load of its own.
+         */
+        bootModule?: QuickJSAsyncWASMModule
     ) {
         const processEnv = new Map<string, string>([
             ['PATH', '/bin:/usr/bin'],
@@ -232,6 +241,7 @@ export class NodeProcess extends Process {
             processEnv.set(key, value);
         }
         super(pid, ProcessType.JAVASCRIPT, executablePath, args, parentPid, cwd, processEnv);
+        this.bootModule = bootModule;
         this.repl = executablePath === '[repl]';
         /* A child spawned with a pipe on fd 0: the parent may still write, so the guest keeps
            process.stdin open until the host ends it. Set by the spawning capability and dropped by
@@ -260,7 +270,10 @@ export class NodeProcess extends Process {
                 setTimeout(() => this.deliver(targetId, name, payload), 0);
             },
             holdRef: (delta) => this.holdRef(delta),
-            output: (message) => this.emitGuestOutput(message)
+            output: (message) => this.emitGuestOutput(message),
+            /* Read at the moment a synchronous child is spawned, and handed to that child: a module
+               no process still needs is a whole WebAssembly instance nothing would take back. */
+            quickJs: () => this.quickJs
         };
     }
 
@@ -476,9 +489,6 @@ export class NodeProcess extends Process {
      */
     private async bootGuest(): Promise<string | undefined> {
         const QuickJS = await newQuickJSAsyncWASMModuleFromVariant(variant);
-        /* The module a synchronous child boots on: such a child runs inside the capability call
-           that spawned it and cannot await a load of its own. The container drops it on dispose. */
-        // EXPERIMENT-B: no services reference
         return this.bootWith(QuickJS);
     }
 
@@ -486,6 +496,7 @@ export class NodeProcess extends Process {
     private bootWith(QuickJS: QuickJSAsyncWASMModule): string | undefined {
         // a REPL has no file to resolve: its input is the terminal, not a script
         const entryPath = this.evalSource === undefined && !this.repl ? this.resolveEntry() : undefined;
+        this.quickJs = QuickJS;
         const runtime = QuickJS.newRuntime();
         this.runtime = runtime;
         runtime.setModuleLoader(
@@ -587,7 +598,7 @@ export class NodeProcess extends Process {
                 result.status = this.answerFlags();
                 return result;
             }
-            const QuickJS = this.services.quickJsModule;
+            const QuickJS = this.bootModule;
             if (QuickJS === undefined) throw new Error('no QuickJS module is loaded');
             this.startEntry(this.bootWith(QuickJS));
             const blocked = this.pumpSync(deadline);
@@ -1054,8 +1065,8 @@ export class NodeProcess extends Process {
      * quickjs-emscripten 0.32 it reads an uninitialized module pointer.
      */
     private parsesAsModule(source: string, file: string): boolean {
-        const runtime = this.services.quickJsModule!.newRuntime();
-        runtime.setModuleLoader((name) => {
+        const runtime = this.quickJs!.newRuntime();
+        runtime.setModuleLoader((name: string) => {
             if (name === PARSE_CHECK_STOP) return { error: new Error(PARSE_CHECK_STOP) };
             return name === file ? source : '';
         });
@@ -1216,6 +1227,11 @@ export class NodeProcess extends Process {
             }
         }
         this.guestTeardown = [];
+        /* The vm capability keeps the guest context under this process's capability context, and a
+           WeakMap entry lives as long as its key does: left bound, it held the context, the runtime
+           and the QuickJS module -- about 30 MB of host external memory -- for as long as the
+           container still reached the process, which it does for every process it has ever run. */
+        // BEFORE-WITNESS: binding left in place
         if (this.api) {
             this.api.dispose();
             this.api = undefined;
@@ -1229,6 +1245,7 @@ export class NodeProcess extends Process {
             // QuickJS asserts on leaked objects at teardown; the process already has its result
         }
         this.runtime = undefined;
+        this.quickJs = undefined;
     }
 }
 
@@ -2030,7 +2047,9 @@ function runNodeSync(request: SyncChildRequest): SyncChildResult {
         request.parentPid,
         request.cwd,
         request.env,
-        request.evalSource
+        request.evalSource,
+        undefined,
+        request.quickJs
     );
     let stdout = '';
     let stderr = '';

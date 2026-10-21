@@ -790,6 +790,7 @@ function nodeRun(
         evalSource: invocation.evalSource,
         fileSystem: ctx.fileSystem,
         services: ctx.services,
+        quickJs: ctx.quickJs(),
         timeoutMs,
         killSignal
     });

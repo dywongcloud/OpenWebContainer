@@ -275,12 +275,16 @@ proc.cpuUsage = function () {
  */
 var LETHAL_SIGNALS = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2, SIGHUP: 1, SIGQUIT: 3, SIGABRT: 6 };
 proc.kill = function (pid, signal) {
-  var name = signal === undefined || signal === null || signal === 0 || signal === '0' ? 'SIGTERM' : String(signal);
+  var name = signal === undefined || signal === null ? 'SIGTERM' : String(signal);
   var num = Number(pid);
+  // Signal 0 is the null signal: it only asks whether the process is there, and never ends it.
+  if (name === '0') {
+    if (num === proc.pid) return true;
+    if (callCap('child.kill', { pid: num, signal: '0' }) === true) return true;
+    throw esrchFor(pid);
+  }
   if (num === proc.pid) {
-    var lethal = LETHAL_SIGNALS[name];
-    if (lethal !== undefined && name !== 'SIGKILL') proc.exit(128 + lethal);
-    if (lethal !== undefined) proc.exit(137);
+    proc.exit(128 + (LETHAL_SIGNALS[name] === undefined ? 15 : LETHAL_SIGNALS[name]));
     return true;
   }
   var table = globalThis.__owcPtyFds;
@@ -291,12 +295,15 @@ proc.kill = function (pid, signal) {
     ? callCap('child.kill', { pid: Number(record.child.pid), signal: name })
     : callCap('child.kill', { pid: num, signal: name });
   if (ok === true) return true;
+  throw esrchFor(pid);
+};
+function esrchFor(pid) {
   var missing = new Error('kill ESRCH');
   missing.code = 'ESRCH';
   missing.errno = -3;
   missing.syscall = 'kill';
-  throw missing;
-};
+  return missing;
+}
 proc.umask = function () {
   return 18;
 };
@@ -602,9 +609,14 @@ globalThis.crypto = nodeCrypto.webcrypto;
       throw failed;
     });
   };
-  ['Headers', 'Request', 'Response'].forEach(function (name) {
+  ['Headers', 'Request', 'Response', 'WebSocket'].forEach(function (name) {
     Object.defineProperty(globalThis, name, {
       get: function () { return undici()[name]; },
+      // an assignment replaces the lazy getter with the value, so a package that installs its own
+      // class under one of these names still finds what it put there
+      set: function (value) {
+        Object.defineProperty(globalThis, name, { value: value, writable: true, configurable: true });
+      },
       configurable: true
     });
   });
