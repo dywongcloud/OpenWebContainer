@@ -200,6 +200,32 @@ BF.url = function () {
   URLSearchParams.prototype.toString = function () {
     return this._list.map(function (pair) { return encodeComponent(pair[0]) + '=' + encodeComponent(pair[1]); }).join('&');
   };
+  /* WHATWG url: sort is a stable sort on the name of each pair, comparing code units. */
+  URLSearchParams.prototype.sort = function () {
+    this._list.sort(function (a, b) { return a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0); });
+  };
+
+  /* WHATWG url: a path is resolved by removing its dot segments (RFC 3986 5.2.4). A percent-encoded
+     dot segment counts as one, but the segment is written back as the caller encoded it. */
+  function removeDotSegments(pathname) {
+    if (pathname.charAt(0) !== '/') return pathname;
+    var segments = pathname.split('/');
+    var out = [''];
+    var trailing = false;
+    for (var i = 1; i < segments.length; i++) {
+      var segment = segments[i];
+      var decoded = segment;
+      try { decoded = decodeURIComponent(segment); } catch (err) { /* an invalid escape is itself */ }
+      if (decoded === '.') { trailing = true; continue; }
+      if (decoded === '..') { if (out.length > 1) out.pop(); trailing = true; continue; }
+      if (segment === '' && i === segments.length - 1) { trailing = true; continue; }
+      trailing = false;
+      out.push(segment);
+    }
+    var resolved = out.join('/');
+    if (trailing && resolved.charAt(resolved.length - 1) !== '/') resolved += '/';
+    return resolved === '' ? '/' : resolved;
+  }
 
   var SCHEME_RE = /^([A-Za-z][A-Za-z0-9+.\-]*:)/;
   var DEFAULT_PORTS = { 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21' };
@@ -227,7 +253,7 @@ BF.url = function () {
     this.hostname = authority ? (m[5] || '').toLowerCase() : '';
     var port = authority && m[6] ? m[6] : '';
     this.port = DEFAULT_PORTS[this.protocol] === port ? '' : port;
-    this.pathname = m[7] !== undefined && m[7] !== '' ? m[7] : (authority ? '/' : '');
+    this.pathname = removeDotSegments(m[7] !== undefined && m[7] !== '' ? m[7] : (authority ? '/' : ''));
     this.search = m[8] && m[8].length > 1 ? m[8] : '';
     this.hash = m[9] && m[9].length > 1 ? m[9] : '';
     this.searchParams = new URLSearchParams(this.search);

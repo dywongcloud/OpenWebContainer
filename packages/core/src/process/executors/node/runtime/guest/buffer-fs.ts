@@ -861,12 +861,17 @@ BF.fs = function () {
      follows: a relative target is written verbatim and resolved beside the link. */
   var LINKTARGETS = {};
 
+  /* Node exports fs.Stats, and packages test a stat with instanceof fs.Stats, so a stat is an
+     instance of it; every field still sits on the instance, exactly as it did before. */
+  function Stats() {}
+  Object.defineProperty(Stats.prototype, Symbol.toStringTag, { value: 'Stats', configurable: true });
+
   function makeStats(st, opts, isLink) {
     var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
     // With bigint every numeric field is a BigInt; the four date fields stay Date objects.
     var num = bigint ? function (value) { return BigInt(value); } : function (value) { return value; };
     var mtime = new Date(st.mtimeMs);
-    return {
+    var out = {
       dev: num(0),
       mode: num(st.mode !== undefined ? st.mode : (st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188))),
       nlink: num(1),
@@ -893,6 +898,8 @@ BF.fs = function () {
       isFIFO: function () { return false; },
       isSocket: function () { return false; }
     };
+    Object.setPrototypeOf(out, Stats.prototype);
+    return out;
   }
 
   var kDirentType = Symbol('owcDirentType');
@@ -1585,6 +1592,7 @@ BF.fs = function () {
 
   fs.Dir = Dir;
   fs.Dirent = Dirent;
+  fs.Stats = Stats;
 
   fs.opendirSync = function (p) {
     var file = toPathString(p);
