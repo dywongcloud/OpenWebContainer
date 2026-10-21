@@ -1,4 +1,5 @@
 import { IFileSystem } from '../../../../../filesystem';
+import type { QuickJSAsyncWASMModule } from 'quickjs-emscripten';
 import { NodeResolver } from '../resolver';
 import { RuntimeServices } from '../services';
 
@@ -16,6 +17,15 @@ export interface CapabilityContext {
     holdRef(delta: number): void;
     /** Writes to this process's own output (for example stdio inherited from a child process). */
     output(message: { stdout?: string; stderr?: string }): void;
+    /**
+     * The QuickJS module this process booted on, while its guest is alive.
+     *
+     * A synchronous child boots on it: such a child runs to completion inside the capability call
+     * that spawned it and cannot await a load of its own. It is read at the moment of the call and
+     * travels no further, so nothing holds a module -- a WebAssembly instance of about 30 MB of host
+     * external memory -- after the process that loaded it is gone.
+     */
+    quickJs(): QuickJSAsyncWASMModule | undefined;
 }
 
 /** A sync capability returns its value; an async one returns a promise of it. */

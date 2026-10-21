@@ -5,6 +5,7 @@
 // .runToCompletionSync (process.ts) steps it from inside the call: guest jobs, due virtual timers and synchronous
 // host operations, until nothing refs the process. This file holds what does not need the process itself.
 import type { IFileSystem } from '../../../filesystem';
+import type { QuickJSAsyncWASMModule } from 'quickjs-emscripten';
 import type { RuntimeServices } from './runtime/services';
 
 /** One synchronous node child, with the executable and arguments already resolved as NodeProcessExecutor resolves them. */
@@ -19,6 +20,12 @@ export interface SyncChildRequest {
     evalSource?: string;
     fileSystem: IFileSystem;
     services: RuntimeServices;
+    /**
+     * The QuickJS module the child boots on: the spawning process's own. A synchronous child cannot
+     * await a load, and the module is handed over rather than looked up, so a child that ends takes
+     * its engine with it instead of leaving one behind for the container.
+     */
+    quickJs?: QuickJSAsyncWASMModule;
     /** 0 means no deadline. */
     timeoutMs: number;
     killSignal: string;

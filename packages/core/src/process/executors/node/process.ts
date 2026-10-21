@@ -1231,7 +1231,7 @@ export class NodeProcess extends Process {
            WeakMap entry lives as long as its key does: left bound, it held the context, the runtime
            and the QuickJS module -- about 30 MB of host external memory -- for as long as the
            container still reached the process, which it does for every process it has ever run. */
-        // BEFORE-WITNESS: binding left in place
+        unbindVmRuntime(this.capabilityContext);
         if (this.api) {
             this.api.dispose();
             this.api = undefined;

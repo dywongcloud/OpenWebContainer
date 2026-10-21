@@ -104,6 +104,18 @@ export function armVmBudget(owner: CapabilityContext, ms: number): void {
     host.lastCheck = 0;
 }
 
+/**
+ * Drops the binding {@link bindVmRuntime} made for a runtime: its guest is gone.
+ *
+ * A WeakMap entry lives as long as its key does, so the binding held the guest context -- and
+ * through it the runtime and the QuickJS module the engine runs in, about 30 MB of host external
+ * memory -- for as long as anything still reached the capability context, which the container's
+ * process table does for every process it has ever run. Unbinding is what lets that go.
+ */
+export function unbindVmRuntime(owner: CapabilityContext): void {
+    hosts.delete(owner);
+}
+
 /** A kill path: the guest stops at its next interrupt check, whatever it is doing. */
 export function cancelVmRuntime(owner: CapabilityContext): void {
     const host = hosts.get(owner);
