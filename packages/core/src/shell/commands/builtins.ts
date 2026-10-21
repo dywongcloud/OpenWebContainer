@@ -909,6 +909,8 @@ type CommandBody =
     | { t: 'simple'; assigns: Assignment[]; words: Word[]; redirects: Redirect[] }
     | { t: 'if'; branches: { cond: Node[]; body: Node[] }[]; else_?: Node[]; redirects: Redirect[] }
     | { t: 'for'; name: string; words: Word[] | null; body: Node[]; redirects: Redirect[] }
+    /** bash's `for ((init; test; next)); do ...; done`: the three expressions are arithmetic. */
+    | { t: 'forarith'; expr: string; body: Node[]; redirects: Redirect[] }
     | { t: 'while'; negate: boolean; cond: Node[]; body: Node[]; redirects: Redirect[] }
     | { t: 'case'; word: Word; items: { patterns: Word[]; body: Node[] }[]; redirects: Redirect[] }
     | { t: 'group'; body: Node[]; redirects: Redirect[] }
@@ -1622,6 +1624,17 @@ class Parser {
     private parseFor(): CommandBody {
         this.pos += 3;
         this.skipSpace(false);
+        /* bash's arithmetic loop: `for ((init; test; next)); do ...; done`. The three expressions
+           are arithmetic, as they are in `$(( ))`, and every one of them may be empty: an empty test
+           is true, which is what makes `for ((;;))` the loop that never ends by itself. */
+        if (this.src.startsWith('((', this.pos)) {
+            this.pos += 2;
+            const expr = this.readDelimited('((', '))');
+            this.skipSpace(true);
+            if (this.here() === ';') this.pos++;
+            const tail = this.parseForTail();
+            return { t: 'forarith', expr, body: tail.body, redirects: tail.redirects };
+        }
         const word = this.readWord();
         if (!word) throw new ShellSyntaxError(`syntax error near unexpected token \`${this.here() === '' ? 'newline' : this.here()}'`);
         const name = rawText(word);
@@ -1666,6 +1679,12 @@ class Parser {
             }
             break;
         }
+        const tail = this.parseForTail();
+        return { t: 'for', name, words, body: tail.body, redirects: tail.redirects };
+    }
+
+    /** `do ... done` and the redirects that follow it: the tail every `for` ends with. */
+    private parseForTail(): { body: Node[]; redirects: Redirect[] } {
         this.skipSpace(true);
         if (!this.keywordAt(this.pos, 'do')) throw new ShellSyntaxError("syntax error: `do' expected");
         this.pos += 2;
@@ -1673,7 +1692,7 @@ class Parser {
         this.skipSpace(true);
         if (!this.keywordAt(this.pos, 'done')) throw new ShellSyntaxError('syntax error: unexpected end of file');
         this.pos += 4;
-        return { t: 'for', name, words, body, redirects: this.readRedirects() };
+        return { body, redirects: this.readRedirects() };
     }
 
     private parseWhile(): CommandBody {
@@ -2292,23 +2311,24 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null):
  *
  * The job is the host's to start. The table `jobs` and `wait` read is the host's -- `state.jobs`
  * takes it out of `state.host` -- and so are the words a job is run from, so `state.startJob` is
- * asked to register it and this module only prints the line a shell prints for the one it got back,
- * which is what a shell prints too. The status of a command the shell did not wait for is 0.
+ * asked to register it. A compound command is one too: `{ echo a; } &` and `for i in 1 2; do echo
+ * $i; done &` are jobs a shell lists and waits for, and the host keeps the text of such a job and
+ * hands it back to this engine to run, rather than losing the `&` and running it in the foreground.
+ * Nothing is printed for the job: bash prints `[1] 12345` only in an interactive shell, and a line
+ * handed to `sh -c` -- which is every line here -- gets no such line from it. The status of a
+ * command the shell did not wait for is 0.
  *
- * Null where the foreground path must have the pipeline instead: a pipeline that is not all simple
- * commands (`{ echo a; } &` is a job the host's own splitter cannot re-read from its source), one
- * with no source to hand over, a state with nothing installed to start one, or a host that declined
- * the source it was given. Waited for, such a command is late rather than lost -- and no job is ever
- * invented for a table that cannot run it.
+ * Null where the foreground path must have the pipeline instead: a pipeline with no source to hand
+ * over, a state with nothing installed to start one, or a host that declined the source it was
+ * given. Waited for, such a command is late rather than lost -- and no job is ever invented for a
+ * table that cannot run it.
  */
 function startBackgroundNode(state: ShellState, node: Node): number | null {
     const source = node.source;
     if (source === undefined || source === '' || state.startJob === undefined) return null;
-    for (const command of node.commands) if (command.t !== 'simple') return null;
     const job = state.startJob(state, source);
     if (job === null || job === undefined) return null;
     state.lastBackgroundPid = job.pid;
-    writeOut(state, `[${job.id}] ${job.pid}\n`);
     return 0;
 }
 
@@ -2401,14 +2421,14 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                 state.protectedDepth++;
                 let condition = 0;
                 try {
-                    condition = runCommandList(state, branch.cond, input);
+                    condition = runCommandList(state, branch.cond, null);
                 } finally {
                     state.protectedDepth--;
                 }
                 if (condition !== 0) continue;
-                return runCommandList(state, branch.body, input);
+                return runCommandList(state, branch.body, null);
             }
-            if (command.else_ !== undefined) return runCommandList(state, command.else_, input);
+            if (command.else_ !== undefined) return runCommandList(state, command.else_, null);
             return 0;
             });
         case 'for':
@@ -2418,7 +2438,7 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
             for (const item of items) {
                 setVar(state, command.name, item);
                 try {
-                    status = runCommandList(state, command.body, input);
+                    status = runCommandList(state, command.body, null);
                 } catch (error) {
                     if (error instanceof BreakSignal) {
                         if (error.count > 1) throw new BreakSignal(error.count - 1);
@@ -2433,6 +2453,33 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
             }
             return status;
             });
+        case 'forarith':
+            return runCompoundRedirected(state, command, input, () => {
+            /* `for ((init; test; next))`: the three parts are split on their `;`, an empty part is
+               left out, and an empty test is true -- which is what `for ((;;))` loops on. */
+            const parts = command.expr.split(';');
+            const test = (parts[1] ?? '').trim();
+            const next = (parts[2] ?? '').trim();
+            const first = (parts[0] ?? '').trim();
+            if (first !== '') evalArith(state, first);
+            let status = 0;
+            for (;;) {
+                if (test !== '' && evalArith(state, test) === 0) break;
+                try {
+                    status = runCommandList(state, command.body, null);
+                } catch (error) {
+                    if (error instanceof BreakSignal) {
+                        if (error.count > 1) throw new BreakSignal(error.count - 1);
+                        break;
+                    }
+                    if (error instanceof ContinueSignal) {
+                        if (error.count > 1) throw new ContinueSignal(error.count - 1);
+                    } else throw error;
+                }
+                if (next !== '') evalArith(state, next);
+            }
+            return status;
+            });
         case 'while':
             return runCompoundRedirected(state, command, input, () => {
             let status = 0;
@@ -2440,14 +2487,14 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                 state.protectedDepth++;
                 let condition = 0;
                 try {
-                    condition = runCommandList(state, command.cond, input);
+                    condition = runCommandList(state, command.cond, null);
                 } finally {
                     state.protectedDepth--;
                 }
                 const proceed = command.negate ? condition !== 0 : condition === 0;
                 if (!proceed) break;
                 try {
-                    status = runCommandList(state, command.body, input);
+                    status = runCommandList(state, command.body, null);
                 } catch (error) {
                     if (error instanceof BreakSignal) {
                         if (error.count > 1) throw new BreakSignal(error.count - 1);
@@ -2474,17 +2521,17 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                     }
                 }
                 if (!matched) continue;
-                return runCommandList(state, item.body, input);
+                return runCommandList(state, item.body, null);
             }
             return 0;
             });
         case 'group':
-            return runCompoundRedirected(state, command, input, () => runCommandList(state, command.body, input));
+            return runCompoundRedirected(state, command, input, () => runCommandList(state, command.body, null));
         case 'subshell':
             return runCompoundRedirected(state, command, input, () => {
             const snapshot = snapshotState(state);
             try {
-                return runCommandList(state, command.body, input);
+                return runCommandList(state, command.body, null);
             } catch (error) {
                 // `exit` inside ( ) leaves the subshell, not the script
                 if (error instanceof ExitSignal) return error.code;
@@ -2660,6 +2707,16 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
 
     const plan = planRedirects(state, command.redirects);
     const commandInput = plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
+    /**
+     * What a command with no input of its own reads: the rest of the input of the compound command
+     * it stands in. `runCompoundRedirected` put that input in `state.inputBuffer` for the whole
+     * construct, and `read` and `mapfile` take it from there, a line at a time, through the cursor;
+     * this is the same text for the commands that read their standard input in one go -- `cat`,
+     * `wc`, `head` -- which is why `echo hi | if true; then cat; fi` prints the line `echo` wrote.
+     * The buffer is not rewinded for them: the cursor stays where the commands before left it.
+     */
+    const shared = state.inputCursor < state.inputBuffer.length ? state.inputBuffer.slice(state.inputCursor) : '';
+    const stdin = commandInput ?? (shared === '' ? null : shared);
 
     if (words.length === 0) {
         for (const entry of pending) {
@@ -2723,7 +2780,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
                 args,
                 cwd: state.cwd,
                 env: state.env,
-                input: commandInput,
+                input: stdin,
                 fs: (state.fs ?? NO_FS) as never
             };
             bindState(ctx, state);
@@ -2746,7 +2803,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
             return finish(state, plan, result.stdout, result.stderr, result.exitCode);
         }
 
-        const step = RUNNER(state, words, commandInput);
+        const step = RUNNER(state, words, stdin);
         for (const entry of pending) setVar(state, entry.name, entry.value);
         syncPwd(state);
         return finish(state, plan, step.stdout, step.stderr, step.exitCode);
