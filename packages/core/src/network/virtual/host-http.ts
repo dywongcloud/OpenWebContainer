@@ -63,6 +63,10 @@ export function attachHostHttp(network: VirtualNetwork): void {
             const handler = state.targets.get(targetId);
             if (handler) handler(name, payload);
         },
+        deliverBytes(targetId, name, bytes, meta) {
+            const handler = state.targets.get(targetId);
+            if (handler) handler(name, bytes === undefined ? meta : bytes);
+        },
         holdRef() {
             // host connections hold nothing alive: each request is bounded by its own timeout
         },
@@ -355,7 +359,7 @@ export function requestGuestServer(network: VirtualNetwork, port: number, reques
             if (settled) return;
             try {
                 if (name === 'data') {
-                    if (reader.feed(base64ToBytes(payload as string))) settle(undefined, reader.response());
+                    if (reader.feed(payload as Uint8Array)) settle(undefined, reader.response());
                 /* 'reset' is the peer's RST (it destroyed the connection with unread data): no EOF
                    follows it, so a body that is not already framed by its length is truncated. */
                 } else if (name === 'end' || name === 'close' || name === 'reset') {
@@ -373,7 +377,7 @@ export function requestGuestServer(network: VirtualNetwork, port: number, reques
             reject(error);
             return;
         }
-        network.write(connectionId, bytesToBase64(outgoing));
+        network.write(connectionId, outgoing);
         timer = setTimeout(() => settle(protocolError('ETIMEDOUT', `request to port ${port} timed out`)), REQUEST_TIMEOUT_MS);
     });
 }

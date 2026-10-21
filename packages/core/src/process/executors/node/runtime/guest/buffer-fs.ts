@@ -71,7 +71,12 @@ BF.buffer = function () {
     var pos = 0;
     for (var j = 0; j < list.length && pos < size; j++) {
       var chunk = list[j];
-      for (var k = 0; k < chunk.length && pos < size; k++) out[pos++] = chunk[k];
+      var take = Math.min(chunk.length, size - pos);
+      /* set() copies the piece in one go; an element at a time costs a loop iteration per byte,
+         which is what made joining the chunks of a large body the slowest thing in a read. */
+      if (take > 0 && typeof chunk.subarray === 'function') out.set(take === chunk.length ? chunk : chunk.subarray(0, take), pos);
+      else for (var k = 0; k < take; k++) out[pos + k] = chunk[k];
+      pos += take;
     }
     return out;
   };
@@ -115,7 +120,9 @@ BF.buffer = function () {
     var stop = typeof end === 'number' ? end : this.length;
     if (typeof offset === 'string') encoding = offset;
     if (typeof value === 'number') {
-      for (var n = start; n < stop; n++) this[n] = value & 0xff;
+      /* One byte repeated: the native fill writes the whole range in one pass, where an element at
+         a time costs a loop iteration per byte -- filling 16 MiB that way took a second. */
+      Uint8Array.prototype.fill.call(this, value & 0xff, start, stop);
       return this;
     }
     var pattern = typeof value === 'string' ? encodeString(value, encoding || 'utf8') : value;

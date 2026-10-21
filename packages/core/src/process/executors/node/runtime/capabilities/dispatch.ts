@@ -43,10 +43,22 @@ function handlerFor(op: string) {
 
 /** Runs a synchronous capability. Returns an envelope; never throws into the guest. */
 export function invokeSync(op: string, argsJson: string, context: CapabilityContext): CapabilityEnvelope {
+    return invokeWith(op, argsJson, context, undefined);
+}
+
+/**
+ * Runs a synchronous capability reached through the binary channel: `bytes` is the caller's payload,
+ * handed over as a Uint8Array instead of as base64 text inside the arguments.
+ */
+export function invokeSyncBytes(op: string, argsJson: string, bytes: Uint8Array, context: CapabilityContext): CapabilityEnvelope {
+    return invokeWith(op, argsJson, context, bytes);
+}
+
+function invokeWith(op: string, argsJson: string, context: CapabilityContext, bytes: Uint8Array | undefined): CapabilityEnvelope {
     const handler = handlerFor(op);
     if (!handler) return errorEnvelope(Object.assign(new Error(`unknown capability ${op}`), { code: 'ERR_UNKNOWN_CAPABILITY' }));
     try {
-        const value = handler(JSON.parse(argsJson), context);
+        const value = handler(JSON.parse(argsJson), context, bytes);
         if (value instanceof Promise) {
             value.catch(() => undefined);
             return errorEnvelope(Object.assign(new Error(`${op} is asynchronous`), { code: 'ERR_ASYNC_CAPABILITY' }));

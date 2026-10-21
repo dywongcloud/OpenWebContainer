@@ -13,6 +13,12 @@ export interface CapabilityContext {
     services: RuntimeServices;
     /** Queues an event for a guest target; it runs as a macrotask, never inside the current call. */
     deliver(targetId: number, name: string, payload: unknown): void;
+    /**
+     * Queues an event that carries bytes. The bytes cross the guest bridge as an ArrayBuffer and
+     * `meta`, when given, carries the rest of the event as JSON. Everything payload-heavy takes
+     * this route: a base64 string inside JSON costs a codec round trip per byte at both ends.
+     */
+    deliverBytes(targetId: number, name: string, bytes: Uint8Array, meta?: unknown): void;
     /** Keep-alive accounting: a positive hold keeps the process alive until released. */
     holdRef(delta: number): void;
     /** Writes to this process's own output (for example stdio inherited from a child process). */
@@ -28,8 +34,14 @@ export interface CapabilityContext {
     quickJs(): QuickJSAsyncWASMModule | undefined;
 }
 
-/** A sync capability returns its value; an async one returns a promise of it. */
-export type CapabilityHandler = (args: any, context: CapabilityContext) => unknown | Promise<unknown>;
+/**
+ * A sync capability returns its value; an async one returns a promise of it.
+ *
+ * `bytes` is the binary channel: a capability reached through it ({@link invokeSyncBytes}) gets the
+ * caller's payload as a `Uint8Array` instead of as base64 text inside `args`, so no codec runs on
+ * either side. Capabilities that have no payload never read it.
+ */
+export type CapabilityHandler = (args: any, context: CapabilityContext, bytes?: Uint8Array) => unknown | Promise<unknown>;
 
 export type CapabilityEnvelope =
     | { ok: true; value: unknown }

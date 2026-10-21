@@ -8,7 +8,7 @@ import { installHostBridge } from './runtime/host-bridge';
 import { NodeResolver, dirnameOf, isPathSpecifier, joinPaths, normalizeAbsolute, withoutUrlSuffix } from './runtime/resolver';
 import { RuntimeServices } from './runtime/services';
 import { CapabilityContext, CapabilityEnvelope } from './runtime/capabilities/types';
-import { errorEnvelope, invokeAsync, invokeSync } from './runtime/capabilities/dispatch';
+import { errorEnvelope, invokeAsync, invokeSync, invokeSyncBytes } from './runtime/capabilities/dispatch';
 import { CAPABILITIES } from './runtime/capabilities/index';
 import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbindVmRuntime, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs } from './pump';
@@ -25,6 +25,15 @@ const RESERVED_WORDS = new Set([
 
 /** A failure inside guest code, already formatted the way Node prints it. */
 class GuestFailure extends Error {}
+
+/**
+ * An ArrayBuffer holding exactly `bytes`, which QuickJS can take as one value: `newArrayBuffer`
+ * copies a whole buffer, so a view over part of one is copied into a buffer of its own first.
+ */
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+    if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) return bytes.buffer as ArrayBuffer;
+    return bytes.slice().buffer;
+}
 
 /** The QuickJS module the last boot loaded: a synchronous child boots on it, since it cannot await a new load. */
 let lastQuickJs: QuickJSAsyncWASMModule | undefined;
@@ -269,6 +278,13 @@ export class NodeProcess extends Process {
                 }
                 setTimeout(() => this.deliver(targetId, name, payload), 0);
             },
+            deliverBytes: (targetId, name, bytes, meta) => {
+                if (this.syncMode) {
+                    this.syncTasks.push(() => this.deliverBytes(targetId, name, bytes, meta));
+                    return;
+                }
+                setTimeout(() => this.deliverBytes(targetId, name, bytes, meta), 0);
+            },
             holdRef: (delta) => this.holdRef(delta),
             output: (message) => this.emitGuestOutput(message),
             /* Read at the moment a synchronous child is spawned, and handed to that child: a module
@@ -350,6 +366,7 @@ export class NodeProcess extends Process {
     }
 
     /** Delivery into this guest from the virtual network or a capability (VirtualSink). */
+    /** Delivery into this guest from the virtual network or a capability (VirtualSink). */
     deliver(targetId: number, name: string, payload: unknown): void {
         if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
         try {
@@ -362,6 +379,34 @@ export class NodeProcess extends Process {
                 id.dispose();
                 eventName.dispose();
                 body.dispose();
+            }
+            this.drainJobs();
+        } catch (error) {
+            this.fatalError = error;
+        }
+        this.wakeIfIdle();
+    }
+
+    /**
+     * A delivery that carries bytes: the chunk reaches the guest as an ArrayBuffer, and `meta` — when
+     * it is not undefined — as the JSON for the rest of the event. This is the route every
+     * payload-heavy event takes, so a chunk of a stream crosses the bridge as bytes and not as base64
+     * text that both sides would have to encode and decode.
+     */
+    deliverBytes(targetId: number, name: string, bytes: Uint8Array, meta?: unknown): void {
+        if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
+        try {
+            const id = this.context.newNumber(targetId);
+            const eventName = this.context.newString(name);
+            const body = this.context.newString(JSON.stringify(meta === undefined ? null : meta));
+            const data = this.context.newArrayBuffer(exactArrayBuffer(bytes));
+            try {
+                this.callApi('deliver', [id, eventName, body, data]).dispose();
+            } finally {
+                id.dispose();
+                eventName.dispose();
+                body.dispose();
+                data.dispose();
             }
             this.drainJobs();
         } catch (error) {
@@ -525,6 +570,7 @@ export class NodeProcess extends Process {
             setTimer: (id, ms) => this.armTimer(id, ms),
             clearTimer: (id) => this.disarmTimer(id),
             capability: (op, argsJson) => invokeSync(op, argsJson, this.capabilityContext),
+            capabilityBytes: (op, argsJson, bytes) => invokeSyncBytes(op, argsJson, bytes, this.capabilityContext),
             startOperation: (op, argsJson, opId) => this.startOperation(op, argsJson, opId),
             holdRef: (delta) => this.holdRef(delta),
             onTeardown: (dispose) => this.guestTeardown.push(dispose),

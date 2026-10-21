@@ -142,6 +142,8 @@ function bodyBytes(body) {
 function bodyOf(chunks) {
   var buffer = Buffer.concat(chunks);
   return {
+    /* The bytes themselves, so a caller that wants them never decodes and re-encodes the body. */
+    buffer: buffer,
     text: function () { return Promise.resolve(buffer.toString('utf8')); },
     json: function () { return Promise.resolve(JSON.parse(buffer.toString('utf8'))); },
     bytes: function () { return Promise.resolve(new Uint8Array(buffer)); },
@@ -298,13 +300,39 @@ function Response(body, init) {
   this.statusText = init.statusText === undefined ? '' : init.statusText;
   this.ok = this.status >= 200 && this.status < 300;
   this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
-  this.body = body === undefined || body === null ? '' : String(body);
   this.url = init.url === undefined ? '' : init.url;
+  /* A Buffer body -- what fetch hands it -- is kept as bytes: the body property decodes it the
+     first time something reads it and arrayBuffer hands the bytes straight back, so a large
+     response crosses no codec unless its text is asked for. Any other body behaves as it did. */
+  if (Buffer.isBuffer(body)) {
+    var bytes = body;
+    var decoded;
+    Object.defineProperty(this, '_bytes', { value: bytes, writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(this, 'body', {
+      enumerable: true,
+      configurable: true,
+      get: function () {
+        if (decoded === undefined) decoded = bytes.toString('utf8');
+        return decoded;
+      },
+      set: function (value) {
+        this._bytes = undefined;
+        decoded = value === undefined || value === null ? '' : String(value);
+      }
+    });
+  } else {
+    this.body = body === undefined || body === null ? '' : String(body);
+  }
 }
 Response.prototype.text = function () { return Promise.resolve(this.body); };
 Response.prototype.json = function () { return Promise.resolve(JSON.parse(this.body)); };
-Response.prototype.arrayBuffer = function () { return Promise.resolve(Buffer.from(this.body, 'utf8')); };
-Response.prototype.clone = function () { return new Response(this.body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url }); };
+Response.prototype.arrayBuffer = function () {
+  return Promise.resolve(this._bytes === undefined ? Buffer.from(this.body, 'utf8') : Buffer.from(this._bytes));
+};
+Response.prototype.clone = function () {
+  var body = this._bytes === undefined ? this.body : this._bytes;
+  return new Response(body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
+};
 
 function Request(target, options) {
   options = options || {};
@@ -357,9 +385,7 @@ function fetch(target, options) {
   }
   var url = String(target && target.href !== undefined ? target.href : target);
   return request(url, init).then(function (res) {
-    return res.body.text().then(function (text) {
-      return new Response(text, { status: res.statusCode, statusText: res.statusText, headers: res.headers, url: url });
-    });
+    return new Response(res.body.buffer, { status: res.statusCode, statusText: res.statusText, headers: res.headers, url: url });
   });
 }
 
