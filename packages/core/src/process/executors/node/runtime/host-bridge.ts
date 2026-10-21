@@ -106,6 +106,13 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         const found = deps.resolver.resolve(text(specifier), text(fromDir), text(mode) as ResolveMode);
         return context.newString(found ?? '');
     });
+    /* Why a resolve that found nothing found nothing, as JSON, or '' for a plain missing module.
+       require() of a subpath no "exports" map defines throws ERR_PACKAGE_PATH_NOT_EXPORTED in Node,
+       not MODULE_NOT_FOUND, and Node names the path that map named rather than the specifier. */
+    define('resolveFailure', (specifier, fromDir, mode) => {
+        const detail = deps.resolver.resolveDetailed(text(specifier), text(fromDir), text(mode) as ResolveMode);
+        return context.newString(detail.kind === 'file' ? '' : JSON.stringify(detail));
+    });
     define('isESM', (file) => (deps.resolver.isESM(text(file)) ? context.true : context.false));
     define('readText', (path) => nullable(safeRead(() => deps.fileSystem.readFile(text(path)))));
     define('readBase64', (path) => nullable(safeRead(() => {

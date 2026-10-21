@@ -5,7 +5,7 @@ import { QuickJSAsyncWASMModule, QuickJSContext, QuickJSHandle, QuickJSRuntime, 
 import variant from "@jitl/quickjs-singlefile-browser-release-asyncify"
 import { BOOTSTRAP_SRC } from './runtime/bootstrap';
 import { installHostBridge } from './runtime/host-bridge';
-import { NodeResolver, dirnameOf, isPathSpecifier, joinPaths, normalizeAbsolute, withoutUrlSuffix } from './runtime/resolver';
+import { NodeResolver, dirnameOf, isPathSpecifier, joinPaths, normalizeAbsolute, urlSuffixOf, withoutUrlSuffix } from './runtime/resolver';
 import { RuntimeServices } from './runtime/services';
 import { CapabilityContext, CapabilityEnvelope } from './runtime/capabilities/types';
 import { errorEnvelope, invokeAsync, invokeSync, invokeSyncBytes, invokeSyncMaybe } from './runtime/capabilities/dispatch';
@@ -801,7 +801,10 @@ export class NodeProcess extends Process {
      */
     private loadEsmSync(file: string, token: number): string {
         const context = this.context!;
-        const source = `import * as __owc_ns from ${JSON.stringify(file)};\n` +
+        /* Percent-escaped, because this is an ES module specifier and the ESM loader decodes one:
+           '?' and '#' in the file's own name would otherwise read as a query or a fragment. */
+        const specifier = JSON.stringify(escapePathChars(file));
+        const source = `import * as __owc_ns from ${specifier};\n` +
             `globalThis.__owc_esm_registry = globalThis.__owc_esm_registry || Object.create(null);\n` +
             `globalThis.__owc_esm_registry[${token}] = __owc_ns;\n`;
         const result = context.evalCode(source, `${file}?owc-require`, { type: 'module' });
@@ -1312,13 +1315,16 @@ export class NodeProcess extends Process {
             if (moduleName.startsWith(ERROR_MODULE_PREFIX)) {
                 return { value: errorModuleSource(moduleName) };
             }
-            if (moduleName.endsWith('.json')) {
-                return { value: `export default ${this.readRequired(moduleName)};` };
+            /* A module name may carry the query and fragment of the specifier that named it, which
+               are part of the module's identity but not of the file it is loaded from. */
+            const { path: file, suffix } = splitModuleName(moduleName);
+            if (file.endsWith('.json')) {
+                return { value: `export default ${this.readRequired(file)};` };
             }
-            if (this.resolver.isESM(moduleName)) {
-                return { value: this.esmSource(this.readRequired(moduleName), moduleName, false) };
+            if (this.resolver.isESM(file)) {
+                return { value: this.esmSource(this.readRequired(file), file, false, suffix) };
             }
-            return { value: this.syntheticModule(moduleName, false) };
+            return { value: this.syntheticModule(file, false) };
         } catch (error) {
             return { error: error as Error };
         }
@@ -1331,10 +1337,10 @@ export class NodeProcess extends Process {
      * and the engine fails to parse the source as it is; a source that parses reaches the engine
      * unchanged.
      */
-    private esmSource(source: string, file: string, isMain: boolean): string {
+    private esmSource(source: string, file: string, isMain: boolean, urlSuffix = ''): string {
         const duplicate = duplicateModuleBinding(source, file);
         if (duplicate !== undefined) throw new GuestFailure(duplicate);
-        const prepared = prepareEsmSource(source, file, isMain, (spec) => {
+        const prepared = prepareEsmSource(source, file, isMain, urlSuffix, (spec) => {
             const found = this.resolver.resolve(spec, dirnameOf(file), 'import');
             return found === undefined ? undefined : toFileUrl(found);
         });
@@ -1384,8 +1390,18 @@ export class NodeProcess extends Process {
         const bare = spec.startsWith('node:') ? spec.slice('node:'.length) : spec;
         if (this.builtinNames.has(bare)) return `builtin:${bare}`;
         const baseDir = baseName && baseName.startsWith('/') ? dirnameOf(baseName) : this.currentCwd;
-        const found = this.resolver.resolve(spec, baseDir, 'import');
-        if (!found) {
+        const detail = this.resolver.resolveDetailed(spec, baseDir, 'import');
+        if (detail.kind !== 'file') {
+            /* A subpath no "exports" map defines is its own failure in Node, not a missing module:
+               ERR_PACKAGE_PATH_NOT_EXPORTED, which user code branches on. */
+            if (detail.kind === 'not-exported') {
+                const where = baseName ? ` imported from ${baseName}` : '';
+                this.lastResolveError = Object.assign(new Error(
+                    `Package subpath '${detail.subpath}' is not defined by "exports" in ${joinPaths(detail.packageDir, 'package.json')}${where}`
+                ), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' });
+                this.setImportFailureCode('ERR_PACKAGE_PATH_NOT_EXPORTED');
+                return { error: this.lastResolveError };
+            }
             const scheme = unsupportedScheme(spec);
             // Node reports a specifier no loader can read as an unsupported scheme, one that names a
             // directory as a directory import, and one that resolves to no file as
@@ -1399,15 +1415,21 @@ export class NodeProcess extends Process {
                 : spec === '.' || spec === '..' || spec.startsWith('./') || spec.startsWith('../')
                     ? normalizeAbsolute(joinPaths(baseDir, spec))
                     : spec;
+            /* A package directory that is absent is 'Cannot find package' in Node, a file that is
+               absent inside one that is present is 'Cannot find module'. */
+            const named = scheme === undefined && directory === undefined && detail.target === 'package'
+                ? `Cannot find package '${detail.name ?? target}'`
+                : `Cannot find module '${detail.file ?? target}'`;
             const message = directory !== undefined
                 ? `Directory import '${directory}' is not supported resolving ES modules imported from ${baseName}`
                 : scheme === undefined
-                    ? `Cannot find module '${target}'${baseName ? ` imported from ${baseName}` : ''}`
+                    ? `${named}${baseName ? ` imported from ${baseName}` : ''}`
                     : `Only URLs with a scheme in: file, data, and node are supported by the default ESM loader. Received protocol '${scheme}'`;
             this.lastResolveError = Object.assign(new Error(message), { code });
             this.setImportFailureCode(code);
             return { error: this.lastResolveError };
         }
+        const found = detail.file;
         if (missingAttribute) {
             // a .json import without `with { type: 'json' }`: evaluating the module throws ERR_IMPORT_ATTRIBUTE_MISSING
             return ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
@@ -1415,7 +1437,11 @@ export class NodeProcess extends Process {
                 message: `Module "${toFileUrl(found)}" needs an import attribute of "type: json"`,
             }));
         }
-        return found;
+        /* The query and fragment are part of the module's identity, not of the file it is read from:
+           './m.mjs?x=1' and './m.mjs' are two modules of the same file. The path is escaped so the
+           two halves can be told apart again in loadModule even when the file's own name holds a
+           '?', a '#' or a '%'. */
+        return escapePathChars(found) + urlSuffixOf(spec);
     }
 
     /**
@@ -2000,11 +2026,15 @@ function rewriteModuleSpecifier(
  * arguments pass through the attribute check, static attribute clauses are resolved, and
  * `export const { a } = ...` (a binding pattern the engine does not export) becomes a plain
  * declaration followed by an explicit export list.
+ *
+ * `urlSuffix` is the query and fragment of the specifier that named this module: `import.meta.url`
+ * carries them, the way Node's does, while the module's own imports resolve from the file itself.
  */
 function prepareEsmSource(
     source: string,
     file: string,
     isMain: boolean,
+    urlSuffix: string,
     resolveUrl: (spec: string) => string | undefined
 ): string {
     if (!/\b(?:import|export)\b/.test(source)) return source;
@@ -2018,7 +2048,7 @@ function prepareEsmSource(
             const next = tokens[i + 1];
             if (isPunc(next, '.') && isId(tokens[i + 2], 'meta')) {
                 const meta = tokens[i + 2];
-                edits.push({ start: tok.s, end: meta.e, text: `globalThis.__owc_importMeta(${JSON.stringify(file)}, ${isMain})` });
+                edits.push({ start: tok.s, end: meta.e, text: `globalThis.__owc_importMeta(${JSON.stringify(file)}, ${isMain}, ${JSON.stringify(urlSuffix)})` });
                 i += 2;
             } else if (isPunc(next, '(')) {
                 const close = matchingClose(tokens, i + 1);
@@ -2175,6 +2205,28 @@ function unsupportedScheme(spec: string): string | undefined {
 
 function toFileUrl(file: string): string {
     return 'file://' + encodeURI(file).replace(/\?/g, '%3F').replace(/#/g, '%23');
+}
+
+/**
+ * Splits a module name into the file it is read from and the query and fragment that make it its
+ * own module. The path is escaped by escapePathChars, so the first '?' or '#' begins the suffix and
+ * the text before it is the file's name.
+ */
+function splitModuleName(moduleName: string): { path: string; suffix: string } {
+    const cut = moduleName.search(/[?#]/);
+    const before = cut < 0 ? moduleName : moduleName.slice(0, cut);
+    return { path: unescapePathChars(before), suffix: cut < 0 ? '' : moduleName.slice(cut) };
+}
+
+/** Escapes the characters that would otherwise read as the start of a query or a fragment, and the
+ *  escape character itself, so what comes back is the path exactly as it stands. */
+function escapePathChars(path: string): string {
+    return path.replace(/%/g, '%25').replace(/\?/g, '%3F').replace(/#/g, '%23');
+}
+
+/** The inverse, read in this order so a path that itself holds '%3F' comes back unchanged. */
+function unescapePathChars(path: string): string {
+    return path.replace(/%3F/gi, '?').replace(/%23/gi, '#').replace(/%25/gi, '%');
 }
 
 /**

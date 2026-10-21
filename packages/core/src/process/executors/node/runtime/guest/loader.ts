@@ -43,6 +43,23 @@ function moduleNotFound(id) {
   return err;
 }
 
+/* Why a resolve found nothing, when the reason is not a plain missing file: a package whose
+   "exports" map defines no such subpath, which Node reports as ERR_PACKAGE_PATH_NOT_EXPORTED in
+   require() as well as in import(), naming the package.json that defines the map; or an exports
+   target that names a file which is not there, which Node names by that path. */
+function notFoundError(id, fromDir) {
+  var info = null;
+  try { info = JSON.parse(host.resolveFailure(String(id), fromDir, 'require')); } catch (e) { info = null; }
+  if (info === null || typeof info !== 'object') return moduleNotFound(id);
+  if (info.kind === 'not-exported') {
+    var err = new Error("Package subpath '" + info.subpath + "' is not defined by \"exports\" in " + info.packageDir + '/package.json');
+    err.code = 'ERR_PACKAGE_PATH_NOT_EXPORTED';
+    return err;
+  }
+  if (info.kind === 'missing' && typeof info.file === 'string') return moduleNotFound(info.file);
+  return moduleNotFound(id);
+}
+
 /* The file whose code is running, for the one piece of code that carries no file of its own: a
    new Function body, which the engine names <input>. A dynamic import written in one has nothing to
    resolve against, and Node resolves it from the file that created the function, so that file is
@@ -119,7 +136,7 @@ Module._resolveFilename = function _resolveFilename(request, parent, isMain, opt
   if (isBuiltinName(request)) return stripNodePrefix(request);
   var base = parent && parent.path ? parent.path : host.cwd();
   var found = host.resolve(String(request), base, 'require');
-  if (!found) throw moduleNotFound(String(request));
+  if (!found) throw notFoundError(String(request), base);
   return found;
 };
 Module._load = function _load(request, parent, isMain) {
@@ -149,7 +166,7 @@ function makeRequire(mod) {
   req.resolve = function resolve(id) {
     if (isBuiltinName(id)) return stripNodePrefix(id);
     var found = host.resolve(String(id), mod.path, 'require');
-    if (!found) throw moduleNotFound(id);
+    if (!found) throw notFoundError(id, mod.path);
     return found;
   };
   req.cache = MODULE_CACHE;
@@ -174,7 +191,7 @@ function requireFrom(parent, id) {
   }
   var base = parent && parent.path ? parent.path : host.cwd();
   var filename = host.resolve(id, base, 'require');
-  if (!filename) throw moduleNotFound(id);
+  if (!filename) throw notFoundError(id, base);
   return loadCJS(filename, parent, false).exports;
 }
 
@@ -436,11 +453,28 @@ function fileUrlOf(p) {
   return 'file://' + encodeURI(p).replace(/\?/g, '%3F').replace(/#/g, '%23');
 }
 
-function importMetaOf(filename, isMain) {
-  var cached = IMPORT_META[filename];
+/* The query and fragment a specifier carries into the module it names, '' when it carries none:
+   './m.mjs?x=1#f' is '?x=1#f'. A bare specifier carries none -- its query is part of a subpath --
+   which is why 'pkg/sub?x=1' is a subpath no "exports" map defines rather than 'pkg/sub'. */
+function urlSuffixOf(spec) {
+  var hash = spec.indexOf('#');
+  var noFragment = hash < 0 ? spec : spec.slice(0, hash);
+  var query = noFragment.indexOf('?');
+  var bare = query < 0 ? noFragment : noFragment.slice(0, query);
+  if (bare === spec) return '';
+  if (bare.charAt(0) !== '/' && bare !== '.' && bare !== '..' && bare.indexOf('./') !== 0 && bare.indexOf('../') !== 0) return '';
+  return spec.slice(bare.length);
+}
+
+/* urlSuffix is the query and fragment of the specifier that named this module: they belong to its
+   URL and to its identity, as they do in Node, but not to the file it was read from. */
+function importMetaOf(filename, isMain, urlSuffix) {
+  var suffix = typeof urlSuffix === 'string' ? urlSuffix : '';
+  var key = filename + '\u0000' + suffix;
+  var cached = IMPORT_META[key];
   if (cached) return cached;
   var meta = Object.create(null);
-  meta.url = fileUrlOf(filename);
+  meta.url = fileUrlOf(filename) + suffix;
   meta.dirname = dirnameOf(filename);
   meta.filename = filename;
   meta.main = !!isMain;
@@ -453,16 +487,16 @@ function importMetaOf(filename, isMain) {
       err.code = 'ERR_MODULE_NOT_FOUND';
       throw err;
     }
-    return fileUrlOf(found);
+    return fileUrlOf(found) + urlSuffixOf(spec);
   };
-  IMPORT_META[filename] = meta;
+  IMPORT_META[key] = meta;
   return meta;
 }
 
 function importUrlOf(spec, filename) {
   var base = dirnameOf(typeof filename === 'string' && filename !== '' ? filename : host.cwd() + '/x');
   var found = host.resolve(String(spec), base, 'import');
-  return found ? fileUrlOf(found) : undefined;
+  return found ? fileUrlOf(found) + urlSuffixOf(String(spec)) : undefined;
 }
 
 /* The module name of a module whose evaluation throws a recorded error: the host builds the module

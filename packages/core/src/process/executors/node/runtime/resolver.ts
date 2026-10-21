@@ -2,6 +2,18 @@ import { IFileSystem } from '../../../../filesystem';
 
 export type ResolveMode = 'require' | 'import';
 
+/**
+ * Why a specifier resolved to nothing. A subpath no "exports" map defines is one failure Node
+ * reports as ERR_PACKAGE_PATH_NOT_EXPORTED rather than as a missing module; a specifier that names
+ * no file is the other, and `target` says whether the package directory itself was absent -- Node
+ * names that one 'Cannot find package' -- or only the file inside it was.
+ */
+export type ResolveFailure =
+    | { kind: 'not-exported'; packageDir: string; subpath: string }
+    | { kind: 'missing'; target: 'package' | 'module'; name?: string; file?: string };
+
+export type ResolveResult = { kind: 'file'; file: string } | ResolveFailure;
+
 const FILE_EXTENSIONS = ['.js', '.json', '.cjs', '.mjs'];
 const INDEX_FILES = ['index.js', 'index.json', 'index.cjs', 'index.mjs'];
 
@@ -107,6 +119,13 @@ function withoutLiterals(source: string): string {
 export class NodeResolver {
     constructor(private fileSystem: IFileSystem) { }
 
+    /* Why the last resolve() that found nothing found nothing, for the caller that has to name the
+       reason: a package whose "exports" map defines no such subpath is ERR_PACKAGE_PATH_NOT_EXPORTED
+       in Node, not a missing module, and a specifier whose package is absent is 'Cannot find
+       package', not 'Cannot find module'. Only resolveDetailed() reads it, and every call is
+       synchronous, so a failure never outlives the resolution that set it. */
+    private lastFailure: ResolveFailure | undefined;
+
     resolve(specifier: string, fromDir: string, mode: ResolveMode): string | undefined {
         const spec = specifierToResolve(specifier, mode);
         // a trailing slash names a directory, which an ES module specifier may not import
@@ -121,6 +140,18 @@ export class NodeResolver {
             return this.resolveImportsField(spec, fromDir, mode);
         }
         return this.resolvePackage(spec, fromDir, mode);
+    }
+
+    /**
+     * resolve() together with the reason it failed. Two failures Node reports under different codes
+     * both come back as undefined from resolve(), so the caller that builds the error needs this:
+     * a subpath no "exports" map defines, and a bare specifier whose package directory is absent.
+     */
+    resolveDetailed(specifier: string, fromDir: string, mode: ResolveMode): ResolveResult {
+        this.lastFailure = undefined;
+        const file = this.resolve(specifier, fromDir, mode);
+        if (file !== undefined) return { kind: 'file', file };
+        return this.lastFailure ?? { kind: 'missing', target: 'module' };
     }
 
     /** `#name` specifiers resolve through the "imports" map of the nearest package.json. */
@@ -194,7 +225,10 @@ export class NodeResolver {
                     return this.resolvePackageDirectory(packageDir, subpath, mode);
                 }
             }
-            if (dir === '/') return undefined;
+            if (dir === '/') {
+                this.lastFailure = { kind: 'missing', target: 'package', name };
+                return undefined;
+            }
             dir = dirnameOf(dir);
         }
     }
@@ -203,10 +237,17 @@ export class NodeResolver {
         const pkg = this.readPackageJson(packageDir);
         if (pkg && pkg.exports !== undefined) {
             const target = resolveExportsTarget(pkg.exports, subpath, mode);
-            if (target === undefined) return undefined;
+            if (target === undefined) {
+                this.lastFailure = { kind: 'not-exported', packageDir, subpath };
+                return undefined;
+            }
             const resolved = normalizeAbsolute(joinPaths(packageDir, target));
             if (this.fileSystem.statPath(resolved)?.type === 'file') return resolved;
-            return this.resolveAsPath(resolved, mode);
+            /* The exports map names a file that is not there: Node reports the path the map named,
+               not the specifier the caller wrote, so the caller can say the same. */
+            const found = this.resolveAsPath(resolved, mode);
+            if (found === undefined) this.lastFailure = { kind: 'missing', target: 'module', file: resolved };
+            return found;
         }
         if (subpath === '.') return this.resolveAsPath(packageDir, mode);
         return this.resolveAsPath(normalizeAbsolute(joinPaths(packageDir, subpath)), mode);
@@ -248,15 +289,39 @@ export function withoutUrlSuffix(specifier: string): string {
 /**
  * The specifier an ES module loader resolves. Node drops a query and a fragment from a relative or
  * absolute specifier before it looks for the file, so './m.mjs?x=1', './m.mjs#frag' and
- * './m.mjs?x=1#frag' all load ./m.mjs. A bare specifier keeps them: 'pkg/sub?x=1' is a subpath no
- * "exports" map defines and 'pkg?x=1' a package that does not exist, which is how Node reads both.
- * require() strips nothing at all, so its specifier names the file with the query still on it.
+ * './m.mjs?x=1#frag' all load ./m.mjs, and percent-decodes what is left: './q%3F1.mjs' is the file
+ * 'q?1.mjs'. A bare specifier keeps them: 'pkg/sub?x=1' is a subpath no "exports" map defines and
+ * 'pkg?x=1' a package that does not exist, which is how Node reads both. require() strips nothing
+ * at all, so its specifier names the file with the query still on it.
  */
 function specifierToResolve(specifier: string, mode: ResolveMode): string {
     if (mode !== 'import') return specifier;
     const bare = withoutUrlSuffix(specifier);
-    if (bare === specifier || bare.startsWith('/') || isRelativeSpecifier(bare)) return bare;
+    if (bare.startsWith('/') || isRelativeSpecifier(bare)) return decodePathOf(bare);
     return specifier;
+}
+
+/** The path a URL pathname names. Node's ESM loader decodes it, and a stray `%` it cannot decode is left as it is. */
+function decodePathOf(path: string): string {
+    if (path.indexOf('%') < 0) return path;
+    try {
+        return decodeURIComponent(path);
+    } catch {
+        return path;
+    }
+}
+
+/**
+ * The query and fragment a specifier carries into the identity of the module it names -- '' when it
+ * carries none: './m.mjs?x=1#f' is '?x=1#f'. Node keeps both in the module's URL and in its
+ * identity, so './m.mjs?x=1' and './m.mjs' are two modules. A bare specifier carries none: its
+ * query is part of a subpath, which is why 'pkg/sub?x=1' is a subpath no "exports" map defines.
+ */
+export function urlSuffixOf(specifier: string): string {
+    const bare = withoutUrlSuffix(specifier);
+    if (bare === specifier) return '';
+    if (!bare.startsWith('/') && !isRelativeSpecifier(bare)) return '';
+    return specifier.slice(bare.length);
 }
 
 /** Whether the specifier names a file or directory by path rather than by package name. */
