@@ -253,13 +253,15 @@ export class ShellProcess extends Process {
                 /* A child process wrote its output to this shell as it ran and the shell's terminal
                    saw it there; writing what the result collected as well would print it twice. */
                 const live = this.liveChildOutput;
+                /* `sh -c <line>` is not a terminal: what the line wrote is what the caller reads, to
+                   the byte, and a newline the shell added to `printf x` would be a byte `sh -c
+                   'printf x'` does not print on a host. Only the interactive loop below, which puts
+                   the prompt back where the cursor is, ends a line that did not end itself. */
                 if (result.stdout && !live) {
-                    this.emitOutput(result.stdout.endsWith('\n') ? result.stdout : result.stdout + '\n');
+                    this.emitOutput(result.stdout);
                 }
                 if (result.stderr && !live) {
-                    // the newline stdout gets only when it has none: a command's own diagnostics end
-                    // in one already, and a second turned every error line into a blank line after it
-                    this.emitError(result.stderr.endsWith('\n') ? result.stderr : result.stderr + '\n');
+                    this.emitError(result.stderr);
                 }
                 this._exitCode = result.exitCode;
                 return;

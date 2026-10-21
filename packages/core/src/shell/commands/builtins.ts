@@ -257,8 +257,12 @@ function globToRegExp(pattern: string, starCrossesSlash: boolean, quoted?: boole
     return new RegExp(`^${out}$`);
 }
 
-function globMatch(pattern: string, text: string, starCrossesSlash: boolean): boolean {
-    return globToRegExp(pattern, starCrossesSlash).test(text);
+/**
+ * `quoted` marks the characters that came out of quoted text -- `"a*"` in a `case` pattern -- which
+ * are literal: `case abc in "a*")` does not match `abc`, the way it does not in a host shell.
+ */
+function globMatch(pattern: string, text: string, starCrossesSlash: boolean, quoted?: boolean[]): boolean {
+    return globToRegExp(pattern, starCrossesSlash, quoted).test(text);
 }
 
 /** True when `text` holds a pattern character that was not quoted: a quoted one is literal. */
@@ -895,7 +899,8 @@ type Word = Part[];
 
 interface Redirect {
     fd: number;
-    op: '>' | '>>' | '<' | '&>' | '&>>' | '>&' | '<&' | '<<' | '<<-';
+    /** `<<<` is a here-string: the word itself is the command's standard input. */
+    op: '>' | '>>' | '<' | '&>' | '&>>' | '>&' | '<&' | '<<' | '<<-' | '<<<';
     target: Word;
 }
 
@@ -1305,8 +1310,10 @@ class Parser {
                 if (end === -1) break;
             }
             const text = lines.length === 0 ? '' : lines.join('\n') + '\n';
+            /* The body is the input itself, not the name of a file holding it: it stays a `<<`
+               redirection, which `planRedirects` reads as text the command reads on its standard
+               input. Reading it as a file looked for a file called `hi` and failed with ENOENT. */
             entry.target.target = [{ t: 'sq', v: text }];
-            entry.target.op = '<';
         }
     }
 
@@ -1462,6 +1469,12 @@ class Parser {
                 op = '>>';
                 width = 2;
                 fd = 1;
+            } else if (three === '<<<') {
+                /* A here-string is read before `<<` is, so `<<<` never looks like `<<` and a
+                   delimiter: the word after it is the input, not the name of a here-document. */
+                op = '<<<';
+                width = 3;
+                fd = 0;
             } else if (two === '<<') {
                 const dash = this.src[this.pos + 2] === '-';
                 op = dash ? '<<-' : '<<';
@@ -1935,9 +1948,32 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
     }
 }
 
+/**
+ * Tilde expansion of the word a literal part opened: `~` and `~/rest` are the home directory, with
+ * the rest of the word kept after it. A `~` that names a user -- `~root` -- is left as it was
+ * written: the container holds no passwd table to answer a login name with a home directory, and a
+ * path invented for one would be a path no file has.
+ */
+function expandTilde(text: string, state: ShellState): string {
+    if (!text.startsWith('~')) return text;
+    const slash = text.indexOf('/');
+    const name = slash === -1 ? text.slice(1) : text.slice(1, slash);
+    if (name !== '') return text;
+    const home = getVar(state, 'HOME');
+    if (home === undefined || home === '') return text;
+    return home + (slash === -1 ? '' : text.slice(slash));
+}
+
 function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: Expanded): void {
-    for (const part of parts) {
+    for (let index = 0; index < parts.length; index++) {
+        const part = parts[index];
         if (part.t === 'lit') {
+            /* Tilde expansion is the first expansion a word gets, and only where the word opens with
+               an unquoted `~`: `echo ~` is the home directory, `echo a~b` and `echo "~"` are not. */
+            if (index === 0 && !quoted && target.text.length === 0) {
+                appendText(target, expandTilde(part.v, state), quoted, false);
+                continue;
+            }
             /* Literal text is never field-split: only what an expansion produced is. */
             appendText(target, part.v, quoted, false);
             continue;
@@ -2384,13 +2420,15 @@ function runCompoundRedirected(state: ShellState, command: Command, input: strin
     const redirects = (command as { redirects?: Redirect[] }).redirects ?? [];
     const plan = planRedirects(state, redirects);
     const fromFile = plan.inputFile !== undefined;
-    const needsInput = fromFile || input !== null;
+    const needsInput = fromFile || plan.inputText !== undefined || input !== null;
     const needsOutput = plan.stdoutTo.kind !== 'out' || plan.stderrTo.kind !== 'err';
     if (!needsInput && !needsOutput) return body();
     const savedBuffer = state.inputBuffer;
     const savedCursor = state.inputCursor;
     if (needsInput) {
-        state.inputBuffer = fromFile ? readInputFile(state, plan.inputFile as string) : (input as string);
+        state.inputBuffer = fromFile
+            ? readInputFile(state, plan.inputFile as string)
+            : plan.inputText ?? (input as string);
         state.inputCursor = 0;
     }
     const savedIo = state.io;
@@ -2515,7 +2553,12 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
             for (const item of command.items) {
                 let matched = false;
                 for (const pattern of item.patterns) {
-                    if (globMatch(expandToString(pattern, state), subject, true)) {
+                    /* The pattern is expanded with its quoting kept, so a `*` a quote took out of
+                       the pattern is a `*` to match and not a wildcard: `case abc in "a*")` is a
+                       case that does not match, as it does not in a host shell. */
+                    const expanded: Expanded = { text: '', quoted: [], split: [] };
+                    expandParts(state, pattern, false, expanded);
+                    if (globMatch(expanded.text, subject, true, expanded.quoted)) {
                         matched = true;
                         break;
                     }
@@ -2559,6 +2602,8 @@ interface RedirectPlan {
     stdoutTo: { kind: 'out' | 'err' | 'file'; file?: string; append?: boolean };
     stderrTo: { kind: 'out' | 'err' | 'file'; file?: string; append?: boolean };
     inputFile?: string;
+    /** The input a here-string wrote: text already read, never the name of a file to open. */
+    inputText?: string;
 }
 
 function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
@@ -2573,6 +2618,18 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
                 break;
             case '<':
                 plan.inputFile = target;
+                break;
+            case '<<<':
+                /* A here-string is the word, expanded as one word -- no field splitting, no globbing
+                   -- with the newline a host shell writes after it: `read -r l <<< "x y"` reads the
+                   line `x y`, and `cat <<< hi` prints `hi`. */
+                plan.inputText = `${target}\n`;
+                break;
+            case '<<':
+            case '<<-':
+                /* A here-document's body: `readHeredocs` put the text itself in the target, and it
+                   already ends in the newline its last line was written with. */
+                plan.inputText = target;
                 break;
             case '&>':
             case '&>>':
@@ -2706,7 +2763,9 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     for (const word of command.words) words.push(...expandWord(state, word));
 
     const plan = planRedirects(state, command.redirects);
-    const commandInput = plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
+    const commandInput = plan.inputText !== undefined
+        ? plan.inputText
+        : plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
     /**
      * What a command with no input of its own reads: the rest of the input of the compound command
      * it stands in. `runCompoundRedirected` put that input in `state.inputBuffer` for the whole
@@ -4208,6 +4267,10 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
     for (const [name, value] of Object.entries(env)) globals.set(name, { value, export: true });
     if (!globals.has('PWD')) globals.set('PWD', { value: cwd, export: true });
     if (!globals.has('PATH')) globals.set('PATH', { value: '/bin:/usr/bin', export: true });
+    /* IFS is set in every shell a host starts, to space-tab-newline, and is a variable of the shell
+       rather than one of its environment: `echo "$IFS"` prints it, `env` does not list it. It is not
+       written over a value the caller's environment already gave it. */
+    if (!globals.has('IFS')) globals.set('IFS', { value: ' \t\n', export: false });
     /** The table of a state whose host keeps none: `child.ts` leaves its own in `state.host`. */
     const ownJobs: ShellJob[] = [];
     const options: ShellOptions = {

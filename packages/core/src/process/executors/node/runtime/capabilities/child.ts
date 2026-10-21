@@ -1359,7 +1359,12 @@ function valueOfName(shell: SyncShell, name: string): string {
             break;
     }
     if (/^[1-9][0-9]*$/.test(name)) return positionalOf(shell)[Number(name) - 1] ?? '';
-    return lookupVar(shell, name) ?? '';
+    const found = lookupVar(shell, name);
+    /* IFS is a variable of the shell rather than one of its environment, so a host shell has it in
+       every shell it starts and never in the environment of the children it runs: it reads as
+       space-tab-newline until a line sets it, and is never written into `shell.env` for a child. */
+    if (found === undefined && name === 'IFS') return ' \t\n';
+    return found ?? '';
 }
 
 /**
@@ -2028,9 +2033,29 @@ function expandWordText(shell: SyncShell, word: RawWord, ctx: ExpandCtx): string
         .join('');
 }
 
+/**
+ * Tilde expansion of the piece a word opens with: `~` and `~/rest` are the home directory. Only a
+ * piece `tokenizeLine` pushed with field splitting still on is one -- an unquoted one -- so `echo ~`
+ * is the home directory and `echo "~"` is a tilde. A `~` that names a user, `~root`, is left as it
+ * was written: the container has no passwd table to answer a login name with a home directory.
+ */
+function expandTildePiece(text: string, shell: SyncShell): string {
+    const slash = text.indexOf('/');
+    const name = slash === -1 ? text.slice(1) : text.slice(1, slash);
+    if (name !== '') return text;
+    const home = shell.env.HOME;
+    if (home === undefined || home === '') return text;
+    return home + (slash === -1 ? '' : text.slice(slash));
+}
+
 function expandParts(shell: SyncShell, parts: ShellPart[], ctx: ExpandCtx): ExpandAtom[] {
     const atoms: ExpandAtom[] = [];
-    for (const part of parts) {
+    for (let index = 0; index < parts.length; index++) {
+        const part = parts[index];
+        if (index === 0 && part.split && part.text.startsWith('~')) {
+            atoms.push({ text: expandTildePiece(part.text, shell), split: false, glob: false });
+            continue;
+        }
         if (part.expand) expandInto(shell, part.text, part.split, atoms, ctx);
         else atoms.push({ text: part.text, split: false, glob: false });
     }
@@ -2060,18 +2085,26 @@ interface RedirectSpec {
     append?: boolean;
     /** The file name as it was written; expanded when the redirection is resolved. */
     file?: RawWord;
+    /** Set for `<<<`: `file` is the input itself, not the name of a file holding it. */
+    hereString?: boolean;
 }
 
 /** `>`, `>>`, `<`, `2>`, `2>>`, `1<` ... with the file standing as a word of its own. */
 const REDIRECT_OPERATOR = /^([0-9]?)(>>?|<)$/;
+/** `cat <<< hi`: the here-string operator with the word it feeds written against it. */
+const REDIRECT_HERESTRING_ATTACHED = /^([0-9]?)<<<(.+)$/;
 /** `2>/dev/null`, `>out.txt`, `>>out.txt`, `<in.txt` ... : the file written against the operator. */
 const REDIRECT_ATTACHED = /^([0-9]?)(>>?|<)(.+)$/;
 /** `2>&1`, `1>&2`, `>&2` ... */
 const REDIRECT_DUP = /^([0-9]?)>&([0-9])$/;
 
-/** The text of a word that is one unquoted piece, so a bare `>` counts and a quoted one does not. */
+/**
+ * The text of a word that is one *unquoted* piece, so a bare `>` counts and a quoted one does not:
+ * `printf "<%s>"` writes a format, it opens no file. A quoted piece is the one `tokenizeLine` pushed
+ * with field splitting off, and an escaped `>` with no expansion at all.
+ */
 function operatorText(word: RawWord): string | null {
-    return word.length === 1 && word[0].expand ? word[0].text : null;
+    return word.length === 1 && word[0].expand && word[0].split ? word[0].text : null;
 }
 
 /** Removes every redirection from a command's words; `missing` names an operator with no file after it. */
@@ -2087,6 +2120,15 @@ function takeRedirects(words: RawWord[]): { ops: RedirectSpec[]; missing: string
             ops.push({ kind: 'dup', fd: dup[1] === '' ? 1 : Number(dup[1]), from: Number(dup[2]) });
             continue;
         }
+        // `read -r line <<< "x y"`: the word after the operator is the input, not a file name
+        if (text === '<<<') {
+            if (i + 1 >= words.length) return { ops, missing: text };
+            const word = words[i + 1];
+            words.splice(i, 2);
+            i--;
+            ops.push({ kind: 'in', fd: 0, file: word, hereString: true });
+            continue;
+        }
         const op = REDIRECT_OPERATOR.exec(text);
         if (op !== null) {
             if (i + 1 >= words.length) return { ops, missing: text };
@@ -2096,7 +2138,19 @@ function takeRedirects(words: RawWord[]): { ops: RedirectSpec[]; missing: string
             ops.push({ kind: op[2] === '<' ? 'in' : 'out', fd: fdOf(op[1], op[2]), file, append: op[2] === '>>' });
             continue;
         }
-        // `2>/dev/null` and `>out.txt`: the operator and the file are one word
+        // `2>/dev/null`, `>out.txt` -- and `<<<hi`, the here-string written against its operator
+        const hereString = REDIRECT_HERESTRING_ATTACHED.exec(text);
+        if (hereString !== null) {
+            words.splice(i, 1);
+            i--;
+            ops.push({
+                kind: 'in',
+                fd: 0,
+                file: [{ text: hereString[2], expand: true, split: false }],
+                hereString: true
+            });
+            continue;
+        }
         const attached = REDIRECT_ATTACHED.exec(text);
         if (attached === null) continue;
         words.splice(i, 1);
@@ -2226,6 +2280,12 @@ function shellStage(shell: SyncShell, words: RawWord[], input: string | null): S
             return { stdout: '', stderr: diagnostic(ctx.error), exitCode: ctx.code };
         }
         if (op.kind === 'in') {
+            /* A here-string is the word itself, with the newline a host shell writes after it; only a
+               `<` names a file to read. */
+            if (op.hereString === true) {
+                stageInput = `${file}\n`;
+                continue;
+            }
             const read = readShellInput(shell, file);
             if (read.error !== null) return { stdout: '', stderr: diagnostic(read.error), exitCode: 1 };
             stageInput = read.text;
