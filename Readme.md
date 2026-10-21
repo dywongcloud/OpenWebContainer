@@ -117,22 +117,37 @@ built from the same C libraries Node's own `zlib` is:
 | zstd | facebook/zstd (`lib/common`, `lib/compress`, `lib/decompress`) | v1.5.7 | 447 KB | 157 KB of base64 |
 
 Each is compiled with Emscripten as a standalone module (`-O3 -flto -sSTANDALONE_WASM=1
--sALLOW_MEMORY_GROWTH=1 -Wl,--no-entry`) over the one-shot entry points in
+-sALLOW_MEMORY_GROWTH=1 -Wl,--no-entry`) over the entry points in
 `packages/core/src/process/executors/node/runtime/capabilities/codec/csrc`, gzipped and written as
 base64 into `brotli-wasm.ts` and `zstd-wasm.ts`, inflated by fflate on first use and then kept. They
 ask for two imports between them — a memory-growth notification and WASI's `proc_exit` — and both are
 stubbed. To rebuild one, from a checkout of the upstream tag:
 
     emcc -O3 -flto -sSTANDALONE_WASM=1 -sALLOW_MEMORY_GROWTH=1 -Wl,--no-entry -I<upstream include> \
-      -sEXPORTED_FUNCTIONS='["_owc_brotli_compress","_owc_brotli_decompress","_owc_brotli_error_string","_malloc","_owc_free"]' \
+      -sEXPORTED_FUNCTIONS='["_owc_brotli_compress","_owc_brotli_decompress","_owc_brotli_error_string","_owc_brotli_stream_new","_owc_brotli_stream_write","_owc_brotli_stream_free","_malloc","_owc_free"]' \
       -o brotli.wasm csrc/brotli_codec.c <upstream>/c/{common,dec,enc}/*.c
 
+The `*_stream_*` entry points are what the stream classes use. A brotli or zstd stream cannot be a
+one-shot call: Node hands each write to the library separately, a `flush()` is a call of its own, and
+the end is another, and every one of them is visible in the bytes — a flush ends the meta-block or
+block that is open, and a zstd flush leaves a frame the next call continues in a new one. So the
+stream keeps a context in the module and the guest drives it one call at a time, over the same output
+buffer size Node uses. The deflate family needs none of this: its output is the same however the
+input is split, so those streams are still buffered and compressed once, at the end.
+
 Node 24.15 bundles those same two libraries, which is what makes the bytes match: a differential over
-8 inputs (0 B to 300 KB) × 9 brotli parameter sets and 9 zstd parameter sets, in the sync, callback
-and stream forms, produced byte-identical output, and the same errors — brotli's
+8 inputs (0 B to 200 KB) × 8 brotli parameter sets and 6 zstd parameter sets × 5 write shapes (one
+write, three writes, a flush before / between / after the writes), in the sync, callback and stream
+forms, produced byte-identical output, and the same errors — brotli's
 `ERR__ERROR_FORMAT_PADDING_2` and `Z_BUF_ERROR`, zstd's `ZSTD_error_prefix_unknown` with its `errno`
 and `ZSTD_getErrorString` message. Every compressed form round-trips in both directions: bytes Node
 compressed decompress here, and bytes compressed here decompress in Node.
+
+One thing the differential needs to be fair: the writes must be paced, each one waiting for its own
+callback before the next. Node's zlib streams give a chunk the stream's *finish* operation when the
+stream has already ended and that chunk is the last one left queued, so writes still queued when
+`end()` lands are compressed with a different operation — and whether a write is still queued is a
+race. Left unpaced, Node's own output varies run to run; paced, it is stable and it matches here.
 
 Two places where this deliberately differs from Node 24.15, both measured:
 

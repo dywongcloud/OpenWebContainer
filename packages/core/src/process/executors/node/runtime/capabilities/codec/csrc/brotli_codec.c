@@ -130,6 +130,113 @@ const char *owc_brotli_error_string(int code) {
     return BrotliDecoderErrorString((BrotliDecoderErrorCode)code);
 }
 
+/*
+ * Streaming: an encoder the host keeps between calls, fed exactly the way Node feeds its own.
+ *
+ * A stream is not one call: Node hands each write to the library with BROTLI_OPERATION_PROCESS, a
+ * `flush()` is a call with BROTLI_OPERATION_FLUSH, and the end is one with BROTLI_OPERATION_FINISH.
+ * The operations are visible in the bytes -- a flush ends the meta-block that is open, which is what
+ * makes a flushed stream longer than the same input compressed in one go -- so matching Node means
+ * keeping the encoder and making the same calls.
+ *
+ * `chunk` is Node's `chunkSize` output buffer and `used` its offset into it, which survives from one
+ * write to the next until the buffer fills, as there.
+ */
+typedef struct {
+    BrotliEncoderState *state;
+    uint8_t *out;
+    size_t chunk;
+    size_t used;
+} owc_brotli_stream;
+
+owc_brotli_stream *owc_brotli_stream_new(const uint32_t *params, size_t param_count, size_t chunk_size) {
+    owc_brotli_stream *s;
+    size_t i;
+    s = (owc_brotli_stream *)malloc(sizeof(owc_brotli_stream));
+    if (!s) return 0;
+    s->state = BrotliEncoderCreateInstance(NULL, NULL, NULL);
+    if (!s->state) {
+        free(s);
+        return 0;
+    }
+    s->chunk = chunk_size == 0 ? 16384 : chunk_size;
+    if (s->chunk < 64) s->chunk = 64;
+    s->used = 0;
+    s->out = (uint8_t *)malloc(s->chunk);
+    if (!s->out) {
+        BrotliEncoderDestroyInstance(s->state);
+        free(s);
+        return 0;
+    }
+    BrotliEncoderSetParameter(s->state, BROTLI_PARAM_QUALITY, 11);
+    BrotliEncoderSetParameter(s->state, BROTLI_PARAM_LGWIN, 22);
+    for (i = 0; i < param_count; i++) {
+        BrotliEncoderSetParameter(s->state, (BrotliEncoderParameter)params[i * 2], (uint32_t)params[i * 2 + 1]);
+    }
+    return s;
+}
+
+void owc_brotli_stream_free(owc_brotli_stream *s) {
+    if (!s) return;
+    BrotliEncoderDestroyInstance(s->state);
+    free(s->out);
+    free(s);
+}
+
+/*
+ * One write, or one flush, or the finish. `op` is the BrotliEncoderOperation. The bytes this call
+ * produced are returned as one buffer the caller frees; they are copied out because Node's own
+ * buffer is handed on and replaced once it fills.
+ */
+int owc_brotli_stream_write(owc_brotli_stream *s, const uint8_t *in, size_t in_len, size_t op, uint32_t *result) {
+    size_t avail_in = in_len;
+    const uint8_t *next_in = in;
+    uint8_t *acc;
+    size_t acc_cap;
+    size_t acc_len = 0;
+    result[0] = 0;
+    result[1] = 0;
+    result[2] = 0;
+    acc_cap = s->chunk + 64;
+    acc = (uint8_t *)malloc(acc_cap);
+    if (!acc) return RES_NOMEM;
+    for (;;) {
+        size_t avail_out = s->chunk - s->used;
+        size_t avail_out_after;
+        uint8_t *next_out = s->out + s->used;
+        for (;;) {
+            size_t before = avail_out;
+            size_t produced;
+            BrotliEncoderCompressStream(s->state, (BrotliEncoderOperation)op, &avail_in, &next_in, &avail_out,
+                                        &next_out, NULL);
+            produced = before - avail_out;
+            if (produced > 0) {
+                if (acc_len + produced > acc_cap) {
+                    uint8_t *bigger = (uint8_t *)realloc(acc, acc_cap + produced + s->chunk);
+                    if (!bigger) {
+                        free(acc);
+                        return RES_NOMEM;
+                    }
+                    acc = bigger;
+                    acc_cap += produced + s->chunk;
+                }
+                memcpy(acc + acc_len, next_out - produced, produced);
+                acc_len += produced;
+            }
+            s->used += produced;
+            /* Drain while there is more to give and room to give it in; a full buffer goes back up. */
+            if (avail_out == 0 || !BrotliEncoderHasMoreOutput(s->state)) break;
+        }
+        avail_out_after = avail_out;
+        if (avail_out_after == 0 || s->used >= s->chunk) s->used = 0;
+        if (avail_out_after == 0) continue;
+        break;
+    }
+    result[0] = (uint32_t)(uintptr_t)acc;
+    result[1] = (uint32_t)acc_len;
+    return RES_OK;
+}
+
 void owc_free(void *ptr) {
     free(ptr);
 }

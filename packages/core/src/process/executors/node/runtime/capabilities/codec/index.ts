@@ -247,3 +247,110 @@ export function zstdParamKnown(compress: boolean, key: number): boolean {
 export function zstdCompressBound(size: number): number {
     return zstdModule().owc_zstd_compress_bound(size) as number;
 }
+
+/**
+ * A brotli or zstd stream: the module's own context, kept alive between the writes that feed it.
+ *
+ * A stream is not one call. Node hands each write to the library separately, a `flush()` is a call
+ * of its own, and the finish is another; each one is visible in the bytes, because a flush ends the
+ * block or meta-block that is open. So the stream keeps its context here and the guest drives it one
+ * call at a time, rather than buffering the input and compressing it in one go at the end.
+ */
+interface LiveStream {
+    kind: 'brotli' | 'zstd';
+    handle: number;
+}
+
+const streams = new Map<number, LiveStream>();
+let nextStreamId = 1;
+
+const moduleFor = (kind: 'brotli' | 'zstd'): WasmExports => (kind === 'brotli' ? brotliModule() : zstdModule());
+
+const failFor = (kind: 'brotli' | 'zstd', code: number, detail: number): Error =>
+    kind === 'brotli' ? brotliFailure(code, detail) : zstdFailure(code, detail);
+
+/** Opens a stream and returns the id the guest drives it with. `params` are set before any input. */
+export function codecStreamOpen(kind: 'brotli' | 'zstd', params?: CodecParams, chunkSize = 0): number {
+    const exports = moduleFor(kind);
+    const count = params ? params.length : 0;
+    let parameters = 0;
+    if (count > 0) {
+        parameters = exports.malloc(count * 8);
+        const view = new DataView(exports.memory.buffer);
+        for (let i = 0; i < count; i++) {
+            view.setUint32(parameters + i * 8, params![i][0], true);
+            view.setUint32(parameters + i * 8 + 4, params![i][1], true);
+        }
+    }
+    const result = exports.malloc(12);
+    let handle = 0;
+    try {
+        handle =
+            kind === 'brotli'
+                ? (exports.owc_brotli_stream_new as (p: number, n: number, c: number) => number)(parameters, count, chunkSize)
+                : (exports.owc_zstd_stream_new as (p: number, n: number, c: number, r: number) => number)(
+                      parameters,
+                      count,
+                      chunkSize,
+                      result
+                  );
+    } finally {
+        if (parameters !== 0) exports.owc_free(parameters);
+    }
+    if (handle === 0) {
+        const detail = new DataView(exports.memory.buffer).getUint32(result + 8, true);
+        exports.owc_free(result);
+        throw failFor(kind, RES_SET_PARAM, detail);
+    }
+    exports.owc_free(result);
+    const id = nextStreamId++;
+    streams.set(id, { kind, handle });
+    return id;
+}
+
+/**
+ * One call against an open stream: `op` is the operation Node would hand the library -- process,
+ * flush or finish -- and what comes back is everything that call produced, possibly nothing.
+ */
+export function codecStreamWrite(id: number, data: Uint8Array, op: number): Uint8Array {
+    const entry = streams.get(id);
+    if (!entry) throw failure(Error, 'ERR_STREAM_DESTROYED', 'zlib stream is closed');
+    const exports = moduleFor(entry.kind);
+    const input = exports.malloc(data.length || 1);
+    new Uint8Array(exports.memory.buffer).set(data, input);
+    const result = exports.malloc(12);
+    let code = 0;
+    try {
+        const write =
+            entry.kind === 'brotli'
+                ? (exports.owc_brotli_stream_write as (h: number, i: number, n: number, o: number, r: number) => number)
+                : (exports.owc_zstd_stream_write as (h: number, i: number, n: number, o: number, r: number) => number);
+        code = write(entry.handle, input, data.length, op, result);
+    } finally {
+        exports.owc_free(input);
+    }
+    /* A fresh view either side of the call: the module may have grown its memory while it ran. */
+    const view = new DataView(exports.memory.buffer);
+    const pointer = view.getUint32(result, true);
+    const length = view.getUint32(result + 4, true);
+    const detail = view.getUint32(result + 8, true);
+    const out =
+        pointer !== 0 && length > 0 ? new Uint8Array(exports.memory.buffer).slice(pointer, pointer + length) : new Uint8Array(0);
+    exports.owc_free(pointer);
+    exports.owc_free(result);
+    if (code !== RES_OK) throw failFor(entry.kind, code, detail);
+    return out;
+}
+
+/** Releases a stream's context. Harmless on an id already closed. */
+export function codecStreamClose(id: number): void {
+    const entry = streams.get(id);
+    if (!entry) return;
+    streams.delete(id);
+    const exports = moduleFor(entry.kind);
+    const free =
+        entry.kind === 'brotli'
+            ? (exports.owc_brotli_stream_free as (h: number) => void)
+            : (exports.owc_zstd_stream_free as (h: number) => void);
+    free(entry.handle);
+}

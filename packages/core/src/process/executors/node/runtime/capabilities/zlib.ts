@@ -1,6 +1,16 @@
 import { CapabilityHandler } from './types';
 import { FlateErrorCode, deflateSync, gzipSync, inflateSync, zlibSync } from 'fflate';
-import { CodecParams, brotliCompress, brotliDecompress, zstdCompress, zstdDecompress, zstdParamKnown } from './codec';
+import {
+    CodecParams,
+    brotliCompress,
+    brotliDecompress,
+    codecStreamClose,
+    codecStreamOpen,
+    codecStreamWrite,
+    zstdCompress,
+    zstdDecompress,
+    zstdParamKnown
+} from './codec';
 
 /**
  * Host operations for the zlib family. fflate does the raw DEFLATE work (its `deflateSync` and
@@ -324,5 +334,18 @@ export const ZLIB_CAPABILITIES: Record<string, CapabilityHandler> = {
         const format = String(args.format);
         const params = format === 'zstd' ? zstdParams(args.params, false) : paramPairs(args.params);
         return bytesToBase64(inflateBytes(format, argBytes(args.data), argDictionary(args.dictionary), params));
+    },
+    /* A brotli or zstd compress stream, driven one write, flush or finish at a time. */
+    'zlib.streamOpen': (args) => {
+        const format = String(args.format);
+        if (format !== 'brotli' && format !== 'zstd') throw new Error(`unknown zlib stream format: ${format}`);
+        const params = format === 'zstd' ? zstdParams(args.params, true) : paramPairs(args.params);
+        const chunk = typeof args.chunkSize === 'number' && args.chunkSize > 0 ? Math.trunc(args.chunkSize) : 0;
+        return codecStreamOpen(format, params, chunk);
+    },
+    'zlib.streamWrite': (args) => bytesToBase64(codecStreamWrite(Number(args.id), argBytes(args.data), Number(args.op))),
+    'zlib.streamClose': (args) => {
+        codecStreamClose(Number(args.id));
+        return true;
     }
 };

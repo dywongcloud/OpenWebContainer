@@ -306,11 +306,55 @@ BF['zlib'] = function () {
     };
   }
 
-  // Stream classes extend the stream module's Transform. The input is buffered and the whole
-  // result is pushed once, on flush. The stream module is looked up when a class is first used.
+  // Stream classes extend the stream module's Transform. Brotli and zstd are driven one call at a
+  // time -- a write, a flush or the finish is its own call against a context the host keeps -- because
+  // each one is visible in the bytes: a flush ends the block or meta-block that is open. The deflate
+  // family's output is the same however the input is split, so it is buffered and compressed once.
+  // The stream module is looked up when a class is first used.
   var streamClasses = Object.create(null);
 
+  /*
+   * The operation a call hands the codec. Brotli numbers process, flush and finish 0, 1, 2 and zstd
+   * numbers continue, flush and end the same way; the deflate family uses zlib's own flush constants.
+   * Only brotli and zstd streams are driven one call at a time; the deflate family's output is the
+   * same however the input is split, so it is buffered and compressed once, at the end.
+   */
+  var EMPTY = new Uint8Array(0);
+  var CODEC_OPS = { write: 0, flush: 1, finish: 2 };
+  var DEFLATE_OPS = { write: 0, flush: 3, finish: 4 };
+
   function streamClass(name, format, compress) {
+    if (streamClasses[name]) return streamClasses[name];
+    var streamModule = requireBuiltin('stream');
+    var Transform = streamModule && streamModule.Transform;
+    if (typeof Transform !== 'function') throw new Error('zlib streams need the stream module');
+
+    var incremental = isCodecFormat(format) && compress;
+    var ops = incremental ? CODEC_OPS : DEFLATE_OPS;
+
+    function openCodec(self) {
+      if (self._owcStream) return self._owcStream;
+      var args = { format: format };
+      if (self._owcParams !== undefined) args.params = self._owcParams;
+      if (self._owcChunkSize !== undefined) args.chunkSize = self._owcChunkSize;
+      self._owcStream = callCap('zlib.streamOpen', args);
+      return self._owcStream;
+    }
+
+    function closeCodec(self) {
+      if (!self._owcStream) return;
+      var id = self._owcStream;
+      self._owcStream = 0;
+      try {
+        callCap('zlib.streamClose', { id: id });
+      } catch (err) { /* the context is gone with the stream either way */ }
+    }
+
+    function pushCodec(self, op, bytes) {
+      var encoded = callCap('zlib.streamWrite', { id: openCodec(self), data: toBase64(bytes), op: op });
+      var out = fromBase64(encoded);
+      if (out.length > 0) self.push(Buf.from(out.buffer));
+    }
     if (streamClasses[name]) return streamClasses[name];
     var streamModule = requireBuiltin('stream');
     var Transform = streamModule && streamModule.Transform;
@@ -323,6 +367,8 @@ BF['zlib'] = function () {
       self._owcDictionary = dictionaryOption(options);
       self._owcParams = codecParamsOption(format, compress, options);
       self._owcChunkSize = chunkOption(format, options);
+      self._owcStream = 0;
+      self._owcEnded = false;
       self.bytesWritten = 0;
       return self;
     }
@@ -333,25 +379,46 @@ BF['zlib'] = function () {
 
     ZlibStream.prototype._transform = function (chunk, encoding, callback) {
       var bytes = typeof chunk === 'string' ? encodeString(chunk, encoding) : inputBytes(chunk, 'chunk', CHUNK_INPUT, false);
-      // Copied now: the caller may reuse its buffer before the stream ends.
-      this._owcChunks.push(bytes.slice(0));
       this.bytesWritten += bytes.length;
-      callback();
-    };
-
-    ZlibStream.prototype._flush = function (callback) {
-      var out;
+      if (!incremental) {
+        // Copied now: the caller may reuse its buffer before the stream ends.
+        this._owcChunks.push(bytes.slice(0));
+        callback();
+        return;
+      }
       try {
-        var input = concatBytes(this._owcChunks);
-        this._owcChunks = [];
-        out = runZlib(format, compress, input, this._owcLevel, this._owcDictionary, this._owcParams,
-          this._owcChunkSize, true);
+        pushCodec(this, ops.write, bytes);
       } catch (err) {
         callback(err);
         return;
       }
-      if (out.length > 0) this.push(out);
       callback();
+    };
+
+    ZlibStream.prototype._flush = function (callback) {
+      this._owcEnded = true;
+      var out;
+      try {
+        if (incremental) pushCodec(this, ops.finish, EMPTY);
+        else {
+          var input = concatBytes(this._owcChunks);
+          this._owcChunks = [];
+          out = runZlib(format, compress, input, this._owcLevel, this._owcDictionary, this._owcParams,
+            this._owcChunkSize, true);
+          if (out.length > 0) this.push(out);
+        }
+      } catch (err) {
+        closeCodec(this);
+        callback(err);
+        return;
+      }
+      closeCodec(this);
+      callback();
+    };
+
+    ZlibStream.prototype._destroy = function (err, callback) {
+      closeCodec(this);
+      if (typeof callback === 'function') callback(err);
     };
 
     ZlibStream.prototype.params = function (level, strategy, callback) {
@@ -360,12 +427,34 @@ BF['zlib'] = function () {
     };
 
     ZlibStream.prototype.reset = function () {
+      closeCodec(this);
       this._owcChunks = [];
+      this._owcEnded = false;
       this.bytesWritten = 0;
     };
 
+    // A flush is a call of its own against the codec, and what it produces reaches the readable side
+    // before the stream continues, as in Node. Past the end there is nothing left to flush.
     ZlibStream.prototype.flush = function (kind, callback) {
       var done = typeof kind === 'function' ? kind : callback;
+      if (typeof kind !== 'number') kind = ops.flush;
+      if (this._owcEnded) {
+        if (typeof done === 'function') this.once('end', done);
+        return;
+      }
+      if (!incremental) {
+        if (typeof done === 'function') setImmediateImpl(done);
+        return;
+      }
+      try {
+        pushCodec(this, kind, EMPTY);
+      } catch (err) {
+        if (typeof done === 'function') {
+          var fail = done;
+          setImmediateImpl(function () { fail(err); });
+        }
+        return;
+      }
       if (typeof done === 'function') setImmediateImpl(done);
     };
 

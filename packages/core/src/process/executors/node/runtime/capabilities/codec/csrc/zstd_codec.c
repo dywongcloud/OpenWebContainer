@@ -224,6 +224,138 @@ size_t owc_zstd_error_code(size_t result) {
     return (size_t)ZSTD_getErrorCode(result);
 }
 
+/*
+ * Streaming: a context the host keeps between calls, fed exactly the way Node feeds its own.
+ *
+ * A stream cannot be a one-shot call: Node hands each write to the library separately and only
+ * finishes at the end, and a `flush()` in between is a call of its own. Those calls are visible in
+ * the bytes -- zstd ends a block, or a whole frame, where the stream was flushed -- so the only way
+ * to match Node is to keep the context and make the same calls.
+ *
+ * `chunk` is Node's `chunkSize`: the size of the output buffer it hands the library, and `used`
+ * Node's own offset into that buffer, which survives from one write to the next until the buffer
+ * fills. Both are kept because how much room the library gets per call can show in the output.
+ */
+typedef struct {
+    ZSTD_CCtx *cctx;
+    uint8_t *out;
+    size_t chunk;
+    size_t used;
+} owc_zstd_stream;
+
+owc_zstd_stream *owc_zstd_stream_new(const uint32_t *params, size_t param_count, size_t chunk_size,
+                                    uint32_t *result) {
+    owc_zstd_stream *s;
+    size_t i;
+    result[0] = 0;
+    result[1] = 0;
+    result[2] = 0;
+    s = (owc_zstd_stream *)malloc(sizeof(owc_zstd_stream));
+    if (!s) return 0;
+    s->cctx = ZSTD_createCCtx();
+    if (!s->cctx) {
+        free(s);
+        return 0;
+    }
+    s->chunk = chunk_size == 0 ? OWC_ZSTD_DEFAULT_CHUNK : chunk_size;
+    if (s->chunk < 64) s->chunk = 64;
+    s->used = 0;
+    s->out = (uint8_t *)malloc(s->chunk ? s->chunk : 1);
+    if (!s->out) {
+        ZSTD_freeCCtx(s->cctx);
+        free(s);
+        return 0;
+    }
+    for (i = 0; i < param_count; i++) {
+        ZSTD_bounds bounds = ZSTD_cParam_getBounds((ZSTD_cParameter)params[i * 2]);
+        size_t rc;
+        if (bounds.error) {
+            ZSTD_freeCCtx(s->cctx);
+            free(s->out);
+            free(s);
+            return 0;
+        }
+        rc = ZSTD_CCtx_setParameter(s->cctx, (ZSTD_cParameter)params[i * 2], (int)params[i * 2 + 1]);
+        if (ZSTD_isError(rc)) {
+            result[2] = (uint32_t)rc;
+            ZSTD_freeCCtx(s->cctx);
+            free(s->out);
+            free(s);
+            return 0;
+        }
+    }
+    return s;
+}
+
+void owc_zstd_stream_free(owc_zstd_stream *s) {
+    if (!s) return;
+    ZSTD_freeCCtx(s->cctx);
+    free(s->out);
+    free(s);
+}
+
+/*
+ * One write, or one flush, or the finish: the same loop Node's `processChunk` runs over one chunk.
+ * `op` is the ZSTD_EndDirective. The bytes produced by this call are returned as one buffer, which
+ * the caller frees; they are copied out because Node's buffer is handed on and replaced.
+ */
+int owc_zstd_stream_write(owc_zstd_stream *s, const uint8_t *in, size_t in_len, size_t op, uint32_t *result) {
+    const uint8_t *next_in = in;
+    size_t avail_in = in_len;
+    uint8_t *acc;
+    size_t acc_cap;
+    size_t acc_len = 0;
+    result[0] = 0;
+    result[1] = 0;
+    result[2] = 0;
+    acc_cap = s->chunk + 64;
+    acc = (uint8_t *)malloc(acc_cap);
+    if (!acc) return RES_NOMEM;
+    for (;;) {
+        ZSTD_inBuffer input;
+        ZSTD_outBuffer output;
+        size_t avail_out = s->chunk - s->used;
+        size_t avail_out_after;
+        size_t remaining;
+        input.src = next_in;
+        input.size = avail_in;
+        input.pos = 0;
+        output.dst = s->out + s->used;
+        output.size = avail_out;
+        output.pos = 0;
+        remaining = ZSTD_compressStream2(s->cctx, &output, &input, (ZSTD_EndDirective)op);
+        if (output.pos > 0) {
+            if (acc_len + output.pos > acc_cap) {
+                uint8_t *bigger = (uint8_t *)realloc(acc, acc_cap + output.pos + s->chunk);
+                if (!bigger) {
+                    free(acc);
+                    return RES_NOMEM;
+                }
+                acc = bigger;
+                acc_cap += output.pos + s->chunk;
+            }
+            memcpy(acc + acc_len, s->out + s->used, output.pos);
+            acc_len += output.pos;
+        }
+        s->used += output.pos;
+        next_in += input.pos;
+        avail_in -= input.pos;
+        if (ZSTD_isError(remaining)) {
+            free(acc);
+            result[2] = (uint32_t)remaining;
+            return RES_COMPRESS;
+        }
+        avail_out_after = avail_out - output.pos;
+        /* Node replaces the buffer once it is full, and keeps going while the last call filled it. */
+        if (avail_out_after == 0 || s->used >= s->chunk) s->used = 0;
+        if (avail_out_after == 0) continue;
+        break;
+    }
+    result[0] = (uint32_t)(uintptr_t)acc;
+    result[1] = (uint32_t)acc_len;
+    return RES_OK;
+}
+
 const char *owc_zstd_error_name(size_t code) {
     return ZSTD_getErrorName(code);
 }
