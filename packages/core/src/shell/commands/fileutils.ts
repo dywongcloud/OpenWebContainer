@@ -1094,13 +1094,11 @@ function deleteEntry(ctx: CommandContext, entry: Entry, env: EvalEnv): EvalOutco
     }
     try {
         if (entry.type === 'dir') {
+            // The measured host (BSD) leaves a still-populated directory in place without a word
+            // and without failing, so `-delete` on it is true; GNU calls it "Directory not empty"
+            // and exits 1. This module follows the host where the two disagree.
             if (dirEntries(ctx.fs, entry.path).length > 0) {
-                return {
-                    stdout: '',
-                    stderr: `find: -delete: ${entry.shown}: Directory not empty\n`,
-                    exitCode: 1,
-                    truth: false
-                };
+                return { stdout: '', stderr: '', exitCode: 0, truth: true };
             }
             ctx.fs.deleteDirectory(entry.path);
         } else {
