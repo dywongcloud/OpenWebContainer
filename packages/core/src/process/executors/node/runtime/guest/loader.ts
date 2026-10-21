@@ -59,19 +59,34 @@ function moduleNotFound(id, parent) {
 
 /* Why a resolve found nothing, when the reason is not a plain missing file: a package whose
    "exports" map defines no such subpath, which Node reports as ERR_PACKAGE_PATH_NOT_EXPORTED in
-   require() as well as in import(), naming the package.json that defines the map; or an exports
-   target that names a file which is not there, which Node names by that path. */
+   require() as well as in import(), naming the package.json that defines the map; a name no
+   "imports" map defines, which is ERR_PACKAGE_IMPORT_NOT_DEFINED; or an exports target that names a
+   file which is not there, which Node names by that path. A subpath a package's own "exports" does
+   not define is the one case Node also names the file that asked for -- an 'imported from' tail a
+   subpath of a package under node_modules does not carry. */
 function notFoundError(id, fromDir, parent) {
   var info = null;
   try { info = JSON.parse(host.resolveFailure(String(id), fromDir, 'require')); } catch (e) { info = null; }
   if (info === null || typeof info !== 'object') return moduleNotFound(id, parent);
   if (info.kind === 'not-exported') {
-    var err = new Error("Package subpath '" + info.subpath + "' is not defined by \"exports\" in " + info.packageDir + '/package.json');
+    var from = info.self ? ' imported from ' + (parent && parent.filename ? parent.filename : fromDir) : '';
+    var err = new Error("Package subpath '" + info.subpath + "' is not defined by \"exports\" in " + info.packageDir + '/package.json' + from);
     err.code = 'ERR_PACKAGE_PATH_NOT_EXPORTED';
     return err;
   }
+  if (info.kind === 'import-not-defined') {
+    var e2 = new TypeError("Package import specifier \"" + info.specifier + "\" is not defined in package " + info.packageDir + '/package.json imported from ' + importFromOf(parent, fromDir));
+    e2.code = 'ERR_PACKAGE_IMPORT_NOT_DEFINED';
+    return e2;
+  }
   if (info.kind === 'missing' && typeof info.file === 'string') return moduleNotFound(info.file, parent);
   return moduleNotFound(id, parent);
+}
+
+/* The file a require or a resolve failure names as the one that asked: a require with no module
+   behind it has no file, and Node then names the directory it resolved from. */
+function importFromOf(parent, fromDir) {
+  return parent && parent.filename ? parent.filename : fromDir;
 }
 
 /* The file whose code is running, for the one piece of code that carries no file of its own: a
@@ -475,15 +490,26 @@ function createReplRequire(directory) {
 var IMPORT_META = Object.create(null);
 var ATTRIBUTE_MISSING = '\u0001owc-attr-missing';
 
+/* A data URL is already a URL: 'file://' is not put in front of one, in import.meta.url or in an
+   import attribute message. */
 function fileUrlOf(p) {
+  if (p.indexOf('data:') === 0) return p;
   return 'file://' + encodeURI(p).replace(/\?/g, '%3F').replace(/#/g, '%23');
 }
 
 /* The query and fragment a specifier carries into the module it names, '' when it carries none:
    './m.mjs?x=1#f' is '?x=1#f'. A bare specifier carries none -- its query is part of a subpath --
-   which is why 'pkg/sub?x=1' is a subpath no "exports" map defines rather than 'pkg/sub'. */
+   which is why 'pkg/sub?x=1' is a subpath no "exports" map defines rather than 'pkg/sub'. A file:
+   URL carries them as a URL does; a data: URL carries none, its text being the module. */
 function urlSuffixOf(spec) {
-  var hash = spec.indexOf('#');
+  if (spec.indexOf('file:') === 0) {
+    var hash = spec.indexOf('#');
+    var query = spec.indexOf('?');
+    var at = hash < 0 ? query : query < 0 ? hash : Math.min(query, hash);
+    return at < 0 ? '' : spec.slice(at);
+  }
+  if (spec.indexOf('data:') === 0) return '';
+  var h = spec.indexOf('#');
   var noFragment = hash < 0 ? spec : spec.slice(0, hash);
   var query = noFragment.indexOf('?');
   var bare = query < 0 ? noFragment : noFragment.slice(0, query);
@@ -507,13 +533,38 @@ function importMetaOf(filename, isMain, urlSuffix) {
   meta.resolve = function resolve(specifier) {
     var spec = String(specifier);
     if (isBuiltinName(spec)) return 'node:' + stripNodePrefix(spec);
-    var found = host.resolve(spec, dirnameOf(filename), 'import');
-    if (!found) {
-      var err = new Error("Cannot find module '" + spec + "' imported from " + filename);
-      err.code = 'ERR_MODULE_NOT_FOUND';
-      throw err;
+    /* Node's import.meta.resolve does not look at the file system: a specifier that names a path or
+       a URL gets its URL back whether or not the file is there. Only a specifier that names no URL
+       at all fails, with the reason the resolve gives. */
+    var url = host.resolveMeta(spec, dirnameOf(filename));
+    if (url !== '') return url;
+    var info = null;
+    try { info = JSON.parse(host.resolveFailure(spec, dirnameOf(filename), 'import')); } catch (e) { info = null; }
+    if (info !== null && typeof info === 'object') {
+      if (info.kind === 'not-exported') {
+        var e1 = new Error("Package subpath '" + info.subpath + "' is not defined by \"exports\" in " + info.packageDir + '/package.json imported from ' + filename);
+        e1.code = 'ERR_PACKAGE_PATH_NOT_EXPORTED';
+        throw e1;
+      }
+      if (info.kind === 'import-not-defined') {
+        var e2 = new TypeError("Package import specifier \"" + info.specifier + "\" is not defined in package " + info.packageDir + '/package.json imported from ' + filename);
+        e2.code = 'ERR_PACKAGE_IMPORT_NOT_DEFINED';
+        throw e2;
+      }
+      if (info.kind === 'bad-file-url') {
+        var e3 = info.ctor === 'URIError' ? new URIError(info.message) : new TypeError(info.message);
+        if (info.code !== '') e3.code = info.code;
+        throw e3;
+      }
+      if (info.target === 'package') {
+        var e4 = new Error("Cannot find package '" + info.name + "' imported from " + filename);
+        e4.code = 'ERR_MODULE_NOT_FOUND';
+        throw e4;
+      }
     }
-    return fileUrlOf(found) + urlSuffixOf(spec);
+    var err = new Error("Cannot find module '" + spec + "' imported from " + filename);
+    err.code = 'ERR_MODULE_NOT_FOUND';
+    throw err;
   };
   IMPORT_META[key] = meta;
   return meta;
@@ -539,7 +590,8 @@ function errorModuleOf(info) {
 function importArgOf(spec, options, filename) {
   var s = String(spec);
   var attrs = options && typeof options === 'object' && options.with && typeof options.with === 'object' ? options.with : null;
-  var isJson = s.slice(-5) === '.json';
+  /* JSON is named by a .json path, and by a data: URL whose media type is application/json. */
+  var isJson = s.slice(-5) === '.json' || /^data:application\/json[,;]/.test(s.toLowerCase());
   var url = importUrlOf(s, filename);
   if (attrs !== null && url !== undefined) {
     var keys = Object.keys(attrs);

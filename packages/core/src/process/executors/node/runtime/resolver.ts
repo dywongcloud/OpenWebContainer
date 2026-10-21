@@ -7,9 +7,14 @@ export type ResolveMode = 'require' | 'import';
  * reports as ERR_PACKAGE_PATH_NOT_EXPORTED rather than as a missing module; a specifier that names
  * no file is the other, and `target` says whether the package directory itself was absent -- Node
  * names that one 'Cannot find package' -- or only the file inside it was.
+ *
+ * `self` marks a subpath the package's *own* "exports" map does not define, which Node names
+ * differently from a subpath of a package under node_modules: it appends the file that asked.
  */
 export type ResolveFailure =
-    | { kind: 'not-exported'; packageDir: string; subpath: string }
+    | { kind: 'not-exported'; packageDir: string; subpath: string; self?: boolean }
+    | { kind: 'import-not-defined'; packageDir: string; specifier: string }
+    | { kind: 'bad-file-url'; ctor: 'TypeError' | 'URIError'; code: string; message: string }
     | { kind: 'missing'; target: 'package' | 'module'; name?: string; file?: string };
 
 export type ResolveResult = { kind: 'file'; file: string } | ResolveFailure;
@@ -127,9 +132,20 @@ export class NodeResolver {
     private lastFailure: ResolveFailure | undefined;
 
     resolve(specifier: string, fromDir: string, mode: ResolveMode): string | undefined {
+        /* An absolute URL is its own module, not a package name: `file:` and `data:` are the two the
+           default ESM loader reads. require() reads neither -- Node reports
+           'Cannot find module "file:///a.cjs"' for one -- so this is import-only. */
+        if (mode === 'import') {
+            const scheme = urlSchemeOf(specifier);
+            if (scheme === 'data:') {
+                this.lastFailure = undefined;
+                return specifier;
+            }
+            if (scheme === 'file:') return this.resolveFileUrl(specifier);
+        }
         const spec = specifierToResolve(specifier, mode);
         // a trailing slash names a directory, which an ES module specifier may not import
-        if (mode === 'import' && spec.endsWith('/')) return undefined;
+        if (mode === 'import' && spec.endsWith('/') && isPathSpecifier(spec)) return undefined;
         if (spec.startsWith('/')) {
             return this.resolveAsPath(normalizeAbsolute(spec), mode, mode === 'import');
         }
@@ -154,20 +170,65 @@ export class NodeResolver {
         return this.lastFailure ?? { kind: 'missing', target: 'module' };
     }
 
-    /** `#name` specifiers resolve through the "imports" map of the nearest package.json. */
+    /**
+     * `#name` specifiers resolve through the "imports" map of the nearest package.json, which is the
+     * only package.json Node looks at: one that defines no such name is
+     * ERR_PACKAGE_IMPORT_NOT_DEFINED (in import(); require() reports a plain missing module), and a
+     * nested package never falls back to the "imports" of a package above it.
+     */
     private resolveImportsField(specifier: string, fromDir: string, mode: ResolveMode): string | undefined {
-        let dir = normalizeAbsolute(fromDir);
-        while (true) {
-            const pkg = this.readPackageJson(dir);
-            if (pkg) {
-                const target = resolveImportsTarget(pkg.imports, specifier, mode);
-                if (target === undefined) return undefined;
-                const resolved = normalizeAbsolute(joinPaths(dir, target));
-                return this.fileSystem.statPath(resolved)?.type === 'file' ? resolved : this.resolveAsPath(resolved, mode);
+        const scope = this.nearestPackageScope(fromDir);
+        if (scope === undefined) return undefined;
+        const target = resolveImportsTarget(scope.pkg.imports, specifier, mode);
+        if (target === undefined) {
+            /* import() always reports ERR_PACKAGE_IMPORT_NOT_DEFINED; require() reports it only for
+               a package.json that has an "imports" map at all, and a plain missing module for one
+               that has none. */
+            if (mode === 'import' || scope.pkg.imports !== undefined) {
+                this.lastFailure = { kind: 'import-not-defined', packageDir: scope.dir, specifier };
             }
-            if (dir === '/') return undefined;
-            dir = dirnameOf(dir);
+            return undefined;
         }
+        const resolved = normalizeAbsolute(joinPaths(scope.dir, target));
+        return this.fileSystem.statPath(resolved)?.type === 'file' ? resolved : this.resolveAsPath(resolved, mode);
+    }
+
+    /**
+     * The file a `file:` URL specifier names. Node reads one as a URL, not as a package name: the
+     * host must be empty or localhost, the percent-encoded path names the file itself -- no
+     * extension is added, no index is read -- and a path it cannot decode is a URIError.
+     */
+    private resolveFileUrl(specifier: string): string | undefined {
+        const url = readFileUrl(specifier);
+        if (url.kind === 'failure') {
+            this.lastFailure = url.failure;
+            return undefined;
+        }
+        const found = this.resolveAsPath(url.path, 'import', true);
+        if (found === undefined) this.lastFailure = { kind: 'missing', target: 'module', file: url.path };
+        return found;
+    }
+
+    /**
+     * The URL `import.meta.resolve` reports, or undefined when no URL can be built for the
+     * specifier. Unlike resolve() this never looks at the file system: Node reports the URL a
+     * relative or absolute specifier names whether or not the file is there.
+     */
+    resolveUrlForMeta(specifier: string, fromDir: string): string | undefined {
+        const scheme = urlSchemeOf(specifier);
+        if (scheme === 'data:') return specifier;
+        const suffix = urlSuffixOf(specifier);
+        if (scheme === 'file:') {
+            const url = readFileUrl(specifier);
+            if (url.kind === 'failure') return undefined;
+            return fileUrlOf(url.path) + suffix;
+        }
+        const spec = specifierToResolve(specifier, 'import');
+        if (spec.startsWith('/')) return fileUrlOf(normalizeAbsolute(spec)) + suffix;
+        if (isRelativeSpecifier(spec)) return fileUrlOf(normalizeAbsolute(joinPaths(fromDir, spec))) + suffix;
+        const file = this.resolve(specifier, fromDir, 'import');
+        if (file === undefined) return undefined;
+        return file.startsWith('data:') ? file : fileUrlOf(file) + suffix;
     }
 
     isESM(file: string): boolean {
@@ -217,6 +278,15 @@ export class NodeResolver {
 
     private resolvePackage(specifier: string, fromDir: string, mode: ResolveMode): string | undefined {
         const { name, subpath } = splitPackageSpecifier(specifier);
+        /* Self-reference: a package may import a subpath of itself by its own name, which Node
+           resolves through the "exports" of the nearest package.json rather than by looking for the
+           package under node_modules. It applies only when that package.json has an "exports" map
+           and its "name" is the one the specifier names; otherwise the lookup falls through, which
+           is why 'app' from a nested package that names itself something else is not found. */
+        const scope = this.nearestPackageScope(fromDir);
+        if (scope !== undefined && scope.pkg.exports !== undefined && scope.pkg.name === name) {
+            return this.resolvePackageDirectory(scope.dir, subpath, mode, true);
+        }
         let dir = normalizeAbsolute(fromDir);
         while (true) {
             if (!dir.endsWith('/node_modules')) {
@@ -233,12 +303,12 @@ export class NodeResolver {
         }
     }
 
-    private resolvePackageDirectory(packageDir: string, subpath: string, mode: ResolveMode): string | undefined {
+    private resolvePackageDirectory(packageDir: string, subpath: string, mode: ResolveMode, self = false): string | undefined {
         const pkg = this.readPackageJson(packageDir);
         if (pkg && pkg.exports !== undefined) {
             const target = resolveExportsTarget(pkg.exports, subpath, mode);
             if (target === undefined) {
-                this.lastFailure = { kind: 'not-exported', packageDir, subpath };
+                this.lastFailure = { kind: 'not-exported', packageDir, subpath, self };
                 return undefined;
             }
             const resolved = normalizeAbsolute(joinPaths(packageDir, target));
@@ -251,6 +321,17 @@ export class NodeResolver {
         }
         if (subpath === '.') return this.resolveAsPath(packageDir, mode);
         return this.resolveAsPath(normalizeAbsolute(joinPaths(packageDir, subpath)), mode);
+    }
+
+    /** The nearest package.json at or above `dir`, with the directory that holds it. */
+    private nearestPackageScope(dir: string): { dir: string; pkg: Record<string, any> } | undefined {
+        let current = normalizeAbsolute(dir);
+        while (true) {
+            const pkg = this.readPackageJson(current);
+            if (pkg) return { dir: current, pkg };
+            if (current === '/') return undefined;
+            current = dirnameOf(current);
+        }
     }
 
     private readPackageJson(dir: string): Record<string, any> | undefined {
@@ -317,7 +398,73 @@ function decodePathOf(path: string): string {
  * identity, so './m.mjs?x=1' and './m.mjs' are two modules. A bare specifier carries none: its
  * query is part of a subpath, which is why 'pkg/sub?x=1' is a subpath no "exports" map defines.
  */
+/**
+ * The scheme of a URL specifier -- 'file:', 'data:', 'http:' -- or undefined for a path, a relative
+ * specifier or a bare package name. A package name can hold no colon, so the two never mix.
+ */
+export function urlSchemeOf(specifier: string): string | undefined {
+    const match = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(specifier);
+    return match === null ? undefined : match[1].toLowerCase() + ':';
+}
+
+/** The path and host of a `file:` URL, or the failure Node reports for one it cannot read. */
+export type FileUrl =
+    | { kind: 'path'; path: string }
+    | { kind: 'failure'; failure: Extract<ResolveFailure, { kind: 'bad-file-url' }> };
+
+/**
+ * Reads a `file:` URL the way Node does: the host may only be empty or localhost -- any other is
+ * ERR_INVALID_FILE_URL_HOST -- and the path is the percent-decoded pathname, a path it cannot
+ * decode being a URIError rather than a missing file.
+ */
+export function readFileUrl(specifier: string): FileUrl {
+    let url: URL;
+    try {
+        url = new URL(withoutUrlSuffix(specifier));
+    } catch {
+        return { kind: 'failure', failure: { kind: 'bad-file-url', ctor: 'TypeError', code: 'ERR_INVALID_URL', message: 'Invalid URL' } };
+    }
+    const host = url.hostname;
+    /* The guest's process.platform is linux (guest/globals.ts), so the host Node names in this
+       message is the one the container reports rather than the machine it runs on. */
+    if (host !== '' && host !== 'localhost') {
+        return {
+            kind: 'failure',
+            failure: {
+                kind: 'bad-file-url',
+                ctor: 'TypeError',
+                code: 'ERR_INVALID_FILE_URL_HOST',
+                message: `File URL host must be "localhost" or empty on linux`
+            }
+        };
+    }
+    try {
+        return { kind: 'path', path: normalizeAbsolute(decodeURIComponent(url.pathname)) };
+    } catch {
+        return { kind: 'failure', failure: { kind: 'bad-file-url', ctor: 'URIError', code: '', message: 'URI malformed' } };
+    }
+}
+
+/** The `file://` URL of a path: '?' and '#' are escaped, since they begin a query or a fragment. */
+export function fileUrlOf(path: string): string {
+    return 'file://' + encodeURI(path).replace(/\?/g, '%3F').replace(/#/g, '%23');
+}
+
+/** The text after the first ',' of a data URL, with its percent escapes decoded. A stray `%` Node
+ *  cannot decode is left as it stands: what it builds is then a source that does not parse. */
+export function percentDecode(text: string): string {
+    try {
+        return decodeURIComponent(text);
+    } catch {
+        return text;
+    }
+}
+
 export function urlSuffixOf(specifier: string): string {
+    if (urlSchemeOf(specifier) === 'file:') {
+        const bare = withoutUrlSuffix(specifier);
+        return bare === specifier ? '' : specifier.slice(bare.length);
+    }
     const bare = withoutUrlSuffix(specifier);
     if (bare === specifier) return '';
     if (!bare.startsWith('/') && !isRelativeSpecifier(bare)) return '';

@@ -113,6 +113,13 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         const detail = deps.resolver.resolveDetailed(text(specifier), text(fromDir), text(mode) as ResolveMode);
         return context.newString(detail.kind === 'file' ? '' : JSON.stringify(detail));
     });
+    /* The URL import.meta.resolve reports, or '' when the specifier names no URL at all. It does
+       not look at the file system, the way Node's does not: './nope.mjs' names a URL whether or not
+       the file is there. */
+    define('resolveMeta', (specifier, fromDir) => {
+        const url = deps.resolver.resolveUrlForMeta(text(specifier), text(fromDir));
+        return context.newString(url ?? '');
+    });
     define('isESM', (file) => (deps.resolver.isESM(text(file)) ? context.true : context.false));
     define('readText', (path) => nullable(safeRead(() => deps.fileSystem.readFile(text(path)))));
     define('readBase64', (path) => nullable(safeRead(() => {

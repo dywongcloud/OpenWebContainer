@@ -1,11 +1,12 @@
 import { IFileSystem } from '../../../filesystem';
 import { NetworkManager } from '../../../network/manager';
+import { base64ToBytes } from '../../../utils/bytes';
 import { Process, ProcessEvent, ProcessState, ProcessType, processOf } from '../../base';
 import { QuickJSAsyncWASMModule, QuickJSContext, QuickJSHandle, QuickJSRuntime, newQuickJSAsyncWASMModuleFromVariant } from 'quickjs-emscripten';
 import variant from "@jitl/quickjs-singlefile-browser-release-asyncify"
 import { BOOTSTRAP_SRC } from './runtime/bootstrap';
 import { installHostBridge } from './runtime/host-bridge';
-import { NodeResolver, dirnameOf, isPathSpecifier, joinPaths, normalizeAbsolute, urlSuffixOf, withoutUrlSuffix } from './runtime/resolver';
+import { NodeResolver, dirnameOf, isPathSpecifier, joinPaths, normalizeAbsolute, percentDecode, readFileUrl, urlSchemeOf, urlSuffixOf, withoutUrlSuffix } from './runtime/resolver';
 import { RuntimeServices } from './runtime/services';
 import { CapabilityContext, CapabilityEnvelope } from './runtime/capabilities/types';
 import { errorEnvelope, invokeAsync, invokeSync, invokeSyncBytes, invokeSyncMaybe } from './runtime/capabilities/dispatch';
@@ -421,15 +422,19 @@ export class NodeProcess extends Process {
     async execute(): Promise<void> {
         let code = 1;
         try {
-            if (this.flagAnswer !== undefined) {
-                // `node --version`, `node --nope`: the answer is the flags', and no guest is booted
-                code = this.answerFlags();
-            } else {
+            if (this.flagAnswer === undefined) {
                 this.claimParentTerminal();
                 const entryPath = await this.bootGuest();
                 this.startEntryGated(entryPath);
                 await this.runEventLoop();
                 code = this.finishProcess();
+            } else if (this.flagAnswer.check === undefined) {
+                // `node --version`, `node --nope`: the answer is the flags', and no guest is booted
+                code = this.answerFlags();
+            } else {
+                /* `node --check <file>` boots no guest either, but the parse needs an engine, and
+                   this one is dropped as soon as the file has been through it. */
+                code = this.answerFlags(await newQuickJSAsyncWASMModuleFromVariant(variant));
             }
         } catch (error) {
             code = this.handleFatal(error);
@@ -447,13 +452,127 @@ export class NodeProcess extends Process {
     /**
      * Writes the answer `node` gave for a line of its own flags and returns the status that answer
      * carries. Nothing of the guest exists on such a run: no runtime was built, no file resolved,
-     * so there is nothing to boot, to drain or to dispose.
+     * so there is nothing to boot, to drain or to dispose -- except a `--check`, which borrows an
+     * engine to parse the file with and hands it straight back.
      */
-    private answerFlags(): number {
+    private answerFlags(quickJs?: QuickJSAsyncWASMModule): number {
         const answer = this.flagAnswer!;
         if (answer.stdout !== undefined) this.emitOutput(answer.stdout);
         if (answer.stderr !== undefined) this.emitError(answer.stderr);
-        return answer.exitCode;
+        return answer.check === undefined ? answer.exitCode : this.checkSyntax(quickJs, answer.check);
+    }
+
+    /**
+     * `node --check <file>`: the file is parsed and nothing in it is run, the way node reads it.
+     * A file that parses leaves the run silent and exits 0; one that does not is reported the way
+     * node reports a syntax error -- the file and line, the offending line, a caret under the
+     * token, and the SyntaxError with its stack -- and exits 1.
+     *
+     * The message is the one the engine that parses here gives, which is QuickJS's wording and not
+     * V8's: `unexpected token in expression: ';'` where node says `Unexpected token ';'`. The shape
+     * is node's; the words cannot be, short of shipping V8 to parse with.
+     */
+    private checkSyntax(quickJs: QuickJSAsyncWASMModule | undefined, file: string): number {
+        if (quickJs === undefined) throw new Error('no QuickJS module is loaded');
+        let found: { path: string; source: string } | undefined;
+        try {
+            const path = this.resolvePath(file);
+            const source = this.fileSystem.readFile(path);
+            found = source === undefined ? undefined : { path, source };
+        } catch {
+            found = undefined;
+        }
+        if (found === undefined) {
+            /* A specifier that is not a path stays as it was written -- node's own message for
+               `node -- -e` is `Cannot find module '-e'` -- where a path is named resolved. */
+            const named = file.startsWith('-') && !file.includes('/')
+                ? file
+                : normalizeAbsolute(joinPaths(this.currentCwd, file));
+            this.emitError(`Error: Cannot find module '${named}'\n`);
+            return 1;
+        }
+        const { path, source } = found;
+        /* The body is compiled in the wrapper the loader wraps it in, so a check and a run agree on
+           what parses: the wrapper is a function expression, and the engine compiles one without
+           calling it -- nothing in the file runs. A `#!` line is commented out rather than cut, so
+           every line after it keeps its number. */
+        const prefix = '(function (exports, require, module, __filename, __dirname) {';
+        const body = source.replace(/^#!.*/, '//');
+        const runtime = quickJs.newRuntime();
+        const context = runtime.newContext();
+        try {
+            const result = context.evalCode(prefix + body + '\n})', path, { type: 'global' });
+            if (result.error === undefined) {
+                result.value.dispose();
+                return 0;
+            }
+            /* A file node reads as an ES module is parsed in the module goal, which this wrapper
+               cannot hold: `import` is a syntax error in one goal and the point of the file in the
+               other. One that parses there is not a syntax error, whatever the wrapper said. */
+            if (this.resolver.isESM(path) && this.moduleGoalParses(quickJs, body, path)) {
+                result.error.dispose();
+                return 0;
+            }
+            this.emitError(this.syntaxErrorReport(context, result.error, path, source, prefix.length));
+            result.error.dispose();
+            return 1;
+        } finally {
+            context.dispose();
+            runtime.dispose();
+        }
+    }
+
+    /**
+     * Whether `source` parses in the module goal, asked without running any of it: a throwaway
+     * runtime answers a probe module that imports the file and then one that fails to load, so the
+     * probe never links and nothing is evaluated. Only a SyntaxError means the source does not
+     * parse -- a module that merely failed to load is the stop the probe asked for.
+     */
+    private moduleGoalParses(quickJs: QuickJSAsyncWASMModule, source: string, file: string): boolean {
+        const stop = 'owc:check-stop';
+        const runtime = quickJs.newRuntime();
+        runtime.setModuleLoader((name: string) => name === file ? source : name === stop ? { error: new Error(stop) } : '');
+        const context = runtime.newContext();
+        try {
+            const probe = `import ${JSON.stringify(file)};\nimport ${JSON.stringify(stop)};\n`;
+            const result = context.evalCode(probe, 'owc-check.js', { type: 'module' });
+            const failure = result.error === undefined
+                ? undefined
+                : context.dump(result.error) as { name?: unknown } | undefined;
+            result.dispose();
+            return failure?.name !== 'SyntaxError';
+        } finally {
+            context.dispose();
+            runtime.dispose();
+        }
+    }
+
+    /**
+     * A syntax error as node prints one: the file and line, the line, a caret under the token, then
+     * the SyntaxError and its stack. `shifted` is what the wrapper the body was compiled in moved
+     * the first line's columns by; every line after it stands where the file put it.
+     */
+    private syntaxErrorReport(context: QuickJSContext, error: QuickJSHandle, path: string, source: string, shifted: number): string {
+        const text = (prop: string): string => {
+            const handle = context.getProp(error, prop);
+            const value = context.typeof(handle) === 'string' ? context.getString(handle) : '';
+            handle.dispose();
+            return value;
+        };
+        const number = (prop: string): number => {
+            const handle = context.getProp(error, prop);
+            const value = context.typeof(handle) === 'number' ? context.getNumber(handle) : 0;
+            handle.dispose();
+            return value;
+        };
+        const message = text('message');
+        const line = number('lineNumber') || 1;
+        const column = (number('columnNumber') || 1) - (line === 1 ? shifted : 0);
+        const stack = text('stack');
+        const lines = source.split('\n');
+        const shown = lines[Math.min(Math.max(line, 1), lines.length) - 1] ?? '';
+        const caret = ' '.repeat(Math.max(column - 1, 0)) + '^';
+        return `${path}:${line}\n${shown}\n${caret}\n\nSyntaxError: ${message}\n${stack}`;
     }
 
     protected async onTerminate(): Promise<void> {
@@ -584,12 +703,26 @@ export class NodeProcess extends Process {
         if (this.refs === 0) this.wakeIfIdle();
     }
 
-    private resolveEntry(): string {
-        const cwd = this.currentCwd;
-        const spec = this.executablePath.startsWith('/') ? this.executablePath : './' + this.executablePath;
-        const found = this.resolver.resolve(spec, cwd, 'require');
-        if (!found) throw new Error(`Cannot find module '${normalizeAbsolute(joinPaths(cwd, this.executablePath))}'`);
+    /**
+     * The file a script entry resolves to, relative to the working directory; throws what node
+     * throws when nothing is there.
+     */
+    private resolvePath(entry: string): string {
+        const spec = entry.startsWith('/') ? entry : './' + entry;
+        const found = this.resolver.resolve(spec, this.currentCwd, 'require');
+        if (found === undefined) {
+            /* An entry that is not a path is named as it was written -- node's own message for
+               `node -- -e` is `Cannot find module '-e'` -- where a path is named resolved. */
+            const named = entry.startsWith('-') && !entry.includes('/')
+                ? entry
+                : normalizeAbsolute(joinPaths(this.currentCwd, entry));
+            throw new Error(`Cannot find module '${named}'`);
+        }
         return found;
+    }
+
+    private resolveEntry(): string {
+        return this.resolvePath(this.executablePath);
     }
 
     /**
@@ -712,7 +845,7 @@ export class NodeProcess extends Process {
         try {
             // a line of node's own flags answers itself here too, as it does in an asynchronous run
             if (this.flagAnswer !== undefined) {
-                result.status = this.answerFlags();
+                result.status = this.answerFlags(this.bootModule);
                 return result;
             }
             const QuickJS = this.bootModule;
@@ -1319,6 +1452,7 @@ export class NodeProcess extends Process {
             if (moduleName.startsWith(ERROR_MODULE_PREFIX)) {
                 return { value: errorModuleSource(moduleName) };
             }
+            if (isDataUrl(moduleName)) return this.dataModule(moduleName);
             /* A module name may carry the query and fragment of the specifier that named it, which
                are part of the module's identity but not of the file it is loaded from. */
             const { path: file, suffix } = splitModuleName(moduleName);
@@ -1346,7 +1480,7 @@ export class NodeProcess extends Process {
         if (duplicate !== undefined) throw new GuestFailure(duplicate);
         const prepared = prepareEsmSource(source, file, isMain, urlSuffix, (spec) => {
             const found = this.resolver.resolve(spec, dirnameOf(file), 'import');
-            return found === undefined ? undefined : toFileUrl(found);
+            return found === undefined ? undefined : isDataUrl(found) ? found : toFileUrl(found);
         });
         if (!CLASS_ELEMENT_CANDIDATE.test(prepared)) return prepared;
         const sourceArg = this.context!.newString(prepared);
@@ -1393,6 +1527,14 @@ export class NodeProcess extends Process {
         if (spec.startsWith(ERROR_MODULE_PREFIX)) return spec;
         const bare = spec.startsWith('node:') ? spec.slice('node:'.length) : spec;
         if (this.builtinNames.has(bare)) return `builtin:${bare}`;
+        /* A data URL is its own module: the source is in the specifier, so nothing is resolved. One
+           Node cannot read becomes a module that throws the error Node throws, so a rejected import
+           carries the code user code branches on. */
+        if (isDataUrl(spec)) {
+            const failure = dataUrlFailure(spec, missingAttribute);
+            return failure === undefined ? spec
+                : ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify(failure));
+        }
         const baseDir = baseName && baseName.startsWith('/') ? dirnameOf(baseName) : this.currentCwd;
         const detail = this.resolver.resolveDetailed(spec, baseDir, 'import');
         if (detail.kind !== 'file') {
@@ -1405,6 +1547,21 @@ export class NodeProcess extends Process {
                 ), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' });
                 this.setImportFailureCode('ERR_PACKAGE_PATH_NOT_EXPORTED');
                 return { error: this.lastResolveError };
+            }
+            /* A `#name` no "imports" map defines is ERR_PACKAGE_IMPORT_NOT_DEFINED in Node, naming
+               the package.json that would have defined it; and a `file:` URL no loader can read is
+               a TypeError Node raises rather than a module that is missing. Both are raised here as
+               modules that throw, so the error keeps the constructor and code Node's has. */
+            if (detail.kind === 'import-not-defined' || detail.kind === 'bad-file-url') {
+                const isImport = detail.kind === 'import-not-defined';
+                const message = isImport
+                    ? `Package import specifier "${detail.specifier}" is not defined in package ${joinPaths(detail.packageDir, 'package.json')}${baseName ? ` imported from ${baseName}` : ''}`
+                    : detail.message;
+                return ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
+                    code: isImport ? 'ERR_PACKAGE_IMPORT_NOT_DEFINED' : detail.code,
+                    ctor: isImport ? 'TypeError' : detail.ctor,
+                    message,
+                }));
             }
             const scheme = unsupportedScheme(spec);
             // Node reports a specifier no loader can read as an unsupported scheme, one that names a
@@ -1438,7 +1595,7 @@ export class NodeProcess extends Process {
             // a .json import without `with { type: 'json' }`: evaluating the module throws ERR_IMPORT_ATTRIBUTE_MISSING
             return ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
                 code: 'ERR_IMPORT_ATTRIBUTE_MISSING',
-                message: `Module "${toFileUrl(found)}" needs an import attribute of "type: json"`,
+                message: `Module "${isDataUrl(found) ? found : toFileUrl(found)}" needs an import attribute of "type: json"`,
             }));
         }
         /* The query and fragment are part of the module's identity, not of the file it is read from:
@@ -1449,6 +1606,23 @@ export class NodeProcess extends Process {
     }
 
     /**
+     * The source of a `data:` module, built from the text the URL carries. A base64 URL is decoded
+     * as bytes; every other one is percent-decoded, since that is the text of the module.
+     */
+    private dataModule(moduleName: string): { value: string } {
+        const url = withoutUrlSuffix(moduleName);
+        const comma = url.indexOf(',');
+        const meta = url.slice(url.indexOf(':') + 1, comma).split(';');
+        const isBase64 = meta.slice(1).some(part => part.trim().toLowerCase() === 'base64');
+        const body = url.slice(comma + 1);
+        const source = isBase64
+            ? new TextDecoder().decode(base64ToBytes(body))
+            : percentDecode(body);
+        if (dataUrlMediaType(url) === 'application/json') return { value: `export default ${source};` };
+        return { value: this.esmSource(source, moduleName, false, '') };
+    }
+
+    /**
      * The path a specifier names when what it names is a directory: a trailing slash always does --
      * Node reads './m.mjs/' as a directory import even though ./m.mjs is a file -- and so does a path
      * that is one, which is how Node reports './sub?x=1' once the query is dropped. Undefined for a
@@ -1456,6 +1630,12 @@ export class NodeProcess extends Process {
      */
     private directoryImportOf(spec: string, baseDir: string): string | undefined {
         const bare = withoutUrlSuffix(spec);
+        /* A `file:` URL names a directory the way a path does, and Node reports it the same way. */
+        if (urlSchemeOf(bare) === 'file:') {
+            const url = readFileUrl(bare);
+            if (url.kind !== 'path') return undefined;
+            return bare.endsWith('/') ? url.path + '/' : this.fileSystem.statPath(url.path)?.type === 'dir' ? url.path : undefined;
+        }
         if (!isPathSpecifier(bare)) return undefined;
         const target = bare.startsWith('/') ? normalizeAbsolute(bare) : normalizeAbsolute(joinPaths(baseDir, bare));
         if (bare.endsWith('/')) return target + '/';
@@ -2187,7 +2367,10 @@ function duplicateModuleBinding(source: string, file: string): string | undefine
 /** The module source for a recorded error: evaluating it throws the error with its Node code. */
 function errorModuleSource(name: string): string {
     const info = JSON.parse(decodeURIComponent(name.slice(ERROR_MODULE_PREFIX.length))) as { code: string; message: string; ctor?: string; exports?: string[] };
-    const ctor = info.ctor === 'Error' ? 'Error' : 'TypeError';
+    /* The constructor Node builds the error with, which user code reads as `err.name`: most loader
+       errors are TypeErrors, but an unknown module format is a RangeError and a path a URL cannot
+       decode is a URIError, and neither is recoverable from a plain Error. */
+    const ctorName = info.ctor === 'TypeError' || info.ctor === 'RangeError' || info.ctor === 'URIError' ? info.ctor : 'Error';
     // the default export, and every name the importing declaration binds, exist so that a static
     // import links; evaluation of the module then throws, which is where Node raises these errors
     let source = 'export default undefined;\n';
@@ -2196,7 +2379,48 @@ function errorModuleSource(name: string): string {
             source += `export const ${key} = undefined;\n`;
         }
     }
-    return source + `throw Object.assign(new ${ctor}(${JSON.stringify(info.message)}), { code: ${JSON.stringify(info.code)} });\n`;
+    return source + `throw Object.assign(new ${ctorName}(${JSON.stringify(info.message)}), { code: ${JSON.stringify(info.code)} });\n`;
+}
+
+/** Whether a specifier is a `data:` URL: the scheme is read case-insensitively, as a URL's is. */
+function isDataUrl(specifier: string): boolean {
+    return specifier.length >= 5 && specifier.slice(0, 5).toLowerCase() === 'data:';
+}
+
+/** The media type of a data URL -- everything between the scheme and the first comma. */
+function dataUrlMediaType(url: string): string {
+    return url.slice(url.indexOf(':') + 1, url.indexOf(',')).split(';')[0].trim().toLowerCase();
+}
+
+/** The media types Node loads a data URL as a JavaScript module for. */
+const DATA_MODULE_MEDIA_TYPES = new Set(['text/javascript', 'application/javascript']);
+
+/**
+ * Why Node loads no module from a `data:` URL, or undefined when it does. A URL with no comma is
+ * not one at all; a media type Node has no loader for -- an empty one included, which Node names
+ * `null` -- is ERR_UNKNOWN_MODULE_FORMAT; and JSON without `with { type: 'json' }` is
+ * ERR_IMPORT_ATTRIBUTE_MISSING, the same error a .json file without it raises.
+ */
+function dataUrlFailure(specifier: string, missingAttribute: boolean): { code: string; ctor: string; message: string } | undefined {
+    if (specifier.indexOf(',') < 0) return { code: 'ERR_INVALID_URL', ctor: 'TypeError', message: 'Invalid URL' };
+    const mediaType = dataUrlMediaType(specifier);
+    /* An empty media type is one Node has no loader for either, and it names it `null`. */
+    const known = DATA_MODULE_MEDIA_TYPES.has(mediaType) || mediaType === 'application/json';
+    if (!known) {
+        return {
+            code: 'ERR_UNKNOWN_MODULE_FORMAT',
+            ctor: 'RangeError',
+            message: `Unknown module format: ${mediaType === '' ? 'null' : mediaType} for URL ${specifier}`,
+        };
+    }
+    if (mediaType === 'application/json' && missingAttribute) {
+        return {
+            code: 'ERR_IMPORT_ATTRIBUTE_MISSING',
+            ctor: 'TypeError',
+            message: `Module "${specifier}" needs an import attribute of "type: json"`,
+        };
+    }
+    return undefined;
 }
 
 /** A URL scheme no ESM loader can read, as Node names it; undefined for a path, a relative specifier or file, data and node. */
@@ -2397,7 +2621,7 @@ function runNodeSync(request: SyncChildRequest): SyncChildResult {
         request.cwd,
         request.env,
         request.evalSource,
-        undefined,
+        request.flagAnswer,
         request.quickJs
     );
     let stdout = '';
