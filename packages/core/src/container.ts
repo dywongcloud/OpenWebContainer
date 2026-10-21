@@ -1,4 +1,4 @@
-import { ChildProcessPayload, ChildProcessResult, Process, ProcessEvent, ProcessExecutor, ProcessInfo, ProcessRegistry, ProcessTree, SpawnChildEventData } from "./process";
+import { ChildProcessPayload, ChildProcessResult, Process, ProcessEvent, ProcessExecutor, ProcessInfo, ProcessRegistry, ProcessState, ProcessTree, SpawnChildEventData } from "./process";
 import { VirtualFileSystem } from "./filesystem/virtual-fs";
 import { ProcessManager } from "./process/manager";
 import { NodeProcessExecutor } from "./process/executors/node";
@@ -186,12 +186,29 @@ export class OpenWebContainer {
     /**
      * File system operations
      */
-    writeFile(path: string, content: string): void {
-        this.fileSystem.writeFile(path, content);
+    /**
+     * Writes a file. A string is stored as UTF-8 text, the way this always stored it; a Uint8Array
+     * (a Buffer is one) is stored as its bytes. The text form is lossy on anything that is not
+     * text: binary decoded as UTF-8 comes back with U+FFFD wherever a byte was not valid UTF-8, and
+     * encoding it again makes it larger -- a 684897-byte sql-wasm.wasm written this way is read
+     * back 765555 bytes long, which WebAssembly rejects because its Type section now runs past the
+     * end of the module.
+     */
+    writeFile(path: string, content: string | Uint8Array): void {
+        if (typeof content === 'string') {
+            this.fileSystem.writeFile(path, content);
+            return;
+        }
+        this.fileSystem.writeBytes(path, content);
     }
 
     readFile(path: string): string | undefined {
         return this.fileSystem.readFile(path);
+    }
+
+    /** Reads a file back as bytes, which is what a file written as bytes has to be checked against. */
+    readFileBytes(path: string): Uint8Array | undefined {
+        return this.fileSystem.readBytes(path);
     }
 
     deleteFile(path: string): void {
@@ -451,6 +468,11 @@ export class OpenWebContainer {
 
             let stdout = '';
             let stderr = '';
+            /* A parent that runs the child in a pipe of its own takes the output out of the result, so
+               writing it to the parent's terminal as well would print it twice: once where the pipe
+               puts it and once where the child wrote it. */
+            const silent = payload.silent === true;
+            const stdin = payload.stdin;
 
             // Spawn the child process
             const childProcess = await this.spawn(
@@ -464,9 +486,24 @@ export class OpenWebContainer {
                        call that starts it, so its listeners are installed before it starts and not
                        after the await above returns, which would drop everything it wrote. */
                     beforeStart: (child) => {
+                        /* What the parent piped in: written once the child can take it, which is after
+                           it is running, and followed by end of file, as it is in a shell. */
+                        if (stdin !== undefined && stdin !== '') {
+                            const pipeStdin = () => {
+                                try {
+                                    child.writeInput(stdin);
+                                    child.endStdin();
+                                } catch {
+                                    /* a process that reads no input is exactly as it was */
+                                }
+                            };
+                            if (child.state === ProcessState.RUNNING) pipeStdin();
+                            else child.addEventListener(ProcessEvent.START, pipeStdin);
+                        }
+
                         // Set up event handlers for the child process
                         child.addEventListener(ProcessEvent.MESSAGE, (data: ProcessEventData) => {
-                            parentProcess.emit(ProcessEvent.MESSAGE, { ...data });
+                            if (!silent) parentProcess.emit(ProcessEvent.MESSAGE, { ...data });
                             /* the parent sees the child's output as it arrives; the caller of spawnChild also
                                gets it in the result, so a lifecycle script's failure can be reported with its cause */
                             if (data.stdout) stdout += data.stdout;
@@ -475,7 +512,7 @@ export class OpenWebContainer {
 
                         child.addEventListener(ProcessEvent.ERROR, (data: ProcessEventData) => {
                             if (data.error) {
-                                parentProcess.emit(ProcessEvent.MESSAGE, { stderr: data.error.message + '\n' });
+                                if (!silent) parentProcess.emit(ProcessEvent.MESSAGE, { stderr: data.error.message + '\n' });
                                 stderr += data.error.message + '\n';
                             }
                         });
@@ -521,11 +558,6 @@ export class OpenWebContainer {
 
         // Kill all processes
         await this.processManager.killAll();
-
-        /* The QuickJS module the guests booted on is a whole WebAssembly instance: dropping the
-           container's reference to it is what lets the host take its memory back, the same way the
-           processes above are dropped. */
-        this.services.quickJsModule = undefined;
 
         // Clear output callbacks
         this.outputCallbacks = [];
