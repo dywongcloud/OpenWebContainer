@@ -422,7 +422,6 @@ We welcome contributions! See our [Contributing Guide](CONTRIBUTING.md) for deta
 ### Areas for Contribution
 
 - Shell command improvements
-  - Add pipe (`|`) support
   - Additional built-in commands
   - Command argument parsing
 - Process management enhancements
@@ -447,9 +446,7 @@ Current focus areas:
 - [ ] WebSocket support
 
 Future plans:
-- [ ] Add pipe support for shell commands
-- [ ] Implement environment variables
-- [ ] Add signal handling (SIGTERM, SIGKILL, etc.)
+- [ ] Add signal handling (SIGTERM, SIGKILL, etc.): `child.kill` sends one, `process.kill` does not reach a process
 - [ ] Create process groups and job control
 - [ ] Create development tools and debugging capabilities
 
