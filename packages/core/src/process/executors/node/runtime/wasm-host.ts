@@ -73,7 +73,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
     const memories = new Map<number, WebAssembly.Memory>();
     const tables = new Map<number, WebAssembly.Table>();
     const globals = new Map<number, WebAssembly.Global>();
-    const hostFns = new Map<number, (...args: number[]) => unknown>();
+    const hostFns = new Map<number, (...args: Array<number | bigint>) => unknown>();
     /** Guest values the host must keep: a handle argument dies with the call that received it. */
     const retained = context.newObject();
     let nextId = 1;
@@ -145,14 +145,41 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         const kind = context.typeof(handle);
         let value: unknown = null;
         if (kind === 'number') value = context.getNumber(handle);
+        else if (kind === 'bigint') value = context.getBigInt(handle);
         else if (kind === 'string') value = context.getString(handle);
         else if (kind === 'boolean') value = context.dump(handle) === true;
         handle.dispose();
         return value;
     };
 
-    const numberArgs = (args: unknown): number[] =>
-        Array.isArray(args) ? args.map((value) => (typeof value === 'number' ? value : Number(value))) : [];
+    /**
+     * One wasm value, restored from the JSON form the guest sent.
+     *
+     * The JS API takes a BigInt for an i64 and a Number for everything else, and JSON has no
+     * BigInt, so a BigInt travels as a string with a NUL and a 'b' in front -- no argument a
+     * caller means as a number looks like that -- and is rebuilt here. Anything else is
+     * coerced the way the JS API coerces it.
+     */
+    const wasmValue = (value: unknown): number | bigint => {
+        if (typeof value === 'string' && value.charCodeAt(0) === 0) return BigInt(value.slice(2));
+        return typeof value === 'number' ? value : Number(value);
+    };
+
+    /** The arguments of a wasm call, decoded from the guest's JSON. */
+    const numberArgs = (args: unknown): Array<number | bigint> =>
+        Array.isArray(args) ? args.map((value) => wasmValue(value)) : [];
+
+    /**
+     * A handle for one value the host hands to the guest.
+     *
+     * An i64 arrives here as a BigInt, the way the JS API hands it to an import function, and
+     * `newNumber` refuses one: it converts through a C double, which is what throws 'Cannot
+     * convert a BigInt value to a number' -- the error that stopped sql.js at module init,
+     * since five of the functions it imports take an i64. A BigInt therefore goes into the
+     * guest as a BigInt, and QuickJS sees the argument a browser would have passed it.
+     */
+    const valueHandle = (value: number | bigint): QuickJSHandle =>
+        typeof value === 'bigint' ? context.newBigInt(value) : context.newNumber(value);
 
     // --- memory sync --------------------------------------------------------------------
 
@@ -307,7 +334,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
                 continue;
             }
             const id = freshId();
-            hostFns.set(id, entry as (...args: number[]) => unknown);
+            hostFns.set(id, entry as (...args: Array<number | bigint>) => unknown);
             entries.push({ i, k: 'fn', id });
         }
         return JSON.stringify(entries);
@@ -317,11 +344,11 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
      * A wasm import that is a function: it may be a guest function (call back into the VM, syncing
      * memory either side of the call) or a function the host took out of a table.
      */
-    const resolveImportFunction = (id: number): ((...args: number[]) => unknown) => {
+    const resolveImportFunction = (id: number): ((...args: Array<number | bigint>) => unknown) => {
         const hostFn = hostFns.get(id);
         if (hostFn) return hostFn;
-        return (...args: number[]) => {
-            const handles = args.map((value) => context.newNumber(value));
+        return (...args: Array<number | bigint>) => {
+            const handles = args.map((value) => valueHandle(value));
             return callGuest(id, handles);
         };
     };
@@ -446,23 +473,25 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
     const wrapImport = (record: InstanceRecord, id: number) => {
         const hostFn = hostFns.get(id);
         if (hostFn) {
-            return (...args: number[]) => {
+            return (...args: Array<number | bigint>) => {
                 const value = hostFn(...args);
                 syncOut(record);
                 return value;
             };
         }
-        return (...args: number[]) => {
+        return (...args: Array<number | bigint>) => {
             syncOut(record);
             let value: unknown;
             try {
-                value = callGuest(id, args.map((arg) => context.newNumber(arg)));
+                value = callGuest(id, args.map((arg) => valueHandle(arg)));
             } catch (error) {
                 syncIn(record);
                 throw error;
             }
             syncIn(record);
-            return typeof value === 'number' ? value : 0;
+            /* An import the module declared as returning an i64 gets the BigInt back: only a
+               BigInt converts to an i64, the same as in a browser. */
+            return typeof value === 'number' || typeof value === 'bigint' ? value : 0;
         };
     };
 
@@ -473,7 +502,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         if (typeof target !== 'function') return fail('ERR_WASM', 'no such export: ' + text(name));
         try {
             syncIn(record);
-            const value = (target as (...args: number[]) => unknown)(...numberArgs(parse(argsJson)));
+            const value = (target as (...args: Array<number | bigint>) => unknown)(...numberArgs(parse(argsJson)));
             syncOut(record);
             return ok(typeof value === 'bigint' ? Number(value) : (value ?? null));
         } catch (error) {
@@ -567,7 +596,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         const entry = table.get(Math.floor(number(index)));
         if (typeof entry !== 'function') return ok({ k: 'null' });
         const fnId = freshId();
-        hostFns.set(fnId, entry as (...args: number[]) => unknown);
+        hostFns.set(fnId, entry as (...args: Array<number | bigint>) => unknown);
         return ok({ k: 'fn', id: fnId });
     });
     define('tableSet', (id, index, value) => {
@@ -630,7 +659,8 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         const record = instanceId ? instances.get(number(instanceId)) : undefined;
         if (!hostFn) {
             try {
-                return ok(callGuest(fnId, numberArgs(parse(argsJson)).map((value) => context.newNumber(value))));
+                const guest = callGuest(fnId, numberArgs(parse(argsJson)).map((value) => valueHandle(value)));
+                return ok(typeof guest === 'bigint' ? Number(guest) : guest);
             } catch (error) {
                 if (error instanceof GuestThrow) {
                     return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
