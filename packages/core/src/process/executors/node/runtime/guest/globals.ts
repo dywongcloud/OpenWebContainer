@@ -1,4 +1,10 @@
 /**
+ * The version this runtime reports as its own: what `node --version` prints, and what the guest's
+ * `process.version` holds. One constant, so the two can never disagree.
+ */
+export const NODE_VERSION = 'v24.15.0';
+
+/**
  * Guest-side globals: the `process` object (an EventEmitter), the console, the
  * standard globals (Buffer, timers, URL, TextEncoder, atob/btoa, performance,
  * crypto) and the finalize hooks the host calls at exit. Plain JavaScript inside a
@@ -10,7 +16,7 @@ var procEnv = JSON.parse(host.envJSON());
 var proc = Object.create(EventEmitterCls.prototype);
 EventEmitterCls.call(proc);
 proc.title = 'node';
-proc.version = 'v24.15.0';
+proc.version = '${NODE_VERSION}';
 proc.versions = { node: '24.15.0', v8: '13.6.233.10-node.24', owc: '0.1.0', napi: '10' };
 proc.arch = 'x64';
 proc.platform = 'linux';
@@ -258,21 +264,38 @@ proc.cpuUsage = function () {
 /*
  * Signals a child of this process, as Node does with the pids it knows. The container has no
  * signals across processes: every name that ends a process ends it the same way (terminate), and
- * the name is only reported back as the signal the child died of. A pid that is not a child of
- * this process is not signalled, and false comes back rather than an error, because a container
- * process cannot see processes that are not its own children.
+ * the name is only reported back as the signal the child died of.
+ *
+ * A process may always signal itself, and that is the one pid the child registry does not hold:
+ * signal 0 only reports that the process is there, and any other ends it with the status Node
+ * leaves (128 + the signal number), so a program that ends itself this way behaves as it does
+ * under Node. Every other pid the container does not know is ESRCH, the error Node's kill gives
+ * for a pid that is not there -- a container process's world is its own children, and a pid that
+ * is not one of them is no more reachable here than a dead one is in Node.
  */
+var LETHAL_SIGNALS = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2, SIGHUP: 1, SIGQUIT: 3, SIGABRT: 6 };
 proc.kill = function (pid, signal) {
   var name = signal === undefined || signal === null || signal === 0 || signal === '0' ? 'SIGTERM' : String(signal);
   var num = Number(pid);
+  if (num === proc.pid) {
+    var lethal = LETHAL_SIGNALS[name];
+    if (lethal !== undefined && name !== 'SIGKILL') proc.exit(128 + lethal);
+    if (lethal !== undefined) proc.exit(137);
+    return true;
+  }
   var table = globalThis.__owcPtyFds;
   var record = table ? table[num] : undefined;
   // An id of a pty stands for the child behind it: the container gives a child its pid after
   // spawn has returned, so a pty has no process id to report when it is built.
-  if (record && record.child && record.child.pid !== undefined) {
-    return callCap('child.kill', { pid: Number(record.child.pid), signal: name }) === true;
-  }
-  return callCap('child.kill', { pid: num, signal: name }) === true;
+  var ok = record && record.child && record.child.pid !== undefined
+    ? callCap('child.kill', { pid: Number(record.child.pid), signal: name })
+    : callCap('child.kill', { pid: num, signal: name });
+  if (ok === true) return true;
+  var missing = new Error('kill ESRCH');
+  missing.code = 'ESRCH';
+  missing.errno = -3;
+  missing.syscall = 'kill';
+  throw missing;
 };
 proc.umask = function () {
   return 18;
@@ -306,11 +329,25 @@ proc.stdout = makeStdioStream(function (text) {
 proc.stderr = makeStdioStream(function (text) {
   host.stderr(text);
 });
-/* stdin has no input source unless the host feeds one. It is a stream that ends at once, so a
-   reader sees end of input -- except in a REPL, where the host keeps it open and pushes into it
-   what the terminal sends, and closes it when the terminal is done. */
+/* stdin has no input source unless the host feeds one. A process started with a pipe on fd 0 keeps it
+   open until the host ends it, so a parent's write reaches a reader there as it does in Node; every
+   other run's stdin ends at once, so a reader sees end of input. A REPL is the run the terminal feeds:
+   the host keeps its stdin open and pushes into it what the terminal sends. */
 var stdinStream = null;
 var stdinOpen = false;
+var stdinHeld = false;
+/** The whole input of a synchronous parent, fed the first time the stream is built: the built-ins are
+ *  not there yet while this source runs, so nothing is pushed into a stream until something reads it. */
+var stdinPending = null;
+/* A reader holds a ref while it listens, the way Node's stdin keeps the loop alive while it is read:
+   a child that reads its stdin waits for the parent, and one that stops reading no longer waits. */
+function stdinRef() {
+  var listening = stdinOpen && stdinStream !== null
+    && (stdinStream.listenerCount('data') > 0 || stdinStream.listenerCount('readable') > 0 || stdinStream.readableFlowing === true);
+  if (listening === stdinHeld) return;
+  stdinHeld = listening;
+  holdRef(listening ? 1 : -1);
+}
 function stdinOf() {
   if (stdinStream === null) {
     var Readable = requireBuiltin('stream').Readable;
@@ -318,7 +355,21 @@ function stdinOf() {
     stdinStream.isTTY = false;
     // text in, text out: a pushed chunk reaches a reader as the string it was written as
     stdinStream.setEncoding('utf8');
-    if (!stdinOpen) stdinStream.push(null);
+    /* newListener is emitted before the listener is added, so the count is read on the next turn */
+    stdinStream.on('newListener', function (ev) { if (ev === 'data' || ev === 'readable') setImmediate(stdinRef); });
+    stdinStream.on('removeListener', function (ev) { if (ev === 'data' || ev === 'readable') setImmediate(stdinRef); });
+    stdinStream.once('end', function () { stdinOpen = false; stdinRef(); });
+    if (stdinPending !== null) {
+      // a synchronous parent's input is all there from the start, and ends as soon as it is read
+      var pending = stdinPending;
+      stdinPending = null;
+      stdinStream.push(pending);
+      stdinStream.push(null);
+    } else if (!stdinOpen) {
+      stdinStream.push(null);
+    } else {
+      stdinRef();
+    }
   }
   return stdinStream;
 }
@@ -348,6 +399,18 @@ api.endStdin = function () {
   stdinOf().push(null);
   return true;
 };
+/* What this run was started with: a pipe on fd 0 the parent may still write to, and the whole input of
+   a synchronous parent (spawnSync's 'input'). Both are taken out of the environment here, before any
+   user code can see them; only the flags are set now, because the stream needs built-ins this source
+   runs ahead of. */
+if (procEnv.OWC_STDIN_INPUT !== undefined) {
+  stdinPending = procEnv.OWC_STDIN_INPUT;
+  delete procEnv.OWC_STDIN_INPUT;
+}
+if (procEnv.OWC_STDIN === 'pipe') {
+  delete procEnv.OWC_STDIN;
+  stdinOpen = true;
+}
 globalThis.process = proc;
 BF.process = function () {
   return proc;
@@ -513,9 +576,39 @@ globalThis.structuredClone = function (value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 };
 globalThis.crypto = nodeCrypto.webcrypto;
-globalThis.fetch = function () {
-  return Promise.reject(new TypeError('fetch is not supported by this runtime'));
-};
+/*
+ * fetch, with the three classes Node also defines beside it (Headers, Request, Response). The
+ * request goes out on the container's own http and https client, so a URL on the virtual network
+ * reaches the server that listens there and a host the container has no route to fails the way a
+ * real socket would; there is no host network behind it. A rejection is Node's shape: a TypeError
+ * 'fetch failed' carrying the transport error as its cause, so err.cause.code is ENOTFOUND or
+ * ECONNREFUSED as it is in Node.
+ */
+(function () {
+  /*
+   * Resolved on first use rather than here: the module registers itself further down the
+   * bootstrap than this file runs, so asking for it now would leave every name below
+   * undefined and take the whole bootstrap down with it.
+   */
+  var webFetch = null;
+  function undici () {
+    if (webFetch === null) webFetch = requireBuiltin('undici');
+    return webFetch;
+  }
+  globalThis.fetch = function fetch(target, options) {
+    return undici().fetch(target, options).then(null, function (cause) {
+      var failed = new TypeError('fetch failed');
+      failed.cause = cause;
+      throw failed;
+    });
+  };
+  ['Headers', 'Request', 'Response'].forEach(function (name) {
+    Object.defineProperty(globalThis, name, {
+      get: function () { return undici()[name]; },
+      configurable: true
+    });
+  });
+})();
 (function () {
   var STATE = new WeakMap();
   var CONTROLLER_SIGNAL = new WeakMap();
