@@ -4,19 +4,7 @@ import { NodeProcess } from './process';
 import { IFileSystem } from '../../../filesystem';
 import { NetworkManager } from '../../../network/manager';
 import { RuntimeServices } from './runtime/services';
-import { nodeFlagAnswer, printScriptArg } from './flags';
-
-/**
- * What a script run with `-e`, `--eval`, `-p` or `--print` sees in process.argv[1..].
- *
- * There is no file after the source, so `--` is not a script name here: it ends the options, as it
- * does for Node, and what follows it is the first argument -- `node -e <src> -- <arg>` puts `<arg>`
- * in process.argv[1], which is how a caller hands a script its data. One `--` at the head is the
- * one that ends the options; a second one is an argument like any other.
- */
-function evalArgv(args: string[]): string[] {
-    return args[0] === '--' ? args.slice(1) : args;
-}
+import { nodeCommand } from './flags';
 
 export class NodeProcessExecutor implements ProcessExecutor {
     constructor(
@@ -30,67 +18,38 @@ export class NodeProcessExecutor implements ProcessExecutor {
     }
 
     async execute(payload: ChildProcessPayload, pid: number, parentPid?: number): Promise<Process> {
-        let executablePath = payload.executable;
-        let args = payload.args;
-        let evalSource: string | undefined;
-
         const cwd = payload.cwd || '/';
         // `node <script> [args]`, `node -e <source> [args]`, `node` alone (a REPL), or a .js executable
-        if (executablePath === 'node') {
-            /* The flags node answers for itself, before anything is read as a file: `node --version`
-               is not a request to run /--version. Everything else -- a script, `-e`, `-p`, a REPL --
-               is left to the guest exactly as it was. */
-            const answered = nodeFlagAnswer(args);
-            if (answered !== undefined) {
-                return new NodeProcess(
-                    pid,
-                    '[flags]',
-                    [],
-                    this.fileSystem,
-                    this.networkManager,
-                    this.services,
-                    parentPid,
-                    cwd,
-                    payload.env ?? {},
-                    undefined,
-                    answered
-                );
-            }
-            if (args.length === 0) {
-                /* Node starts a REPL when it is given no file; it does not complain. The sentinel is
-                   read the way `[eval]` is: no file is resolved for it. */
-                executablePath = '[repl]';
-            } else if (args[0] === '-e' || args[0] === '--eval') {
-                if (args.length < 2) throw new Error(`${args[0]} requires an argument`);
-                evalSource = args[1];
-                executablePath = '[eval]';
-                args = evalArgv(args.slice(2));
-            } else if (args[0] === '-p' || args[0] === '--print') {
-                evalSource = printScriptArg(args);
-                executablePath = '[eval]';
-                args = evalArgv(args.slice(2));
-            } else if (args[0] === '--' && args.length > 1) {
-                /* `--` ends the options: what follows is the script, even where it begins with a
-                   dash, so `node -- --version` runs the file rather than printing a version. */
-                executablePath = args[1];
-                args = args.slice(2);
-            } else {
-                executablePath = args[0];
-                args = args.slice(1);
-            }
+        if (payload.executable === 'node') {
+            /* What the line is: the flags node answers for itself, before anything is read as a file
+               -- `node --version` is not a request to run /--version -- or else a script, a `-e`,
+               a `-p` or a REPL, left to the guest exactly as it was. */
+            const command = nodeCommand(payload.args);
+            return new NodeProcess(
+                pid,
+                command.file,
+                command.args,
+                this.fileSystem,
+                this.networkManager,
+                this.services,
+                parentPid,
+                cwd,
+                payload.env ?? {},
+                command.evalSource,
+                command.flagAnswer
+            );
         }
 
         return new NodeProcess(
             pid,
-            executablePath,
-            args,
+            payload.executable,
+            payload.args,
             this.fileSystem,
             this.networkManager,
             this.services,
             parentPid,
             cwd,
-            payload.env ?? {},
-            evalSource
+            payload.env ?? {}
         );
     }
 }

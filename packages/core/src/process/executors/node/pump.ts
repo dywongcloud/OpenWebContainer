@@ -7,6 +7,7 @@
 import type { IFileSystem } from '../../../filesystem';
 import type { QuickJSAsyncWASMModule } from 'quickjs-emscripten';
 import type { RuntimeServices } from './runtime/services';
+import type { NodeFlagAnswer } from './flags';
 
 /** One synchronous node child, with the executable and arguments already resolved as NodeProcessExecutor resolves them. */
 export interface SyncChildRequest {
@@ -18,6 +19,8 @@ export interface SyncChildRequest {
     cwd: string;
     env: Record<string, string>;
     evalSource?: string;
+    /** The answer for a line of node's own flags this child was given; a `--check` reaches the process to be parsed. */
+    flagAnswer?: NodeFlagAnswer;
     fileSystem: IFileSystem;
     services: RuntimeServices;
     /**

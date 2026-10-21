@@ -1,6 +1,6 @@
 import { Process, ProcessEvent, ProcessState } from '../../../../base';
 import { CapabilityContext, CapabilityHandler } from './types';
-import { nodeFlagAnswer, printScriptArg } from '../../flags';
+import { nodeCommand } from '../../flags';
 import type { NodeFlagAnswer } from '../../flags';
 import { COMMANDS as TEXT_UTILS } from '../../../../../shell/commands/textutils';
 import { COMMANDS as FILE_UTILS } from '../../../../../shell/commands/fileutils';
@@ -797,21 +797,14 @@ function syncSpawnError(error: unknown, file: string, argv: string[]): SyncError
 
 /** The file and arguments a node command runs, as NodeProcessExecutor reads them. */
 function nodeInvocation(argv: string[]): { file: string; args: string[]; evalSource?: string; flagAnswer?: NodeFlagAnswer } {
-    /* The flags node answers for itself -- `--version`, one it does not know -- are answered before
-       anything is read as a file, here as they are on the command line. */
-    const answered = nodeFlagAnswer(argv);
-    if (answered !== undefined) return { file: '[flags]', args: [], flagAnswer: answered };
-    if (argv.length === 0) throw new Error('No JavaScript file specified');
-    if (argv[0] === '-e' || argv[0] === '--eval') {
-        if (argv.length < 2) throw new Error(`${argv[0]} requires an argument`);
-        return { file: '[eval]', args: argv.slice(2), evalSource: argv[1] };
-    }
-    if (argv[0] === '-p' || argv[0] === '--print') {
-        return { file: '[eval]', args: argv.slice(2), evalSource: printScriptArg(argv) };
-    }
-    // `--` ends the options: what follows is the script, even where it begins with a dash
-    if (argv[0] === '--' && argv.length > 1) return { file: argv[1], args: argv.slice(2) };
-    return { file: argv[0], args: argv.slice(1) };
+    /* Read as NodeProcessExecutor reads it: the flags node answers for itself -- `--version`,
+       `--help`, `--check`, one it does not know -- are answered here as they are on the command
+       line, and everything else is a script, a `-e`/`-p` source or a REPL. */
+    const command = nodeCommand(argv);
+    /* A synchronous child has nowhere to put a REPL: no terminal of its own and no caller to hand
+       one to. A bare `node` is refused here, where an asynchronous run would start one. */
+    if (command.file === '[repl]') throw new Error('No JavaScript file specified');
+    return { file: command.file, args: command.args, evalSource: command.evalSource, flagAnswer: command.flagAnswer };
 }
 
 /** One node child run to completion. The caller decides what a blocked or timed-out run means. */
@@ -828,7 +821,10 @@ function nodeRun(
     const runner = nodeSyncRunner.run;
     if (runner === undefined) throw notSupportedSync('a node child');
     const pid = nextSyncPid++;
-    if (invocation.flagAnswer !== undefined) {
+    /* A line of flags node answers itself -- `--version`, `--help`, one it does not know. A
+       `--check` is the one answer that needs an engine to parse with, so it rides the runner like
+       any other child and is answered there, on the module this run already has. */
+    if (invocation.flagAnswer !== undefined && invocation.flagAnswer.check === undefined) {
         const answer = invocation.flagAnswer;
         return { pid, status: answer.exitCode, signal: null, stdout: answer.stdout ?? '', stderr: answer.stderr ?? '', timedOut: false };
     }
@@ -843,6 +839,7 @@ function nodeRun(
         cwd,
         env,
         evalSource: invocation.evalSource,
+        flagAnswer: invocation.flagAnswer,
         fileSystem: ctx.fileSystem,
         services: ctx.services,
         quickJs: ctx.quickJs(),
