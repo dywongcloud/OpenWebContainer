@@ -1,12 +1,14 @@
 import { CapabilityHandler } from './types';
 import { FlateErrorCode, deflateSync, gzipSync, inflateSync, zlibSync } from 'fflate';
+import { CodecParams, brotliCompress, brotliDecompress, zstdCompress, zstdDecompress, zstdParamKnown } from './codec';
 
 /**
  * Host operations for the zlib family. fflate does the raw DEFLATE work (its `deflateSync` and
  * `inflateSync` are raw streams; `zlibSync` and `unzlibSync` are the zlib framing). The framing Node
  * checks and fflate does not (CRC-32 and size for gzip, Adler-32 for zlib, multi-member gzip, the
- * zero-byte stop rule) is reproduced here, with zlib's error codes and wording. Bytes cross the
- * capability boundary as base64 strings because capability arguments are JSON.
+ * zero-byte stop rule) is reproduced here, with zlib's error codes and wording. Brotli and zstd come
+ * from wasm codecs, which Node also builds on the same C libraries. Bytes cross the capability
+ * boundary as base64 strings because capability arguments are JSON.
  */
 
 type Bytes = Uint8Array;
@@ -214,7 +216,30 @@ function unzipAll(data: Bytes, dictionary?: Bytes): Bytes {
     return data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b ? gunzipAll(data) : zlibInflate(data, dictionary);
 }
 
-function inflateBytes(format: string, data: Bytes, dictionary?: Bytes): Bytes {
+/** The (key, value) pairs a guest collected from `options.params`, already validated there. */
+function paramPairs(value: unknown): CodecParams | undefined {
+    if (!Array.isArray(value)) return undefined;
+    const pairs: CodecParams = [];
+    for (const entry of value) {
+        if (!Array.isArray(entry) || entry.length < 2) continue;
+        pairs.push([Number(entry[0]), Number(entry[1])]);
+    }
+    return pairs.length > 0 ? pairs : undefined;
+}
+
+/** zstd names the offending key when a parameter is unknown; the guest cannot know zstd's set. */
+function zstdParams(value: unknown, compress: boolean): CodecParams | undefined {
+    const pairs = paramPairs(value);
+    if (!pairs) return undefined;
+    for (const [key] of pairs) {
+        if (!zstdParamKnown(compress, key)) {
+            throw Object.assign(new RangeError(key + ' is not a valid zstd parameter'), { code: 'ERR_ZSTD_INVALID_PARAM' });
+        }
+    }
+    return pairs;
+}
+
+function inflateBytes(format: string, data: Bytes, dictionary?: Bytes, params?: CodecParams): Bytes {
     switch (format) {
         case 'gzip':
             return gunzipAll(data);
@@ -224,13 +249,25 @@ function inflateBytes(format: string, data: Bytes, dictionary?: Bytes): Bytes {
             return inflateRaw(data, dictionary);
         case 'unzip':
             return unzipAll(data, dictionary);
+        case 'brotli':
+            return brotliDecompress(data, params);
+        case 'zstd':
+            return zstdDecompress(data, params);
         default:
             throw new Error(`unknown zlib format: ${format}`);
     }
 }
 
-/** Level -1 is zlib's default, which is 6; fflate takes 0-9. */
-function deflateBytes(format: string, data: Bytes, level: number, dictionary?: Bytes): Bytes {
+/** Level -1 is zlib's default, which is 6; fflate takes 0-9. Brotli and zstd take parameters instead. */
+function deflateBytes(
+    format: string,
+    data: Bytes,
+    level: number,
+    dictionary?: Bytes,
+    params?: CodecParams,
+    chunkSize = 0,
+    streamed = false
+): Bytes {
     const lvl = (level < 0 ? 6 : Math.min(9, Math.trunc(level))) as FlateLevel;
     const options = dictionary ? { level: lvl, dictionary } : { level: lvl };
     switch (format) {
@@ -240,6 +277,10 @@ function deflateBytes(format: string, data: Bytes, level: number, dictionary?: B
             return zlibSync(data, options);
         case 'deflate-raw':
             return deflateSync(data, options);
+        case 'brotli':
+            return brotliCompress(data, params);
+        case 'zstd':
+            return zstdCompress(data, params, chunkSize, streamed);
         default:
             throw new Error(`unknown zlib format: ${format}`);
     }
@@ -263,15 +304,25 @@ const argDictionary = (value: unknown): Bytes | undefined => (typeof value === '
 
 /** Zlib host operations: compress and decompress whole buffers. The guest buffers stream input and calls these once. */
 export const ZLIB_CAPABILITIES: Record<string, CapabilityHandler> = {
-    'zlib.compress': (args) =>
-        bytesToBase64(
+    'zlib.compress': (args) => {
+        const format = String(args.format);
+        const params = format === 'zstd' ? zstdParams(args.params, true) : paramPairs(args.params);
+        const chunk = typeof args.chunkSize === 'number' && args.chunkSize > 0 ? Math.trunc(args.chunkSize) : 0;
+        return bytesToBase64(
             deflateBytes(
-                String(args.format),
+                format,
                 argBytes(args.data),
                 typeof args.level === 'number' ? args.level : -1,
-                argDictionary(args.dictionary)
+                argDictionary(args.dictionary),
+                params,
+                chunk,
+                args.streamed === true
             )
-        ),
-    'zlib.decompress': (args) =>
-        bytesToBase64(inflateBytes(String(args.format), argBytes(args.data), argDictionary(args.dictionary)))
+        );
+    },
+    'zlib.decompress': (args) => {
+        const format = String(args.format);
+        const params = format === 'zstd' ? zstdParams(args.params, false) : paramPairs(args.params);
+        return bytesToBase64(inflateBytes(format, argBytes(args.data), argDictionary(args.dictionary), params));
+    }
 };

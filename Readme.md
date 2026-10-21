@@ -49,7 +49,7 @@ The architecture consists of three main layers:
 - **JavaScript Runtime**
   - QuickJS-based execution
   - CommonJS and ES Modules, with `node_modules` resolution, `package.json` `main`/`exports`/`imports`, and CJS/ESM interop
-  - Node built-ins: `path`, `events`, `util`, `assert`, `fs` (sync, callback and promises, plus read and write streams and file descriptors — `openSync`, `writeSync`, `readSync`, `closeSync`, `fstatSync`, `ftruncateSync` — over the virtual file system), `buffer`, `os`, `timers`, `url` (WHATWG URL and legacy `parse`/`resolve`/`format`), `crypto` (random values, `createHash`, `createHmac`, `pbkdf2`, `timingSafeEqual`, and `createCipheriv`/`createDecipheriv` over `@noble/ciphers`: AES-ECB, AES-CBC, AES-CTR, AES-CFB and AES-GCM at 128, 192 and 256 bits and ChaCha20-Poly1305, byte-identical to host Node 24.15 and with Node's `ERR_CRYPTO_INVALID_KEYLEN` and `ERR_CRYPTO_INVALID_IV` codes), `process` (including `chdir`/`cwd` over the virtual file system), `console`, `module`, `stream` and `readline`, `querystring`, `string_decoder`, `punycode`, `diagnostics_channel`, `async_hooks` (AsyncLocalStorage across timers, ticks and `.then` callbacks), `perf_hooks`, `v8`, `vm`, `domain`, `inspector` and `repl` (partial), `zlib` (gzip, deflate and raw, backed by fflate)
+  - Node built-ins: `path`, `events`, `util`, `assert`, `fs` (sync, callback and promises, plus read and write streams and file descriptors — `openSync`, `writeSync`, `readSync`, `closeSync`, `fstatSync`, `ftruncateSync` — over the virtual file system), `buffer`, `os`, `timers`, `url` (WHATWG URL and legacy `parse`/`resolve`/`format`), `crypto` (random values, `createHash`, `createHmac`, `pbkdf2`, `timingSafeEqual`, and `createCipheriv`/`createDecipheriv` over `@noble/ciphers`: AES-ECB, AES-CBC, AES-CTR, AES-CFB and AES-GCM at 128, 192 and 256 bits and ChaCha20-Poly1305, byte-identical to host Node 24.15 and with Node's `ERR_CRYPTO_INVALID_KEYLEN` and `ERR_CRYPTO_INVALID_IV` codes), `process` (including `chdir`/`cwd` over the virtual file system), `console`, `module`, `stream` and `readline`, `querystring`, `string_decoder`, `punycode`, `diagnostics_channel`, `async_hooks` (AsyncLocalStorage across timers, ticks and `.then` callbacks), `perf_hooks`, `v8`, `vm`, `domain`, `inspector` and `repl` (partial), `zlib` (gzip, deflate and raw, backed by fflate; brotli and zstd, backed by WebAssembly codecs built from the same C libraries Node uses, byte-identical to host Node 24.15 — see "Codecs")
   - Express 4 apps run: responses with bodies, POST bodies, chunked responses and the 404 handler are verified against real Node
   - `child_process` (spawn, exec, execFile, fork, running as container processes), `worker_threads` and `cluster`, with message passing between processes
   - `net`, `dgram` and `dns` over the container's virtual network (loopback TCP and UDP between processes, a virtual name table), `http`, `https` and `http2`: servers and clients inside the container, and external requests through `fetch` (browser CORS applies); `tls` and `https` run TLS 1.3 inside the container (certificates are verified against the `ca` option only, with no built-in roots); `http2` is native HTTP/2 (RFC 9113 framing with RFC 7541 HPACK, flow control, trailers and the compat API), as h2c with prior knowledge and as h2 over TLS with ALPN through `http2.createSecureServer` and `https://` sessions
@@ -100,6 +100,49 @@ chunk, and a piece that is the whole memory is handed over without being copied 
 same machine: 0.353 to 0.143 ms per call at 16 pages, 3.389 to 2.456 at 256, 6.528 to 5.352 at 512,
 13.369 to 10.828 at 1024 and 26.664 to 20.609 at 2048 -- between 1.2x and 2.5x fewer, with the
 small-memory end gaining most.
+
+### ✅ Brotli and zstd: what they are built from, and where they differ from Node
+
+`zlib.brotliCompressSync`, `brotliDecompressSync`, `brotliCompress`, `brotliDecompress`,
+`createBrotliCompress`/`BrotliCompress` and the six `zstd` equivalents are real codecs, not stubs.
+Neither has a JavaScript implementation worth its size: a complete brotli encoder in JS is megabytes
+of source, and zstd compression has no JS implementation at all. So both are WebAssembly, and not
+guest WebAssembly — the bridge copies a whole module memory per crossing, which a bulk codec cannot
+pay — but modules the host instantiates, in the same realm the bridge runs guest modules in. They are
+built from the same C libraries Node's own `zlib` is:
+
+| | upstream | version | module | source |
+| --- | --- | --- | --- | --- |
+| brotli | google/brotli (`c/common`, `c/enc`, `c/dec`) | v1.1.0 | 762 KB | 445 KB of base64 |
+| zstd | facebook/zstd (`lib/common`, `lib/compress`, `lib/decompress`) | v1.5.7 | 447 KB | 157 KB of base64 |
+
+Each is compiled with Emscripten as a standalone module (`-O3 -flto -sSTANDALONE_WASM=1
+-sALLOW_MEMORY_GROWTH=1 -Wl,--no-entry`) over the one-shot entry points in
+`packages/core/src/process/executors/node/runtime/capabilities/codec/csrc`, gzipped and written as
+base64 into `brotli-wasm.ts` and `zstd-wasm.ts`, inflated by fflate on first use and then kept. They
+ask for two imports between them — a memory-growth notification and WASI's `proc_exit` — and both are
+stubbed. To rebuild one, from a checkout of the upstream tag:
+
+    emcc -O3 -flto -sSTANDALONE_WASM=1 -sALLOW_MEMORY_GROWTH=1 -Wl,--no-entry -I<upstream include> \
+      -sEXPORTED_FUNCTIONS='["_owc_brotli_compress","_owc_brotli_decompress","_owc_brotli_error_string","_malloc","_owc_free"]' \
+      -o brotli.wasm csrc/brotli_codec.c <upstream>/c/{common,dec,enc}/*.c
+
+Node 24.15 bundles those same two libraries, which is what makes the bytes match: a differential over
+8 inputs (0 B to 300 KB) × 9 brotli parameter sets and 9 zstd parameter sets, in the sync, callback
+and stream forms, produced byte-identical output, and the same errors — brotli's
+`ERR__ERROR_FORMAT_PADDING_2` and `Z_BUF_ERROR`, zstd's `ZSTD_error_prefix_unknown` with its `errno`
+and `ZSTD_getErrorString` message. Every compressed form round-trips in both directions: bytes Node
+compressed decompress here, and bytes compressed here decompress in Node.
+
+Two places where this deliberately differs from Node 24.15, both measured:
+
+- `zstdCompressSync(buf, { level: n })` — Node **ignores** `level` for zstd: levels 1, 3, 19, 22 and
+  -3 all produce its default level-3 output. A level asked for here is applied, as
+  `ZSTD_c_compressionLevel`, before any `params`. Use `{ params: { 100: n } }` to see Node's own
+  behaviour change.
+- `zstdDecompressSync` of a short or undecodable frame — Node returns an empty buffer for a truncated
+  frame and for a bare magic number. This throws instead (`ZSTD_error_srcSize_wrong`), because
+  answering corrupt input with a silent empty result is lost data.
 
 ### ⚠️ Guest network throughput, and why it is bounded by the capability boundary
 
@@ -269,7 +312,7 @@ is still byte-identical to host Node 24.15 after these changes.
 ### 📋 Upcoming Features
 
 - Additional shell commands
-- Node built-ins not yet implemented or partial: `brotli` and `zstd` compression (both await the WebAssembly bridge — `zlib.brotliCompressSync` and `zlib.zstdCompressSync` exist and throw `ERR_NOT_SUPPORTED`); `crypto` ciphers work but the list behind them is short, so `getCiphers()` returns 16 names where Node 24.15 returns 130 and `aes-192-cfb8` is `ERR_CRYPTO_UNKNOWN_CIPHER` here although Node supports it; several stream helper edge cases; `inspector` sessions construct, `connect()` and answer `Runtime.evaluate` by evaluating the expression in the realm and returning the protocol's `RemoteObject` (measured: `1+1` gives `{"result":{"type":"number","value":2,"description":"2"}}`, byte-identical to host Node 24.15), while every other method still fails with `Inspector protocol is not available in this runtime`; `v8.serialize` still emits its own JSON text rather than the V8 wire format (host Node 24.15 writes `ff0f6f220161...` for `{a:1,b:'x'}`), so a buffer written here is readable here and nowhere else; `module.register` is still `undefined`, and there is no pipeline to put it in: host Node 24.15 exports it as a function whose hooks really apply (measured: a hooks module whose `load` returns `{ format: 'module', source: 'export const tag = "hooked";', shortCircuit: true }` for `./target.mjs` makes a later `import('./target.mjs')` report `tag: hooked`), while the ESM loader here is the synchronous `normalizeModule`/`loadModule` pair QuickJS calls through `runtime.setModuleLoader` in `packages/core/src/process/executors/node/process.ts`, which resolves and loads in one synchronous call with no hook point in either step and no hooks thread to await an async hook in, so a `register` that reported success without ever applying its hooks would be worse than the gap; `process.report` is `undefined`; `fs.glob` is absent, where Node 24.15 has `fs.glob` and `fs.globSync`
+- Node built-ins not yet implemented or partial: `zlib`'s `maxOutputLength` option and its `ZstdDictionary`/`BrotliCompress` native handle internals; `crypto` ciphers work but the list behind them is short, so `getCiphers()` returns 16 names where Node 24.15 returns 130 and `aes-192-cfb8` is `ERR_CRYPTO_UNKNOWN_CIPHER` here although Node supports it; several stream helper edge cases; `inspector` sessions construct, `connect()` and answer `Runtime.evaluate` by evaluating the expression in the realm and returning the protocol's `RemoteObject` (measured: `1+1` gives `{"result":{"type":"number","value":2,"description":"2"}}`, byte-identical to host Node 24.15), while every other method still fails with `Inspector protocol is not available in this runtime`; `v8.serialize` still emits its own JSON text rather than the V8 wire format (host Node 24.15 writes `ff0f6f220161...` for `{a:1,b:'x'}`), so a buffer written here is readable here and nowhere else; `module.register` is still `undefined`, and there is no pipeline to put it in: host Node 24.15 exports it as a function whose hooks really apply (measured: a hooks module whose `load` returns `{ format: 'module', source: 'export const tag = "hooked";', shortCircuit: true }` for `./target.mjs` makes a later `import('./target.mjs')` report `tag: hooked`), while the ESM loader here is the synchronous `normalizeModule`/`loadModule` pair QuickJS calls through `runtime.setModuleLoader` in `packages/core/src/process/executors/node/process.ts`, which resolves and loads in one synchronous call with no hook point in either step and no hooks thread to await an async hook in, so a `register` that reported success without ever applying its hooks would be worse than the gap; `process.report` is `undefined`; `fs.glob` is absent, where Node 24.15 has `fs.glob` and `fs.globSync`
 - TLS: `tls` and `https` implement TLS 1.3 only (no TLS 1.2, session resumption or 0-RTT); peers are verified against the `ca` option only (no system or built-in roots); pfx, passphrase-protected keys, Ed25519 and P-521 keys are not supported; only the X25519 and P-256 groups, the AES-GCM and ChaCha20-Poly1305 suites and ECDSA P-256/P-384, RSA-PSS and RSA PKCS#1 signatures are implemented, and an `ecdhCurve`, `ciphers` or `sigalgs` value that names only other algorithms throws `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`; external `https` requests still go through the browser's `fetch`. `tls.DEFAULT_MIN_VERSION` still reports `TLSv1.2`, so nothing but a handshake tells you it is wrong: a client pinned to `minVersion`/`maxVersion` `TLSv1.2` fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` (`no protocols available`) where host Node connects and reports `TLSv1.2`
 - HTTP/2: `http2` does not send server push (`pushStream` reports `ERR_HTTP2_PUSH_UNSUPPORTED`) and has no `respondWithFile`/`respondWithFD`, ALTSVC or ORIGIN frames, h2c `Upgrade` from HTTP/1.1, `allowHTTP1`, or session and stream timeouts. HTTP/3 over QUIC is not started
 - Guest-side `fetch` is implemented: a request goes out on the container's own `http` and `https` client, so a URL on the virtual network reaches the server listening there (measured against host Node 24.15 on the same script: a 200 over `http://127.0.0.1`, its body, and a POST with a body and headers all agree, and an unreachable host rejects as `TypeError: fetch failed` with `ENOTFOUND` on `err.cause`) and there is no host network behind it. `Headers`, `Request`, `Response` and `FormData` are globals beside it — one script covering status, `text()`, `json()`, a response header, a POST with a string body, a `FormData` body sent as `multipart/form-data`, an abort through `AbortSignal` (which rejects with the signal's own `AbortError`, not with `fetch failed`), an unreachable host, and `typeof` plus a construct-and-read round trip for all four classes is byte-identical to host Node 24.15 — but the streaming half of the WHATWG surface is not there: `Request` and `Response` have no `.body` ReadableStream and no `.formData()`, so a body is buffered and read whole, and a stream body needs the `duplex` option Node asks for and is refused with `RequestInit: duplex option is required when sending a body.` The `WebSocket` global is a client over the same sockets: the handshake, a text frame, a binary frame, the negotiated subprotocol and the close handshake were measured against host Node 24.15 and agree; there is no WebSocket server and no `EventSource`. `undici`'s own module is served over the same client

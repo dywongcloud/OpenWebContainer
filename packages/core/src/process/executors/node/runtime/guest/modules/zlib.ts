@@ -1,7 +1,9 @@
 /**
  * Guest-side `zlib` built-in for the in-browser Node runtime. Sync, callback and stream forms share
- * the host's zlib capabilities (fflate underneath); brotli and zstd report ERR_NOT_SUPPORTED.
- * Plain JavaScript inside a String.raw snippet: no backticks and no template interpolation.
+ * the host's zlib capabilities: fflate underneath for deflate, gzip and zlib framing, and -- since
+ * brotli and zstd have no JavaScript implementation worth its size -- wasm codecs the host builds
+ * from the same C libraries Node does. Plain JavaScript inside a String.raw snippet: no backticks
+ * and no template interpolation.
  */
 export const SRC = String.raw`
 BF['zlib'] = function () {
@@ -148,11 +150,6 @@ BF['zlib'] = function () {
       'The "' + name + '"' + noun + ' must be ' + expected + '. Received ' + describeReceived(value));
   }
 
-  function notSupported(name) {
-    return failure(Error, 'ERR_NOT_SUPPORTED',
-      'zlib.' + name + ' is not supported in this runtime (deflate, gzip and zlib framing only)');
-  }
-
   function inputBytes(value, name, expected, allowArrayBuffer) {
     if (typeof value === 'string') return encodeUtf8(value);
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
@@ -169,6 +166,50 @@ BF['zlib'] = function () {
         'The value of "options.level" is out of range. It must be >= -1 and <= 9. Received ' + level);
     }
     return Math.trunc(level);
+  }
+
+  /* Options only brotli and zstd read: 'params' is a map of BROTLI_PARAM_* or ZSTD_c_* / ZSTD_d_*
+     keys to numbers. Node checks the key before the value, and names the key as it was written. */
+  var BROTLI_PARAM_MAX = 8;
+  var ZSTD_COMPRESSION_LEVEL = 100;
+  var CODEC = { brotli: 1, zstd: 1 };
+
+  function isCodecFormat(format) {
+    return CODEC[format] === 1;
+  }
+
+  function paramsOption(format, options) {
+    var params = options && typeof options === 'object' ? options.params : undefined;
+    if (params === undefined || params === null) return undefined;
+    var label = format === 'brotli' ? 'Brotli' : 'zstd';
+    var invalid = format === 'brotli' ? 'ERR_BROTLI_INVALID_PARAM' : 'ERR_ZSTD_INVALID_PARAM';
+    var pairs = [];
+    var keys = Object.keys(params);
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var numeric = Number(key);
+      var unknown = !isFinite(numeric) || Math.floor(numeric) !== numeric ||
+        (format === 'brotli' && (numeric < 0 || numeric > BROTLI_PARAM_MAX));
+      if (unknown) throw failure(RangeError, invalid, key + ' is not a valid ' + label + ' parameter');
+      var value = params[key];
+      if (typeof value !== 'number') throw argTypeError('options.params[key]', 'of type number', value);
+      pairs.push([numeric, value]);
+    }
+    return pairs.length > 0 ? pairs : undefined;
+  }
+
+  /* Brotli takes nine parameters; zstd's set is the library's own, so the host names a bad key.
+     Node ignores 'level' for zstd -- it is only ever a deflate-family option there -- and a level
+     asked for here is applied, as ZSTD_c_compressionLevel, before any 'params'. */
+  function codecParamsOption(format, compress, options) {
+    var pairs = paramsOption(format, options);
+    if (format === 'zstd' && compress) {
+      var level = options && typeof options === 'object' ? options.level : undefined;
+      if (typeof level === 'number') {
+        pairs = pairs ? [[ZSTD_COMPRESSION_LEVEL, level]].concat(pairs) : [[ZSTD_COMPRESSION_LEVEL, level]];
+      }
+    }
+    return pairs;
   }
 
   function dictionaryOption(options) {
@@ -189,20 +230,51 @@ BF['zlib'] = function () {
     return out;
   }
 
-  function runZlib(format, compress, bytes, level, dictionary) {
+  /* 'chunkSize' is zstd's: the output buffer Node hands the library, which decides where the
+     block boundaries fall. Anything but a finite number falls back to Node's default, as there. */
+  function chunkOption(format, options) {
+    if (format !== 'zstd') return undefined;
+    var size = options && typeof options === 'object' ? options.chunkSize : undefined;
+    if (typeof size !== 'number' || !isFinite(size)) return undefined;
+    if (size < 64) {
+      throw failure(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "options.chunkSize" is out of range. It must be >= 64. Received ' + size);
+    }
+    return Math.trunc(size);
+  }
+
+  function runZlib(format, compress, bytes, level, dictionary, params, chunkSize, streamed) {
     var args = { format: format, data: toBase64(bytes) };
     if (compress) args.level = level;
     if (dictionary !== undefined) args.dictionary = dictionary;
-    var encoded = callCap(compress ? 'zlib.compress' : 'zlib.decompress', args);
+    if (params !== undefined) args.params = params;
+    if (chunkSize !== undefined) args.chunkSize = chunkSize;
+    if (streamed) args.streamed = true;
+    var encoded;
+    try {
+      encoded = callCap(compress ? 'zlib.compress' : 'zlib.decompress', args);
+    } catch (err) {
+      /*
+       * The host knows which parameter keys zstd accepts, so an unknown one is reported there --
+       * and a capability failure always comes back as an Error. Node raises a RangeError, so the
+       * one code that means that is rebuilt as one here.
+       */
+      if (err && err.code === 'ERR_ZSTD_INVALID_PARAM') throw failure(RangeError, err.code, String(err.message));
+      throw err;
+    }
     var result = fromBase64(encoded);
     return Buf.from(result.buffer);
+  }
+
+  function levelOf(format, compress, options) {
+    return compress && !isCodecFormat(format) ? levelOption(options) : -1;
   }
 
   function syncOp(format, compress) {
     return function (buffer, options) {
       var bytes = inputBytes(buffer, 'buffer', SYNC_INPUT, true);
-      var level = compress ? levelOption(options) : undefined;
-      return runZlib(format, compress, bytes, level, dictionaryOption(options));
+      return runZlib(format, compress, bytes, levelOf(format, compress, options), dictionaryOption(options),
+        codecParamsOption(format, compress, options), chunkOption(format, options), false);
     };
   }
 
@@ -216,41 +288,20 @@ BF['zlib'] = function () {
       }
       if (typeof callback !== 'function') throw argTypeError('callback', 'of type function', callback);
       var bytes = inputBytes(chunk, 'chunk', CHUNK_INPUT, false);
-      var level = compress ? levelOption(options) : undefined;
+      var level = levelOf(format, compress, options);
       var dictionary = dictionaryOption(options);
+      var params = codecParamsOption(format, compress, options);
+      var chunkSize = chunkOption(format, options);
       var result = null;
       var error = null;
       try {
-        result = runZlib(format, compress, bytes, level, dictionary);
+        result = runZlib(format, compress, bytes, level, dictionary, params, chunkSize, true);
       } catch (err) {
         error = err;
       }
       setImmediateImpl(function () {
         if (error) callback(error);
         else callback(null, result);
-      });
-    };
-  }
-
-  /*
-   * Brotli and zstd are not implemented here, by decision: the only pure-JS brotli on npm is a
-   * ~2.2 MB package, and zstd compression has no small pure-JS implementation (fzstd, 65 KB, is
-   * decompress-only). Both belong to the WebAssembly bridge as codec modules, which is where the
-   * container already carries large native code. Until they land there these stay unavailable.
-   */
-  function unsupportedSync(name) {
-    return function () {
-      throw notSupported(name);
-    };
-  }
-
-  function unsupportedCallback(name) {
-    return function (chunk, options, callback) {
-      if (typeof options === 'function') callback = options;
-      if (typeof callback !== 'function') throw argTypeError('callback', 'of type function', callback);
-      var err = notSupported(name);
-      setImmediateImpl(function () {
-        callback(err);
       });
     };
   }
@@ -268,8 +319,10 @@ BF['zlib'] = function () {
     function ZlibStream(options) {
       var self = Reflect.construct(Transform, [options || {}], ZlibStream);
       self._owcChunks = [];
-      self._owcLevel = compress ? levelOption(options) : -1;
+      self._owcLevel = levelOf(format, compress, options);
       self._owcDictionary = dictionaryOption(options);
+      self._owcParams = codecParamsOption(format, compress, options);
+      self._owcChunkSize = chunkOption(format, options);
       self.bytesWritten = 0;
       return self;
     }
@@ -291,7 +344,8 @@ BF['zlib'] = function () {
       try {
         var input = concatBytes(this._owcChunks);
         this._owcChunks = [];
-        out = runZlib(format, compress, input, this._owcLevel, this._owcDictionary);
+        out = runZlib(format, compress, input, this._owcLevel, this._owcDictionary, this._owcParams,
+          this._owcChunkSize, true);
       } catch (err) {
         callback(err);
         return;
@@ -368,6 +422,10 @@ BF['zlib'] = function () {
   zlib.deflateRawSync = syncOp('deflate-raw', true);
   zlib.inflateRawSync = syncOp('deflate-raw', false);
   zlib.unzipSync = syncOp('unzip', false);
+  zlib.brotliCompressSync = syncOp('brotli', true);
+  zlib.brotliDecompressSync = syncOp('brotli', false);
+  zlib.zstdCompressSync = syncOp('zstd', true);
+  zlib.zstdDecompressSync = syncOp('zstd', false);
 
   zlib.gzip = callbackOp('gzip', true);
   zlib.gunzip = callbackOp('gzip', false);
@@ -376,6 +434,10 @@ BF['zlib'] = function () {
   zlib.deflateRaw = callbackOp('deflate-raw', true);
   zlib.inflateRaw = callbackOp('deflate-raw', false);
   zlib.unzip = callbackOp('unzip', false);
+  zlib.brotliCompress = callbackOp('brotli', true);
+  zlib.brotliDecompress = callbackOp('brotli', false);
+  zlib.zstdCompress = callbackOp('zstd', true);
+  zlib.zstdDecompress = callbackOp('zstd', false);
 
   [
     ['Gzip', 'gzip', true],
@@ -384,7 +446,11 @@ BF['zlib'] = function () {
     ['Inflate', 'deflate', false],
     ['DeflateRaw', 'deflate-raw', true],
     ['InflateRaw', 'deflate-raw', false],
-    ['Unzip', 'unzip', false]
+    ['Unzip', 'unzip', false],
+    ['BrotliCompress', 'brotli', true],
+    ['BrotliDecompress', 'brotli', false],
+    ['ZstdCompress', 'zstd', true],
+    ['ZstdDecompress', 'zstd', false]
   ].forEach(function (kind) {
     Object.defineProperty(zlib, kind[0], {
       enumerable: true,
@@ -394,24 +460,6 @@ BF['zlib'] = function () {
       return createStream(kind[0], kind[1], kind[2], options);
     };
   });
-
-  zlib.brotliCompressSync = unsupportedSync('brotliCompressSync');
-  zlib.brotliDecompressSync = unsupportedSync('brotliDecompressSync');
-  zlib.brotliCompress = unsupportedCallback('brotliCompress');
-  zlib.brotliDecompress = unsupportedCallback('brotliDecompress');
-  zlib.createBrotliCompress = unsupportedSync('createBrotliCompress');
-  zlib.createBrotliDecompress = unsupportedSync('createBrotliDecompress');
-  zlib.BrotliCompress = unsupportedSync('BrotliCompress');
-  zlib.BrotliDecompress = unsupportedSync('BrotliDecompress');
-
-  zlib.zstdCompressSync = unsupportedSync('zstdCompressSync');
-  zlib.zstdDecompressSync = unsupportedSync('zstdDecompressSync');
-  zlib.zstdCompress = unsupportedCallback('zstdCompress');
-  zlib.zstdDecompress = unsupportedCallback('zstdDecompress');
-  zlib.createZstdCompress = unsupportedSync('createZstdCompress');
-  zlib.createZstdDecompress = unsupportedSync('createZstdDecompress');
-  zlib.ZstdCompress = unsupportedSync('ZstdCompress');
-  zlib.ZstdDecompress = unsupportedSync('ZstdDecompress');
 
   return zlib;
 };
