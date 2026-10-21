@@ -12,12 +12,16 @@
  *  - a class element named get, set or async and followed by a semicolon is written as the quoted
  *    name, declaring the same field (QuickJS parses the bare form as an accessor and fails with
  *    "invalid property name").
- * The scanner tracks strings, template literals, comments, regex literals (previous-token rule)
- * and class bodies, so only real literals and class elements are touched.
+ * The scanner tracks strings, template literals, comments, regex literals (previous-token rule),
+ * control headers, object literals and class bodies, so only real literals and class elements are
+ * touched: a '/' is a regex where a value cannot continue and a division where one can.
  */
 export const REGEX_COMPAT_SRC = String.raw`
 var RX_NATIVE_REGEXP = RegExp;
 var RX_REGEX_AFTER_WORD ={ 'return': 1, 'typeof': 1, 'instanceof': 1, 'in': 1, 'of': 1, 'new': 1, 'delete': 1, 'void': 1, 'throw': 1, 'case': 1, 'do': 1, 'else': 1, 'yield': 1, 'await': 1 };
+var RX_CTRL_PAREN = { 'if': 1, 'while': 1, 'for': 1, 'with': 1, 'switch': 1 };
+var RX_BLOCK_WORD = { 'do': 1, 'else': 1, 'try': 1, 'catch': 1, 'finally': 1 };
+var RX_BLOCK_AFTER = { ';': 1, '{': 1, '}': 1, ')': 1, ']': 1, 'hdr': 1, '=>': 1 };
 var RX_VALUE_WORD = { 'this': 1, 'super': 1, 'null': 1, 'true': 1, 'false': 1 };
 var RX_ELEMENT_NAME = { 'get': 1, 'set': 1, 'async': 1 };
 function rxIsSpace(c) {
@@ -84,15 +88,27 @@ function rxReadRegex(src, start) {
   while (flagEnd < n && rxIsIdPart(src.charCodeAt(flagEnd))) flagEnd++;
   return { s: start, e: flagEnd, body: src.slice(start + 1, i), flags: src.slice(i + 1, flagEnd) };
 }
-function rxRegexAllowed(last) {
+/* A '/' that follows one of these can only be a division, not a regex, so long as it stays on the
+   same line: an object literal, a call or a group ends a value. After a line break the value is
+   already a whole statement and the '/' starts a new one, so there it is a regex again. */
+function rxRegexAllowed(last, nl) {
   if (last === null || last.k === 'kw') return true;
-  if (last.k === 'p') return last.v !== ')' && last.v !== ']';
-  return false;
+  if (last.k !== 'p') return false;
+  if (last.v === ')' || last.v === ']' || last.v === 'obj}') return nl;
+  return true;
+}
+/* Whether a value may stand where the last token ended: after '=', '(', '[', ',' or an operator it
+   may, after ';', '{', '}', ')' (a body follows), a control header, '=>' or a block keyword it may
+   not. Both the class expression and the object literal are told apart by this. */
+function rxValuePosition(last) {
+  if (last === null) return false;
+  if (last.k === 'p') return !RX_BLOCK_AFTER.hasOwnProperty(last.v);
+  return (last.k === 'kw' || last.k === 'id') && !RX_BLOCK_WORD.hasOwnProperty(last.v);
 }
 function rxScan(src) {
   var n = src.length, i = 0, st = { nl: false }, look = { nl: false };
   var stack = [], regexes = [], names = [];
-  var last = null, classHead = -1;
+  var last = null, classHead = -1, classValue = false;
   while (i < n) {
     i = rxSkip(src, i, st);
     if (i >= n) break;
@@ -111,10 +127,14 @@ function rxScan(src) {
       var afterDot = last !== null && last.k === 'p' && (last.v === '.' || last.v === '?.');
       if (word === 'class' && !afterDot) {
         var nx = rxSkip(src, j, look);
-        if (nx < n && (rxIsIdStart(src.charCodeAt(nx)) || src.charCodeAt(nx) === 123)) classHead = stack.length;
+        if (nx < n && (rxIsIdStart(src.charCodeAt(nx)) || src.charCodeAt(nx) === 123)) {
+          classHead = stack.length;
+          classValue = rxValuePosition(last);
+        }
       }
-      if (!afterDot && RX_ELEMENT_NAME.hasOwnProperty(word) && stack.length > 0 && stack[stack.length - 1] === 'C') {
-        var starts = last !== null && ((last.k === 'p' && (last.v === '{' || last.v === ';' || last.v === '}')) ||
+      if (!afterDot && RX_ELEMENT_NAME.hasOwnProperty(word) && stack.length > 0 &&
+          (stack[stack.length - 1] === 'C' || stack[stack.length - 1] === 'c')) {
+        var starts = last !== null && ((last.k === 'p' && (last.v === '{' || last.v === ';' || last.v === '}' || last.v === 'obj}')) ||
           (last.k === 'id' && last.v === 'static') ||
           (nl && (last.k === 'val' || last.k === 'id' || (last.k === 'p' && (last.v === ')' || last.v === ']')))));
         if (starts) {
@@ -155,7 +175,7 @@ function rxScan(src) {
       continue;
     }
     if (c === 47) {
-      var re = rxRegexAllowed(last) ? rxReadRegex(src, i) : null;
+      var re = rxRegexAllowed(last, nl) ? rxReadRegex(src, i) : null;
       if (re !== null) {
         regexes.push(re);
         last = { k: 'val', v: '' };
@@ -167,13 +187,25 @@ function rxScan(src) {
       continue;
     }
     if (c === 40 || c === 91) {
-      stack.push(c === 40 ? 'P' : 'A');
-      last = { k: 'p', v: c === 40 ? '(' : '[' };
+      if (c === 40) {
+        /* the header of if, while, for, with and switch ends with a ')' that a regex may follow
+           ('if (a) /x/.test(b)'), unlike the ')' of a call or a grouping; the stack remembers which
+           one it opened so the '/' after it is read as a regex and not as a division */
+        stack.push(last !== null && last.k === 'id' && RX_CTRL_PAREN.hasOwnProperty(last.v) ? 'K' : 'P');
+        last = { k: 'p', v: '(' };
+      } else {
+        stack.push('A');
+        last = { k: 'p', v: '[' };
+      }
       i++;
       continue;
     }
     if (c === 123) {
-      if (classHead === stack.length) { stack.push('C'); classHead = -1; }
+      if (classHead === stack.length) {
+        /* 'c' is a class expression: its body ends a value, so a '/' after it divides */
+        stack.push(classValue ? 'c' : 'C');
+        classHead = -1;
+      } else if (rxValuePosition(last)) stack.push('O');
       else stack.push('B');
       last = { k: 'p', v: '{' };
       i++;
@@ -188,14 +220,14 @@ function rxScan(src) {
         i = t2.next;
         continue;
       }
-      stack.pop();
-      last = { k: 'p', v: '}' };
+      var closedBrace = stack.pop();
+      last = { k: 'p', v: closedBrace === 'O' || closedBrace === 'c' ? 'obj}' : '}' };
       i++;
       continue;
     }
     if (c === 41 || c === 93) {
-      stack.pop();
-      last = { k: 'p', v: c === 41 ? ')' : ']' };
+      var closed = stack.pop();
+      last = { k: 'p', v: c === 93 ? ']' : (closed === 'K' ? 'hdr' : ')') };
       i++;
       continue;
     }
