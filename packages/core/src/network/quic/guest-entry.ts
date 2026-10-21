@@ -51,6 +51,90 @@ function asBuffer(bytes: Uint8Array): Uint8Array {
     return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
+/**
+ * Node-style argument errors: `code` is the code Node reports for the same mistake, so a program
+ * that catches on `error.code` behaves as it would against Node.
+ */
+function argError(Ctor: ErrorConstructor, code: string, message: string): Error {
+    return Object.assign(new Ctor(message), { code });
+}
+
+/** Node's rendering of a received value in an error message: `"a"`, `5`, `an instance of X`. */
+function describe(value: unknown): string {
+    if (typeof value === 'string') return JSON.stringify(value);
+    if (typeof value === 'object' && value !== null) {
+        const name = (value as { constructor?: { name?: string } }).constructor?.name;
+        return name !== undefined && name !== 'Object' ? `an instance of ${name}` : 'an object';
+    }
+    return String(value);
+}
+
+function optionsObject(value: unknown, name: string): Record<string, unknown> {
+    if (value === null || typeof value !== 'object') {
+        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type object. Received ${describe(value)}.`);
+    }
+    return value as Record<string, unknown>;
+}
+
+/**
+ * Node's validatePort (internal/validators): an integer in the port range, or a numeric string.
+ * allowZero separates a port to bind (0 asks the OS for one) from a port to send to. Checked on the
+ * call, because the QUIC layer would only fail when its first datagram goes out, from a timer, where
+ * the throw is uncaught and takes the process down.
+ */
+function portOf(value: unknown, allowZero: boolean, name: string): number {
+    const port = typeof value === 'string' && value !== '' ? Number(value) : value;
+    const minimum = allowZero ? 0 : 1;
+    if (typeof port !== 'number' || !Number.isInteger(port) || port < minimum || port > 65535) {
+        throw argError(RangeError, 'ERR_SOCKET_BAD_PORT', `Port should be ${allowZero ? '>= 0' : '> 0'} and < 65536. Received ${describe(value)}.`);
+    }
+    return port;
+}
+
+/** An optional string argument; null counts as absent. */
+function stringOf(value: unknown, name: string): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'string') {
+        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type string. Received ${describe(value)}.`);
+    }
+    return value;
+}
+
+function alpnOf(value: unknown): string[] | undefined {
+    if (value === undefined || value === null) return undefined;
+    const list: readonly unknown[] = Array.isArray(value) ? value : [value];
+    for (const item of list) {
+        if (typeof item !== 'string') {
+            throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "options.alpn" argument must be an array of strings. Received ${describe(item)}.`);
+        }
+    }
+    return list as string[];
+}
+
+function callbackOf(value: unknown, name: string): (() => void) | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'function') {
+        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type function. Received ${describe(value)}.`);
+    }
+    return value as () => void;
+}
+
+function traceOf(value: unknown): ((event: Record<string, unknown>) => void) | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'function') {
+        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "options.trace" argument must be of type function. Received ${describe(value)}.`);
+    }
+    return value as (event: Record<string, unknown>) => void;
+}
+
+function idleTimeoutOf(value: unknown): number | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw argError(RangeError, 'ERR_OUT_OF_RANGE', `The value of "options.idleTimeout" is out of range. It must be >= 0. Received ${describe(value)}.`);
+    }
+    return value;
+}
+
 const SUITE_CODES: Readonly<Record<string, number>> = {
     TLS_AES_128_GCM_SHA256: 0x1301,
     TLS_AES_256_GCM_SHA384: 0x1302,
@@ -141,11 +225,14 @@ class QuicServer extends Emitter {
 
     listen(port = 0, host = '127.0.0.1', callback?: () => void): this {
         if (this.socket !== null) throw Object.assign(new Error('server is already listening'), { code: 'ERR_SERVER_ALREADY_LISTEN' });
+        const bindPort = portOf(port, true, 'port');
+        const bindHost = stringOf(host, 'host') ?? '127.0.0.1';
+        const onListening = callbackOf(callback, 'callback');
         const dgram = requireBuiltin('dgram');
-        const socket = dgram.createSocket(host.indexOf(':') >= 0 ? 'udp6' : 'udp4');
+        const socket = dgram.createSocket(bindHost.indexOf(':') >= 0 ? 'udp6' : 'udp4');
         this.socket = socket;
         socket.on('error', (error: unknown) => this.emit('error', error));
-        socket.bind(port, host);
+        socket.bind(bindPort, bindHost);
         const key = OWC_TLS13.loadPem(this.options.key).key;
         const certs = OWC_TLS13.loadPem(this.options.cert).certs;
         const tls: TlsSettings = {
@@ -166,7 +253,7 @@ class QuicServer extends Emitter {
         this.endpoint.on('session', (session: QuicConnection) => this.emit('session', session));
         socket.once('listening', () => {
             this.emit('listening');
-            if (callback) callback();
+            if (onListening) onListening();
         });
         return this;
     }
@@ -185,35 +272,47 @@ class QuicServer extends Emitter {
 }
 
 function createServer(options: ServerOptions, onSession?: (session: QuicConnection) => void): QuicServer {
+    optionsObject(options, 'options');
     const server = new QuicServer(options);
     if (onSession) server.on('session', onSession);
     return server;
 }
 
-/** Connects to a QUIC server; the socket closes when the connection has fully closed. */
+/**
+ * Connects to a QUIC server; the socket closes when the connection has fully closed. The arguments
+ * are checked here, synchronously: nothing about the connection can fail before the first datagram
+ * goes out, which a timer does, where a throw would be uncaught and would take the process down.
+ */
 function connect(options: ClientOptions): QuicConnection & { endpoint: QuicEndpoint; localPort: number } {
+    const opts = optionsObject(options, 'options') as unknown as ClientOptions;
+    const host = stringOf(opts.host, 'options.host') ?? '127.0.0.1';
+    const port = portOf(opts.port, false, 'options.port');
+    const localAddress = stringOf(opts.localAddress, 'options.localAddress');
+    const localPort = opts.localPort === undefined || opts.localPort === null ? undefined : portOf(opts.localPort, true, 'options.localPort');
+    const alpn = alpnOf(opts.alpn);
+    const trace = traceOf(opts.trace);
+    const idleTimeout = idleTimeoutOf(opts.idleTimeout);
     const dgram = requireBuiltin('dgram');
-    const host = options.host ?? '127.0.0.1';
     const socket = dgram.createSocket(host.indexOf(':') >= 0 ? 'udp6' : 'udp4');
-    socket.bind(options.localPort ?? 0, options.localAddress ?? (host.indexOf(':') >= 0 ? '::1' : '127.0.0.1'));
-    const endpoint = new QuicEndpoint({ platform, socket: adaptSocket(socket), trace: options.trace, wrapBytes: asBuffer });
-    const servername = options.servername ?? (/^[0-9.]+$/.test(host) || host.indexOf(':') >= 0 ? undefined : host);
-    const contexts = options.key !== undefined && options.cert !== undefined ? [{ certificates: OWC_TLS13.loadPem(options.cert).certs, privateKey: OWC_TLS13.loadPem(options.key).key }] : undefined;
+    socket.bind(localPort ?? 0, localAddress ?? (host.indexOf(':') >= 0 ? '::1' : '127.0.0.1'));
+    const endpoint = new QuicEndpoint({ platform, socket: adaptSocket(socket), trace, wrapBytes: asBuffer });
+    const servername = stringOf(opts.servername, 'options.servername') ?? (/^[0-9.]+$/.test(host) || host.indexOf(':') >= 0 ? undefined : host);
+    const contexts = opts.key !== undefined && opts.cert !== undefined ? [{ certificates: OWC_TLS13.loadPem(opts.cert).certs, privateKey: OWC_TLS13.loadPem(opts.key).key }] : undefined;
     const tls: TlsSettings = {
-        ALPNProtocols: options.alpn ?? ['h3'],
+        ALPNProtocols: alpn ?? ['h3'],
         serverName: servername,
-        anchors: certificatesOf(options.ca),
+        anchors: certificatesOf(opts.ca),
         hostname: servername ?? host,
-        suites: codes(options.suites, SUITE_CODES, 'cipher suite'),
-        groups: codes(options.groups, GROUP_CODES, 'group'),
+        suites: codes(opts.suites, SUITE_CODES, 'cipher suite'),
+        groups: codes(opts.groups, GROUP_CODES, 'group'),
         contexts,
     };
     const connection = endpoint.connect({
         address: host,
-        port: options.port,
+        port,
         tls,
-        rejectUnauthorized: options.rejectUnauthorized,
-        transport: transportOf(options),
+        rejectUnauthorized: opts.rejectUnauthorized,
+        transport: transportOf({ ...opts, idleTimeout }),
     }) as QuicConnection & { endpoint: QuicEndpoint; localPort: number };
     connection.endpoint = endpoint;
     Object.defineProperty(connection, 'localPort', { get: () => socket.address().port, enumerable: true });
