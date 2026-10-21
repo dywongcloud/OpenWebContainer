@@ -898,16 +898,11 @@ BF.crypto = function () {
   };
 };
 
+/* require('module') is the Module class the loader builds modules with, carrying Node's statics;
+   builtinModules is filled in here, where every builtin factory has registered itself. */
 BF.module = function () {
-  return {
-    createRequire: function (filename) {
-      return createRequireFor(String(filename));
-    },
-    isBuiltin: function (name) {
-      return isBuiltinName(String(name));
-    },
-    builtinModules: Object.keys(BF).filter(function (n) { return n.indexOf('/') < 0; }).sort()
-  };
+  Module.builtinModules = Object.keys(BF).filter(function (n) { return n.indexOf('/') < 0; }).sort();
+  return Module;
 };
 
 BF.tty = function () {

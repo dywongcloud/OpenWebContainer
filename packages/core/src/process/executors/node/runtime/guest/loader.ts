@@ -64,6 +64,39 @@ function Module(filename, parent) {
   this.paths = [];
 }
 
+/* require('module') exports this class, so its statics are Node's: a package that patches
+   Module._resolveFilename or Module.prototype.require to hook resolution (next's
+   dist/server/require-hook.js does both, at load time) finds the real thing rather than an object
+   with no prototype. Resolution itself still goes through the host, and a patch to _resolveFilename
+   or to prototype.require therefore changes what a caller of those two sees, not what the loader
+   does: the loader resolves with host.resolve, which no patch reaches. */
+Module._cache = MODULE_CACHE;
+Module._extensions = EXTENSIONS;
+Module._pathCache = Object.create(null);
+Module.globalPaths = [];
+Module.wrapper = ['(function (exports, require, module, __filename, __dirname) { ', '\n});'];
+Module.wrap = function wrap(script) { return Module.wrapper[0] + script + Module.wrapper[1]; };
+Module.Module = Module;
+Module.isBuiltin = isBuiltinName;
+Module.createRequire = function createRequire(filename) { return createRequireFor(String(filename)); };
+Module.createRequireFromPath = function createRequireFromPath(filename) { return createRequireFor(String(filename)); };
+Module._initPaths = function _initPaths() { return undefined; };
+Module._nodeModulePaths = function _nodeModulePaths() { return []; };
+Module._preloadModules = function _preloadModules() { return undefined; };
+Module.syncBuiltinESMExports = function syncBuiltinESMExports() { return undefined; };
+Module._resolveFilename = function _resolveFilename(request, parent, isMain, options) {
+  if (isBuiltinName(request)) return stripNodePrefix(request);
+  var base = parent && parent.path ? parent.path : host.cwd();
+  var found = host.resolve(String(request), base, 'require');
+  if (!found) throw moduleNotFound(String(request));
+  return found;
+};
+Module._load = function _load(request, parent, isMain) {
+  if (isBuiltinName(request)) return requireBuiltin(request);
+  return requireFrom(parent, request);
+};
+Module.prototype.require = function _require(request) { return requireFrom(this, request); };
+
 /* require.extensions (Module._extensions): .node files load through it, by process.dlopen; .js and .json files load in loadCJS */
 var EXTENSIONS = {
   '.js': function (module, filename) {
@@ -167,14 +200,14 @@ function loadCJS(filename, parent, isMain) {
 
 var nextEsmToken = 1;
 
+/* require() of an ES module. The host reports a failure as a record of the error it met, so what
+   require() throws is the error Node throws: a module that does not parse is a SyntaxError, one
+   that throws reports its own error, and one whose own import is missing ERR_MODULE_NOT_FOUND.
+   Only a failure the host cannot describe is left as ERR_REQUIRE_ESM. */
 function loadEsmFromRequire(filename, mod) {
   var token = nextEsmToken++;
   var failure = host.esmLoad(filename, token);
-  if (failure) {
-    var loadErr = new Error(failure);
-    loadErr.code = 'ERR_REQUIRE_ESM';
-    throw loadErr;
-  }
+  if (failure) throw requireEsmFailureOf(failure);
   var registry = globalThis.__owc_esm_registry || {};
   var namespace = registry[token];
   delete registry[token];
@@ -183,9 +216,40 @@ function loadEsmFromRequire(filename, mod) {
     asyncErr.code = 'ERR_REQUIRE_ASYNC_MODULE';
     throw asyncErr;
   }
-  mod.exports = namespace;
+  /* Node marks the namespace of a module that has a default export with __esModule, the marker a
+     transpiled CommonJS consumer looks for; a module with no default export gets none. The engine
+     seals its namespaces, so the marked one is a copy that reads the same way: the same exports in
+     the same order, a null prototype and the '[object Module]' tag. */
+  mod.exports = Object.prototype.hasOwnProperty.call(namespace, 'default')
+    ? markedNamespace(namespace)
+    : namespace;
   mod.loaded = true;
   return mod;
+}
+
+function markedNamespace(namespace) {
+  var marked = Object.create(null);
+  marked.__esModule = true;
+  var keys = Object.keys(namespace);
+  for (var i = 0; i < keys.length; i++) marked[keys[i]] = namespace[keys[i]];
+  Object.defineProperty(marked, Symbol.toStringTag, { value: 'Module' });
+  return marked;
+}
+
+function requireEsmFailureOf(failure) {
+  var info = null;
+  try { info = JSON.parse(failure); } catch (e) { info = null; }
+  if (info === null || typeof info !== 'object' || typeof info.name !== 'string') {
+    var plain = new Error(failure);
+    plain.code = 'ERR_REQUIRE_ESM';
+    return plain;
+  }
+  var Ctor = globalThis[info.name];
+  var err = typeof Ctor === 'function' ? new Ctor(info.message) : new Error(info.message);
+  if (typeof info.code === 'string' && info.code !== '') {
+    try { err.code = info.code; } catch (e) { /* a frozen error keeps the message it has */ }
+  }
+  return err;
 }
 
 function scheduleTimer(fn, ms, args, repeat) {

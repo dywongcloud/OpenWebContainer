@@ -27,6 +27,7 @@ const USAGE = [
     '  npm init [-y]',
     '  npm run [<script> [-- <args>]] [--if-present]                 alias: run-script',
     '  npm test | npm start | npm stop | npm restart',
+    '  npm exec [<pkg>[@range>] [-- <args>]] [-p|--package <pkg>]    alias: x',
     '',
     'npx [-y] [-p <pkg>] <command|pkg[@range]> [args...]',
     ''
@@ -91,6 +92,9 @@ export class NpmProcess extends Process {
             case 'stop':
             case 'restart':
                 return this.runScript(rest, LIFECYCLE_COMMANDS[command]);
+            case 'exec':
+            case 'x':
+                return this.runExec(rest, registry, log);
             default:
                 this.emitError(`Unknown command: "${command}"\n`);
                 return 1;
@@ -198,21 +202,37 @@ export class NpmProcess extends Process {
         return 0;
     }
 
-    private async runNpx(registry: NpmRegistry, log: (line: string) => void): Promise<number> {
-        const args = [...this.args];
-        let packageArg: string | undefined;
-        while (args.length > 0 && args[0].startsWith('-')) {
-            const flag = args.shift()!;
-            if (flag === '-p' || flag === '--package') packageArg = args.shift();
-        }
-        const command = args.shift();
+    /**
+     * `npm exec [<pkg>] [-- <args>]`, and its alias `x`: the npm spelling of npx. The command is the
+     * first bare word, or the first word after `--` when every word sits behind it; the words that
+     * follow it are its own. `-p`/`--package` names the package the bin comes out of, as npx has it.
+     */
+    private async runExec(args: string[], registry: NpmRegistry, log: (line: string) => void): Promise<number> {
+        const { command, commandArgs, packageArg } = parseExecArgs(args);
         const requested = packageArg ?? command;
-        if (requested === undefined) throw new Error('npx: a command or package is required');
-
-        // the command names the bin, so a version on it (npx cowsay@1) is stripped: the bin is `cowsay`
+        if (requested === undefined) {
+            this.emitError('npm error exec: a command or package is required\n');
+            return 1;
+        }
         const binName = parseInstallSpec(command ?? requested).name.split('/').pop()!;
-        const cwd = this.cwd ?? '/';
-        let shim = packageArg === undefined ? findLocalBinShim(this.fileSystem, cwd, binName) : undefined;
+        return this.runBin(binName, requested, commandArgs, this.cwd ?? '/', registry, log, packageArg !== undefined);
+    }
+
+    /**
+     * The body `npx` and `npm exec` share: the bin is the tree's own when the package has one, and
+     * is fetched into the npx cache and taken from there when it has not; the shim runs, so the
+     * program sees the name it was invoked by in argv[1].
+     */
+    private async runBin(
+        binName: string,
+        requested: string,
+        args: string[],
+        cwd: string,
+        registry: NpmRegistry,
+        log: (line: string) => void,
+        explicitPackage: boolean
+    ): Promise<number> {
+        let shim = explicitPackage ? undefined : findLocalBinShim(this.fileSystem, cwd, binName);
 
         if (shim === undefined) {
             const spec = parseInstallSpec(requested);
@@ -233,6 +253,46 @@ export class NpmProcess extends Process {
         const result = await this.spawnChild('node', [shim, ...args], Object.fromEntries(this.env), cwd);
         return result.exitCode;
     }
+
+    private async runNpx(registry: NpmRegistry, log: (line: string) => void): Promise<number> {
+        const args = [...this.args];
+        let packageArg: string | undefined;
+        while (args.length > 0 && args[0].startsWith('-')) {
+            const flag = args.shift()!;
+            if (flag === '-p' || flag === '--package') packageArg = args.shift();
+        }
+        const command = args.shift();
+        const requested = packageArg ?? command;
+        if (requested === undefined) throw new Error('npx: a command or package is required');
+
+        // the command names the bin, so a version on it (npx cowsay@1) is stripped: the bin is `cowsay`
+        const binName = parseInstallSpec(command ?? requested).name.split('/').pop()!;
+        return this.runBin(binName, requested, args, this.cwd ?? '/', registry, log, packageArg !== undefined);
+    }
+}
+
+/**
+ * `npm exec [-p <pkg>] [--] <command> [args...]`: npm's own flags first, then the command, then the
+ * words that belong to the command. `--` is optional, so both `npm exec next -- typegen` and
+ * `npm exec next typegen` hand `typegen` to `next`.
+ */
+function parseExecArgs(args: string[]): { command?: string; commandArgs: string[]; packageArg?: string } {
+    let packageArg: string | undefined;
+    const head: string[] = [];
+    const tail: string[] = [];
+    let passthrough = false;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (passthrough) tail.push(arg);
+        else if (arg === '--') passthrough = true;
+        else if (arg === '-p' || arg === '--package') packageArg = args[++i];
+        else if (arg.startsWith('-') && arg !== '-') continue;
+        else head.push(arg);
+    }
+    // `--` before the command (`npm exec -- next typegen`) makes the first word after it the command
+    const command = head.length > 0 ? head[0] : tail[0];
+    const commandArgs = head.length > 0 ? [...head.slice(1), ...tail] : tail.slice(1);
+    return { command, commandArgs, packageArg };
 }
 
 /** The nearest node_modules/.bin/<name> shim from `startDir` upward. */
