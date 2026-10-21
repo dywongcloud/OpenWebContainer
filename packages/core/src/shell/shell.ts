@@ -614,6 +614,10 @@ export class Shell implements IShell {
                     // such as `ls *.txt` expands to -- prints its own name, as it does in a shell.
                     const operands = args.filter((arg) => !arg.startsWith('-'));
                     const names: string[] = [];
+                    /* Every operand is looked at, not just up to the first one that is missing: a
+                       shell reports each name it could not find and still lists the ones it could,
+                       and only then fails -- `ls a nosuch b` lists a and b and names nosuch once. */
+                    const missing: string[] = [];
                     if (operands.length === 0) {
                         names.push(...this.lsNames(at(this.shellState.cwd)));
                     } else {
@@ -621,8 +625,15 @@ export class Shell implements IShell {
                             const path = at(operand);
                             if (this.isDirectorySafe(path)) names.push(...this.lsNames(path));
                             else if (this.fileExistsSafe(path)) names.push(operand);
-                            else return fail(`ls: ${operand}: No such file or directory`);
+                            else missing.push(`ls: ${operand}: No such file or directory`);
                         }
+                    }
+                    if (missing.length > 0) {
+                        return {
+                            stdout: names.length > 0 ? names.join('\n') + '\n' : '',
+                            stderr: missing.join('\n'),
+                            exitCode: 1
+                        };
                     }
                     return ok(names.length > 0 ? names.join('\n') + '\n' : '');
                 }
