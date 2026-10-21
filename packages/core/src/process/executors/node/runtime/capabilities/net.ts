@@ -118,10 +118,12 @@ export const NET_CAPABILITIES: Record<string, CapabilityHandler> = {
         return null;
     }),
 
+    /* `unread` is the guest telling the hub that it is destroying a connection with data it never
+       read: that is the case in which a real socket sends RST, so the peer is reset, not end-of-file. */
     'net.destroy': (args, ctx) => guard('destroy', () => {
         const connectionId = numberArg(args.connectionId);
         if (ownedBy(ctx.services.network.ownerOfConnection(connectionId), ctx.pid)) {
-            ctx.services.network.destroy(connectionId);
+            ctx.services.network.destroy(connectionId, { unread: args.unread === true });
         }
         return null;
     }),

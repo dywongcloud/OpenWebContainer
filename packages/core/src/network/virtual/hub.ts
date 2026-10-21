@@ -60,6 +60,8 @@ interface Connection {
     listenerId?: number;
     /** Server side: its 'connection' event is not delivered yet, so its owner may still attach it. */
     offerPending?: boolean;
+    /** Client side: its 'connect' event is not delivered yet, so the peer has not been established. */
+    connectPending?: boolean;
     /**
      * Server side of a host-owned listener, left unattached by its 'connection' delivery: the host may
      * attach it later, for as long as it keeps that event's payload.
@@ -203,6 +205,7 @@ export class VirtualNetwork {
             local: { ownerPid: request.ownerPid, address: '127.0.0.1', port: localPort, targetId: request.targetId, pending: [] },
             closed: false,
             writeEnded: false,
+            connectPending: true,
         };
         const server: Connection = {
             id: this.nextId++,
@@ -217,7 +220,11 @@ export class VirtualNetwork {
         this.connections.set(client.id, client);
         this.connections.set(server.id, server);
         // The client's 'connect' is delivered before the server's 'connection', the order Node shows on loopback.
-        this.schedule(request.ownerPid, request.targetId, 'connect', { connectionId: client.id });
+        this.schedule(request.ownerPid, request.targetId, 'connect', { connectionId: client.id }, undefined, () => {
+            /* Only a client still there to receive it was ever connected: one destroyed before this
+               abandoned the attempt, and its listener must not hear of it. */
+            if (this.connections.get(client.id) === client) client.connectPending = false;
+        });
         this.offer(server, listener, {
             connectionId: server.id,
             localAddress: displayAddress(listener.address === '' ? '127.0.0.1' : listener.address),
@@ -264,12 +271,13 @@ export class VirtualNetwork {
     }
 
     /**
-     * Closes both ends. The peer gets EOF first (unless it already has it), then 'close'. A peer that
-     * may still be attached (its 'connection' event is not delivered yet, or it is claimable) keeps its
-     * record, with those events queued, for that attach; its owner can still destroy it, which only
-     * removes it.
+     * Closes both ends. The peer gets EOF first (unless it already has it), then 'close', unless this
+     * side still holds unread data: that is the reset Node sends, so the peer gets 'reset' (an
+     * ECONNRESET error) and 'close' with no EOF at all. A peer that may still be attached (its
+     * 'connection' event is not delivered yet, or it is claimable) keeps its record, with those events
+     * queued, for that attach; its owner can still destroy it, which only removes it.
      */
-    destroy(connectionId: number): void {
+    destroy(connectionId: number, options?: { unread?: boolean }): void {
         const connection = this.connections.get(connectionId);
         if (!connection) return;
         this.connections.delete(connection.id);
@@ -277,8 +285,12 @@ export class VirtualNetwork {
         connection.closed = true;
         const peer = connection.remote;
         if (peer && !peer.closed) {
-            if (!connection.writeEnded) this.emitToPeer(connection, 'end', undefined);
             peer.closed = true;
+            if (options?.unread) {
+                this.emitToPeer(connection, 'reset', { code: 'ECONNRESET' });
+            } else if (!connection.writeEnded) {
+                this.emitToPeer(connection, 'end', undefined);
+            }
             if (peer.local.targetId !== undefined || !(peer.offerPending || peer.claimable)) this.connections.delete(peer.id);
             this.schedule(peer.local.ownerPid, peer.local.targetId, 'close', undefined, peer.local);
         }
@@ -376,12 +388,13 @@ export class VirtualNetwork {
         this.schedule(peer.local.ownerPid, peer.local.targetId, name, payload);
     }
 
-    private schedule(pid: number, targetId: number | undefined, name: string, payload: unknown, endpoint?: Endpoint): void {
+    private schedule(pid: number, targetId: number | undefined, name: string, payload: unknown, endpoint?: Endpoint, onDelivered?: () => void): void {
         if (targetId === undefined) {
             if (endpoint) endpoint.pending.push({ name, payload });
             return;
         }
         setTimeout(() => {
+            onDelivered?.();
             this.sinkOf(pid)?.deliver(targetId, name, payload);
         }, 0);
     }
@@ -396,6 +409,12 @@ export class VirtualNetwork {
     private offer(server: Connection, listener: Listener, payload: object): void {
         setTimeout(() => {
             if (this.connections.get(server.id) !== server) return;
+            /* A client that destroyed the connection before its 'connect' was delivered never
+               completed it, so Node's listener does not see a socket: drop it unannounced. */
+            if (server.closed && server.remote?.connectPending !== false) {
+                this.connections.delete(server.id);
+                return;
+            }
             this.sinkOf(listener.ownerPid)?.deliver(listener.targetId, 'connection', payload);
             server.offerPending = false;
             if (server.local.targetId !== undefined) return;

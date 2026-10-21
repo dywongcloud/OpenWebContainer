@@ -356,7 +356,9 @@ export function requestGuestServer(network: VirtualNetwork, port: number, reques
             try {
                 if (name === 'data') {
                     if (reader.feed(base64ToBytes(payload as string))) settle(undefined, reader.response());
-                } else if (name === 'end' || name === 'close') {
+                /* 'reset' is the peer's RST (it destroyed the connection with unread data): no EOF
+                   follows it, so a body that is not already framed by its length is truncated. */
+                } else if (name === 'end' || name === 'close' || name === 'reset') {
                     if (reader.end()) settle(undefined, reader.response());
                     else settle(protocolError('ECONNRESET', 'socket hang up'));
                 }

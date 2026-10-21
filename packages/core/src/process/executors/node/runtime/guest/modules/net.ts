@@ -23,6 +23,9 @@ export const SRC = String.raw`
 (function () {
 var NET_REASON_TEXT = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'address not available' };
 
+/** What a loopback socket absorbs before a write is still in flight when it is destroyed: Node's SO_SNDBUF. */
+var NET_SNDBUF = 262144;
+
 function netError(Ctor, code, message) {
   var err = new Ctor(message);
   err.code = code;
@@ -116,6 +119,18 @@ function netUtf8Cut(buf) {
     return n - i < need ? i : n;
   }
   return n;
+}
+
+/** Checks a buffer size the way Node does: the socket must be running, the size a plain integer. */
+function netBufferSize(socket, size, syscall) {
+  if (socket._dead || !socket._bound) {
+    throw Object.assign(
+      netError(Error, 'ERR_SOCKET_BUFFER_SIZE', 'Could not get or set buffer size: ' + syscall + ' returned EBADF (bad file descriptor)'),
+      { syscall: syscall });
+  }
+  if (typeof size !== 'number' || !Number.isInteger(size) || size < 0) {
+    throw netError(RangeError, 'ERR_SOCKET_BAD_BUFFER_SIZE', 'Buffer size must be a non-negative integer. Received ' + netDescribe(size));
+  }
 }
 
 /** Address shown for a listener: no host means the IPv6 wildcard, as Node does on a dual-stack host. */
@@ -275,6 +290,7 @@ BF['net'] = function () {
       this._connectStarted = false;
       this._endRequested = false;
       this._pendingWrites = [];
+      this._writeCbs = [];
       this._readQueue = [];
       this._flowing = undefined;
       this._encoding = null;
@@ -313,7 +329,7 @@ BF['net'] = function () {
 
     get readyState() {
       if (this.connecting) return 'opening';
-      if (this._hubId === undefined || this._dead) return 'closed';
+      if (this._dead) return 'closed';
       var canRead = duplexMode ? this.readable : !this._rEnded;
       var canWrite = duplexMode ? this.writable : !this._wEnded;
       if (canRead && canWrite) return 'open';
@@ -324,6 +340,15 @@ BF['net'] = function () {
 
     get pending() {
       return this._hubId === undefined;
+    }
+
+    /** Bytes written but not yet acknowledged, the way Node counts a socket's unsent queue. */
+    get bufferSize() {
+      if (this._hubId === undefined && !this.connecting) return undefined;
+      var queued = 0;
+      for (var i = 0; i < this._writeCbs.length; i++) queued += this._writeCbs[i].size;
+      var buffered = duplexMode && typeof this.writableLength === 'number' ? this.writableLength : 0;
+      return queued + buffered;
     }
 
     connect() {
@@ -368,7 +393,20 @@ BF['net'] = function () {
       if (name === 'data') this._onChunk(Buffer.from(payload, 'base64'));
       else if (name === 'connect') this._onConnectEvent();
       else if (name === 'end') this._onRemoteEnd();
+      else if (name === 'reset') this._onRemoteReset(payload);
       else if (name === 'close') this._onRemoteClose();
+    }
+
+    /** The peer closed with unread data of its own: a reset, so this side gets ECONNRESET, never EOF. */
+    _onRemoteReset(payload) {
+      if (this._dead) return;
+      var code = payload && typeof payload.code === 'string' ? payload.code : 'ECONNRESET';
+      /* Node names a reset the way the read that found it failed: 'read ECONNRESET', with no address. */
+      var failure = netError(Error, code, 'read ' + code);
+      failure.errno = -54;
+      failure.syscall = 'read';
+      this._readQueue = [];
+      this.destroy(failure);
     }
 
     _onConnectEvent() {
@@ -519,14 +557,55 @@ BF['net'] = function () {
       if (this._endRequested) this._sendEnd();
     }
 
-    _closeHub() {
+    /**
+     * Completes one write. A write bigger than the socket buffer is still in flight once this tick
+     * ends, so it is held until the next one -- and a socket destroyed meanwhile cancels it with
+     * ECANCELED instead of reporting a success it never had, which is what Node does.
+     */
+    _settleWrite(callback, size) {
+      if (typeof callback !== 'function') return;
+      if (size > NET_SNDBUF) {
+        this._writeCbs.push({ cb: callback, size: size });
+        var self = this;
+        setTimeout(function () { self._drainWriteCbs(null); }, 0);
+        return;
+      }
+      if (duplexMode) callback();
+      else netDefer(function () { callback(); });
+    }
+
+    /** Runs every held write callback: with the failure that ended the socket, or with none. */
+    _drainWriteCbs(failure) {
+      var pending = this._writeCbs;
+      this._writeCbs = [];
+      for (var i = 0; i < pending.length; i++) pending[i].cb(failure);
+    }
+
+    _writeCancelError() {
+      return netError(Error, 'ECANCELED', 'write ECANCELED');
+    }
+
+    /* The unread count is measured before this socket drops what it was holding: it is the reason
+       the hub sends the peer a reset instead of end-of-file. */
+    _closeHub(unread) {
       if (this._hubId === undefined || this._hubClosed) return;
       this._hubClosed = true;
+      var pending = unread === undefined ? this._unreadBytes() : unread;
       try {
-        callCap('net.destroy', { connectionId: this._hubId });
+        callCap('net.destroy', { connectionId: this._hubId, unread: pending > 0 });
       } catch (cause) {
         // Already destroyed.
       }
+    }
+
+    /** Bytes this side received and never read: closing with them is the reset Node sends. */
+    _unreadBytes() {
+      var queued = 0;
+      for (var i = 0; i < this._readQueue.length; i++) {
+        if (this._readQueue[i].chunk !== undefined) queued += this._readQueue[i].chunk.length;
+      }
+      var buffered = duplexMode && typeof this.readableLength === 'number' ? this.readableLength : 0;
+      return queued + buffered;
     }
 
     _ensureTarget() {
@@ -625,13 +704,31 @@ BF['net'] = function () {
   }
 
   if (duplexMode) {
+    var duplexWrite = DuplexBase.prototype.write;
+    /* A write past this end is EPIPE, as the socket would have raised: it goes to the callback and
+       nothing else, which is what Node does -- only a write past a destroyed socket is an 'error'. */
+    Socket.prototype.write = function (chunk, encoding, callback) {
+      if (typeof encoding === 'function') {
+        callback = encoding;
+        encoding = undefined;
+      }
+      /* A socket that sent its own end takes EPIPE, even once it has closed: only one that was
+         destroyed without ending (a reset) reports the stream's own error instead. */
+      if (this._wFinished || this._wEnded) {
+        var failure = netError(Error, 'EPIPE', 'This socket has been ended by the other party');
+        netDefer(function () { if (typeof callback === 'function') callback(failure); });
+        return false;
+      }
+      return duplexWrite.call(this, chunk, encoding, callback);
+    };
+
     Socket.prototype._read = function () {};
 
     Socket.prototype._write = function (chunk, encoding, callback) {
       this.bytesWritten += chunk.length;
       this._armIdle();
       this._sendChunk(chunk);
-      callback();
+      this._settleWrite(callback, chunk.length);
     };
 
     Socket.prototype._final = function (callback) {
@@ -641,11 +738,14 @@ BF['net'] = function () {
     };
 
     Socket.prototype._destroy = function (error, callback) {
+      var unread = this._unreadBytes();
       this._dead = true;
       this._hadError = !!error;
       this.connecting = false;
       this._readQueue = [];
-      this._closeHub();
+      // Node cancels what a destroyed socket never managed to send, and reports that first.
+      this._drainWriteCbs(error || this._writeCancelError());
+      this._closeHub(unread);
       this._teardown();
       callback(error);
     };
@@ -663,21 +763,25 @@ BF['net'] = function () {
         encoding = undefined;
       }
       var buf = netToBuffer(chunk, encoding);
-      if (this._dead || this._wEnded) {
+      if (this._wFinished || this._wEnded) {
+        /* Node reports a write past this end as EPIPE, the errno the socket would have raised. */
+        var ended = netError(Error, 'EPIPE', 'This socket has been ended by the other party');
+        netDefer(function () { if (typeof callback === 'function') callback(ended); });
+        return false;
+      }
+      if (this._dead) {
         var self = this;
-        var failure = this._dead
-          ? netError(Error, 'ERR_STREAM_DESTROYED', 'Cannot call write after a stream was destroyed')
-          : netError(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end');
+        var failure = netError(Error, 'ERR_STREAM_DESTROYED', 'Cannot call write after a stream was destroyed');
         netDefer(function () {
           if (typeof callback === 'function') callback(failure);
-          if (!self._dead && self._wEnded) self.emit('error', failure);
+          self.emit('error', failure);
         });
         return false;
       }
       this.bytesWritten += buf.length;
       this._armIdle();
       this._sendChunk(buf);
-      if (typeof callback === 'function') netDefer(function () { callback(); });
+      this._settleWrite(callback, buf.length);
       return true;
     };
 
@@ -710,10 +814,13 @@ BF['net'] = function () {
 
     Socket.prototype.destroy = function (error) {
       if (this._dead) return this;
+      var unread = this._unreadBytes();
       this._dead = true;
       this.connecting = false;
       this._readQueue = [];
-      this._closeHub();
+      // Node cancels what a destroyed socket never managed to send, and reports that first.
+      this._drainWriteCbs(error || this._writeCancelError());
+      this._closeHub(unread);
       this._teardown();
       var self = this;
       netDefer(function () {
@@ -1176,6 +1283,11 @@ BF['dgram'] = function () {
       return this._bound && !this._dead;
     }
 
+    /** 'udp4' or 'udp6', as Node names the kind of socket this is. */
+    get type() {
+      return this._type;
+    }
+
     _onHub(name, payload) {
       if (name !== 'message' || this._dead || !this._bound) return;
       var datagram = Buffer.from(payload.data, 'base64');
@@ -1295,8 +1407,11 @@ BF['dgram'] = function () {
     }
 
     address() {
-      if (!this._bound || this._dead || this._address === null) {
-        throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
+      /* A socket that was never bound has no name to return and no file descriptor to ask, which
+         Node reports as EBADF from getsockname; one that was closed is no longer running at all. */
+      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
+      if (!this._bound || this._address === null) {
+        throw Object.assign(netError(Error, 'EBADF', 'getsockname EBADF'), { syscall: 'getsockname' });
       }
       return { address: this._address.address, family: this._address.family, port: this._address.port };
     }
@@ -1357,6 +1472,16 @@ BF['dgram'] = function () {
     }
 
     setMulticastInterface() {}
+
+    /* Buffer sizes are a kernel setting this runtime has no kernel for: accepted and checked, then
+       dropped. An unbound or closed socket has no descriptor to set one on, as on Node. */
+    setRecvBufferSize(size) {
+      netBufferSize(this, size, 'uv_recv_buffer_size');
+    }
+
+    setSendBufferSize(size) {
+      netBufferSize(this, size, 'uv_send_buffer_size');
+    }
 
     addMembership() {}
 
