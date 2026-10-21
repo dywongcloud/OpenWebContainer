@@ -782,13 +782,22 @@ BF.fs = function () {
    * is what utimes is for.
    */
   var MTIMES = {};
+  /*
+   * chmod has no host file system to write its bits through to either, so the mode it sets is kept
+   * here beside the times and folded into every later stat of that path. A mode nothing reads back
+   * is a no-op that reports success, which is worse than a refusal.
+   */
+  var MODES = {};
 
   function statOf(file) {
     var raw = host.statJSON(file);
     if (raw === null) return null;
     var st = JSON.parse(raw);
     var override = MTIMES[file];
-    return override === undefined ? st : { type: st.type, size: st.size, mtimeMs: override };
+    var withTime = override === undefined ? st : { type: st.type, size: st.size, mtimeMs: override };
+    var mode = MODES[file];
+    return mode === undefined ? withTime
+      : { type: withTime.type, size: withTime.size, mtimeMs: withTime.mtimeMs, mode: mode };
   }
 
   function optionsEncoding(opts) {
@@ -834,6 +843,9 @@ BF.fs = function () {
      path it was created at: lstat reports the link, stat follows it, and readlink names its target.
      The link itself holds a copy of the target's bytes, so a read through it sees the same data. */
   var SYMLINKS = {};
+  /* readlink hands back the target exactly as symlink wrote it, which is not always the path stat
+     follows: a relative target is written verbatim and resolved beside the link. */
+  var LINKTARGETS = {};
 
   function makeStats(st, opts, isLink) {
     var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
@@ -842,7 +854,7 @@ BF.fs = function () {
     var mtime = new Date(st.mtimeMs);
     return {
       dev: num(0),
-      mode: num(st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188)),
+      mode: num(st.mode !== undefined ? st.mode : (st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188))),
       nlink: num(1),
       uid: num(0),
       gid: num(0),
@@ -978,17 +990,22 @@ BF.fs = function () {
   }
 
   fs.symlinkSync = function (target, linkPath) {
-    var from = toPathString(target);
+    var raw = target && typeof target === 'object' && target.href ? target.href : String(target);
     var to = toPathString(linkPath);
+    // A relative target names a path beside the link, not one under the working directory: that is
+    // where the system resolves it when the link is opened, and where Node leaves it for readlink.
+    var from = P.isAbsolute(raw) ? toPathString(raw) : P.resolve(P.dirname(to), raw);
     if (!statOf(from)) throw symlinkError('ENOENT', from, to);
     if (statOf(to)) throw symlinkError('EEXIST', from, to);
     check(host.writeBase64(to, encodeBase64(readBytesOf(from))), 'symlink', to);
     SYMLINKS[to] = from;
+    LINKTARGETS[to] = raw;
   };
 
   fs.readlinkSync = function (p) {
     var file = toPathString(p);
-    var target = SYMLINKS[file];
+    var target = LINKTARGETS[file];
+    if (target === undefined) target = SYMLINKS[file];
     if (target !== undefined) return target;
     if (!statOf(file)) throw fsError('ENOENT', 'readlink', file);
     throw fsError('EINVAL', 'readlink', file);
@@ -1266,7 +1283,8 @@ BF.fs = function () {
     return makeStats({
       type: st ? st.type : (rec.isDir ? 'dir' : 'file'),
       size: rec.bytes.length,
-      mtimeMs: st ? st.mtimeMs : 0
+      mtimeMs: st ? st.mtimeMs : 0,
+      mode: st ? st.mode : undefined
     });
   }
 
@@ -1341,11 +1359,25 @@ BF.fs = function () {
     return total;
   };
 
-  // The file system has no owners or permission bits to set, so these only have to report the
-  // error Node would for a path that is not there.
+  // A mode is kept per path, with the type bits Node puts above it: statSync is what makes the
+  // change observable, and a chmod no later stat reports is a no-op that reports success.
+  function setModeOf(file, mode) {
+    var st = statOf(file);
+    if (!st) return null;
+    var bits = typeof mode === 'string' ? parseInt(mode, 8) : Number(mode);
+    if (!isFinite(bits)) bits = 0;
+    MODES[file] = (st.type === 'dir' ? 16384 : 32768) | (bits & 4095);
+    return st;
+  }
+
   fs.chmodSync = function (p, mode) {
     var file = toPathString(p);
-    if (!statOf(file)) throw fsError('ENOENT', 'chmod', file);
+    if (!setModeOf(file, mode)) throw fsError('ENOENT', 'chmod', file);
+  };
+
+  fs.fchmodSync = function (fd, mode) {
+    var rec = descriptorOf(fd, 'fchmod');
+    if (!setModeOf(rec.path, mode)) throw fsError('ENOENT', 'fchmod', rec.path);
   };
 
   fs.chownSync = function (p, uid, gid) {

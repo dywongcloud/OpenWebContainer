@@ -504,7 +504,7 @@ function owcBuildStreamCore() {
         if (!Buf.isBuffer(chunk)) chunk = Buf.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
         encoding = '';
       } else if (chunk !== undefined && chunk !== null) {
-        err = argTypeError('chunk', 'of type string or an instance of Buffer or Uint8Array', chunk);
+        err = argTypeError('chunk', 'of type string or an instance of Buffer, TypedArray, or DataView', chunk);
       }
     }
     if (err) {
@@ -810,7 +810,16 @@ function owcBuildStreamCore() {
     }
 
     function ondata(chunk) {
-      if (dest.write(chunk) === false) pauseSource();
+      // A destination that rejects the chunk (a non-objectMode sink fed objects, say) throws out of
+      // write(); Node turns that into the destination's 'error', never an uncaught exception.
+      var wrote;
+      try {
+        wrote = dest.write(chunk);
+      } catch (er) {
+        errorOrDestroy(dest, er);
+        return;
+      }
+      if (wrote === false) pauseSource();
     }
 
     function pauseSource() {
@@ -1619,7 +1628,7 @@ function owcBuildStreamCore() {
         chunk = Buf.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
         encoding = 'buffer';
       } else {
-        throw argTypeError('chunk', 'of type string or an instance of Buffer or Uint8Array', chunk);
+        throw argTypeError('chunk', 'of type string or an instance of Buffer, TypedArray, or DataView', chunk);
       }
     }
     var err = null;
@@ -1865,10 +1874,13 @@ function owcBuildStreamCore() {
     var wDone = !writable || (wState !== undefined && wState.finished === true);
     var called = false;
     var listeners = [];
+    var signal = opts.signal === undefined || opts.signal === null ? null : opts.signal;
+    var onAbort = null;
 
     function cleanup() {
       for (var i = 0; i < listeners.length; i++) offListener(stream, listeners[i][0], listeners[i][1]);
       listeners = [];
+      if (onAbort !== null && signal !== null) signal.removeEventListener('abort', onAbort);
     }
     function done(err) {
       if (called) return;
@@ -1903,6 +1915,17 @@ function owcBuildStreamCore() {
       if (!rDone || !wDone) done(errPrematureClose());
       else done();
     });
+
+    // finished() takes a signal as pipeline() does: an abort ends the wait with the signal's abort
+    // error, at once when it is already aborted.
+    if (signal !== null) {
+      checkSignalProp(signal);
+      onAbort = function () {
+        done(abortErrorFor(signal));
+      };
+      if (signal.aborted) process.nextTick(onAbort);
+      else signal.addEventListener('abort', onAbort);
+    }
 
     var storedError = (rState && rState.errored) || (wState && wState.errored) || null;
     var closedAlready = (rState && rState.closeEmitted) || (wState && wState.closeEmitted);
@@ -2148,7 +2171,11 @@ function owcBuildStreamCore() {
     if (streams.length === 1) return duplexFrom(streams[0]);
     if (typeof streams[0] === 'function') streams[0] = funcToDuplex(streams[0]);
     var last = streams.length - 1;
-    if (typeof streams[last] === 'function') streams[last] = funcToDuplex(streams[last]);
+    // A generator function is a body wherever it stands, not only at either end: in the middle it is
+    // the transform between the two streams around it.
+    for (var m = 0; m < streams.length; m++) {
+      if (typeof streams[m] === 'function') streams[m] = funcToDuplex(streams[m]);
+    }
     for (var n = 0; n < streams.length; n++) {
       var item = streams[n];
       if (!item || typeof item !== 'object') continue;
@@ -2168,7 +2195,17 @@ function owcBuildStreamCore() {
     var ondrain = null;
     var onfinish = null;
     var onreadable = null;
+    function composeError(er) {
+      if (!d.destroyed) d.destroy(er);
+    }
     for (var i = 1; i < streams.length; i++) linkPipe(streams[i - 1], streams[i]);
+    // Node holds the composed duplex to the fate of its parts: an error on any one of them is the
+    // composed stream's error, so 'compose(...).toArray()' rejects instead of the part erroring
+    // where nobody can hear it.
+    for (var e = 0; e < streams.length; e++) {
+      var part = streams[e];
+      if (part && typeof part.on === 'function') part.on('error', composeError);
+    }
     if (writable) {
       d._write = function (chunk, encoding, callback) {
         if (head.write(chunk, encoding)) callback();
@@ -2313,6 +2350,41 @@ function owcBuildStreamCore() {
   Object.defineProperty(Writable.prototype, 'writableErrored', { get: writableErroredGetter, configurable: true });
   Object.defineProperty(Duplex.prototype, 'writableErrored', { get: writableErroredGetter, configurable: true });
 
+  /* duplexPair: two duplexes wired to each other, so what one is written with the other reads.
+     Each side's write pushes straight into the other's readable buffer and waits for that side to
+     ask for more before it takes another chunk; ending one side ends the other's readable half. */
+  function duplexPair(options) {
+    var opts = options || {};
+    var sides = [];
+    var awaiting = [null, null];
+    function make(index) {
+      var other = 1 - index;
+      return new Duplex({
+        objectMode: !!opts.objectMode,
+        highWaterMark: opts.highWaterMark,
+        allowHalfOpen: true,
+        read: function () {
+          var cb = awaiting[index];
+          if (cb !== null) {
+            awaiting[index] = null;
+            cb();
+          }
+        },
+        write: function (chunk, encoding, callback) {
+          if (sides[other].push(chunk)) callback();
+          else awaiting[other] = callback;
+        },
+        final: function (callback) {
+          sides[other].push(null);
+          callback();
+        }
+      });
+    }
+    sides[0] = make(0);
+    sides[1] = make(1);
+    return sides;
+  }
+
   Stream.Stream = Stream;
   Stream.Readable = Readable;
   Stream.Writable = Writable;
@@ -2331,6 +2403,7 @@ function owcBuildStreamCore() {
   Stream.isErrored = streamIsErrored;
   Stream.isDisturbed = streamIsDisturbed;
   Stream.isDestroyed = streamIsDestroyed;
+  Stream.duplexPair = duplexPair;
 
   // ---------------------------------------------------------------- readline
 
@@ -2451,6 +2524,9 @@ function owcBuildStreamCore() {
     });
     this.input.on('data', st.onData);
     this.input.on('end', st.onEnd);
+    // A terminal interface decodes keys, as Node's does: the input stream emits 'keypress' and a
+    // caller can read the arrow keys, the function keys and the control characters it sends.
+    if (this.terminal) emitKeypressEvents(this.input, this);
     if (typeof this.input.resume === 'function') this.input.resume();
   }
   Object.setPrototypeOf(Interface.prototype, EventEmitter.prototype);
@@ -2554,7 +2630,89 @@ function owcBuildStreamCore() {
     return writeEscape(stream, data, callback);
   }
 
-  function emitKeypressEvents() {}
+  /*
+   * readline.emitKeypressEvents(stream, iface): the stream emits 'keypress' for every key its
+   * input carries, with the character and the key record { name, ctrl, meta, shift, sequence,
+   * code }, decoded the way Node decodes the bytes a terminal sends. Bytes are decoded as UTF-8
+   * as they arrive and an escape sequence split across chunks is held until it is complete, so a
+   * key is reported once, in order, with the whole sequence it was written with. A lone escape is
+   * not a key: it starts a sequence, as it does in Node.
+   */
+  var KEY_NAMES = { '\r': 'return', '\n': 'enter', '\t': 'tab', '\b': 'backspace', '\u007f': 'backspace', ' ': 'space' };
+  var CSI_LETTERS = { A: 'up', B: 'down', C: 'right', D: 'left', E: 'clear', F: 'end', H: 'home', Z: 'tab' };
+  var CSI_TILDES = { 1: 'home', 2: 'insert', 3: 'delete', 4: 'end', 5: 'pageup', 6: 'pagedown', 7: 'home',
+    8: 'end', 11: 'f1', 15: 'f5', 17: 'f6', 18: 'f7', 19: 'f8', 20: 'f9', 21: 'f10', 23: 'f11', 24: 'f12', 200: 'paste-start' };
+  var SS3_LETTERS = { P: 'f1', Q: 'f2', R: 'f3', S: 'f4' };
+  var CSI_KEY = /^\x1b+\[([0-9]*)(?:;([0-9]+))?([a-zA-Z~])$/;
+  var SS3_KEY = /^\x1b+O([PQRS])$/;
+  var META_KEY = /^\x1b([a-zA-Z0-9])$/;
+
+  function keypressName(ch) {
+    if (KEY_NAMES[ch] !== undefined) return { name: KEY_NAMES[ch], ctrl: false, shift: false };
+    var code = ch.charCodeAt(0);
+    if (code < 32) return { name: String.fromCharCode(code + 96), ctrl: true, shift: false };
+    if (code >= 65 && code <= 90) return { name: ch.toLowerCase(), ctrl: false, shift: true };
+    return { name: ch, ctrl: false, shift: false };
+  }
+
+  /* The parameter after the first is the modifier: 1 none, and one bit each for shift, alt and control. */
+  function keypressModifiers(param) {
+    var bits = (param === undefined ? 1 : Number(param)) - 1;
+    return { shift: (bits & 1) !== 0, meta: (bits & 2) !== 0, ctrl: (bits & 4) !== 0 };
+  }
+
+  function keypressOf(text) {
+    if (text === '\x1b') return undefined;
+    if (text.charAt(0) !== '\x1b') {
+      var plain = keypressName(text);
+      return { str: text, key: { name: plain.name, ctrl: plain.ctrl, meta: false, shift: plain.shift, sequence: text } };
+    }
+    var csi = CSI_KEY.exec(text);
+    if (csi !== null) {
+      var body = csi[1];
+      var last = csi[3];
+      var mods = keypressModifiers(csi[2]);
+      var name = CSI_TILDES[Number(body)];
+      var code = '[' + (last === '~' ? body + '~' : last);
+      if (last !== '~') {
+        name = CSI_LETTERS[last];
+        if (last === 'Z') mods.shift = true;
+      }
+      return { str: undefined, key: { name: name === undefined ? 'undefined' : name, ctrl: mods.ctrl, meta: mods.meta, shift: mods.shift, sequence: text, code: code } };
+    }
+    var ss3 = SS3_KEY.exec(text);
+    if (ss3 !== null) {
+      return { str: undefined, key: { name: SS3_LETTERS[ss3[1]], ctrl: false, meta: false, shift: false, sequence: text, code: 'O' + ss3[1] } };
+    }
+    // O and [ open a longer sequence, so an escape followed by one of them is not a key yet
+    if (text.length === 2 && (text.charAt(1) === '[' || text.charAt(1) === 'O')) return undefined;
+    var meta = META_KEY.exec(text);
+    if (meta !== null) {
+      var named = keypressName(meta[1]);
+      return { str: undefined, key: { name: named.name, ctrl: named.ctrl, meta: true, shift: named.shift, sequence: text } };
+    }
+    return undefined;
+  }
+
+  var keypressStreams = new WeakMap();
+
+  function emitKeypressEvents(stream, iface) {
+    if (stream === null || stream === undefined || typeof stream.on !== 'function') return;
+    if (keypressStreams.has(stream)) return;
+    keypressStreams.set(stream, { iface: iface === undefined ? null : iface });
+    var decoder = createDecoder('utf8');
+    var pending = '';
+    stream.on('data', function (chunk) {
+      var text = decoder.write(chunk);
+      for (var i = 0; i < text.length; i++) {
+        pending += text.charAt(i);
+        var press = keypressOf(pending);
+        if (press === undefined) continue;
+        stream.emit('keypress', press.str, press.key);
+        pending = '';
+      }
+    });
+  }
 
   var readlineExports = {
     Interface: Interface,
@@ -2580,8 +2738,10 @@ function owcBuildStreamCore() {
     });
   };
 
+  // readline/promises names the class twice: Interface, and Readline as its alias.
   var readlinePromisesExports = {
     Interface: PromisesInterface,
+    Readline: PromisesInterface,
     createInterface: function (input, output, completer, terminal) {
       return new PromisesInterface(input, output, completer, terminal);
     }
