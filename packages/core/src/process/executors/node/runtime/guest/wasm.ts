@@ -74,15 +74,19 @@ export const WASM_SRC = String.raw`
 
   /*
    * A wasm export takes numbers, and the JS API coerces anything else: ToNumber, then NaN
-   * becomes 0. Doing it here rather than shipping the arguments across as JSON keeps the
+   * becomes 0 -- except at an i64, which the JS API takes as a BigInt and which JSON cannot
+   * carry, so a BigInt goes over as a string with a NUL and a 'b' in front and the host
+   * rebuilds it. Doing this here rather than shipping the arguments across as JSON keeps the
    * heap out of it -- emscripten hands its Module object to a queued callback, and that
    * object carries a typed array view over every byte of a memory this size.
    */
+  var BIGINT_TAG = '\u0000b';
   function wasmArgs (args) {
     var out = [];
     for (var i = 0; i < args.length; i++) {
-      var value = Number(args[i]);
-      out.push(value === value ? value : 0);
+      var value = args[i];
+      if (typeof value === 'bigint') out.push(BIGINT_TAG + value.toString());
+      else { var num = Number(value); out.push(num === num ? num : 0); }
     }
     return JSON.stringify(out);
   }
@@ -231,6 +235,20 @@ export const WASM_SRC = String.raw`
    */
   var PULL = 0;
   var PUSH = 0;
+  /*
+   * The piece the host is handed, kept between calls: the host copies the bytes out of this
+   * heap before it asks for the next piece, so one piece-sized buffer serves a whole sync
+   * instead of a fresh megabyte being allocated for every chunk of it.
+   */
+  var PIECE = null;
+  var PIECE_N = 0;
+  function piece (n) {
+    if (PIECE_N === n) return PIECE;
+    var buffer = new ArrayBuffer(n);
+    if (n >= PIECE_N) { PIECE = buffer; PIECE_N = n; }
+    return buffer;
+  }
+
   function onPull (kind, id, offset, length) {
     if (kind !== 'mem') return undefined;
     var memory = MEM[id];
@@ -238,9 +256,13 @@ export const WASM_SRC = String.raw`
     var size = memory.__buffer.byteLength;
     var start = typeof offset === 'number' && offset > 0 ? Math.min(offset, size) : 0;
     var end = typeof length === 'number' && length > 0 ? Math.min(size, start + length) : size;
-    var out = new Uint8Array(Math.max(0, end - start));
-    if (out.length > 0) out.set(new Uint8Array(memory.__buffer, start, out.length));
-    return out.buffer;
+    var n = Math.max(0, end - start);
+    if (n === 0) return undefined;
+    /* Asked for the whole shadow: hand over the shadow itself rather than a copy of it. */
+    if (start === 0 && n === size) return memory.__buffer;
+    var buffer = piece(n);
+    new Uint8Array(buffer).set(new Uint8Array(memory.__buffer, start, n));
+    return buffer;
   }
   function onPush (kind, id, offset, payload) {
     if (kind !== 'mem') return undefined;

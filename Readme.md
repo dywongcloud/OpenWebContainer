@@ -70,6 +70,37 @@ The architecture consists of three main layers:
   - `npm exec <bin> [-- <args>]` (alias `npm x`) is the same command under npm's own name
   - `npm run <script>` runs a `package.json` script with its `pre`/`post` lifecycle scripts, and `npm install` writes `package-lock.json` at lockfileVersion 3. Global installs are refused
 
+### ⚠️ What a WebAssembly call costs, and why it is proportional to the memory
+
+A `WebAssembly.Memory` is a host memory plus a shadow of the same size in the guest, and the two are
+made equal every time control crosses between them -- an export call, and every import that calls back
+into guest code. That copy is O(memory) per crossing, so a module that makes many calls over a large
+memory pays calls x memory. Measured in the container, one `store` or one `load` over a memory of
+M pages:
+
+| pages | 16 | 256 | 512 | 1024 | 2048 |
+| --- | --- | --- | --- | --- | --- |
+| ms per call | 0.143 | 2.456 | 5.352 | 10.828 | 20.609 |
+
+**Less than a whole memory cannot be moved while the contract holds, and the reason is not the
+copying: it is that nothing on either side can report a change.** Guest JavaScript writes into
+`memory.buffer` through an ordinary typed array, and QuickJS has no trap on a write into an
+ArrayBuffer's bytes, so the host cannot learn that one page changed without reading them all. And
+quickjs-emscripten copies an ArrayBuffer across the boundary rather than aliasing it, so the guest
+cannot be handed the host's memory to write into directly. Comparing pages was measured and rejected
+for the same reason: the comparison reads everything the copy would, and QuickJS is far slower per
+byte than a copy is. A page map, a counter, or a hash all need the same write trap to stay honest.
+So O(calls x memory) stands until the engine offers one of those two things -- a trap on a write into
+an ArrayBuffer, or a host ArrayBuffer the guest can hold -- and this is recorded rather than fixed.
+
+What is left is the constant, and that has been cut: the pull path hands the chunk the runtime copied
+out of the guest straight into the host memory instead of filling a second host buffer from it, the
+guest reuses one piece-sized buffer for a whole sync instead of allocating a fresh megabyte per
+chunk, and a piece that is the whole memory is handed over without being copied at all. Same loop,
+same machine: 0.353 to 0.143 ms per call at 16 pages, 3.389 to 2.456 at 256, 6.528 to 5.352 at 512,
+13.369 to 10.828 at 1024 and 26.664 to 20.609 at 2048 -- between 1.2x and 2.5x fewer, with the
+small-memory end gaining most.
+
 ### 🚧 In Progress
 
 - **Network Simulation hardening**
