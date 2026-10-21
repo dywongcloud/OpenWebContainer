@@ -16,7 +16,10 @@ import {
 import {
     COMMANDS as SHELL_BUILTIN_UTILS,
     createShellState,
+    diagnosticPrefix,
     evalArith,
+    formatJobText,
+    killJobSpecs,
     runScript,
     setActiveState,
     setRunner
@@ -2473,7 +2476,7 @@ function startBackgroundJob(shell: SyncShell, stages: RawWord[][], line?: string
     const job: ShellJob = {
         id,
         pid: nextBackgroundPid++,
-        text: line === undefined ? jobText(stages) : line,
+        text: line === undefined ? jobText(stages) : formatJobText(line),
         stages,
         line,
         done: false,
@@ -2609,10 +2612,12 @@ function shellWait(shell: SyncShell, args: string[]): ShellStep {
         const job = findJob(shell, arg);
         if (job === undefined) {
             /* bash says which of the three went wrong: a job spec that names no job, a number that is
-               no child of the shell, or a word that is neither a pid nor a job spec. */
-            if (arg.startsWith('%')) stderr += `wait: ${arg}: no such job\n`;
-            else if (/^[0-9]+$/.test(arg)) stderr += `wait: pid ${arg} is not a child of this shell\n`;
-            else stderr += `wait: \`${arg}': not a pid or valid job spec\n`;
+               no child of the shell, or a word that is neither a pid nor a job spec. The middle one
+               is written without the `line 0` the other two carry, as bash writes it. */
+            const prefix = diagnosticPrefix(shellStateFor(shell));
+            if (arg.startsWith('%')) stderr += `${prefix}wait: ${arg}: no such job\n`;
+            else if (/^[0-9]+$/.test(arg)) stderr += `${shell.name ?? 'sh'}: wait: pid ${arg} is not a child of this shell\n`;
+            else stderr += `${prefix}wait: \`${arg}': not a pid or valid job spec\n`;
             exitCode = arg.startsWith('%') || /^[0-9]+$/.test(arg) ? 127 : 1;
             continue;
         }
@@ -3026,6 +3031,14 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         if (command === 'jobs') return shellBuiltinModule(shell, command, cmdArgs);
         // `wait` has to run a job, and running one is something only this dispatcher can do
         if (command === 'wait') return shellWait(shell, cmdArgs);
+        /* A jobspec typed as a command is `fg` with that jobspec as its argument, as it is in
+           /bin/sh: `%1` never reaches a search for a command called `%1`. */
+        if (command.startsWith('%')) return shellBuiltinModule(shell, 'fg', [command, ...cmdArgs]);
+        /* `kill %1` names a job of this dispatcher's own table; `kill` itself can only signal the
+           container's processes, and a job's pid is not one of them. */
+        if (command === 'kill' && cmdArgs.some((arg) => arg.startsWith('%'))) {
+            return killJobSpecs(shellStateFor(shell), cmdArgs);
+        }
         if (SHELL_BUILTINS.has(command)) return shellBuiltinWithRedirects(shell, command, cmdArgs);
         const version = externalVersion(command, cmdArgs);
         if (version !== null) return { stdout: version, stderr: '', exitCode: 0 };

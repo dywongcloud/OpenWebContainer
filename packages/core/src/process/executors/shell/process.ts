@@ -231,7 +231,11 @@ export class ShellProcess extends Process {
         const oscMode = args.includes('--osc');
         this.filteredArgs = args.filter(arg => arg !== '--osc');
 
-        this.shell = new Shell(fileSystem, { oscMode, process: this,env: this.env, cwd: this.cwd, network });
+        /* A shell started with no arguments reads its lines from a terminal, and so has the job
+           control `sh -c <line>` has none of: `&` announces the job it started there, and `fg`
+           can resume one. The interactive loop below is the only reader of the lines it gets. */
+        const interactive = this.filteredArgs.length === 0;
+        this.shell = new Shell(fileSystem, { oscMode, process: this,env: this.env, cwd: this.cwd, network, interactive });
         this.shell.setHistorySink(() => ({
             stdout: this.commandHistory
                 .map((entry, index) => `${index + 1}: [${entry.timestamp.toISOString()}] ${entry.command}`)
@@ -408,7 +412,9 @@ export class ShellProcess extends Process {
         this.currentLine = '';
         this.cursorPosition = 0;
         this.draftLine = null;
-        this.emitOutput(this.prompt);
+        /* A line that ended the shell -- `exit`, or a command that failed under `set -e` -- leaves
+           no prompt behind it, as it leaves none in /bin/sh. */
+        if (this.running) this.emitOutput(this.prompt);
     }
 
     private handleBackspace(): void {
@@ -554,7 +560,11 @@ export class ShellProcess extends Process {
         }
 
         const result = this.shell.executeLine(commandLine);
-        if (this.shell.stopped) {
+        this.rememberStopped(result.exitCode);
+        /* `set -e` and a command that failed: the shell ends, with the status the command left, as
+           /bin/sh does. Typed into the loop below -- which is the only reader of this flag -- it
+           is what stops a script pasted or typed into the terminal where bash would have stopped. */
+        if (this.shell.errexitStopped) {
             this.running = false;
             this._exitCode = result.exitCode;
         }

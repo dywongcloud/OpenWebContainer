@@ -188,6 +188,12 @@ export interface ShellState {
     execTarget: string[] | null;
     /** Non-zero while evaluating a condition, a negated command or a `&&`/`||` operand. */
     protectedDepth: number;
+    /**
+     * Set by `exit`: the line ended the shell itself, not a subshell or a function inside it -- both
+     * of which put it back with the rest of the state they restore. An interactive shell process
+     * stops with it, as /bin/sh does when `exit` is typed into it.
+     */
+    exitCalled?: boolean;
     /** Where output goes; command substitution swaps in a scratch sink. */
     io: { stdout: string; stderr: string };
     /** Line of the command being run, for `caller`. */
@@ -1469,45 +1475,50 @@ class Parser {
             const two = this.src.slice(this.pos, this.pos + 2);
             let op: Redirect['op'] | null = null;
             let width = 0;
+            /* The operator's own descriptor is the default it has with no number in front of it;
+               a number there -- `2>`, `2>>`, `2>&1`, `3<` -- is the one that was read above, and it
+               is never overwritten by the default. Every branch below used to set it unconditionally,
+               which is why `{ echo a; } 2>f` sent the group's *output* to `f`, as `&>` would. */
+            const defaultFd = (value: number): number => (fd === -1 ? value : fd);
             if (three === '&>>') {
                 op = '&>>';
                 width = 3;
-                fd = 1;
+                fd = defaultFd(1);
             } else if (two === '&>') {
                 op = '&>';
                 width = 2;
-                fd = 1;
+                fd = defaultFd(1);
             } else if (two === '>>') {
                 op = '>>';
                 width = 2;
-                fd = 1;
+                fd = defaultFd(1);
             } else if (three === '<<<') {
                 /* A here-string is read before `<<` is, so `<<<` never looks like `<<` and a
                    delimiter: the word after it is the input, not the name of a here-document. */
                 op = '<<<';
                 width = 3;
-                fd = 0;
+                fd = defaultFd(0);
             } else if (two === '<<') {
                 const dash = this.src[this.pos + 2] === '-';
                 op = dash ? '<<-' : '<<';
                 width = dash ? 3 : 2;
-                fd = 0;
+                fd = defaultFd(0);
             } else if (two === '>&') {
                 op = '>&';
                 width = 2;
-                fd = 1;
+                fd = defaultFd(1);
             } else if (two === '<&') {
                 op = '<&';
                 width = 2;
-                fd = 0;
+                fd = defaultFd(0);
             } else if (this.here() === '>') {
                 op = '>';
                 width = 1;
-                fd = 1;
+                fd = defaultFd(1);
             } else if (this.here() === '<') {
                 op = '<';
                 width = 1;
-                fd = 0;
+                fd = defaultFd(0);
             }
             if (op === null) break;
             this.pos += width;
@@ -2191,6 +2202,7 @@ interface Snapshot {
     inputBuffer: string;
     inputCursor: number;
     lastStatus: number;
+    exitCalled: boolean;
 }
 
 function snapshotState(state: ShellState): Snapshot {
@@ -2209,7 +2221,8 @@ function snapshotState(state: ShellState): Snapshot {
         optarg: state.optarg,
         inputBuffer: state.inputBuffer,
         inputCursor: state.inputCursor,
-        lastStatus: state.lastStatus
+        lastStatus: state.lastStatus,
+        exitCalled: state.exitCalled === true
     };
 }
 
@@ -2228,6 +2241,7 @@ function restoreState(state: ShellState, snapshot: Snapshot): void {
     state.optarg = snapshot.optarg;
     state.inputBuffer = snapshot.inputBuffer;
     state.inputCursor = snapshot.inputCursor;
+    state.exitCalled = snapshot.exitCalled;
     state.lastStatus = snapshot.lastStatus;
 }
 
@@ -2844,13 +2858,36 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
         return finish(state, plan, '', '', 0);
     }
 
-    const name = words[0];
-    const args = words.slice(1);
+    let name = words[0];
+    let args = words.slice(1);
+
+    /* A jobspec typed as a command is `fg` with that jobspec as its argument: `%1` on a line of
+       its own resumes the job in the foreground, and where the shell has no job control it is
+       `fg`'s own error that comes back -- `sh: line 0: fg: no job control`, never `Command not
+       found`. */
+    if (name.startsWith('%')) {
+        args = [name, ...args];
+        name = 'fg';
+    }
+    /*
+     * `kill %1` names a job of this shell's own table. The `kill` of `procinfo.ts` can only signal
+     * the container's processes, and a job's pid is not one of them, so a jobspec ends here. A
+     * signal name or number in front of it is kept: `kill -TERM %1` is the same kill.
+     */
+    if (name === 'kill' && args.some((arg) => arg.startsWith('%'))) {
+        const killed = killJobSpecs(state, args);
+        return finish(state, plan, killed.stdout, killed.stderr, killed.exitCode);
+    }
 
     // control flow: these are parsed as commands but never reach the runner
     if (name === 'exit') {
         const code = args.length === 0 ? state.lastStatus : Number.parseInt(args[0], 10);
-        return finish(state, plan, '', '', Number.isNaN(code) ? 0 : code) && throwExit(code);
+        const status = Number.isNaN(code) ? 0 : code;
+        state.exitCalled = true;
+        /* `exit 0` ends the line as `exit 1` does: the status it leaves is falsy, so a `&&` that
+           asked for it would have skipped the exit itself and run the commands behind it. */
+        finish(state, plan, '', '', status);
+        return throwExit(status);
     }
     if (name === 'break') {
         const count = args.length === 0 ? 1 : Number.parseInt(args[0], 10);
@@ -4083,6 +4120,65 @@ function popdBuiltin(ctx: CommandContext): CommandResult {
 }
 
 /**
+ * The front of a builtin's own diagnostic, as bash 3.2 prints it: `$0: line N: ` for a shell
+ * running the string `sh -c` was given -- numbered from 0, which is why its first line is
+ * `line 0` -- and `$0: ` with no line at all for an interactive one.
+ */
+export function diagnosticPrefix(state: ShellState): string {
+    const name = state.shellName === '' ? 'sh' : state.shellName;
+    if (state.options.interactive) return `${name}: `;
+    return `${name}: line ${state.line > 1 ? state.line - 1 : 0}: `;
+}
+
+/** Drops the jobs that have run out of the table: a shell lists a job only while it has one to run. */
+function reapJobs(state: ShellState): void {
+    const jobs = state.jobs;
+    for (let i = jobs.length - 1; i >= 0; i--) if (jobs[i].done) jobs.splice(i, 1);
+}
+
+/**
+ * Runs every job the shell has not run yet, in the order it was started, and drops them. This is
+ * what a background job means on a host that runs one command at a time: the command is not waited
+ * for where it stands, and it runs -- with its output kept -- once the line's foreground is through.
+ */
+export function runPendingJobs(state: ShellState): { stdout: string; stderr: string; exitCode: number } {
+    const jobs = state.jobs;
+    let stdout = '';
+    let stderr = '';
+    for (const job of jobs) {
+        if (job.done) continue;
+        const step = runPendingJob(state, job);
+        stdout += step.stdout;
+        stderr += step.stderr;
+    }
+    reapJobs(state);
+    return { stdout, stderr, exitCode: 0 };
+}
+
+/**
+ * `kill %1`: the job is over, with the status a process killed by SIGTERM leaves (128 + 15). A
+ * jobspec that names no job is bash's own `kill: %1: no such job`, with status 1 -- not the
+ * `illegal process id` a word that is no pid at all gets.
+ */
+export function killJobSpecs(state: ShellState, args: string[]): CommandResult {
+    let stderr = '';
+    let exitCode = 0;
+    for (const arg of args) {
+        if (!arg.startsWith('%')) continue;
+        const job = findJob(state.jobs, arg);
+        if (job === undefined) {
+            stderr += `${diagnosticPrefix(state)}kill: ${arg}: no such job\n`;
+            exitCode = 1;
+            continue;
+        }
+        job.done = true;
+        job.exitCode = 143;
+    }
+    reapJobs(state);
+    return { stdout: '', stderr, exitCode };
+}
+
+/**
  * The job a `jobs` or `wait` argument names: `%2` is the second job, `%+` the newest and `%-` the
  * one before it, and a bare number is a pid -- the one `&` printed and `$!` holds.
  */
@@ -4106,11 +4202,207 @@ function jobMarker(jobs: ShellJob[], job: ShellJob): string {
 }
 
 /**
+ * Splits `source` at the operators that sit between commands, keeping quoting: `|`, `&&`, `||` and
+ * `;`. The operators themselves are kept, in the order they were met.
+ */
+function splitJobSegments(source: string): { op: string | null; text: string }[] {
+    const out: { op: string | null; text: string }[] = [];
+    let text = '';
+    let op: string | null = null;
+    /* An operator inside a subshell or a group belongs to the construct, not to the list around it:
+       `(echo a;echo b)` is one job, not a `;` list of half a paren and half a paren. */
+    let depth = 0;
+    const push = (next: string): void => {
+        out.push({ op, text: text.trim() });
+        text = '';
+        op = next;
+    };
+    let i = 0;
+    while (i < source.length) {
+        const ch = source[i];
+        if (ch === "'") {
+            const close = source.indexOf("'", i + 1);
+            const stop = close === -1 ? source.length : close;
+            text += source.slice(i, stop + 1);
+            i = stop + 1;
+            continue;
+        }
+        if (ch === '"') {
+            let j = i + 1;
+            while (j < source.length && source[j] !== '"') j += source[j] === '\\' ? 2 : 1;
+            text += source.slice(i, Math.min(j + 1, source.length));
+            i = j + 1;
+            continue;
+        }
+        if (ch === '\\') {
+            text += source.slice(i, i + 2);
+            i += 2;
+            continue;
+        }
+        if (ch === '(' || ch === '{') depth++;
+        else if (ch === ')' || ch === '}') depth--;
+        if (ch === '|') {
+            if (depth > 0) {
+                text += ch;
+                i++;
+                continue;
+            }
+            push(source[i + 1] === '|' ? '||' : '|');
+            i += source[i + 1] === '|' ? 2 : 1;
+            continue;
+        }
+        if (ch === '&' && source[i + 1] === '&') {
+            if (depth > 0) {
+                text += '&&';
+                i += 2;
+                continue;
+            }
+            push('&&');
+            i += 2;
+            continue;
+        }
+        if (ch === ';') {
+            if (depth > 0) {
+                text += ch;
+                i++;
+                continue;
+            }
+            push(';');
+            i++;
+            continue;
+        }
+        text += ch;
+        i++;
+    }
+    out.push({ op, text: text.trim() });
+    return out.filter((segment) => segment.text !== '' || segment.op !== null);
+}
+
+/**
+ * How the operator in front of one segment of a job is printed: `;` closes the command before it
+ * and takes no space of its own, while `|`, `&&` and `||` are spaced on both sides.
+ */
+function joinJobOp(op: string | null): string {
+    if (op === null) return '';
+    return op === ';' ? '; ' : ` ${op} `;
+}
+
+/** The words a shell would read out of `text`, joined by one space: `echo  a` is `echo a`. */
+function jobWords(text: string): string {
+    const words: string[] = [];
+    let word = '';
+    let inWord = false;
+    let i = 0;
+    while (i < text.length) {
+        const ch = text[i];
+        if (ch === ' ' || ch === '\t' || ch === '\n') {
+            if (inWord) {
+                words.push(word);
+                word = '';
+                inWord = false;
+            }
+            i++;
+        } else if (ch === "'") {
+            const close = text.indexOf("'", i + 1);
+            const stop = close === -1 ? text.length : close;
+            word += text.slice(i + 1, stop);
+            inWord = true;
+            i = stop + 1;
+        } else if (ch === '"') {
+            inWord = true;
+            i++;
+            while (i < text.length && text[i] !== '"') {
+                const next = text[i + 1];
+                if (text[i] === '\\' && next !== undefined && '"\\$`'.includes(next)) {
+                    word += next;
+                    i += 2;
+                } else {
+                    word += text[i];
+                    i++;
+                }
+            }
+            i++;
+        } else if (ch === '\\') {
+            const next = text[i + 1];
+            if (next !== undefined) word += next;
+            inWord = true;
+            i += 2;
+        } else {
+            word += ch;
+            inWord = true;
+            i++;
+        }
+    }
+    if (inWord) words.push(word);
+    return words.join(' ');
+}
+
+/** The index of the `)` closing the `(` at `start`, or -1 when it is never closed. */
+function closingParen(text: string, start: number): number {
+    let depth = 0;
+    for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === "'" || ch === '"') {
+            const quote = ch;
+            let j = i + 1;
+            while (j < text.length && text[j] !== quote) j += text[j] === '\\' ? 2 : 1;
+            i = j;
+            continue;
+        }
+        if (ch === '\\') {
+            i++;
+            continue;
+        }
+        if (ch === '(') depth++;
+        else if (ch === ')') {
+            depth--;
+            if (depth === 0) return i;
+        }
+    }
+    return -1;
+}
+
+function jobSegmentText(text: string): string {
+    const trimmed = text.trim();
+    /* A subshell is printed with a space inside each paren, as bash prints it: `(echo a)` is the
+       job `( echo a )`, which is why `set -- $(jobs)` counts seven words for it and not five. */
+    if (trimmed.startsWith('(')) {
+        const close = closingParen(trimmed, 0);
+        if (close === trimmed.length - 1) return `( ${jobSegmentText(trimmed.slice(1, -1))} )`;
+    }
+    const parts = splitJobSegments(trimmed);
+    if (parts.length > 1) {
+        let out = '';
+        for (const part of parts) out += joinJobOp(part.op) + jobSegmentText(part.text);
+        return out;
+    }
+    return jobWords(trimmed);
+}
+
+/**
+ * The command as `jobs` prints it: the source of the pipeline the `&` was written on, in the one
+ * shape bash prints it in -- words joined by single spaces, `|`, `&&`, `||` and `;` spaced, and a
+ * subshell opened and closed with a space inside its parens.
+ */
+export function formatJobText(source: string): string {
+    const segments = splitJobSegments(source);
+    let out = '';
+    for (const segment of segments) {
+        if (segment.text === '') continue;
+        out += joinJobOp(segment.op) + jobSegmentText(segment.text);
+    }
+    return out === '' ? source.trim() : out;
+}
+
+/**
  * One line of `jobs`, in the columns a shell prints them in: `[1]+  Running                 echo a &`.
  * A job that has run is reported `Done` and without the `&`, as a shell reports one.
  */
 function jobLine(jobs: ShellJob[], job: ShellJob, long: boolean): string {
-    return `[${job.id}]${jobMarker(jobs, job)} ${long ? `${job.pid} ` : ' '}${(job.done ? 'Done' : 'Running').padEnd(24)}${job.text}${job.done ? '' : ' &'}\n`;
+    /* The pid of `-l` is right-aligned in a column five wide, as bash prints it: `[1]+  9120`
+       for a four-digit pid and `[1]+ 51920` for a five-digit one. */
+    const pid = long ? `${String(job.pid).padStart(5)} ` : ' ';
+    return `[${job.id}]${jobMarker(jobs, job)} ${pid}${(job.done ? 'Done' : 'Running').padEnd(24)}${job.text}${job.done ? '' : ' &'}\n`;
 }
 
 function jobsBuiltin(ctx: CommandContext): CommandResult {
@@ -4134,7 +4426,7 @@ function jobsBuiltin(ctx: CommandContext): CommandResult {
         listed = [];
         for (const spec of specs) {
             const job = findJob(jobs, spec);
-            if (job === undefined) return failLine(`jobs: ${spec}: no such job`, 1);
+            if (job === undefined) return failLine(`${diagnosticPrefix(state)}jobs: ${spec}: no such job`, 1);
             listed.push(job);
         }
     }
@@ -4143,19 +4435,61 @@ function jobsBuiltin(ctx: CommandContext): CommandResult {
     return ok(out, state);
 }
 
+/**
+ * `fg`, and the `%1` that bash reads as `fg %1`: the job is brought to the foreground, which here
+ * means it is run now and waited for, with its command printed first as a shell prints it.
+ *
+ * A shell with no job control -- every `sh -c`, which has no terminal to give a job -- cannot do
+ * that at all, and says so: `sh: line 0: fg: no job control`, whatever jobs the line has started.
+ */
 function fgBuiltin(ctx: CommandContext): CommandResult {
-    void ctx;
-    return failLine('fg: current: no such job', 1);
+    const state = stateOf(ctx);
+    const prefix = diagnosticPrefix(state);
+    if (state.options.monitor !== true) return failLine(`${prefix}fg: no job control`, 1);
+    const jobs = state.jobs;
+    const named = ctx.args.length > 0;
+    const spec = named ? ctx.args[0] : '%+';
+    const job = findJob(jobs, spec);
+    if (job === undefined) {
+        return failLine(`${prefix}fg: ${named ? spec : 'current'}: no such job`, 1);
+    }
+    const step = runPendingJob(state, job);
+    reapJobs(state);
+    return { stdout: `${job.text}\n${step.stdout}`, stderr: step.stderr, exitCode: step.exitCode };
 }
 
+/**
+ * `bg`: the job is already running in the one sense this shell can run one -- it runs when the line
+ * around it is through -- so the answer is bash's own, `sh: bg: job 1 already in background`, with
+ * status 0. A shell with no job control says what `fg` says.
+ */
 function bgBuiltin(ctx: CommandContext): CommandResult {
-    void ctx;
-    return failLine('bg: current: no such job', 1);
+    const state = stateOf(ctx);
+    const prefix = diagnosticPrefix(state);
+    if (state.options.monitor !== true) return failLine(`${prefix}bg: no job control`, 1);
+    const jobs = state.jobs;
+    const named = ctx.args.length > 0;
+    const spec = named ? ctx.args[0] : '%+';
+    const job = findJob(jobs, spec);
+    if (job === undefined) {
+        return failLine(`${prefix}bg: ${named ? spec : 'current'}: no such job`, 1);
+    }
+    return { stdout: '', stderr: `${state.shellName}: bg: job ${job.id} already in background\n`, exitCode: 0 };
 }
 
+/**
+ * `disown`: the job is taken out of the table, so `jobs` lists it no more and `wait` has nothing
+ * left to wait for. It is the one of the four that succeeds on a shell with no job control.
+ */
 function disownBuiltin(ctx: CommandContext): CommandResult {
-    void ctx;
-    return failLine('disown: current: no such job', 1);
+    const state = stateOf(ctx);
+    const jobs = state.jobs;
+    const named = ctx.args.length > 0;
+    const spec = named ? ctx.args[0] : '%+';
+    const job = findJob(jobs, spec);
+    if (job === undefined) return failLine(`${diagnosticPrefix(state)}disown: ${named ? spec : 'current'}: no such job`, 1);
+    jobs.splice(jobs.indexOf(job), 1);
+    return ok();
 }
 
 function suspendBuiltin(ctx: CommandContext): CommandResult {
@@ -4196,6 +4530,8 @@ function waitBuiltin(ctx: CommandContext): CommandResult {
             stdout += step.stdout;
             stderr += step.stderr;
         }
+        // a job `wait` has waited for is a job `jobs` lists no more, as it is in a shell
+        reapJobs(state);
         return { stdout, stderr, exitCode: 0 };
     }
     let exitCode = 0;
@@ -4203,8 +4539,13 @@ function waitBuiltin(ctx: CommandContext): CommandResult {
         if (arg === '-n' || arg === '-f') continue;
         const job = findJob(jobs, arg);
         if (job === undefined) {
-            stderr += `wait: ${arg}: not a child of this shell\n`;
-            exitCode = 127;
+            /* bash says which of the three went wrong: a jobspec that names no job, a number that
+               is no child of the shell, or a word that is neither. The middle one is written
+               without the `line 0` the other two carry, as bash writes it. */
+            if (arg.startsWith('%')) stderr += `${diagnosticPrefix(state)}wait: ${arg}: no such job\n`;
+            else if (/^[0-9]+$/.test(arg)) stderr += `${state.shellName}: wait: pid ${arg} is not a child of this shell\n`;
+            else stderr += `${diagnosticPrefix(state)}wait: \`${arg}': not a pid or valid job spec\n`;
+            exitCode = arg.startsWith('%') || /^[0-9]+$/.test(arg) ? 127 : 1;
             continue;
         }
         const step = job.done ? { stdout: '', stderr: '', exitCode: job.exitCode } : runPendingJob(state, job);
@@ -4212,6 +4553,7 @@ function waitBuiltin(ctx: CommandContext): CommandResult {
         stderr += step.stderr;
         exitCode = step.exitCode;
     }
+    reapJobs(state);
     return { stdout, stderr, exitCode };
 }
 

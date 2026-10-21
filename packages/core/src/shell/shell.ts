@@ -19,11 +19,13 @@ import {
 import {
     COMMANDS as SHELL_BUILTIN_UTILS,
     createShellState,
+    formatJobText,
     getRunner,
+    runPendingJobs,
     runScript,
     setRunner
 } from './commands/builtins';
-import type { ShellState } from './commands/builtins';
+import type { ShellJob, ShellState } from './commands/builtins';
 import type { CommandContext, CommandResult, ShellCommand } from './commands/types';
 import type { NetworkHandle } from './commands/types';
 
@@ -35,6 +37,11 @@ interface ShellOptions {
     cwd?: string;
     /** A read of the container's virtual network, for the commands that list what it holds. */
     network?: NetworkHandle;
+    /**
+     * True for a shell that reads its lines from a terminal rather than from the one string `sh -c`
+     * was given: such a shell has job control, and prints what a shell with job control prints.
+     */
+    interactive?: boolean;
 }
 
 /**
@@ -119,6 +126,21 @@ export class Shell implements IShell {
     stoppedCode: number = 0;
     /** `$?` of the last line, as the expansions of the next one see it. */
     lastStatus: number = 0;
+    /**
+     * True once `set -e` has ended a line: the shell process stops, as /bin/sh does. A line handed
+     * to `sh -c` ends anyway, so only an interactive shell reads this.
+     */
+    errexitStopped: boolean = false;
+    /** True for a shell that reads lines from a terminal, and so has job control. */
+    private interactive: boolean = false;
+    /**
+     * The background jobs `&` started, in the order it started them. `state.jobs` reads this one
+     * table out of `state.host`, so `jobs`, `wait`, `fg` and `%1` here name the very jobs the
+     * engine's `&` registered.
+     */
+    readonly jobs: ShellJob[] = [];
+    /** Pids of background jobs, counted apart from the container's own processes. */
+    private nextBackgroundPid = 62000;
 
     constructor(fileSystem: IFileSystem, options: ShellOptions) {
         this.fileSystem = fileSystem;
@@ -143,9 +165,39 @@ export class Shell implements IShell {
         );
         this.shellState.shellName = 'sh';
         this.shellState.host = this;
+        /* An interactive shell has job control -- `fg` can resume a job and `&` announces one --
+           and `sh -c <line>` has none: it has no terminal to hand to a job, which is why bash
+           answers `fg` there with `no job control` whatever jobs the line started. */
+        this.interactive = options.interactive === true;
+        this.shellState.options.interactive = this.interactive;
+        this.shellState.options.monitor = this.interactive;
+        this.shellState.startJob = this.startBackgroundJob;
         this.registerAllBuiltInCommands()
         this.registerAllExternalCommands();
     }
+
+    /**
+     * `cmd &`: the job is registered and nothing runs where it stands, on a host that runs one
+     * command at a time. It runs when `wait` asks for it, when `fg` or `%1` brings it to the
+     * foreground, or once the line's own commands are through -- and `$!` is its pid from the
+     * moment it is registered, which is what the engine sets from the job this hands back.
+     *
+     * An interactive shell announces it the way bash does, `[1] 12345`. A line handed to `sh -c`
+     * gets no such line, as it gets none from /bin/sh.
+     */
+    private readonly startBackgroundJob = (state: ShellState, source: string): ShellJob => {
+        const id = this.jobs.reduce((high, job) => Math.max(high, job.id), 0) + 1;
+        const job: ShellJob = {
+            id,
+            pid: this.nextBackgroundPid++,
+            text: formatJobText(source),
+            done: false,
+            exitCode: 0
+        };
+        this.jobs.push(job);
+        if (this.interactive) state.io.stdout += `[${job.id}] ${job.pid}\n`;
+        return job;
+    };
     private registerBuiltInCommand(name: string, command: (args: string[]) => Promise<ShellCommandResult>) {
         this.buildInCommands.set(name, command);
     }
@@ -474,7 +526,32 @@ export class Shell implements IShell {
             const run = runScript(state, line);
             this.lastStatus = run.exitCode;
             this.syncFromState();
-            let result: ShellCommandResult = { stdout: run.stdout, stderr: run.stderr, exitCode: run.exitCode };
+            /* A job the line started and never waited for runs once the line's own commands are
+               through, as it does in a shell: `echo one & jobs` prints the job, and then `one`.
+               Only a line that ends the shell -- the one string `sh -c` was given -- has a "through"
+               to run them in: an interactive shell leaves a job in its table until `wait`, `fg`
+               or `%1` asks for it, which is what keeps `sleep 5 &` from blocking the terminal and
+               what lets `jobs` list it on the next line. */
+            const flushed = this.interactive
+                ? { stdout: '', stderr: '', exitCode: 0 }
+                : runPendingJobs(state);
+            /* `exit` ended the line, and the shell with it: the status it left is the shell's, and
+               the process reads `stopped` to stop. `sh -c` ends anyway; only the loop that reads
+               lines from a terminal needs it, and `exit` inside `( )` or a job never sets it --
+               those put the flag back with the rest of the state they restore. */
+            if (state.exitCalled === true) {
+                state.exitCalled = false;
+                this.stopped = true;
+                this.stoppedCode = run.exitCode;
+            }
+            /* `set -e` ended the line: the shell stops with the status of the command that failed,
+               the way /bin/sh does -- typed into it, not only handed to it with `-c`. */
+            this.errexitStopped = state.options.errexit && run.exitCode !== 0 && !this.stopped;
+            let result: ShellCommandResult = {
+                stdout: run.stdout + flushed.stdout,
+                stderr: run.stderr + flushed.stderr,
+                exitCode: run.exitCode
+            };
             if (this.oscMode) {
                 if (result.stdout) result.stdout = this.formatCommandOutput(this.headOf(line), result.stdout);
                 if (result.stderr) result.stderr = this.formatOscOutput('error', result.stderr);
