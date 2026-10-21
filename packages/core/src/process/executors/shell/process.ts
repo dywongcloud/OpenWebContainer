@@ -103,6 +103,17 @@ function firstWordOf(text: string): string {
     return splitCommandLine(text)[0] ?? '';
 }
 
+/**
+ * The container's own interpreter: `process.execPath` of a guest, and the name no file in the
+ * virtual file system holds -- the container's node *is* the interpreter, not a script it has.
+ */
+const NODE_BINARY = '/usr/local/bin/node';
+
+/** The name a command is spawned as: the container's own interpreter is `node` to every executor. */
+function spawnedAs(command: string): string {
+    return command === NODE_BINARY ? 'node' : command;
+}
+
 /** One step of a compound line: `op` joins it to the step before it, and null opens the line. */
 interface CompoundStep {
     op: '|' | '&&' | '||' | ';' | null;
@@ -519,11 +530,12 @@ export class ShellProcess extends Process {
             return { stdout: '', stderr: '', exitCode: 0 };
         }
 
-        const [command, ...cmdArgs] = processedArgs;
+        const [head, ...cmdArgs] = processedArgs;
+        const command = spawnedAs(head);
 
         if (this.shell.isCompound(commandLine)) {
             const steps = splitCompoundLine(commandLine);
-            if (steps !== null && steps.some((step) => this.shell.isSpawnedCommand(firstWordOf(step.text)))) {
+            if (steps !== null && steps.some((step) => this.shell.isSpawnedCommand(spawnedAs(firstWordOf(step.text))))) {
                 const run = await this.executeSteps(steps);
                 if (this.shell.stopped) {
                     this.running = false;
@@ -583,7 +595,8 @@ export class ShellProcess extends Process {
     private async runStep(text: string, input: string | null): Promise<ShellCommandResult> {
         const words = splitCommandLine(text);
         if (words.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
-        const [command, ...args] = words;
+        const [head, ...args] = words;
+        const command = spawnedAs(head);
         if (this.shell.isSpawnedCommand(command)) {
             const env = Object.fromEntries(this.env);
             /* The child reads its stdin only when it is told it has one, the way a pipe tells it */

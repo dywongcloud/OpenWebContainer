@@ -194,7 +194,7 @@ function registryByPidOf(record: ChildRecord): Map<number, ChildRecord> {
 
 const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
     const registry = registryFor(ctx);
-    const file = String(args.file);
+    const file = executableOf(String(args.file));
     const argv: string[] = Array.isArray(args.args) ? args.args.map(String) : [];
     const env: Record<string, string> = args.env ? { ...args.env } : childEnvOf(ctx);
     if (args.ipc) {
@@ -395,6 +395,19 @@ const parentExit: CapabilityHandler = (_args, ctx) => {
 
 /** process.argv[0] of every node child: `node` in a shell command and the container's node binary both resolve to it. */
 const NODE_BINARY = '/usr/local/bin/node';
+
+/**
+ * The executable a spawn names, as the container's own executors claim it.
+ *
+ * `process.execPath` in a guest is NODE_BINARY, and no file in the virtual file system holds that
+ * path: the container's node *is* the interpreter, not a script it has. A spawn naming it looked for
+ * a file and reported ENOENT, where a host runs its own interpreter. It is `node` for the executor,
+ * and the arguments are unchanged, so `spawn(execPath, [file, ...args])` runs `node file ...args`.
+ * Every other name is left alone: a missing path still fails, a real file still resolves as it does.
+ */
+function executableOf(file: string): string {
+    return file === NODE_BINARY ? 'node' : file;
+}
 
 /** Pids of synchronous children, counted apart from the container's own process pids. */
 let nextSyncPid = 61000;

@@ -6,6 +6,18 @@ import { NetworkManager } from '../../../network/manager';
 import { RuntimeServices } from './runtime/services';
 import { nodeFlagAnswer, printScriptArg } from './flags';
 
+/**
+ * What a script run with `-e`, `--eval`, `-p` or `--print` sees in process.argv[1..].
+ *
+ * There is no file after the source, so `--` is not a script name here: it ends the options, as it
+ * does for Node, and what follows it is the first argument -- `node -e <src> -- <arg>` puts `<arg>`
+ * in process.argv[1], which is how a caller hands a script its data. One `--` at the head is the
+ * one that ends the options; a second one is an argument like any other.
+ */
+function evalArgv(args: string[]): string[] {
+    return args[0] === '--' ? args.slice(1) : args;
+}
+
 export class NodeProcessExecutor implements ProcessExecutor {
     constructor(
         private fileSystem: IFileSystem,
@@ -52,11 +64,11 @@ export class NodeProcessExecutor implements ProcessExecutor {
                 if (args.length < 2) throw new Error(`${args[0]} requires an argument`);
                 evalSource = args[1];
                 executablePath = '[eval]';
-                args = args.slice(2);
+                args = evalArgv(args.slice(2));
             } else if (args[0] === '-p' || args[0] === '--print') {
                 evalSource = printScriptArg(args);
                 executablePath = '[eval]';
-                args = args.slice(2);
+                args = evalArgv(args.slice(2));
             } else if (args[0] === '--' && args.length > 1) {
                 /* `--` ends the options: what follows is the script, even where it begins with a
                    dash, so `node -- --version` runs the file rather than printing a version. */
