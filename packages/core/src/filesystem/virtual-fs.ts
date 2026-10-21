@@ -3,10 +3,13 @@ import { IFileSystem, PathStat } from './types';
 export class VirtualFileSystem implements IFileSystem {
     private files: Map<string, string>;
     private directories: Set<string>;
+    /** The modification time `utimes` set, which `statPath` then reports. */
+    private mtimes: Map<string, number>;
 
     constructor() {
         this.files = new Map();
         this.directories = new Set();
+        this.mtimes = new Map();
         this.directories.add('/'); // Root directory
     }
     readBuffer(path: string): Buffer | undefined {
@@ -185,7 +188,15 @@ export class VirtualFileSystem implements IFileSystem {
         }
         const content = this.files.get(normalizedPath);
         if (content === undefined) return undefined;
-        return { type: 'file', size: content.length, mtimeMs: 0 };
+        return {
+            type: 'file',
+            size: content.length,
+            mtimeMs: this.mtimes.get(normalizedPath) ?? this.mtimes.get(path) ?? 0
+        };
+    }
+
+    utimes(path: string, mtimeMs: number): void {
+        this.mtimes.set(this.normalizePath(path), mtimeMs);
     }
 
     readdirNames(path: string): string[] | undefined {

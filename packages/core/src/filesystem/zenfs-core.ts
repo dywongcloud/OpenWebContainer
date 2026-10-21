@@ -188,4 +188,9 @@ export class ZenFSCore implements IFileSystem {
     renamePath(from: string, to: string): void {
         this.fs.renameSync(from, to);
     }
+
+    utimes(path: string, mtimeMs: number): void {
+        const at = new Date(mtimeMs);
+        this.fs.utimesSync(path, at, at);
+    }
 }

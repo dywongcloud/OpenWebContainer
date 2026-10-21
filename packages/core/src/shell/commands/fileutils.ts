@@ -3167,7 +3167,17 @@ function formatBsd(info: StatInfo, format: string, timeFormat: string): string {
             else out += '%S' + (sub ?? '');
             continue;
         }
+        if (code === 'L') {
+            /* `%Lp` is the permission bits without the file type or the setuid, setgid and sticky
+               bits: the host prints 755 for a file chmod set to 4755. */
+            i++;
+            const sub = format[i];
+            if (sub === 'p') out += (info.mode & 0o777).toString(8);
+            else out += '%L' + (sub ?? '');
+            continue;
+        }
         switch (code) {
+            case 'A': out += (info.mode & 0o7777).toString(8); break;
             case 'N': out += info.name; break;
             case 'n': out += info.name; break;
             case 'z': out += String(info.size); break;
@@ -3291,7 +3301,9 @@ function parseMode(spec: string, base: number): number | undefined {
     let mode = base;
     for (const clause of spec.split(',')) {
         if (clause === '') return undefined;
-        const match = /^([ugoa]*)([+-=])([rwxXstugo]*)$/.exec(clause);
+        /* `-` is first in the class: inside brackets it would otherwise read as a range from `+`
+           to `=`, which takes in every digit -- and `chmod 8 f` would be a silent success. */
+        const match = /^([ugoa]*)([-+=])([rwxXstugo]*)$/.exec(clause);
         if (match === null) return undefined;
         let who = match[1] === '' ? 'a' : match[1];
         if (who.indexOf('a') >= 0) who = 'ugo';
@@ -3611,6 +3623,254 @@ const chmod: ShellCommand = (ctx) => {
         return result('', `chmod: ${unreadable.join(', ')}: permissions are not enforced in this container; the file is still readable\n`, 0);
     }
     return ok();
+};
+
+/* ------------------------------------------------------------------- touch */
+
+const TOUCH_USAGE =
+    'usage: touch [-A [-][[hh]mm]SS] [-achm] [-r file] [-t [[CC]YY]MMDDhhmm[.SS]] file ...\n';
+
+/** The mtime `touch -t [[CC]YY]MMDDhhmm[.SS]` names, read on the local clock as the host reads it. */
+function parseTouchStamp(spec: string): number | undefined {
+    const parts = spec.split('.');
+    if (parts.length > 2) return undefined;
+    const main = parts[0];
+    const seconds = parts.length === 2 ? parts[1] : '';
+    if (!/^[0-9]+$/.test(main) || (seconds !== '' && !/^[0-9]{1,2}$/.test(seconds))) return undefined;
+    let year: number;
+    let rest: string;
+    if (main.length === 12) {
+        year = Number(main.slice(0, 4));
+        rest = main.slice(4);
+    } else if (main.length === 10) {
+        const two = Number(main.slice(0, 2));
+        year = two < 69 ? 2000 + two : 1900 + two;
+        rest = main.slice(2);
+    } else if (main.length === 8) {
+        year = new Date().getFullYear();
+        rest = main;
+    } else return undefined;
+    const month = Number(rest.slice(0, 2));
+    const day = Number(rest.slice(2, 4));
+    const hour = Number(rest.slice(4, 6));
+    const minute = Number(rest.slice(6, 8));
+    const second = seconds === '' ? 0 : Number(seconds);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return undefined;
+    if (hour > 23 || minute > 59 || second > 60) return undefined;
+    return new Date(year, month - 1, day, hour, minute, second, 0).getTime();
+}
+
+/** Sets a path's mtime where the file system carries one; one that does not keeps what it has. */
+function setMtime(fs: Fs, path: string, ms: number): void {
+    const utimes = fs.utimes;
+    if (typeof utimes !== 'function') return;
+    try {
+        utimes.call(fs, path, ms);
+    } catch {
+        /* no timestamp metadata on this file system */
+    }
+}
+
+const touch: ShellCommand = (ctx) => {
+    const words = ctx.args.slice();
+    let noCreate = false;
+    let stampMs: number | undefined;
+    let reference: string | undefined;
+    const operands: string[] = [];
+    let index = 0;
+    while (index < words.length) {
+        const word = words[index];
+        const value = words[index + 1];
+        if (word === '-c' || word === '--no-create') { noCreate = true; index++; }
+        else if (word === '-a' || word === '-m') index++;
+        else if (word === '-A') index += 2;
+        else if (word === '-r') {
+            if (value === undefined) return fail(`touch: option requires an argument -- r\n${TOUCH_USAGE}`);
+            reference = value;
+            index += 2;
+        } else if (word === '-t') {
+            if (value === undefined) return fail(`touch: option requires an argument -- t\n${TOUCH_USAGE}`);
+            const parsed = parseTouchStamp(value);
+            if (parsed === undefined) {
+                return fail(`touch: out of range or illegal time specification: [[CC]YY]MMDDhhmm[.SS]\n${TOUCH_USAGE}`);
+            }
+            stampMs = parsed;
+            index += 2;
+        } else if (word === '--') index++;
+        else if (isOption(word)) return fail(`touch: illegal option -- ${word.slice(1, 2)}\n${TOUCH_USAGE}`);
+        else { operands.push(word); index++; }
+    }
+    if (operands.length === 0) return fail(TOUCH_USAGE);
+    if (stampMs === undefined && reference !== undefined) {
+        const ref = statOf(ctx.fs, resolveAt(ctx, reference));
+        if (ref === undefined) return fail(`touch: ${reference}: No such file or directory`);
+        stampMs = ref.mtimeMs;
+    }
+    const wanted = stampMs ?? Date.now();
+    const errors: string[] = [];
+    let exitCode = 0;
+    /* Every operand, not just the first: `touch a b c` leaves three files behind, as it does on
+       the host. An existing one keeps its content and gets a new mtime -- never an empty file. */
+    for (const operand of operands) {
+        const path = resolveAt(ctx, operand);
+        const stat = statOf(ctx.fs, path);
+        if (stat === undefined) {
+            if (noCreate) continue;
+            if (!isDir(ctx.fs, parentOf(path))) {
+                errors.push(`touch: ${operand}: No such file or directory`);
+                exitCode = 1;
+                continue;
+            }
+            try {
+                ctx.fs.writeFile(path, '');
+            } catch (error) {
+                errors.push(`touch: ${operand}: ${message(error)}`);
+                exitCode = 1;
+                continue;
+            }
+        }
+        setMtime(ctx.fs, path, wanted);
+    }
+    return result('', errors.map((line) => line + '\n').join(''), exitCode);
+};
+
+/* ---------------------------------------------------------------------- ls */
+
+const LS_USAGE =
+    'usage: ls [-@ABCFGHILOPRSTUWXabcdefghiklmnopqrstuvwxy1%,] [--color=when] [-D format] [file ...]\n';
+
+const LS_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** `ls -l`'s date: `Oct 15 15:35` within six months of now, `Oct 15  2025` outside it. */
+function lsDate(ms: number, now: number): string {
+    const date = new Date(ms);
+    const day = String(date.getDate()).padStart(2, ' ');
+    if (now - ms < 0 || now - ms > 182 * 24 * 3600 * 1000) {
+        return `${LS_MONTHS[date.getMonth()]} ${day} ${String(date.getFullYear()).padStart(5, ' ')}`;
+    }
+    const hour = String(date.getHours()).padStart(2, '0');
+    const minute = String(date.getMinutes()).padStart(2, '0');
+    return `${LS_MONTHS[date.getMonth()]} ${day} ${hour}:${minute}`;
+}
+
+/** What a file costs in the 512-byte blocks `ls -l` totals: whole 4 KiB clusters, empty ones none. */
+function lsBlocks(size: number): number {
+    return size === 0 ? 0 : Math.ceil(size / 4096) * 8;
+}
+
+interface LsRow {
+    name: string;
+    perms: string;
+    links: string;
+    user: string;
+    group: string;
+    size: string;
+    date: string;
+    blocks: number;
+}
+
+/** One line of `ls -l`: the mode, owner and size the side table and the file system agree on. */
+function lsRow(fs: Fs, path: string, name: string, now: number): LsRow {
+    const stat = statOf(fs, path);
+    const isDirectory = stat !== undefined && stat.type === 'dir';
+    const mode = modeOf(fs, path, isDirectory);
+    const owner = ownerOf(fs, path);
+    const size = stat === undefined ? 0 : stat.size;
+    let links = linksOf(fs, path);
+    if (isDirectory) {
+        links = 2;
+        for (const entry of dirEntries(fs, path)) if (isDir(fs, joinPath(path, entry))) links++;
+    }
+    return {
+        name,
+        perms: permissionString(mode, isDirectory ? 'dir' : 'file'),
+        links: String(links),
+        user: nameOfId(owner.uid, USER_NAMES),
+        group: nameOfId(owner.gid, GROUP_NAMES),
+        size: String(size),
+        date: lsDate(stat === undefined ? now : stat.mtimeMs, now),
+        blocks: isDirectory ? 0 : lsBlocks(size)
+    };
+}
+
+/** The listing of one group of rows: the names, or `total` and one line each. */
+function lsRender(rows: LsRow[], long: boolean, withTotal: boolean): string {
+    if (!long) return rows.length === 0 ? '' : rows.map((row) => row.name).join('\n') + '\n';
+    const linksWidth = rows.reduce((width, row) => Math.max(width, row.links.length), 0);
+    const sizeWidth = Math.max(rows.reduce((width, row) => Math.max(width, row.size.length), 0), 1) + 1;
+    /* An empty directory still prints its `total 0`, as the host's does. */
+    const body = rows.length === 0 ? '' : rows.map((row) =>
+        `${row.perms.padEnd(11)} ${row.links.padStart(linksWidth)} ${row.user} ${row.group} ` +
+        `${row.size.padStart(sizeWidth)} ${row.date} ${row.name}`).join('\n') + '\n';
+    if (!withTotal) return body;
+    return `total ${rows.reduce((sum, row) => sum + row.blocks, 0)}\n` + body;
+}
+
+/** `ls -F`: a directory's name carries the slash that marks it. */
+function lsClassify(rows: LsRow[], classify: boolean): LsRow[] {
+    if (!classify) return rows;
+    return rows.map((row) => (row.perms[0] === 'd' ? { ...row, name: row.name + '/' } : row));
+}
+
+const ls: ShellCommand = (ctx) => {
+    const words = ctx.args.slice();
+    let long = false;
+    let all = false;
+    let almostAll = false;
+    let classify = false;
+    const operands: string[] = [];
+    let index = 0;
+    while (index < words.length) {
+        const word = words[index];
+        if (word === '--') { index++; continue; }
+        if (!isOption(word)) { operands.push(word); index++; continue; }
+        /* Every letter of a clustered option, so `-la` is `-l` and `-a` and an unknown letter is
+           refused: an option this shell cannot honour is never quietly dropped. */
+        for (const letter of word.slice(1)) {
+            if (letter === 'l') long = true;
+            else if (letter === 'a') all = true;
+            else if (letter === 'A') almostAll = true;
+            else if (letter === 'F') classify = true;
+            else if (letter === '1') continue;
+            else return fail(`ls: invalid option -- ${letter}\n${LS_USAGE}`);
+        }
+        index++;
+    }
+    const now = Date.now();
+    const targets = operands.length === 0 ? ['.'] : operands;
+    const files: LsRow[] = [];
+    const blocks: string[] = [];
+    const errors: string[] = [];
+    let exitCode = 0;
+    for (const target of targets) {
+        const path = resolveAt(ctx, target);
+        const stat = statOf(ctx.fs, path);
+        if (stat === undefined) {
+            errors.push(`ls: ${target}: No such file or directory`);
+            exitCode = 1;
+            continue;
+        }
+        if (stat.type === 'dir') {
+            const names = dirEntries(ctx.fs, path).slice().sort(cmpStr);
+            /* The dot files are listed by `-a` (with `.` and `..` ahead of them) and by `-A`
+               (without), and left out otherwise, which is what a shell's `ls` shows. */
+            const shown = all || almostAll ? names : names.filter((name) => !name.startsWith('.'));
+            const entries = all ? ['.', '..'].concat(shown) : shown;
+            const rows = entries.map((name) => {
+                const child = name === '.' ? path : name === '..' ? parentOf(path) : joinPath(path, name);
+                return lsRow(ctx.fs, child, name, now);
+            });
+            const body = lsRender(lsClassify(rows, classify), long, true);
+            blocks.push(targets.length > 1 ? `${target}:\n${body}` : body);
+        } else {
+            files.push(lsRow(ctx.fs, path, target, now));
+        }
+    }
+    const chunks: string[] = [];
+    if (files.length > 0) chunks.push(lsRender(lsClassify(files, classify), long, false));
+    for (const block of blocks) chunks.push(block);
+    /* One blank line between the groups, which is what separates two operands on the host. */
+    return result(chunks.join('\n'), errors.map((line) => line + '\n').join(''), exitCode);
 };
 
 /* ------------------------------------------------------------------ du / df */
@@ -4673,6 +4933,8 @@ export const USAGE: Record<string, string> = {
     install: INSTALL_USAGE,
     ln: LN_USAGE,
     chmod: CHMOD_USAGE,
+    ls: LS_USAGE,
+    touch: TOUCH_USAGE,
     du: DU_USAGE,
     dir: DIR_USAGE,
     tac: TAC_USAGE,
@@ -4706,6 +4968,8 @@ export const COMMANDS: Record<string, ShellCommand> = {
     link,
     chown,
     chmod,
+    ls,
+    touch,
     du,
     df,
     dir,

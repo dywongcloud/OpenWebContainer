@@ -260,10 +260,14 @@ const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
 const spawnChild: CapabilityHandler = (args, ctx) => (syncRunActive() ? spawnChildNow(args, ctx) : spawnChildAsync(args, ctx));
 
 const killChild: CapabilityHandler = (args, ctx) => {
+    const signal = args.signal === undefined || args.signal === null ? 'SIGTERM' : String(args.signal);
     const record = registryFor(ctx).byPid.get(Number(args.pid));
     if (!record || record.exited || !record.process || record.parent.pid !== ctx.pid) return false;
     if (record.process.state !== ProcessState.RUNNING) return false;
-    record.killSignal = String(args.signal ?? 'SIGTERM');
+    // Signal 0 is the null signal: it asks only whether the process is still there, so the child is
+    // left running and true comes back, which is what a caller probing a pid expects.
+    if (signal === '0') return true;
+    record.killSignal = signal;
     void record.process.terminate();
     return true;
 };
@@ -750,6 +754,8 @@ function nodeInvocation(argv: string[]): { file: string; args: string[]; evalSou
     if (argv[0] === '-p' || argv[0] === '--print') {
         return { file: '[eval]', args: argv.slice(2), evalSource: printScriptArg(argv) };
     }
+    // `--` ends the options: what follows is the script, even where it begins with a dash
+    if (argv[0] === '--' && argv.length > 1) return { file: argv[1], args: argv.slice(2) };
     return { file: argv[0], args: argv.slice(1) };
 }
 

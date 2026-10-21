@@ -609,34 +609,12 @@ export class Shell implements IShell {
                 }
                 case 'pwd':
                     return ok(this.shellState.cwd + '\n');
-                case 'ls': {
-                    // A directory operand lists the names in it; a file operand -- every name a glob
-                    // such as `ls *.txt` expands to -- prints its own name, as it does in a shell.
-                    const operands = args.filter((arg) => !arg.startsWith('-'));
-                    const names: string[] = [];
-                    /* Every operand is looked at, not just up to the first one that is missing: a
-                       shell reports each name it could not find and still lists the ones it could,
-                       and only then fails -- `ls a nosuch b` lists a and b and names nosuch once. */
-                    const missing: string[] = [];
-                    if (operands.length === 0) {
-                        names.push(...this.lsNames(at(this.shellState.cwd)));
-                    } else {
-                        for (const operand of operands) {
-                            const path = at(operand);
-                            if (this.isDirectorySafe(path)) names.push(...this.lsNames(path));
-                            else if (this.fileExistsSafe(path)) names.push(operand);
-                            else missing.push(`ls: ${operand}: No such file or directory`);
-                        }
-                    }
-                    if (missing.length > 0) {
-                        return {
-                            stdout: names.length > 0 ? names.join('\n') + '\n' : '',
-                            stderr: missing.join('\n'),
-                            exitCode: 1
-                        };
-                    }
-                    return ok(names.length > 0 ? names.join('\n') + '\n' : '');
-                }
+                case 'ls':
+                case 'touch':
+                    /* The file utilities own these two: `ls -l` and `ls -a` read the mode and owner
+                       of a name, and `touch a b c` has to reach every operand, neither of which a
+                       built-in that only lists names and writes the first one could do. */
+                    return (FILE_UTILS[command] as ShellCommand)(this.moduleContext(args, input));
                 case 'mkdir': {
                     if (args.length === 0) return fail('No directory specified');
                     const recursive = args.includes('-p');
@@ -660,10 +638,6 @@ export class Shell implements IShell {
                 case 'rmdir':
                     if (args.length === 0) return fail('No directory specified');
                     fs.deleteDirectory(at(args[0]));
-                    return ok();
-                case 'touch':
-                    if (args.length === 0) return fail('No file specified');
-                    fs.writeFile(at(args[0]), '');
                     return ok();
                 case 'cd': {
                     const target = args[0] || '/';

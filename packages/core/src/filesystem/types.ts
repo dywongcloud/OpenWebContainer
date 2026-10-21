@@ -31,4 +31,9 @@ export interface IFileSystem {
     writeBytes(path: string, data: Uint8Array): void;
     removePath(path: string, recursive?: boolean): void;
     renamePath(from: string, to: string): void;
+    /**
+     * Moves a path's modification time, which is what `touch` and `tar -x` need. A file system
+     * without timestamps leaves it out and keeps the time the write left behind.
+     */
+    utimes?(path: string, mtimeMs: number): void;
 }
