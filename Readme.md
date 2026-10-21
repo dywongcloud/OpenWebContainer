@@ -218,6 +218,54 @@ Recorded rather than fixed:
   source, so it reaches the engine unchanged, and no rewrite that leaves every line where it was makes
   the two agree — QuickJS also ends the element at a line terminator inside a `/* */` comment.
 
+### ⚠️ Old toolchains that call Node internals: `npx create-react-app my-app`
+
+`create-react-app@5.1.0` is a 2022 toolchain, and on its way to `Creating a new React app` it loads
+`envinfo`, `fs-extra` and `tar-pack`, each of which reaches for a Node internal this runtime did not have.
+Measured against host Node 24.15, with stdout, stderr and the exit code captured for both, the three gaps
+were:
+
+- **`process.binding('uv')`.** The `execa` bundled into `envinfo` asks for it and wants `uv.errname` plus
+  the `UV_E*` constants, to turn an errno into a name. The container answered `Error: No such module: uv`
+  and printed the whole stack as a warning. `process.binding` now serves `uv`: the 85 `UV_*` constants with
+  the numbers Node 24.15 reports on Linux, and `errname`, which is libuv's own table -- a code's name is
+  its constant without the `UV_`, so `errname(-2)` is `ENOENT` and `errname(-4094)` is `UNKNOWN`.
+  `util.getSystemErrorName` shares the table and keeps Node's stricter rule: a code that is not a negative
+  integer is `ERR_OUT_OF_RANGE`. One deliberate divergence is recorded here: Node's own `uv.errname`
+  **aborts the process** on a code that is not negative -- `uv.errname(2)` kills host Node 24.15 with
+  `Assertion failed: (err) < 0` -- and this one answers `UNKNOWN` instead, because a guest that kills its
+  container is worse than one that cannot name an error.
+- **`fs.realpath.native`.** `fs-extra/lib/fs/index.js:121` reads `typeof fs.realpath.native` when it loads,
+  and warns `fs.realpath.native is not a function. Is fs being monkey-patched?` when it is missing.
+  `fs.realpath` and `fs.realpathSync` now each carry a `.native`, as they do in Node: the same resolution,
+  because here the wrapper and the binding behind it are one implementation.
+- **`new Buffer(512)`.** `tar/lib/pack.js:12` is `, eof = new Buffer(512)` -- read out of the container's
+  own copy of `tar@2.2.2`, not guessed. That number is a byte count, and `Buffer(arg)` handed it to
+  `Buffer.from`, which has never taken a size, so it threw
+  `TypeError: The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array`.
+  `Buffer(size)` and `new Buffer(size)` now allocate zero-filled, the way Node does; `Buffer.from(number)`
+  still throws, the way Node's does.
+
+With those three in place `npx create-react-app my-app` installs `create-react-app` and its dependencies,
+creates `/my-app`, and reaches `Installing react, react-dom, and react-scripts with cra-template...` before
+npm stops the run:
+
+```
+npm error code EBADPLATFORM
+npm error notsup Unsupported platform for fsevents@2.3.3: wanted {"os":["darwin"]} (current: {"os":"linux","cpu":"x64","libc":"glibc"})
+```
+
+That one is **recorded rather than fixed**. `react-scripts@5.0.1` lists `fsevents` in both `dependencies`
+and `optionalDependencies` (both `^2.3.2`, read from the registry); npm treats the optional entry as the one
+that decides and skips a package the platform excludes, while `src/npm/installer.ts` still enqueues the
+`dependencies` edge first, with `optional: false`, and aborts on it. The change belongs to
+`packages/core/src/npm/**`, in `dependenciesOf`: a name that `optionalDependencies` also lists is optional,
+whatever `dependencies` says, and an optional dependency's own dependencies inherit that flag. Until it
+lands, that EBADPLATFORM line is the one honest reason the run ends.
+
+The ten-package corpus (lodash, semver, uuid, chalk, sql.js, hash-wasm, js-yaml, marked, xlsx, prettier)
+is still byte-identical to host Node 24.15 after these changes.
+
 ### 📋 Upcoming Features
 
 - Additional shell commands

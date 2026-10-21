@@ -6,6 +6,13 @@
 export const BUFFER_FS_SRC = String.raw`
 BF.buffer = function () {
   function Buffer(arg, encodingOrOffset, length) {
+    /*
+     * Node's deprecated Buffer(size) / new Buffer(size): a number is a byte count, not a value to
+     * copy, and it allocates zero-filled as Buffer.alloc does. tar 2.2.2 (a tar-pack dependency, on
+     * the create-react-app path) allocates its end-of-archive marker with new Buffer(512), so a
+     * number here is a length. Buffer.from keeps rejecting it: from() has never taken a size.
+     */
+    if (typeof arg === 'number') return Buffer.alloc(arg);
     return Buffer.from(arg, encodingOrOffset, length);
   }
   Buffer.prototype = Object.create(Uint8Array.prototype);
@@ -1855,6 +1862,14 @@ BF.fs = function () {
     if (done) queueMicrotask(function () { done(error, count); });
     else if (error) throw error;
   };
+  /*
+   * Node hangs a .native on realpath and on realpathSync: the binding entry points behind the
+   * JavaScript wrappers, which resolve the same path without the cache the wrapper keeps. Both
+   * resolve the same path here, so each .native is its own function again. fs-extra reads
+   * typeof fs.realpath.native at load time and warns, loudly, when it is not a function.
+   */
+  fs.realpath.native = fs.realpath;
+  fs.realpathSync.native = fs.realpathSync;
   return fs;
 };
 

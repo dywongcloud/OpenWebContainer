@@ -566,6 +566,26 @@ BF.util = function () {
     stripVTControlCharacters: function (s) {
       return String(s).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
     },
+    /*
+     * The name of an errno, e.g. -2 -> 'ENOENT'. The table is libuv's, shared with
+     * process.binding('uv').errname through __owcErrname, which globals.ts sets. Node rejects
+     * anything that is not a negative integer with ERR_OUT_OF_RANGE, and so does this: execa takes
+     * getSystemErrorName over the old binding when it finds one, so it has to behave the same way.
+     */
+    getSystemErrorName: function (err) {
+      if (typeof err !== 'number') {
+        var typeError = new TypeError('The "err" argument must be of type number. Received type ' + typeof err);
+        typeError.code = 'ERR_INVALID_ARG_TYPE';
+        throw typeError;
+      }
+      if (!Number.isInteger(err) || err >= 0) {
+        var rangeError = new RangeError('The value of "err" is out of range. It must be a negative integer. Received ' + err);
+        rangeError.code = 'ERR_OUT_OF_RANGE';
+        throw rangeError;
+      }
+      var errname = globalThis.__owcErrname;
+      return typeof errname === 'function' ? errname(err) : 'UNKNOWN';
+    },
     types: utilTypes(),
     parseArgs: parseArgsImpl,
     TextEncoder: TextEncoderImpl,

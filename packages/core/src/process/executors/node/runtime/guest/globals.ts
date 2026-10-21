@@ -23,7 +23,12 @@ proc.platform = 'linux';
 proc.release = { name: 'node' };
 Object.defineProperty(proc, Symbol.toStringTag, { value: 'process', configurable: true });
 proc.features = {};
-/* Only the internal 'constants' binding is provided: packages such as tmp read it at load time. Other names fail as they do in node. */
+/*
+ * Two internal bindings are provided: 'constants', which packages such as tmp read at load time,
+ * and 'uv', which the old execa bundled into envinfo (a create-react-app dependency) reads to turn
+ * an errno into a name -- it wants uv.errname and, failing that, the UV_E* constants. Every other
+ * name fails as it does in node.
+ */
 proc.binding = function binding(name) {
   if (name === 'constants') {
     return {
@@ -34,8 +39,51 @@ proc.binding = function binding(name) {
       trace: {}
     };
   }
+  if (name === 'uv') return uvBinding();
   throw new Error('No such module: ' + name);
 };
+/*
+ * libuv's errno table, which is all uv_err_name is: the numbers node 24.15 reports for these
+ * constants on Linux, and a code's name is its constant with UV_ stripped, so errname(-2) is
+ * 'ENOENT' and errname(-4094) is 'UNKNOWN'. Node's own errname asserts -- aborts the whole process
+ * -- on a code that is not negative; this one answers 'UNKNOWN' instead, because a guest that kills
+ * its container is worse than one that reports an error it cannot name. util.getSystemErrorName
+ * shares the table through __owcErrname and keeps node's stricter RangeError.
+ */
+var UV_ERRNO = {
+  UV_E2BIG: -7, UV_EACCES: -13, UV_EADDRINUSE: -48, UV_EADDRNOTAVAIL: -49, UV_EAFNOSUPPORT: -47, UV_EAGAIN: -35,
+  UV_EAI_ADDRFAMILY: -3000, UV_EAI_AGAIN: -3001, UV_EAI_BADFLAGS: -3002, UV_EAI_BADHINTS: -3013, UV_EAI_CANCELED: -3003, UV_EAI_FAIL: -3004,
+  UV_EAI_FAMILY: -3005, UV_EAI_MEMORY: -3006, UV_EAI_NODATA: -3007, UV_EAI_NONAME: -3008, UV_EAI_OVERFLOW: -3009, UV_EAI_PROTOCOL: -3014,
+  UV_EAI_SERVICE: -3010, UV_EAI_SOCKTYPE: -3011, UV_EALREADY: -37, UV_EBADF: -9, UV_EBUSY: -16, UV_ECANCELED: -89,
+  UV_ECHARSET: -4080, UV_ECONNABORTED: -53, UV_ECONNREFUSED: -61, UV_ECONNRESET: -54, UV_EDESTADDRREQ: -39, UV_EEXIST: -17,
+  UV_EFAULT: -14, UV_EFBIG: -27, UV_EHOSTUNREACH: -65, UV_EINTR: -4, UV_EINVAL: -22, UV_EIO: -5,
+  UV_EISCONN: -56, UV_EISDIR: -21, UV_ELOOP: -62, UV_EMFILE: -24, UV_EMSGSIZE: -40, UV_ENAMETOOLONG: -63,
+  UV_ENETDOWN: -50, UV_ENETUNREACH: -51, UV_ENFILE: -23, UV_ENOBUFS: -55, UV_ENODEV: -19, UV_ENOENT: -2,
+  UV_ENOMEM: -12, UV_ENONET: -4056, UV_ENOPROTOOPT: -42, UV_ENOSPC: -28, UV_ENOSYS: -78, UV_ENOTCONN: -57,
+  UV_ENOTDIR: -20, UV_ENOTEMPTY: -66, UV_ENOTSOCK: -38, UV_ENOTSUP: -45, UV_EOVERFLOW: -84, UV_EPERM: -1,
+  UV_EPIPE: -32, UV_EPROTO: -100, UV_EPROTONOSUPPORT: -43, UV_EPROTOTYPE: -41, UV_ERANGE: -34, UV_EROFS: -30,
+  UV_ESHUTDOWN: -58, UV_ESPIPE: -29, UV_ESRCH: -3, UV_ETIMEDOUT: -60, UV_ETXTBSY: -26, UV_EXDEV: -18,
+  UV_UNKNOWN: -4094, UV_EOF: -4095, UV_ENXIO: -6, UV_EMLINK: -31, UV_EHOSTDOWN: -64, UV_EREMOTEIO: -4030,
+  UV_ENOTTY: -25, UV_EFTYPE: -79, UV_EILSEQ: -92, UV_ESOCKTNOSUPPORT: -44, UV_ENODATA: -96, UV_EUNATCH: -4023,
+  UV_ENOEXEC: -8
+};
+var UV_NAMES = Object.create(null);
+Object.keys(UV_ERRNO).forEach(function (key) {
+  UV_NAMES[UV_ERRNO[key]] = key.slice(3);
+});
+function uvErrname(code) {
+  var at = Number(code);
+  if (!Number.isInteger(at) || at >= 0) return 'UNKNOWN';
+  return UV_NAMES[at] || 'UNKNOWN';
+}
+globalThis.__owcErrname = uvErrname;
+function uvBinding() {
+  var binding = { errname: uvErrname };
+  Object.keys(UV_ERRNO).forEach(function (key) {
+    binding[key] = UV_ERRNO[key];
+  });
+  return binding;
+}
 /*
  * Node-API add-ons. Native code cannot load here: an add-on file whose basename (NAPI_BINARIES) or owning
  * package (NAPI_PACKAGES) a guest/modules/napi-<shim>.ts module registered gets the exports of that
