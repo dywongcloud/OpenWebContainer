@@ -28,6 +28,12 @@ export interface ContainerOptions {
     debug?: boolean;
     onServerListen?: (port: number) => void;
     onServerClose?: (port: number) => void;
+    /**
+     * Milliseconds of guest execution with no host call in it before the guest is stopped as a
+     * runaway, with the `vm` timeout error Node reports. 0 leaves a runaway loop unstoppable, which
+     * is what hangs a browser tab; the default is 30000.
+     */
+    guestBudgetMs?: number;
 }
 
 export interface SpawnOptions {
@@ -76,7 +82,8 @@ export class OpenWebContainer {
                 env: request.env,
                 beforeStart: request.beforeStart
             }),
-            sinkFor: (pid) => this.guestSink(pid)
+            sinkFor: (pid) => this.guestSink(pid),
+            guestBudgetMs: options.guestBudgetMs
         };
 
         // Register default process executors

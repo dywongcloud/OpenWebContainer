@@ -5,7 +5,7 @@ import { QuickJSAsyncWASMModule, QuickJSContext, QuickJSHandle, QuickJSRuntime, 
 import variant from "@jitl/quickjs-singlefile-browser-release-asyncify"
 import { BOOTSTRAP_SRC } from './runtime/bootstrap';
 import { installHostBridge } from './runtime/host-bridge';
-import { NodeResolver, dirnameOf, joinPaths, normalizeAbsolute } from './runtime/resolver';
+import { NodeResolver, dirnameOf, isPathSpecifier, joinPaths, normalizeAbsolute, withoutUrlSuffix } from './runtime/resolver';
 import { RuntimeServices } from './runtime/services';
 import { CapabilityContext, CapabilityEnvelope } from './runtime/capabilities/types';
 import { errorEnvelope, invokeAsync, invokeSync } from './runtime/capabilities/dispatch';
@@ -36,6 +36,10 @@ class GuestFailure extends Error {}
  * anything -- starts the stretch again each time and is never stopped by it.
  */
 const DEFAULT_GUEST_BUDGET_MS = 30_000;
+
+/** What Node 24 says when require() is asked for an ES module graph with top-level await. */
+const REQUIRE_ASYNC_MESSAGE = 'require() cannot be used on an ESM graph with top-level await. Use import() instead.' +
+    ' To see where the top-level await comes from, use --experimental-print-required-tla.';
 
 /** The `vm` timeout error, as Node words it, over the guest's own stack. */
 function interruptedMessage(budgetMs: number, formatted: string): string {
@@ -589,7 +593,10 @@ export class NodeProcess extends Process {
 
     /**
      * require() of an ES module: evaluates it as a module whose namespace is recorded under
-     * `token`. A graph with top-level await leaves the record unset; the guest reports that.
+     * `token`. Returns '' or a JSON record of the failure, which the guest rebuilds as the error
+     * Node itself throws: a graph with top-level await is still pending the moment its evaluation
+     * starts, and a module that does not parse or that throws reports its own error -- a SyntaxError
+     * stays a SyntaxError -- rather than a blanket ERR_REQUIRE_ESM.
      */
     private loadEsmSync(file: string, token: number): string {
         const context = this.context!;
@@ -598,17 +605,55 @@ export class NodeProcess extends Process {
             `globalThis.__owc_esm_registry[${token}] = __owc_ns;\n`;
         const result = context.evalCode(source, `${file}?owc-require`, { type: 'module' });
         if (result.error) {
-            const dumped = context.dump(result.error) as { message?: unknown } | string | null | undefined;
+            const failure = this.requireFailureOf(result.error);
             result.error.dispose();
-            // the engine dumps a thrown guest error as an object; require() reports its message,
-            // not the object the dump would stringify to
-            if (typeof dumped === 'string') return dumped;
-            if (dumped !== null && typeof dumped === 'object' && typeof dumped.message === 'string') return dumped.message;
-            return String(dumped);
+            return failure;
         }
-        result.value.dispose();
+        const promise = result.value;
+        let pending = false;
+        let failure: string | undefined;
+        try {
+            const state = context.getPromiseState(promise);
+            // A graph with top-level await is still pending the moment its evaluation starts: a
+            // synchronous require() cannot load one, and Node says so with ERR_REQUIRE_ASYNC_MODULE.
+            if (state.type === 'pending') {
+                pending = true;
+            } else if (state.type === 'rejected') {
+                failure = this.requireFailureOf(state.error);
+                state.error.dispose();
+            }
+            // the fulfilled value is the promise's own; disposing it here frees what the guest reads
+        } catch {
+            // not a promise at all: a graph with no top-level await finished evaluating at once
+        }
+        promise.dispose();
+        if (failure !== undefined) return failure;
+        if (pending) {
+            return JSON.stringify({ name: 'Error', code: 'ERR_REQUIRE_ASYNC_MODULE', message: REQUIRE_ASYNC_MESSAGE });
+        }
         this.drainJobs();
         return '';
+    }
+
+    /** The failure record for a require() of an ES module: the error's own name, message and code. */
+    private requireFailureOf(error: QuickJSHandle): string {
+        const context = this.context!;
+        let name = '';
+        let message = '';
+        let code = '';
+        for (const prop of ['name', 'message', 'code']) {
+            const handle = context.getProp(error, prop);
+            try {
+                if (context.typeof(handle) !== 'string') continue;
+                const value = context.getString(handle);
+                if (prop === 'name') name = value;
+                else if (prop === 'message') message = value;
+                else code = value;
+            } finally {
+                handle.dispose();
+            }
+        }
+        return JSON.stringify({ name: name === '' ? 'Error' : name, message, code });
     }
 
     private startEntry(entryPath: string | undefined): void {
@@ -934,17 +979,23 @@ export class NodeProcess extends Process {
         const found = this.resolver.resolve(spec, baseDir, 'import');
         if (!found) {
             const scheme = unsupportedScheme(spec);
-            // Node reports a specifier no loader can read as an unsupported scheme, and one that
-            // resolves to no file as ERR_MODULE_NOT_FOUND; the code is what user code branches on.
-            const code = scheme === undefined ? 'ERR_MODULE_NOT_FOUND' : 'ERR_UNSUPPORTED_ESM_URL_SCHEME';
+            // Node reports a specifier no loader can read as an unsupported scheme, one that names a
+            // directory as a directory import, and one that resolves to no file as
+            // ERR_MODULE_NOT_FOUND; the code is what user code branches on.
+            const directory = scheme === undefined ? this.directoryImportOf(spec, baseDir) : undefined;
+            const code = scheme === undefined
+                ? directory === undefined ? 'ERR_MODULE_NOT_FOUND' : 'ERR_UNSUPPORTED_DIR_IMPORT'
+                : 'ERR_UNSUPPORTED_ESM_URL_SCHEME';
             // Node names the module it looked for by its absolute path, and a bare specifier by itself
             const target = spec.startsWith('/') ? normalizeAbsolute(spec)
                 : spec === '.' || spec === '..' || spec.startsWith('./') || spec.startsWith('../')
                     ? normalizeAbsolute(joinPaths(baseDir, spec))
                     : spec;
-            const message = scheme === undefined
-                ? `Cannot find module '${target}'${baseName ? ` imported from ${baseName}` : ''}`
-                : `Only URLs with a scheme in: file, data, and node are supported by the default ESM loader. Received protocol '${scheme}'`;
+            const message = directory !== undefined
+                ? `Directory import '${directory}' is not supported resolving ES modules imported from ${baseName}`
+                : scheme === undefined
+                    ? `Cannot find module '${target}'${baseName ? ` imported from ${baseName}` : ''}`
+                    : `Only URLs with a scheme in: file, data, and node are supported by the default ESM loader. Received protocol '${scheme}'`;
             this.lastResolveError = Object.assign(new Error(message), { code });
             this.setImportFailureCode(code);
             return { error: this.lastResolveError };
@@ -957,6 +1008,20 @@ export class NodeProcess extends Process {
             }));
         }
         return found;
+    }
+
+    /**
+     * The path a specifier names when what it names is a directory: a trailing slash always does --
+     * Node reads './m.mjs/' as a directory import even though ./m.mjs is a file -- and so does a path
+     * that is one, which is how Node reports './sub?x=1' once the query is dropped. Undefined for a
+     * bare specifier, which names a package rather than a path.
+     */
+    private directoryImportOf(spec: string, baseDir: string): string | undefined {
+        const bare = withoutUrlSuffix(spec);
+        if (!isPathSpecifier(bare)) return undefined;
+        const target = bare.startsWith('/') ? normalizeAbsolute(bare) : normalizeAbsolute(joinPaths(baseDir, bare));
+        if (bare.endsWith('/')) return target + '/';
+        return this.fileSystem.statPath(target)?.type === 'dir' ? target : undefined;
     }
 
     /**

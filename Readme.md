@@ -67,6 +67,7 @@ The architecture consists of three main layers:
   - Registry packuments and tarballs, semver ranges and dist-tags, sha512/sha1 integrity checks
   - Hoisted `node_modules` with nested copies for version conflicts, and `node_modules/.bin` shims
   - `npx <bin>` runs a project bin, or installs a package into a cache and runs its bin
+  - `npm exec <bin> [-- <args>]` (alias `npm x`) is the same command under npm's own name
 
 ### 🚧 In Progress
 
@@ -99,10 +100,11 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
 - **`/dev/null` in a redirection is a sink, not a file.** What is written to it is discarded and what is
   read from it is empty. No `/dev` directory is created and nothing else in the tree learns the name.
 - **`timeout` measures its deadline after the command, not during it.** The container has no signal to
-  deliver and no way to interrupt a command that is still running, so the command finishes and the wall
+  deliver to a command that is still running, so the command finishes and the wall
   clock decides: one that ran over its duration reports 124, or 128 plus the signal for `-s` or
   `--preserve-status`, but it ran to completion -- its output is the whole output, not the part it had
-  written when the deadline passed.
+  written when the deadline passed. A guest that never finishes is stopped on its own budget instead,
+  not by `timeout`: see [Stopping a runaway guest](#-stopping-a-runaway-guest).
 - **`unexpand -t` with a list whose stops are adjacent (`-t 1,2`, `-t 2,3`) does not reproduce the host's
   own behaviour.** Lists whose stops are two or more columns apart (`-t 1,3`, `-t 4,8`) do, for every
   blank-run length measured. The host's list parser treats the degenerate case in a way this one does not.
@@ -155,16 +157,64 @@ Recorded rather than fixed:
 - Native addons: a compiled binary cannot run, so `process.versions.napi`, `process.dlopen` and a `.node` require serve a JavaScript reimplementation from `src/napi`: `bcrypt`, `sodium-native`, `better-sqlite3` (SQLite 3.47.0 transpiled to plain JS), `leveldown` and `rocksdb`, `node-pty`, `canvas` and `sharp`. `sodium_malloc` returns an ordinary zero-filled Buffer, and `sodium_mprotect_*` and `sodium_mlock` are no-ops: the container has no guarded heap and cannot lock memory, so libsodium's memory hardening is unavailable, though computed values are unaffected. `esbuild` ships a Go binary rather than an add-on
 - Utilities a browser container cannot have report it instead of exiting 127: `ping`, `dig`, `traceroute`, `nc`, `netstat`, `ss`, `ip`, `ifconfig`, `nft`, `systemctl`, `cron`, `crontab`, `chroot`, `su`, `sudo`, `usermod`, `groupadd`, `groupdel`, `lspci`, `iostat`, `vmstat`, `perf`, `tmux`, `vi`, `import`, `xclip`, `open`, `write` and `man` each write `<name>: not supported on this runtime: <reason>` and exit 1; `make` (variables, pattern rules, `.PHONY`, automatic variables), `bc` (arbitrary precision, `scale`, `sqrt`, `ibase`/`obase`) and an `openssl` subset (`dgst` with md5/sha1/sha224/sha256/sha384/sha512 and `-hmac`, those digests as shorthand commands, `rand -hex/-base64`, `version`) are implemented
 - The shell now provides the POSIX utilities as JavaScript over the virtual file system: the text filters (`grep`, `sed`, `awk`, `cut`, `sort`, `tr`, `paste`, `uniq`, `wc`, `head`, `tail`, `join`, `comm`, `diff`, `fmt`, `pr`, `tabs`), the file utilities (`find`, `xargs`, `stat`, `date`, `printf`, `expr`, `test`, `seq`, `base64`, `base32`, `xxd`, `split`, `install`, `ln`, `chown`, `chmod`, `du`, `df`, `tee`, `sleep`, `yes`, `basename`, `dirname`), the archives (`gzip`, `gunzip`, `zcat`, `compress`, `uncompress`, `tar`, `cpio`; no `bzip2` or `xz` codec is available), the shell builtins (`set`, `export`, `alias`, `type`, `trap`, `read`, `pushd`/`popd`, `source`) and the operators `;`, `&&`, `||`, `|`, `<`, `>`, `>>`, `2>&1` and `2>/dev/null`
-- `vm` `timeout` is enforced for JavaScript loops, but a loop inside a native built-in cannot be interrupted; `vm` contexts share one realm (`instanceof Array` is true across contexts)
+- **`vm` `timeout` is enforced for JavaScript loops**, and so is a runaway guest process: see
+  [Stopping a runaway guest](#-stopping-a-runaway-guest) below. `vm` contexts share one realm
+  (`instanceof Array` is true across contexts)
 - A `WebAssembly.Table` holds what the host will accept: a table of function type takes WebAssembly function objects, so a JavaScript function a guest `set`s is kept on the guest side (its own `get` returns it) while the module sees an empty slot
 - `WeakRef` keeps its target and `FinalizationRegistry` never runs cleanup callbacks (the engine build has no GC observation); `MessageChannel` delivers only inside the process
 - Worker messages deliver a `Buffer` where Node delivers a `Uint8Array`
 - QuickJS 0.31 printed `Assertion failed: list_empty(&rt->gc_obj_list)` at teardown after correct output (`mathjs`, `prettier`, `typescript`, `uglify-js`, `xlsx`, `jsdom`); the pinned 0.32 engine passes all six in the corpus
-- `sass` does not finish: the engine hangs on a construct not isolated yet, and the watchdog cannot interrupt a native loop
+- `sass` does not finish: the engine hangs on a construct not isolated yet. A hang of that kind is now stopped by the runaway budget rather than left running, but the construct itself is still not isolated, so `sass` still produces no output
 - `AsyncLocalStorage` context is not carried across `await` (timers, ticks and `.then` callbacks do carry it)
 - Shell features: `;` separators and `|` pipes print literally; `npm run` lifecycle scripts, `package-lock.json` writing and global installs (refused) are not supported
 - Process: unhandled promise rejections are swallowed (Node exits with status 1); `domain` binding for promises is absent
 - `readline` keypress events and terminal mode are partial
+
+### 🛑 Stopping a runaway guest
+
+A guest loop blocks the host thread, so nothing on the host can end it: the runner's own `timeoutMs`
+is only read between steps of the event loop, and a `while (true) {}` never reaches one. On the host
+nothing stops `node -e 'while(true){}'` either — `timeout 3 node -e 'while(true){}'` kills it from
+outside at 3.010 s and it prints nothing.
+
+The container now stops it from the inside. One QuickJS interrupt handler is armed per runtime for
+the process's lifetime and carries the run's budget: guest execution that runs longer than the budget
+without calling the host is interrupted, and the process ends with status 1 and the error Node's `vm`
+timeout reports, over the guest's own stack:
+
+```
+$ node /loop.js          # while (true) {}
+Error: Script execution timed out after 30000ms
+    at <anonymous> (/loop.js:1:2)
+    at call (native)
+    at loadCJS (owc-bootstrap.js:670:19)
+    at runMain (owc-bootstrap.js:948:12)
+```
+
+Measured, against the default 30000 ms budget: `while (true) {}` is stopped at 30155 ms. With the
+budget set to 3000 ms it is stopped at 3243 ms, while a 1.2 s pure guest loop, a 4.5 s program that
+writes to stdout throughout, a 6 s `setInterval` program, a 20 s pure guest busy loop, a 397 ms
+`JSON.stringify`/`parse` round trip over 200 000 objects and a 54.8 s run of 5000 synchronous file
+writes all finish normally with status 0 — the last two matter because both run past the wall clock
+without ever running away. The budget bounds one *uninterrupted stretch*: every host call, await,
+timer wait or step of the event loop starts it again, so a program that reaches the host in bursts is
+never stopped by it, however long it runs. `new OpenWebContainer({ guestBudgetMs: ms })` sets it, and
+`0` disarms it, which is the old behaviour.
+
+Known limits, measured rather than claimed:
+
+- A loop inside a native built-in **is** stopped when the built-in is one of this container's own
+  JavaScript reimplementations (a 120 MiB `crypto` hash is interrupted at 3183 ms) and when it is the
+  engine's regexp matcher (catastrophic backtracking in `/(a+)+$/` is interrupted at 3205 ms), because
+  both still run QuickJS bytecode or poll interrupts. A built-in that runs entirely in C without
+  polling is not — `JSON.parse` of 200 000-deep nesting is not interrupted, it raises
+  `RangeError: Maximum call stack size exceeded` at 193 ms.
+- A kill (`kill <pid>`, `container` signal, `process.terminate()`) cancels the guest at its next
+  interrupt check, which is the only point at which anything still runs while the guest holds the
+  thread.
+- An interrupted guest leaves objects live, so QuickJS prints
+  `Assertion failed: list_empty(&rt->gc_obj_list)` when its runtime is freed. It is caught during
+  teardown; the process still reports its status and output, and the container keeps working.
 
 ## 🚀 Features
 
@@ -195,6 +245,7 @@ Recorded rather than fixed:
   - `Event`, `EventTarget`, `AbortController` and `AbortSignal`, `DOMException`, `Blob` and `File` globals
   - Synchronous child processes: `spawnSync`, `execSync` and `execFileSync`, including `node -e` and `node -p`
   - `vm` `timeout` for JavaScript loops, with Node's error codes
+  - Preemption: a guest that runs away is stopped, with Node's `Script execution timed out` error
 
 ## 📦 Project Structure
 

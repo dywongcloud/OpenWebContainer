@@ -18,4 +18,9 @@ export interface RuntimeServices {
     startProcess(request: StartProcessRequest): Promise<Process>;
     /** Delivery sink for a running guest process, if it is still alive. */
     sinkFor(pid: number): VirtualSink | undefined;
+    /**
+     * Milliseconds of guest execution with no host call in it before the guest is stopped as a
+     * runaway; 0 leaves it unstoppable. Absent means the default.
+     */
+    guestBudgetMs?: number;
 }
