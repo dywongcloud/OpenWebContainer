@@ -236,6 +236,7 @@ BF.buffer = function () {
     if (value === null) return 'null';
     if (typeof value === 'function') return 'function ' + value.name;
     if (typeof value === 'object') return 'an instance of ' + ((value.constructor && value.constructor.name) || 'Object');
+    if (typeof value === 'string') return "type string ('" + value + "')";
     return 'type ' + typeof value + ' (' + String(value) + ')';
   }
 
@@ -518,6 +519,44 @@ BF.buffer = function () {
 
   var kBlobBytes = Symbol('owcBlobBytes');
   var kBlobType = Symbol('owcBlobType');
+  var kBlobParts = Symbol('owcBlobParts');
+
+  function makeBlobStream(parts) {
+    var Ctor = typeof globalThis !== 'undefined' && typeof globalThis.ReadableStream === 'function'
+      ? globalThis.ReadableStream : null;
+    if (Ctor !== null) {
+      return new Ctor({
+        start: function (controller) {
+          for (var i = 0; i < parts.length; i++) controller.enqueue(parts[i].slice());
+          controller.close();
+        }
+      });
+    }
+    var pos = 0;
+    function ReadableStream() {}
+    Object.defineProperty(ReadableStream, 'name', { value: 'ReadableStream', configurable: true });
+    var stream = new ReadableStream();
+    stream.getReader = function () {
+      return {
+        read: function () {
+          if (pos >= parts.length) return Promise.resolve({ value: undefined, done: true });
+          return Promise.resolve({ value: parts[pos++].slice(), done: false });
+        },
+        releaseLock: function () {},
+        cancel: function () { return Promise.resolve(); }
+      };
+    };
+    stream[Symbol.asyncIterator] = function () {
+      return {
+        next: function () {
+          if (pos >= parts.length) return Promise.resolve({ value: undefined, done: true });
+          return Promise.resolve({ value: parts[pos++].slice(), done: false });
+        },
+        [Symbol.asyncIterator]: function () { return this; }
+      };
+    };
+    return stream;
+  }
 
   function blobType(value) {
     var text = String(value);
@@ -554,6 +593,7 @@ BF.buffer = function () {
         pos += parts[j].length;
       }
       this[kBlobBytes] = out;
+      this[kBlobParts] = parts.filter(function (part) { return part.length > 0; });
       this[kBlobType] = options && options.type !== undefined ? blobType(options.type) : '';
     }
     get size() {
@@ -561,6 +601,11 @@ BF.buffer = function () {
     }
     get type() {
       return this[kBlobType];
+    }
+    /* Node yields one chunk per non-empty source part; the reader is the web ReadableStream the
+       runtime already installs, or a small stand-in with the same surface when it is absent. */
+    stream() {
+      return makeBlobStream(this[kBlobParts]);
     }
     text() {
       return Promise.resolve(decodeBytes(this[kBlobBytes], 'utf8'));
@@ -584,6 +629,7 @@ BF.buffer = function () {
   function makeBlob(bytes, type) {
     var blob = Object.create(Blob.prototype);
     blob[kBlobBytes] = bytes;
+    blob[kBlobParts] = bytes.length > 0 ? [bytes] : [];
     blob[kBlobType] = type;
     return blob;
   }
@@ -626,10 +672,15 @@ BF.buffer = function () {
     return wrapBytes(out);
   }
 
+  /* Node's isUtf8 and isAscii take an ArrayBuffer, a Buffer or a TypedArray: a DataView is not one,
+     even though it is a view, so it is rejected with the same message a string gets. */
   function inputBytes(value) {
+    if (value instanceof DataView) {
+      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "input" argument must be an instance of ArrayBuffer, Buffer, or TypedArray. Received ' + describeArg(value));
+    }
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     if (value instanceof ArrayBuffer) return new Uint8Array(value);
-    throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "input" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' + describeArg(value));
+    throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "input" argument must be an instance of ArrayBuffer, Buffer, or TypedArray. Received ' + describeArg(value));
   }
 
   // Strict UTF-8: no overlong forms, no surrogates, nothing above U+10FFFF.
@@ -705,7 +756,9 @@ BF.fs = function () {
     EEXIST: 'file already exists',
     EISDIR: 'illegal operation on a directory',
     ENOTDIR: 'not a directory',
-    ENOTEMPTY: 'directory not empty'
+    ENOTEMPTY: 'directory not empty',
+    EINVAL: 'invalid argument',
+    EBADF: 'bad file descriptor'
   };
 
   function fsError(code, syscall, path) {
@@ -723,9 +776,19 @@ BF.fs = function () {
     return P.resolve(s);
   }
 
+  /*
+   * utimesSync has no host file system to write its times through to, so the time it sets is kept
+   * here and folded into every later stat of that path: that is what Node makes observable, and it
+   * is what utimes is for.
+   */
+  var MTIMES = {};
+
   function statOf(file) {
     var raw = host.statJSON(file);
-    return raw === null ? null : JSON.parse(raw);
+    if (raw === null) return null;
+    var st = JSON.parse(raw);
+    var override = MTIMES[file];
+    return override === undefined ? st : { type: st.type, size: st.size, mtimeMs: override };
   }
 
   function optionsEncoding(opts) {
@@ -734,30 +797,56 @@ BF.fs = function () {
     return undefined;
   }
 
-  function makeStats(st) {
+  // Node checks the type of a range bound first, then that it is an integer within the safe range.
+  function checkRange(value, name) {
+    if (typeof value !== 'number') {
+      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "' + name + '" argument must be of type number. Received ' + describeArg(value));
+    }
+    if (value !== Math.floor(value)) {
+      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be an integer. Received ' + value);
+    }
+    if (value < 0 || value > 9007199254740991) {
+      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be >= 0 && <= 9007199254740991. Received ' + value);
+    }
+    return value;
+  }
+
+  function owcRange(name, mustBe, value) {
+    return bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be ' + mustBe + '. Received ' + value);
+  }
+
+  /* The descriptor layer's path based view has no inodes, so a symlink is recorded against the
+     path it was created at: lstat reports the link, stat follows it, and readlink names its target.
+     The link itself holds a copy of the target's bytes, so a read through it sees the same data. */
+  var SYMLINKS = {};
+
+  function makeStats(st, opts, isLink) {
+    var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
+    // With bigint every numeric field is a BigInt; the four date fields stay Date objects.
+    var num = bigint ? function (value) { return BigInt(value); } : function (value) { return value; };
     var mtime = new Date(st.mtimeMs);
     return {
-      dev: 0,
-      mode: st.type === 'dir' ? 16877 : 33188,
-      nlink: 1,
-      uid: 0,
-      gid: 0,
-      rdev: 0,
-      blksize: 4096,
-      ino: 0,
-      size: st.size,
-      blocks: Math.ceil(st.size / 512),
-      atimeMs: st.mtimeMs,
-      mtimeMs: st.mtimeMs,
-      ctimeMs: st.mtimeMs,
-      birthtimeMs: st.mtimeMs,
+      dev: num(0),
+      mode: num(st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188)),
+      nlink: num(1),
+      uid: num(0),
+      gid: num(0),
+      rdev: num(0),
+      blksize: num(4096),
+      ino: num(0),
+      size: num(st.size),
+      blocks: num(Math.ceil(st.size / 512)),
+      atimeMs: num(st.mtimeMs),
+      mtimeMs: num(st.mtimeMs),
+      ctimeMs: num(st.mtimeMs),
+      birthtimeMs: num(st.mtimeMs),
       atime: mtime,
       mtime: mtime,
       ctime: mtime,
       birthtime: mtime,
-      isFile: function () { return st.type === 'file'; },
-      isDirectory: function () { return st.type === 'dir'; },
-      isSymbolicLink: function () { return false; },
+      isFile: function () { return !isLink && st.type === 'file'; },
+      isDirectory: function () { return !isLink && st.type === 'dir'; },
+      isSymbolicLink: function () { return !!isLink; },
       isBlockDevice: function () { return false; },
       isCharacterDevice: function () { return false; },
       isFIFO: function () { return false; },
@@ -765,19 +854,25 @@ BF.fs = function () {
     };
   }
 
+  var kDirentType = Symbol('owcDirentType');
+
+  function Dirent(name, parentPath, type) {
+    this.name = name;
+    this.parentPath = parentPath;
+    this.path = parentPath;
+    this[kDirentType] = type;
+  }
+  Dirent.prototype.isFile = function () { return this[kDirentType] === 'file'; };
+  Dirent.prototype.isDirectory = function () { return this[kDirentType] === 'dir'; };
+  Dirent.prototype.isSymbolicLink = function () { return this[kDirentType] === 'link'; };
+  Dirent.prototype.isBlockDevice = function () { return false; };
+  Dirent.prototype.isCharacterDevice = function () { return false; };
+  Dirent.prototype.isFIFO = function () { return false; };
+  Dirent.prototype.isSocket = function () { return false; };
+  Object.defineProperty(Dirent.prototype, Symbol.toStringTag, { value: 'Dirent', configurable: true });
+
   function makeDirent(name, st, parentPath) {
-    return {
-      name: name,
-      parentPath: parentPath,
-      path: parentPath,
-      isFile: function () { return st.type === 'file'; },
-      isDirectory: function () { return st.type === 'dir'; },
-      isSymbolicLink: function () { return false; },
-      isBlockDevice: function () { return false; },
-      isCharacterDevice: function () { return false; },
-      isFIFO: function () { return false; },
-      isSocket: function () { return false; }
-    };
+    return new Dirent(name, parentPath, st.type === 'link' ? 'link' : (st.type === 'dir' ? 'dir' : 'file'));
   }
 
   function readBytesOf(file) {
@@ -832,16 +927,44 @@ BF.fs = function () {
     }
   };
 
+  // stat follows a recorded link to its target; lstat reports the link itself.
   fs.statSync = function (p, opts) {
+    var file = toPathString(p);
+    for (var hop = 0; SYMLINKS[file] !== undefined && hop < 32; hop++) file = SYMLINKS[file];
+    var st = statOf(file);
+    if (!st) {
+      if (opts && opts.throwIfNoEntry === false) return undefined;
+      throw fsError('ENOENT', 'stat', toPathString(p));
+    }
+    return makeStats(st, opts, false);
+  };
+
+  fs.lstatSync = function (p, opts) {
     var file = toPathString(p);
     var st = statOf(file);
     if (!st) {
       if (opts && opts.throwIfNoEntry === false) return undefined;
-      throw fsError('ENOENT', 'stat', file);
+      throw fsError('ENOENT', 'lstat', file);
     }
-    return makeStats(st);
+    return makeStats(st, opts, SYMLINKS[file] !== undefined);
   };
-  fs.lstatSync = fs.statSync;
+
+  fs.symlinkSync = function (target, linkPath) {
+    var from = toPathString(target);
+    var to = toPathString(linkPath);
+    if (!statOf(from)) throw fsError('ENOENT', 'symlink', from);
+    if (statOf(to)) throw fsError('EEXIST', 'symlink', to);
+    check(host.writeBase64(to, encodeBase64(readBytesOf(from))), 'symlink', to);
+    SYMLINKS[to] = from;
+  };
+
+  fs.readlinkSync = function (p) {
+    var file = toPathString(p);
+    var target = SYMLINKS[file];
+    if (target !== undefined) return target;
+    if (!statOf(file)) throw fsError('ENOENT', 'readlink', file);
+    throw fsError('EINVAL', 'readlink', file);
+  };
 
   // The host lists in creation order; Node (scandir with strcmp) lists sorted, so sort here.
   function sortedEntries(dir) {
@@ -1005,10 +1128,10 @@ BF.fs = function () {
     if (VALID_FLAGS.indexOf(f) < 0) throw badFlagError(flags);
     var file = toPathString(p);
     var letter = flagLetter(f);
-    var writable = letter === 'w' || letter === 'a';
+    var creates = letter === 'w' || letter === 'a';
     var st = statOf(file);
     var isDir = !!(st && st.type === 'dir');
-    if (writable) {
+    if (creates) {
       if (isDir) throw fsError('EISDIR', 'open', file);
       if (letter === 'w' || !st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file);
     } else if (!st) {
@@ -1023,10 +1146,10 @@ BF.fs = function () {
       flags: f,
       bytes: bytes,
       position: letter === 'a' ? bytes.length : 0,
-      writable: writable,
+      writable: creates || f.indexOf('+') >= 0,
       readable: letter === 'r' || f.indexOf('+') >= 0,
       isDir: isDir,
-      dirty: writable
+      dirty: creates || f.indexOf('+') >= 0
     };
     return fd;
   };
@@ -1096,6 +1219,101 @@ BF.fs = function () {
     delete DESCRIPTORS[fd];
   };
 
+  /*
+   * The rest of the descriptor family. A descriptor's size is the size of the buffer it holds, so
+   * fstatSync reports the bytes written so far even before closeSync has pushed them through, and
+   * ftruncateSync resizes that buffer: shorten it, or grow it the way Node grows a file, with zero
+   * bytes up to the new length. Node refuses to truncate a descriptor that was not opened for
+   * writing with EINVAL, and its error carries the syscall but no path.
+   */
+  function noPathError(code, syscall) {
+    var err = new Error(code + ': ' + (DESCRIPTIONS[code] || code) + ', ' + syscall);
+    err.errno = -1;
+    err.code = code;
+    err.syscall = syscall;
+    return err;
+  }
+
+  function descriptorStats(rec) {
+    var st = statOf(rec.path);
+    return makeStats({
+      type: st ? st.type : (rec.isDir ? 'dir' : 'file'),
+      size: rec.bytes.length,
+      mtimeMs: st ? st.mtimeMs : 0
+    });
+  }
+
+  fs.fstatSync = function (fd, opts) {
+    return descriptorStats(descriptorOf(fd, 'fstat'));
+  };
+
+  function truncateLength(len) {
+    if (len === undefined) return 0;
+    if (typeof len !== 'number' || len !== Math.floor(len) || len < 0) {
+      var err = new RangeError('The value of "len" is out of range. It must be an integer. Received ' + String(len));
+      err.code = 'ERR_OUT_OF_RANGE';
+      throw err;
+    }
+    return len;
+  }
+
+  fs.ftruncateSync = function (fd, len) {
+    var rec = descriptorOf(fd, 'ftruncate');
+    if (!rec.writable) throw noPathError('EINVAL', 'ftruncate');
+    var size = truncateLength(len);
+    var next = new Uint8Array(size);
+    var keep = Math.min(size, rec.bytes.length);
+    for (var i = 0; i < keep; i++) next[i] = rec.bytes[i];
+    rec.bytes = next;
+    if (rec.position > size) rec.position = size;
+    rec.dirty = true;
+  };
+
+  fs.fchmodSync = function (fd, mode) {
+    var rec = descriptorOf(fd, 'fchmod');
+    if (!statOf(rec.path)) throw fsError('ENOENT', 'fchmod', rec.path);
+  };
+
+  fs.fdatasyncSync = function (fd) {
+    flushDescriptor(descriptorOf(fd, 'fdatasync'), 'fdatasync');
+  };
+
+  // Node takes a Date, a number of seconds or a numeric string; anything it cannot read is now.
+  function timeToMs(value) {
+    if (value instanceof Date) return value.getTime();
+    if (typeof value === 'number') return Math.floor(value * 1000);
+    var n = Number(value);
+    if (value === undefined || value === null || (typeof n === 'number' && isNaN(n))) return Date.now();
+    return Math.floor(n * 1000);
+  }
+
+  fs.utimesSync = function (p, atime, mtime) {
+    var file = toPathString(p);
+    if (!statOf(file)) throw fsError('ENOENT', 'utime', file);
+    MTIMES[file] = timeToMs(mtime);
+  };
+
+  // One read across several buffers: the descriptor's position runs on through all of them, and
+  // the count is the total, exactly as Node reports it.
+  fs.readvSync = function (fd, buffers, position) {
+    var rec = descriptorOf(fd, 'read');
+    if (!rec.readable) throw badFdError('read');
+    if (rec.isDir) throw fsError('EISDIR', 'read', rec.path);
+    var at = typeof position === 'number' ? position : rec.position;
+    var total = 0;
+    for (var i = 0; i < buffers.length; i++) {
+      var buf = buffers[i];
+      var target = ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : buf;
+      var available = rec.bytes.length - (at + total);
+      if (available <= 0) break;
+      var n = Math.min(target.length, available);
+      for (var j = 0; j < n; j++) target[j] = rec.bytes[at + total + j];
+      total += n;
+    }
+    if (typeof position !== 'number') rec.position = at + total;
+    return total;
+  };
+
   // The file system has no owners or permission bits to set, so these only have to report the
   // error Node would for a path that is not there.
   fs.chmodSync = function (p, mode) {
@@ -1115,8 +1333,21 @@ BF.fs = function () {
     var options = typeof opts === 'string' ? { encoding: opts } : (opts || {});
     var file = toPathString(p);
     var chunkSize = options.highWaterMark || 65536;
-    var rangeStart = typeof options.start === 'number' ? options.start : 0;
-    var rangeEnd = typeof options.end === 'number' ? options.end : Infinity;
+    /* Node validates the range when the stream is constructed, so a bad start or end throws before
+       a chunk is ever read. */
+    var rangeStart = 0;
+    var rangeEnd = Infinity;
+    if (options.start !== undefined) {
+      rangeStart = checkRange(options.start, 'start');
+      if (options.end !== undefined && options.end !== Infinity) {
+        rangeEnd = checkRange(options.end, 'end');
+        if (rangeStart > rangeEnd) {
+          throw owcRange('start', '<= "end" (here: ' + rangeEnd + ')', rangeStart);
+        }
+      }
+    } else if (options.end !== undefined && options.end !== Infinity) {
+      rangeEnd = checkRange(options.end, 'end');
+    }
     var bytes = null;
     var offset = 0;
     var stream = new Readable({
@@ -1136,11 +1367,15 @@ BF.fs = function () {
           return;
         }
         var end = Math.min(offset + chunkSize, bytes.length);
-        stream.push(Buf.from(bytes.subarray(offset, end)));
+        var chunk = Buf.from(bytes.subarray(offset, end));
         offset = end;
+        stream.bytesRead += chunk.length;
+        stream.push(chunk);
       }
     });
     stream.path = file;
+    // Node reports 0 before the first read and the byte count of the range afterwards.
+    stream.bytesRead = 0;
     if (options.encoding) stream.setEncoding(options.encoding);
     // like Node, the file is opened when the stream is created: a missing file is an 'error' even with no reader
     setImmediate(function () {
@@ -1311,6 +1546,174 @@ BF.fs = function () {
   fs.W_OK = 2;
   fs.X_OK = 1;
 
+  /*
+   * fs.promises.open resolves to one of these and not to the bare integer fs.open hands back: a
+   * FileHandle carries its descriptor and reads and writes through it, and its fd reads -1 once the
+   * handle is closed, so every use after closeSync is EBADF. Each method is the descriptor call
+   * above wrapped in a promise, which is all Node's own handle is.
+   */
+  function FileHandle(fd) {
+    this.fd = fd;
+  }
+
+  function handleCall(work) {
+    try {
+      return Promise.resolve(work());
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+
+  function viewFor(buf) {
+    return ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : buf;
+  }
+
+  FileHandle.prototype.read = function (buffer, offset, length, position) {
+    var self = this;
+    var opts = buffer && typeof buffer === 'object' && !ArrayBuffer.isView(buffer) ? buffer : null;
+    var buf = opts ? opts.buffer : buffer;
+    var off = opts ? (opts.offset || 0) : (typeof offset === 'number' ? offset : 0);
+    var len = opts ? (opts.length === undefined ? buf.length - off : opts.length)
+      : (typeof length === 'number' ? length : buf.length - off);
+    var at = opts ? opts.position : position;
+    return handleCall(function () {
+      var n = at === undefined || at === null
+        ? fs.readSync(self.fd, buf, off, len)
+        : fs.readSync(self.fd, buf, off, len, at);
+      return { bytesRead: n, buffer: buf };
+    });
+  };
+
+  FileHandle.prototype.readv = function (buffers, position) {
+    var self = this;
+    return handleCall(function () {
+      var n = position === undefined || position === null
+        ? fs.readvSync(self.fd, buffers)
+        : fs.readvSync(self.fd, buffers, position);
+      return { bytesRead: n, buffers: buffers };
+    });
+  };
+
+  FileHandle.prototype.write = function (buffer, offset, length, position) {
+    var self = this;
+    if (typeof buffer === 'string') {
+      var enc = typeof offset === 'string' ? offset : typeof length === 'string' ? length : undefined;
+      var strAt = typeof offset === 'number' ? offset : typeof length === 'number' ? length
+        : typeof position === 'number' ? position : undefined;
+      return handleCall(function () {
+        var n = strAt === undefined ? fs.writeSync(self.fd, buffer, undefined, enc)
+          : fs.writeSync(self.fd, buffer, strAt, enc);
+        return { bytesWritten: n, buffer: buffer };
+      });
+    }
+    var off = typeof offset === 'number' ? offset : 0;
+    var len = typeof length === 'number' ? length : viewFor(buffer).length - off;
+    return handleCall(function () {
+      var n = position === undefined || position === null
+        ? fs.writeSync(self.fd, buffer, off, len)
+        : fs.writeSync(self.fd, buffer, off, len, position);
+      return { bytesWritten: n, buffer: buffer };
+    });
+  };
+
+  FileHandle.prototype.writev = function (buffers, position) {
+    var self = this;
+    return handleCall(function () {
+      var written = 0;
+      var rec = descriptorOf(self.fd, 'write');
+      var at = typeof position === 'number' ? position : rec.position;
+      for (var i = 0; i < buffers.length; i++) {
+        var chunk = viewFor(buffers[i]);
+        var n = fs.writeSync(self.fd, chunk, 0, chunk.length, at + written);
+        written += n;
+      }
+      return { bytesWritten: written, buffers: buffers };
+    });
+  };
+
+  FileHandle.prototype.writeFile = function (data, options) {
+    var self = this;
+    return handleCall(function () {
+      var bytes = writeBytes(data, optionsEncoding(options));
+      // Writes from the handle's position and leaves it past what was written, as Node does.
+      fs.writeSync(self.fd, bytes, 0, bytes.length);
+      return undefined;
+    });
+  };
+
+  FileHandle.prototype.readFile = function (options) {
+    var self = this;
+    return handleCall(function () {
+      var rec = descriptorOf(self.fd, 'read');
+      var bytes = rec.bytes.subarray(rec.position);
+      rec.position = rec.bytes.length;
+      var enc = optionsEncoding(options);
+      return enc ? decodeBytes(bytes, enc) : Buf.from(bytes);
+    });
+  };
+
+  FileHandle.prototype.appendFile = function (data, options) {
+    var self = this;
+    return handleCall(function () {
+      var rec = descriptorOf(self.fd, 'write');
+      var bytes = writeBytes(data, optionsEncoding(options));
+      fs.writeSync(self.fd, bytes, 0, bytes.length, rec.bytes.length);
+      rec.position = rec.bytes.length;
+      return undefined;
+    });
+  };
+
+  FileHandle.prototype.close = function () {
+    var self = this;
+    return handleCall(function () {
+      fs.closeSync(self.fd);
+      self.fd = -1;
+      return undefined;
+    });
+  };
+
+  FileHandle.prototype.stat = function (opts) {
+    var self = this;
+    return handleCall(function () { return fs.fstatSync(self.fd, opts); });
+  };
+
+  FileHandle.prototype.truncate = function (len) {
+    var self = this;
+    return handleCall(function () { fs.ftruncateSync(self.fd, len === undefined ? 0 : len); });
+  };
+
+  FileHandle.prototype.datasync = function () {
+    var self = this;
+    return handleCall(function () { fs.fdatasyncSync(self.fd); });
+  };
+
+  FileHandle.prototype.sync = function () {
+    var self = this;
+    return handleCall(function () { fs.fsyncSync(self.fd); });
+  };
+
+  FileHandle.prototype.chmod = function (mode) {
+    var self = this;
+    return handleCall(function () { fs.fchmodSync(self.fd, mode); });
+  };
+
+  FileHandle.prototype.chown = function (uid, gid) {
+    var self = this;
+    return handleCall(function () { fs.chownSync(descriptorOf(self.fd, 'fchown').path, uid, gid); });
+  };
+
+  FileHandle.prototype.utimes = function (atime, mtime) {
+    var self = this;
+    return handleCall(function () { fs.utimesSync(descriptorOf(self.fd, 'futimes').path, atime, mtime); });
+  };
+
+  /*
+   * The *Sync sweep below would hand promises.open the integer fs.openSync returns; Node hands back
+   * a handle, so open is replaced here once the sweep has run. Node has no promise form for the f*
+   * descriptor calls or for readv either: those live on the handle alone.
+   */
+  var HANDLE_ONLY = { fstatSync: 1, fchmodSync: 1, ftruncateSync: 1, fdatasyncSync: 1, readvSync: 1 };
+
   var names = Object.keys(fs);
   var promises = {};
   fs.promises = promises;
@@ -1334,17 +1737,28 @@ BF.fs = function () {
         else cb(null, result);
       });
     };
-    promises[base] = function () {
-      var args = Array.prototype.slice.call(arguments);
-      return new Promise(function (resolve, reject) {
-        try {
-          resolve(impl.apply(fs, args));
-        } catch (err) {
-          reject(err);
-        }
-      });
-    };
+    if (!HANDLE_ONLY[syncName]) {
+      promises[base] = function () {
+        var args = Array.prototype.slice.call(arguments);
+        return new Promise(function (resolve, reject) {
+          try {
+            resolve(impl.apply(fs, args));
+          } catch (err) {
+            reject(err);
+          }
+        });
+      };
+    }
   });
+  promises.open = function (p, flags, mode) {
+    return new Promise(function (resolve, reject) {
+      try {
+        resolve(new FileHandle(fs.openSync(p, flags, mode)));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  };
   fs.exists = function (p, cb) {
     var found = fs.existsSync(p);
     queueMicrotask(function () { cb(found); });
