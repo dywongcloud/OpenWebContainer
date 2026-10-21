@@ -244,11 +244,17 @@ export abstract class Process extends BrowserEventEmitter {
     /**
      * Helper methods for child processes
      */
+    /**
+     * Starts a child process. `stdin` is text for the child to read, and `silent` keeps the child's
+     * own output off this process's terminal, so a caller that takes it into a pipe of its own -- a
+     * shell running `printf x | node ...` -- is the only thing that writes it.
+     */
     protected async spawnChild(
         executable: string,
         args: string[] = [],
         env: Record<string, string> = {},
-        cwd?: string
+        cwd?: string,
+        options: { stdin?: string; silent?: boolean } = {}
     ): Promise<ChildProcessResult> {
         return new Promise((resolve) => {
             this.emit(ProcessEvent.SPAWN_CHILD, {
@@ -256,7 +262,9 @@ export abstract class Process extends BrowserEventEmitter {
                     executable,
                     args,
                     env,
-                    cwd
+                    cwd,
+                    stdin: options.stdin,
+                    silent: options.silent
                 },
                 callback: resolve
             });

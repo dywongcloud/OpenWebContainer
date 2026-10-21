@@ -22,6 +22,13 @@ export interface ChildProcessPayload {
     args: string[];        // Arguments to pass to the process
     env?: Record<string, string>;  // Additional environment variables
     cwd?: string;         // Working directory for the process
+    /** Text for the child's stdin, for a parent that runs it in a pipeline instead of at a terminal. */
+    stdin?: string;
+    /**
+     * True when the parent is taking the child's output into a pipe of its own: the container then
+     * hands that output back in the result only, and does not also write it to the parent's terminal.
+     */
+    silent?: boolean;
 }
 
 export interface ChildProcessResult {

@@ -172,6 +172,25 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         }
         return result.value;
     });
+    /**
+     * Compiles the body of a `new Function(...)` call into a function. The host compiles it for the
+     * same reason it compiles a CommonJS body, and for one more: the engine names eval'd code
+     * `<input>`, and a dynamic import written in a body with no path of its own is resolved from the
+     * working directory, where Node resolves it from the file that created the function -- which is
+     * why prettier's bin, whose `import()` sits in a `new Function` body, looked for its CLI in
+     * `/internal/legacy-cli.mjs`. Returns the function, or the compile failure's message as a string.
+     */
+    define('compileFunction', (src, file) => {
+        const result = context.evalCode(text(src), text(file), { type: 'global' });
+        if (result.error) {
+            const messageHandle = context.getProp(result.error, 'message');
+            const message = context.typeof(messageHandle) === 'string' ? context.getString(messageHandle) : '';
+            messageHandle.dispose();
+            result.error.dispose();
+            return context.newString(message);
+        }
+        return result.value;
+    });
     define('esmLoad', (file, token) => context.newString(deps.loadEsm(text(file), context.getNumber(token))));
     define('ref', (delta) => {
         deps.holdRef(context.getNumber(delta));

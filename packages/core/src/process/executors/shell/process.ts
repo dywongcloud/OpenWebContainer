@@ -95,6 +95,91 @@ function shebangInterpreter(fileSystem: IFileSystem, file: string): string | und
     return first.split('/').pop();
 }
 
+/** A word that opens a construct the script engine parses: a line that opens with one is the engine's whole. */
+const COMPOUND_KEYWORDS = new Set(['if', 'for', 'while', 'until', 'case', 'select', 'function']);
+
+/** The first word of a line, as the shell quotes it. */
+function firstWordOf(text: string): string {
+    return splitCommandLine(text)[0] ?? '';
+}
+
+/** One step of a compound line: `op` joins it to the step before it, and null opens the line. */
+interface CompoundStep {
+    op: '|' | '&&' | '||' | ';' | null;
+    text: string;
+}
+
+/**
+ * The steps of a line this shell runs itself: `;`, `&&`, `||` and `|`, split the way a shell splits
+ * them, with quoting kept and an operator inside quotes left alone.
+ *
+ * Null for a line it does not run: a redirection, a background job, a subshell, a command
+ * substitution or a compound command, and a line with a step missing beside an operator. Those the
+ * script engine takes whole, as it always has.
+ */
+function splitCompoundLine(line: string): CompoundStep[] | null {
+    const steps: CompoundStep[] = [];
+    let text = '';
+    let op: CompoundStep['op'] = null;
+    const push = (next: CompoundStep['op']): void => {
+        steps.push({ op, text: text.trim() });
+        text = '';
+        op = next;
+    };
+    let i = 0;
+    while (i < line.length) {
+        const ch = line[i];
+        if (ch === "'") {
+            const close = line.indexOf("'", i + 1);
+            if (close === -1) return null;
+            text += line.slice(i, close + 1);
+            i = close + 1;
+            continue;
+        }
+        if (ch === '"') {
+            let j = i + 1;
+            while (j < line.length && line[j] !== '"') {
+                j += line[j] === '\\' ? 2 : 1;
+            }
+            if (j >= line.length) return null;
+            text += line.slice(i, j + 1);
+            i = j + 1;
+            continue;
+        }
+        if (ch === '\\') {
+            text += line.slice(i, i + 2);
+            i += 2;
+            continue;
+        }
+        if (ch === '|') {
+            push(line[i + 1] === '|' ? '||' : '|');
+            i += line[i + 1] === '|' ? 2 : 1;
+            continue;
+        }
+        if (ch === '&') {
+            if (line[i + 1] !== '&') return null; // a background job
+            push('&&');
+            i += 2;
+            continue;
+        }
+        if (ch === ';') {
+            push(';');
+            i++;
+            continue;
+        }
+        /* Anything else that is an operator or opens a construct: the engine's, not this splitter's */
+        if ('<>(){`'.includes(ch)) return null;
+        if (ch === '$' && line[i + 1] === '(') return null;
+        text += ch;
+        i++;
+    }
+    steps.push({ op, text: text.trim() });
+    if (steps.length === 0) return null;
+    for (const step of steps) if (step.text === '') return null; // a command missing beside an operator
+    if (COMPOUND_KEYWORDS.has(firstWordOf(steps[0].text))) return null;
+    return steps;
+}
+
 export class ShellProcess extends Process {
     private shell: Shell;
     private prompt: string;
@@ -420,6 +505,11 @@ export class ShellProcess extends Process {
      * registry -- is spawned on a line of its own, where the shell can wait for it, before the line
      * reaches the engine. Everything else -- the operators, pipes, redirections and expansions, and
      * every built-in and utility -- is the engine's, and is what the other path runs.
+     *
+     * One line the engine cannot take whole is a compound line with such a command in it --
+     * `cd /app; node x.js`, `printf 'x' | node ...`, `node ... && echo done`. The engine is
+     * synchronous and a child is not, so this shell runs that line itself, one step at a time, and
+     * gives the child the text the step before it wrote.
      */
     private async executeCommand(commandLine: string): Promise<ShellCommandResult> {
         const processedArgs = splitCommandLine(commandLine);
@@ -431,7 +521,17 @@ export class ShellProcess extends Process {
 
         const [command, ...cmdArgs] = processedArgs;
 
-        if (!this.shell.isCompound(commandLine)) {
+        if (this.shell.isCompound(commandLine)) {
+            const steps = splitCompoundLine(commandLine);
+            if (steps !== null && steps.some((step) => this.shell.isSpawnedCommand(firstWordOf(step.text)))) {
+                const run = await this.executeSteps(steps);
+                if (this.shell.stopped) {
+                    this.running = false;
+                    this._exitCode = run.exitCode;
+                }
+                return run;
+            }
+        } else {
             const spawned = await this.spawnOneCommand(command, cmdArgs);
             if (spawned !== undefined) {
                 this.rememberStopped(spawned.exitCode);
@@ -445,6 +545,55 @@ export class ShellProcess extends Process {
             this._exitCode = result.exitCode;
         }
         return result;
+    }
+
+    /**
+     * The steps of a compound line, in order: `;` sequences them, `&&` and `||` run one on the status
+     * of the one before it, and `|` hands what a step wrote to the step after it.
+     */
+    private async executeSteps(steps: CompoundStep[]): Promise<ShellCommandResult> {
+        let stdout = '';
+        let stderr = '';
+        let exitCode = 0;
+        let piped = '';
+        for (let i = 0; i < steps.length; i++) {
+            const step = steps[i];
+            if (step.op === '&&' && exitCode !== 0) continue;
+            if (step.op === '||' && exitCode === 0) continue;
+            const stage = await this.runStep(step.text, step.op === '|' ? piped : null);
+            stderr += stage.stderr;
+            exitCode = stage.exitCode;
+            const next = steps[i + 1];
+            if (next !== undefined && next.op === '|') {
+                piped = stage.stdout;
+            } else {
+                stdout += stage.stdout;
+                piped = '';
+            }
+            if (this.shell.stopped) break;
+        }
+        return { stdout, stderr, exitCode };
+    }
+
+    /**
+     * One step of a compound line. A command only a child can run is spawned with the text the step
+     * before it wrote on its stdin, and its own output is read back rather than written to the
+     * terminal, so a pipe takes it. Every other step is the engine's.
+     */
+    private async runStep(text: string, input: string | null): Promise<ShellCommandResult> {
+        const words = splitCommandLine(text);
+        if (words.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
+        const [command, ...args] = words;
+        if (this.shell.isSpawnedCommand(command)) {
+            const env = Object.fromEntries(this.env);
+            /* The child reads its stdin only when it is told it has one, the way a pipe tells it */
+            if (input !== null) env.OWC_STDIN = 'pipe';
+            return await this.spawnChild(command, args, env, this.shell.getWorkingDirectory(), {
+                stdin: input ?? undefined,
+                silent: true
+            });
+        }
+        return this.shell.executeLine(text, input);
     }
 
     /** `exit` on a line of its own: the status it gave is the shell's. */
@@ -463,6 +612,18 @@ export class ShellProcess extends Process {
             if (this.shell.isSpawnedCommand(command)) {
                 /* A child process writes to this shell's output as it runs, so the result's copy is
                    not written again: `sh -c 'node x.js'` printed every line twice otherwise. */
+                this.liveChildOutput = true;
+                return await this.spawnChild(
+                    command,
+                    cmdArgs,
+                    Object.fromEntries(this.env),
+                    this.shell.getWorkingDirectory()
+                );
+            }
+            /* `sh -c <line>` is a shell of its own, and it runs that line the way this shell runs one:
+               a command only a child can run -- `sh -c 'node x.js'` -- reaches a child through it,
+               where the engine's own `sh`, which cannot spawn, would refuse it with 127. */
+            if (command === 'sh' && cmdArgs[0] === '-c') {
                 this.liveChildOutput = true;
                 return await this.spawnChild(
                     command,

@@ -455,10 +455,20 @@ export class Shell implements IShell {
      * redirections, expansions, quoting, the utilities and the built-ins. The state the engine keeps
      * is this shell's own, so variables, functions, aliases and the working directory survive the
      * line and are what the next line sees.
+     *
+     * `input` is what the line reads on its standard input: the text a pipeline to its left wrote.
+     * The engine takes it out of the buffer `read`, `mapfile` and every command that reads stdin in
+     * one go -- `cat`, `wc`, `head` -- read, and the line leaves that buffer as it found it.
      */
-    executeLine(line: string): ShellCommandResult {
+    executeLine(line: string, input?: string | null): ShellCommandResult {
         const state = this.shellState;
         const previous = getRunner();
+        const savedBuffer = state.inputBuffer;
+        const savedCursor = state.inputCursor;
+        if (input !== undefined && input !== null) {
+            state.inputBuffer = input;
+            state.inputCursor = 0;
+        }
         setRunner(this.runSimpleCommand);
         try {
             const run = runScript(state, line);
@@ -471,6 +481,8 @@ export class Shell implements IShell {
             }
             return result;
         } finally {
+            state.inputBuffer = savedBuffer;
+            state.inputCursor = savedCursor;
             setRunner(previous);
         }
     }

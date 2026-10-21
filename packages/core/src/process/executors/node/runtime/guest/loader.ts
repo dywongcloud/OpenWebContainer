@@ -43,6 +43,37 @@ function moduleNotFound(id) {
   return err;
 }
 
+/* The file whose code is running, for the one piece of code that carries no file of its own: a
+   new Function body, which the engine names <input>. A dynamic import written in one has nothing to
+   resolve against, and Node resolves it from the file that created the function, so that file is
+   recorded here while a CommonJS module body runs. */
+var CURRENT_FILE = '';
+
+function setCurrentFile(file) {
+  CURRENT_FILE = typeof file === 'string' ? file : '';
+}
+
+/* new Function: the body is compiled by the host under the file that is running, so a dynamic
+   import in it resolves from that file, as it does in Node. A body built outside any module -- the
+   top of a -e script, or a REPL line -- has no file to name and is left to the engine, which
+   resolves an import in it from the working directory, as Node resolves one there. */
+var REAL_FUNCTION = globalThis.Function;
+
+globalThis.Function = function Function() {
+  var argc = arguments.length;
+  if (CURRENT_FILE === '') return REAL_FUNCTION.apply(REAL_FUNCTION, arguments);
+  var params = [];
+  for (var k = 0; k < argc - 1; k++) params.push(String(arguments[k]));
+  var body = argc === 0 ? '' : String(arguments[argc - 1]);
+  var compiled = host.compileFunction(
+    '(function anonymous(' + params.join(',') + '\n) {\n' + body + '\n})',
+    CURRENT_FILE
+  );
+  if (typeof compiled === 'string') throw new SyntaxError(compiled);
+  return compiled;
+};
+globalThis.Function.prototype = REAL_FUNCTION.prototype;
+
 function readSource(filename) {
   var src = host.readText(filename);
   if (src === null) throw moduleNotFound(filename);
@@ -187,7 +218,15 @@ function loadCJS(filename, parent, isMain) {
       }
       var src = stripHashbang(readSource(filename));
       var wrapper = compileCjsWrapper(src, filename);
-      wrapper.call(mod.exports, mod.exports, makeRequire(mod), mod, filename, mod.path);
+      /* The body runs as this file, so a new Function it builds -- and a dynamic import in that
+         body -- is resolved from here, as it is in Node. */
+      var savedFile = CURRENT_FILE;
+      setCurrentFile(filename);
+      try {
+        wrapper.call(mod.exports, mod.exports, makeRequire(mod), mod, filename, mod.path);
+      } finally {
+        setCurrentFile(savedFile);
+      }
     }
     mod.loaded = true;
   } catch (err) {
