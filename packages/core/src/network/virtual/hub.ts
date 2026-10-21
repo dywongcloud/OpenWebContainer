@@ -247,10 +247,17 @@ export class VirtualNetwork {
         };
     }
 
-    /** Binds a server-side connection to the guest target that will receive its events. */
-    attach(connectionId: number, targetId: number): void {
+    /**
+     * Binds a server-side connection to the guest target that will receive its events.
+     *
+     * Returns false when there is no such connection. That is the host's case: a host that kept only
+     * the id of its 'connection' payload lets the connection be released, and one closed since then is
+     * removed with whatever its peer had queued for it, so the data a late attach would have delivered
+     * is gone. Reporting it is the difference between that and losing the bytes without a word.
+     */
+    attach(connectionId: number, targetId: number): boolean {
         const connection = this.connections.get(connectionId);
-        if (!connection) return;
+        if (!connection) return false;
         connection.local.targetId = targetId;
         const queued = connection.local.pending.splice(0);
         for (const event of queued) {
@@ -258,6 +265,7 @@ export class VirtualNetwork {
         }
         // A side closed before it was attached was kept only to deliver its queued end and close.
         if (connection.closed) this.connections.delete(connection.id);
+        return true;
     }
 
     /**

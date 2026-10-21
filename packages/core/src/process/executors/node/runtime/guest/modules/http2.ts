@@ -1646,6 +1646,8 @@ BF['http2'] = function () {
       this._recvConnUnacked = 0;
       this._continuation = null;
       this._out = [];
+      /* Headers of the DATA frames queued since the last flush: END_STREAM can still ride on them. */
+      this._dataFrames = [];
       this._afterFlush = [];
       this._outScheduled = false;
       this._ready = !!isServer;
@@ -1779,6 +1781,8 @@ BF['http2'] = function () {
       if (!this._ready) return;
       var parts = this._out;
       this._out = [];
+      /* What has left cannot be rewritten: END_STREAM rides only on a frame still waiting here. */
+      this._dataFrames = [];
       if (parts.length > 0 && !this._socketClosed) {
         try {
           this._socket.write(parts.length === 1 ? parts[0] : Buffer.concat(parts));
@@ -1809,9 +1813,11 @@ BF['http2'] = function () {
         head[2] = len & 0xff;
         this._send(head);
         this._send(payload);
-        return;
+        return head;
       }
-      this._send(frameBuffer(type, flags, streamId, payload));
+      var frame = frameBuffer(type, flags, streamId, payload);
+      this._send(frame);
+      return frame;
     }
     _sendSettings(settings, callback) {
       if (settings.maxConcurrentStreams !== undefined) this._announcedMaxConcurrent = settings.maxConcurrentStreams;
@@ -1843,6 +1849,16 @@ BF['http2'] = function () {
         first = false;
       } while (off < block.length);
     }
+    /* Sets END_STREAM on the last DATA frame of this stream still waiting to go out; false when there is none. */
+    _endStreamOnLastData(stream) {
+      for (var i = this._dataFrames.length - 1; i >= 0; i--) {
+        var entry = this._dataFrames[i];
+        if (entry.stream !== stream) continue;
+        entry.head[4] |= F.END_STREAM;
+        return true;
+      }
+      return false;
+    }
     _flushStream(stream) {
       if (this._destroyed) return;
       var q = stream._outQueue;
@@ -1852,18 +1868,26 @@ BF['http2'] = function () {
           var remaining = item.buf.length - item.off;
           if (remaining === 0) {
             q.shift();
-            this._afterSend(item.cb);
+            /*
+             * Node hands a write to nghttp2 and calls back before the frame leaves, so a stream that
+             * ends as its last write completes still puts END_STREAM on that frame. The callback runs
+             * on the next tick, which is still before this batch is written.
+             */
+            process.nextTick(item.cb);
             continue;
           }
           if (!stream._canSend()) return;
           var allowed = Math.min(remaining, this._sendConnWindow, stream._sendWindow, this._remoteSettings.maxFrameSize);
           if (allowed <= 0) return;
           var part = item.buf.subarray(item.off, item.off + allowed);
+          /* A frame this long is not copied into a frame buffer, so the bytes must outlive the
+             callback, which runs before the frame reaches the socket. */
+          if (part.length > 1024) part = Buffer.from(part);
           item.off += allowed;
           stream._queuedBytes -= allowed;
           this._sendConnWindow -= allowed;
           stream._sendWindow -= allowed;
-          this._sendFrame(T.DATA, 0, stream.id, part);
+          this._dataFrames.push({ stream: stream, head: this._sendFrame(T.DATA, 0, stream.id, part) });
         } else if (item.kind === 'end') {
           if (!stream._wireOpen || !stream._headersSent) return;
           q.shift();
@@ -1880,7 +1904,14 @@ BF['http2'] = function () {
             });
             continue;
           } else if (stream._canSend()) {
-            this._sendFrame(T.DATA, F.END_STREAM, stream.id, null);
+            /*
+             * Node hands END_STREAM to nghttp2 with the shutdown, and nghttp2 sets it on the last DATA
+             * frame of this stream still waiting to go out; only when there is none does an empty DATA
+             * frame leave. Witnessed against Node 24.15: respond() then end('hello') is one DATA frame
+             * carrying END_STREAM, and so is a write() followed by end() in a later turn, while an end()
+             * with no write since the last flush is an empty frame.
+             */
+            if (!this._endStreamOnLastData(stream)) this._sendFrame(T.DATA, F.END_STREAM, stream.id, null);
             stream._markLocalEnd();
           }
           item.cb();

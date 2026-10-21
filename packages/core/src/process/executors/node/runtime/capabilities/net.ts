@@ -106,12 +106,12 @@ export const NET_CAPABILITIES: Record<string, CapabilityHandler> = {
         localPort: args.localPort ? portArg(args.localPort) : undefined,
     })),
 
+    /* False when the connection is gone: a host that dropped its 'connection' payload let it be
+       released, so a late attach has nothing left to bind and its queued data was lost. */
     'net.attach': (args, ctx) => guard('attach', () => {
         const connectionId = numberArg(args.connectionId);
-        if (ownedBy(ctx.services.network.ownerOfConnection(connectionId), ctx.pid)) {
-            ctx.services.network.attach(connectionId, targetArg(args.targetId));
-        }
-        return null;
+        if (!ownedBy(ctx.services.network.ownerOfConnection(connectionId), ctx.pid)) return false;
+        return ctx.services.network.attach(connectionId, targetArg(args.targetId));
     }),
 
     'net.write': (args, ctx, bytes) => guard('write', () => {
