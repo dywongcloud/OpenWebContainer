@@ -758,6 +758,31 @@ globalThis.crypto = nodeCrypto.webcrypto;
   };
   globalThis.AbortSignal = AbortSignal;
   globalThis.AbortController = AbortController;
+  /*
+   * CloseEvent, which Node delivers to a WebSocket's close handler: code, reason and wasClean, and
+   * the socket it happened to. The engine has no such class, so a close would otherwise arrive as a
+   * plain object, so an "event instanceof CloseEvent" check -- the one a program makes to tell a
+   * real close from a hand-built one -- would be false.
+   */
+  globalThis.CloseEvent = (function () {
+    function CloseEvent(type, init) {
+      init = init || {};
+      this.type = String(type === undefined ? 'close' : type);
+      this.code = init.code === undefined ? 0 : Number(init.code);
+      this.reason = init.reason === undefined ? '' : String(init.reason);
+      this.wasClean = init.wasClean === undefined ? false : !!init.wasClean;
+      this.target = init.target === undefined ? null : init.target;
+      this.currentTarget = null;
+      this.bubbles = false;
+      this.cancelable = false;
+      this.defaultPrevented = false;
+      this.timeStamp = 0;
+    }
+    CloseEvent.prototype.preventDefault = function () {};
+    CloseEvent.prototype.stopPropagation = function () {};
+    Object.defineProperty(CloseEvent.prototype, Symbol.toStringTag, { value: 'CloseEvent', configurable: true });
+    return CloseEvent;
+  })();
 })();
 
 /* Legacy RegExp statics: RegExp.$1-$9, input, lastMatch, lastParen, leftContext, rightContext. V8 keeps them from the last successful exec or test, and showdown reads RegExp.$1 right after RegExp.prototype.test. The engine build has none, so exec and test record the match here. */

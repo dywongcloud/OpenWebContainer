@@ -83,27 +83,48 @@ function multipartQuote(value) {
   return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
 }
 
-function multipartOf(form) {
+function multipartBoundary() {
   var bytes = requireBuiltin('crypto').randomBytes(24);
   var boundary = '----formdata-owc-';
   for (var i = 0; i < bytes.length; i++) boundary += MULTIPART_CHARS[bytes[i] % MULTIPART_CHARS.length];
+  return boundary;
+}
+
+function multipartHead(boundary, name, value) {
+  var head = '--' + boundary + '\r\nContent-Disposition: form-data; name="' + multipartQuote(name) + '"';
+  if (isBlobLike(value)) {
+    head += '; filename="' + multipartQuote(value.name === undefined || value.name === '' ? 'blob' : value.name) +
+      '"\r\nContent-Type: ' + (value.type || 'application/octet-stream');
+  }
+  return head + '\r\n\r\n';
+}
+
+/* The whole multipart body in one buffer: possible while every part is a string, which is what a
+   form of fields is. A Blob part has to be read first, so that form takes the promise below. */
+function multipartSync(form, boundary) {
+  var parts = [];
+  var entries = form._entries;
+  for (var i = 0; i < entries.length; i++) {
+    parts.push(Buffer.from(multipartHead(boundary, entries[i].name, entries[i].value), 'utf8'));
+    parts.push(Buffer.from(String(entries[i].value), 'utf8'));
+    parts.push(Buffer.from('\r\n', 'utf8'));
+  }
+  /* the epilogue: the closing delimiter follows the CRLF that ended the last part */
+  parts.push(Buffer.from('--' + boundary + '--\r\n', 'utf8'));
+  return Buffer.concat(parts);
+}
+
+function multipartAsync(form, boundary) {
   var parts = [];
   var entries = form._entries;
   var at = 0;
   function step() {
     if (at >= entries.length) {
-      /* the epilogue: the closing delimiter follows the CRLF that ended the last part */
       parts.push(Buffer.from('--' + boundary + '--\r\n', 'utf8'));
-      return Promise.resolve({ payload: Buffer.concat(parts), contentType: 'multipart/form-data; boundary=' + boundary });
+      return Promise.resolve(Buffer.concat(parts));
     }
     var entry = entries[at++];
-    var head = '--' + boundary + '\r\nContent-Disposition: form-data; name="' + multipartQuote(entry.name) + '"';
-    if (isBlobLike(entry.value)) {
-      var file = entry.value;
-      head += '; filename="' + multipartQuote(file.name === undefined || file.name === '' ? 'blob' : file.name) +
-        '"\r\nContent-Type: ' + (file.type || 'application/octet-stream');
-    }
-    parts.push(Buffer.from(head + '\r\n\r\n', 'utf8'));
+    parts.push(Buffer.from(multipartHead(boundary, entry.name, entry.value), 'utf8'));
     if (isBlobLike(entry.value)) {
       return Promise.resolve(entry.value.arrayBuffer()).then(function (buf) {
         parts.push(Buffer.from(new Uint8Array(buf)));
@@ -118,25 +139,96 @@ function multipartOf(form) {
   return step();
 }
 
+/* ---- a body, as Request and Response both hold one ----
+ *
+ * Node keeps a body as a stream of bytes and derives a Content-Type from the kind of value it was
+ * built from. Here a body is one of three things: bytes already in hand (bytes), a stream the
+ * caller owns (stream), or bytes that have to be read before they exist (pending). contentType is
+ * what Node would derive, and has says whether the caller passed a body at all -- a null body and
+ * an empty one are not the same thing, and only a null one is allowed beside status 204.
+ */
+function makeBody(value) {
+  if (value === undefined || value === null) return { bytes: null, stream: null, pending: null, contentType: null, has: false };
+  if (typeof value === 'string') {
+    return { bytes: Buffer.from(value, 'utf8'), stream: null, pending: null, contentType: 'text/plain;charset=UTF-8', has: true };
+  }
+  if (Buffer.isBuffer(value)) return { bytes: value, stream: null, pending: null, contentType: null, has: true };
+  if (value instanceof Uint8Array) {
+    return { bytes: Buffer.from(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)), stream: null, pending: null, contentType: null, has: true };
+  }
+  if (globalThis.ArrayBuffer !== undefined && value instanceof globalThis.ArrayBuffer) {
+    return { bytes: Buffer.from(new Uint8Array(value)), stream: null, pending: null, contentType: null, has: true };
+  }
+  if (globalThis.URLSearchParams !== undefined && value instanceof globalThis.URLSearchParams) {
+    return { bytes: Buffer.from(String(value), 'utf8'), stream: null, pending: null, contentType: 'application/x-www-form-urlencoded;charset=UTF-8', has: true };
+  }
+  if (value instanceof FormData) {
+    var boundary = multipartBoundary();
+    var contentType = 'multipart/form-data; boundary=' + boundary;
+    var needsRead = false;
+    for (var i = 0; i < value._entries.length; i++) if (isBlobLike(value._entries[i].value)) needsRead = true;
+    if (!needsRead) return { bytes: multipartSync(value, boundary), stream: null, pending: null, contentType: contentType, has: true };
+    return { bytes: null, stream: null, pending: multipartAsync(value, boundary), contentType: contentType, has: true };
+  }
+  if (isBlobLike(value)) {
+    return {
+      bytes: null, stream: null, contentType: value.type || null, has: true,
+      pending: Promise.resolve(value.arrayBuffer()).then(function (buf) { return Buffer.from(new Uint8Array(buf)); })
+    };
+  }
+  if (typeof value.getReader === 'function') return { bytes: null, stream: value, pending: null, contentType: null, has: true };
+  return { bytes: Buffer.from(String(value), 'utf8'), stream: null, pending: null, contentType: 'text/plain;charset=UTF-8', has: true };
+}
+
+function readStream(stream) {
+  var reader = stream.getReader();
+  var parts = [];
+  function step() {
+    return reader.read().then(function (read) {
+      if (read.done) return Buffer.concat(parts);
+      parts.push(Buffer.isBuffer(read.value) ? read.value : Buffer.from(read.value));
+      return step();
+    });
+  }
+  return step();
+}
+
+/* A body that is read the way Node reads one: the bytes are handed over the first time something
+   pulls on the stream, and only then is the body marked used -- asking for .body disturbs nothing. */
+function streamOfBytes(readBytes, markUsed) {
+  var Ctor = globalThis.ReadableStream;
+  if (typeof Ctor !== 'function') return undefined;
+  var sent = false;
+  return new Ctor({
+    pull: function (controller) {
+      if (sent) { controller.close(); return; }
+      sent = true;
+      markUsed();
+      var bytes = readBytes();
+      if (bytes !== null && bytes !== undefined) {
+        controller.enqueue(new Uint8Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
+      }
+      controller.close();
+    }
+  });
+}
+
 function bodyBytes(body) {
   if (body === undefined || body === null) return Promise.resolve(null);
-  /* a stream needs the duplex option Node requires for one; sending its String() would be garbage */
+  /* bytes that are still being read, as a FormData holding a Blob reaches fetch: wait, then go on */
+  if (typeof body.then === 'function') return Promise.resolve(body).then(function (bytes) { return bodyBytes(bytes); });
+  /* a Node stream needs the duplex option Node requires for one; sending its String() would be garbage */
   if (typeof body.pipe === 'function') {
     return Promise.reject(new TypeError('RequestInit: duplex option is required when sending a body.'));
   }
-  if (typeof body === 'string') return Promise.resolve({ payload: Buffer.from(body, 'utf8'), contentType: 'text/plain;charset=UTF-8' });
-  if (body instanceof FormData) return multipartOf(body);
-  if (globalThis.URLSearchParams !== undefined && body instanceof globalThis.URLSearchParams) {
-    return Promise.resolve({ payload: Buffer.from(String(body), 'utf8'), contentType: 'application/x-www-form-urlencoded;charset=UTF-8' });
+  var made = makeBody(body);
+  if (made.stream !== null) {
+    return readStream(made.stream).then(function (buffer) { return { payload: buffer, contentType: null }; });
   }
-  if (Buffer.isBuffer(body)) return Promise.resolve({ payload: body });
-  if (body instanceof Uint8Array) {
-    return Promise.resolve({ payload: Buffer.from(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)) });
+  if (made.pending !== null) {
+    return made.pending.then(function (buffer) { return { payload: buffer, contentType: made.contentType }; });
   }
-  if (isBlobLike(body)) {
-    return Promise.resolve(body.arrayBuffer()).then(function (buf) { return { payload: Buffer.from(new Uint8Array(buf)) }; });
-  }
-  return Promise.resolve({ payload: Buffer.from(String(body), 'utf8') });
+  return Promise.resolve({ payload: made.bytes, contentType: made.contentType });
 }
 
 function bodyOf(chunks) {
@@ -212,31 +304,137 @@ function pipeline(target, options, handler) {
   return request(target, options).then(function (res) { return handler(res); });
 }
 
+/*
+ * Headers, as Node keeps them: a list of lower-cased name/value pairs in the order they were
+ * added, read back sorted by name with the values of one name joined by ', '. A name that is not
+ * a token and a value carrying a byte a header cannot hold (NUL, CR or LF) are both rejected
+ * with Node's own TypeError, and set-cookie keeps every value it was given, which getSetCookie
+ * hands back one by one where get joins them.
+ */
+/* The token a header name has to be: the characters RFC 7230 allows, written with \x60 for the
+   backtick because this whole module is one template literal. */
+var HEADER_NAME = /^[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+$/;
+var CONTROL_BYTES = ['\n', '\r', String.fromCharCode(0)];
+
+function normalizeHeaderValue(value) {
+  return String(value).replace(/^[\t\n\f\r ]+/, '').replace(/[\t\n\f\r ]+$/, '');
+}
+
 function Headers(init) {
-  this.map = Object.create(null);
-  if (!init) return;
-  if (typeof init.forEach === 'function' && typeof init.get !== 'function') {
-    var self = this;
-    init.forEach(function (value, key) { self.append(String(key), String(value)); });
+  if (!(this instanceof Headers)) {
+    throw new TypeError("Failed to construct 'Headers': Please use the 'new' operator.");
+  }
+  this._list = [];
+  if (init === undefined || init === null) return;
+  var self = this;
+  /* A sequence of pairs: an array of arrays, another Headers, or anything else iterable. */
+  if (init[Symbol.iterator] !== undefined && typeof init[Symbol.iterator] === 'function') {
+    var iter = init[Symbol.iterator]();
+    var step = iter.next();
+    while (!step.done) {
+      var pair = [];
+      var item = step.value;
+      if (item !== undefined && item !== null && typeof item[Symbol.iterator] === 'function') {
+        var inner = item[Symbol.iterator]();
+        var part = inner.next();
+        while (!part.done) { pair.push(part.value); part = inner.next(); }
+      } else if (typeof item.length === 'number') {
+        for (var i = 0; i < item.length; i++) pair.push(item[i]);
+      }
+      if (pair.length !== 2) {
+        throw new TypeError('Headers constructor: expected name/value pair to be length 2, found ' + pair.length + '.');
+      }
+      self.append(String(pair[0]), String(pair[1]));
+      step = iter.next();
+    }
     return;
   }
-  for (var key in init) this.append(key, String(init[key]));
+  /* A record: one value per key, or several for a key the server sent more than once. */
+  for (var key in init) {
+    var value = init[key];
+    if (Array.isArray(value)) {
+      for (var j = 0; j < value.length; j++) self.append(key, String(value[j]));
+    } else {
+      self.append(key, String(value));
+    }
+  }
 }
 Headers.prototype.append = function (name, value) {
+  var rawName = String(name);
+  if (!HEADER_NAME.test(rawName)) {
+    throw new TypeError('Headers.append: "' + rawName + '" is an invalid header name.');
+  }
+  var rawValue = String(value);
+  for (var i = 0; i < CONTROL_BYTES.length; i++) {
+    if (rawValue.indexOf(CONTROL_BYTES[i]) >= 0) {
+      throw new TypeError('Headers.append: "' + rawValue + '" is an invalid header value.');
+    }
+  }
+  this._list.push({ name: rawName.toLowerCase(), value: normalizeHeaderValue(rawValue) });
+};
+Headers.prototype.set = function (name, value) {
   var lower = String(name).toLowerCase();
-  if (this.map[lower] === undefined) this.map[lower] = String(value);
-  else this.map[lower] = this.map[lower] + ', ' + String(value);
+  var kept = [];
+  for (var i = 0; i < this._list.length; i++) if (this._list[i].name !== lower) kept.push(this._list[i]);
+  this._list = kept;
+  this.append(name, value);
 };
-Headers.prototype.set = function (name, value) { this.map[String(name).toLowerCase()] = String(value); };
 Headers.prototype.get = function (name) {
-  var value = this.map[String(name).toLowerCase()];
-  return value === undefined ? null : value;
+  var lower = String(name).toLowerCase();
+  var found = [];
+  for (var i = 0; i < this._list.length; i++) if (this._list[i].name === lower) found.push(this._list[i].value);
+  return found.length === 0 ? null : found.join(', ');
 };
-Headers.prototype.has = function (name) { return this.map[String(name).toLowerCase()] !== undefined; };
-Headers.prototype.delete = function (name) { delete this.map[String(name).toLowerCase()]; };
-Headers.prototype.forEach = function (fn) {
-  for (var key in this.map) fn(this.map[key], key, this);
+Headers.prototype.has = function (name) {
+  var lower = String(name).toLowerCase();
+  for (var i = 0; i < this._list.length; i++) if (this._list[i].name === lower) return true;
+  return false;
 };
+Headers.prototype.delete = function (name) {
+  var lower = String(name).toLowerCase();
+  var kept = [];
+  for (var i = 0; i < this._list.length; i++) if (this._list[i].name !== lower) kept.push(this._list[i]);
+  this._list = kept;
+};
+Headers.prototype.getSetCookie = function () {
+  var found = [];
+  for (var i = 0; i < this._list.length; i++) if (this._list[i].name === 'set-cookie') found.push(this._list[i].value);
+  return found;
+};
+/* What Node iterates: one entry per name, the names sorted, the values of a name joined. */
+function headerEntries(list) {
+  var names = [];
+  var byName = Object.create(null);
+  for (var i = 0; i < list.length; i++) {
+    if (byName[list[i].name] === undefined) {
+      byName[list[i].name] = [];
+      names.push(list[i].name);
+    }
+    byName[list[i].name].push(list[i].value);
+  }
+  names.sort();
+  var out = [];
+  for (var j = 0; j < names.length; j++) out.push([names[j], byName[names[j]].join(', ')]);
+  return out;
+}
+Headers.prototype.keys = function () {
+  return headerEntries(this._list).map(function (pair) { return pair[0]; })[Symbol.iterator]();
+};
+Headers.prototype.values = function () {
+  return headerEntries(this._list).map(function (pair) { return pair[1]; })[Symbol.iterator]();
+};
+Headers.prototype.entries = function () {
+  return headerEntries(this._list).map(function (pair) { return [pair[0], pair[1]]; })[Symbol.iterator]();
+};
+Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
+Headers.prototype.forEach = function (fn, thisArg) {
+  var entries = headerEntries(this._list);
+  var self = this;
+  for (var i = 0; i < entries.length; i++) {
+    fn.call(thisArg === undefined ? self : thisArg, entries[i][1], entries[i][0], self);
+  }
+};
+Object.defineProperty(Headers.prototype, Symbol.toStringTag, { value: 'Headers', configurable: true });
 
 /* ---- FormData ----
  *
@@ -294,76 +492,249 @@ FormData.prototype.values = function () {
 FormData.prototype[Symbol.iterator] = FormData.prototype.entries;
 Object.defineProperty(FormData.prototype, Symbol.toStringTag, { value: 'FormData', configurable: true });
 
-function Response(body, init) {
-  init = init || {};
-  this.status = init.status === undefined ? 200 : init.status;
-  this.statusText = init.statusText === undefined ? '' : init.statusText;
-  this.ok = this.status >= 200 && this.status < 300;
-  this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
-  this.url = init.url === undefined ? '' : init.url;
-  /* A Buffer body -- what fetch hands it -- is kept as bytes: the body property decodes it the
-     first time something reads it and arrayBuffer hands the bytes straight back, so a large
-     response crosses no codec unless its text is asked for. Any other body behaves as it did. */
-  if (Buffer.isBuffer(body)) {
-    var bytes = body;
-    var decoded;
-    Object.defineProperty(this, '_bytes', { value: bytes, writable: true, enumerable: false, configurable: true });
-    Object.defineProperty(this, 'body', {
-      enumerable: true,
-      configurable: true,
-      get: function () {
-        if (decoded === undefined) decoded = bytes.toString('utf8');
-        return decoded;
-      },
-      set: function (value) {
-        this._bytes = undefined;
-        decoded = value === undefined || value === null ? '' : String(value);
+/* The bytes a body holds, whichever of the three kinds it is: what is in hand is returned as it is,
+   what has to be read is read once and kept, and a body the caller owns is drained. */
+function bodyBuffer(body) {
+  if (body._bytes !== null && body._bytes !== undefined) return Promise.resolve(body._bytes);
+  if (body._pending !== null && body._pending !== undefined) {
+    return Promise.resolve(body._pending).then(function (bytes) {
+      body._pending = null;
+      body._bytes = bytes;
+      return bytes;
+    });
+  }
+  if (body._stream !== null && body._stream !== undefined) {
+    return readStream(body._stream).then(function (bytes) {
+      body._stream = null;
+      body._bytes = bytes;
+      return bytes;
+    });
+  }
+  return Promise.resolve(Buffer.alloc(0));
+}
+
+/* The stream a body is read through. A body the caller owns is handed back unchanged; bytes in hand
+   are wrapped, and the wrapper marks the body used when something first pulls on it. */
+function bodyStream(body) {
+  if (body._stream !== null && body._stream !== undefined) return body._stream;
+  if (body._bytes === null && body._pending === null) return null;
+  var self = body;
+  var stream = streamOfBytes(function () { return self._bytes; }, function () { self._used = true; });
+  if (stream === undefined) return undefined;
+  if (body._pending !== null && body._pending !== undefined) {
+    /* the bytes do not exist yet: the first pull waits for them */
+    var Ctor = globalThis.ReadableStream;
+    return new Ctor({
+      pull: function (controller) {
+        self._used = true;
+        return bodyBuffer(self).then(function (bytes) {
+          controller.enqueue(new Uint8Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
+          controller.close();
+        });
       }
     });
-  } else {
-    this.body = body === undefined || body === null ? '' : String(body);
   }
+  return stream;
 }
-Response.prototype.text = function () { return Promise.resolve(this.body); };
-Response.prototype.json = function () { return Promise.resolve(JSON.parse(this.body)); };
-Response.prototype.arrayBuffer = function () {
-  return Promise.resolve(this._bytes === undefined ? Buffer.from(this.body, 'utf8') : Buffer.from(this._bytes));
-};
-Response.prototype.clone = function () {
-  var body = this._bytes === undefined ? this.body : this._bytes;
-  return new Response(body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
-};
 
-function Request(target, options) {
-  options = options || {};
-  this.url = String(target && target.href !== undefined ? target.href : target);
-  this.method = (options.method || 'GET').toUpperCase();
-  this.headers = options.headers instanceof Headers ? options.headers : new Headers(options.headers);
-  this._body = options.body === undefined || options.body === null ? null : options.body;
+function Response(body, init) {
+  if (!(this instanceof Response)) {
+    throw new TypeError("Failed to construct 'Response': Please use the 'new' operator.");
+  }
+  init = init || {};
+  var raw = init.status === undefined ? 200 : Number(init.status);
+  var status = raw < 0 ? Math.ceil(raw) : Math.floor(raw);
+  if (status < 200 || status > 599) {
+    throw new RangeError('init["status"] must be in the range of 200 to 599, inclusive.');
+  }
+  var statusText = init.statusText === undefined ? '' : String(init.statusText);
+  if (statusText.indexOf('\n') >= 0 || statusText.indexOf('\r') >= 0) throw new TypeError('Invalid statusText');
+  var made = makeBody(body);
+  /* a status that carries no body may not be given one */
+  if (made.has && (status === 204 || status === 205 || status === 304)) {
+    throw new TypeError('Response constructor: Invalid response status code ' + status);
+  }
+  this.status = status;
+  this.statusText = statusText;
+  this.ok = status >= 200 && status < 300;
+  this.type = 'default';
+  this.redirected = false;
+  this.url = init.url === undefined ? '' : String(init.url);
+  this.headers = new Headers(init.headers);
+  if (made.contentType !== null && !this.headers.has('content-type')) this.headers.set('content-type', made.contentType);
+  this._bytes = made.bytes;
+  this._stream = made.stream;
+  this._pending = made.pending;
   this._used = false;
 }
+Object.defineProperty(Response.prototype, 'body', {
+  get: function () { return bodyStream(this); },
+  configurable: true
+});
+Object.defineProperty(Response.prototype, 'bodyUsed', {
+  get: function () { return this._used; },
+  configurable: true
+});
+Object.defineProperty(Response.prototype, Symbol.toStringTag, { value: 'Response', configurable: true });
+Response.prototype.bytes = function () {
+  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  this._used = true;
+  return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
+};
+Response.prototype.text = function () {
+  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  this._used = true;
+  return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
+};
+Response.prototype.json = function () {
+  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  this._used = true;
+  return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
+};
+Response.prototype.arrayBuffer = function () {
+  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  this._used = true;
+  return bodyBuffer(this).then(function (buffer) {
+    return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+  });
+};
+Response.prototype.clone = function () {
+  if (this._used) throw new TypeError('Response.clone: body has already been used.');
+  var copy = new Response(null, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
+  if (this._stream !== null && this._stream !== undefined) {
+    var both = this._stream.tee();
+    this._stream = both[0];
+    copy._stream = both[1];
+    this._bytes = null;
+  } else {
+    copy._bytes = this._bytes;
+    copy._pending = this._pending;
+  }
+  return copy;
+};
+
+var FORBIDDEN_METHODS = ['CONNECT', 'TRACE', 'TRACK'];
+var METHOD_TOKEN = /^[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+$/;
+
+/* Node checks the method twice: once as a token, and once against the three methods a Request may
+   never carry. Both messages quote the method as the caller wrote it, not as Node normalises it. */
+function normalizeMethod(raw) {
+  var name = String(raw);
+  if (!METHOD_TOKEN.test(name)) throw new TypeError("'" + name + "' is not a valid HTTP method.");
+  var upper = name.toUpperCase();
+  if (FORBIDDEN_METHODS.indexOf(upper) >= 0) throw new TypeError("'" + name + "' HTTP method is unsupported.");
+  return upper;
+}
+
+function Request(target, options) {
+  if (!(this instanceof Request)) {
+    throw new TypeError("Failed to construct 'Request': Please use the 'new' operator.");
+  }
+  if (arguments.length < 1) throw new TypeError('Request constructor: 1 argument required, but 0 found.');
+  options = options === undefined || options === null ? {} : options;
+  var url;
+  var rawMethod = 'GET';
+  var headersInit = undefined;
+  var bodyIn = null;
+  if (target instanceof Request) {
+    if (target._used) {
+      throw new TypeError('Cannot construct a Request with a Request object that has already been used.');
+    }
+    url = target.url;
+    rawMethod = target.method;
+    headersInit = target.headers;
+    if (target._bytes !== null && target._bytes !== undefined) bodyIn = target._bytes;
+    else if (target._stream !== null && target._stream !== undefined) bodyIn = target._stream;
+    else if (target._pending !== null && target._pending !== undefined) bodyIn = target._pending;
+  } else {
+    url = target === undefined || target === null ? '' : (target.href !== undefined ? String(target.href) : String(target));
+  }
+  if (options.method !== undefined && options.method !== null) rawMethod = String(options.method);
+  if (options.headers !== undefined && options.headers !== null) headersInit = options.headers;
+  if (options.body !== undefined && options.body !== null) bodyIn = options.body;
+  var method = normalizeMethod(rawMethod);
+  var made = makeBody(bodyIn);
+  if (made.has && (method === 'GET' || method === 'HEAD')) {
+    throw new TypeError('Request with GET/HEAD method cannot have body.');
+  }
+  var parsed = null;
+  try { parsed = new globalThis.URL(url); } catch (badUrl) { parsed = null; }
+  if (parsed === null) throw new TypeError('Failed to parse URL from ' + url);
+  this.url = parsed.href;
+  this.method = method;
+  this.headers = new Headers(headersInit);
+  if (made.contentType !== null && !this.headers.has('content-type')) this.headers.set('content-type', made.contentType);
+  this._bytes = made.bytes;
+  this._stream = made.stream;
+  this._pending = made.pending;
+  this._used = false;
+  this._signal = options.signal !== undefined && options.signal !== null ? options.signal : undefined;
+  this.mode = options.mode === undefined ? 'cors' : String(options.mode);
+  this.credentials = options.credentials === undefined ? 'same-origin' : String(options.credentials);
+  this.cache = options.cache === undefined ? 'default' : String(options.cache);
+  this.redirect = options.redirect === undefined ? 'follow' : String(options.redirect);
+  this.referrer = options.referrer === undefined ? 'about:client' : String(options.referrer);
+  this.referrerPolicy = options.referrerPolicy === undefined ? '' : String(options.referrerPolicy);
+  this.integrity = options.integrity === undefined ? '' : String(options.integrity);
+  this.keepalive = options.keepalive === undefined ? false : !!options.keepalive;
+  this.destination = '';
+  this.isReloadNavigation = false;
+}
+Object.defineProperty(Request.prototype, 'duplex', { get: function () { return 'half'; }, configurable: true });
+Object.defineProperty(Request.prototype, 'body', {
+  get: function () { return bodyStream(this); },
+  configurable: true
+});
 Object.defineProperty(Request.prototype, 'bodyUsed', {
   get: function () { return this._used; },
   configurable: true
 });
+/* Every Request carries a signal, whether the caller passed one or not. */
+Object.defineProperty(Request.prototype, 'signal', {
+  get: function () {
+    if (this._signal === undefined || this._signal === null) {
+      this._signal = globalThis.AbortController !== undefined ? new globalThis.AbortController().signal : undefined;
+    }
+    return this._signal;
+  },
+  configurable: true
+});
+Object.defineProperty(Request.prototype, Symbol.toStringTag, { value: 'Request', configurable: true });
+Request.prototype.bytes = function () {
+  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  this._used = true;
+  return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
+};
 Request.prototype.text = function () {
   if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
   this._used = true;
-  var body = this._body;
-  if (body === null) return Promise.resolve('');
-  if (typeof body === 'string') return Promise.resolve(body);
-  if (isBlobLike(body)) return Promise.resolve(body.text());
-  return Promise.resolve(String(body));
+  return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
 };
 Request.prototype.json = function () {
-  return this.text().then(function (text) { return JSON.parse(text); });
+  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  this._used = true;
+  return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
 };
 Request.prototype.arrayBuffer = function () {
-  return this.text().then(function (text) { return Buffer.from(text, 'utf8'); });
+  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  this._used = true;
+  return bodyBuffer(this).then(function (buffer) {
+    return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+  });
 };
 Request.prototype.clone = function () {
-  var copy = new Request(this.url, { method: this.method, headers: this.headers, body: this._body });
-  copy._used = this._used;
+  if (this._used) throw new TypeError('Request.clone: body has already been used.');
+  var copy = new Request(this.url, { method: this.method, headers: this.headers });
+  if (this._stream !== null && this._stream !== undefined) {
+    var both = this._stream.tee();
+    this._stream = both[0];
+    copy._stream = both[1];
+    this._bytes = null;
+  } else {
+    copy._bytes = this._bytes;
+    copy._pending = this._pending;
+  }
+  copy._signal = this._signal;
   return copy;
 };
 
@@ -378,14 +749,21 @@ function fetch(target, options) {
       Object.defineProperty(used, 'owcNotTransport', { value: true });
       return Promise.reject(used);
     }
-    init = { method: target.method, headers: target.headers, body: target._body };
+    var carried = target._bytes !== null && target._bytes !== undefined
+      ? target._bytes
+      : (target._stream !== null && target._stream !== undefined
+        ? target._stream
+        : (target._pending !== null && target._pending !== undefined ? target._pending : null));
+    init = { method: target.method, headers: target.headers, body: carried };
     for (var key in options) init[key] = options[key];
     target._used = true;
     target = target.url;
   }
   var url = String(target && target.href !== undefined ? target.href : target);
   return request(url, init).then(function (res) {
-    return new Response(res.body.buffer, { status: res.statusCode, statusText: res.statusText, headers: res.headers, url: url });
+    /* a status that carries no body gets none, so a 204 is not built with an empty one */
+    var payload = (res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304) ? null : res.body.buffer;
+    return new Response(payload, { status: res.statusCode, statusText: res.statusText, headers: res.headers, url: url });
   });
 }
 
@@ -524,11 +902,19 @@ function wsHandleFrame(ws, fin, opcode, payload) {
   if (opcode === 0x8) {
     var code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
     var reason = payload.length > 2 ? payload.slice(2).toString('utf8') : '';
+    /*
+     * Half of a close handshake, whichever side started it: the code and reason are remembered and
+     * the peer's frame is answered, but nothing is settled yet. Node holds the socket at CLOSING
+     * until the connection itself ends, so a program that waits for close waits for the TCP close,
+     * not for the frame -- a server that sends a close frame and keeps the socket leaves the
+     * client at readyState 2 for as long as the socket lives.
+     */
+    ws._closeReceived = code;
+    ws._closeReceivedReason = reason;
     if (ws.readyState === WS_OPEN) {
       ws.readyState = WS_CLOSING;
       wsSendFrame(ws, 0x8, wsCloseBody(code, ''));
     }
-    wsSettle(ws, code, reason, true);
     return;
   }
   if (opcode === 0x9) { wsSendFrame(ws, 0xa, payload); return; }
@@ -579,20 +965,114 @@ function wsFeed(ws, buf) {
   return buf;
 }
 
+/*
+ * The close event, and the only moment it is fired: when the connection ends. A close frame that
+ * was exchanged settles cleanly, with the code the peer sent; a connection that ended without one
+ * is the abnormal closure Node reports as 1006, and it carries an error first.
+ */
 function wsSettle(ws, code, reason, clean) {
-  if (ws.readyState === WS_CLOSED) return;
+  if (ws._settled) return;
+  ws._settled = true;
   ws.readyState = WS_CLOSED;
   if (ws._socket) {
     try { ws._socket.destroy(); } catch (destroyError) {}
     ws._socket = null;
   }
-  ws.emit('close', { type: 'close', code: code, reason: reason, wasClean: !!clean, target: ws });
+  ws.emit('close', wsCloseEvent(code, reason, clean, ws));
+}
+
+function wsSocketGone(ws) {
+  if (ws._settled || ws.readyState === WS_CLOSED) return;
+  if (ws._closeReceived !== undefined && ws._closeReceived !== null) {
+    wsSettle(ws, ws._closeReceived, ws._closeReceivedReason, true);
+    return;
+  }
+  if (ws.listenerCount('error') > 0) {
+    ws.emit('error', new Error('The WebSocket connection was closed before a close frame was received.'));
+  }
+  wsSettle(ws, 1006, '', false);
 }
 
 function wsFail(ws, err) {
-  if (ws.readyState === WS_CLOSED) return;
+  if (ws._settled) return;
+  /* a listener sees the socket as Node does: already CLOSED, not still connecting */
+  ws.readyState = WS_CLOSED;
   if (ws.listenerCount('error') > 0) ws.emit('error', err);
   wsSettle(ws, 1006, '', false);
+}
+
+function wsCloseEvent(code, reason, clean, target) {
+  var Ctor = globalThis.CloseEvent;
+  if (typeof Ctor === 'function') {
+    try {
+      return new Ctor('close', { code: code, reason: reason, wasClean: !!clean, target: target });
+    } catch (badEvent) { /* a CloseEvent that will not build falls back to the plain object */ }
+  }
+  return { type: 'close', code: code, reason: reason, wasClean: !!clean, target: target };
+}
+
+/* Node rejects a URL the way the platform does: a DOMException SyntaxError, not a SyntaxError. */
+function wsSyntax(message) {
+  if (globalThis.DOMException !== undefined) {
+    try {
+      return new globalThis.DOMException(message, 'SyntaxError');
+    } catch (badException) { /* no DOMException that takes a name: fall through */ }
+  }
+  return new SyntaxError(message);
+}
+
+/*
+ * The URL a WebSocket is built from. http and https are the ws and wss of the same host -- Node
+ * rewrites the scheme rather than rejecting it -- a URL that does not parse at all is an invalid
+ * URL, one that parses to some other scheme is refused as not a ws: or wss: url, and a fragment is
+ * refused outright. What the socket is opened on is the normalised href, so 'ws://x.test' and
+ * 'ws://x.test/' are one address.
+ */
+function wsParseUrl(url) {
+  var raw = url !== null && typeof url === 'object' && typeof url.href === 'string' ? url.href : String(url);
+  /*
+   * The container's URL leaves a ws: URL written with one slash as it found it, where Node's adds
+   * the authority slashes, so 'ws:/x.test/' would keep its single slash and resolve to no host.
+   * Adding them here is what makes both spellings the same address.
+   */
+  var schemeEnd = raw.indexOf(':/');
+  if (schemeEnd === 2 || schemeEnd === 3) {
+    var scheme = raw.slice(0, schemeEnd).toLowerCase();
+    if (scheme === 'ws' || scheme === 'wss') {
+      var rest = raw.slice(schemeEnd + 2);
+      if (rest.charAt(0) !== '/') raw = scheme + '://' + rest;
+    }
+  }
+  var parsed = null;
+  try { parsed = new globalThis.URL(raw); } catch (badUrl) { parsed = null; }
+  if (parsed === null) throw wsSyntax('TypeError: Invalid URL');
+  /* a ws: URL with no host is no more a URL here than it is in Node, which will not parse one */
+  if (parsed.hostname === '') throw wsSyntax('TypeError: Invalid URL');
+  if (parsed.hash !== '') throw wsSyntax('hash');
+  if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+  else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+  else if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') throw wsSyntax('expected a ws: or wss: url');
+  if (parsed.pathname === '') parsed.pathname = '/';
+  return parsed.href;
+}
+
+/* The Sec-WebSocket-Protocol list: one token each, none repeated, and no value a header cannot hold. */
+function wsProtocols(protocols) {
+  if (protocols === undefined || protocols === null) return [];
+  var list = Array.isArray(protocols) ? protocols : [String(protocols)];
+  var out = [];
+  for (var i = 0; i < list.length; i++) {
+    var value = String(list[i]);
+    var ok = value !== '';
+    for (var j = 0; ok && j < value.length; j++) {
+      var at = value.charCodeAt(j);
+      if (at <= 0x20 || at >= 0x7f || value.charAt(j) === ',') ok = false;
+    }
+    for (var k = 0; ok && k < out.length; k++) if (out[k] === value) ok = false;
+    if (!ok) throw wsSyntax('Invalid Sec-WebSocket-Protocol value');
+    out.push(value);
+  }
+  return out;
 }
 
 function WebSocket(url, protocols) {
@@ -600,13 +1080,12 @@ function WebSocket(url, protocols) {
   var EventEmitter = requireBuiltin('events');
   EventEmitter.call(this);
   var self = this;
-  var parsed = null;
-  try { parsed = new globalThis.URL(String(url)); } catch (badUrl) { parsed = null; }
-  if (parsed === null || (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:')) {
-    throw new SyntaxError('Failed to construct \'WebSocket\': The URL \'' + String(url) + '\' is invalid.');
-  }
+  if (arguments.length < 1) throw new TypeError('WebSocket constructor: 1 argument required, but 0 found.');
+  var offered = wsProtocols(protocols);
+  var href = wsParseUrl(url);
+  var parsed = new globalThis.URL(href);
   var secure = parsed.protocol === 'wss:';
-  this.url = String(url);
+  this.url = href;
   this.protocol = '';
   this.extensions = '';
   this.binaryType = 'blob';
@@ -615,11 +1094,11 @@ function WebSocket(url, protocols) {
   this._socket = null;
   this._frags = [];
   this._fragOp = 0;
+  this._settled = false;
   this._closeCode = undefined;
   this._closeReason = '';
-  var offered = protocols === undefined || protocols === null
-    ? []
-    : (Array.isArray(protocols) ? protocols : [String(protocols)]);
+  this._closeReceived = undefined;
+  this._closeReceivedReason = '';
   var key = requireBuiltin('crypto').randomBytes(16).toString('base64');
   var headers = {
     Connection: 'Upgrade',
@@ -646,9 +1125,9 @@ function WebSocket(url, protocols) {
       rest = wsFeed(self, Buffer.concat([rest, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]));
     });
     socket.on('error', function (err) { if (self.listenerCount('error') > 0) self.emit('error', err); });
-    socket.on('close', function () {
-      wsSettle(self, self._closeCode === undefined ? 1006 : self._closeCode, self._closeReason, self._closeCode !== undefined);
-    });
+    /* the connection ending is what closes the socket: a FIN, or the socket going away */
+    socket.on('end', function () { wsSocketGone(self); });
+    socket.on('close', function () { wsSocketGone(self); });
     self.readyState = WS_OPEN;
     self.emit('open', { type: 'open', target: self });
     if (rest.length > 0) rest = wsFeed(self, rest);
