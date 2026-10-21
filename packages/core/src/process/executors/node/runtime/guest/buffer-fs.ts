@@ -71,7 +71,12 @@ BF.buffer = function () {
     var pos = 0;
     for (var j = 0; j < list.length && pos < size; j++) {
       var chunk = list[j];
-      for (var k = 0; k < chunk.length && pos < size; k++) out[pos++] = chunk[k];
+      var take = Math.min(chunk.length, size - pos);
+      /* set() copies the piece in one go; an element at a time costs a loop iteration per byte,
+         which is what made joining the chunks of a large body the slowest thing in a read. */
+      if (take > 0 && typeof chunk.subarray === 'function') out.set(take === chunk.length ? chunk : chunk.subarray(0, take), pos);
+      else for (var k = 0; k < take; k++) out[pos + k] = chunk[k];
+      pos += take;
     }
     return out;
   };

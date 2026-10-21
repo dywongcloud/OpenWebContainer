@@ -22,6 +22,11 @@ export interface HostBridgeDeps {
     clearTimer: (id: number) => void;
     /** Synchronous capability call; returns an envelope. */
     capability: (op: string, argsJson: string) => CapabilityEnvelope;
+    /**
+     * Synchronous capability call over the binary channel: `bytes` is the payload, taken straight out
+     * of the guest heap, so nothing encodes or decodes it. The JSON arguments carry metadata only.
+     */
+    capabilityBytes: (op: string, argsJson: string, bytes: Uint8Array) => CapabilityEnvelope;
     /** Asynchronous capability; the guest's pending operation `opId` is settled later. */
     startOperation: (op: string, argsJson: string, opId: number) => void;
     holdRef: (delta: number) => void;
@@ -146,6 +151,20 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         return context.undefined;
     });
     define('cap', (op, args) => context.newString(JSON.stringify(deps.capability(text(op), text(args)))));
+    /**
+     * The binary channel. The third argument is a guest ArrayBuffer: `getArrayBuffer` hands back a
+     * view over the bytes the runtime copied out of the guest heap, and it is freed with its
+     * lifetime, so the payload is copied into a host buffer here -- the one copy this direction pays,
+     * in place of a base64 encode in the guest and a decode on this side.
+     */
+    define('capBytes', (op, args, bytes) => {
+        const lifetime = context.getArrayBuffer(bytes);
+        const view = lifetime.value;
+        const copy = new Uint8Array(view.length);
+        copy.set(view);
+        lifetime.dispose();
+        return context.newString(JSON.stringify(deps.capabilityBytes(text(op), text(args), copy)));
+    });
     define('start', (op, args, opId) => {
         deps.startOperation(text(op), text(args), context.getNumber(opId));
         return context.undefined;

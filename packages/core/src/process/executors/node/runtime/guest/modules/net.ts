@@ -389,8 +389,10 @@ BF['net'] = function () {
       this._flushPending();
     }
 
-    _onHub(name, payload) {
-      if (name === 'data') this._onChunk(Buffer.from(payload, 'base64'));
+    /* The third argument is the payload on the binary channel, an ArrayBuffer the host read out of
+       this heap; a delivery made over JSON carries it as base64 in the payload instead. */
+    _onHub(name, payload, bytes) {
+      if (name === 'data') this._onChunk(bytes === undefined ? Buffer.from(payload, 'base64') : Buffer.from(bytes));
       else if (name === 'connect') this._onConnectEvent();
       else if (name === 'end') this._onRemoteEnd();
       else if (name === 'reset') this._onRemoteReset(payload);
@@ -531,7 +533,7 @@ BF['net'] = function () {
       }
       if (chunk.length === 0) return;
       try {
-        callCap('net.write', { connectionId: this._hubId, data: chunk.toString('base64') });
+        callCapBytes('net.write', { connectionId: this._hubId }, chunk);
       } catch (cause) {
         // The connection is already gone; the peer's close finishes this side.
       }
@@ -611,8 +613,8 @@ BF['net'] = function () {
     _ensureTarget() {
       if (this._targetId !== undefined) return;
       var self = this;
-      this._targetId = createTarget(function (name, payload) {
-        self._onHub(name, payload);
+      this._targetId = createTarget(function (name, payload, bytes) {
+        self._onHub(name, payload, bytes);
       });
     }
 
@@ -1288,9 +1290,9 @@ BF['dgram'] = function () {
       return this._type;
     }
 
-    _onHub(name, payload) {
+    _onHub(name, payload, bytes) {
       if (name !== 'message' || this._dead || !this._bound) return;
-      var datagram = Buffer.from(payload.data, 'base64');
+      var datagram = bytes === undefined ? Buffer.from(payload.data, 'base64') : Buffer.from(bytes);
       this.emit('message', datagram, {
         address: payload.address,
         family: this._family,
@@ -1309,8 +1311,8 @@ BF['dgram'] = function () {
         : (this._family === 'IPv6' ? '::' : '0.0.0.0');
       if (this._targetId === undefined) {
         var target = this;
-        this._targetId = createTarget(function (name, payload) {
-          target._onHub(name, payload);
+        this._targetId = createTarget(function (name, payload, bytes) {
+          target._onHub(name, payload, bytes);
         });
       }
       var res;
@@ -1374,7 +1376,7 @@ BF['dgram'] = function () {
         }
         if (self._hubId !== undefined) {
           try {
-            callCap('net.udpSend', { socketId: self._hubId, address: resolved, port: port, data: datagram.toString('base64') });
+            callCapBytes('net.udpSend', { socketId: self._hubId, address: resolved, port: port }, datagram);
           } catch (cause) {
             // The socket is gone; UDP drops silently.
           }

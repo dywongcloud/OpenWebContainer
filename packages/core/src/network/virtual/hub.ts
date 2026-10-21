@@ -15,6 +15,12 @@
 /** Receives events for one owner (a guest process, or the host itself). */
 export interface VirtualSink {
     deliver(targetId: number, name: string, payload: unknown): void;
+    /**
+     * An event whose payload is bytes. The bytes reach the guest as an ArrayBuffer, with `meta` — when
+     * it is not undefined — as the JSON for the rest of the event, so a chunk of a TCP stream or a
+     * UDP datagram crosses the bridge without a base64 round trip at either end.
+     */
+    deliverBytes?(targetId: number, name: string, bytes: Uint8Array, meta?: unknown): void;
     holdRef(delta: number): void;
 }
 
@@ -36,7 +42,7 @@ interface Endpoint {
     address: string;
     port: number;
     targetId?: number;
-    pending: Array<{ name: string; payload: unknown }>;
+    pending: Array<{ name: string; payload: unknown; bytes?: Uint8Array }>;
 }
 
 interface Listener {
@@ -248,17 +254,20 @@ export class VirtualNetwork {
         connection.local.targetId = targetId;
         const queued = connection.local.pending.splice(0);
         for (const event of queued) {
-            this.schedule(connection.local.ownerPid, targetId, event.name, event.payload);
+            this.schedule(connection.local.ownerPid, targetId, event.name, event.payload, undefined, undefined, event.bytes);
         }
         // A side closed before it was attached was kept only to deliver its queued end and close.
         if (connection.closed) this.connections.delete(connection.id);
     }
 
-    /** Writes base64 bytes to the peer of a connection. False once the connection is gone or this side ended it. */
-    write(connectionId: number, dataBase64: string): boolean {
+    /**
+     * Writes bytes to the peer of a connection. The bytes are held, not copied: the caller must not
+     * reuse the buffer. False once the connection is gone or this side ended it.
+     */
+    write(connectionId: number, data: Uint8Array): boolean {
         const connection = this.connections.get(connectionId);
         if (!connection || connection.closed || connection.writeEnded || !connection.remote) return false;
-        this.emitToPeer(connection, 'data', dataBase64);
+        this.emitToPeer(connection, 'data', undefined, data);
         return true;
     }
 
@@ -306,7 +315,7 @@ export class VirtualNetwork {
      * Sends a datagram to a bound UDP socket of the same family. Undeliverable datagrams are
      * dropped, as UDP does; the return value says whether a receiver existed.
      */
-    sendUdp(options: { socketId: number; address: string; port: number; dataBase64: string }): boolean {
+    sendUdp(options: { socketId: number; address: string; port: number; data: Uint8Array }): boolean {
         const socket = this.udpSockets.get(options.socketId);
         if (!socket) return false;
         const destination = this.hubDestination(options.address);
@@ -314,10 +323,9 @@ export class VirtualNetwork {
         const receiver = this.findEndpoint('udp', socket.family, destination, options.port);
         if (!receiver) return false;
         this.schedule(receiver.ownerPid, receiver.targetId, 'message', {
-            data: options.dataBase64,
             address: socket.family === 'IPv6' ? '::1' : '127.0.0.1',
             port: socket.port,
-        });
+        }, undefined, undefined, options.data);
         return true;
     }
 
@@ -378,24 +386,26 @@ export class VirtualNetwork {
         return pid === HOST_PID ? this.hostSink : this.deps.sinkFor(pid);
     }
 
-    private emitToPeer(connection: Connection, name: string, payload: unknown): void {
+    private emitToPeer(connection: Connection, name: string, payload: unknown, bytes?: Uint8Array): void {
         const peer = connection.remote;
         if (!peer) return;
         if (peer.local.targetId === undefined) {
-            peer.local.pending.push({ name, payload });
+            peer.local.pending.push({ name, payload, bytes });
             return;
         }
-        this.schedule(peer.local.ownerPid, peer.local.targetId, name, payload);
+        this.schedule(peer.local.ownerPid, peer.local.targetId, name, payload, undefined, undefined, bytes);
     }
 
-    private schedule(pid: number, targetId: number | undefined, name: string, payload: unknown, endpoint?: Endpoint, onDelivered?: () => void): void {
+    private schedule(pid: number, targetId: number | undefined, name: string, payload: unknown, endpoint?: Endpoint, onDelivered?: () => void, bytes?: Uint8Array): void {
         if (targetId === undefined) {
-            if (endpoint) endpoint.pending.push({ name, payload });
+            if (endpoint) endpoint.pending.push({ name, payload, bytes });
             return;
         }
         setTimeout(() => {
             onDelivered?.();
-            this.sinkOf(pid)?.deliver(targetId, name, payload);
+            const sink = this.sinkOf(pid);
+            if (bytes !== undefined && sink?.deliverBytes) sink.deliverBytes(targetId, name, bytes, payload);
+            else sink?.deliver(targetId, name, payload);
         }, 0);
     }
 

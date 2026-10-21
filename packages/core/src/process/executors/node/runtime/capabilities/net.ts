@@ -1,5 +1,6 @@
 import { CapabilityHandler } from './types';
 import { hostsFileAddresses } from './dns';
+import { base64ToBytes } from '../../../../../utils/bytes';
 
 /** errno values for the codes the virtual network raises (macOS numbering: the reference platform). */
 const ERRNO: Record<string, number> = {
@@ -57,6 +58,15 @@ function targetArg(value: unknown): number {
     return value;
 }
 
+/**
+ * The payload of a write or a send. It arrives on the binary channel as bytes; the base64 argument
+ * is the JSON route, kept for a caller that still reaches this capability through `cap`.
+ */
+function payloadArg(args: { data?: unknown }, bytes: Uint8Array | undefined): Uint8Array {
+    if (bytes !== undefined) return bytes;
+    return base64ToBytes(dataArg(args.data));
+}
+
 function dataArg(value: unknown): string {
     if (typeof value !== 'string') {
         throw Object.assign(new TypeError('data must be base64 text'), { code: 'ERR_INVALID_ARG_TYPE' });
@@ -104,10 +114,10 @@ export const NET_CAPABILITIES: Record<string, CapabilityHandler> = {
         return null;
     }),
 
-    'net.write': (args, ctx) => guard('write', () => {
+    'net.write': (args, ctx, bytes) => guard('write', () => {
         const connectionId = numberArg(args.connectionId);
         if (!ownedBy(ctx.services.network.ownerOfConnection(connectionId), ctx.pid)) return false;
-        return ctx.services.network.write(connectionId, dataArg(args.data));
+        return ctx.services.network.write(connectionId, payloadArg(args, bytes));
     }),
 
     'net.end': (args, ctx) => guard('end', () => {
@@ -137,14 +147,14 @@ export const NET_CAPABILITIES: Record<string, CapabilityHandler> = {
         family: args.family === 'IPv6' ? 'IPv6' : 'IPv4',
     })),
 
-    'net.udpSend': (args, ctx) => guard('send', () => {
+    'net.udpSend': (args, ctx, bytes) => guard('send', () => {
         const socketId = numberArg(args.socketId);
         if (!ownedBy(ctx.services.network.ownerOfUdp(socketId), ctx.pid)) return false;
         return ctx.services.network.sendUdp({
             socketId,
             address: addressArg(args.address) ?? 'localhost',
             port: portArg(args.port),
-            dataBase64: dataArg(args.data),
+            data: payloadArg(args, bytes),
         });
     }),
 

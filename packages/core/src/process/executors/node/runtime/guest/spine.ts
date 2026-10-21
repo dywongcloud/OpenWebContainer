@@ -27,6 +27,25 @@ function callCap(op, args) {
   return envelope.value;
 }
 
+/**
+ * The ArrayBuffer behind a chunk of bytes. quickjs-emscripten reads an ArrayBuffer and not a view,
+ * so a Buffer that is a window into a bigger buffer is copied into one of exactly its own length.
+ */
+function bytesBufferOf(chunk) {
+  if (chunk.byteOffset === 0 && chunk.byteLength === chunk.buffer.byteLength) return chunk.buffer;
+  var copy = new Uint8Array(chunk.byteLength);
+  copy.set(chunk);
+  return copy.buffer;
+}
+
+/* A capability over the binary channel: the payload goes as an ArrayBuffer and the JSON carries
+   metadata only, so no codec runs over the bytes at either end. */
+function callCapBytes(op, args, bytes) {
+  var envelope = JSON.parse(host.capBytes(op, JSON.stringify(args === undefined ? {} : args), bytesBufferOf(bytes)));
+  if (!envelope.ok) throw operationError(envelope);
+  return envelope.value;
+}
+
 function callOp(op, args) {
   var opId = nextOpId++;
   return new Promise(function (resolve, reject) {
@@ -58,9 +77,9 @@ api.settle = function (opId, envelopeJson) {
   else waiter.reject(operationError(envelope));
 };
 
-api.deliver = function (targetId, name, payloadJson) {
+api.deliver = function (targetId, name, payloadJson, bytes) {
   var handler = TARGETS[targetId];
   if (!handler) return;
-  handler(name, JSON.parse(payloadJson));
+  handler(name, payloadJson === null || payloadJson === undefined ? undefined : JSON.parse(payloadJson), bytes);
 };
 `;
