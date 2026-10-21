@@ -10,10 +10,12 @@ export function useContainer() {
     useEffect(() => {        
         if (!containerRef.current||!ready) return
         let interval = setInterval(() => {
+            /* A poll that the container cannot answer -- it is busy running a long command on its
+               one thread -- must not surface as an unhandled rejection. */
             containerRef.current?.listActiveServers().then((resp)=>{
                 let {ports}=resp
                 setServers(ports)
-        });
+            }).catch(() => {});
         }, 1000);
         return ()=>{
             clearInterval(interval)

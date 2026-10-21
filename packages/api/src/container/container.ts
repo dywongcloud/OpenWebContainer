@@ -289,10 +289,15 @@ export class ContainerManager {
         }
 
         try {
+            /* The whole tree, walked on the container's one thread: an install that has written
+               tens of thousands of files takes longer than the default request budget to walk, and
+               the walk hands the thread back as it goes so the command the terminal is running
+               keeps it too. Cutting the walk short at the default budget only makes the caller ask
+               again at once, which is what left a foreground install with no thread at all. */
             const result = await this.worker.sendMessage({
                 type: 'listFiles',
                 payload: { path }
-            });
+            }, 180000);
             if (result.type !== 'fileList') {
                 throw new Error("Invalid response type");
             }

@@ -45,6 +45,9 @@ export interface SpawnOptions {
     beforeStart?: (process: Process) => void;
 }
 
+/** How much host time one slice of a paced walk takes before the thread is handed back. */
+const PACE_SLICE_MS = 4;
+
 /**
  * Main OpenWebContainer class
  */
@@ -217,6 +220,46 @@ export class OpenWebContainer {
 
     listFiles(basePath: string = '/'): string[] {
         return this.fileSystem.listFiles(basePath);
+    }
+
+    /**
+     * Every file under `basePath`, walked in slices that hand the thread back between them.
+     *
+     * This container runs on one thread -- a worker's, in a browser -- and that same thread is
+     * the one a foreground child is using while it runs. A whole-tree walk of an installed
+     * node_modules costs seconds of host time, and taking them in one synchronous pass leaves
+     * the child nothing: it is what stopped `npx create-next-app` typed in the playground
+     * terminal from ever reaching its prompt, because the file explorer asks for the whole tree
+     * every second, so from the moment the install had written a few thousand files the walks
+     * never stopped and the install got no thread time at all. Slicing the walk lets the child
+     * run in the gaps, however large the tree is.
+     */
+    async listFilesPaced(basePath: string = '/'): Promise<string[]> {
+        const root = basePath === '/' ? '/' : basePath.replace(/\/+$/, '') || '/';
+        const files: string[] = [];
+        const directories: string[] = [root];
+        let entries: string[] = [];
+        let directory = root;
+        for (;;) {
+            const sliceEnds = Date.now() + PACE_SLICE_MS;
+            do {
+                if (entries.length === 0) {
+                    if (directories.length === 0) return files;
+                    directory = directories.pop() as string;
+                    try {
+                        entries = this.fileSystem.listDirectory(directory);
+                    } catch {
+                        entries = [];
+                    }
+                    continue;
+                }
+                const name = entries.pop() as string;
+                const path = directory === '/' ? `/${name}` : `${directory}/${name}`;
+                if (this.fileSystem.isDirectory(path)) directories.push(path);
+                else files.push(path);
+            } while (Date.now() < sliceEnds);
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
     }
 
     createDirectory(path: string): void {

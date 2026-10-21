@@ -181,7 +181,7 @@ self.onmessage = async function (e: MessageEvent<WorkerMessage>) {
         case 'listFiles':
             try {
                 const { path } = e.data.payload;
-                const files = await container.listFiles(path);
+                const files = await container.listFilesPaced(path);
                 sendWorkerResponse({
                     type: 'fileList',
                     id,
