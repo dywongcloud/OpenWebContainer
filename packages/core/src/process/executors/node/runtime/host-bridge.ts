@@ -25,8 +25,18 @@ export interface HostBridgeDeps {
     /** Asynchronous capability; the guest's pending operation `opId` is settled later. */
     startOperation: (op: string, argsJson: string, opId: number) => void;
     holdRef: (delta: number) => void;
+    /**
+     * Registers work that must run before the context is freed: a handle the host still holds then
+     * keeps its object alive, and QuickJS asserts on the objects still live when the runtime is freed.
+     */
+    onTeardown: (dispose: () => void) => void;
     /** Evaluates an ES module synchronously for require(); returns '' or the failure text. */
     loadEsm: (file: string, token: number) => string;
+    /**
+     * Called on every call the guest makes into the host. A guest that reaches the host is not
+     * running a runaway loop, so the runaway guard's clock starts again here.
+     */
+    onHostCall?: () => void;
 }
 
 class FsCodeError extends Error {
@@ -43,7 +53,10 @@ class FsCodeError extends Error {
 export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps): QuickJSHandle {
     const host = context.newObject();
     const define = (name: string, impl: (...args: QuickJSHandle[]) => QuickJSHandle) => {
-        const fn = context.newFunction(name, (...args: QuickJSHandle[]) => impl(...args));
+        const fn = context.newFunction(name, (...args: QuickJSHandle[]) => {
+            deps.onHostCall?.();
+            return impl(...args);
+        });
         context.setProp(host, name, fn);
         fn.dispose();
     };
@@ -167,8 +180,9 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
 
     // WebAssembly: the guest engine has none, so modules compile and run here.
     const wasm = installWasmBridge(context);
-    context.setProp(host, 'wasm', wasm);
-    wasm.dispose();
+    context.setProp(host, 'wasm', wasm.api);
+    deps.onTeardown(wasm.dispose);
+    wasm.api.dispose();
 
     return host;
 }

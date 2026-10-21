@@ -203,7 +203,16 @@ proc.cwd = function () {
     error.path = dir;
     throw error;
   };
+/*
+ * The first process.exit decides the status, and nothing runs after it -- exactly as in Node. The
+ * host keeps the first code it was asked to leave with; this guard keeps the guest's own record in
+ * step with it, so a callback still queued behind the exit (a rejection handler, an exit listener
+ * that exits again) cannot overwrite the status the process already left with.
+ */
+var exitedByCall = false;
 proc.exit = function (code) {
+  if (exitedByCall) throw EXIT_SIGNAL;
+  exitedByCall = true;
   var fallback = typeof proc.exitCode === 'number' ? proc.exitCode : 0;
   var finalCode = code === undefined ? fallback : Number(code);
   proc.exitCode = finalCode;

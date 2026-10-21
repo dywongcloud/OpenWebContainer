@@ -25,10 +25,25 @@ import { QuickJSContext, QuickJSHandle } from 'quickjs-emscripten';
  * out), and memories, tables and globals that are synced like the memory above.
  *
  * Guest functions are kept alive by `retain`: a handle given to a host function dies when that
- * function returns, so it is copied into a host-owned object that outlives the call.
+ * function returns, so it is copied into a host-owned object that outlives the call. That object is
+ * the one thing here the host owns past the install, so the caller must dispose it (see
+ * {@link WasmBridge.dispose}) before the context is freed.
  */
 
 type SyncKind = 'mem' | 'glob' | 'tab';
+
+/**
+ * What `installWasmBridge` hands back.
+ *
+ * `api` is the `host.wasm` object: the caller owns it and disposes it once it has been set on the
+ * host. `dispose` frees the retained-values object, and must run before the context is freed -- a
+ * handle the host still holds then keeps its object alive, and QuickJS asserts on the objects still
+ * live when the runtime is freed, which is what made every process end in that assertion.
+ */
+export interface WasmBridge {
+    api: QuickJSHandle;
+    dispose(): void;
+}
 
 interface InstanceRecord {
     instance: WebAssembly.Instance;
@@ -51,8 +66,8 @@ class GuestThrow extends Error {
     }
 }
 
-/** Installs `host.wasm`. Returns a handle the caller owns and must dispose after setting it. */
-export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
+/** Installs `host.wasm`. See {@link WasmBridge} for what the caller owns. */
+export function installWasmBridge(context: QuickJSContext): WasmBridge {
     const modules = new Map<number, WebAssembly.Module>();
     const instances = new Map<number, InstanceRecord>();
     const memories = new Map<number, WebAssembly.Memory>();
@@ -160,9 +175,25 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
         if (wanted > current) memory.grow(wanted - current);
     };
 
-    const pullFromGuest = (record: InstanceRecord, kind: SyncKind, id: number, offset: number, length: number): unknown => {
+    /**
+     * Hands one piece of a guest value to `use`, which runs while the bytes are still live.
+     *
+     * `getArrayBuffer` returns a view over the bytes the runtime copied out of the guest heap,
+     * and frees them when its lifetime is disposed, so the piece is consumed inside `use`
+     * instead of being copied into a second host buffer first. A memory sync therefore pays one
+     * copy out of the guest per piece rather than two. Returns the number of bytes handed over,
+     * or 0 when the guest answered with something other than bytes.
+     */
+    const pullChunk = (
+        record: InstanceRecord,
+        kind: SyncKind,
+        id: number,
+        offset: number,
+        length: number,
+        use: (bytes: Uint8Array) => void
+    ): number => {
         const target = retainedHandle(record.pull);
-        if (!target) return undefined;
+        if (!target) return 0;
         const kindHandle = context.newString(kind);
         const idHandle = context.newNumber(id);
         const offsetHandle = context.newNumber(offset);
@@ -175,16 +206,21 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
         target.dispose();
         if (result.error) {
             result.error.dispose();
-            return undefined;
+            return 0;
         }
         const handle = result.value;
-        const type = context.typeof(handle);
-        let value: unknown = undefined;
-        if (type === 'object') value = bytesOf(handle);
-        else if (type === 'number') value = context.getNumber(handle);
-        else if (type === 'string') value = context.getString(handle);
+        let size = 0;
+        if (context.typeof(handle) === 'object') {
+            const lifetime = context.getArrayBuffer(handle);
+            const bytes = lifetime.value;
+            size = bytes.length;
+            if (size > 0) use(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+            lifetime.dispose();
+        } else if (context.typeof(handle) === 'number') {
+            size = context.getNumber(handle);
+        }
         handle.dispose();
-        return value;
+        return size;
     };
 
     const pushToGuest = (record: InstanceRecord, kind: SyncKind, id: number, offset: number, make: () => QuickJSHandle) => {
@@ -207,9 +243,16 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
     /** A view over the memory's bytes. newArrayBuffer copies into the guest, so no extra copy here. */
     const hostMemoryBytes = (memory: WebAssembly.Memory): Uint8Array => new Uint8Array(memory.buffer);
 
-    /** One piece of the memory, copied out: a view would hand the guest the whole buffer. */
-    const hostMemoryChunk = (memory: WebAssembly.Memory, offset: number, length: number): Uint8Array =>
-        new Uint8Array(memory.buffer, offset, length).slice();
+    /**
+     * One piece of the memory, as bytes the host can hand to the guest. A piece that is the whole
+     * memory needs no copy: `newArrayBuffer` reads the bytes itself. Anything smaller does, since
+     * a view over part of the buffer would carry the whole buffer with it.
+     */
+    const hostMemoryChunk = (memory: WebAssembly.Memory, offset: number, length: number): Uint8Array => {
+        const buffer = memory.buffer;
+        if (offset === 0 && length === buffer.byteLength) return new Uint8Array(buffer);
+        return new Uint8Array(buffer, offset, length).slice();
+    };
 
     /**
      * guest -> host, before the host runs wasm or an import. Tables and globals need no sync:
@@ -217,8 +260,9 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
      * guest can change invisibly, by writing into its shadow.
      *
      * The shadow is read one chunk at a time and each chunk is written straight into the host
-     * memory, so at most one chunk exists outside the two memories. A chunk shorter than the
-     * one asked for means the shadow ended, which is also how a zero-page memory ends.
+     * memory while the bytes the runtime copied out are still live, so at most one chunk exists
+     * outside the two memories and no second host buffer is filled. A chunk shorter than the one
+     * asked for means the shadow ended, which is also how a zero-page memory ends.
      */
     const syncIn = (record: InstanceRecord) => {
         for (const id of record.memories) {
@@ -226,14 +270,17 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
             if (!memory) continue;
             let offset = 0;
             while (true) {
-                const bytes = pullFromGuest(record, 'mem', id, offset, SYNC_CHUNK_BYTES);
-                if (!(bytes instanceof Uint8Array) || bytes.length === 0) break;
-                if (offset + bytes.length > memory.buffer.byteLength) ensurePages(memory, offset + bytes.length);
-                const view = new Uint8Array(memory.buffer);
-                const room = Math.max(0, view.length - offset);
-                if (room > 0) view.set(bytes.subarray(0, Math.min(bytes.length, room)), offset);
-                offset += bytes.length;
-                if (bytes.length < SYNC_CHUNK_BYTES) break;
+                let moved = 0;
+                pullChunk(record, 'mem', id, offset, SYNC_CHUNK_BYTES, (bytes) => {
+                    moved = bytes.length;
+                    if (offset + moved > memory.buffer.byteLength) ensurePages(memory, offset + moved);
+                    const view = new Uint8Array(memory.buffer);
+                    const room = Math.max(0, view.length - offset);
+                    if (room > 0) view.set(bytes.subarray(0, Math.min(moved, room)), offset);
+                });
+                if (moved === 0) break;
+                offset += moved;
+                if (moved < SYNC_CHUNK_BYTES) break;
             }
         }
     };
@@ -625,5 +672,10 @@ export function installWasmBridge(context: QuickJSContext): QuickJSHandle {
         return context.undefined;
     });
 
-    return api;
+    return {
+        api,
+        dispose() {
+            if (retained.alive) retained.dispose();
+        }
+    };
 }

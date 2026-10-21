@@ -10,7 +10,7 @@ import { RuntimeServices } from './runtime/services';
 import { CapabilityContext, CapabilityEnvelope } from './runtime/capabilities/types';
 import { errorEnvelope, invokeAsync, invokeSync } from './runtime/capabilities/dispatch';
 import { CAPABILITIES } from './runtime/capabilities/index';
-import { bindVmRuntime } from './runtime/capabilities/vm';
+import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs } from './pump';
 import type { SyncChildRequest, SyncChildResult } from './pump';
 
@@ -27,6 +27,23 @@ let lastQuickJs: QuickJSAsyncWASMModule | undefined;
 
 /** A failure inside guest code, already formatted the way Node prints it. */
 class GuestFailure extends Error {}
+
+/**
+ * How long a guest may run without reaching the host before it is treated as a runaway and stopped.
+ * A guest loop blocks the host thread, so no host timer can end it: the QuickJS interrupt handler
+ * carries this bound and stops the guest the way Node's `vm` timeout stops a script. A program that
+ * reaches the host in bursts -- which is every program that reads a file, writes output or awaits
+ * anything -- starts the stretch again each time and is never stopped by it.
+ */
+const DEFAULT_GUEST_BUDGET_MS = 30_000;
+
+/** The `vm` timeout error, as Node words it, over the guest's own stack. */
+function interruptedMessage(budgetMs: number, formatted: string): string {
+    const headline = `Error: Script execution timed out after ${Math.round(budgetMs)}ms`;
+    const lines = formatted.split('\n');
+    const rest = lines.slice(1).join('\n');
+    return rest === '' ? headline : headline + '\n' + rest;
+}
 
 /**
  * Guest-side tracking of promise rejections, installed once the bootstrap has built the API.
@@ -156,6 +173,8 @@ export class NodeProcess extends Process {
     private context?: QuickJSContext;
     private api?: QuickJSHandle;
     private builtinNames = new Set<string>();
+    /** Host handles that outlive the install and must be freed before the context is: see HostBridgeDeps.onTeardown. */
+    private guestTeardown: (() => void)[] = [];
     private timers = new Map<number, ReturnType<typeof setTimeout>>();
     private refs = 0;
     private idleWaiter?: () => void;
@@ -172,6 +191,8 @@ export class NodeProcess extends Process {
     private syncTimedOut = false;
     /** Deliveries from children that finished inside this run, taken by the pump in order. */
     private syncTasks: (() => void)[] = [];
+    /** Milliseconds of guest execution with no host call in it before the guest is stopped; 0 is none. */
+    private guestBudgetMs: number;
 
     constructor(
         pid: number,
@@ -201,6 +222,7 @@ export class NodeProcess extends Process {
         this.services = services;
         this.resolver = new NodeResolver(fileSystem);
         this.evalSource = evalSource;
+        this.guestBudgetMs = services.guestBudgetMs ?? DEFAULT_GUEST_BUDGET_MS;
         this.capabilityContext = {
             pid,
             cwd: () => this.currentCwd,
@@ -265,6 +287,9 @@ export class NodeProcess extends Process {
 
     protected async onTerminate(): Promise<void> {
         this.stopped = true;
+        // a kill stops the guest wherever it is: the interrupt handler is the only thing that still
+        // runs while guest code holds the host thread
+        cancelVmRuntime(this.capabilityContext);
         for (const handle of this.timers.values()) {
             clearTimeout(handle);
         }
@@ -279,10 +304,13 @@ export class NodeProcess extends Process {
             const id = this.context.newNumber(targetId);
             const eventName = this.context.newString(name);
             const body = this.context.newString(JSON.stringify(payload === undefined ? null : payload));
-            this.callApi('deliver', [id, eventName, body]).dispose();
-            id.dispose();
-            eventName.dispose();
-            body.dispose();
+            try {
+                this.callApi('deliver', [id, eventName, body]).dispose();
+            } finally {
+                id.dispose();
+                eventName.dispose();
+                body.dispose();
+            }
             this.drainJobs();
         } catch (error) {
             this.fatalError = error;
@@ -340,8 +368,11 @@ export class NodeProcess extends Process {
         if (this.context === undefined) return;
         try {
             const handles = args.map((text) => this.context!.newString(text));
-            this.callApi(name, handles).dispose();
-            for (const handle of handles) handle.dispose();
+            try {
+                this.callApi(name, handles).dispose();
+            } finally {
+                for (const handle of handles) handle.dispose();
+            }
             this.drainJobs();
         } catch (error) {
             this.fatalError = error;
@@ -408,7 +439,9 @@ export class NodeProcess extends Process {
             capability: (op, argsJson) => invokeSync(op, argsJson, this.capabilityContext),
             startOperation: (op, argsJson, opId) => this.startOperation(op, argsJson, opId),
             holdRef: (delta) => this.holdRef(delta),
-            loadEsm: (file, token) => this.loadEsmSync(file, token)
+            onTeardown: (dispose) => this.guestTeardown.push(dispose),
+            loadEsm: (file, token) => this.loadEsmSync(file, token),
+            onHostCall: () => yieldVmSlice(this.capabilityContext)
         });
 
         const bootstrap = context.unwrapResult(context.evalCode(BOOTSTRAP_SRC, 'owc-bootstrap.js', { type: 'global' }));
@@ -418,6 +451,7 @@ export class NodeProcess extends Process {
         this.api = api;
         this.installRejectionTracker(context);
         bindVmRuntime(this.capabilityContext, runtime, context, api);
+        armVmBudget(this.capabilityContext, this.guestBudgetMs);
         this.builtinNames = new Set<string>(JSON.parse(this.callApiString('builtinNames')));
         return entryPath;
     }
@@ -580,16 +614,24 @@ export class NodeProcess extends Process {
     private startEntry(entryPath: string | undefined): void {
         if (this.evalSource !== undefined) {
             const source = this.context!.newString(this.evalSource);
-            this.callApi('runEval', [source]).dispose();
-            source.dispose();
+            try {
+                this.callApi('runEval', [source]).dispose();
+            } finally {
+                source.dispose();
+            }
         } else if (this.repl) {
             this.startRepl();
         } else if (entryPath !== undefined && this.resolver.isESM(entryPath)) {
             this.runEsmEntry(entryPath);
         } else {
             const file = this.context!.newString(entryPath!);
-            this.callApi('runMain', [file]).dispose();
-            file.dispose();
+            /* an interruption throws out of the call: the handle still has to go, or the object it
+               holds is one QuickJS reports as still live when the runtime is freed */
+            try {
+                this.callApi('runMain', [file]).dispose();
+            } finally {
+                file.dispose();
+            }
         }
         this.drainJobs();
     }
@@ -677,8 +719,11 @@ export class NodeProcess extends Process {
         }
         try {
             const idArg = this.context!.newNumber(id);
-            this.callApi('fire', [idArg]).dispose();
-            idArg.dispose();
+            try {
+                this.callApi('fire', [idArg]).dispose();
+            } finally {
+                idArg.dispose();
+            }
             this.drainJobs();
         } catch (error) {
             this.fatalError = error;
@@ -790,7 +835,15 @@ export class NodeProcess extends Process {
         } catch {
             message = String(context.dump(errorHandle));
         }
+        const interruption = takeVmInterruption(this.capabilityContext);
         errorHandle.dispose();
+        /* A runaway guest is not a guest bug: report the `vm` timeout error Node reports, over the
+           stack the guest's own formatter produced, so a stopped loop reads the way it does on the
+           host. A kill leaves the guest's own text: a terminated process reports no error. */
+        if (interruption === 'budget') {
+            armVmBudget(this.capabilityContext, 0);
+            return new GuestFailure(interruptedMessage(this.guestBudgetMs, message));
+        }
         return new GuestFailure(message);
     }
 
@@ -983,6 +1036,17 @@ export class NodeProcess extends Process {
             clearTimeout(handle);
         }
         this.timers.clear();
+        /* A handle the host still holds at this point keeps its object alive past the context, and
+           QuickJS asserts on the objects still live when the runtime is freed. Freeing them here is
+           what keeps the teardown quiet; an absent one must not change the process's result. */
+        for (const dispose of this.guestTeardown) {
+            try {
+                dispose();
+            } catch {
+                // a handle already gone is nothing to report
+            }
+        }
+        this.guestTeardown = [];
         if (this.api) {
             this.api.dispose();
             this.api = undefined;
