@@ -200,10 +200,17 @@ function loadNapiAddon(name) {
   if (st.type === 'dir') throw dlopenError(name + ': cannot read file data: Is a directory');
   var shim = napiShimOf(file);
   if (shim !== undefined) return requireBuiltin('owc:internal/napi/' + shim).createAddon(NAPI_HOST);
-  if (st.size < 64) throw dlopenError(name + ': file too short');
+  if (st.size < 64) throw dlopenError(name + ': file too short (this container runs no native code: an add-on is served by a JavaScript shim, registered in src/napi/registry.ts, and a placeholder left by the installer is shorter than any real object file)');
   var head = decodeBase64(host.readBase64(file));
   if (head[0] !== 0x7f || head[1] !== 0x45 || head[2] !== 0x4c || head[3] !== 0x46) throw dlopenError(name + ': invalid ELF header');
-  throw dlopenError("Module did not self-register: '" + name + "'.");
+  /*
+   * Nothing in the registry owns this file, which is the only reason a real object file fails here. Say
+   * so, and say what the registry does hold: the message is the whole explanation a caller gets, since
+   * the alternative is a dlopen that fails the way it fails on Linux and names nothing.
+   */
+  var base = file.slice(file.lastIndexOf('/') + 1);
+  var registered = Object.keys(NAPI_PACKAGES).sort().join(', ');
+  throw dlopenError("Module did not self-register: '" + name + "'. Native code cannot run in this container: process.dlopen serves an add-on from a JavaScript shim (owc:internal/napi/<shim>, registered in src/napi/registry.ts) when its basename is in NAPI_BINARIES or the package that owns it is in NAPI_PACKAGES, and '" + base + "' is in neither; registered packages: " + registered + '.');
 }
 proc.dlopen = function dlopen(module, filename, flags) {
   if (arguments.length < 2) {

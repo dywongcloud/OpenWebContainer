@@ -146,20 +146,10 @@ function randombytes_uniform(args: IArguments): number {
  * any computed value, and refusing them throws at module load in packages such as sodium-native 3.x,
  * which would take the caller down before it runs. The reason is printed once so it is not silent.
  */
-const GUARDED_HEAP_NOTE =
-    'sodium-native: the container has no guarded heap and cannot lock memory, so sodium_malloc returns an ordinary zero-filled Buffer and sodium_mprotect_* and sodium_mlock do nothing';
-let guardedHeapWarned = false;
-
-function warnGuardedHeap(): void {
-    if (guardedHeapWarned) return;
-    guardedHeapWarned = true;
-    const console = (globalThis as { console?: { warn?: (message: string) => void } }).console;
-    try {
-        console?.warn?.(GUARDED_HEAP_NOTE);
-    } catch {
-        /* no console to warn on */
-    }
-}
+/*
+ * Documented in Readme.md rather than printed at run time: sodium_malloc returns an ordinary
+ * zero-filled Buffer, and sodium_mprotect_* and sodium_mlock are no-ops.
+ */
 
 function allocBuffer(size: number): Uint8Array {
     const BufferCtor = (globalThis as { Buffer?: { alloc(size: number): Uint8Array } }).Buffer;
@@ -168,13 +158,11 @@ function allocBuffer(size: number): Uint8Array {
 
 function sodium_malloc(args: IArguments): Uint8Array {
     argv(args, 1, 'sodium_malloc');
-    warnGuardedHeap();
     return allocBuffer(uint32(args[0], 'size'));
 }
 
 function sodium_free(args: IArguments): undefined {
     argv(args, 1, 'sodium_free');
-    warnGuardedHeap();
     typedArray(args[0], 'buf').fill(0);
     return undefined;
 }
@@ -183,7 +171,6 @@ function sodiumMprotect(name: string): (args: IArguments) => undefined {
     return function (args: IArguments): undefined {
         argv(args, 1, name);
         typedArray(args[0], 'buf');
-        warnGuardedHeap();
         return undefined;
     };
 }
@@ -192,7 +179,6 @@ function sodium_mlock(args: IArguments): number {
     argv(args, 2, 'sodium_mlock');
     typedArray(args[0], 'buf');
     uint32(args[1], 'len');
-    warnGuardedHeap();
     return 0;
 }
 
@@ -200,7 +186,6 @@ function sodium_munlock(args: IArguments): number {
     argv(args, 2, 'sodium_munlock');
     typedArray(args[0], 'buf');
     uint32(args[1], 'len');
-    warnGuardedHeap();
     return 0;
 }
 
@@ -533,6 +518,44 @@ function crypto_generichash(args: IArguments): undefined {
         assertMaxLength(key.length, GENERICHASH_KEYBYTES_MAX, 'key', 'crypto_generichash_KEYBYTES_MAX');
     }
     out.set(generichash(input, key, out.length).subarray(0, out.length));
+    return undefined;
+}
+
+/*
+ * The add-on's crypto_generichash_batch hashes the batch as one message: the wrapper in sodium-native 5
+ * calls it as (out, batch, hasKey, key) and, off node, falls back to generichash_init/update/final over
+ * the same buffers in one state. Measured against the real add-on on Node 24.15: with a 32-byte key,
+ * batch ['a', 'bc'] into 32 bytes is byte-identical to crypto_generichash of 'abc', and not to 'a'.
+ */
+function crypto_generichash_batch(args: IArguments): undefined {
+    argvOpts(args, 2, 'crypto_generichash_batch');
+    const out = typedArray(args[0], 'out');
+    const batch = args[1];
+    if (!Array.isArray(batch)) throw new TypeError('batch must be an instance of Array');
+    assertMinLength(out.length, GENERICHASH_BYTES_MIN, 'out', 'crypto_generichash_BYTES_MIN');
+    assertMaxLength(out.length, GENERICHASH_BYTES_MAX, 'out', 'crypto_generichash_BYTES_MAX');
+    // hasKey is a separate boolean, and a key that is present and empty hashes without one, as it does
+    // in crypto_generichash: an absent key arrives as the wrapper's zero-length OPTIONAL buffer.
+    const hasKey = args.length > 2 && args[2] !== false && args[2] !== undefined && args[2] !== null;
+    const key = hasKey ? optionalTypedArray(args[3], 'key') : new Uint8Array(0);
+    if (key.length !== 0) {
+        throws(key.length < GENERICHASH_KEYBYTES_MIN, 'key');
+        assertMaxLength(key.length, GENERICHASH_KEYBYTES_MAX, 'key', 'crypto_generichash_KEYBYTES_MAX');
+    }
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for (let i = 0; i < batch.length; i++) {
+        const part = typedArray(batch[i], 'batch');
+        parts.push(part);
+        total += part.length;
+    }
+    const joined = new Uint8Array(total);
+    let at = 0;
+    for (const part of parts) {
+        joined.set(part, at);
+        at += part.length;
+    }
+    out.set(generichash(joined, key, out.length).subarray(0, out.length));
     return undefined;
 }
 
@@ -903,6 +926,7 @@ const IMPLEMENTED: Readonly<Record<string, (args: IArguments) => unknown>> = {
     crypto_box_open_easy,
     crypto_box_seed_keypair,
     crypto_generichash,
+    crypto_generichash_batch,
     crypto_generichash_keygen,
     crypto_hash,
     crypto_hash_sha256,

@@ -49,8 +49,14 @@ export const NAPI_SHIMS: readonly NapiShim[] = [
     },
     {
         // rocksdb 5.2.1: the same loader, the same prebuild names, a different package directory.
+        // rocksdb-native 3.x: binding.js is require('require-addon')('.', __filename), which resolves
+        // prebuilds/<platform>-<arch>/rocksdb-native.node, so that basename is a binary here -- it
+        // covers every platform directory, not only the one this guest reports -- and the package gets
+        // the same placeholder treatment as rocksdb. Both reach this shim, whose createAddon is the
+        // leveldown store; the two bindings are not the same API, and what rocksdb-native needs beyond
+        // it is recorded in Readme.md.
         name: 'rocksdb',
-        binaries: [],
+        binaries: ['rocksdb-native.node'],
         packages: {
             rocksdb: [
                 'build/Release/rocksdb.node',
@@ -58,7 +64,8 @@ export const NAPI_SHIMS: readonly NapiShim[] = [
                 'prebuilds/linux-x64/node.napi.node',
                 'prebuilds/linux-x64/node.napi.glibc.node',
                 'prebuilds/linux-x64/node.napi.musl.node'
-            ]
+            ],
+            'rocksdb-native': ['prebuilds/linux-x64/rocksdb-native.node']
         }
     },
     {
