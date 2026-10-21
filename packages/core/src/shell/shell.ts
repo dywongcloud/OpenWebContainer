@@ -133,7 +133,14 @@ export class Shell implements IShell {
         this.network = options.network;
         this.commandRegistry = new CommandRegistry();
         this.moduleFs = this.fsForModules();
-        this.shellState = createShellState(Object.fromEntries(this.env), this.currentDirectory, this.moduleFs);
+        /* `$$` is the pid of this shell's own process, so the state is built with it: a state with
+           the default 1 would answer `$$` with 1 in every shell the container runs. */
+        this.shellState = createShellState(
+            Object.fromEntries(this.env),
+            this.currentDirectory,
+            this.moduleFs,
+            this.process.pid
+        );
         this.shellState.shellName = 'sh';
         this.shellState.host = this;
         this.registerAllBuiltInCommands()

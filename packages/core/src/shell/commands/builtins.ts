@@ -147,6 +147,11 @@ export interface ShellState {
     dirs: string[];
     /** `$?` */
     lastStatus: number;
+    /**
+     * `$$` -- the pid of the shell itself, which is the pid of the process this state belongs to.
+     * A fresh state with no process behind it has 1, the pid of the container's own first process.
+     */
+    pid: number;
     /** `$!` -- the pid the last `&` printed, 0 before the first one. */
     lastBackgroundPid: number;
     /**
@@ -1164,7 +1169,9 @@ class Parser {
         }
         if (next !== undefined && /[A-Za-z_0-9@*#?!$-]/.test(next)) {
             let i = this.pos;
-            if (/[0-9@*#?!$]/.test(next)) i = this.pos + 1;
+            /* `$-` is one character like `$?` and `$$` are: left out of this set it was read as a
+               name of no characters at all, and a bare `$` next to a literal `-` was what expanded. */
+            if (/[0-9@*#?!$-]/.test(next)) i = this.pos + 1;
             else while (i < this.src.length && /[A-Za-z0-9_]/.test(this.src[i])) i++;
             const name = this.src.slice(this.pos, i);
             this.pos = i;
@@ -1416,9 +1423,19 @@ class Parser {
         const redirects: Redirect[] = [];
         for (;;) {
             this.skipSpace(false);
+            /* `2>&1` written after a compound command -- `{ echo a; } 2>&1`, `while ...; done 2>&1`
+               -- has no word in front of it to carry the descriptor, so the number is read here: a
+               bare number immediately before an operator is that operator's fd, as it is after a
+               simple command. Only a number an operator really follows is taken, so a stray one is
+               left for the caller to report as the syntax error it is. */
+            const numbered = /^([0-9]+)(?=[<>])/.exec(this.src.slice(this.pos));
+            let fd = -1;
+            if (numbered !== null) {
+                fd = Number.parseInt(numbered[1], 10);
+                this.pos += numbered[1].length;
+            }
             const three = this.src.slice(this.pos, this.pos + 3);
             const two = this.src.slice(this.pos, this.pos + 2);
-            let fd = -1;
             let op: Redirect['op'] | null = null;
             let width = 0;
             if (three === '&>>') {
@@ -1602,9 +1619,13 @@ class Parser {
         let words: Word[] | null = null;
         for (;;) {
             this.skipSpace(false);
+            if (this.eof()) break;
             if (this.here() === '\n') {
+                /* a newline may stand where the `;` stands: `for i` newline `in 1 2` and `for i`
+                   newline `do` are both a loop, as they are in bash. The newline is eaten and the
+                   search goes on, so the `in` or the `do` of the next line is still found. */
                 this.pos++;
-                break;
+                continue;
             }
             if (this.here() === ';') {
                 this.pos++;
@@ -1614,7 +1635,10 @@ class Parser {
                 this.pos += 2;
                 words = [];
                 for (;;) {
-                    this.skipSpace(true);
+                    /* not `skipSpace(true)`: a newline ends the list of words, as it ends it in
+                       bash -- `for i in 1` newline `2` newline `do` is a syntax error there, and
+                       skipping the newline here read the `do` as one of the words instead. */
+                    this.skipSpace(false);
                     if (this.eof()) throw new ShellSyntaxError('syntax error: unexpected end of file');
                     if (this.here() === ';') {
                         this.pos++;
@@ -1630,7 +1654,6 @@ class Parser {
                 }
                 break;
             }
-            if (this.keywordAt(this.pos, 'do')) break;
             break;
         }
         this.skipSpace(true);
@@ -1735,9 +1758,11 @@ function specialValue(state: ShellState, name: string): string | undefined {
         case '#':
             return String(state.positional.length);
         case '$':
-            return String(1);
+            return String(state.pid);
         case '!':
-            return String(state.lastBackgroundPid);
+            /* No background job yet: `$!` is unset and expands to nothing, the way it does in a
+               host shell -- a `0` there read as a pid the shell never printed. */
+            return state.lastBackgroundPid === 0 ? '' : String(state.lastBackgroundPid);
         case '-':
             return optionFlags(state);
         default:
@@ -4098,8 +4123,11 @@ export const COMMANDS: Record<string, ShellCommand> = {
  * 9. Creating a state
  * ================================================================== */
 
-/** Creates the state of a fresh shell: `env` becomes its exported variables. */
-export function createShellState(env: Record<string, string>, cwd: string, fs?: ShellFs): ShellState {
+/**
+ * Creates the state of a fresh shell: `env` becomes its exported variables, and `pid` -- what `$$`
+ * reads -- is the pid of the process it belongs to, 1 for a state with no process behind it.
+ */
+export function createShellState(env: Record<string, string>, cwd: string, fs?: ShellFs, pid = 1): ShellState {
     const globals = new Map<string, ShellVar>();
     for (const [name, value] of Object.entries(env)) globals.set(name, { value, export: true });
     if (!globals.has('PWD')) globals.set('PWD', { value: cwd, export: true });
@@ -4142,6 +4170,7 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
         functions: new Map(),
         dirs: [cwd],
         lastStatus: 0,
+        pid,
         lastBackgroundPid: 0,
         get jobs(): ShellJob[] {
             const host = this.host as { jobs?: ShellJob[] } | null | undefined;
