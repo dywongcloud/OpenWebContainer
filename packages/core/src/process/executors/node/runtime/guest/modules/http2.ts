@@ -1652,6 +1652,8 @@ BF['http2'] = function () {
       this._settingsAcks = [];
       this._pings = Object.create(null);
       this._goawaySent = false;
+      /* Set only by the goaway() call itself: a GOAWAY this side asked for, as opposed to one sent by close(). */
+      this._goawayLocal = false;
       this._goawayReceived = false;
       /* Node's goawayCode (null until a GOAWAY arrives) and destroyCode. */
       this._goawayCode = null;
@@ -2649,7 +2651,14 @@ BF['http2'] = function () {
       this._goawayReceived = true;
       this._goawayCode = code;
       this._goawayLastStreamId = lastId;
-      this.emit('goaway', code, lastId, debug);
+      /*
+       * Node raises no 'goaway' for a GOAWAY that arrives after this side has asked for one with goaway().
+       * Witnessed against Node 24.15: a server that calls goaway(1) / goaway(2) / goaway(0) and is then
+       * answered with the peer's GOAWAY(0) on the wire emits nothing, while a server that has not called
+       * goaway() — one that only reacted to a received GOAWAY with close(), or one still open after
+       * close() — emits 'goaway' once per frame it receives. The frame still drives the teardown below.
+       */
+      if (this._goawayLocal !== true) this.emit('goaway', code, lastId, debug);
       if (this._destroyed) return undefined;
       if (code !== E.NO_ERROR) {
         /* As Node does: the session is destroyed with ERR_HTTP2_SESSION_ERROR (GOAWAY NO_ERROR in reply), which its streams receive. */
@@ -2758,6 +2767,7 @@ BF['http2'] = function () {
       validateNumber(code, 'code');
       validateNumber(lastStreamId, 'lastStreamID');
       var last = lastStreamId <= 0 ? this._lastPeerId() : lastStreamId;
+      this._goawayLocal = true;
       this._sendGoaway(code, last, opaqueData === undefined ? EMPTY : Buffer.from(bytesOf(opaqueData)));
     }
     /* Node's close(): GOAWAY, no new streams, and the session is destroyed once its last stream is. */
