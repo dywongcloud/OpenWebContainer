@@ -381,59 +381,71 @@ interface SplitField {
 
 /**
  * Field splitting on IFS, keeping which characters came out of quoted text: a `*`, `?` or `[` that
- * was quoted is a literal character, and only an unquoted one makes the field a pattern. Whitespace
- * IFS characters collapse; the default IFS is ' \t\n'.
+ * was quoted is a literal character, and only an unquoted one makes the field a pattern.
+ *
+ * The rules of POSIX 2.6.5, the way this machine's /bin/sh applies them:
+ *   - IFS white space at the two ends of the word is ignored, and a run of it inside the word is one
+ *     delimiter: `IFS=' '; v=' a  b '` gives two fields, not four;
+ *   - an IFS character that is not white space is a delimiter of its own, and the white space next
+ *     to it belongs to that one delimiter: `IFS=' :'; v='a : b'` gives two fields;
+ *   - two delimiters with nothing between them still leave the empty field between them, while one
+ *     the word ends on opens no field after it: `IFS=:; v='a::b'` gives three and `v='a:'` gives one;
+ *   - a null IFS splits nothing at all.
  *
  * `splitable` -- per character, and defaulting to every unquoted one -- says which characters may
- * end a field. A character of the word's own literal text may not: `IFS=:; echo a:b` is `a:b`.
+ * end a field. Every character of a word holding no unquoted expansion is one: `IFS=:; echo a:b`
+ * prints `a:b`, because splitting is something a shell does to the result of an expansion and not to
+ * a word it was handed.
  */
 function splitFieldsQuoted(text: string, quoted: boolean[], ifs: string, splitable?: boolean[]): SplitField[] {
     const canSplit = (i: number): boolean =>
         splitable === undefined ? quoted[i] !== true : splitable[i] === true;
+    if (text === '') return [];
+    /* A null IFS: no field splitting is performed, whatever the word holds. */
+    if (ifs === '') return [{ text, quoted }];
     const ws: string[] = [...ifs].filter((ch) => ch === ' ' || ch === '\t' || ch === '\n');
-    if (ws.length === 0) {
-        const fields: SplitField[] = [];
-        let cur = '';
-        let curQuoted: boolean[] = [];
-        /* A delimiter at the very end of the word ends the last field; it does not open a new one,
-           so `:a:` is two fields and not three, the way a host shell splits it. */
-        let ended = false;
-        for (let i = 0; i < text.length; i++) {
-            if (canSplit(i) && ifs.includes(text[i])) {
-                fields.push({ text: cur, quoted: curQuoted });
-                cur = '';
-                curQuoted = [];
-                ended = true;
-            } else {
-                cur += text[i];
-                curQuoted.push(quoted[i] === true);
-                ended = false;
-            }
-        }
-        if (!ended || cur !== '') fields.push({ text: cur, quoted: curQuoted });
-        return fields;
-    }
+    const seps: string[] = [...ifs].filter((ch) => ch !== ' ' && ch !== '\t' && ch !== '\n');
+    /* IFS white space at the two ends of the word is not a delimiter, it is ignored. */
+    let from = 0;
+    let to = text.length;
+    while (from < to && canSplit(from) && ws.includes(text[from])) from++;
+    while (to > from && canSplit(to - 1) && ws.includes(text[to - 1])) to--;
+    if (from >= to) return [];
     const fields: SplitField[] = [];
     let cur = '';
     let curQuoted: boolean[] = [];
-    let started = false;
-    for (let i = 0; i < text.length; i++) {
-        const isWs = ws.includes(text[i]);
-        const isOther = ifs.includes(text[i]) && !isWs;
-        if (canSplit(i) && (isWs || isOther)) {
-            if (started) {
-                fields.push({ text: cur, quoted: curQuoted });
-                cur = '';
-                curQuoted = [];
-                started = false;
-            }
+    let ended = false;
+    for (let i = from; i < to; ) {
+        if (canSplit(i) && ws.includes(text[i])) {
+            let j = i;
+            while (j < to && canSplit(j) && ws.includes(text[j])) j++;
+            /* White space standing next to a delimiter is one delimiter with it. */
+            if (j < to && canSplit(j) && seps.includes(text[j])) j++;
+            while (j < to && canSplit(j) && ws.includes(text[j])) j++;
+            fields.push({ text: cur, quoted: curQuoted });
+            cur = '';
+            curQuoted = [];
+            ended = true;
+            i = j;
+            continue;
+        }
+        if (canSplit(i) && seps.includes(text[i])) {
+            let j = i + 1;
+            while (j < to && canSplit(j) && ws.includes(text[j])) j++;
+            fields.push({ text: cur, quoted: curQuoted });
+            cur = '';
+            curQuoted = [];
+            ended = true;
+            i = j;
             continue;
         }
         cur += text[i];
         curQuoted.push(quoted[i] === true);
-        started = true;
+        ended = false;
+        i++;
     }
-    if (started) fields.push({ text: cur, quoted: curQuoted });
+    /* A delimiter the word ends on opened no field after it, so `IFS=:; v='a:'` is one field. */
+    if (!ended || cur !== '') fields.push({ text: cur, quoted: curQuoted });
     return fields;
 }
 
@@ -1998,7 +2010,7 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
         const ref = part.ref;
         if (quoted && ref.op === '' && (ref.name === '@' || ref.name === '*')) {
             for (let i = 0; i < state.positional.length; i++) {
-                if (i > 0) appendText(target, ref.name === '*' ? (getVar(state, 'IFS') ?? ' ')[0] ?? ' ' : FIELD_MARK, true);
+                if (i > 0) appendText(target, ref.name === '*' ? ifsJoiner(state) : FIELD_MARK, true);
                 appendText(target, state.positional[i], true);
             }
             continue;
@@ -2007,7 +2019,7 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
         let value: string | undefined;
         let set = false;
         if (name === '@' || name === '*') {
-            value = state.positional.join((getVar(state, 'IFS') ?? ' ')[0] ?? ' ');
+            value = state.positional.join(ifsJoiner(state));
             set = state.positional.length > 0;
         } else if (/^[0-9]$/.test(name)) {
             // `$0` is the name the shell was started as, not a positional: `sh -c 'echo $0' nm a1`
@@ -2039,13 +2051,57 @@ function expandToString(word: Word, state: ShellState): string {
     return target.text.split(FIELD_MARK).join(' ');
 }
 
+/**
+ * What `$*` joins the positional parameters with: the first character of IFS, a space where IFS is
+ * unset, and nothing at all where it is null -- `IFS=; set -- a b; echo "$*"` prints `ab`.
+ */
+function ifsJoiner(state: ShellState): string {
+    const ifs = getVar(state, 'IFS') ?? ' \t\n';
+    return ifs === '' ? '' : ifs.slice(0, 1);
+}
+
+/**
+ * Whether a word is quoted somewhere, so that a word coming to nothing is still one empty field:
+ * `set -- ''; echo $#` prints 1 while `set -- $undef; echo $#` prints 0, the field splitting having
+ * nothing to split. `"$@"` is the one exception a host shell makes -- it gives no field at all while
+ * no positional parameter stands behind it, where `"$*"` in the same place is one empty field.
+ */
+function wordIsQuoted(word: Word): boolean {
+    for (const part of word) {
+        if (part.t === 'sq') return true;
+        if (part.t !== 'dq') continue;
+        if (part.parts.length === 0) return true;
+        for (const inner of part.parts) {
+            if (inner.t === 'var' && inner.ref.op === '' && inner.ref.name === '@') continue;
+            return true;
+        }
+    }
+    return false;
+}
+
 /** Expands a word the way a command argument is expanded: splitting, then pathname expansion. */
 function expandWord(state: ShellState, word: Word): string[] {
     const target: Expanded = { text: '', quoted: [], split: [] };
     expandParts(state, word, false, target);
     if (target.text.includes(FIELD_MARK)) return target.text.split(FIELD_MARK);
     const ifs = getVar(state, 'IFS');
-    const fields = splitFieldsQuoted(target.text, target.quoted, ifs === undefined ? ' \t\n' : ifs, target.split);
+    /* Field splitting is something a shell does to the result of an expansion, so a word holding no
+       unquoted expansion is never split: `IFS=:; echo a:b` prints `a:b`. Where the word does hold
+       one, every unquoted character of it may end a field, its own literal text included, which is
+       why `IFS=:; s=a:b; echo $s:y` prints `a b y`. */
+    const splits = target.split.includes(true);
+    const fields = splitFieldsQuoted(
+        target.text,
+        target.quoted,
+        ifs === undefined ? ' \t\n' : ifs,
+        target.quoted.map((isQuoted) => splits && !isQuoted)
+    );
+    if (fields.length === 0) {
+        /* A word that expanded to nothing and was never quoted is no argument at all; a quoted one
+           is one empty argument, which is what `printf ''` and `set -- ''` turn on. */
+        if (!wordIsQuoted(word)) return [];
+        return state.options.noglob ? [''] : expandGlob(state, '', []);
+    }
     if (state.options.noglob) return fields.map((field) => field.text);
     const out: string[] = [];
     for (const field of fields) out.push(...expandGlob(state, field.text, field.quoted));

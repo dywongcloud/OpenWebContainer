@@ -41,6 +41,7 @@ import {
 } from '../../../../../npm/scripts';
 import { nodeSyncRunner, syncRunActive } from '../../pump';
 import type { SyncChildResult } from '../../pump';
+import type { MaybeAsync } from './dispatch';
 import { InstallSpec, NpmInstaller, parseInstallSpec } from '../../../../../npm/installer';
 import type { SaveTarget } from '../../../../../npm/installer';
 import { NpmRegistry } from '../../../../../npm/registry';
@@ -460,8 +461,13 @@ interface SyncShell {
     state?: ShellState;
     /** Set when a builtin ended the shell (`exec`, or an `exit` inside `eval`): no later command runs. */
     stopped?: boolean;
-    /** The background jobs of this line: `cmd &` adds one, `jobs` lists them and `wait` runs them. */
+    /** The jobs of this line and the EXIT trap after them: see endOfLine. */
     jobs?: ShellJob[];
+    /**
+     * True on the one command of a line `runShell` can wait on -- the last one, with nothing beside
+     * it -- so a command that would suspend is only started where the suspend can be honoured.
+     */
+    suspendable?: boolean;
 }
 
 /**
@@ -742,6 +748,39 @@ function notSupportedSync(what: string): Error {
 
 function isNotSupported(error: unknown): boolean {
     return (error as { code?: unknown } | null | undefined)?.code === 'ERR_NOT_SUPPORTED';
+}
+
+/**
+ * Thrown by a shell command that can only be answered by work the host has to finish -- `npm install`
+ * reaching the registry -- inside a shell line, where the engine around it steps one command at a
+ * time and has no promise to hand back. It carries the work, and it is a throw rather than a return
+ * so it crosses the whole engine: `shellLine`, the compound-command script engine and every builtin
+ * in between stay synchronous, and the one caller that can suspend, `runShell`, catches it.
+ *
+ * It is never thrown where the guest cannot unwind: `npmInstallStep` answers `undefined` inside a
+ * synchronous run, so this only ever escapes from the outermost synchronous call.
+ */
+class ShellSuspend {
+    constructor(readonly work: Promise<ShellStep>) {}
+}
+
+function isShellSuspend(error: unknown): error is ShellSuspend {
+    return error instanceof ShellSuspend;
+}
+
+/**
+ * The refusal for a command that would have to wait on the host from inside a synchronous child.
+ *
+ * A synchronous child's own wasm call sits inside the one that spawned it, so one unwind cannot cover
+ * both: the outer call would have to answer before the inner one's work could settle, which would
+ * mean answering before the install had happened. The name says which of the two is stuck rather
+ * than leaving it to the reader to tell a nested child from the outermost call.
+ */
+function notSupportedNested(what: string): Error {
+    return Object.assign(
+        new Error(`child_process: ${what} waits on host work, and a nested synchronous child cannot suspend to wait for it; use the asynchronous API`),
+        { code: 'ERR_NOT_SUPPORTED' }
+    );
 }
 
 /** The error a failed spawn reports, named the way spawnSync names it. */
@@ -1199,7 +1238,9 @@ function tokenizeLine(line: string): RawWord[] {
     let word: RawWord = [];
     let inWord = false;
     const push = (text: string, expand: boolean, split: boolean): void => {
-        if (text === '') return;
+        /* A piece the quoting emptied still opens a word: `printf ''` writes a format, it does not
+           leave the command without one. Only an unquoted piece can come out empty, and none does. */
+        if (text === '' && split) return;
         const last = word[word.length - 1];
         if (last !== undefined && last.expand === expand && last.split === split) last.text += text;
         else word.push({ text, expand, split });
@@ -1288,9 +1329,12 @@ function isBackgroundAmp(line: string, i: number): boolean {
 /** What a word expands to: `text` plus `split` (field splitting applies) and, for `"$@"`, the field boundary. */
 interface ExpandAtom {
     text: string;
+    /** The text is open to field splitting: it came out of an unquoted expansion. */
     split: boolean;
     /** The text came out of an unquoted piece, so pathname expansion applies to it. */
     glob: boolean;
+    /** The text was written quoted or escaped, so field splitting never breaks it. */
+    quoted?: boolean;
     /** The field before this one ends here. */
     before?: boolean;
     /** This field ends here, even where the next piece would otherwise join it. */
@@ -1310,8 +1354,63 @@ interface ExpandCtx {
     substStatus: number | null;
 }
 
-/** `IFS` is the default one; only its white space is split on. */
-const IFS_SPLIT = /[ \t\n]+/;
+/**
+ * Field splitting on the shell's `IFS`, in the three rules of POSIX 2.6.5 the way this machine's
+ * /bin/sh applies them:
+ *   - IFS white space at the two ends of the word is ignored, and a run of it inside the word is one
+ *     delimiter, so `IFS=' '; s=' a  b '; set -- $s` gives two fields and not four;
+ *   - an IFS character that is not white space is a delimiter of its own, and the white space next
+ *     to it belongs to that one delimiter, so `IFS=' :'; s='a : b'; set -- $s` gives two fields;
+ *   - two delimiters with nothing between them still leave the empty field between them, while one
+ *     the word ends on opens no field after it, so `IFS=:; s='a::b'` gives three and `s='a:'` one.
+ *
+ * `mask` is per character: it says which of them a field may end on, which is every unquoted one of
+ * a word holding an unquoted expansion and no character of a word holding none -- `IFS=:; echo a:b`
+ * prints `a:b` in a host shell. A null `IFS` splits nothing at all.
+ */
+function splitOnIFS(text: string, mask: boolean[], ifs: string): string[] {
+    if (text === '') return [];
+    if (ifs === '') return [text];
+    const ws: string[] = [...ifs].filter((ch) => ch === ' ' || ch === '\t' || ch === '\n');
+    const seps: string[] = [...ifs].filter((ch) => ch !== ' ' && ch !== '\t' && ch !== '\n');
+    let from = 0;
+    let to = text.length;
+    while (from < to && mask[from] === true && ws.includes(text[from])) from++;
+    while (to > from && mask[to - 1] === true && ws.includes(text[to - 1])) to--;
+    if (from >= to) return [];
+    const fields: string[] = [];
+    let cur = '';
+    let ended = false;
+    for (let i = from; i < to; ) {
+        if (mask[i] === true && ws.includes(text[i])) {
+            let j = i;
+            while (j < to && mask[j] === true && ws.includes(text[j])) j++;
+            /* White space standing next to a delimiter is one delimiter with it. */
+            if (j < to && mask[j] === true && seps.includes(text[j])) j++;
+            while (j < to && mask[j] === true && ws.includes(text[j])) j++;
+            fields.push(cur);
+            cur = '';
+            ended = true;
+            i = j;
+            continue;
+        }
+        if (mask[i] === true && seps.includes(text[i])) {
+            let j = i + 1;
+            while (j < to && mask[j] === true && ws.includes(text[j])) j++;
+            fields.push(cur);
+            cur = '';
+            ended = true;
+            i = j;
+            continue;
+        }
+        cur += text[i];
+        ended = false;
+        i++;
+    }
+    /* A delimiter the word ends on opened no field after it, so `IFS=:; s='a:'` is one field. */
+    if (!ended || cur !== '') fields.push(cur);
+    return fields;
+}
 
 /** A leading `NAME=` turns a word into an assignment rather than a command. */
 const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -1379,7 +1478,11 @@ function parameterAtoms(shell: SyncShell, name: string, split: boolean, out: Exp
         }
         return;
     }
-    out.push({ text: params.join(' '), split, glob: split });
+    /* `$*` is one field with the parameters joined by the first character of IFS, a space where IFS
+       is unset and nothing at all where it is null; unquoted `$@` joins the same way, the two being
+       alike once field splitting has been at them. */
+    const ifs = valueOfName(shell, 'IFS');
+    out.push({ text: params.join(ifs === '' ? '' : ifs[0]), split, glob: split });
 }
 
 /**
@@ -1574,7 +1677,9 @@ function expandInto(shell: SyncShell, text: string, split: boolean, out: ExpandA
     const flushLiteral = (): void => {
         if (literal !== '') {
             // a glob character only counts where it was written unquoted: `\*` is an ordinary `*`
-            out.push({ text: literal, split, glob: split && literalGlob });
+            // Field splitting is something a shell does to the result of an expansion, never to the
+            // word's own literal text, so this piece is no ground for a delimiter of its own.
+            out.push({ text: literal, split: false, glob: split && literalGlob });
             literal = '';
             literalGlob = false;
         }
@@ -1837,37 +1942,40 @@ function paramExpansion(shell: SyncShell, body: string, split: boolean, out: Exp
 }
 
 /**
- * One word's worth of fields. Field splitting happens here and only here: a run of white space that
- * came out of an unquoted expansion ends the field, and an empty unquoted expansion leaves none.
+ * One word's worth of fields. Field splitting happens here and only here, on the `IFS` the shell
+ * holds at this moment rather than on white space: a run of IFS white space that came out of an
+ * unquoted expansion ends the field, and an empty unquoted expansion leaves none. A word the quoting
+ * emptied is the other way round -- `printf ''` is one empty argument, not a command without one.
  */
-function assembleFields(atoms: ExpandAtom[]): ExpandedField[] {
+function assembleFields(shell: SyncShell, atoms: ExpandAtom[]): ExpandedField[] {
+    const ifs = valueOfName(shell, 'IFS');
+    /* A word no unquoted expansion stands in is never split: `IFS=:; echo a:b` prints `a:b`. */
+    const splits = atoms.some((atom) => atom.split === true);
     const fields: ExpandedField[] = [];
-    let cur = '';
+    let text = '';
+    let mask: boolean[] = [];
     let glob = false;
     let have = false;
     const push = (): void => {
-        if (have) fields.push({ text: cur, glob });
-        cur = '';
+        if (have) {
+            for (const piece of text === '' ? [''] : splitOnIFS(text, mask, ifs)) {
+                fields.push({ text: piece, glob });
+            }
+        }
+        text = '';
+        mask = [];
         glob = false;
         have = false;
     };
     for (const atom of atoms) {
         if (atom.before === true && have) push();
-        if (atom.split) {
-            const pieces = atom.text.split(IFS_SPLIT);
-            for (let i = 0; i < pieces.length; i++) {
-                if (i > 0) push();
-                if (pieces[i] !== '') {
-                    cur += pieces[i];
-                    glob = glob || atom.glob;
-                    have = true;
-                }
-            }
-        } else {
-            cur += atom.text;
-            glob = glob || atom.glob;
-            have = true;
+        for (const ch of atom.text) {
+            text += ch;
+            mask.push(splits && atom.quoted !== true);
         }
+        /* An unquoted expansion that came to nothing is no field at all: `set -- $undef` is none. */
+        if (atom.text !== '' || atom.split !== true) have = true;
+        glob = glob || atom.glob;
         if (atom.after === true && have) push();
     }
     push();
@@ -1998,8 +2106,23 @@ function lsNames(fs: IFileSystem, dir: string): string[] {
  */
 function expandCommandWords(shell: SyncShell, words: RawWord[], ctx: ExpandCtx): string[] | null {
     let i = 0;
-    while (i < words.length && ASSIGNMENT_WORD.test(rawText(words[i]))) {
-        const assignment = expandWordText(shell, words[i], ctx);
+    while (i < words.length && ASSIGNMENT_WORD.test(rawText(words[i]))) i++;
+    const assignments: string[] = [];
+    for (let k = 0; k < i; k++) assignments.push(expandWordText(shell, words[k], ctx));
+    const fields: string[] = [];
+    for (let j = i; j < words.length; j++) {
+        for (const field of assembleFields(shell, expandParts(shell, words[j], ctx))) {
+            // `set -f` turns pathname expansion off; otherwise no match leaves the word as written
+            if (field.glob && shell.state?.options.noglob !== true) {
+                fields.push(...(shellGlob(shell, field.text) ?? [field.text]));
+            } else {
+                fields.push(field.text);
+            }
+        }
+    }
+    /* Every word of the command is expanded before its assignment prefixes take effect, the way a
+       host shell has it: `IFS=:; s=a:b; IFS=, echo $s` prints `a b`, and not `a:b`. */
+    for (const assignment of assignments) {
         const at = assignment.indexOf('=');
         if (at > 0) {
             const refused = assignVar(shell, assignment.slice(0, at), assignment.slice(at + 1));
@@ -2009,20 +2132,8 @@ function expandCommandWords(shell: SyncShell, words: RawWord[], ctx: ExpandCtx):
                 return null;
             }
         }
-        i++;
     }
     if (i === words.length) return null;
-    const fields: string[] = [];
-    for (let j = i; j < words.length; j++) {
-        for (const field of assembleFields(expandParts(shell, words[j], ctx))) {
-            // `set -f` turns pathname expansion off; otherwise no match leaves the word as written
-            if (field.glob && shell.state?.options.noglob !== true) {
-                fields.push(...(shellGlob(shell, field.text) ?? [field.text]));
-            } else {
-                fields.push(field.text);
-            }
-        }
-    }
     return fields;
 }
 
@@ -2049,15 +2160,22 @@ function expandTildePiece(text: string, shell: SyncShell): string {
 }
 
 function expandParts(shell: SyncShell, parts: ShellPart[], ctx: ExpandCtx): ExpandAtom[] {
+    /* `''` and `""` leave a word with no piece in it at all, and one empty field is what they mean:
+       the quoting wrote a word, the expansion of it is empty, and `printf ''` is a format. */
+    if (parts.length === 0) return [{ text: '', split: false, glob: false, quoted: true }];
     const atoms: ExpandAtom[] = [];
     for (let index = 0; index < parts.length; index++) {
         const part = parts[index];
+        const from = atoms.length;
         if (index === 0 && part.split && part.text.startsWith('~')) {
             atoms.push({ text: expandTildePiece(part.text, shell), split: false, glob: false });
-            continue;
+        } else if (part.expand) {
+            expandInto(shell, part.text, part.split, atoms, ctx);
+        } else {
+            atoms.push({ text: part.text, split: false, glob: false });
         }
-        if (part.expand) expandInto(shell, part.text, part.split, atoms, ctx);
-        else atoms.push({ text: part.text, split: false, glob: false });
+        /* Quoted where the piece was, so field splitting leaves it alone however the word splits. */
+        for (let k = from; k < atoms.length; k++) atoms[k].quoted = !part.split;
     }
     return atoms;
 }
@@ -2534,7 +2652,7 @@ function runCompoundLine(shell: SyncShell, line: string): ShellStep {
                 const result = runScript(state, line);
                 return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
             } catch (error) {
-                if (isNotSupported(error)) throw error;
+                if (isNotSupported(error) || isShellSuspend(error)) throw error;
                 return {
                     stdout: state.io.stdout,
                     stderr: state.io.stderr + (error instanceof Error ? error.message : String(error)),
@@ -2598,7 +2716,18 @@ function shellLine(shell: SyncShell, line: string, deferPendingJobs = false): Sh
             startBackgroundJob(shell, pipelines[i] as RawWord[][]);
             step = EMPTY_STEP;
         } else {
-            step = shellPipeline(shell, pipelines[i] as RawWord[][]);
+            const pipeline = pipelines[i] as RawWord[][];
+            /* Only a trailing command can suspend. The engine steps one command at a time, so a
+               command *after* an `npm install` on the same line could not run -- it would be
+               skipped, and a line that quietly runs half of itself is worse than one that says it
+               cannot run. Setting the flag before the step is what keeps the install from being
+               started in that case at all. */
+            shell.suspendable = i + 1 === segments.length && pipeline.length === 1;
+            try {
+                step = shellPipeline(shell, pipeline);
+            } finally {
+                shell.suspendable = undefined;
+            }
         }
         stdout += step.stdout;
         stderr += step.stderr;
@@ -2699,6 +2828,13 @@ function npmCommand(shell: SyncShell, args: string[]): ShellStep {
         return { stdout: NPM_VERSION + '\n', stderr: '', exitCode: 0 };
     }
     if (sub !== undefined && REMOVE_SUBCOMMANDS.has(sub)) return npmRemove(shell, args);
+    if (sub !== undefined && INSTALL_SUBCOMMANDS.has(sub)) {
+        /* Reached only where the install cannot suspend: inside a nested synchronous child, whose own
+           wasm call sits inside the one that spawned it, or with another command on the line that
+           would have to run after it. Name which of the two it is. */
+        if (syncRunActive()) throw notSupportedNested(`npm ${sub}`);
+        throw notSupportedSync(`npm ${sub} as anything but the last command of a synchronous line`);
+    }
     const event = LIFECYCLE_COMMANDS[sub ?? ''];
     if (sub !== 'run' && sub !== 'run-script' && event === undefined) {
         throw notSupportedSync(`the shell command npm ${sub ?? ''}`.trim());
@@ -2896,7 +3032,14 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         if (SHELL_BUILTINS.has(command)) return shellBuiltinWithRedirects(shell, command, cmdArgs);
         const version = externalVersion(command, cmdArgs);
         if (version !== null) return { stdout: version, stderr: '', exitCode: 0 };
-        if (command === 'npm') return npmCommand(shell, cmdArgs);
+        if (command === 'npm') {
+            /* `npm install` is the one command here that can suspend instead of refusing. The shell
+               engine steps one command at a time and has no promise to hand back, so the install
+               travels out as a throw that `runShell` catches and waits on. */
+            const install = shell.suspendable === true ? npmInstallStep(shell, cmdArgs) : undefined;
+            if (install !== undefined) throw new ShellSuspend(install);
+            return npmCommand(shell, cmdArgs);
+        }
         // `curl` that names no URL has nothing to wait for: its own usage failure, with its own
         // status 2, so a synchronous caller gets what the utility would answer rather than the
         // blanket refusal a command that needs the network gets.
@@ -2951,12 +3094,21 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         if (moduleStep !== null) return moduleStep;
         return { stdout: '', stderr: diagnostic(`Command not found: ${command}`), exitCode: 127 };
     } catch (error) {
-        if (isNotSupported(error)) throw error;
+        if (isNotSupported(error) || isShellSuspend(error)) throw error;
         return { stdout: '', stderr: error instanceof Error ? error.message : String(error), exitCode: 1 };
     }
 }
 
-/** `sh -c <line>` (or `sh <words>`): stdout exactly as the built-ins wrote it, stderr with a newline after it, as ShellProcess prints it. */
+/**
+ * `sh -c <line>` (or `sh <words>`): stdout exactly as the built-ins wrote it, stderr with a newline
+ * after it, as ShellProcess prints it.
+ *
+ * A line that reaches `npm install` cannot be stepped to the end inside this call -- the install has
+ * to reach the registry, and the host thread is the thread this call is blocking -- so it answers
+ * with a promise instead, and the guest's stack unwinds on it exactly as it does for
+ * `spawnSync('npm', ['install'])`. The line's own end -- its pending jobs and its EXIT trap -- runs
+ * once the install is through, so a bare `npm install` line ends the way any other line ends.
+ */
 function runShell(
     ctx: CapabilityContext,
     argv: string[],
@@ -2964,16 +3116,26 @@ function runShell(
     cwd: string,
     input: string | null,
     name: string
-): { status: number; stdout: string; stderr: string } {
+): MaybeAsync<{ status: number; stdout: string; stderr: string }> {
     if (argv.length === 0) throw notSupportedSync('an interactive sh (no command given)');
     const line = argv[0] === '-c' ? (argv[1] ?? '') : argv.join(' ');
-    const step = shellLine({ ctx, cwd, env, input, name, lastStatus: 0 }, line);
-    return {
-        status: step.exitCode,
-        stdout: step.stdout,
-        // `sh` ends a diagnostic with a newline; a command that wrote its own already ends in one
-        stderr: step.stderr === '' || step.stderr.endsWith('\n') ? step.stderr : step.stderr + '\n'
-    };
+    const shell: SyncShell = { ctx, cwd, env, input, name, lastStatus: 0 };
+    let step: MaybeAsync<ShellStep>;
+    try {
+        step = shellLine(shell, line);
+    } catch (error) {
+        if (!isShellSuspend(error)) throw error;
+        step = error.work.then((done) => endOfLine(shell, done.stdout, done.stderr, done.exitCode, false));
+    }
+    if (step instanceof Promise) {
+        return step.then((settled) => ({ status: settled.exitCode, stdout: settled.stdout, stderr: ended(settled.stderr) }));
+    }
+    return { status: step.exitCode, stdout: step.stdout, stderr: ended(step.stderr) };
+}
+
+/** `sh` ends a diagnostic with a newline; a command that wrote its own already ends in one. */
+function ended(stderr: string): string {
+    return stderr === '' || stderr.endsWith('\n') ? stderr : stderr + '\n';
 }
 
 /** One completed shell step as a synchronous run: the pid npm and the shell commands get, and no signal. */
@@ -2994,7 +3156,9 @@ function runSyncCommand(
 ): SyncRun | Promise<SyncRun> {
     if (file === 'sh' || file === '/bin/sh') {
         const step = runShell(ctx, argv, env, cwd, input, file);
-        return { pid: nextSyncPid++, status: step.status, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
+        const done = (r: { status: number; stdout: string; stderr: string }): SyncRun =>
+            ({ pid: nextSyncPid++, status: r.status, signal: null, stdout: r.stdout, stderr: r.stderr, timedOut: false });
+        return step instanceof Promise ? step.then(done) : done(step);
     }
     if (file === 'node' || file === NODE_BINARY) return nodeRun(ctx, nodeInvocation(argv), env, cwd, timeoutMs, killSignal, input);
     if (file.endsWith('.js')) return nodeRun(ctx, { file, args: argv }, env, cwd, timeoutMs, killSignal, input);
@@ -3037,7 +3201,7 @@ function spawnChildNow(args: Record<string, any>, ctx: CapabilityContext): { pid
     }
     /* A synchronous child's own wasm call sits inside the one that spawned it, so nothing here can
        suspend: `npmInstallStep` answers undefined in that case, which is what keeps this a run. */
-    if (run instanceof Promise) throw notSupportedSync(`the child ${file}, which waits on host work,`);
+    if (run instanceof Promise) throw notSupportedNested(`the child ${file}`);
     if (run.blocked !== undefined) throw notSupportedSync(`the child, which waits on ${run.blocked},`);
     const stdoutMode = modeOf(stdio[1]);
     const stderrMode = modeOf(stdio[2]);
