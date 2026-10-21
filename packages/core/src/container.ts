@@ -9,7 +9,7 @@ import { RuntimeServices } from "./process/executors/node/runtime/services";
 import { VirtualNetwork } from "./network/virtual/hub";
 import { IFileSystem } from "./filesystem";
 import { ZenFSCore } from "./filesystem/zenfs-core";
-import { NetworkManager } from "network/manager";
+import { NetworkManager } from "./network/manager";
 import { ServerType, VirtualServer } from "./network/types";
 import { NetworkStats } from "./network/types";
 import { HostRequest } from "process/executors/node/modules/network-module";

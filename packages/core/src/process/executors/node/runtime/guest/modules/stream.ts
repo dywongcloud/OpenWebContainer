@@ -982,6 +982,48 @@ function owcBuildStreamCore() {
     return createReadableIterator(this);
   };
 
+  /* Node's readable.iterator(options) is the async iterator a for-await loop uses, handed back
+     directly: a caller who wants the stream to survive a break asks for destroyOnReturn false. */
+  Readable.prototype.iterator = function (options) {
+    return createReadableIterator(this, options);
+  };
+
+  /* readable.wrap(stream) drives this stream from an old-style one -- a stream with data, end and
+     error events but nothing to read on demand -- pausing the source when this stream's buffer is
+     full and resuming it when the reader asks for more. */
+  Readable.prototype.wrap = function (src) {
+    var self = this;
+    var paused = false;
+    src.on('data', function (chunk) {
+      if (!self.push(chunk)) {
+        paused = true;
+        if (typeof src.pause === 'function') src.pause();
+      }
+    });
+    src.on('end', function () { self.push(null); });
+    src.on('error', function (err) { self.emit('error', err); });
+    src.on('close', function () { self.emit('close'); });
+    src.on('destroy', function () { self.emit('close'); });
+    this._read = function () {
+      if (paused) {
+        paused = false;
+        if (typeof src.resume === 'function') src.resume();
+      }
+    };
+    return this;
+  };
+
+  /* readable.compose(stream, options): the same body conversion stream.compose starts with, with this
+     stream as the first source. Node validates options and its signal, then composes; the options
+     object itself is not a stream in the chain, so only the two streams are handed to compose. */
+  Readable.prototype.compose = function (stream, options) {
+    if (options !== undefined && options !== null) {
+      if (typeof options !== 'object') throw argTypeError('options', 'of type object', options);
+      checkSignalProp(options.signal);
+    }
+    return compose(this, stream);
+  };
+
   Readable.prototype.toArray = async function (options) {
     var signal = checkOperatorOptions(options);
     var out = [];
@@ -2385,6 +2427,156 @@ function owcBuildStreamCore() {
     return sides;
   }
 
+  // ---------------------------------------------------------------- web streams
+
+  /* Node bridges its streams and the web's with toWeb and fromWeb: a web reader pulls through the
+     node stream's async iterator, and a web writer's write, close and abort drive write, end and
+     destroy. A byte stream crosses as bytes -- a Buffer or Uint8Array unchanged, a string encoded --
+     while an object-mode stream hands its values over as they are. */
+  function webChunkOf(value, objectMode) {
+    if (objectMode) return value;
+    if (value instanceof Uint8Array) return value;
+    if (typeof value === 'string') return typeof TextEncoder === 'function' ? new TextEncoder().encode(value) : Buf.from(value);
+    return value;
+  }
+  function nodeChunkOf(value) {
+    if (value instanceof Buf) return value;
+    if (value instanceof Uint8Array) return Buf.from(value.buffer, value.byteOffset, value.byteLength);
+    return value;
+  }
+  function isWebReadable(value) {
+    return !!value && typeof value === 'object' && typeof value.getReader === 'function';
+  }
+  function isWebWritable(value) {
+    return !!value && typeof value === 'object' && typeof value.getWriter === 'function';
+  }
+  function webStreamsMissing(what, value) {
+    if (typeof ReadableStream !== 'function') return owcErr(Error, 'ERR_INVALID_ARG_TYPE', 'The web stream API is not available in this runtime');
+    return argTypeError(what, 'an instance of ' + what, value);
+  }
+
+  Readable.toWeb = function (stream) {
+    if (typeof ReadableStream !== 'function') throw webStreamsMissing('ReadableStream', stream);
+    var it = createReadableIterator(stream, null);
+    var objectMode = !!(stream && stream._readableState && stream._readableState.objectMode);
+    var ended = false;
+    return new ReadableStream({
+      pull: function (controller) {
+        return it.next().then(function (step) {
+          if (step.done) {
+            ended = true;
+            controller.close();
+            return;
+          }
+          controller.enqueue(webChunkOf(step.value, objectMode));
+        }, function (err) { controller.error(err); });
+      },
+      cancel: function () {
+        if (!ended && typeof it.return === 'function') it.return();
+        return undefined;
+      }
+    });
+  };
+
+  Readable.fromWeb = function (readableStream, options) {
+    if (!isWebReadable(readableStream)) throw webStreamsMissing('ReadableStream', readableStream);
+    var reader = readableStream.getReader();
+    var opts = {};
+    if (options) for (var key in options) opts[key] = options[key];
+    opts.read = function () {
+      var self = this;
+      reader.read().then(function (step) {
+        if (step.done) self.push(null);
+        else self.push(nodeChunkOf(step.value));
+      }, function (err) { self.destroy(err); });
+    };
+    if (typeof opts.destroy !== 'function') {
+      opts.destroy = function (err, cb) {
+        try { reader.cancel(); } catch (e) { /* a web stream already closed rejects the cancel */ }
+        cb(err);
+      };
+    }
+    return new Readable(opts);
+  };
+
+  Writable.toWeb = function (stream) {
+    if (typeof WritableStream !== 'function') throw webStreamsMissing('WritableStream', stream);
+    return new WritableStream({
+      write: function (chunk) {
+        return new Promise(function (resolve, reject) {
+          stream.write(nodeChunkOf(chunk), function (err) { if (err) reject(err); else resolve(); });
+        });
+      },
+      close: function () {
+        return new Promise(function (resolve, reject) {
+          stream.on('error', reject);
+          stream.end(function () { resolve(); });
+        });
+      },
+      abort: function (reason) { stream.destroy(reason); }
+    });
+  };
+
+  Writable.fromWeb = function (writableStream, options) {
+    if (!isWebWritable(writableStream)) throw webStreamsMissing('WritableStream', writableStream);
+    var writer = writableStream.getWriter();
+    var opts = {};
+    if (options) for (var key in options) opts[key] = options[key];
+    opts.write = function (chunk, encoding, cb) {
+      writer.write(chunk).then(function () { cb(); }, function (err) { cb(err); });
+    };
+    if (typeof opts.final !== 'function') {
+      opts.final = function (cb) {
+        writer.close().then(function () { cb(); }, function (err) { cb(err); });
+      };
+    }
+    if (typeof opts.destroy !== 'function') {
+      opts.destroy = function (err, cb) {
+        try { writer.abort(err); } catch (e) { /* already closed */ }
+        cb(err);
+      };
+    }
+    return new Writable(opts);
+  };
+
+  /* Duplex.toWeb hands back the two halves Node names -- the readable as a ReadableStream and the
+     writable as a WritableStream -- both over the one duplex. */
+  Duplex.toWeb = function (stream) {
+    return { readable: Readable.toWeb(stream), writable: Writable.toWeb(stream) };
+  };
+
+  Duplex.fromWeb = function (pair, options) {
+    var readable = pair && pair.readable;
+    var writable = pair && pair.writable;
+    if (!isWebReadable(readable)) throw webStreamsMissing('ReadableStream', readable);
+    if (!isWebWritable(writable)) throw webStreamsMissing('WritableStream', writable);
+    var reader = readable.getReader();
+    var writer = writable.getWriter();
+    var opts = {};
+    if (options) for (var key in options) opts[key] = options[key];
+    opts.read = function () {
+      var self = this;
+      reader.read().then(function (step) {
+        if (step.done) self.push(null);
+        else self.push(nodeChunkOf(step.value));
+      }, function (err) { self.destroy(err); });
+    };
+    opts.write = function (chunk, encoding, cb) {
+      writer.write(chunk).then(function () { cb(); }, function (err) { cb(err); });
+    };
+    if (typeof opts.final !== 'function') {
+      opts.final = function (cb) {
+        writer.close().then(function () { cb(); }, function (err) { cb(err); });
+      };
+    }
+    opts.destroy = function (err, cb) {
+      try { reader.cancel(); } catch (e) { /* already closed */ }
+      try { writer.abort(err); } catch (e) { /* already closed */ }
+      cb(err);
+    };
+    return new Duplex(opts);
+  };
+
   Stream.Stream = Stream;
   Stream.Readable = Readable;
   Stream.Writable = Writable;
@@ -2411,8 +2603,20 @@ function owcBuildStreamCore() {
     if (self.output !== null && self.output !== undefined) self.output.write(text);
   }
 
+  /* The history holds the lines the interface has read, most recent first, as Node's does: an empty
+     line is not remembered, and a historySize of 0 remembers nothing. */
+  function addHistory(self, line) {
+    if (line.length === 0 || self.historySize === 0) return;
+    var h = self[kState].history;
+    if (h.length === 0 || h[0] !== line) {
+      h.unshift(line);
+      if (h.length > self.historySize) h.pop();
+    }
+  }
+
   function deliverLine(self, line) {
     var st = self[kState];
+    addHistory(self, line);
     if (st.questionCallback !== null) {
       var answer = st.questionCallback;
       st.questionCallback = null;
@@ -2423,10 +2627,43 @@ function owcBuildStreamCore() {
     }
   }
 
+  /* A terminal interface answers the two control keys that end or interrupt a line the way Node's
+     does: Ctrl-D on an empty line is end of file and closes the interface, and Ctrl-C raises
+     SIGINT. Both are plain characters to a non-terminal interface, which only splits on newlines.
+     The filter answers null once it has closed the interface, so nothing more is written to it. */
+  function stripTerminalControls(self, text) {
+    var st = self[kState];
+    var out = '';
+    var pending = st.lineBuffer.length;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (ch === '\x03') {
+        self.emit('SIGINT');
+        continue;
+      }
+      if (ch === '\x04') {
+        if (pending === 0) {
+          st.lineBuffer = '';
+          self.close();
+          return null;
+        }
+        continue;
+      }
+      if (ch === '\n' || ch === '\r') pending = 0;
+      else pending++;
+      out += ch;
+    }
+    return out;
+  }
+
   function normalWrite(self, b) {
     if (b === undefined || b === null) return;
     var st = self[kState];
     var text = st.decoder.write(b);
+    if (self.terminal) {
+      text = stripTerminalControls(self, text);
+      if (text === null) return;
+    }
     if (st.sawReturnAt !== 0 && Date.now() - st.sawReturnAt <= self.crlfDelay) {
       if (text.charCodeAt(0) === 10) text = text.slice(1);
       st.sawReturnAt = 0;
@@ -2495,7 +2732,8 @@ function owcBuildStreamCore() {
         decoder: createDecoder('utf8'),
         lineIterator: null,
         onData: null,
-        onEnd: null
+        onEnd: null,
+        history: []
       },
       enumerable: false,
       writable: true,
@@ -2506,8 +2744,10 @@ function owcBuildStreamCore() {
     this.output = opts.output;
     this.terminal = opts.terminal !== undefined ? !!opts.terminal : !!(opts.output && opts.output.isTTY);
     this.line = '';
-    this.history = [];
     this.historySize = opts.historySize !== undefined ? opts.historySize : 30;
+    /* The history is the array a caller reads on the interface, so it is the one the state keeps:
+       a line recorded later is seen by a caller who already holds rl.history. */
+    this.history = st.history;
     this.crlfDelay = opts.crlfDelay ? Math.max(100, opts.crlfDelay) : 100;
 
     st.onData = function (chunk) {
@@ -2738,10 +2978,91 @@ function owcBuildStreamCore() {
     });
   };
 
-  // readline/promises names the class twice: Interface, and Readline as its alias.
+  /* readline/promises exports a second class of its own, Readline: a cursor-control writer over one
+     stream. Each call queues its escape sequence and answers the instance, so the calls chain; the
+     queue reaches the stream only on commit(), which answers a promise, or on the next tick when the
+     instance was built with autoCommit. rollback() throws the queue away. It is not the Interface:
+     the two are unrelated classes that readline/promises exports side by side. */
+  function isWritableStreamLike(value) {
+    if (!value || typeof value !== 'object') return false;
+    if (value._writableState !== undefined) return true;
+    return typeof value.write === 'function' && typeof value.end === 'function';
+  }
+  function validateCursorInt(value, name) {
+    if (typeof value !== 'number') throw argTypeError(name, 'of type number', value);
+    if (value !== Math.floor(value)) throw owcErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be an integer. Received ' + value);
+    return value;
+  }
+  function validateCursorRange(value, name, min, max) {
+    validateCursorInt(value, name);
+    if (value < min || value > max) {
+      throw owcErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "' + name + '" is out of range. It must be >= ' + min + ' && <= ' + max + '. Received ' + value);
+    }
+    return value;
+  }
+
+  var readlineWriters = new WeakMap();
+
+  function ReadlineWriter(stream, options) {
+    if (!(this instanceof ReadlineWriter)) return new ReadlineWriter(stream, options);
+    if (!isWritableStreamLike(stream)) throw argTypeError('stream', 'an instance of Writable', stream);
+    readlineWriters.set(this, {
+      stream: stream,
+      autoCommit: !!(options && options.autoCommit === true),
+      todo: []
+    });
+  }
+
+  function writerSend(self, data) {
+    var rec = readlineWriters.get(self);
+    if (rec.autoCommit) process.nextTick(function () { rec.stream.write(data); });
+    else rec.todo.push(data);
+  }
+
+  ReadlineWriter.prototype.cursorTo = function (x, y) {
+    validateCursorInt(x, 'x');
+    if (y !== null && y !== undefined) validateCursorInt(y, 'y');
+    writerSend(this, y === null || y === undefined ? '\x1b[' + (x + 1) + 'G' : '\x1b[' + (y + 1) + ';' + (x + 1) + 'H');
+    return this;
+  };
+  ReadlineWriter.prototype.moveCursor = function (dx, dy) {
+    validateCursorInt(dx, 'dx');
+    validateCursorInt(dy, 'dy');
+    if (!dx && !dy) return this;
+    var data = '';
+    if (dx < 0) data += '\x1b[' + -dx + 'D';
+    else if (dx > 0) data += '\x1b[' + dx + 'C';
+    if (dy < 0) data += '\x1b[' + -dy + 'A';
+    else if (dy > 0) data += '\x1b[' + dy + 'B';
+    writerSend(this, data);
+    return this;
+  };
+  ReadlineWriter.prototype.clearLine = function (dir) {
+    validateCursorRange(dir, 'dir', -1, 1);
+    writerSend(this, dir < 0 ? '\x1b[1K' : dir > 0 ? '\x1b[0K' : '\x1b[2K');
+    return this;
+  };
+  ReadlineWriter.prototype.clearScreenDown = function () {
+    writerSend(this, '\x1b[0J');
+    return this;
+  };
+  ReadlineWriter.prototype.commit = function () {
+    var rec = readlineWriters.get(this);
+    var pending = rec.todo.join('');
+    rec.todo = [];
+    return new Promise(function (resolve) {
+      rec.stream.write(pending, resolve);
+    });
+  };
+  ReadlineWriter.prototype.rollback = function () {
+    readlineWriters.get(this).todo = [];
+    return this;
+  };
+
+  // readline/promises exports the Interface and the Readline writer side by side, as Node 24 does.
   var readlinePromisesExports = {
     Interface: PromisesInterface,
-    Readline: PromisesInterface,
+    Readline: ReadlineWriter,
     createInterface: function (input, output, completer, terminal) {
       return new PromisesInterface(input, output, completer, terminal);
     }
