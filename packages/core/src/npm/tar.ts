@@ -48,10 +48,12 @@ export function parseTar(tar: Uint8Array): TarEntry[] {
         paxPath = undefined;
         const path = normalizeEntryPath(name);
         if (path === undefined) continue;
+        /* A view into the inflated archive, not a copy of it: a package is written straight from its
+           entries, and copying every one of them doubles the bytes an install holds at once. */
         entries.push({
             path,
             type: entryType(typeflag),
-            data: typeflag === '5' ? new Uint8Array() : data.slice()
+            data: typeflag === '5' ? new Uint8Array() : data
         });
     }
     return entries;
