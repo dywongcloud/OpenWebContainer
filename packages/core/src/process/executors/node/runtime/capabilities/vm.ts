@@ -19,9 +19,25 @@ import { CapabilityContext, CapabilityHandler } from './types';
  */
 
 interface VmHost {
+    runtime: QuickJSRuntime;
     context: QuickJSContext;
     /** The guest bootstrap API object; vm.run reads the thunk from its `vmThunk` slot. */
     api: QuickJSHandle;
+    /**
+     * A second realm: a second QuickJS context on the same runtime, made the first time a value has
+     * to cross out of a `vm` context. Its intrinsics are its own -- `Array` here is not the guest's
+     * `Array` -- because QuickJS gives each context its own set, while objects of one context are
+     * usable from another of the same runtime. That is the whole of what Node's cross-realm
+     * behaviour needs, and it is why a value from `runInContext` answers `false` to
+     * `instanceof Array` while `Array.isArray` still answers `true`.
+     */
+    realm?: QuickJSContext;
+    /** Values built in {@link VmHost.realm} and handed to the guest, freed with the binding. */
+    realmValues: QuickJSHandle[];
+    /** `Array.isArray`, `Object.prototype.toString`, `Object.keys` and `Object.prototype`, once. */
+    probes?: VmProbes;
+    /** The standard globals of the guest realm beside their namesakes in the second realm, once. */
+    builtins?: { from: QuickJSHandle[]; to: QuickJSHandle[] };
     /** Armed deadline in epoch milliseconds; 0 while nothing is armed. */
     deadline: number;
     /** Set by the interrupt handler when it interrupts; read by vm.run. */
@@ -47,6 +63,34 @@ export type VmInterruption = 'vm' | 'cancel' | 'budget';
  */
 const YIELD_MS = 250;
 
+/** How deep a value is rebuilt in the second realm: past this it crosses as it is. */
+const REALM_MAX_DEPTH = 8;
+/** How many values one process rebuilds: past this they cross as they are, rather than pinning memory. */
+const REALM_MAX_VALUES = 4096;
+
+/**
+ * The standard globals whose namesake in the second realm replaces the guest realm's when one of
+ * them is what crosses out of a `vm` context: `runInContext('Array')` is the context's own `Array`,
+ * not the caller's, which is why host Node reports `false` for `runInContext('Array') === Array`.
+ */
+const REALM_BUILTINS = ['AggregateError', 'Array', 'ArrayBuffer', 'Atomics', 'BigInt', 'BigInt64Array',
+    'BigUint64Array', 'Boolean', 'DataView', 'Date', 'Error', 'EvalError', 'FinalizationRegistry',
+    'Float32Array', 'Float64Array', 'Function', 'Int16Array', 'Int32Array', 'Int8Array', 'Intl',
+    'JSON', 'Map', 'Math', 'Number', 'Object', 'Promise', 'Proxy', 'RangeError', 'ReferenceError',
+    'Reflect', 'RegExp', 'Set', 'SharedArrayBuffer', 'String', 'Symbol', 'SyntaxError', 'TypeError',
+    'Uint16Array', 'Uint32Array', 'Uint8Array', 'Uint8ClampedArray', 'URIError', 'WeakMap',
+    'WeakRef', 'WeakSet'];
+
+/** `Array.isArray`, `Object.prototype.toString`, `Object.keys` and `Object.prototype`, once. */
+interface VmProbes {
+    /** `Object` itself, the `this` of `Object.keys`. */
+    object: QuickJSHandle;
+    keys: QuickJSHandle;
+    isArray: QuickJSHandle;
+    tag: QuickJSHandle;
+    objectProto: QuickJSHandle;
+}
+
 const hosts = new WeakMap<CapabilityContext, VmHost>();
 
 /**
@@ -56,8 +100,10 @@ const hosts = new WeakMap<CapabilityContext, VmHost>();
  */
 export function bindVmRuntime(owner: CapabilityContext, runtime: QuickJSRuntime, context: QuickJSContext, api: QuickJSHandle): void {
     const host: VmHost = {
+        runtime,
         context,
         api,
+        realmValues: [],
         deadline: 0,
         fired: false,
         cancelled: false,
@@ -113,7 +159,47 @@ export function armVmBudget(owner: CapabilityContext, ms: number): void {
  * process table does for every process it has ever run. Unbinding is what lets that go.
  */
 export function unbindVmRuntime(owner: CapabilityContext): void {
+    const host = hosts.get(owner);
     hosts.delete(owner);
+    if (!host) return;
+    /* The second realm and every value rebuilt in it belong to this binding: they are freed here,
+       before the process frees the context around them, or the runtime asserts on what is left. */
+    for (const handle of host.realmValues) {
+        try {
+            handle.dispose();
+        } catch {
+            // a handle already gone is nothing to report
+        }
+    }
+    host.realmValues = [];
+    if (host.builtins !== undefined) {
+        for (const handle of [...host.builtins.from, ...host.builtins.to]) {
+            try {
+                handle.dispose();
+            } catch {
+                // as above
+            }
+        }
+        host.builtins = undefined;
+    }
+    if (host.probes !== undefined) {
+        for (const handle of [host.probes.object, host.probes.keys, host.probes.isArray, host.probes.tag, host.probes.objectProto]) {
+            try {
+                handle.dispose();
+            } catch {
+                // as above
+            }
+        }
+        host.probes = undefined;
+    }
+    if (host.realm !== undefined) {
+        try {
+            host.realm.dispose();
+        } catch {
+            // as above
+        }
+        host.realm = undefined;
+    }
 }
 
 /** A kill path: the guest stops at its next interrupt check, whatever it is doing. */
@@ -150,6 +236,193 @@ function describeError(error: unknown): string {
     return String(error);
 }
 
+/** The second realm, made on the first value that has to cross, or undefined when it cannot be made. */
+function realmOf(host: VmHost): QuickJSContext | undefined {
+    if (host.realm !== undefined) return host.realm;
+    try {
+        host.realm = host.runtime.newContext();
+        return host.realm;
+    } catch {
+        return undefined;
+    }
+}
+
+/** `Array.isArray`, `Object.prototype.toString` and `Object.prototype` of the guest realm, once. */
+function probesOf(host: VmHost): VmProbes {
+    if (host.probes !== undefined) return host.probes;
+    const { context } = host;
+    const global = context.global;
+    const array = context.getProp(global, 'Array');
+    const object = context.getProp(global, 'Object');
+    const objectProto = context.getProp(object, 'prototype');
+    const probes: VmProbes = {
+        object,
+        keys: context.getProp(object, 'keys'),
+        isArray: context.getProp(array, 'isArray'),
+        tag: context.getProp(objectProto, 'toString'),
+        objectProto
+    };
+    array.dispose();
+    host.probes = probes;
+    return probes;
+}
+
+/** Calls `fn.call(thisArg, ...args)` in the guest realm and dumps the answer, or undefined if it throws. */
+function callFor(host: VmHost, fn: QuickJSHandle, thisArg: QuickJSHandle, args: QuickJSHandle[]): unknown {
+    const result = host.context.callFunction(fn, thisArg, args);
+    if (result.error) {
+        result.error.dispose();
+        return undefined;
+    }
+    const answer = host.context.dump(result.value);
+    result.value.dispose();
+    return answer;
+}
+
+/**
+ * The namesake of `value` in the second realm, when `value` is one of the guest realm's own standard
+ * globals: the context's `Array` is its own, so that is the one a program gets back from it.
+ */
+function builtinOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle | undefined {
+    if (host.builtins === undefined) {
+        const from: QuickJSHandle[] = [];
+        const to: QuickJSHandle[] = [];
+        const { context } = host;
+        for (const name of REALM_BUILTINS) {
+            const ofGuest = context.getProp(context.global, name);
+            const ofRealm = realm.getProp(realm.global, name);
+            from.push(ofGuest);
+            to.push(ofRealm);
+        }
+        host.builtins = { from, to };
+    }
+    const { from, to } = host.builtins;
+    for (let i = 0; i < from.length; i++) {
+        if (host.context.eq(from[i], value)) return to[i];
+    }
+    return undefined;
+}
+
+/** Calls `value[name]()` in the guest realm and dumps the answer, or undefined if it throws. */
+function methodDump(host: VmHost, value: QuickJSHandle, name: string): unknown {
+    const result = host.context.callMethod(value, name, []);
+    if (result.error) {
+        result.error.dispose();
+        return undefined;
+    }
+    const answer = host.context.dump(result.value);
+    result.value.dispose();
+    return answer;
+}
+
+/**
+ * Rebuilds `value` inside the second realm, so that what the guest gets back from a `vm` context is
+ * an object of another realm -- `instanceof Array` and `instanceof Object` false, `Array.isArray`
+ * true, `Object.prototype.toString.call` still `[object Array]`, which is what host Node 24.15
+ * reports for the same probe.
+ *
+ * Only arrays, plain objects, `Date`s and `RegExp`s are rebuilt. Everything else -- a function, a
+ * `Map`, a class instance -- crosses as it is: a function's body belongs to the realm it was
+ * compiled in and cannot be recompiled into another, and a live `Map` cannot be copied without
+ * running code that could itself be interrupted. A value too deep, a cycle, or one past the cap on
+ * rebuilt values also crosses as it is, so nothing here can grow without bound or loop.
+ */
+function rehomeInto(
+    host: VmHost,
+    realm: QuickJSContext,
+    value: QuickJSHandle,
+    depth: number,
+    seen: QuickJSHandle[],
+    twins: QuickJSHandle[]
+): QuickJSHandle {
+    const { context } = host;
+    if (host.realmValues.length >= REALM_MAX_VALUES) return value;
+    const builtin = builtinOf(host, realm, value);
+    if (builtin !== undefined) return builtin;
+    if (context.typeof(value) !== 'object') return value;
+    if (depth >= REALM_MAX_DEPTH) return value;
+    for (let i = 0; i < seen.length; i++) {
+        if (context.eq(seen[i], value)) return twins[i];
+    }
+    const probes = probesOf(host);
+    /* `Object.prototype.toString.call(value)`: the value is what `this` has to be, not an argument. */
+    const tag = String(callFor(host, probes.tag, value, []) ?? '');
+    const isArray = callFor(host, probes.isArray, context.undefined, [value]) === true;
+    let made: QuickJSHandle;
+    try {
+        if (isArray) {
+            made = realm.newArray();
+        } else if (tag === '[object Object]') {
+            made = realm.newObject();
+        } else if (tag === '[object Date]') {
+            const ms = Number(methodDump(host, value, 'getTime'));
+            return pin(host, context.unwrapResult(realm.evalCode(`new Date(${Number.isFinite(ms) ? ms : 0})`)));
+        } else if (tag === '[object RegExp]') {
+            const source = String(propDump(host, value, 'source') ?? '');
+            const flags = String(propDump(host, value, 'flags') ?? '');
+            return pin(host, context.unwrapResult(realm.evalCode(`new RegExp(${JSON.stringify(source)}, ${JSON.stringify(flags)})`)));
+        } else {
+            return value;
+        }
+    } catch {
+        return value;
+    }
+    pin(host, made);
+    seen.push(value);
+    twins.push(made);
+    try {
+        const keys = ownKeysOf(host, value);
+        for (const key of keys) {
+            const own = context.getProp(value, key);
+            try {
+                realm.setProp(made, key, rehomeInto(host, realm, own, depth + 1, seen, twins));
+            } finally {
+                own.dispose();
+            }
+        }
+    } catch {
+        // a value whose own names cannot be read crosses as the empty shell it is so far
+    }
+    return made;
+}
+
+/**
+ * The own enumerable string keys of `value`, read as `Object.keys` reads them.
+ *
+ * `Object.keys` rather than the engine's own property enumeration: that call traps in the build the
+ * container runs, and enumerable string keys are the ones a program can see anyway. Symbols and
+ * non-enumerable properties do not cross, and are named in the Readme.
+ */
+function ownKeysOf(host: VmHost, value: QuickJSHandle): string[] {
+    const result = host.context.callFunction(host.probes!.keys, host.probes!.object, [value]);
+    if (result.error) {
+        result.error.dispose();
+        return [];
+    }
+    const names = host.context.dump(result.value);
+    result.value.dispose();
+    if (!Array.isArray(names)) return [];
+    return names.map((name) => String(name));
+}
+
+/** Keeps a value built in the second realm alive for as long as the binding does, and returns it. */
+function pin(host: VmHost, value: QuickJSHandle): QuickJSHandle {
+    host.realmValues.push(value);
+    return value;
+}
+
+/** Reads `value[key]` in the guest realm and dumps it, or undefined if it cannot be read. */
+function propDump(host: VmHost, value: QuickJSHandle, key: string): unknown {
+    try {
+        const own = host.context.getProp(value, key);
+        const answer = host.context.dump(own);
+        own.dispose();
+        return answer;
+    } catch {
+        return undefined;
+    }
+}
+
 export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
     /**
      * Runs the guest thunk (api.vmThunk) synchronously under a deadline `timeout` ms from now, never
@@ -180,6 +453,34 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
                must not read the reason as its own later */
             host.reason = undefined;
             thunk.dispose();
+        }
+    },
+
+    /**
+     * Rebuilds the value the guest left at `api.vmValue` inside the second realm and leaves the
+     * result at `api.vmBack`, so a value returned from a `vm` context is an object of another realm.
+     *
+     * The value travels on the api object both ways: a capability carries JSON, and this one carries
+     * a live object. Nothing is written to `api.vmBack` when there is no binding, no second realm or
+     * nothing to rebuild, and the guest keeps the value it had.
+     */
+    'vm.realm': (_args, ctx) => {
+        const host = hosts.get(ctx);
+        if (!host) return { unbound: true };
+        const { context } = host;
+        const value = context.getProp(host.api, 'vmValue');
+        try {
+            if (context.typeof(value) !== 'object' && context.typeof(value) !== 'function') return { rebuilt: false };
+            const realm = realmOf(host);
+            if (realm === undefined) return { rebuilt: false };
+            const rebuilt = rehomeInto(host, realm, value, 0, [], []);
+            if (rebuilt === value) return { rebuilt: false };
+            context.setProp(host.api, 'vmBack', rebuilt);
+            return { rebuilt: true };
+        } catch {
+            return { rebuilt: false };
+        } finally {
+            value.dispose();
         }
     }
 };

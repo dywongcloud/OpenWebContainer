@@ -7,8 +7,10 @@
  * a Proxy: names the sandbox owns resolve there, ES builtins fall through to the host
  * realm, and every other free name reads and writes the sandbox, so undeclared
  * assignments and top-level var declarations land on the sandbox. Top-level function
- * declarations are copied onto the sandbox after each run. This is not a separate
- * realm: prototypes, builtins and instanceof are shared with the host.
+ * declarations are copied onto the sandbox after each run. The code runs in this realm, so a
+ * value it makes is rebuilt by the host inside a second one before it is handed back: prototypes,
+ * builtins and instanceof of what comes back are that realm's, as they are for a value host
+ * Node hands back from another context. See outOfRecord.
  */
 export const SRC = String.raw`
 (function () {
@@ -361,7 +363,37 @@ export const SRC = String.raw`
     }
     var decl = declaredNames(code);
     var scope = new Proxy(rec.sb, withHandler(rec, fnSet, decl));
-    return runWrapped.call(rec.G, scope, rewriteTypeof(code), fns, rec.sb);
+    return outOfRecord(rec, runWrapped.call(rec.G, scope, rewriteTypeof(code), fns, rec.sb));
+  }
+
+  /**
+   * A value a vm context hands back, as host Node hands it back: an object of another realm.
+   *
+   * The host keeps a second realm -- a second QuickJS context on the same runtime -- and rebuilds
+   * the value there, so an array from runInContext answers false to instanceof Array while
+   * Array.isArray still answers true, and Object.prototype.toString.call still says [object Array].
+   * That is a copy rather than the object the context's code made, so a value the caller put into
+   * the sandbox itself is not rebuilt: a copy of it would drift from the original the moment either
+   * was changed, and Node hands the very same object back.
+   */
+  function outOfRecord(rec, out) {
+    if (out === null || (typeof out !== 'object' && typeof out !== 'function')) return out;
+    if (out === rec.G || out === rec.sb) return out;
+    var keys = Object.keys(rec.sb);
+    for (var i = 0; i < keys.length; i++) {
+      if (rec.sb[keys[i]] === out) return out;
+    }
+    api.vmValue = out;
+    var back;
+    try {
+      callCap('vm.realm', {});
+      back = api.vmBack;
+    } catch (e) {
+      back = undefined;
+    }
+    api.vmValue = undefined;
+    api.vmBack = undefined;
+    return back === undefined ? out : back;
   }
 
   function createContextObject(obj) {
