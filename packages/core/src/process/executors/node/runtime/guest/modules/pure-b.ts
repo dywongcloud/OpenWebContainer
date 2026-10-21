@@ -514,6 +514,29 @@ export const SRC = String.raw`
     var stack = [];
     var exp = { active: null };
 
+    /*
+     * A promise reaction registered while a domain is active runs inside it, as it does in Node.
+     * Node binds promises through the promise hooks of async_hooks; this is the same binding at
+     * the one place a reaction is registered, so domain.active -- and process.domain, which
+     * follows it -- is the domain inside a then, catch or finally callback, and an error thrown
+     * there reaches the domain's 'error' listeners instead of escaping as an uncaught exception.
+     * The patch is installed on the first domain, so a program that never builds one keeps the
+     * engine's own then.
+     */
+    var domainThen = null;
+    function bindInDomain(dom, cb) {
+      return typeof cb === 'function' ? dom.bind(cb) : cb;
+    }
+    function installDomainPromiseHook() {
+      if (domainThen !== null) return;
+      domainThen = Promise.prototype.then;
+      Promise.prototype.then = function then(onFulfilled, onRejected) {
+        var dom = exp.active;
+        if (dom === null || dom === undefined) return domainThen.call(this, onFulfilled, onRejected);
+        return domainThen.call(this, bindInDomain(dom, onFulfilled), bindInDomain(dom, onRejected));
+      };
+    }
+
     function setActive(d) {
       exp.active = d;
       if (typeof process === 'object' && process !== null) process.domain = d;
@@ -561,11 +584,13 @@ export const SRC = String.raw`
     }
 
     Domain.prototype.run = function (fn) {
+      installDomainPromiseHook();
       return invokeInDomain(this, fn, this, Array.prototype.slice.call(arguments, 1));
     };
 
     Domain.prototype.bind = function (cb) {
       var self = this;
+      installDomainPromiseHook();
       function runBound() {
         return invokeInDomain(self, cb, this, Array.prototype.slice.call(arguments));
       }
@@ -630,7 +655,7 @@ export const SRC = String.raw`
     };
 
     exp.Domain = Domain;
-    exp.create = function createDomain() { return new Domain(); };
+    exp.create = function createDomain() { installDomainPromiseHook(); return new Domain(); };
     exp.createDomain = exp.create;
     return exp;
   };
@@ -663,6 +688,60 @@ export const SRC = String.raw`
       this._owcConnected = false;
     };
 
+    /*
+     * Runtime.evaluate is the one method of the protocol this runtime can answer: the expression
+     * runs here, in the realm the program runs in, and what comes back is the RemoteObject the
+     * protocol describes. The debugger, the profiler and the heap need a V8 this runtime has none
+     * of, so every other method still reports ERR_INSPECTOR_NOT_AVAILABLE, as it did before.
+     */
+    function unserializableNumber(value) {
+      if (value !== value) return 'NaN';
+      if (value === Infinity) return 'Infinity';
+      if (value === -Infinity) return '-Infinity';
+      if (value === 0 && 1 / value === -Infinity) return '-0';
+      return null;
+    }
+
+    function remoteObjectOf(value) {
+      if (value === undefined) return { type: 'undefined' };
+      if (value === null) return { type: 'object', subtype: 'null', value: null, description: 'null' };
+      var kind = typeof value;
+      if (kind === 'number') {
+        var special = unserializableNumber(value);
+        if (special !== null) return { type: 'number', unserializableValue: special, description: special };
+        return { type: 'number', value: value, description: String(value) };
+      }
+      if (kind === 'string') return { type: 'string', value: value };
+      if (kind === 'boolean') return { type: 'boolean', value: value, description: String(value) };
+      if (kind === 'bigint') return { type: 'bigint', unserializableValue: String(value) + 'n', description: String(value) + 'n' };
+      if (kind === 'symbol') return { type: 'symbol', value: String(value), description: String(value) };
+      if (kind === 'function') return { type: 'function', className: 'Function', description: inspectValue(value) };
+      var className = value && value.constructor && typeof value.constructor.name === 'string'
+        ? value.constructor.name : 'Object';
+      return { type: 'object', className: className, description: inspectValue(value) };
+    }
+
+    function evaluateForInspector(params) {
+      var expression = params && typeof params.expression === 'string' ? params.expression : '';
+      try {
+        return { result: remoteObjectOf((0, eval)(expression)) };
+      } catch (err) {
+        return {
+          exceptionDetails: {
+            exception: remoteObjectOf(err),
+            text: 'Uncaught',
+            lineNumber: 0,
+            columnNumber: 0
+          }
+        };
+      }
+    }
+
+    function deliver(done, error, result) {
+      if (typeof done !== 'function') return;
+      setTimeout(function () { done(error, result); }, 0);
+    }
+
     Session.prototype.post = function (method, params, callback) {
       if (typeof method !== 'string') throw argError('method', 'of type string', method);
       if (typeof params === 'function') {
@@ -670,10 +749,18 @@ export const SRC = String.raw`
         params = undefined;
       }
       if (!this._owcConnected) throw nodeError(Error, 'ERR_INSPECTOR_NOT_CONNECTED', 'Session is not connected');
-      if (typeof callback === 'function') {
-        callback(nodeError(Error, 'ERR_INSPECTOR_NOT_AVAILABLE',
-          'Inspector protocol is not available in this runtime'));
+      if (method === 'Runtime.evaluate') {
+        var outcome = evaluateForInspector(params);
+        deliver(callback, null, outcome);
+        return undefined;
       }
+      if (method === 'Runtime.enable' || method === 'Runtime.disable' || method === 'Runtime.runIfWaitingForDebugger') {
+        deliver(callback, null, {});
+        return undefined;
+      }
+      deliver(callback, nodeError(Error, 'ERR_INSPECTOR_NOT_AVAILABLE',
+        'Inspector protocol is not available in this runtime'), undefined);
+      return undefined;
     };
 
     exp.Session = Session;
