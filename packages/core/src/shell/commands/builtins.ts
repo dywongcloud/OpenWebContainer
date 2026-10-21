@@ -379,24 +379,34 @@ interface SplitField {
  * Field splitting on IFS, keeping which characters came out of quoted text: a `*`, `?` or `[` that
  * was quoted is a literal character, and only an unquoted one makes the field a pattern. Whitespace
  * IFS characters collapse; the default IFS is ' \t\n'.
+ *
+ * `splitable` -- per character, and defaulting to every unquoted one -- says which characters may
+ * end a field. A character of the word's own literal text may not: `IFS=:; echo a:b` is `a:b`.
  */
-function splitFieldsQuoted(text: string, quoted: boolean[], ifs: string): SplitField[] {
+function splitFieldsQuoted(text: string, quoted: boolean[], ifs: string, splitable?: boolean[]): SplitField[] {
+    const canSplit = (i: number): boolean =>
+        splitable === undefined ? quoted[i] !== true : splitable[i] === true;
     const ws: string[] = [...ifs].filter((ch) => ch === ' ' || ch === '\t' || ch === '\n');
     if (ws.length === 0) {
         const fields: SplitField[] = [];
         let cur = '';
         let curQuoted: boolean[] = [];
+        /* A delimiter at the very end of the word ends the last field; it does not open a new one,
+           so `:a:` is two fields and not three, the way a host shell splits it. */
+        let ended = false;
         for (let i = 0; i < text.length; i++) {
-            if (!quoted[i] && ifs.includes(text[i])) {
+            if (canSplit(i) && ifs.includes(text[i])) {
                 fields.push({ text: cur, quoted: curQuoted });
                 cur = '';
                 curQuoted = [];
+                ended = true;
             } else {
                 cur += text[i];
                 curQuoted.push(quoted[i] === true);
+                ended = false;
             }
         }
-        fields.push({ text: cur, quoted: curQuoted });
+        if (!ended || cur !== '') fields.push({ text: cur, quoted: curQuoted });
         return fields;
     }
     const fields: SplitField[] = [];
@@ -406,7 +416,7 @@ function splitFieldsQuoted(text: string, quoted: boolean[], ifs: string): SplitF
     for (let i = 0; i < text.length; i++) {
         const isWs = ws.includes(text[i]);
         const isOther = ifs.includes(text[i]) && !isWs;
-        if (!quoted[i] && (isWs || isOther)) {
+        if (canSplit(i) && (isWs || isOther)) {
             if (started) {
                 fields.push({ text: cur, quoted: curQuoted });
                 cur = '';
@@ -1775,12 +1785,20 @@ const FIELD_MARK = ' ';
 interface Expanded {
     text: string;
     quoted: boolean[];
+    /**
+     * Per character: it came out of an unquoted expansion, so field splitting may break the word
+     * on it. Literal text of the word is never split, whatever IFS holds -- `IFS=:; echo a:b`
+     * prints `a:b` in a host shell, because splitting is something a shell does to the result of
+     * an expansion and not to a word it was handed.
+     */
+    split: boolean[];
 }
 
-function appendText(target: Expanded, text: string, quoted: boolean): void {
+function appendText(target: Expanded, text: string, quoted: boolean, split = !quoted): void {
     for (const ch of text) {
         target.text += ch;
         target.quoted.push(quoted);
+        target.split.push(split);
     }
 }
 
@@ -1901,7 +1919,8 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
 function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: Expanded): void {
     for (const part of parts) {
         if (part.t === 'lit') {
-            appendText(target, part.v, quoted);
+            /* Literal text is never field-split: only what an expansion produced is. */
+            appendText(target, part.v, quoted, false);
             continue;
         }
         if (part.t === 'sq') {
@@ -1960,18 +1979,18 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
 
 /** Expands a word to one string: no field splitting, no pathname expansion. */
 function expandToString(word: Word, state: ShellState): string {
-    const target: Expanded = { text: '', quoted: [] };
+    const target: Expanded = { text: '', quoted: [], split: [] };
     expandParts(state, word, false, target);
     return target.text.split(FIELD_MARK).join(' ');
 }
 
 /** Expands a word the way a command argument is expanded: splitting, then pathname expansion. */
 function expandWord(state: ShellState, word: Word): string[] {
-    const target: Expanded = { text: '', quoted: [] };
+    const target: Expanded = { text: '', quoted: [], split: [] };
     expandParts(state, word, false, target);
     if (target.text.includes(FIELD_MARK)) return target.text.split(FIELD_MARK);
     const ifs = getVar(state, 'IFS');
-    const fields = splitFieldsQuoted(target.text, target.quoted, ifs === undefined ? ' \t\n' : ifs);
+    const fields = splitFieldsQuoted(target.text, target.quoted, ifs === undefined ? ' \t\n' : ifs, target.split);
     if (state.options.noglob) return fields.map((field) => field.text);
     const out: string[] = [];
     for (const field of fields) out.push(...expandGlob(state, field.text, field.quoted));
@@ -2382,14 +2401,14 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                 state.protectedDepth++;
                 let condition = 0;
                 try {
-                    condition = runCommandList(state, branch.cond, null);
+                    condition = runCommandList(state, branch.cond, input);
                 } finally {
                     state.protectedDepth--;
                 }
                 if (condition !== 0) continue;
-                return runCommandList(state, branch.body, null);
+                return runCommandList(state, branch.body, input);
             }
-            if (command.else_ !== undefined) return runCommandList(state, command.else_, null);
+            if (command.else_ !== undefined) return runCommandList(state, command.else_, input);
             return 0;
             });
         case 'for':
@@ -2399,7 +2418,7 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
             for (const item of items) {
                 setVar(state, command.name, item);
                 try {
-                    status = runCommandList(state, command.body, null);
+                    status = runCommandList(state, command.body, input);
                 } catch (error) {
                     if (error instanceof BreakSignal) {
                         if (error.count > 1) throw new BreakSignal(error.count - 1);
@@ -2421,14 +2440,14 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                 state.protectedDepth++;
                 let condition = 0;
                 try {
-                    condition = runCommandList(state, command.cond, null);
+                    condition = runCommandList(state, command.cond, input);
                 } finally {
                     state.protectedDepth--;
                 }
                 const proceed = command.negate ? condition !== 0 : condition === 0;
                 if (!proceed) break;
                 try {
-                    status = runCommandList(state, command.body, null);
+                    status = runCommandList(state, command.body, input);
                 } catch (error) {
                     if (error instanceof BreakSignal) {
                         if (error.count > 1) throw new BreakSignal(error.count - 1);
@@ -2455,17 +2474,17 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                     }
                 }
                 if (!matched) continue;
-                return runCommandList(state, item.body, null);
+                return runCommandList(state, item.body, input);
             }
             return 0;
             });
         case 'group':
-            return runCompoundRedirected(state, command, input, () => runCommandList(state, command.body, null));
+            return runCompoundRedirected(state, command, input, () => runCommandList(state, command.body, input));
         case 'subshell':
             return runCompoundRedirected(state, command, input, () => {
             const snapshot = snapshotState(state);
             try {
-                return runCommandList(state, command.body, null);
+                return runCommandList(state, command.body, input);
             } catch (error) {
                 // `exit` inside ( ) leaves the subshell, not the script
                 if (error instanceof ExitSignal) return error.code;
