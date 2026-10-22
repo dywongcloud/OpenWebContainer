@@ -534,6 +534,18 @@ function utf8PendingLength(bytes) {
     }
     return 0;
 }
+/*
+ * A string as a host's UTF-8 encoder writes it, which is the only place the two differ: a host
+ * encodes each write on its own, so a lone surrogate -- the half of a pair whose other half is in
+ * another write, or one written alone -- comes out as one replacement character and not as the three
+ * bytes of its own escape, which is what this engine's transport would make of it and which would
+ * come back as three replacement characters. A string with no surrogate in it comes back as it is.
+ */
+var HAS_SURROGATE = /[\ud800-\udfff]/;
+function utf8LossyText(text) {
+    if (!HAS_SURROGATE.test(text)) return text;
+    return Buffer.from(text, 'utf8').toString('utf8');
+}
 function makeStdioStream(fd, writeText) {
     function SyncWriteStream() {}
     var proto = Object.create(Writable.prototype);
@@ -558,8 +570,13 @@ function makeStdioStream(fd, writeText) {
     function writeChunk(chunk) {
         var bytes = stdioChunkBytes(chunk);
         if (bytes === null) {
-            writeOutPending();
-            writeText(chunk);
+            /* A write of no text at all emits nothing, so it puts nothing behind the bytes that are
+               being kept and leaves them for the write that finishes the character: an empty string
+               is not a write of text and must not flush. */
+            if (chunk.length !== 0) {
+                writeOutPending();
+                writeText(utf8LossyText(chunk));
+            }
             return;
         }
         if (pendingBytes !== null) {
