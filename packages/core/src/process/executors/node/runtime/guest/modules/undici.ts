@@ -1089,6 +1089,19 @@ function wsSendFrame(ws, opcode, payload) {
   return true;
 }
 
+/*
+ * A frame the program asked to send, which is the only kind bufferedAmount counts: the bytes stand
+ * against the socket until the write has been taken, so a read in the same turn as the send() -- the
+ * way a program that sends and then looks -- reports them, and a read after a turn does not. Control
+ * frames the container answers with are not the program's, and are not counted.
+ */
+function wsWrite(ws, opcode, payload) {
+  var state = wsState(ws);
+  state.bufferedAmount += payload.length;
+  wsSendFrame(ws, opcode, payload);
+  setTimeout(function () { state.bufferedAmount = 0; }, 0);
+}
+
 function wsCloseBody(code, reason) {
   var text = typeof reason === 'string' ? reason : '';
   var body = Buffer.alloc(2 + Buffer.byteLength(text));
@@ -1235,7 +1248,14 @@ function wsDeliverMessage(ws, opcode, bytes) {
       wsFail(ws);
       return;
     }
+    /*
+     * A text frame is read the way Node reads one: a leading byte-order mark is dropped, the way a
+     * TextDecoder with ignoreBOM false reads a stream, so ef bb bf at the head of a message -- or at
+     * the head of the first fragment of one -- never reaches the program. Only one is dropped, so a
+     * second still does, which is what Node delivers for a message carrying two.
+     */
     data = bytes.toString('utf8');
+    if (data.charCodeAt(0) === 0xfeff) data = data.slice(1);
   } else if (ws.binaryType === 'arraybuffer') {
     data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   } else if (ws.binaryType === 'nodebuffer' || ws.binaryType === 'buffer') {
@@ -1256,8 +1276,20 @@ function wsHandleFrame(ws, fin, opcode, payload) {
      * carrying no payload at all is the exception: it names no code, which is the 1005 Node
      * settles on cleanly.
      */
-    if (payload.length === 1 || (payload.length >= 2 && !wsCloseCodeOk(payload.readUInt16BE(0)))) {
-      wsFail(ws);
+    if (payload.length === 1) {
+      wsProtocolFail(ws, 1002, 'Received close frame with a 1-byte body.');
+      return;
+    }
+    if (payload.length >= 2 && !wsCloseCodeOk(payload.readUInt16BE(0))) {
+      wsProtocolFail(ws, 1002, 'Invalid status code');
+      return;
+    }
+    /*
+     * A close reason that is not UTF-8, which is a 1007 and not a 1002: the payload is text and the
+     * text is wrong, not the frame around it.
+     */
+    if (payload.length > 2 && !wsUtf8Ok(payload.slice(2))) {
+      wsProtocolFail(ws, 1007, 'Invalid UTF-8');
       return;
     }
     var code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
@@ -1303,6 +1335,54 @@ function wsFeed(ws, buf) {
     var masked = (b1 & 0x80) !== 0;
     var len = b1 & 0x7f;
     var at = 2;
+    /*
+     * A frame the peer may not send, each of which Node answers with a 1002 close and then a failed
+     * connection rather than reading past it. A server's frames are never masked -- only a client's
+     * are -- so a masked one is refused outright, before its payload is even looked at.
+     */
+    if (masked) {
+      wsProtocolFail(ws, 1002, 'Frame cannot be masked');
+      return buf;
+    }
+    /*
+     * The three reserved bits: RSV1 is the one a permessage-deflate extension would set, so it has a
+     * message of its own, and RSV2 and RSV3 share the other.
+     */
+    if ((b0 & 0x40) !== 0) {
+      wsProtocolFail(ws, 1002, 'Expected RSV1 to be clear.');
+      return buf;
+    }
+    if ((b0 & 0x30) !== 0) {
+      wsProtocolFail(ws, 1002, 'RSV1, RSV2, RSV3 must be clear');
+      return buf;
+    }
+    var frags = wsState(ws).frags.length;
+    if (opcode >= 0x8) {
+      /* a control frame may carry no more than 125 bytes and may never be fragmented */
+      if (!fin) {
+        wsProtocolFail(ws, 1002, 'Invalid frame type was fragmented.');
+        return buf;
+      }
+      if (len > 125) {
+        wsProtocolFail(ws, 1002, 'Control frame either too large or fragmented');
+        return buf;
+      }
+      if (opcode !== 0x8 && opcode !== 0x9 && opcode !== 0xa) {
+        wsProtocolFail(ws, 1002, 'Invalid opcode received');
+        return buf;
+      }
+    } else if (opcode !== 0x0 && opcode !== 0x1 && opcode !== 0x2) {
+      wsProtocolFail(ws, 1002, 'Invalid opcode received');
+      return buf;
+    } else if (opcode === 0x0 && frags === 0) {
+      /* a continuation with nothing to continue */
+      wsProtocolFail(ws, 1002, 'Unexpected continuation frame');
+      return buf;
+    } else if (opcode !== 0x0 && frags > 0) {
+      /* a new message started while the last one was still fragmented */
+      wsProtocolFail(ws, 1002, 'Expected continuation frame');
+      return buf;
+    }
     if (len === 126) {
       if (buf.length < 4) return buf;
       len = buf.readUInt16BE(2);
@@ -1349,6 +1429,12 @@ function wsSocketGone(ws) {
     wsSettle(ws, state.closeReceived, state.closeReceivedReason, true);
     return;
   }
+  /*
+   * A connection that ended without a close frame: the socket itself is already gone, so Node
+   * reports the failure on a socket that is already CLOSED -- a handler reads readyState 3, not the
+   * OPEN it had while the connection was still up -- and settles it as the abnormal 1006.
+   */
+  state.readyState = WS_CLOSED;
   if (wsListenerCount(ws, 'error') > 0) wsEmit(ws, 'error', wsErrorEvent(ws));
   wsSettle(ws, 1006, '', false);
 }
@@ -1360,6 +1446,16 @@ function wsFail(ws) {
   state.readyState = WS_CLOSED;
   if (wsListenerCount(ws, 'error') > 0) wsEmit(ws, 'error', wsErrorEvent(ws));
   wsSettle(ws, 1006, '', false);
+}
+
+/*
+ * A frame the protocol does not allow. Node does not just drop the connection: it tells the peer
+ * why with a close frame -- 1002 for a frame that is malformed or a close code a peer may not send,
+ * 1007 when the payload that is wrong is a close reason -- and only then fails the connection.
+ */
+function wsProtocolFail(ws, code, reason) {
+  wsSendFrame(ws, 0x8, wsCloseBody(code, reason));
+  wsFail(ws);
 }
 
 /*
@@ -1503,11 +1599,12 @@ function wsProtocols(protocols) {
   return out;
 }
 
-function WebSocket(url, protocols) {
-  if (!(this instanceof WebSocket)) return new WebSocket(url, protocols);
+function WebSocket(url) {
+  if (!(this instanceof WebSocket)) return new WebSocket(url, arguments[1]);
   var EventEmitter = requireBuiltin('events');
   var self = this;
   if (arguments.length < 1) throw new TypeError('WebSocket constructor: 1 argument required, but 0 found.');
+  var protocols = arguments[1];
   var offered = wsProtocols(protocols);
   var href = wsParseUrl(url);
   var parsed = new globalThis.URL(href);
@@ -1571,6 +1668,15 @@ function WebSocket(url, protocols) {
         return;
       }
       state.protocol = negotiated;
+    } else if (offered.length > 0) {
+      /*
+       * The other half of the same rule: a client that sent a Sec-WebSocket-Protocol and got no
+       * Sec-WebSocket-Protocol back also fails. Node reads the request's own list and asks whether
+       * the answer is in it, so with nothing answered there is nothing to be in it, and the socket
+       * never opens -- it does not settle for no subprotocol.
+       */
+      wsFail(self);
+      return;
     }
     var negotiatedExtensions = res.headers['sec-websocket-extensions'];
     if (negotiatedExtensions !== undefined && negotiatedExtensions !== null) {
@@ -1641,22 +1747,30 @@ WebSocket.prototype = Object.create(WS_EVENT_BASE);
 Object.defineProperty(WebSocket.prototype, 'constructor', { value: WebSocket, writable: true, configurable: true });
 Object.defineProperty(WebSocket.prototype, Symbol.toStringTag, { value: 'WebSocket', configurable: true });
 
-WebSocket.prototype.close = function close(code, reason) {
-  if (this.readyState === WS_CLOSED || this.readyState === WS_CLOSING) return;
+WebSocket.prototype.close = function close() {
+  var code = arguments[0];
+  var reason = arguments[1];
   var num = code === undefined ? 1000 : wsCloseCodeOf(code);
   /*
    * The code is validated before the reason: a close carrying both an invalid code and an over-long
-   * reason is an invalid code, which is the order Node checks them in.
+   * reason is an invalid code, which is the order Node checks them in. Both are checked before the
+   * state is, so a second close() on a socket that is already closing still reports a code that is
+   * not one, instead of being the no-op a socket in that state otherwise is.
    */
   if (num !== 1000 && (num < 3000 || num > 4999)) throw wsDomError('invalid code', 'InvalidAccessError');
   var text = reason === undefined ? '' : String(reason);
   var bytes = Buffer.byteLength(text, 'utf8');
   if (bytes > 123) throw wsDomError('Reason must be less than 123 bytes; received ' + bytes, 'SyntaxError');
+  if (this.readyState === WS_CLOSED || this.readyState === WS_CLOSING) return;
   var state = wsState(this);
   state.closeCode = num;
   state.closeReason = text;
   state.readyState = WS_CLOSING;
-  wsSendFrame(this, 0x8, wsCloseBody(num, text));
+  /*
+   * A close() that names no code sends a close frame with no body, not one carrying 1000: the peer
+   * reads no code from it and the socket settles on 1005, which is what Node puts on the wire.
+   */
+  wsSendFrame(this, 0x8, arguments.length === 0 ? Buffer.alloc(0) : wsCloseBody(num, text));
 };
 
 WebSocket.prototype.send = function send(data) {
@@ -1665,6 +1779,11 @@ WebSocket.prototype.send = function send(data) {
    * DOMException InvalidStateError rather than a state message of its own. Once the socket is
    * closing or closed a send is dropped on the floor: no throw, nothing written, no return value.
    */
+  /*
+   * No argument at all is an arity error and not a send of 'undefined': Node's webidl layer counts
+   * the arguments before anything else looks at them.
+   */
+  if (arguments.length < 1) throw new TypeError('WebSocket.send: 1 argument required, but 0 found.');
   if (this.readyState === WS_CONNECTING) throw wsDomError('Sent before connected.', 'InvalidStateError');
   if (this.readyState !== WS_OPEN) return;
   var payload;
@@ -1681,14 +1800,21 @@ WebSocket.prototype.send = function send(data) {
   } else if (data instanceof ArrayBuffer) {
     payload = Buffer.from(new Uint8Array(data));
     opcode = 0x2;
+  } else if (typeof globalThis.Blob === 'function' && data instanceof globalThis.Blob) {
+    /*
+     * A Blob is binary, and its bytes are only reachable through a promise, so the frame is written
+     * when they arrive: an op2 carrying the Blob's contents, not the op1 'String(blob)' would give.
+     */
+    var self = this;
+    data.arrayBuffer().then(function (ab) {
+      wsWrite(self, 0x2, Buffer.from(new Uint8Array(ab)));
+    });
+    return;
   } else {
     payload = Buffer.from(String(data), 'utf8');
     opcode = 0x1;
   }
-  var state = wsState(this);
-  state.bufferedAmount += payload.length;
-  wsSendFrame(this, opcode, payload);
-  state.bufferedAmount = 0;
+  wsWrite(this, opcode, payload);
 };
 
 WebSocket.CONNECTING = WS_CONNECTING;
@@ -1700,7 +1826,19 @@ WebSocket.CLOSED = WS_CLOSED;
  * The attributes, each a prototype accessor over state a program cannot see, declared in the order
  * Node declares them: both a for-in and Object.getOwnPropertyNames read that order back.
  */
+/* A function under the name Node's own accessors carry, which a program can read back off .name. */
+function wsNamed(name, fn) {
+  Object.defineProperty(fn, 'name', { value: name, configurable: true });
+  return fn;
+}
+
 function wsAttribute(name, read) {
+  /*
+   * The accessor's own name, which is what a program reads off 'Object.getOwnPropertyDescriptor(...
+   * ).get.name': Node declares each attribute as 'get readyState' and friends, and a function built
+   * here would otherwise be named after the variable it was passed in.
+   */
+  Object.defineProperty(read, 'name', { value: 'get ' + name, configurable: true });
   Object.defineProperty(WebSocket.prototype, name, { configurable: true, enumerable: true, get: read });
 }
 
@@ -1718,16 +1856,16 @@ wsAttribute('protocol', function () { return wsState(this).protocol; });
            assigned reads null rather than the undefined a plain slot would give. */
         configurable: true,
         enumerable: true,
-        get: function () {
+        get: wsNamed('get on' + name, function () {
           var fn = wsState(this).handlers[name];
           return typeof fn === 'function' ? fn : null;
-        },
-        set: function (fn) {
+        }),
+        set: wsNamed('set on' + name, function (fn) {
           var handlers = wsState(this).handlers;
           if (typeof handlers[name] === 'function') wsOff(this, name, handlers[name]);
           handlers[name] = typeof fn === 'function' ? fn : null;
           if (typeof fn === 'function') wsOn(this, name, fn);
-        }
+        })
       });
     })(WS_HANDLERS[i]);
   }
@@ -1738,8 +1876,8 @@ wsAttribute('protocol', function () { return wsState(this).protocol; });
   Object.defineProperty(WebSocket.prototype, 'binaryType', {
     configurable: true,
     enumerable: true,
-    get: function () { return wsState(this).binaryType === 'arraybuffer' ? 'arraybuffer' : 'blob'; },
-    set: function (value) { wsState(this).binaryType = value === 'arraybuffer' ? 'arraybuffer' : 'blob'; }
+    get: wsNamed('get binaryType', function () { return wsState(this).binaryType === 'arraybuffer' ? 'arraybuffer' : 'blob'; }),
+    set: wsNamed('set binaryType', function (value) { wsState(this).binaryType = value === 'arraybuffer' ? 'arraybuffer' : 'blob'; })
   });
   /* the four states are readable off an instance, not only off the class */
   var states = { CONNECTING: WS_CONNECTING, OPEN: WS_OPEN, CLOSING: WS_CLOSING, CLOSED: WS_CLOSED };
