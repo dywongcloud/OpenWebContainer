@@ -1598,8 +1598,11 @@ class Parser {
                 continue;
             }
             if (this.here() === ';') {
+                /* No body is read here: a here-document's body starts on the line behind the one its
+                   `<<` is on, so the `;` that ends `cat <<EOF1; cat <<EOF2` still has a second `<<`
+                   to parse before either body can be read -- reading it now took ` cat <<EOF2` and
+                   `a` as the body of the first, and left the real first body for the second. */
                 this.pos++;
-                this.readHeredocs();
                 continue;
             }
             if (this.here() === '&') {

@@ -669,12 +669,19 @@ const KILL_USAGE = [
     '       kill -signal_number pid ...'
 ].join('\n');
 
+/* `kill` with nothing to signal is bash's own one-line usage and status 1 -- `kill $!` before any
+   job has started, on a host where `$!` expands to nothing at all. The four-line usage above is
+   what `kill -l` with a bad argument prints, which is a different failure. */
+const KILL_NO_ARGS_USAGE =
+    'kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]';
+
 const kill: ShellCommand = (ctx) => {
     const args = ctx.args;
-    if (args.length === 0) return fail(KILL_USAGE, 2);
+    if (args.length === 0) return fail(KILL_NO_ARGS_USAGE, 1);
     if (args[0] === '-l' || (args[0].startsWith('-') && args[0].includes('l') && args.length === 1 && /^-[A-Za-z]*l[A-Za-z]*$/.test(args[0]))) {
         const arg = args[1];
-        if (arg === undefined) return out(signalList(false));
+        // `kill -l` names every signal the host knows on one line, 31 of them, never wrapped.
+        if (arg === undefined) return out(signalList(false, SIGNAL_NAMES.length));
         const n = Number(arg);
         if (!Number.isFinite(n)) return fail(KILL_USAGE, 2);
         const sig = n > 128 ? n - 128 : n;
@@ -700,6 +707,9 @@ const kill: ShellCommand = (ctx) => {
             signal = word;
             i = 1;
         }
+        /* bash 3.2 refuses the `SIG` prefix outright, so `kill -SIGTERM` and `kill -s SIGTERM` are
+           both `kill: SIGTERM: invalid signal specification` with status 1 -- not a name it looks up. */
+        if (/^SIG/i.test(signal)) return fail(`kill: ${signal}: invalid signal specification`, 1);
         const resolved = resolveSignal(signal);
         if (!resolved) {
             return fail(`kill: unknown signal ${signal}; valid signals:\n${signalList(false)}`, 2);
