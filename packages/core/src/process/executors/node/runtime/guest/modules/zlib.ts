@@ -385,13 +385,31 @@ BF['zlib'] = function () {
         callback();
         return;
       }
+      /*
+       * Which call this chunk is. A write is the codec's own default and the finish is the last
+       * one -- but Node hands the finish over as soon as the chunk it is processing is the only
+       * one left in the queue, not only once the stream ends: writableEnded with nothing behind
+       * this chunk. So a stream fed more than once finishes during a write, and then again when it
+       * ends. zstd is where that shows: its second finish is a whole empty frame, nine bytes,
+       * which a stream fed in one piece never carries. A deflate or brotli finish past the end
+       * produces nothing, so there the extra call is invisible.
+       */
+      var op = ops.write;
+      if (this.writableEnded && this.writableLength === chunk.byteLength) op = ops.finish;
       try {
-        pushCodec(this, ops.write, bytes);
+        pushCodec(this, op, bytes);
       } catch (err) {
         callback(err);
         return;
       }
-      callback();
+      /*
+       * Answered on a later turn, as the host's zlib does: its write finishes on the thread pool,
+       * so a chunk queued behind this one is not handed to the library until after the call that
+       * ended the stream -- which is what makes the finish flag above ever true. Answering here
+       * instead drains every queued write before the end is seen, and a stream fed more than once
+       * then never finishes early.
+       */
+      setImmediateImpl(callback);
     };
 
     ZlibStream.prototype._flush = function (callback) {
