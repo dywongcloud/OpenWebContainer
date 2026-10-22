@@ -12,6 +12,12 @@ export interface HostBridgeDeps {
     pid: number;
     argv: string[];
     env: Record<string, string>;
+    /**
+     * Publishes the environment the guest has made its own back to the host, so a child this process
+     * spawns inherits it: `process.env.X = v` at run time is a change to this process's environment,
+     * and on the host a later spawn hands that value down. `setEnvJSON` is the guest's side of it.
+     */
+    setEnv: (json: string) => void;
     cwd: () => string;
     /** Changes the process's working directory; returns '' or an fs error code. */
     chdir: (path: string) => string;
@@ -55,6 +61,18 @@ class FsCodeError extends Error {
         super(code);
     }
 }
+
+/**
+ * How many cpus the machine running the container has, which is what `os.cpus()` and
+ * `os.availableParallelism()` count. A container is not given cpus of its own: it sees the ones
+ * under it, and `navigator.hardwareConcurrency` is the number both a browser worker and a host
+ * Node process answer. One is the floor when neither will say.
+ */
+const CPU_COUNT: number = (() => {
+    const nav = (globalThis as { navigator?: { hardwareConcurrency?: unknown } }).navigator;
+    const n = nav === undefined ? undefined : nav.hardwareConcurrency;
+    return typeof n === 'number' && n > 0 && isFinite(n) ? Math.floor(n) : 1;
+})();
 
 /**
  * Builds the `host` object the guest bootstrap receives. Every function returns a
@@ -172,7 +190,21 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
     define('pid', () => context.newNumber(deps.pid));
     define('argvJSON', () => context.newString(JSON.stringify(deps.argv)));
     define('envJSON', () => context.newString(JSON.stringify(deps.env)));
+    /**
+     * The guest's environment, written back: `process.env.X = v` (and `delete process.env.X`) lands
+     * here, on the object `envJSON` hands out and on the process's own record of it, which is what a
+     * spawn reads. A child therefore inherits the environment its parent has at the moment it is
+     * spawned, as it does on the host, rather than the one the container booted with.
+     */
+    define('setEnvJSON', (json) => {
+        const next: Record<string, string> = JSON.parse(text(json));
+        for (const name of Object.keys(deps.env)) delete deps.env[name];
+        Object.assign(deps.env, next);
+        deps.setEnv(text(json));
+        return context.undefined;
+    });
     define('now', () => context.newNumber(deps.now()));
+    define('cpuCount', () => context.newNumber(CPU_COUNT));
     define('randomBase64', (size) => {
         const bytes = new Uint8Array(context.getNumber(size));
         crypto.getRandomValues(bytes);

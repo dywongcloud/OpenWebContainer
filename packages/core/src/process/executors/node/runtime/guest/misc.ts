@@ -50,8 +50,8 @@ BF.os = function () {
     endianness: function () { return 'LE'; },
     /*
      * One entry per cpu the machine under the container has, which is what a container sees: it is
-     * not given cpus of its own. The count is the host's `navigator.hardwareConcurrency`, asked for
-     * through the bridge, so `os.cpus().length` and `os.availableParallelism()` agree with it and
+     * not given cpus of its own. The count is the host's navigator.hardwareConcurrency, asked for
+     * through the bridge, so os.cpus().length and os.availableParallelism() agree with it and
      * with each other, as they do on the host. An empty list, which this was, makes a package that
      * divides by the cpu count divide by zero and one that sizes a worker pool by it size it at 0.
      */
@@ -68,8 +68,8 @@ BF.os = function () {
       return out;
     },
     availableParallelism: function () { return host.cpuCount(); },
-    /* os.version is the release string `uname -v` prints; os.machine is what `uname -m` prints, which
-       for this container's own architecture (x64, the `process.arch` it reports) is x86_64. */
+    /* os.version is the release string uname -v prints; os.machine is what uname -m prints, which
+       for this container's own architecture (x64, the process.arch it reports) is x86_64. */
     version: function () { return '#1 SMP PREEMPT_DYNAMIC Mon Jan 1 00:00:00 UTC 2024'; },
     machine: function () { return 'x86_64'; },
     totalmem: function () { return 4294967296; },

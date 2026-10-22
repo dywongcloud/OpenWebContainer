@@ -14,17 +14,17 @@ export const GLOBALS_SRC = String.raw`
 var EventEmitterCls = requireBuiltin('events');
 var envStore = JSON.parse(host.envJSON());
 /*
- * Node's own `process.env` is not a plain object: its prototype is an object of node's that is not
- * `Object.prototype`, and a package that asks which it is gets the answer the host gives. An empty
+ * Node's own process.env is not a plain object: its prototype is an object of node's that is not
+ * Object.prototype, and a package that asks which it is gets the answer the host gives. An empty
  * object stands in for it, so the properties still read, write and enumerate as an ordinary
- * object's do while `Object.getPrototypeOf(process.env) === Object.prototype` is false, as on the
+ * object's do while Object.getPrototypeOf(process.env) === Object.prototype is false, as on the
  * host.
  */
 var ENV_PROTO = {};
 Object.setPrototypeOf(envStore, ENV_PROTO);
 /*
  * A write to the environment is a change to *this process's* environment, and on the host that is
- * what a child inherits: `process.env.X = v` followed by a spawn hands `X` down. Publishing the
+ * what a child inherits: process.env.X = v followed by a spawn hands X down. Publishing the
  * whole object after each write is what keeps the host's copy -- the one a spawn reads -- in step;
  * a symbol key is left alone, because no environment variable has one.
  */
@@ -54,11 +54,11 @@ Object.defineProperty(proc, Symbol.toStringTag, { value: 'process', configurable
 proc.features = {};
 /*
  * The flags node 24.15 accepts in NODE_OPTIONS, as the Set process.allowedNodeEnvironmentFlags is:
- * a package asks `has()` of it before it puts a flag in the options it spawns with, and an
+ * a package asks has() of it before it puts a flag in the options it spawns with, and an
  * undefined here made that ask throw. The list is the one that node's own build reports, written
  * out rather than generated, because no guest can ask the node it models what it accepts.
  */
-var ENV_FLAGS = ''.split(' ');
+var ENV_FLAGS = '--abort-on-uncaught-exception --addons --allow-addons --allow-child-process --allow-fs-read --allow-fs-write --allow-inspector --allow-wasi --allow-worker --async-context-frame --conditions --cpu-prof --cpu-prof-dir --cpu-prof-interval --cpu-prof-name --debug-arraybuffer-allocations --debug-port --deprecation --diagnostic-dir --disable-proto --disable-sigusr1 --disable-warning --disable-wasm-trap-handler --disallow-code-generation-from-strings --dns-result-order --enable-etw-stack-walking --enable-fips --enable-network-family-autoselection --enable-source-maps --entry-url --es-module-specifier-resolution --experimental-abortcontroller --experimental-addon-modules --experimental-detect-module --experimental-eventsource --experimental-fetch --experimental-global-customevent --experimental-global-navigator --experimental-global-webcrypto --experimental-import-meta-resolve --experimental-json-modules --experimental-loader --experimental-modules --experimental-print-required-tla --experimental-quic --experimental-repl-await --experimental-report --experimental-require-module --experimental-shadow-realm --experimental-specifier-resolution --experimental-sqlite --experimental-strip-types --experimental-test-isolation --experimental-top-level-await --experimental-transform-types --experimental-vm-modules --experimental-wasi-unstable-preview1 --experimental-wasm-modules --experimental-websocket --experimental-webstorage --experimental-worker --expose-gc --extra-info-on-fatal-exception --force-async-hooks-checks --force-context-aware --force-fips --force-node-api-uncaught-exceptions-policy --frozen-intrinsics --global-search-paths --heap-prof --heap-prof-dir --heap-prof-interval --heap-prof-name --heapsnapshot-near-heap-limit --heapsnapshot-signal --http-parser --icu-data-dir --import --input-type --insecure-http-parser --inspect --inspect-brk --inspect-port --inspect-publish-uid --inspect-wait --interpreted-frames-native-stack --jitless --loader --localstorage-file --max-heap-size --max-http-header-size --max-old-space-size --max-old-space-size-percentage --max-semi-space-size --napi-modules --network-family-autoselection --network-family-autoselection-attempt-timeout --no-addons --no-allow-addons --no-allow-child-process --no-allow-inspector --no-allow-wasi --no-allow-worker --no-async-context-frame --no-cpu-prof --no-debug-arraybuffer-allocations --no-deprecation --no-disable-sigusr1 --no-disable-wasm-trap-handler --no-enable-fips --no-enable-source-maps --no-entry-url --no-experimental-addon-modules --no-experimental-detect-module --no-experimental-eventsource --no-experimental-global-navigator --no-experimental-import-meta-resolve --no-experimental-print-required-tla --no-experimental-repl-await --no-experimental-require-module --no-experimental-shadow-realm --no-experimental-sqlite --no-experimental-transform-types --no-experimental-vm-modules --no-experimental-websocket --no-experimental-webstorage --no-extra-info-on-fatal-exception --no-force-async-hooks-checks --no-force-context-aware --no-force-fips --no-force-node-api-uncaught-exceptions-policy --no-frozen-intrinsics --no-global-search-paths --no-heap-prof --no-insecure-http-parser --no-inspect --no-inspect-brk --no-inspect-wait --no-network-family-autoselection --no-node-snapshot --no-openssl-legacy-provider --no-openssl-shared-config --no-pending-deprecation --no-permission --no-preserve-symlinks --no-preserve-symlinks-main --no-report-compact --no-report-exclude-env --no-report-exclude-network --no-report-on-fatalerror --no-report-on-signal --no-report-uncaught-exception --no-require-module --no-strip-types --no-test-only --no-throw-deprecation --no-tls-max-v1.2 --no-tls-max-v1.3 --no-tls-min-v1.0 --no-tls-min-v1.1 --no-tls-min-v1.2 --no-tls-min-v1.3 --no-trace-deprecation --no-trace-env --no-trace-env-js-stack --no-trace-env-native-stack --no-trace-exit --no-trace-promises --no-trace-sigint --no-trace-sync-io --no-trace-tls --no-trace-uncaught --no-trace-warnings --no-track-heap-objects --no-use-bundled-ca --no-use-env-proxy --no-use-openssl-ca --no-use-system-ca --no-verify-base-objects --no-warnings --no-watch --no-watch-preserve-output --no-zero-fill-buffers --node-memory-debug --node-snapshot --openssl-config --openssl-legacy-provider --openssl-shared-config --pending-deprecation --perf-basic-prof --perf-basic-prof-only-functions --perf-prof --perf-prof-unwinding-info --permission --preserve-symlinks --preserve-symlinks-main --prof-process --redirect-warnings --report-compact --report-dir --report-directory --report-exclude-env --report-exclude-network --report-filename --report-on-fatalerror --report-on-signal --report-signal --report-uncaught-exception --require --require-module --secure-heap --secure-heap-min --snapshot-blob --stack-trace-limit --strip-types --test-coverage-branches --test-coverage-exclude --test-coverage-functions --test-coverage-include --test-coverage-lines --test-global-setup --test-isolation --test-name-pattern --test-only --test-reporter --test-reporter-destination --test-rerun-failures --test-shard --test-skip-pattern --throw-deprecation --title --tls-cipher-list --tls-keylog --tls-max-v1.2 --tls-max-v1.3 --tls-min-v1.0 --tls-min-v1.1 --tls-min-v1.2 --tls-min-v1.3 --trace-deprecation --trace-env --trace-env-js-stack --trace-env-native-stack --trace-event-categories --trace-event-file-pattern --trace-events-enabled --trace-exit --trace-promises --trace-require-module --trace-sigint --trace-sync-io --trace-tls --trace-uncaught --trace-warnings --track-heap-objects --unhandled-rejections --use-bundled-ca --use-env-proxy --use-largepages --use-openssl-ca --use-system-ca --v8-pool-size --verify-base-objects --warnings --watch --watch-kill-signal --watch-path --watch-preserve-output --zero-fill-buffers -C -r'.split(' ');
 proc.allowedNodeEnvironmentFlags = new Set(ENV_FLAGS);
 /*
  * Two internal bindings are provided: 'constants', which packages such as tmp read at load time,
@@ -407,9 +407,9 @@ function makeStdioStream(writeText) {
   EventEmitterCls.call(stream);
   /*
    * No terminal is attached, and a stream node has with no terminal behind it has *no* isTTY and
-   * *no* columns: a host run with its output piped reports `undefined` for both, not false and 80.
-   * The difference is observable -- `columns || 80` never falls back here, and a library that reads
-   * `isTTY` to decide whether it is talking to a person is answered with a value that says it is
+   * *no* columns: a host run with its output piped reports undefined for both, not false and 80.
+   * The difference is observable -- columns || 80 never falls back here, and a library that reads
+   * isTTY to decide whether it is talking to a person is answered with a value that says it is
    * not rather than with nothing. Both are left off the stream, as a piped host leaves them off.
    */
   stream.write = function (chunk, encoding, callback) {

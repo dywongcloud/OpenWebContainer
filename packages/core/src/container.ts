@@ -14,7 +14,7 @@ import { ServerType, VirtualServer } from "./network/types";
 import { NetworkStats } from "./network/types";
 import { HostRequest } from "process/executors/node/modules/network-module";
 import { setProcessHost } from "./shell/commands/procinfo";
-import { NODE_BINARY } from "./process/executors/default-env";
+import { CONTAINER_WORKDIR, NODE_BINARY } from "./process/executors/default-env";
 
 
 interface ProcessEventData {
@@ -310,7 +310,7 @@ export class OpenWebContainer {
     }
 
     async spawn(executablePath: string, args: string[] = [], parentPid?: number,options: SpawnOptions = {}): Promise<Process> {
-        const cwd = options.cwd || '/';
+        const cwd = options.cwd || CONTAINER_WORKDIR;
         /* The container's own interpreter: a spawn naming `process.execPath` runs node itself and
            not the file that stands at that path for a search of PATH to find -- the same mapping a
            guest's `child_process` makes, and the one that stops the shim's own shebang from running
@@ -536,11 +536,14 @@ export class OpenWebContainer {
                        after the await above returns, which would drop everything it wrote. */
                     beforeStart: (child) => {
                         /* What the parent piped in: written once the child can take it, which is after
-                           it is running, and followed by end of file, as it is in a shell. */
-                        if (stdin !== undefined && stdin !== '') {
+                           it is running, and followed by end of file, as it is in a shell. An empty
+                           string is a pipe the writer closed without writing -- `printf '' | node` --
+                           and is followed by that end of file too: a reader waiting on its input has
+                           to see it, or it waits forever for bytes that are never coming. */
+                        if (stdin !== undefined) {
                             const pipeStdin = () => {
                                 try {
-                                    child.writeInput(stdin);
+                                    if (stdin !== '') child.writeInput(stdin);
                                     child.endStdin();
                                 } catch {
                                     /* a process that reads no input is exactly as it was */

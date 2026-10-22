@@ -7,6 +7,16 @@
 export const NODE_BINARY = '/usr/local/bin/node';
 
 /**
+ * The directory a process starts in when the caller named none: a container's working directory,
+ * which is where its project is put (`/app`, as the node image that runs one has it). It is what
+ * the host's "the directory you started me in" is here -- a host process started with no `cwd`
+ * inherits the one it was launched from, and `/` answered nothing a relative path could land in,
+ * so `process.cwd()` and a shell `pwd` both said `/` where a host names the project's directory.
+ * A `cwd` option and a `cd` are honoured over it, as they are on the host.
+ */
+export const CONTAINER_WORKDIR = '/app';
+
+/**
  * The environment a container process starts with, wherever it is built: a shell's and a node
  * process's are the same set, so the two cannot drift apart.
  *
@@ -37,7 +47,7 @@ export const CONTAINER_ENV: ReadonlyArray<readonly [string, string]> = [
  */
 export function containerEnv(cwd: string | undefined, overrides: Record<string, string> = {}): Map<string, string> {
     const env = new Map<string, string>(CONTAINER_ENV);
-    env.set('PWD', cwd || '/');
+    env.set('PWD', cwd || CONTAINER_WORKDIR);
     for (const [name, value] of Object.entries(overrides)) env.set(name, value);
     return env;
 }

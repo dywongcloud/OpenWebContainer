@@ -5,6 +5,7 @@ import { IFileSystem } from '../../../filesystem';
 import { NetworkManager } from '../../../network/manager';
 import { RuntimeServices } from './runtime/services';
 import { NodeRunOptions, nodeCommand } from './flags';
+import { CONTAINER_WORKDIR } from '../default-env';
 
 export class NodeProcessExecutor implements ProcessExecutor {
     constructor(
@@ -18,7 +19,7 @@ export class NodeProcessExecutor implements ProcessExecutor {
     }
 
     async execute(payload: ChildProcessPayload, pid: number, parentPid?: number): Promise<Process> {
-        const cwd = payload.cwd || '/';
+        const cwd = payload.cwd || CONTAINER_WORKDIR;
         // `node <script> [args]`, `node -e <source> [args]`, `node` alone (a REPL), or a .js executable
         if (payload.executable === 'node') {
             /* What the line is: the flags node answers for itself, before anything is read as a file

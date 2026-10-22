@@ -16,7 +16,7 @@ import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbind
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs, syncRunActive } from './pump';
 import type { NodeFlagAnswer, NodeRunOptions } from './flags';
 import { NODE_VERSION } from './runtime/guest/globals';
-import { containerEnv } from '../default-env';
+import { CONTAINER_WORKDIR, containerEnv } from '../default-env';
 import type { SyncChildRequest, SyncChildResult } from './pump';
 
 const RESERVED_WORDS = new Set([
@@ -500,7 +500,7 @@ export class NodeProcess extends Process {
         this.execArgv = run.execArgv;
         this.stackTraceLimit = run.stackTraceLimit;
         this.evalScript = run.evalScript;
-        this.currentCwd = cwd || '/';
+        this.currentCwd = cwd || CONTAINER_WORKDIR;
         this.fileSystem = fileSystem;
         this.networkManager = networkManager;
         this.services = services;
@@ -1028,6 +1028,9 @@ export class NodeProcess extends Process {
             pid: this.pid,
             argv,
             env: Object.fromEntries(this.env),
+            /* The guest's `process.env.X = v` lands back here, so a child this process spawns is
+               handed the environment its parent has at that moment and not the one it booted with. */
+            setEnv: (json) => { this.env = new Map(Object.entries(JSON.parse(json) as Record<string, string>)); },
             cwd: () => this.currentCwd,
             chdir: (path) => this.changeDirectory(path),
             now: () => performance.now(),
@@ -1421,7 +1424,18 @@ export class NodeProcess extends Process {
            caret, the error -- instead of as a bare QuickJS stack naming the container's own frames. */
         const reported = this.evalScript === undefined ? message : evalFailureText(message, this.evalScript);
         this.emitGuestOutput({ stderr: reported + '\n' });
-        return 1;
+        /*
+         * The process is dying, and node runs what `process.on('exit')` registered on the way out
+         * even when it dies like this: an uncaught throw and an unhandled rejection both reach
+         * their exit handlers with status 1 after the error has been written. Nothing of the
+         * guest's own follows an exit handler -- the loop is not resumed -- but a handler that
+         * writes, which is what the observable difference is, still writes here.
+         */
+        this.safeEmitExit(1);
+        /* An exit listener may have asked for a status of its own -- `process.exit(7)` inside one,
+           which node honours -- and it is that one the process leaves with; otherwise the status of
+           a process that died like this is 1, whatever the exit handlers wrote. */
+        return this.exitRequested !== undefined ? this.exitRequested : 1;
     }
 
     /** Runs until no ref is held, process.exit runs, a fatal error occurs, or the process is stopped.

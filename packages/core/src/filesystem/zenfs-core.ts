@@ -72,11 +72,38 @@ function createScratchDirectories(): void {
  * while neither existed. Device files are not among them -- `/dev/null` is a character device on a
  * host and no file here is, so the directory is made and the devices are not.
  */
-const SYSTEM_DIRS: ReadonlyArray<string> = ['/bin', '/dev', '/etc', '/home', '/opt', '/usr/bin', '/usr/lib'];
+const SYSTEM_DIRS: ReadonlyArray<string> = ['/bin', '/dev', '/etc', '/home', '/opt', '/usr/bin', '/usr/lib', '/app'];
 
 function createSystemDirectories(): void {
     for (const dir of SYSTEM_DIRS) {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    }
+}
+
+/**
+ * The files `PATH` names for the commands a guest looks for there: `sh`, `ls`, `cat` and `echo` in
+ * `/bin` and `env` in `/usr/bin`. `PATH` listed both directories while `node` was the only file on
+ * it, so `which sh`, `which cat` and `command -v sh` all failed -- and `readdir('/bin')` was empty
+ * -- in a container that runs every one of those commands: they are built into its shell and need
+ * no file to run, but a lookup is a question about the file system, and the file system had no
+ * answer to give. Each is the script the shell would run to reach the same command, executable for
+ * the same reason the node file is: every lookup ends in `isexe`, which reads the mode bits.
+ */
+const PATH_COMMANDS: ReadonlyArray<readonly [string, string]> = [
+    ['/bin/sh', '#!/bin/sh\n'],
+    ['/bin/ls', '#!/bin/sh\nls "$@"\n'],
+    ['/bin/cat', '#!/bin/sh\ncat "$@"\n'],
+    ['/bin/echo', '#!/bin/sh\necho "$@"\n'],
+    ['/usr/bin/env', '#!/bin/sh\nenv "$@"\n']
+];
+
+function writePathCommands(): void {
+    for (const [path, script] of PATH_COMMANDS) {
+        if (fs.existsSync(path)) continue;
+        const dir = path.slice(0, path.lastIndexOf('/'));
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+        fs.writeFileSync(path, script, { mode: 0o755, encoding: 'utf-8' });
+        if ((fs.statSync(path).mode & 0o111) === 0) fs.chmodSync(path, 0o755);
     }
 }
 
@@ -91,6 +118,7 @@ export class ZenFSCore implements IFileSystem {
         installPrototypeNameFix();
         mountContainerRoot();
         writeNodeBinary();
+        writePathCommands();
         createScratchDirectories();
         createSystemDirectories();
         this.fs = fs;

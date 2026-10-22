@@ -133,6 +133,28 @@ function stripHashbang(src) {
   return src.charAt(0) === '#' && src.charAt(1) === '!' ? '//' + src.slice(2) : src;
 }
 
+/*
+ * module.paths is the list of node_modules directories a require from this file searches: one
+ * beside the file's own directory, then one beside each directory above it, out to the root. It was
+ * empty, so a package that walks it -- and one that asks module.paths.length -- found no place to
+ * look in a container that resolves through them. Relative resolution still goes through the host;
+ * this is only the list Node reports.
+ */
+function nodeModulePaths(dir) {
+  var parts = String(dir).split('/');
+  var out = [];
+  var at = '';
+  for (var i = 0; i < parts.length; i++) {
+    var part = parts[i];
+    if (part === '' || part === '.' || part === '..') continue;
+    at += '/' + part;
+    out.push(at + '/node_modules');
+  }
+  out.reverse();
+  if (String(dir).charAt(0) === '/') out.push('/node_modules');
+  return out;
+}
+
 function Module(filename, parent) {
   this.id = filename;
   this.filename = filename;
@@ -141,7 +163,7 @@ function Module(filename, parent) {
   this.parent = parent;
   this.loaded = false;
   this.children = [];
-  this.paths = [];
+  this.paths = nodeModulePaths(this.path);
 }
 
 /* require('module') exports this class, so its statics are Node's: a package that patches
@@ -161,7 +183,7 @@ Module.isBuiltin = isBuiltinName;
 Module.createRequire = function createRequire(filename) { return createRequireFor(String(filename)); };
 Module.createRequireFromPath = function createRequireFromPath(filename) { return createRequireFor(String(filename)); };
 Module._initPaths = function _initPaths() { return undefined; };
-Module._nodeModulePaths = function _nodeModulePaths() { return []; };
+Module._nodeModulePaths = function _nodeModulePaths(from) { return nodeModulePaths(from); };
 Module._preloadModules = function _preloadModules() { return undefined; };
 Module.syncBuiltinESMExports = function syncBuiltinESMExports() { return undefined; };
 Module._resolveFilename = function _resolveFilename(request, parent, isMain, options) {
@@ -196,7 +218,9 @@ function makeRequire(mod) {
     return requireFrom(mod, id);
   };
   req.resolve = function resolve(id) {
-    if (isBuiltinName(id)) return stripNodePrefix(id);
+    /* A built-in is answered with the name it was asked for: node hands back 'node:fs' for
+       'node:fs' and 'fs' for 'fs', and stripping the prefix here answered 'fs' to both. */
+    if (isBuiltinName(id)) return String(id);
     var found = host.resolve(String(id), mod.path, 'require');
     if (!found) throw notFoundError(id, mod.path, mod);
     return found;
@@ -677,7 +701,27 @@ var api = {
     return api.formatUncaught(pending.error);
   },
   runMain: function (filename) {
-    loadCJS(filename, null, true);
+    /*
+     * An exception that reaches the top of the main module ends the process -- but only after an
+     * 'uncaughtException' listener has been given it, and a listener that has been given it *keeps*
+     * the process alive: node does not exit once one has run, so what happens next is the handler's
+     * to decide (it may well call process.exit, and then that code is the status). With no listener
+     * the error goes exactly where it has always gone, out of the main module and off the end of
+     * the process, which is the fatal path that ends it with status 1.
+     */
+    var proc = globalThis.process;
+    try {
+      loadCJS(filename, null, true);
+    } catch (err) {
+      /* The listener is counted when the error is in hand, not when the module starts: a program
+         registers it at the top and throws at the bottom, so at the start there is none. */
+      if (!(proc && typeof proc.emit === 'function' && proc.listenerCount('uncaughtException') > 0)) throw err;
+      try {
+        proc.emit('uncaughtException', err);
+      } catch (again) {
+        if (again !== EXIT_SIGNAL) throw again;
+      }
+    }
   },
   fire: fireTimer,
   clearAll: function () {
