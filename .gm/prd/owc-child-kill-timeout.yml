@@ -1,0 +1,50 @@
+id: owc-child-kill-timeout
+title: 'What is left of a child that cannot be stopped: a kill with no moment attached to it. A spawn''s `timeout` now ends a guest child on time; `child.kill()` and `process.kill(pid)` still cannot reach a guest that never calls the host, and a `sh` child''s `timeout` is still ignored'
+body: |-
+  Re-measured at HEAD (local main c15e75b7a5b0d8eb2c2ebe51046335c02638e614) after the kill-deadline
+  change landed, differentially against host node v24.15.0 (npm 11.12.1) from the same directory,
+  container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, each case in its own
+  container process with stdout, stderr and the exit code captured. Machine load while measuring was
+  17-31 on 11 CPUs with 0.6-3.4 GB free, so every figure is a floor and the timings wander; the
+  shapes below were each reproduced at least twice.
+
+  HOLDS NOW -- the `timeout` of a spawn, because the bound is put on the child's interrupt handler
+  rather than on a host timer:
+   - spawn: spawn('node', [busy 5 s], { timeout: 400, killSignal: 'SIGKILL' }) closes at 416 ms with
+     code null, signal SIGKILL, killed true; host 416 ms with the same three. (Was 5415 ms, code 0,
+     killed false.)
+   - execFile: execFile('node', [busy 5 s], { timeout: 400 }) reports killed true, signal SIGTERM and
+     'Command failed: ...' at 423 ms; host 421 ms, the same. (Was: no error at all at 5383 ms.)
+   - spawnSync: spawnSync('node', [busy 5 s], { timeout: 400, killSignal: 'SIGKILL' }) reports status
+     null, signal SIGKILL, error ETIMEDOUT at 411 ms; host 407 ms, the same. (Was: status 0 at 5331 ms.)
+   - No regression on the shapes a timeout must not touch: a child that finishes inside a generous
+     timeout closes 0 / signal null / killed false on both sides, and a child that yields (a 3 s timer)
+     is killed at 535 ms with SIGTERM and killed true where the host kills it at 419 ms.
+   The mechanism: a guest that never calls the host holds the host thread, so the timer the spawning
+   guest arms for its `timeout` cannot fire -- only the interrupt handler runs. armKillDeadline
+   (node/process.ts) hands that handler what is left of the deadline, rearmed at every host call, so
+   the bound is the wall-clock one the caller asked for and not a stretch of guest execution.
+
+  STILL DIVERGES -- a kill with no moment attached to it:
+   - child.kill() 600 ms into a 5 s busy child answers false, process.kill(child.pid, 0) throws ESRCH,
+     and the child runs the full 5 s and exits 0; the host answers true and true and ends it at 614 ms
+     with SIGTERM. The pid is not the problem and neither is the lookup: the callback that would make
+     the call does not run until 5398 ms, by which time the child has already gone.
+   - spawn('node', ['-e', 'while(1){}']) plus a kill from the parent ends at 30391 ms with code 1 and
+     signal null -- the container's ~30 s runaway budget, the only bound left -- where the host ends it
+     at 326 ms with SIGTERM.
+   Both are the engine, proved with bare QuickJS 0.32 and no container in the way (quickjs-emscripten
+   0.32.0, /tmp/adv5-ck/qjs/repro2.mjs): a host setTimeout(..., 100) armed before a 3 s guest loop
+   fires at 3012 ms and not at 100, so no host timer can preempt guest execution; and the interrupt
+   handler -- 1595 checks during one `while(1){}`, ending it at 501 ms with InternalError: interrupted
+   -- can only abort a guest, never resume one. A parent's kill therefore has no moment at which to
+   run: preemption that preserves the guest would be needed, and QuickJS has none.
+   A `sh` child's timeout is ignored for the same reason one level up: ShellProcess
+   (packages/core/src/process/executors/shell/process.ts, a file this shard does not own) carries no
+   armKillDeadline, so spawn('sh', ['-c', busy], { timeout: 400, killSignal: 'SIGKILL' }) closes at
+   5659 ms with code 0 and killed false where the host closes at 5078 ms with null and SIGKILL. Filed
+   separately as owc-sh-child-kill-timeout.
+session_id: adv4-judge-child-process-3
+owner: adv5-exec-child-kill
+status: pending
+measured_at: c15e75b7a5b0d8eb2c2ebe51046335c02638e614 (local main)

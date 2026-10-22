@@ -481,7 +481,11 @@ function cpSpawnCore(child, file, argv, options, extra) {
     ipcData: extra.ipcData || {},
     token: token,
     kind: extra.kind,
-    target: child._cpTarget
+    target: child._cpTarget,
+    /* The host arms the deadline a guest timer cannot keep: a child that never calls the host holds
+       the host thread, and a timer armed for this timeout would not fire until the child had gone. */
+    timeout: Number(opts.timeout) > 0 ? Number(opts.timeout) : 0,
+    killSignal: cpKillName(opts.killSignal)
   }).then(function (result) {
     cpSpawnedOk(child, result.pid);
   }, function (error) {
@@ -525,7 +529,7 @@ function cpOnEvent(child, ev) {
     var stream = ev.fd === 2 ? child.stderr : child.stdout;
     if (stream) stream.push(Buffer.from(ev.s, 'utf8'));
   } else if (ev.k === 'exit') {
-    cpExit(child, ev.code, ev.signal);
+    cpExit(child, ev.code, ev.signal, ev.timedOut === true);
   } else if (ev.k === 'error') {
     child.emit('error', cpErrorFrom(ev.e));
   } else if (ev.k === 'ipc') {
@@ -538,10 +542,13 @@ function cpOnEvent(child, ev) {
   }
 }
 
-function cpExit(child, code, signal) {
+function cpExit(child, code, signal, timedOut) {
   if (child._cpExited) return;
   child._cpExited = true;
   if (child._cpTimer) clearTimeout(child._cpTimer);
+  /* The spawn's own timeout ended this child on the host: the kill a caller reads on "killed"
+     happened, even though the timer above never got a turn to make it. */
+  if (timedOut) child.killed = true;
   /* A terminated worker ends with status 1: the thread did not choose to exit, it was stopped. A
      worker that ends on its own keeps the status it chose, and one with no status keeps 0. */
   var exitCode = child._cpWorker
@@ -594,12 +601,16 @@ function cpIpc(child, frame) {
   }
 }
 
+/* The signal name a kill, a timeout or a spawn's killSignal ends a child with, as Node names it. */
+function cpKillName(signal) {
+  if (typeof signal === 'number') return cpSignalNames[signal] || 'SIGTERM';
+  return String(signal === undefined || signal === null ? 'SIGTERM' : signal);
+}
+
 function cpKill(child, signal) {
   if (!child._cpSpawned || child._cpExited) return false;
   if (signal === 0 || signal === '0') return true;
-  var name = typeof signal === 'number'
-    ? (cpSignalNames[signal] || 'SIGTERM')
-    : String(signal === undefined || signal === null ? 'SIGTERM' : signal);
+  var name = cpKillName(signal);
   var ok = callCap('child.kill', { pid: child.pid, signal: name });
   if (ok) child.killed = true;
   return ok === true;
