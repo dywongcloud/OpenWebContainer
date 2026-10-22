@@ -193,7 +193,12 @@ export const IMPLEMENTED_OPTIONS: readonly string[] = [
     'angle', 'rotationAngle', 'flip', 'flop', 'rotateBeforePreExtract', 'rotationBackground',
     'formatOut', 'fileOut', 'streamOut', 'resolveWithObject',
     'jpegQuality', 'jpegChromaSubsampling', 'rawDepth',
-    'pngCompressionLevel', 'pngEffort', 'pngQuality', 'pngAdaptiveFiltering', 'pngDither', 'pngBitdepth',
+    // pngCompressionLevel and pngAdaptiveFiltering are deliberately absent: the PNG encoder has no
+    // zlib, so it emits stored blocks and neither option can change a byte. Naming them here would
+    // claim an implementation the shim does not have, and the caller would get its own compression
+    // level back as a silently different file instead of a refusal -- which is what pngPalette, and
+    // every other option with no effect here, already gives.
+    'pngEffort', 'pngQuality', 'pngDither', 'pngBitdepth',
     'jpegOptimiseCoding', 'jpegOptimiseScans', 'jpegOvershootDeringing', 'jpegTrellisQuantisation',
     'jpegQuantisationTable'
 ];

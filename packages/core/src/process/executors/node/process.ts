@@ -1916,6 +1916,12 @@ export class NodeProcess extends Process {
         ]);
     }
 
+    /** The file a synchronous require() is loading as a module, which is the one the ES module
+     *  loader is asked about with require's own rule: a name whose extension the loader does not
+     *  know is detected for it, the way require's fallback to the `.js` handler detects, while an
+     *  `import` reaching the same name is ERR_UNKNOWN_FILE_EXTENSION, which detects nothing. */
+    private requireFile: string | undefined;
+
     /**
      * require() of an ES module: evaluates it as a module whose namespace is recorded under
      * `token`. Returns '' or a JSON record of the failure, which the guest rebuilds as the error
@@ -1931,7 +1937,9 @@ export class NodeProcess extends Process {
         const source = `import * as __owc_ns from ${specifier};\n` +
             `globalThis.__owc_esm_registry = globalThis.__owc_esm_registry || Object.create(null);\n` +
             `globalThis.__owc_esm_registry[${token}] = __owc_ns;\n`;
+        this.requireFile = file;
         const result = context.evalCode(source, `${file}?owc-require`, { type: 'module' });
+        this.requireFile = undefined;
         // the engine rebuilds a loader error as a plain Error and drops what was on it, so the code
         // of a failure inside the graph travels through the guest: read it back for the record
         const published = this.takeImportFailureCode();
@@ -2602,7 +2610,7 @@ export class NodeProcess extends Process {
             if (file.endsWith('.json')) {
                 return { value: `export default ${this.readRequired(file)};` };
             }
-            if (this.resolver.isESM(file)) {
+            if (this.resolver.isESM(file, file === this.requireFile)) {
                 return { value: this.esmSource(this.readRequired(file), file, false, suffix) };
             }
             return { value: this.syntheticModule(file, false) };

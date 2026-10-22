@@ -151,7 +151,9 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         const url = deps.resolver.resolveUrlForMeta(text(specifier), text(fromDir));
         return context.newString(url ?? '');
     });
-    define('isESM', (file) => (deps.resolver.isESM(text(file)) ? context.true : context.false));
+    /* Only the CommonJS loader asks, so this is the require answer: a name whose extension the
+       loader does not know is detected here, the way require's fallback to the `.js` handler does. */
+    define('isESM', (file) => (deps.resolver.isESM(text(file), true) ? context.true : context.false));
     define('readText', (path) => nullable(safeRead(() => deps.fileSystem.readFile(text(path)))));
     define('readBase64', (path) => nullable(safeRead(() => {
         const bytes = deps.fileSystem.readBytes(text(path));

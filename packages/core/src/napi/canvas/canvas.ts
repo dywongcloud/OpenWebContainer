@@ -125,6 +125,8 @@ function toDimension(value: number): number {
 export class Canvas {
     private w: number;
     private h: number;
+    /** Every 2D context handed out for this canvas, so a resize can reset them the way cairo does. */
+    private contexts: CanvasRenderingContext2d[] = [];
     readonly type = 'image';
 
     static readonly PNG_NO_FILTERS = 0;
@@ -169,6 +171,7 @@ export class Canvas {
         const next = toDimension(value);
         if (next > MAX_DIMENSION) return;
         this.w = next;
+        this.resetContexts();
     }
 
     get height(): number {
@@ -180,6 +183,21 @@ export class Canvas {
         const next = toDimension(value);
         if (next > MAX_DIMENSION) return;
         this.h = next;
+        this.resetContexts();
+    }
+
+    /** A context hands itself here when it is constructed, so a later resize can reach it. */
+    attachContext(context: CanvasRenderingContext2d): void {
+        this.contexts.push(context);
+    }
+
+    /**
+     * Assigning width or height resizes the drawing buffer, and the add-on loses the context with it:
+     * fillStyle is back to #000000, lineWidth to 1 and the transform to identity, because cairo
+     * recreates the surface. Measured on canvas 3.2.3.
+     */
+    private resetContexts(): void {
+        for (const context of this.contexts) context.reset();
     }
 
     get stride(): number {
@@ -356,7 +374,12 @@ export class Image {
         return this.bitmap;
     }
 
-    /** SetSource.call(img, src) from lib/image.js: encoded bytes or a path. */
+    /**
+     * SetSource.call(img, src) from lib/image.js: encoded bytes or a path. The add-on decodes
+     * synchronously -- `img.src = pngBuffer` leaves width, height and naturalWidth set and has called
+     * onload (or onerror) before the assignment returns -- so the shim decodes here too rather than in
+     * a macrotask, where a caller reading img.width straight after would still see 0x0.
+     */
     setSource(src: unknown): void {
         this.pending = src;
         this.bitmap = null;
@@ -364,7 +387,7 @@ export class Image {
         this.height = 0;
         this.naturalW = 0;
         this.naturalH = 0;
-        setImmediate(() => this.load(src));
+        this.load(src);
     }
 
     /** GetSource.call(img) from lib/image.js. */
@@ -485,6 +508,9 @@ interface State {
     shadowOffsetY: number;
     imageSmoothingEnabled: boolean;
     antialias: string;
+    /** The sampling-quality properties: read back as set, though the shim samples one way. */
+    quality: string;
+    patternQuality: string;
     clip: Float32Array | null;
     /** True while the clip mask is shared with a state pushed by save(), so clip() must copy it first. */
     clipShared: boolean;
@@ -509,6 +535,18 @@ export class CanvasRenderingContext2d {
 
     constructor(canvas: Canvas) {
         this.canvas = canvas;
+        canvas.attachContext(this);
+    }
+
+    /**
+     * What the add-on does when the canvas is resized: the state, the save() stack and the current
+     * path all go with the surface cairo recreates.
+     */
+    reset(): void {
+        this.state = freshState();
+        this.stack.length = 0;
+        this.path = new PathBuilder();
+        this.cov = null;
     }
 
     /* -------------------------------------------------- state */
@@ -801,21 +839,36 @@ export class CanvasRenderingContext2d {
         if (value === 'default' || value === 'gray' || value === 'none' || value === 'subpixel') this.state.antialias = value;
     }
 
-    /** Accepted and ignored; the shim has one sampling quality, which MANIFEST.md records. */
+    /**
+     * The sampling-quality properties. There is one sampling quality in the shim, but the values are
+     * stored and read back as the add-on does, so a caller that sets and reads them is not told a
+     * different value from the one it wrote: the accepted set is measured off canvas 3.2.3, and the
+     * two differ on a value they reject -- quality falls back to 'good', patternQuality keeps what
+     * it had.
+     */
+    private setQuality(key: 'quality' | 'patternQuality', value: string): void {
+        const allowed = ['default', 'fast', 'good', 'best', 'nearest', 'bilinear'];
+        if (typeof value !== 'string' || allowed.indexOf(value) < 0) {
+            if (key === 'quality') this.state.quality = 'good';
+            return;
+        }
+        this.state[key] = value === 'default' ? 'good' : value;
+    }
+
     get quality(): string {
-        return 'good';
+        return this.state.quality;
     }
 
     set quality(value: string) {
-        void value;
+        this.setQuality('quality', value);
     }
 
     get patternQuality(): string {
-        return 'good';
+        return this.state.patternQuality;
     }
 
     set patternQuality(value: string) {
-        void value;
+        this.setQuality('patternQuality', value);
     }
 
     get textDrawingMode(): string {
@@ -1038,6 +1091,10 @@ export class CanvasRenderingContext2d {
         const w = Math.floor(Number(sw));
         const h = Math.floor(Number(sh));
         if (!isFinite(w) || !isFinite(h)) throw new RangeError('IndexSizeError');
+        // A zero-sided source rectangle is refused, as cairo's own surface read is: the add-on raises
+        // "IndexSizeError: The source width is 0." (measured), naming height when only the height is 0.
+        if (w === 0) throw new Error('IndexSizeError: The source width is 0.');
+        if (h === 0) throw new Error('IndexSizeError: The source height is 0.');
         const out = new ImageData(Math.max(0, w), Math.max(0, h));
         const surface = this.canvas.pixels();
         const x0 = Math.floor(Number(sx));
@@ -1300,6 +1357,8 @@ function freshState(): State {
         shadowOffsetY: 0,
         imageSmoothingEnabled: true,
         antialias: 'default',
+        quality: 'good',
+        patternQuality: 'good',
         clip: null,
         clipShared: false
     };
