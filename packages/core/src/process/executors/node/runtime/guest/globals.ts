@@ -731,7 +731,45 @@ globalThis.crypto = nodeCrypto.webcrypto;
     abortSignal(signal, reason);
     return signal;
   };
+  /*
+   * How Node writes the value an ERR_OUT_OF_RANGE carries: an integer past 2**32 is printed with
+   * numeric separators (1_099_511_627_776), and anything else -- a fraction, NaN, Infinity, a number
+   * small enough to sit inside 32 bits -- the way String() writes it.
+   */
+  function outOfRangeText(value) {
+    if (Number.isInteger(value) && Math.abs(value) > 4294967296) {
+      var text = String(value);
+      var at = text.length;
+      var start = text.charCodeAt(0) === 45 ? 1 : 0;
+      var grouped = '';
+      while (at > start + 3) {
+        at -= 3;
+        grouped = '_' + text.slice(at, at + 3) + grouped;
+      }
+      return text.slice(0, at) + grouped;
+    }
+    return String(value);
+  }
+  function delayOutOfRange(value, range) {
+    var bad = new RangeError('The value of "delay" is out of range. It must be ' + range + '. Received ' + outOfRangeText(value));
+    bad.code = 'ERR_OUT_OF_RANGE';
+    return bad;
+  }
+  function delayNotANumber(value) {
+    var kind = value === null ? 'Received null'
+      : value === undefined ? 'Received undefined'
+        : typeof value === 'string' ? "Received type string ('" + value + "')"
+          : 'Received type ' + typeof value;
+    var bad = new TypeError('The "delay" argument must be of type number. ' + kind);
+    bad.code = 'ERR_INVALID_ARG_TYPE';
+    return bad;
+  }
+  /* Node checks a timeout against the same bounds it checks any uint32 against, and refuses it
+     before anything is scheduled: not an integer is one error, outside 0..2**32-1 another. */
   AbortSignal.timeout = function timeout(ms) {
+    if (typeof ms !== 'number') throw delayNotANumber(ms);
+    if (!Number.isInteger(ms)) throw delayOutOfRange(ms, 'an integer');
+    if (ms < 0 || ms > 4294967295) throw delayOutOfRange(ms, '>= 0 && <= 4294967295');
     var signal = createSignal();
     setTimeout(function () {
       var reason = new DOMException('The operation was aborted due to timeout', 'TimeoutError');

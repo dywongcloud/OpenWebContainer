@@ -146,6 +146,23 @@ BF.url = function () {
           this._list.push([decodeComponent(k), decodeComponent(v)]);
         }
       }
+    } else if (init && typeof init === 'object' && typeof init[Symbol.iterator] === 'function') {
+      /* A sequence of pairs: an array of [name, value] tuples, another URLSearchParams, a Map, or
+         anything else iterable. Each item has to be an iterable of exactly two values. */
+      var iter = init[Symbol.iterator]();
+      var step = iter.next();
+      while (!step.done) {
+        var item = step.value;
+        var pair = [];
+        if (item !== undefined && item !== null && typeof item[Symbol.iterator] === 'function') {
+          var inner = item[Symbol.iterator]();
+          var part = inner.next();
+          while (!part.done) { pair.push(part.value); part = inner.next(); }
+        }
+        if (pair.length !== 2) throw new TypeError('Each query pair must be an iterable [name, value] tuple');
+        this._list.push([String(pair[0]), String(pair[1])]);
+        step = iter.next();
+      }
     } else if (init && typeof init === 'object') {
       var keys = Object.keys(init);
       for (var j = 0; j < keys.length; j++) this._list.push([keys[j], String(init[keys[j]])]);
