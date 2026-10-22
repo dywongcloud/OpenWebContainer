@@ -79,6 +79,9 @@ function notFoundError(id, fromDir, parent) {
     e2.code = 'ERR_PACKAGE_IMPORT_NOT_DEFINED';
     return e2;
   }
+  /* An "exports" target that names a directory: Node reads no index out of it, so the require is
+     a missing module -- and names the directory the map pointed at, not the specifier. */
+  if (info.kind === 'dir-target') return moduleNotFound(info.dir, parent);
   if (info.kind === 'missing' && typeof info.file === 'string') return moduleNotFound(info.file, parent);
   return moduleNotFound(id, parent);
 }
@@ -301,10 +304,8 @@ function loadEsmFromRequire(filename, mod) {
     asyncErr.code = 'ERR_REQUIRE_ASYNC_MODULE';
     throw asyncErr;
   }
-  /* Node marks the namespace of a module that has a default export with __esModule, the marker a
-     transpiled CommonJS consumer looks for; a module with no default export gets none. The engine
-     seals its namespaces, so the marked one is a copy that reads the same way: the same exports in
-     the same order, a null prototype and the '[object Module]' tag. */
+  /* A module with a default export is the one Node marks, so a transpiled CommonJS consumer that
+     looks for __esModule finds it; one with no default export is handed over as it stands. */
   mod.exports = Object.prototype.hasOwnProperty.call(namespace, 'default')
     ? markedNamespace(namespace)
     : namespace;
@@ -312,13 +313,42 @@ function loadEsmFromRequire(filename, mod) {
   return mod;
 }
 
+/* A property of Node's namespace: writable and enumerable, and never configurable, which is what
+   makes the whole object sealed without freezing any one value. */
+function defineNamespaceProperty(target, key, value) {
+  Object.defineProperty(target, key, { value: value, writable: true, enumerable: true, configurable: false });
+}
+
+/* Node marks the namespace of a module that has a default export with __esModule, the marker a
+   transpiled CommonJS consumer looks for; a module with no default export gets none. The engine
+   seals its namespaces, so the marked one is a sealed view that reads through to the original:
+   the same exports in the same order, a null prototype and the '[object Module]' tag, and -- the
+   part a copy cannot do -- a binding the module later reassigns still reads as its new value. */
 function markedNamespace(namespace) {
-  var marked = Object.create(null);
-  marked.__esModule = true;
+  var target = Object.create(null);
   var keys = Object.keys(namespace);
-  for (var i = 0; i < keys.length; i++) marked[keys[i]] = namespace[keys[i]];
-  Object.defineProperty(marked, Symbol.toStringTag, { value: 'Module' });
-  return marked;
+  keys.push('__esModule');
+  keys.sort();
+  for (var i = 0; i < keys.length; i++) {
+    defineNamespaceProperty(target, keys[i], keys[i] === '__esModule' ? true : namespace[keys[i]]);
+  }
+  Object.defineProperty(target, Symbol.toStringTag, { value: 'Module' });
+  Object.preventExtensions(target);
+  return new Proxy(target, {
+    get: function (t, key) {
+      if (key === '__esModule') return true;
+      if (key === Symbol.toStringTag) return 'Module';
+      return namespace[key];
+    },
+    /* A read of the descriptor sees the binding's current value too, as it does in Node: the
+       property stays a writable, non-configurable data property either way. */
+    getOwnPropertyDescriptor: function (t, key) {
+      var desc = Object.getOwnPropertyDescriptor(t, key);
+      if (desc === undefined || key === '__esModule' || key === Symbol.toStringTag) return desc;
+      desc.value = namespace[key];
+      return desc;
+    }
+  });
 }
 
 function requireEsmFailureOf(failure) {

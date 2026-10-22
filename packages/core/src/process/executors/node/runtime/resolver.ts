@@ -14,6 +14,7 @@ export type ResolveMode = 'require' | 'import';
 export type ResolveFailure =
     | { kind: 'not-exported'; packageDir: string; subpath: string; self?: boolean }
     | { kind: 'import-not-defined'; packageDir: string; specifier: string }
+    | { kind: 'dir-target'; dir: string }
     | { kind: 'bad-file-url'; ctor: 'TypeError' | 'URIError'; code: string; message: string }
     | { kind: 'missing'; target: 'package' | 'module'; name?: string; file?: string };
 
@@ -312,6 +313,14 @@ export class NodeResolver {
                 return undefined;
             }
             const resolved = normalizeAbsolute(joinPaths(packageDir, target));
+            /* An "exports" target that names a directory is a failure in Node, not a directory to
+               read an index out of: import() reports ERR_UNSUPPORTED_DIR_IMPORT and require() a
+               missing module, and both name the directory the map pointed at. Reading
+               ./dir/index.js instead loads a package in the container that fails on Node. */
+            if (this.fileSystem.statPath(resolved)?.type === 'dir') {
+                this.lastFailure = { kind: 'dir-target', dir: resolved };
+                return undefined;
+            }
             if (this.fileSystem.statPath(resolved)?.type === 'file') return resolved;
             /* The exports map names a file that is not there: Node reports the path the map named,
                not the specifier the caller wrote, so the caller can say the same. */
