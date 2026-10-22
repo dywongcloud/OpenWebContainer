@@ -1119,8 +1119,10 @@ type CommandBody =
     | { t: 'simple'; assigns: Assignment[]; words: Word[]; redirects: Redirect[] }
     | { t: 'if'; branches: { cond: Node[]; body: Node[] }[]; else_?: Node[]; redirects: Redirect[] }
     | { t: 'for'; name: string; words: Word[] | null; body: Node[]; redirects: Redirect[] }
-    /** bash's `for ((init; test; next)); do ...; done`: the three expressions are arithmetic. */
+    /** bash's arithmetic loop: `for ((init; test; next)); do ...; done` */
     | { t: 'forarith'; expr: string; body: Node[]; redirects: Redirect[] }
+    /** The arithmetic command `(( ))`: the status is 0 when the expression is non-zero, 1 when it is. */
+    | { t: 'arithcmd'; expr: string; redirects: Redirect[] }
     | { t: 'while'; negate: boolean; cond: Node[]; body: Node[]; redirects: Redirect[] }
     | { t: 'case'; word: Word; items: { patterns: Word[]; body: Node[] }[]; redirects: Redirect[] }
     | { t: 'group'; body: Node[]; redirects: Redirect[] }
@@ -1631,6 +1633,15 @@ class Parser {
             this.pos++;
             return { t: 'var', ref: parseVarRef(this.readBraced()) };
         }
+        /* `$[ ]` is the arithmetic a shell wrote before POSIX gave it the `$(( ))` it writes now,
+           and a host still expands it: `echo $[1+1]` prints `2`, and the operand error a bad
+           expression is names the same text either way -- `$[1+]` is `1+: syntax error: operand
+           expected`. Left alone as text, `echo $[1+1]` printed `$[1+1]` and `$[1+]` was a command
+           nothing could find. */
+        if (next === '[') {
+            this.pos++;
+            return { t: 'arith', expr: this.readDelimited('$[', ']') };
+        }
         /* `$'...'`: ANSI-C quoting. The escapes are decoded and nothing inside expands, so the whole
            run is one literal part -- `echo $'a\tb'` prints the tab a host prints, and a `)` inside
            one is text, which is why `x=$( echo $'a)b' )` is `[a)b]`. */
@@ -2030,9 +2041,20 @@ class Parser {
         if (this.eof()) throw new ShellSyntaxError('syntax error: unexpected end of file');
         const line = countLines(this.src, this.pos);
         const ch = this.here();
+        /* `(( ))` is the arithmetic command, not a subshell holding a subshell: a host evaluates the
+           expression between the brackets and takes the command's status from its value -- `((1));
+           echo $?` prints `0`, `((0)); echo $?` prints `1`, and `((x=5)); echo $x` prints `5` --
+           where reading the brackets as two nested subshells ran `1` as a command and reported it
+           as not found. The expression is read to the `))` that closes it, as bash reads it: even
+           `((echo hi))` is an expression that will not evaluate, and not a subshell that echoes. */
+        if (this.src.startsWith('((', this.pos)) {
+            this.pos += 2;
+            const expr = this.readDelimited('((', '))');
+            return { t: 'arithcmd', expr, redirects: this.readRedirects(), line };
+        }
         if (ch === '(') {
             this.pos++;
-            const body = this.parseList([')']);
+            const body = this.parseBody([')']);
             this.skipSpace(true);
             if (this.here() !== ')') throw new ShellSyntaxError('syntax error: unexpected end of file');
             this.pos++;
@@ -2040,7 +2062,7 @@ class Parser {
         }
         if (ch === '{') {
             this.pos++;
-            const body = this.parseList(['}']);
+            const body = this.parseBody(['}']);
             this.skipSpace(true);
             if (this.here() !== '}') throw new ShellSyntaxError('syntax error: unexpected end of file');
             this.pos++;
@@ -2245,7 +2267,7 @@ class Parser {
             this.skipSpace(true);
             if (!this.keywordAt(this.pos, 'then')) throw this.expectedKeyword();
             this.pos += 4;
-            const body = this.parseList(['elif', 'else', 'fi']);
+            const body = this.parseBody(['elif', 'else', 'fi']);
             branches.push({ cond, body });
             this.skipSpace(true);
             if (this.keywordAt(this.pos, 'elif')) {
@@ -2254,7 +2276,7 @@ class Parser {
             }
             if (this.keywordAt(this.pos, 'else')) {
                 this.pos += 4;
-                elseBody = this.parseList(['fi']);
+                elseBody = this.parseBody(['fi']);
                 this.skipSpace(true);
             }
             if (!this.keywordAt(this.pos, 'fi')) throw new ShellSyntaxError('syntax error: unexpected end of file');
@@ -2327,12 +2349,33 @@ class Parser {
         return { t: 'for', name, words, body: tail.body, redirects: tail.redirects };
     }
 
+    /**
+     * The commands between the words that open a construct and the ones that close it. A host does
+     * not accept an empty body: `if true; then` newline `fi` is `syntax error near unexpected token
+     * `fi'', and `{ }`, `( )`, `for i in 1; do` newline `done` and `while true; do` newline `done`
+     * name their own closing word the same way. Reading one as a body that holds no commands parsed
+     * the line as valid and ran nothing where a host reports it, and a `while` whose body cannot
+     * change its condition looped forever instead -- the one construct a caller cannot time out.
+     *
+     * The token named is whatever stands where the body should have been, which is not always the
+     * word the construct closes with: an `if` whose `then` is followed by an `elif` names the
+     * `elif`. Nothing is named where the input ends instead -- that is the end of file the caller
+     * reports, and not a token at all.
+     */
+    private parseBody(terminators: string[]): Node[] {
+        const body = this.parseList(terminators);
+        if (body.length === 0 && !this.eof()) {
+            throw new ShellSyntaxError(`syntax error near unexpected token \`${this.tokenHere()}'`);
+        }
+        return body;
+    }
+
     /** `do ... done` and the redirects that follow it: the tail every `for` ends with. */
     private parseForTail(): { body: Node[]; redirects: Redirect[] } {
         this.skipSpace(true);
         if (!this.keywordAt(this.pos, 'do')) throw this.expectedKeyword();
         this.pos += 2;
-        const body = this.parseList(['done']);
+        const body = this.parseBody(['done']);
         this.skipSpace(true);
         if (!this.keywordAt(this.pos, 'done')) throw new ShellSyntaxError('syntax error: unexpected end of file');
         this.pos += 4;
@@ -2346,7 +2389,7 @@ class Parser {
         this.skipSpace(true);
         if (!this.keywordAt(this.pos, 'do')) throw this.expectedKeyword();
         this.pos += 2;
-        const body = this.parseList(['done']);
+        const body = this.parseBody(['done']);
         this.skipSpace(true);
         if (!this.keywordAt(this.pos, 'done')) throw new ShellSyntaxError('syntax error: unexpected end of file');
         this.pos += 4;
@@ -3147,21 +3190,26 @@ function runParsed(state: ShellState, script: string): number {
                    the `exit`'s status is the script's, and no syntax error is reported at all. */
                 if (signal instanceof ExitSignal) return signal.code;
             }
-            /* The message, and then the line it stands on, echoed in backquotes the way a host
-               handed a script with `-c` echoes it: `/bin/sh: -c: line 1: syntax error near
-               unexpected token `;'` followed by `` `if; then' ``. Only the error that names a
-               token gets an echo -- `syntax error: unexpected end of file` is one line on a host,
-               and `echo |` and `case x in` are single-line reports. */
-            writeErr(state, `${error.message}\n`);
+            /* A host names the line it read, and says it read the one `-c` was handed: `/bin/sh: -c:
+               line 1: syntax error near unexpected token `;''. Where the input ended it names the
+               line the end stands on -- the empty one a trailing newline leaves behind it, or the
+               one past the last when the script stops mid-line -- which is not the line the token
+               that opened the unclosed quote stands on, so an unclosed quote is two reports on two
+               different lines. */
+            const heading = (line: number): string =>
+                `${state.shellName === '' ? 'sh' : state.shellName}: -c: line ${line}: `;
+            const eofLine = lineIndexOf(script, script.length) + (script.endsWith('\n') ? 0 : 1);
+            const line = error.message === 'syntax error: unexpected end of file' ? eofLine : lineIndexOf(script, at);
+            writeErr(state, `${heading(line)}${error.message}\n`);
             if (error.message.startsWith('syntax error near unexpected token')) {
                 const spans = lineSpans(script);
-                const span = spans[Math.min(lineIndexOf(script, at), spans.length - 1)];
-                if (span !== undefined) writeErr(state, `\`${script.slice(span.start, span.end).replace(/\n$/, '')}'\n`);
+                const span = spans[Math.min(line, spans.length - 1)];
+                if (span !== undefined) writeErr(state, `${heading(line)}\`${script.slice(span.start, span.end).replace(/\n$/, '')}'\n`);
             } else if (error.message.startsWith('unexpected EOF while looking for matching')) {
                 /* An unclosed quote is two reports on a host, not one: the lexer names the quote
                    it never found the match for, and the parser then finds the input ended where a
                    command should have been -- `echo 'abc` is the one line and then the other. */
-                writeErr(state, 'syntax error: unexpected end of file\n');
+                writeErr(state, `${heading(eofLine)}syntax error: unexpected end of file\n`);
             }
             return 2;
         }
@@ -3472,6 +3520,22 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
     switch (command.t) {
         case 'simple':
             return runSimple(state, command, input);
+        case 'arithcmd':
+            return runCompoundRedirected(state, command, input, () => {
+                try {
+                    /* The status is the one a host takes from the value: 0 when the expression is
+                       non-zero, 1 when it is zero, and 1 as well for one that will not evaluate --
+                       `((1+))` is `sh: ((: 1+: syntax error: operand expected (error token is "+")`
+                       and the status 1, never the 127 a `$((1+))` that will not expand is. */
+                    return evalArith(state, command.expr) === 0 ? 1 : 0;
+                } catch (error) {
+                    if (error instanceof ArithError) {
+                        writeErr(state, `${arithDiagnostic(state, command.expr, error, '((')}\n`);
+                        return 1;
+                    }
+                    throw error;
+                }
+            });
         case 'if':
             return runCompoundRedirected(state, command, input, () => {
             for (const branch of command.branches) {
@@ -4432,7 +4496,9 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     }
     if (name === 'return') {
         if (state.callStack.length === 0) {
-            writeErr(state, `return: can only 'return' from a function or sourced script\n`);
+            /* The wording is a host's own, backquotes and all: `can only `return' from a function
+               or sourced script`, behind the shell's name and the line it stands on. */
+            writeErr(state, `${diagnosticPrefix(state)}return: can only \`return' from a function or sourced script\n`);
             return 1;
         }
         const code = args.length === 0 ? state.lastStatus : Number.parseInt(args[0], 10);
