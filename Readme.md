@@ -49,7 +49,7 @@ The architecture consists of three main layers:
 - **JavaScript Runtime**
   - QuickJS-based execution
   - CommonJS and ES Modules, with `node_modules` resolution, `package.json` `main`/`exports`/`imports`, and CJS/ESM interop
-  - Node built-ins: `path`, `events`, `util`, `assert`, `fs` (sync, callback and promises, plus read and write streams and file descriptors — `openSync`, `writeSync`, `readSync`, `closeSync`, `fstatSync`, `ftruncateSync` — over the virtual file system), `buffer`, `os`, `timers`, `url` (WHATWG URL and legacy `parse`/`resolve`/`format`), `crypto` (random values, `createHash`, `createHmac`, `pbkdf2`, `timingSafeEqual`, and `createCipheriv`/`createDecipheriv` over `@noble/ciphers`: AES-ECB, AES-CBC, AES-CTR, AES-CFB and AES-GCM at 128, 192 and 256 bits and ChaCha20-Poly1305, byte-identical to host Node 24.15 and with Node's `ERR_CRYPTO_INVALID_KEYLEN` and `ERR_CRYPTO_INVALID_IV` codes), `process` (including `chdir`/`cwd` over the virtual file system), `console`, `module`, `stream` and `readline`, `querystring`, `string_decoder`, `punycode`, `diagnostics_channel`, `async_hooks` (AsyncLocalStorage across timers, ticks and `.then` callbacks), `perf_hooks`, `v8`, `vm`, `domain`, `inspector` and `repl` (partial), `zlib` (gzip, deflate and raw, compressed by the zlib Node bundles and decompressed by fflate; brotli and zstd, backed by WebAssembly codecs built from the same C libraries Node uses, byte-identical to host Node 24.15 — see "Codecs")
+  - Node built-ins: `path`, `events`, `util`, `assert`, `fs` (sync, callback and promises, plus read and write streams and file descriptors — `openSync`, `writeSync`, `readSync`, `readvSync`, `writevSync`, `closeSync`, `fstatSync`, `ftruncateSync`, `truncateSync`, `linkSync`, `cpSync`, `statfsSync` and `openAsBlob` — over the virtual file system), `buffer`, `os`, `timers`, `url` (WHATWG URL and legacy `parse`/`resolve`/`format`), `crypto` (random values, `createHash`, `createHmac`, `pbkdf2`, `timingSafeEqual`, and `createCipheriv`/`createDecipheriv` over `@noble/ciphers`: AES-ECB, AES-CBC, AES-CTR, AES-CFB and AES-GCM at 128, 192 and 256 bits and ChaCha20-Poly1305, byte-identical to host Node 24.15 and with Node's `ERR_CRYPTO_INVALID_KEYLEN` and `ERR_CRYPTO_INVALID_IV` codes), `process` (including `chdir`/`cwd` over the virtual file system), `console`, `module`, `stream` and `readline`, `querystring`, `string_decoder`, `punycode`, `diagnostics_channel`, `async_hooks` (AsyncLocalStorage across timers, ticks and `.then` callbacks), `perf_hooks`, `v8`, `vm`, `domain`, `inspector` and `repl` (partial), `zlib` (gzip, deflate and raw, compressed by the zlib Node bundles and decompressed by fflate; brotli and zstd, backed by WebAssembly codecs built from the same C libraries Node uses, byte-identical to host Node 24.15 — see "Codecs")
   - Express 4 apps run: responses with bodies, POST bodies, chunked responses and the 404 handler are verified against real Node
   - `child_process` (spawn, exec, execFile, fork, running as container processes), `worker_threads` and `cluster`, with message passing between processes
   - `net`, `dgram` and `dns` over the container's virtual network (loopback TCP and UDP between processes, a virtual name table), `http`, `https` and `http2`: servers and clients inside the container, and external requests through `fetch` (browser CORS applies); `tls` and `https` run TLS 1.3 inside the container (certificates are verified against the `ca` option only, with no built-in roots); `http2` is native HTTP/2 (RFC 9113 framing with RFC 7541 HPACK, flow control, trailers and the compat API), as h2c with prior knowledge and as h2 over TLS with ALPN through `http2.createSecureServer` and `https://` sessions
@@ -296,19 +296,25 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   blank-run length measured. The host's list parser treats the degenerate case in a way this one does not.
 - **A trailing newline.** The container writes a command's stderr exactly as the command left it; the host
   adds one only where the text has none.
-- **`>>` fails on a target no file has yet.** `echo hi >> newfile` writes to `stderr`
-  `Failed to redirect to newfile: ENOENT` and leaves status 1, where the host creates the file and
-  writes to it; `>` creates the file on both. Appending to a file that is already there works on both,
-  and so does the failure when the *directory* is missing, so only the new-file case differs.
+- **A redirection whose target is in a directory that is not there fails with the container's own message.**
+  `echo hi >> /nodir/f` writes `Failed to redirect to /nodir/f: ENOENT: No such file or directory, '/nodir'`
+  where the host writes `/bin/sh: /nodir/f: No such file or directory`. Both leave status 1 and write
+  nothing. The new-file case itself is fixed: `echo hi >> newfile` creates the file and writes to it,
+  as the host does.
+- **`command -v` names the built-ins as built-ins.** `command -v ls` answers `ls is a shell builtin` on a
+  container whose `ls` is one, where the host answers `/bin/ls`; `command -v sh` answers `/bin/sh` now
+  that `/bin/sh` is a file. Both answer *something* for every one of `sh`, `ls`, `cat`, `echo` and `env`,
+  which is what a lookup that used to fail on all five now does. The wording is the shell's own, and it
+  is about a command this shell does not have to find a file for.
 
 ### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
 
 Each of these was measured by running the same script under host Node 24.15 and in the container and
 diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
 
-- **`process.stdout.columns` is 80 and `isTTY` is false, where a piped host stream leaves both undefined.**
-  A package that sizes its output from `columns || 80` therefore never falls back, and `writableHighWaterMark`
-  is undefined where the host's is 65536. There is no terminal behind a guest stream to ask.
+- **`process.stdout.writableHighWaterMark` is undefined** where the host's is 65536. `isTTY` and `columns`
+  are now left off a stream with no terminal behind it, as a piped host leaves them off, so a package that
+  sizes its output from `columns || 80` falls back here as it does there.
 - **A guest `err.stack` has no `Error: <message>` header line.** It begins at the first frame, so
   `err.stack.split('\n')[0]` is `    at <anonymous> (/app/main.js:24:52)` where the host's is `Error: boom`.
 - **`e.requireStack` on a `MODULE_NOT_FOUND` error is undefined**, where host Node's is the array of files
@@ -318,37 +324,48 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   kernel object and this file system has files and directories only: `fs.writeFileSync('/dev/null', '')`
   makes an ordinary file, and a read of one gives back what was written rather than end of file. Shell
   redirection to `/dev/null` is a sink and never touches the tree.
-- **Nothing in `/bin` or `/usr/bin` is a program.** Those directories are created at boot, and
-  `PATH` names them as a Linux image does, but the only file on it is `/usr/local/bin/node`, so
-  `which ls`, `which cat`, `which env` and `command -v sh` all fail where a host answers a path.
-  The shell's own commands are built in and run without a file.
-- **No hard links: `fs.linkSync` does not exist.** `fs.linkSync(a, b)` throws `TypeError: not a function`
-  and a host gives `b` an `st_nlink` of 2, so `fs-extra`'s `ensureLinkSync` fails here with
-  `ERR:NOCODE:not a function`. The file system has no link count and no second name for one inode,
-  which is what a link is, so `fs.symlinkSync` is the nearest thing it has.
-- **`fs.statSync` reports `ino` 0 and `blocks` 1 for every file.** The host gives a real inode number
-  and a block count derived from the size (`blocks: 8` for a 2-byte file). There is no inode table
-  and no allocation in blocks behind a file here.
-- **`require.resolve('node:fs')` returns `'fs'`, and `module.paths` is empty.** The host returns
-  `'node:fs'` from `require.resolve` and gives `module.paths` the six `node_modules` directories it
-  searched; the guest strips the `node:` prefix on resolve and has no `node_modules` to walk.
-- **`os.cpus()` is empty and `os.version`, `os.machine` and `process.versions.uv` are missing.**
-  The host returns 11 cpu objects, two functions and the libuv version string. The guest has one
-  virtual cpu, no kernel to name a version for and no libuv, so `os.availableParallelism()` is 1.
-- **`process.allowedNodeEnvironmentFlags` is undefined** where the host's is the `Set` of flags Node
-  accepts in `NODE_OPTIONS`. Nothing here reads that variable.
-- **A runtime `process.env.X = v` is not inherited by a child the process spawns.** On the host a
-  later `spawnSync('sh', ['-c', 'echo $X'])` and a later `node` child both see the new value; here
-  the child gets the environment the container booted with and prints nothing. `execa` hides this
-  because it passes `env` explicitly, so only a raw `child_process` call shows it.
-- **The default working directory is `/`, not the directory the process was started in.** `process.cwd()`
-  and a shell `pwd` both answer `/`, so a relative path written without a `cwd` option lands at the
-  root. A `cwd` passed to `spawn`/`exec` is honoured, and so is `cd`.
-- **`process.on('exit')` handlers do not run when the process dies on the fatal path.** After an
-  uncaught throw or an unhandled rejection the host still writes what an `exit` handler writes
-  (`exit=1`) before ending with status 1; the guest writes nothing more after the statement that
-  threw. A `process.on('uncaughtException')` handler is not called either: the host's catches the
-  error and can leave its own status, the guest ignores it and exits 1. A normal exit does run them.
+- **The files on `PATH` are scripts, not binaries.** `/bin/sh`, `/bin/ls`, `/bin/cat`, `/bin/echo` and
+  `/usr/bin/env` are created at boot beside `/usr/local/bin/node`, as executable files holding the script
+  that runs the command, so `which ls`, `which cat`, `which env` and `command -v sh` all answer where they
+  used to fail. `fs.readFileSync('/bin/ls')` hands back that script where a host hands back an executable's
+  bytes: a browser container can have no binary, and the commands themselves are built into the shell and
+  run without a file.
+- **A hard link's hold on its bytes is the first name's.** `fs.linkSync(a, b)` gives both names an
+  `st_nlink` of 2 and an `st_ino` they share, and a write through either is read back through the other,
+  which is what `fs-extra`'s `ensureLinkSync` asks of one. Removing the *first* name is where the two part
+  company: ext4 keeps the bytes for the names that remain, and here the copy the second name was given is
+  what a read of it finds from then on.
+- **`fs.statSync`'s `ino` is a number this file system made up.** It is not 0, it survives a write and it
+  differs between two files, as a host's does; the number itself is a counter here, not an inode on a disk.
+  `blocks` is now the host's own figure -- `Math.ceil(size / 4096) * 8`, so 8 for a 2-byte file and 16 for a
+  5000-byte one -- where it used to be `size / 512` rounded up.
+- **`module.paths` is as long as the file's path is deep.** `require.resolve('node:fs')` now answers
+  `'node:fs'`, as the host does, and `module.paths` is the list of `node_modules` directories Node builds --
+  one beside the file's own directory, then one beside each directory above it, out to `/`. Its *length*
+  follows the path: 2 for `/app/main.js` where the host's `/private/tmp/.../probe/main.js` gives 6, because
+  the host's file is four directories deeper.
+- **`os.cpus()` and `os.machine()` report the machine under the container, and `os.version()` a release
+  string of this container's own.** `os.cpus()` holds one entry per cpu that machine has -- 11 here, so
+  `os.availableParallelism()` is 11 too, as they are on the host -- rather than the empty list it was; the
+  `model` of an entry is this container's name for it, not the host's `Apple M3 Pro`. `os.machine()` answers
+  `x86_64`, which is what Node answers for the `process.arch` this container reports (`x64`), where the
+  host's `arm64` goes with its own `arch`. `process.versions.uv` is `1.51.0`, the libuv of the Node it models.
+- **`process.allowedNodeEnvironmentFlags` holds 271 of the flags the host's holds 274 of.** It is the
+  `Set` of flags Node 24.15 accepts in `NODE_OPTIONS`, so `has()` answers as the host's does for every flag
+  measured (`--experimental-vm-modules`, `--max-old-space-size`, `--no-warnings`, and false for one that is
+  not a flag). The three the host counts but does not yield are its own: this set is what its iterator gives.
+- **A runtime `process.env.X = v` *is* inherited by a child the process spawns, as on the host.** A later
+  `spawnSync('sh', ['-c', 'echo $X'])` and a later `node` child both see the new value. `Object.getPrototypeOf(process.env)`
+  is not `Object.prototype` either, which is what the host reports for its own.
+- **The default working directory is `/app`, the directory a container's project is put in.** It is what
+  the host's "the directory you started me in" is here, and it is what `process.cwd()`, a shell `pwd` and
+  `process.env.PWD` all answer now; they answered `/` before, so a relative path written without a `cwd`
+  option landed at the root. A `cwd` passed to `spawn`/`exec` is honoured over it, and so is `cd`.
+- **`process.on('exit')` handlers *do* run when the process dies on the fatal path, as on the host.** After
+  an uncaught throw or an unhandled rejection the process writes what an `exit` handler writes (`exit=1`)
+  after the error, and ends with status 1; a `process.on('uncaughtException')` handler is called, and the
+  status it leaves is the status the process leaves (`caught:boom`, `exit=7`, status 7), which is what the
+  host does with the same three scripts. A normal exit runs them as it always did.
 
 ### ⚠️ `node` with no arguments: the REPL, and where it differs from host node
 
@@ -486,7 +503,7 @@ is still byte-identical to host Node 24.15 after these changes.
 - A rejection of an `async function`'s own promise is not reported: `(async function () { throw new Error('x'); })();` goes on to the next statement and ends the process with status 0, where host Node 24.15 writes the error to stderr and exits 1 without running a later timer. Every promise the guest builds itself is tracked — one `Promise` subclass records a rejection when it happens and records a handler when one is attached — but the engine builds the result of an async function with its intrinsic `%Promise%` and not through `Promise[Symbol.species]`, so no cell exists for it; measured with `then`, `catch` and `finally` patched on that intrinsic's prototype, a discarded async function's promise is never touched at all, so nothing in the guest can see the rejection. It needs the hook QuickJS's C API names `JS_SetHostPromiseRejectionTracker`, or a hook on job enqueue, and `quickjs-emscripten` 0.32 exports neither that nor `addFunction`, so no callback can be installed. A rejection of a promise the guest did build, and one an `await` or a `.then` reaches, are reported and end the process with status 1, as they do on the host
 - `readline` keypress events are delivered: `readline.emitKeypressEvents(stream)` makes the stream emit `keypress` with the character and Node's key record, and `createInterface({ terminal: true })` installs it on its input. Measured against host Node 24.15 over 35 sequences, the name, the `ctrl`/`meta`/`shift` flags, the `sequence` and the `code` agree for every one of them except the malformed `ESC [ 1 ; 1 0 A`, which the host splits into two keys and this one reads as one; a lone escape is not a key in either, and a sequence split across two `write`s is held until it is complete. A `Promise` reaction registered inside `d.run()` sees `domain.active` as the domain, as it does on the host
 - **The container's environment is its own, and none of the host's is inherited**: a process starts with `PATH=/bin:/usr/bin:/usr/local/bin`, `HOME=/home`, `PWD`, `TERM=xterm`, `COLORTERM=truecolor` and `LANG=C.UTF-8` and nothing else, so `Object.keys(process.env)` is those six where a host process on this machine carries 60-odd. It cannot be inherited: the container runs in a browser worker, which has no environment to read, and a host `HOME` or `PATH` here would tell a guest where it is running from. `TERM` is what makes `colors@1` agree with host Node 24.15 (`'x'.red` is `\e[31mx\e[39m` on both)
-- **No terminal is attached, so `process.stdout.isTTY` is `false`**: a library that gates colour on a TTY (`chalk` 4 and later, `supports-color`) reports no colour support here where a host run in a real terminal reports some. One that reads the environment alone — `colors@1` does, and calls `supportsColor()` with no stream — matches the host. There is no terminal to attach: the playground's output is a stream the container writes to
+- **No terminal is attached, and `process.stdout.isTTY` is left undefined rather than set false**: a piped host stream carries neither `isTTY` nor `columns`, and the same library that gates colour on a TTY (`chalk` 4 and later, `supports-color`) reads the absent value as no terminal here too. One that reads the environment alone — `colors@1` does, and calls `supportsColor()` with no stream — matches the host. There is no terminal to attach: the playground's output is a stream the container writes to
 - **`node` on `PATH` is a file, not a binary**: `/usr/local/bin/node` exists and is mode `0755`, so `which.sync('node')` returns it as the host returns a path, but `fs.readFileSync('/usr/local/bin/node')` hands back the shim's script text where a host hands back an executable's bytes. A browser container cannot have a binary, and a spawn of that path runs the interpreter, not the script
 - **An unresolved entry is reported without node's own dump**: `node missing.js` writes `Error: Cannot find module '/app/missing.js'` and exits 1, where host Node 24.15 writes the `node:internal/modules/cjs/loader:1479` preamble, the resolved path, eight frames of its loader, `code: 'MODULE_NOT_FOUND'`, `requireStack` and `Node.js v24.15.0`. The frames name node's own internals with line numbers that belong to that build, so they are not reproduced; the path is now resolved against the process's working directory, and no frame names a host path
 
@@ -771,6 +788,18 @@ Future plans:
 - [ ] url module legacy API -- `require('url').domainToASCII` is absent and `url.parse(...).href` writes a stray `=` before the fragment (row owc-url-module-legacy-api)
 - [ ] Builtin module namespace surface -- `node:fs` lacks `cp`/`glob`/`statfs`/`openAsBlob` and leaks `F_OK` at top level (row owc-esm-builtin-namespace-surface)
 - [ ] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
+- [ ] `cmd 3>f >&3` -- a descriptor the command itself opened is not visible to its own later `>&n` (row owc-shell-fd-opened-by-command-visible-to-itself)
+- [ ] `exec >f`, `exec 2>f` and `exec 1>&2` are dropped, so they do not persist (row owc-shell-exec-standard-fd-dropped)
+- [ ] `exec 3>&1` and `exec 3>&2` are "Bad file descriptor" where a host duplicates the standard one (row owc-shell-exec-duplicating-standard-fd)
+- [ ] `exec 3<f; cat <&3` reads nothing -- input descriptors above 2 are not implemented (row owc-shell-exec-input-fd)
+- [ ] a failing `exec` does not end a non-interactive shell (row owc-shell-exec-failure-does-not-end-shell)
+- [ ] `echo hi >&-` writes and succeeds where a host reports a write error (row owc-shell-closed-fd-write-error)
+- [ ] a redirection’s file is created even when the command fails on a bad descriptor (row owc-shell-redirect-file-created-on-failed-command)
+- [ ] a job's or a substitution's OWN EXIT trap never fires (row owc-shell-subshell-own-exit-trap)
+- [ ] a syntax error does not echo the offending source line the way a host does (row owc-shell-syntax-error-source-line)
+- [ ] the unexpected token a `$( )` reports is `newline` where a host names the real one (row owc-shell-syntax-error-token-in-substitution)
+- [ ] a here-document body is lost when its command is backgrounded (row owc-shell-heredoc-background-job)
+- [ ] the container’s "Command not found" diagnostic has no trailing newline (row owc-shell-command-not-found-newline)
 - [ ] Add signal handling (SIGTERM, SIGKILL, etc.): `child.kill` sends one, `process.kill` does not reach a process
 - [ ] Create process groups and job control
 - [ ] Create development tools and debugging capabilities
@@ -791,3 +820,38 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Similar Projects
 - [Nano Web IDE](https://github.com/anbraten/nano-web-ide)
+
+## Known divergences from a host `node` (measured, not fixed)
+
+`sh -c <line>` in the container against `sh -c <line>` on the host, node v24.15.0 on both sides,
+cwd at the app directory, one case per process. Each line below is one symptom that survives a
+re-run in isolation; the rows are open.
+
+- `owc-node-require-preload-dropped`: `node -r ./pre.js main.js` (and `--require ./pre.js`) reads the
+  option, so `process.execArgv` and `process.argv` agree with the host, but the preload module is
+  never run -- the host prints `preloaded` before `main`, the container prints `main` only.
+- `owc-node-stack-trace-limit-value-message`: `node --stack-trace-limit 5 -e 1` -- the host prints
+  four lines (`Error: illegal value for flag --stack-trace-limit of type int`, `Try --help for
+  options`, then two more `bad option` lines), the container prints one `node: bad option:`.
+- `owc-node-completion-bash-output`: `node --completion-bash` -- the host prints its ~4 KB bash
+  completion function and exits 0, the container exits 0 and prints nothing.
+- `owc-node-report-getreport-shape`: `process.report.getReport()` -- the host returns 11 top-level
+  sections and a header of 23 keys (`javascriptHeap`, `nativeStack`, `resourceUsage`, `libuv`,
+  `workers`, `componentVersions`, `cpus`, `host`, ...); the container returns 3 sections and a header
+  of 14, with `reportVersion` 3 against the host's 5 and `trigger` `JS API` against `GetReport`.
+  `writeReport` is byte-identical; only `getReport` is short.
+- `owc-node-input-type-module-goal`: `--input-type=module -e <source>` is accepted but the source is
+  still compiled as CommonJS -- `typeof import.meta` is a `SyntaxError` and `typeof require` is
+  `function`, where the host has `object` and `undefined`, and `node --input-type=module -p 1` should
+  fail with `ERR_EVAL_ESM_CANNOT_PRINT` rather than print `1`.
+- `owc-node-missing-entry-dump`: `node <missing>` -- the host prints its loader dump (eight
+  `node:internal/modules/cjs/loader` frames, `code: 'MODULE_NOT_FOUND'`), the container prints the
+  single line `Error: Cannot find module '<path>'`.
+- `owc-node-check-syntax-message`: `node --check bad.js` -- the host reports `SyntaxError: Function
+  statements require a function name` with a caret under `function`, the container reports
+  `SyntaxError: function name expected` with the caret elsewhere and no `Node.js v24.15.0` trailer.
+- `owc-node-spawned-command-redirect`: a spawned command used with a redirection or inside a
+  subshell or `if` -- `node - < main.js`, `node main.js > out.txt`, `(node --version)` -- is refused
+  with `node: cannot run here: it can only be run on a line of its own` and exit 127, where the host
+  runs the command. The root cause is the shell's, not node's: `splitCompoundLine` hands any line
+  holding `<`, `>`, `(`, `)` or a backtick to the script engine, which cannot spawn.

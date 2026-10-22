@@ -14,8 +14,9 @@ import type { MaybeAsync } from './runtime/capabilities/dispatch';
 import { CAPABILITIES } from './runtime/capabilities/index';
 import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbindVmRuntime, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs, syncRunActive } from './pump';
-import type { NodeFlagAnswer } from './flags';
-import { containerEnv } from '../default-env';
+import type { NodeFlagAnswer, NodeRunOptions } from './flags';
+import { NODE_VERSION } from './runtime/guest/globals';
+import { CONTAINER_WORKDIR, containerEnv } from '../default-env';
 import type { SyncChildRequest, SyncChildResult } from './pump';
 
 const RESERVED_WORDS = new Set([
@@ -147,6 +148,48 @@ const DEFAULT_GUEST_BUDGET_MS = 30_000;
 const REQUIRE_ASYNC_MESSAGE = 'require() cannot be used on an ESM graph with top-level await. Use import() instead.' +
     ' To see where the top-level await comes from, use --experimental-print-required-tla.';
 
+/**
+ * A failure of a `-e`/`-p` run, in the shape node prints one: the file and the line, the offending
+ * line of the source, a caret under it, then the error and the one frame that is the script's own.
+ *
+ * The frames behind that one are the container's -- `runEval`, `owc-bootstrap.js` -- and no host
+ * node names anything of ours, so they are dropped rather than printed: what is left is the dump
+ * node writes, minus the `node:internal` frames of its own loader, which no build here can name
+ * without inventing their line numbers. The engine's wording of the error is its own too, and that
+ * is not something a QuickJS run can change.
+ */
+function evalFailureText(message: string, source: string): string {
+    const lines = message.split('\n');
+    const first = lines[0] ?? '';
+    const frames = lines.slice(1);
+    /*
+     * Where the failure is in the source the line gave: the frame of the indirect eval `-p` runs the
+     * source through names the engine's `<input>`, and its line and column are the source's own; a
+     * `-e` source is compiled inside the CommonJS wrapper, so the frame names `[eval]` and its
+     * column carries the wrapper's length in front of the source's.
+     */
+    const frame = (pattern: RegExp): RegExpExecArray | undefined => {
+        const found = frames.map((line) => pattern.exec(line)).find((match) => match !== null);
+        return found === undefined ? undefined : found;
+    };
+    const inner = frame(/^\s*at (?:.*?)<input>:(\d+):(\d+)\s*$/);
+    const outer = frame(/^\s*at (?:.*?)\((?:\/\/)?\[eval\]:(\d+):(\d+)\)\s*$/);
+    const at = inner ?? outer;
+    const line = at === undefined ? 1 : Number(at[1]);
+    const column = at === undefined ? 1
+        : inner !== undefined ? Number(at[2])
+            : Math.max(1, Number(at[2]) - EVAL_WRAPPER_PREFIX);
+    const shown = (source.split('\n')[line - 1] ?? '').replace(/\t/g, ' ');
+    /* Node points past the end of the line with spaces and no caret -- a syntax error at the end of
+       `1+` sits one column past the `+` -- so a column past the text is shown the way it shows one. */
+    const caret = column > shown.length ? ' '.repeat(shown.length) : ' '.repeat(column - 1) + '^';
+    return `[eval]:${line}\n${shown}\n${caret}\n\n` +
+        `${first}\n    at [eval]:${line}:${column}\n\nNode.js ${NODE_VERSION}`;
+}
+
+/** What a guest is given to read a CommonJS body with: the wrapper the host compiles it inside. */
+const EVAL_WRAPPER_PREFIX = '(function (exports, require, module, __filename, __dirname) {'.length;
+
 /** The `vm` timeout error, as Node words it, over the guest's own stack. */
 function interruptedMessage(budgetMs: number, formatted: string): string {
     const headline = `Error: Script execution timed out after ${Math.round(budgetMs)}ms`;
@@ -262,6 +305,71 @@ const REJECTION_TRACKER_SRC = String.raw`
 `;
 
 /**
+ * `process.report`, as node has it: a handle a caller feature-detects (`typeof process.report`) and
+ * asks for a diagnostic report through. `getReport` builds one out of what this process really is --
+ * its pid, its directory, its command line, its version -- and `writeReport` writes that JSON where
+ * it is told to, or to node's own default name when it is not. It is given `fs` rather than reaching
+ * for it, because a bootstrap script has no `require` of its own.
+ */
+const PROCESS_REPORT_SRC = `(function (fs) {
+  var p = globalThis.process;
+  if (p === undefined || p === null || p.report !== undefined) return;
+  var seq = 0;
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  /* Node's own default name for a report file: the UTC timestamp, the pid and a counter. */
+  function defaultName() {
+    var d = new Date();
+    seq += 1;
+    return 'report.' + d.getUTCFullYear() + pad(d.getUTCMonth() + 1) + pad(d.getUTCDate()) + '.' +
+      pad(d.getUTCHours()) + pad(d.getUTCMinutes()) + pad(d.getUTCSeconds()) + '.' + p.pid + '.' + seq + '.json';
+  }
+  function header() {
+    return {
+      reportVersion: 3,
+      event: 'JavaScript API',
+      trigger: 'JS API',
+      filename: p.report.filename,
+      dumpEventTime: new Date().toISOString(),
+      processId: p.pid,
+      cwd: p.cwd(),
+      commandLine: p.argv.slice(),
+      nodejsVersion: p.version,
+      wordSize: 64,
+      platform: p.platform,
+      arch: p.arch,
+      execPath: p.execPath,
+      execArgv: p.execArgv.slice()
+    };
+  }
+  p.report = {
+    writeReport: function (file) {
+      var target = file === undefined || file === '' ? defaultName() : String(file);
+      if (p.report.directory !== '' && target.charAt(0) !== '/') target = p.report.directory + '/' + target;
+      fs.writeFileSync(target, JSON.stringify(p.report.getReport(), null, 2));
+      /* Node says what it wrote and where, on stderr, before the call returns the name. */
+      p.stderr.write('\\nWriting Node.js report to file: ' + target + '\\nNode.js report completed\\n');
+      return target;
+    },
+    getReport: function () {
+      return {
+        header: header(),
+        javascriptStack: { message: '', stack: [] },
+        environmentVariables: p.report.excludeEnv ? {} : p.env
+      };
+    },
+    directory: '',
+    filename: '',
+    compact: false,
+    excludeNetwork: true,
+    signal: 'SIGUSR2',
+    reportOnFatalError: false,
+    reportOnSignal: false,
+    reportOnUncaughtException: false,
+    excludeEnv: false
+  };
+})`;
+
+/**
  * One `node` process: a QuickJS guest with a Node-compatible CommonJS/ESM loader, built-in
  * modules and a host-driven event loop. The process lives while anything holds a ref
  * (armed timers, in-flight host operations, open sockets and servers); process.exit, a
@@ -275,6 +383,27 @@ export class NodeProcess extends Process {
     private evalSource?: string;
     /** `node` with no file: the run is a REPL on the guest's stdin and stdout. */
     private readonly repl: boolean;
+    /** `node -`: the program is what is piped to this process, as it is on the host. */
+    private readonly stdinScript: boolean;
+    /**
+     * What the REPL reads: true while the terminal behind it can still be typed at. A `node` a user
+     * started from a shell has one; one a program spawned `sh -c 'node'` has none, and neither has
+     * one when its stdin is a pipe the writer has yet to fill -- in both, the input is at its end,
+     * which is what a host `node` finds when its stdin is not a tty.
+     */
+    private readonly replReadsTerminal: boolean;
+    /** The input is a pipe a parent writes to and will close: a program arrives on it in pieces. */
+    private readonly stdinFromPipe: boolean;
+    /** `process.execArgv`: the options the line named, as node reports them. */
+    private readonly execArgv: string[];
+    /** `--stack-trace-limit=<n>`: the bound put on the frames of a stack trace. */
+    private readonly stackTraceLimit?: number;
+    /** The `-e`/`-p` source as the line wrote it: the text node quotes back when the run fails. */
+    private readonly evalScript?: string;
+    /** The program `node -` has been piped so far, kept until the input ends and it can be run. */
+    private stdinScriptText = '';
+    /** The piped program has been handed to the guest; it is never run twice. */
+    private stdinScriptStarted = false;
     /** A guest that reads one -- a REPL, or a child the parent writes to -- keeps process.stdin open. */
     private readonly stdinPiped: boolean;
     /** Written by the host, not taken by the guest yet: a write can arrive before the guest boots. */
@@ -345,18 +474,33 @@ export class NodeProcess extends Process {
          * it. Such a child runs to completion inside the capability call that spawned it and cannot
          * await a load of its own.
          */
-        bootModule?: QuickJSAsyncWASMModule
+        bootModule?: QuickJSAsyncWASMModule,
+        /** What the line asked for besides the file it runs: `process.execArgv`, and the rest. */
+        run: NodeRunOptions = { execArgv: [] }
     ) {
         /* The container's own environment, with the caller's over it; see `containerEnv`. */
         const processEnv = containerEnv(cwd, env);
         super(pid, ProcessType.JAVASCRIPT, executablePath, args, parentPid, cwd, processEnv);
         this.bootModule = bootModule;
         this.repl = executablePath === '[repl]';
-        /* A child spawned with a pipe on fd 0: the parent may still write, so the guest keeps
-           process.stdin open until the host ends it. Set by the spawning capability and dropped by
-           the guest at bootstrap, before any user code runs. */
-        this.stdinPiped = env.OWC_STDIN === 'pipe' || this.repl;
-        this.currentCwd = cwd || '/';
+        /* A pipe on fd 0 is a writer, not a person: what it carries is a program, or data for one,
+           and it ends when the writer closes it. A terminal is the only thing a REPL prompts at. */
+        this.stdinFromPipe = env.OWC_STDIN === 'pipe';
+        this.replReadsTerminal = !this.stdinFromPipe && this.parentHasTerminal();
+        /*
+         * A bare `node` nobody is typing at reads its program from what it is given instead, exactly
+         * as a host `node` does when its stdin is not a terminal: `echo 'console.log(7)' | node`
+         * prints 7, and `node < /dev/null` runs nothing and leaves with status 0. Only a `node` with
+         * a terminal behind it prompts, which is what `node -` asks for on any input at all.
+         */
+        this.stdinScript = executablePath === '[stdin]' || (this.repl && !this.replReadsTerminal);
+        /* A piped stdin, a REPL and a `node -` all read what is written to them; a `node -` reads
+           the whole program before it runs any of it. */
+        this.stdinPiped = env.OWC_STDIN === 'pipe' || this.repl || this.stdinScript;
+        this.execArgv = run.execArgv;
+        this.stackTraceLimit = run.stackTraceLimit;
+        this.evalScript = run.evalScript;
+        this.currentCwd = cwd || CONTAINER_WORKDIR;
         this.fileSystem = fileSystem;
         this.networkManager = networkManager;
         this.services = services;
@@ -421,7 +565,15 @@ export class NodeProcess extends Process {
             if (this.flagAnswer === undefined) {
                 this.claimParentTerminal();
                 const entryPath = await this.bootGuest();
-                this.startEntryGated(entryPath);
+                this.installRunOptions();
+                if (this.stdinScript) {
+                    /* What is piped in is the program, and it has not all arrived yet: the ref holds
+                       the process open until it has, and `endStdin` starts it. */
+                    this.holdRef(1);
+                    this.startStdinScript();
+                } else {
+                    this.startEntryGated(entryPath);
+                }
                 await this.runEventLoop();
                 code = this.finishProcess();
             } else if (this.flagAnswer.check === undefined) {
@@ -612,6 +764,79 @@ export class NodeProcess extends Process {
     }
 
     /**
+     * What the line asked for that the guest's own `process` carries, set before the entry runs the
+     * way node has them before a script of its own starts: `process.execArgv`, the bound
+     * `--stack-trace-limit` puts on a trace, and `process.report`.
+     */
+    private installRunOptions(): void {
+        this.setGuestProcessArray('execArgv', this.execArgv);
+        if (this.stackTraceLimit !== undefined) this.setGuestStackTraceLimit(this.stackTraceLimit);
+        this.installProcessReport();
+    }
+
+    /** Puts an array of strings on the guest's `process`, leaving a guest with no process alone. */
+    private setGuestProcessArray(key: string, values: string[]): void {
+        const context = this.context;
+        if (context === undefined) return;
+        try {
+            const process = context.getProp(context.global, 'process');
+            try {
+                const array = context.newArray();
+                for (let at = 0; at < values.length; at++) {
+                    const item = context.newString(values[at]!);
+                    context.setProp(array, at, item);
+                    item.dispose();
+                }
+                context.setProp(process, key, array);
+                array.dispose();
+            } finally {
+                process.dispose();
+            }
+        } catch {
+            // a handle already gone, or a process object that takes no property
+        }
+    }
+
+    /** `Error.stackTraceLimit`, the one option of the line that bounds what a guest's trace holds. */
+    private setGuestStackTraceLimit(limit: number): void {
+        const context = this.context;
+        if (context === undefined) return;
+        try {
+            const errorCtor = context.getProp(context.global, 'Error');
+            try {
+                const value = context.newNumber(limit);
+                context.setProp(errorCtor, 'stackTraceLimit', value);
+                value.dispose();
+            } finally {
+                errorCtor.dispose();
+            }
+        } catch {
+            // no Error constructor to set it on, or one that takes no property
+        }
+    }
+
+    /** `process.report`, handed the `fs` builtin to write a report with: see `PROCESS_REPORT_SRC`. */
+    private installProcessReport(): void {
+        const context = this.context;
+        if (context === undefined) return;
+        let fs: QuickJSHandle | undefined;
+        let installer: QuickJSHandle | undefined;
+        try {
+            const id = context.newString('fs');
+            fs = this.callApi('exportsOf', [id, context.true]);
+            id.dispose();
+            installer = context.unwrapResult(context.evalCode(PROCESS_REPORT_SRC, 'owc-report.js', { type: 'global' }));
+            const called = context.callFunction(installer, context.undefined, [fs]);
+            if (called.error) called.error.dispose(); else called.value.dispose();
+        } catch {
+            // a guest with no process object, or one whose fs cannot be reached: no report is put there
+        } finally {
+            fs?.dispose();
+            installer?.dispose();
+        }
+    }
+
+    /**
      * A REPL takes over the terminal of the process that started it: the shell hands it every
      * keystroke instead of editing a line of its own, the way a foreground job owns a terminal.
      */
@@ -621,12 +846,31 @@ export class NodeProcess extends Process {
     }
 
     /**
+     * Whether the shell that started this process reads its lines from a terminal: one started with
+     * no command of its own -- `sh`, or the playground's `sh --osc` -- is reading what a person
+     * types and has a terminal to hand a REPL, and one started with a command (`sh -c <line>`, the
+     * way a program runs a command) is reading that command. A `node` with no shell behind it and
+     * no pipe on its input has nothing being typed at it either.
+     */
+    private parentHasTerminal(): boolean {
+        const parent = this.parentPid === undefined ? undefined : processOf(this.parentPid);
+        if (parent === undefined || parent.type !== ProcessType.SHELL) return false;
+        return parent.args.every((arg) => arg === '--osc');
+    }
+
+    /**
      * Terminal input for the guest. A run with a stdin pipe -- a REPL, or a child the parent writes
      * to -- reads it: what is written reaches the guest's process.stdin, which is where a REPL and
      * a `process.stdin.on('data')` reader both read from. Any other run keeps the base behaviour, so
      * a child that is written to and never reads is exactly as it was.
      */
     writeInput(input: string): void {
+        /* `node -` runs what it is given, so it is kept whole until the input ends: a script is not
+           a stream of lines to execute one at a time, and half of one cannot run. */
+        if (this.stdinScript) {
+            this.stdinScriptText += input;
+            return;
+        }
         if (!this.repl) {
             if (!this.stdinPiped) {
                 super.writeInput(input);
@@ -655,6 +899,25 @@ export class NodeProcess extends Process {
         if (!this.stdinPiped || this.stdinEnded) return;
         this.stdinEnded = true;
         this.flushStdin();
+        /* The whole program has been piped in, so it can run now. It may have arrived before the
+           guest finished booting, in which case the boot starts it. */
+        this.startStdinScript();
+    }
+
+    /**
+     * Runs the program `node -` was given, once it has all of it and a guest to run it on. The wait
+     * holds a ref, so the process stays alive while the input is still arriving.
+     */
+    private startStdinScript(): void {
+        if (!this.stdinScript || this.stdinScriptStarted) return;
+        /* A `node -` with a pipe on its input waits for the writer to close it: a half-written
+           program cannot run. One with nothing behind it at all is already at its end. */
+        if (!this.stdinEnded && this.stdinFromPipe) return;
+        if (this.context === undefined || this.stopped || this.exitRequested !== undefined) return;
+        this.stdinScriptStarted = true;
+        this.evalSource = this.stdinScriptText;
+        this.guestStep(() => this.startEntry(undefined));
+        this.holdRef(-1);
     }
 
     /**
@@ -741,8 +1004,10 @@ export class NodeProcess extends Process {
 
     /** Everything after the module load has no suspension point, so a synchronous run boots through it too. */
     private bootWith(QuickJS: QuickJSAsyncWASMModule): string | undefined {
-        // a REPL has no file to resolve: its input is the terminal, not a script
-        const entryPath = this.evalSource === undefined && !this.repl ? this.resolveEntry() : undefined;
+        // a REPL has no file to resolve: its input is the terminal, not a script; nor does a `node -`
+        const entryPath = this.evalSource === undefined && !this.repl && !this.stdinScript
+            ? this.resolveEntry()
+            : undefined;
         this.quickJs = QuickJS;
         const runtime = QuickJS.newRuntime();
         this.runtime = runtime;
@@ -763,6 +1028,9 @@ export class NodeProcess extends Process {
             pid: this.pid,
             argv,
             env: Object.fromEntries(this.env),
+            /* The guest's `process.env.X = v` lands back here, so a child this process spawns is
+               handed the environment its parent has at that moment and not the one it booted with. */
+            setEnv: (json) => { this.env = new Map(Object.entries(JSON.parse(json) as Record<string, string>)); },
             cwd: () => this.currentCwd,
             chdir: (path) => this.changeDirectory(path),
             now: () => performance.now(),
@@ -880,7 +1148,15 @@ export class NodeProcess extends Process {
             }
             const QuickJS = this.bootModule;
             if (QuickJS === undefined) throw new Error('no QuickJS module is loaded');
-            this.startEntry(this.bootWith(QuickJS));
+            if (this.stdinScript) {
+                this.bootWith(QuickJS);
+                this.installRunOptions();
+                this.holdRef(1);
+                this.startStdinScript();
+            } else {
+                this.startEntry(this.bootWith(QuickJS));
+                this.installRunOptions();
+            }
             const blocked = this.pumpSync(deadline);
             if (blocked !== undefined) {
                 result.blocked = blocked;
@@ -1144,8 +1420,22 @@ export class NodeProcess extends Process {
         const message = error instanceof GuestFailure
             ? error.message
             : error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-        this.emitGuestOutput({ stderr: message + '\n' });
-        return 1;
+        /* A `-e`/`-p` failure is reported the way node reports one -- the source it was given, a
+           caret, the error -- instead of as a bare QuickJS stack naming the container's own frames. */
+        const reported = this.evalScript === undefined ? message : evalFailureText(message, this.evalScript);
+        this.emitGuestOutput({ stderr: reported + '\n' });
+        /*
+         * The process is dying, and node runs what `process.on('exit')` registered on the way out
+         * even when it dies like this: an uncaught throw and an unhandled rejection both reach
+         * their exit handlers with status 1 after the error has been written. Nothing of the
+         * guest's own follows an exit handler -- the loop is not resumed -- but a handler that
+         * writes, which is what the observable difference is, still writes here.
+         */
+        this.safeEmitExit(1);
+        /* An exit listener may have asked for a status of its own -- `process.exit(7)` inside one,
+           which node honours -- and it is that one the process leaves with; otherwise the status of
+           a process that died like this is 1, whatever the exit handlers wrote. */
+        return this.exitRequested !== undefined ? this.exitRequested : 1;
     }
 
     /** Runs until no ref is held, process.exit runs, a fatal error occurs, or the process is stopped.
@@ -2706,7 +2996,8 @@ function runNodeSync(request: SyncChildRequest): SyncChildResult {
         request.env,
         request.evalSource,
         request.flagAnswer,
-        request.quickJs
+        request.quickJs,
+        { execArgv: [] }
     );
     let stdout = '';
     let stderr = '';

@@ -805,14 +805,17 @@ BF.fs = function () {
   var MODES = {};
 
   function statOf(file) {
-    var raw = host.statJSON(file);
+    var raw = host.statJSON(canonicalOf(file));
     if (raw === null) return null;
     var st = JSON.parse(raw);
     var override = MTIMES[file];
     var withTime = override === undefined ? st : { type: st.type, size: st.size, mtimeMs: override };
     var mode = MODES[file];
-    return mode === undefined ? withTime
+    var out = mode === undefined ? withTime
       : { type: withTime.type, size: withTime.size, mtimeMs: withTime.mtimeMs, mode: mode };
+    out.ino = inoOf(file);
+    out.nlink = nlinkOf(file);
+    return out;
   }
 
   function optionsEncoding(opts) {
@@ -862,6 +865,46 @@ BF.fs = function () {
      follows: a relative target is written verbatim and resolved beside the link. */
   var LINKTARGETS = {};
 
+  /*
+   * Hard links, and the inode numbers that come with them. This file system has no inode table of
+   * its own, so the two are tables kept here: LINKS names, for a second name of a file, the first
+   * name whose bytes it shares, and INODES gives every file a number that survives a write and
+   * differs from every other file's -- which is all ino is for. Every read and write of a linked
+   * name goes through canonicalOf to the bytes it shares, so a write through one name is read
+   * back through the other, and nlink counts the names a file has.
+   */
+  var LINKS = {};
+  var INODES = {};
+  var INO_NEXT = 1;
+
+  /* The name a file's bytes live under: itself, unless it is a second name of another file's. */
+  function canonicalOf(file) {
+    var at = file;
+    for (var hop = 0; LINKS[at] !== undefined && hop < 64; hop++) at = LINKS[at];
+    return at;
+  }
+
+  function inoOf(file) {
+    var canonical = canonicalOf(file);
+    if (INODES[canonical] === undefined) INODES[canonical] = INO_NEXT++;
+    return INODES[canonical];
+  }
+
+  /* How many names a file has: its own, plus every name recorded as a second one of it. */
+  function nlinkOf(file) {
+    var canonical = canonicalOf(file);
+    var count = 1;
+    var names = Object.keys(LINKS);
+    for (var i = 0; i < names.length; i++) if (LINKS[names[i]] === canonical) count++;
+    return count;
+  }
+
+  /* Node's blocks counts 512-byte blocks while the allocation it reports is in 4096-byte ones: a
+     1-byte file holds 8, a 4097-byte one 16, and an empty one none. */
+  function blocksOf(size) {
+    return Math.ceil(size / 4096) * 8;
+  }
+
   /* Node exports fs.Stats, and packages test a stat with instanceof fs.Stats, so a stat is an
      instance of it; every field still sits on the instance, exactly as it did before. */
   function Stats() {}
@@ -875,14 +918,14 @@ BF.fs = function () {
     var out = {
       dev: num(0),
       mode: num(st.mode !== undefined ? st.mode : (st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188))),
-      nlink: num(1),
+      nlink: num(st.nlink !== undefined ? st.nlink : 1),
       uid: num(0),
       gid: num(0),
       rdev: num(0),
       blksize: num(4096),
-      ino: num(0),
+      ino: num(st.ino !== undefined ? st.ino : 0),
       size: num(st.size),
-      blocks: num(Math.ceil(st.size / 512)),
+      blocks: num(blocksOf(st.size)),
       atimeMs: num(st.mtimeMs),
       mtimeMs: num(st.mtimeMs),
       ctimeMs: num(st.mtimeMs),
@@ -931,7 +974,7 @@ BF.fs = function () {
   }
 
   function readBytesOf(file) {
-    return decodeBase64(host.readBase64(file));
+    return decodeBase64(host.readBase64(canonicalOf(file)));
   }
 
   function check(code, syscall, file) {
@@ -946,10 +989,45 @@ BF.fs = function () {
     if (!st) throw fsError('ENOENT', 'open', String(p));
     if (st.type === 'dir') throw fsError('EISDIR', 'read', file);
     var enc = optionsEncoding(opts);
-    if (enc && normalizeEncoding(enc) === 'utf8') return host.readText(file);
+    if (enc && normalizeEncoding(enc) === 'utf8') return host.readText(canonicalOf(file));
     var bytes = readBytesOf(file);
     if (enc) return decodeBytes(bytes, enc);
     return Buf.from(bytes);
+  };
+
+  /*
+   * openAsBlob hands the file back as a Blob, which is what a fetch of a file: URL and a browser
+   * package both expect of it. This engine has no Blob of its own, so what resolves is an object
+   * with the size and type of one and the arrayBuffer, text and slice of one; the promise
+   * around it is what Node returns, and a missing file rejects with the ENOENT Node reports.
+   */
+  function blobOf(data, type) {
+    return {
+      size: data.length,
+      type: type,
+      arrayBuffer: function () {
+        var copy = new Uint8Array(data.length);
+        copy.set(data);
+        return Promise.resolve(copy.buffer);
+      },
+      text: function () { return Promise.resolve(decodeBytes(data, 'utf8')); },
+      slice: function (start, end, contentType) {
+        var from = start === undefined ? 0 : (start < 0 ? Math.max(0, data.length + start) : start);
+        var to = end === undefined ? data.length : (end < 0 ? Math.max(from, data.length + end) : end);
+        return blobOf(data.subarray(from, to), typeof contentType === 'string' ? contentType : '');
+      }
+    };
+  }
+
+  fs.openAsBlob = function (p, opts) {
+    var file = toPathString(p);
+    var type = opts && typeof opts === 'object' && typeof opts.type === 'string' ? opts.type : '';
+    return new Promise(function (resolve, reject) {
+      var st = statOf(file);
+      if (!st) { reject(fsError('ENOENT', 'open', String(p))); return; }
+      if (st.type === 'dir') { reject(fsError('EISDIR', 'open', file)); return; }
+      resolve(blobOf(readBytesOf(file), type));
+    });
   };
 
   /*
@@ -981,7 +1059,7 @@ BF.fs = function () {
       merged.set(bytes, existing.length);
       bytes = merged;
     }
-    check(host.writeBase64(file, encodeBase64(bytes), mode), 'open', file);
+    check(host.writeBase64(canonicalOf(file), encodeBase64(bytes), mode), 'open', file);
   };
 
   fs.appendFileSync = function (p, data, opts) {
@@ -1048,6 +1126,29 @@ BF.fs = function () {
     }
     SYMLINKS[to] = from;
     LINKTARGETS[to] = raw;
+  };
+
+  /*
+   * A hard link: a second name for the bytes one name already holds. This file system has no inode
+   * for two names to share, so the new name is put in the tree as a file -- which is what makes it
+   * visible to a readdir, to the shell and to every lookup that asks whether it is there -- and
+   * recorded as a second name of the bytes the first one holds, so a read of either sees what a
+   * write to the other put there and stat gives both the same ino and an nlink of 2. What it
+   * cannot do is what ext4 does when the last name goes: the hold on the bytes is the first
+   * name's, and removing that one leaves the others reading the copy made here.
+   */
+  fs.linkSync = function (existingPath, newPath) {
+    var from = toPathString(existingPath);
+    var to = toPathString(newPath);
+    var st = statOf(from);
+    if (!st) throw fsError('ENOENT', 'link', String(existingPath));
+    if (st.type === 'dir') throw fsError('EPERM', 'link', String(existingPath));
+    if (statOf(to)) throw fsError('EEXIST', 'link', String(newPath));
+    var canonical = canonicalOf(from);
+    var raw = host.readBase64(canonical);
+    if (raw === null) throw fsError('ENOENT', 'link', String(existingPath));
+    check(host.writeBase64(to, raw, 0o644), 'link', to);
+    LINKS[to] = canonical;
   };
 
   fs.readlinkSync = function (p) {
@@ -1145,6 +1246,9 @@ BF.fs = function () {
     if (!st) throw fsError('ENOENT', 'unlink', file);
     if (st.type === 'dir') throw fsError('EISDIR', 'unlink', file);
     check(host.rm(file, false), 'unlink', file);
+    /* A second name of a file is dropped from the table when its own name goes; the bytes it was
+       sharing stay under the name they were written to. */
+    delete LINKS[file];
   };
 
   fs.renameSync = function (from, to) {
@@ -1157,6 +1261,57 @@ BF.fs = function () {
     var src = toPathString(from);
     if (!statOf(src)) throw fsError('ENOENT', 'copyfile', src);
     check(host.writeBase64(toPathString(to), encodeBase64(readBytesOf(src))), 'copyfile', src);
+  };
+
+  /*
+   * cpSync is copyFileSync over a tree: recursive for a directory, force to overwrite a
+   * destination that is already there (errorOnExist is its opposite, and Node refuses when both
+   * are asked for), filter to skip a path, dereference to copy the bytes a symlink points at
+   * rather than the link, and mode for what a copied directory is created with. A destination
+   * that does not exist is created, and copying a directory without recursive is the EISDIR
+   * Node reports rather than a copy of nothing.
+   */
+  function cpOne(src, dest, opts, seen) {
+    if (typeof opts.filter === 'function' && !opts.filter(src, dest)) return;
+    var st = statOf(src);
+    if (!st) throw fsError('ENOENT', 'cp', src);
+    if (st.type === 'dir') {
+      if (!opts.recursive) throw eisdirError('cp', src);
+      if (statOf(dest)) {
+        if (opts.errorOnExist) throw fsError('EEXIST', 'cp', dest);
+      } else {
+        check(host.mkdir(dest, opts.mode === undefined ? newMode(null, 0o777) : opts.mode), 'cp', dest);
+      }
+      var names = sortedEntries(src);
+      for (var i = 0; i < names.length; i++) {
+        cpOne(P.join(src, names[i]), P.join(dest, names[i]), opts, seen);
+      }
+      return;
+    }
+    var linked = SYMLINKS[src] !== undefined;
+    if (linked && !opts.dereference) {
+      if (!opts.force && statOf(dest)) throw fsError('EEXIST', 'cp', dest);
+      fs.symlinkSync(LINKTARGETS[src] !== undefined ? LINKTARGETS[src] : SYMLINKS[src], dest);
+      return;
+    }
+    if (!opts.force && statOf(dest)) throw fsError('EEXIST', 'cp', dest);
+    check(host.writeBase64(dest, encodeBase64(readBytesOf(src)), 0o644), 'cp', src);
+  }
+
+  fs.cpSync = function (src, dest, opts) {
+    var options = opts === undefined || opts === null ? {} : opts;
+    if (typeof options !== 'object') throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "options" argument must be of type object. Received ' + describeFsArg(options));
+    if (options.force && options.errorOnExist) {
+      throw fsArgErr(TypeError, 'ERR_INVALID_ARG_VALUE', 'The "options.force" and "options.errorOnExist" options are mutually exclusive');
+    }
+    cpOne(toPathString(src), toPathString(dest), {
+      recursive: !!options.recursive,
+      force: !!options.force,
+      errorOnExist: !!options.errorOnExist,
+      dereference: !!options.dereference,
+      filter: typeof options.filter === 'function' ? options.filter : undefined,
+      mode: typeof options.mode === 'number' ? options.mode : undefined
+    }, {});
   };
 
   /*
@@ -1465,6 +1620,25 @@ BF.fs = function () {
     return total;
   };
 
+  /*
+   * writev, the other half of the pair: several buffers written in order to one descriptor, from
+   * its position or from the one it was given, and the count is the total written, as in Node.
+   */
+  fs.writevSync = function (fd, buffers, position) {
+    var rec = descriptorOf(fd, 'write');
+    if (!rec.writable) throw badFdError('write');
+    if (rec.isDir) throw fsError('EISDIR', 'write', rec.path);
+    var at = typeof position === 'number' ? position : rec.position;
+    var total = 0;
+    for (var i = 0; i < buffers.length; i++) {
+      var buf = buffers[i];
+      if (buf.length === 0) continue;
+      total += fs.writeSync(fd, buf, 0, buf.length, at + total);
+    }
+    if (typeof position !== 'number') rec.position = at + total;
+    return total;
+  };
+
   // A mode is kept per path, with the type bits Node puts above it: statSync is what makes the
   // change observable, and a chmod no later stat reports is a no-op that reports success.
   function setModeOf(file, mode) {
@@ -1711,6 +1885,29 @@ BF.fs = function () {
   fs.R_OK = 4;
   fs.W_OK = 2;
   fs.X_OK = 1;
+
+  /*
+   * What statfs reports about the file system a path sits on, in the seven numbers Node's own give:
+   * a 4096-byte block, a 32 GiB volume with half of it free, and a million inodes with half of
+   * those. There is no disk behind this file system to measure, and the numbers a host answers
+   * describe its own, so what is reproduced is the shape of the answer -- the keys a package reads
+   * -- and a size no package will run out of.
+   */
+  fs.statfsSync = function (p, opts) {
+    var file = toPathString(p === undefined ? '/' : p);
+    if (!statOf(file)) throw fsError('ENOENT', 'statfs', file);
+    var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
+    var num = bigint ? function (value) { return BigInt(value); } : function (value) { return value; };
+    return {
+      type: num(61267),
+      bsize: num(4096),
+      blocks: num(8388608),
+      bfree: num(4194304),
+      bavail: num(4194304),
+      files: num(1048576),
+      ffree: num(524288)
+    };
+  };
 
   /*
    * fs.promises.open resolves to one of these and not to the bare integer fs.open hands back: a

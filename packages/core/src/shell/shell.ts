@@ -6,8 +6,9 @@ import { CurlCommand } from './commands/curl';
 import { UnzipCommand } from './commands/unzip';
 import { WgetCommand } from './commands/wget';
 import { Process } from '../process';
+import { CONTAINER_WORKDIR } from '../process/executors/default-env';
 import { COMMANDS as TEXT_UTILS } from './commands/textutils';
-import { COMMANDS as FILE_UTILS, readable, setCreationMode, setUmask } from './commands/fileutils';
+import { COMMANDS as FILE_UTILS, readable, setCreationMode, setMode, setUmask } from './commands/fileutils';
 import { COMMANDS as ARCHIVES } from './commands/archives';
 import { COMMANDS as PROC_INFO } from './commands/procinfo';
 import {
@@ -145,7 +146,7 @@ export class Shell implements IShell {
 
     constructor(fileSystem: IFileSystem, options: ShellOptions) {
         this.fileSystem = fileSystem;
-        this.currentDirectory = options.cwd || '/';
+        this.currentDirectory = options.cwd || CONTAINER_WORKDIR;
         this.env = options.env || new Map([
             ['PATH', '/bin:/usr/bin'],
             ['HOME', '/home'],
@@ -493,6 +494,9 @@ export class Shell implements IShell {
             const filePath = this.resolvePath(redirect.file);
 
             try {
+                /* A name a redirection created carries the mode the umask leaves, as it does on the
+                   host; one that was already there keeps the mode it had. */
+                const existed = this.fileExistsSafe(filePath);
                 if (redirect.type === '>>') {
                     // Append to file; a target no file has yet starts empty, as it does on the host
                     let existingContent = '';
@@ -502,6 +506,7 @@ export class Shell implements IShell {
                     // Overwrite file
                     this.fileSystem.writeFile(filePath, output);
                 }
+                if (!existed) setCreationMode(this.moduleFs, filePath, false);
             } catch (error: any) {
                 throw new Error(`Failed to redirect to ${redirect.file}: ${error.message}`);
             }
@@ -731,7 +736,20 @@ export class Shell implements IShell {
                 case 'mkdir': {
                     if (args.length === 0) return fail('No directory specified');
                     const recursive = args.includes('-p');
-                    const paths = args.filter((arg) => !arg.startsWith('-'));
+                    /* `-m mode` names the mode outright, and the umask does not mask it: `umask 077;
+                       mkdir -m 700 d` leaves 700 on a host, not 700 with 077 taken out of it.
+                       The value is either the next word or the rest of this one (`-m700`). */
+                    let named: number | undefined;
+                    let namedMode: number | undefined;
+                    const paths: string[] = [];
+                    for (let i = 0; i < args.length; i++) {
+                        const arg = args[i];
+                        if (named === i) continue;
+                        if (arg === '-m') { named = i + 1; namedMode = Number.parseInt(args[i + 1] ?? '', 8); continue; }
+                        if (arg.startsWith('-m') && arg.length > 2) { namedMode = Number.parseInt(arg.slice(2), 8); continue; }
+                        if (arg.startsWith('-') && arg !== '-') continue;
+                        paths.push(arg);
+                    }
                     if (paths.length === 0) return fail('No directory specified');
                     /* A directory this shell creates carries the mode the umask leaves, which is
                        what `umask 077; mkdir d1` leaves on a host: `drwx------`. */
@@ -747,6 +765,11 @@ export class Shell implements IShell {
                             setCreationMode(this.moduleFs, at(path), true);
                         }
                     }
+                    /* `-m` overrides what the umask left, and is recorded the same way so `ls -l`
+                       and `stat` read it back. */
+                    if (namedMode !== undefined && !Number.isNaN(namedMode)) {
+                        for (const path of paths) setMode(this.moduleFs, at(path), namedMode);
+                    }
                     return ok();
                 }
                 case 'rm': {
@@ -754,14 +777,24 @@ export class Shell implements IShell {
                        letters of one word are read one at a time, the way rm reads them. */
                     let force = false;
                     let recursive = false;
+                    /* `--` ends the options and everything behind it is an operand, so `rm -- -f`
+                       removes the file named `-f` and `rm -- --` the one named `--`, which a filter
+                       that dropped every word starting with a dash left behind. */
+                    let noMoreOptions = false;
                     for (const arg of args) {
+                        if (noMoreOptions) continue;
+                        if (arg === '--') { noMoreOptions = true; continue; }
                         if (!arg.startsWith('-') || arg === '-') continue;
                         for (const ch of arg.slice(1)) {
                             if (ch === 'f') force = true;
                             else if (ch === 'r' || ch === 'R') recursive = true;
                         }
                     }
-                    const paths = args.filter((arg) => !arg.startsWith('-') || arg === '-');
+                    const afterDash = args.indexOf('--');
+                    const guarded = afterDash < 0 ? [] : args.slice(afterDash + 1);
+                    const paths = (afterDash < 0
+                        ? args.filter((arg) => !arg.startsWith('-') || arg === '-')
+                        : guarded);
                     /* No operand at all is a usage error and not a missing file, with the status a
                        host gives for one -- 64, which `echo $?` reads where a plain failure reads
                        1. `-f` is the one flag that swallows it: `rm -f` names nothing and says
@@ -1113,7 +1146,12 @@ export class Shell implements IShell {
             }
             const bytes = this.fileSystem.readBytes(src);
             if (bytes === undefined) return fail(`cp: ${operands[0]}: No such file or directory`);
+            /* A name this copy created carries the mode the umask leaves, as `> f` and `touch f`
+               leave it: `umask 077; cp a b` is `-rw-------` on a host. One that was already there
+               keeps the mode it had, which is what copying over an existing file does. */
+            const existed = this.fileExistsSafe(to);
             this.fileSystem.writeBytes(to, bytes);
+            if (!existed) setCreationMode(this.moduleFs, to, false);
             return { stdout: '', stderr: '', exitCode: 0 };
         } catch (error: any) {
             return fail(error instanceof Error ? error.message : String(error));

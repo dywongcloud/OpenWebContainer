@@ -2,6 +2,7 @@ import { IFileSystem } from '../../../filesystem';
 import { ChildProcessPayload, Process } from '../../base';
 import { ProcessExecutor } from '../base';
 import { NpmProcess } from './process';
+import { CONTAINER_WORKDIR } from '../default-env';
 
 export class NpmProcessExecutor implements ProcessExecutor {
     constructor(private fileSystem: IFileSystem) { }
@@ -11,6 +12,6 @@ export class NpmProcessExecutor implements ProcessExecutor {
     }
 
     async execute(payload: ChildProcessPayload, pid: number, parentPid?: number): Promise<Process> {
-        return new NpmProcess(pid, payload.executable, payload.args, this.fileSystem, parentPid, payload.cwd || '/');
+        return new NpmProcess(pid, payload.executable, payload.args, this.fileSystem, parentPid, payload.cwd || CONTAINER_WORKDIR);
     }
 }

@@ -36,10 +36,42 @@ BF.os = function () {
     release: function () { return '6.0.0'; },
     hostname: function () { return 'localhost'; },
     homedir: function () { return (globalThis.process && process.env.HOME) || '/home'; },
-    tmpdir: function () { return '/tmp'; },
+    /*
+     * Node reads TMPDIR fresh on every call, so a process that sets it and then asks sees its own
+     * value from that point on, and falls back to TMP, TEMP and then /tmp. A fixed /tmp answered
+     * the value the environment happened to carry at boot and nothing after it.
+     */
+    tmpdir: function () {
+      var env = (globalThis.process && process.env) || {};
+      var path = env.TMPDIR || env.TMP || env.TEMP || '/tmp';
+      while (path.length > 1 && path.charAt(path.length - 1) === '/') path = path.slice(0, -1);
+      return path;
+    },
     endianness: function () { return 'LE'; },
-    cpus: function () { return []; },
-    availableParallelism: function () { return 1; },
+    /*
+     * One entry per cpu the machine under the container has, which is what a container sees: it is
+     * not given cpus of its own. The count is the host's navigator.hardwareConcurrency, asked for
+     * through the bridge, so os.cpus().length and os.availableParallelism() agree with it and
+     * with each other, as they do on the host. An empty list, which this was, makes a package that
+     * divides by the cpu count divide by zero and one that sizes a worker pool by it size it at 0.
+     */
+    cpus: function () {
+      var count = host.cpuCount();
+      var out = [];
+      for (var i = 0; i < count; i++) {
+        out.push({
+          model: 'OpenWebContainer virtual cpu',
+          speed: 2400,
+          times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 }
+        });
+      }
+      return out;
+    },
+    availableParallelism: function () { return host.cpuCount(); },
+    /* os.version is the release string uname -v prints; os.machine is what uname -m prints, which
+       for this container's own architecture (x64, the process.arch it reports) is x86_64. */
+    version: function () { return '#1 SMP PREEMPT_DYNAMIC Mon Jan 1 00:00:00 UTC 2024'; },
+    machine: function () { return 'x86_64'; },
     totalmem: function () { return 4294967296; },
     freemem: function () { return 2147483648; },
     uptime: function () { return 0; },
@@ -132,8 +164,19 @@ BF.url = function () {
     return encodeURIComponent(s).replace(/%20/g, '+');
   }
 
+  /* The pairs a caller stores: an own property in this runtime's own implementation, but not one
+     Node's shows -- Object.keys, JSON.stringify and for-in of a URLSearchParams are all empty. */
+  function quoteString(text) {
+    return "'" + String(text).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+  }
+
+  function initList(self) {
+    Object.defineProperty(self, '_list', { value: [], writable: true, configurable: true });
+    return self._list;
+  }
+
   function URLSearchParams(init) {
-    this._list = [];
+    initList(this);
     if (typeof init === 'string') {
       var s = init.charAt(0) === '?' ? init.slice(1) : init;
       if (s.length) {
@@ -204,16 +247,39 @@ BF.url = function () {
   URLSearchParams.prototype.forEach = function (cb, thisArg) {
     for (var i = 0; i < this._list.length; i++) cb.call(thisArg, this._list[i][1], this._list[i][0], this);
   };
+  /* WHATWG url: the three iterators hand out an iterator, not an array -- that is what makes a
+     URLSearchParams spreadable, and what for..of walks. */
   URLSearchParams.prototype.keys = function () {
-    return this._list.map(function (pair) { return pair[0]; });
+    return this._list.map(function (pair) { return pair[0]; })[Symbol.iterator]();
   };
   URLSearchParams.prototype.values = function () {
-    return this._list.map(function (pair) { return pair[1]; });
+    return this._list.map(function (pair) { return pair[1]; })[Symbol.iterator]();
   };
   URLSearchParams.prototype.entries = function () {
-    return this._list.map(function (pair) { return [pair[0], pair[1]]; });
+    return this._list.map(function (pair) { return [pair[0], pair[1]]; })[Symbol.iterator]();
   };
   URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
+  /* WHATWG url: size is the number of pairs, a getter over the list rather than a field on it. */
+  Object.defineProperty(URLSearchParams.prototype, 'size', {
+    get: function () { return this._list.length; },
+    configurable: true
+  });
+  /* What Node prints for a params object: each pair as name => value, and nothing but braces when
+     there are none. */
+  var USP_INSPECT = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
+  if (USP_INSPECT !== undefined) {
+    Object.defineProperty(URLSearchParams.prototype, USP_INSPECT, {
+      value: function () {
+        var shown = '';
+        for (var i = 0; i < this._list.length; i++) {
+          shown += (i === 0 ? '' : ', ') + quoteString(this._list[i][0]) + ' => ' + quoteString(this._list[i][1]);
+        }
+        return 'URLSearchParams {' + (shown === '' ? '' : ' ' + shown) + ' }';
+      },
+      writable: true, configurable: true
+    });
+  }
+  Object.defineProperty(URLSearchParams.prototype, Symbol.toStringTag, { value: 'URLSearchParams', configurable: true });
   URLSearchParams.prototype.toString = function () {
     return this._list.map(function (pair) { return encodeComponent(pair[0]) + '=' + encodeComponent(pair[1]); }).join('&');
   };
@@ -221,6 +287,23 @@ BF.url = function () {
   URLSearchParams.prototype.sort = function () {
     this._list.sort(function (a, b) { return a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0); });
   };
+  /* Node's own order: size first among the methods, the mutators next, then the iterators and
+     toString; and among the symbols its inspect hook, then the tag, then the iterator. Deleting
+     and re-adding is what rewrites an order that was already written. */
+  ['size', 'append', 'delete', 'get', 'getAll', 'has', 'set', 'sort', 'entries', 'forEach',
+   'keys', 'values', 'toString'].forEach(function (name) {
+    var desc = Object.getOwnPropertyDescriptor(URLSearchParams.prototype, name);
+    if (desc === undefined) return;
+    delete URLSearchParams.prototype[name];
+    Object.defineProperty(URLSearchParams.prototype, name, desc);
+  });
+  [USP_INSPECT, Symbol.toStringTag, Symbol.iterator].forEach(function (sym) {
+    if (sym === undefined) return;
+    var desc = Object.getOwnPropertyDescriptor(URLSearchParams.prototype, sym);
+    if (desc === undefined) return;
+    delete URLSearchParams.prototype[sym];
+    Object.defineProperty(URLSearchParams.prototype, sym, desc);
+  });
 
   /* WHATWG url: a path is resolved by removing its dot segments (RFC 3986 5.2.4). A percent-encoded
      dot segment counts as one, but the segment is written back as the caller encoded it. */
