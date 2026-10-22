@@ -438,3 +438,29 @@ export const NODE_HELP_TEXT = [
     "Documentation can be found at https://nodejs.org/",
     ""
 ].join('\n');
+
+/**
+ * The text `node --completion-bash` prints: Node 24.15's own bash completion function, byte for
+ * byte, captured from the build whose version NODE_VERSION reports. Like the usage block, it is a
+ * constant of the build rather than something a container composes: it is the list of the options
+ * that very build reads, and a container that answered with a list of its own would be answering
+ * for a node it is not.
+ *
+ * Captured, not hand-written: `node --completion-bash > completion.txt` on the Node build whose
+ * version NODE_VERSION reports (runtime/guest/globals.ts), one line to a row.
+ */
+export const NODE_COMPLETION_BASH_TEXT = [
+    "_node_complete() {",
+    "  local cur_word options",
+    "  cur_word=\"${COMP_WORDS[COMP_CWORD]}\"",
+    "  if [[ \"${cur_word}\" == -* ]] ; then",
+    "    COMPREPLY=( $(compgen -W '--run --experimental-sea-config --node-memory-debug --perf-basic-prof --test-concurrency --heap-prof-interval --perf-prof-unwinding-info --experimental-global-webcrypto --max-old-space-size-percentage --watch-path --experimental-eventsource --max-heap-size --test-timeout --experimental-report --experimental-worker-inspection --trace-env-native-stack --version --test-update-snapshots --test --frozen-intrinsics --disable-proto --trace-env --track-heap-objects --experimental-detect-module --max-semi-space-size --max-http-header-size --test-udp-no-try-send --trace-env-js-stack --debug-brk --use-system-ca --stack-trace-limit --report-signal --experimental-modules --dns-result-order --experimental-sqlite --jitless --harmony-shadow-realm --perf-prof --test-shard --preserve-symlinks --disable-wasm-trap-handler --heapsnapshot-near-heap-limit --experimental-top-level-await --experimental-test-snapshots --test-name-pattern --inspect-brk --trace-require-module --inspect-brk-node --tls-cipher-list --report-uncaught-exception --interactive --tls-max-v1.2 --trace-warnings --report-exclude-env --heap-prof-name --heap-prof --expose-gc --trace-tls --tls-min-v1.3 --help --tls-min-v1.0 --test-global-setup --redirect-warnings --tls-min-v1.2 --disallow-code-generation-from-strings --preserve-symlinks-main --print --enable-etw-stack-walking --watch-kill-signal --unhandled-rejections --tls-max-v1.3 --report-exclude-network --inspect-wait --strip-types --experimental-json-modules --trace-sync-io --trace-exit --throw-deprecation --report-on-signal --test-rerun-failures --test-coverage-exclude --abort-on-uncaught-exception --inspect-publish-uid --test-only --test-skip-pattern --tls-keylog --build-snapshot-config --test-reporter-destination --test-reporter --disable-sigusr1 --deprecation --experimental-wasm-modules --cpu-prof-interval --test-coverage-functions --env-file-if-exists --eval --experimental-vm-modules --debug --experimental-fetch --report-compact --cpu-prof-dir --experimental-network-inspection --experimental-default-config-file --experimental-shadow-realm --cpu-prof --experimental-test-module-mocks --insecure-http-parser --perf-basic-prof-only-functions --network-family-autoselection --experimental-transform-types --require --experimental-test-coverage --use-env-proxy --test-coverage-lines --disable-warning --warnings --require-module --global-search-paths --experimental-websocket --force-node-api-uncaught-exceptions-policy --env-file --experimental-loader --http-parser --inspect-port --prof --watch --async-context-frame --trace-event-categories --experimental-worker --heap-prof-dir --inspect --heapsnapshot-signal --allow-child-process --trace-sigint --test-coverage-include --test-coverage-branches --experimental-import-meta-resolve --localstorage-file --trace-promises --allow-inspector --permission --trace-deprecation --test-force-exit --addons --entry-url --experimental-global-customevent --test-isolation --experimental-inspector-network-resource --title --experimental-global-navigator --max-old-space-size --experimental-quic --experimental-addon-modules --enable-source-maps --experimental-repl-await --experimental-print-required-tla --prof-process --watch-preserve-output --use-largepages --expose-internals --experimental-webstorage --diagnostic-dir --interpreted-frames-native-stack --verify-base-objects --snapshot-blob --experimental-require-module --network-family-autoselection-attempt-timeout --extra-info-on-fatal-exception --allow-fs-write --secure-heap-min --check --trace-uncaught --allow-worker --import --force-context-aware --napi-modules --v8-options --openssl-legacy-provider --enable-fips --openssl-shared-config --allow-addons --zero-fill-buffers --report-dir --use-bundled-ca --use-openssl-ca --openssl-config --icu-data-dir --experimental-config-file --v8-pool-size --report-on-fatalerror --experimental-wasi-unstable-preview1 --cpu-prof-name --allow-wasi --force-async-hooks-checks --completion-bash --tls-min-v1.1 --force-fips --report-filename --security-revert --node-snapshot --debug-arraybuffer-allocations --trace-event-file-pattern --conditions --input-type --pending-deprecation --experimental-abortcontroller --allow-fs-read --build-snapshot --experimental-specifier-resolution --secure-heap -r -i --loader -pe -p --debug-port --inspect-brk-node= --inspect= --print <arg> -c -e --es-module-specifier-resolution --inspect-wait= --prof-process --debug-brk= -C -v --debug= --experimental-strip-types --enable-network-family-autoselection --inspect-brk= --experimental-test-isolation --report-directory -h --security-reverts --trace-events-enabled' -- \"${cur_word}\") )",
+    "    return 0",
+    "  else",
+    "    COMPREPLY=( $(compgen -f \"${cur_word}\") )",
+    "    return 0",
+    "  fi",
+    "}",
+    "complete -o filenames -o nospace -o bashdefault -F _node_complete node node_g",
+    ""
+].join('\n');

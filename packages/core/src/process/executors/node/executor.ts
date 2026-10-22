@@ -31,7 +31,8 @@ export class NodeProcessExecutor implements ProcessExecutor {
             const run: NodeRunOptions = {
                 execArgv: command.execArgv,
                 ...(command.stackTraceLimit === undefined ? {} : { stackTraceLimit: command.stackTraceLimit }),
-                ...(command.evalScript === undefined ? {} : { evalScript: command.evalScript })
+                ...(command.evalScript === undefined ? {} : { evalScript: command.evalScript }),
+                ...(command.inputType === undefined ? {} : { inputType: command.inputType })
             };
             return new NodeProcess(
                 pid,
