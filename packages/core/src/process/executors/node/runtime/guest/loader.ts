@@ -107,6 +107,10 @@ function importFromOf(parent, fromDir) {
    recorded here while a CommonJS module body runs. */
 var CURRENT_FILE = '';
 
+/* Every file the host compiled inside the CommonJS wrapper. A frame the engine names for line 1 of
+   one counts the wrapper's own columns in front of the module's, and only these files. */
+var WRAPPED_FILES = Object.create(null);
+
 function setCurrentFile(file) {
   CURRENT_FILE = typeof file === 'string' ? file : '';
 }
@@ -480,14 +484,24 @@ function cjsImportSource(src, filename) {
   return out + src.slice(cursor);
 }
 
-/* The host compiles the wrapper, not an in-guest eval: the engine names eval'd code <input>, so
-   every CommonJS module would share one nameless script and its stack frames would carry no path.
-   Packages that locate their binary from a stack frame (bindings, and anything built on it) read
-   CallSite.getFileName() and fail on that. A failed compile comes back as the message string. */
+/*
+ * The host compiles the wrapper, not an in-guest eval: the engine names eval'd code <input>, so
+ * every CommonJS module would share one nameless script and its stack frames would carry no path.
+ * Packages that locate their binary from a stack frame (bindings, and anything built on it) read
+ * CallSite.getFileName() and fail on that. A failed compile comes back as the message string.
+ * The file is recorded as one compiled inside that wrapper, because the wrapper sits in front of
+ * the module's first line and a frame the engine names there counts its columns too (see
+ * frameColumnUnwrapped in globals.ts).
+ */
 function compileCjs(src, filename) {
-  var compiled = host.compileCjs(src, filename);
+  var compiled = compileCjsWrapped(src, filename);
   if (typeof compiled === 'string') throw new SyntaxError(compiled);
   return compiled;
+}
+
+function compileCjsWrapped(src, filename) {
+  WRAPPED_FILES[filename] = true;
+  return host.compileCjs(src, filename);
 }
 
 function compileCjsWrapper(src, filename) {
@@ -496,7 +510,7 @@ function compileCjsWrapper(src, filename) {
      words -- that the source as written earns. */
   var wrapped = cjsImportSource(src, filename);
   if (wrapped !== src) {
-    var tried = host.compileCjs(wrapped, filename);
+    var tried = compileCjsWrapped(wrapped, filename);
     if (typeof tried !== 'string') return tried;
   }
   try {
