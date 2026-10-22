@@ -2301,11 +2301,7 @@ function owcBuildStreamCore() {
   }
 
   // Duplex.from(fn): the writable side feeds the generator's argument, the readable side yields it.
-  function funcToDuplex(fn) {
-    if (typeof fn !== 'function') return fn;
-    var source = new PassThrough({ objectMode: true });
-    var iterator = fn(source);
-    if (!iterator || typeof iterator.next !== 'function') throw argBodyError(fn);
+  function iteratorToDuplex(iterator, source) {
     var duplex = new Duplex({
       objectMode: true,
       write: function (chunk, encoding, callback) {
@@ -2334,6 +2330,28 @@ function owcBuildStreamCore() {
       });
     }
     return duplex;
+  }
+
+  /* Node calls a function that takes no argument at once and takes what it answers as the next link
+     in the chain; one that takes the source is a generator over it, and what it answers is read as
+     an iterable even when it is a stream. */
+  function funcToDuplex(fn) {
+    if (typeof fn !== 'function') return fn;
+    if (fn.length === 0) {
+      var made = fn();
+      if (made === null || typeof made !== 'object') throw argBodyError(fn);
+      if (typeof made.next === 'function') return iteratorToDuplex(made, new PassThrough({ objectMode: true }));
+      return made;
+    }
+    var source = new PassThrough({ objectMode: true });
+    var iterator = fn(source);
+    if (iterator === null || typeof iterator !== 'object') throw argBodyError(fn);
+    if (typeof iterator.next !== 'function') {
+      if (typeof iterator[Symbol.asyncIterator] === 'function') iterator = iterator[Symbol.asyncIterator]();
+      else if (typeof iterator[Symbol.iterator] === 'function') iterator = iterator[Symbol.iterator]();
+      else throw argBodyError(fn);
+    }
+    return iteratorToDuplex(iterator, source);
   }
 
   function duplexFrom(value) {
@@ -2553,13 +2571,22 @@ function owcBuildStreamCore() {
   /* duplexPair: two duplexes wired to each other, so what one is written with the other reads.
      Each side's write pushes straight into the other's readable buffer and waits for that side to
      ask for more before it takes another chunk; ending one side ends the other's readable half. */
+  /* The two sides Node's duplexPair answers are instances of its own DuplexSide subclass of Duplex,
+     so that is the name a caller reads off them. */
+  function DuplexSide(options) {
+    if (!(this instanceof DuplexSide)) return new DuplexSide(options);
+    Duplex.call(this, options);
+  }
+  Object.setPrototypeOf(DuplexSide.prototype, Duplex.prototype);
+  Object.setPrototypeOf(DuplexSide, Duplex);
+
   function duplexPair(options) {
     var opts = options || {};
     var sides = [];
     var awaiting = [null, null];
     function make(index) {
       var other = 1 - index;
-      return new Duplex({
+      return new DuplexSide({
         objectMode: !!opts.objectMode,
         highWaterMark: opts.highWaterMark,
         allowHalfOpen: true,
@@ -2789,10 +2816,10 @@ function owcBuildStreamCore() {
     }
   }
 
-  function deliverLine(self, line) {
+  /* A finished line goes to the question waiting for one, or to the 'line' event. */
+  function dispatchLine(self, line) {
     var st = self[kState];
-    addHistory(self, line);
-    if (st.questionCallback !== null) {
+    if (st.questionCallback !== null && st.questionCallback !== undefined) {
       var answer = st.questionCallback;
       st.questionCallback = null;
       self.setPrompt(st.oldPrompt);
@@ -2800,6 +2827,14 @@ function owcBuildStreamCore() {
     } else {
       self.emit('line', line);
     }
+  }
+
+  /* Node records history on the terminal path only: _line() remembers the line it finished, while a
+     non-terminal interface hands each line straight to _onLine and leaves rl.history empty. */
+  function deliverLine(self, line) {
+    if (self.terminal) addHistory(self, line);
+    if (self.historyIndex !== undefined) self.historyIndex = -1;
+    dispatchLine(self, line);
   }
 
   /* A terminal interface answers the two control keys that end or interrupt a line the way Node's
@@ -2955,6 +2990,91 @@ function owcBuildStreamCore() {
     };
   }
 
+  /* Node's HistoryManager (internal/repl/history.js, whose class is named ReplHistory): it owns the
+     array the interface exposes and the index of the line being navigated, both behind prototype
+     accessors, so a manager carries no own property of its own. */
+  var kHistory = Symbol('owcReplHistory');
+
+  function ReplHistory(iface) {
+    this[kHistory] = { iface: iface, index: -1, flushing: false, size: iface ? iface.historySize : 30, history: iface ? iface.history : [] };
+  }
+  ReplHistory.prototype.initialize = function (history) {
+    var bag = this[kHistory];
+    bag.history = Array.isArray(history) ? history : [];
+    bag.index = -1;
+  };
+  ReplHistory.prototype.addHistory = function () {
+    var bag = this[kHistory];
+    var line = bag.iface.line === undefined ? '' : bag.iface.line;
+    if (line.length === 0 || bag.size === 0) return line;
+    if (bag.history.length === 0 || bag.history[0] !== line) {
+      bag.history.unshift(line);
+      while (bag.history.length > bag.size) bag.history.pop();
+    }
+    bag.index = -1;
+    return line;
+  };
+  ReplHistory.prototype.canNavigateToNext = function () {
+    return this[kHistory].index > -1;
+  };
+  ReplHistory.prototype.navigateToNext = function () {
+    var bag = this[kHistory];
+    if (bag.index === -1) return '';
+    bag.index--;
+    return bag.index === -1 ? '' : bag.history[bag.index];
+  };
+  ReplHistory.prototype.canNavigateToPrevious = function () {
+    var bag = this[kHistory];
+    return bag.index < bag.history.length - 1;
+  };
+  ReplHistory.prototype.navigateToPrevious = function () {
+    var bag = this[kHistory];
+    bag.index++;
+    return bag.history[bag.index];
+  };
+  Object.defineProperty(ReplHistory.prototype, 'size', {
+    get: function () { return this[kHistory].size; },
+    set: function (value) { this[kHistory].size = value; },
+    configurable: true
+  });
+  Object.defineProperty(ReplHistory.prototype, 'isFlushing', {
+    get: function () { return this[kHistory].flushing; },
+    set: function (value) { this[kHistory].flushing = !!value; },
+    configurable: true
+  });
+  Object.defineProperty(ReplHistory.prototype, 'history', {
+    get: function () { return this[kHistory].history; },
+    set: function (value) { this[kHistory].history = value; },
+    configurable: true
+  });
+  Object.defineProperty(ReplHistory.prototype, 'index', {
+    get: function () { return this[kHistory].index; },
+    set: function (value) { this[kHistory].index = value; },
+    configurable: true
+  });
+
+  /* Node's readline Interface extends an internal base class: the public surface (clearLine, close,
+     columns, getCursorPos, getPrompt, pause, prompt, resume, setPrompt, setupHistoryManager, write)
+     is own on the base prototype, and the legacy Interface.prototype owns only the private
+     _-prefixed members plus question. */
+  function OwcRlBase() {}
+  Object.setPrototypeOf(OwcRlBase.prototype, EventEmitter.prototype);
+  Object.setPrototypeOf(OwcRlBase, EventEmitter);
+  Object.defineProperty(OwcRlBase.prototype, 'columns', {
+    get: function () { return this.output === null || this.output === undefined ? undefined : this.output.columns; },
+    configurable: true
+  });
+  OwcRlBase.prototype.clearLine = function (dir) {
+    var code = dir < 0 ? '\x1b[1K' : dir > 0 ? '\x1b[0K' : '\x1b[2K';
+    writeOutput(this, code);
+  };
+  OwcRlBase.prototype.setupHistoryManager = function (history, historySize) {
+    var manager = new ReplHistory(this);
+    if (Array.isArray(history)) manager.initialize(history);
+    if (typeof historySize === 'number') manager.size = historySize;
+    this.historyManager = manager;
+  };
+
   function Interface(input, output, completer, terminal) {
     var opts = input !== null && typeof input === 'object' && input.input !== undefined
       ? input
@@ -2964,10 +3084,13 @@ function owcBuildStreamCore() {
     Object.defineProperty(this, kState, {
       value: {
         prompt: opts.prompt !== undefined ? String(opts.prompt) : '> ',
-        oldPrompt: '> ',
+        oldPrompt: undefined,
         questionCallback: null,
         lineBuffer: '',
         sawReturnAt: 0,
+        sawKeyPress: false,
+        previousKey: null,
+        prevRows: 0,
         decoder: createDecoder('utf8'),
         lineIterator: null,
         onData: null,
@@ -2983,7 +3106,9 @@ function owcBuildStreamCore() {
     this.output = opts.output;
     this.terminal = opts.terminal !== undefined ? !!opts.terminal : !!(opts.output && opts.output.isTTY);
     this.line = '';
-    this.cursor = 0;
+    /* Only a terminal interface gets a cursor: on a non-terminal one rl.cursor is not a key of the
+       interface at all, and reading it answers undefined, as on the host. */
+    if (this.terminal) this.cursor = 0;
     this.tabSize = opts.tabSize !== undefined ? opts.tabSize : 8;
     this.escapeCodeTimeout = opts.escapeCodeTimeout !== undefined ? opts.escapeCodeTimeout : 500;
     /* Node always sets the completer, so it is a key of the interface whether or not one was given. */
@@ -2993,6 +3118,11 @@ function owcBuildStreamCore() {
        a line recorded later is seen by a caller who already holds rl.history. */
     this.history = st.history;
     this.crlfDelay = opts.crlfDelay ? Math.max(100, opts.crlfDelay) : 100;
+    /* The history manager the interface keeps beside the array: historyIndex mirrors its index. */
+    this.historyIndex = -1;
+    this.historyManager = new ReplHistory(this);
+    this.isCompletionEnabled = true;
+    this.isFlushing = false;
 
     st.onData = function (chunk) {
       normalWrite(self, chunk);
@@ -3013,21 +3143,21 @@ function owcBuildStreamCore() {
     if (this.terminal) emitKeypressEvents(this.input, this);
     if (typeof this.input.resume === 'function') this.input.resume();
   }
-  Object.setPrototypeOf(Interface.prototype, EventEmitter.prototype);
-  Object.setPrototypeOf(Interface, EventEmitter);
+  Object.setPrototypeOf(Interface.prototype, OwcRlBase.prototype);
+  Object.setPrototypeOf(Interface, OwcRlBase);
 
-  Interface.prototype.setPrompt = function (prompt) {
+  OwcRlBase.prototype.setPrompt = function (prompt) {
     this[kState].prompt = String(prompt);
   };
 
-  Interface.prototype.getPrompt = function () {
+  OwcRlBase.prototype.getPrompt = function () {
     return this[kState].prompt;
   };
 
   /* getCursorPos answers the column and row the cursor sits on, counted from the start of the
      prompt: the prompt and the text of the line before the cursor give the column, and a line that
      fits the terminal's width, or one whose width is unknown, gives no row. */
-  Interface.prototype.getCursorPos = function () {
+  OwcRlBase.prototype.getCursorPos = function () {
     var cols = this[kState].prompt.length + (this.cursor === undefined ? 0 : this.cursor);
     var columns = this.output === null || this.output === undefined ? undefined : this.output.columns;
     if (typeof columns === 'number' && columns > 0) return { cols: cols % columns, rows: Math.floor(cols / columns) };
@@ -3037,7 +3167,7 @@ function owcBuildStreamCore() {
   /* A terminal interface redraws the line when it prompts, as Node does: back to the first column,
      clear what is below, the prompt and the line being read, then the cursor where the prompt and
      the column inside the line put it. Node leaves the cursor alone for a caller who asks it to. */
-  Interface.prototype.prompt = function (preserveCursor) {
+  OwcRlBase.prototype.prompt = function (preserveCursor) {
     if (this.paused) this.resume();
     var st = this[kState];
     if (!this.terminal) {
@@ -3063,13 +3193,377 @@ function owcBuildStreamCore() {
     }
   };
 
-  Interface.prototype.write = function (data) {
+  /*
+   * The private members Node's lib/readline.js declares on Interface.prototype. They are the line
+   * editor behind a terminal interface; on the non-terminal path, which is what an in-browser
+   * container runs, only _normalWrite, _onLine, _line, _addHistory, _writeToOutput and the
+   * accessors carry behaviour. The eight accessors read and write the interface's own state bag.
+   */
+  function defineRlAccessor(name, field) {
+    Object.defineProperty(Interface.prototype, name, {
+      get: function () { return this[kState][field]; },
+      set: function (value) { this[kState][field] = value; },
+      enumerable: false,
+      configurable: true
+    });
+  }
+  defineRlAccessor('_decoder', 'decoder');
+  defineRlAccessor('_line_buffer', 'lineBuffer');
+  defineRlAccessor('_oldPrompt', 'oldPrompt');
+  defineRlAccessor('_previousKey', 'previousKey');
+  defineRlAccessor('_prompt', 'prompt');
+  defineRlAccessor('_questionCallback', 'questionCallback');
+  defineRlAccessor('_sawKeyPress', 'sawKeyPress');
+  defineRlAccessor('_sawReturnAt', 'sawReturnAt');
+
+  Interface.prototype._writeToOutput = function (stringToWrite) {
+    if (typeof stringToWrite !== 'string') throw argTypeError('stringToWrite', 'of type string', stringToWrite);
+    writeOutput(this, stringToWrite);
+  };
+
+  Interface.prototype._setRawMode = function (mode) {
+    var wasInRawMode = this.input.isRaw;
+    if (typeof this.input.setRawMode === 'function') this.input.setRawMode(mode);
+    return wasInRawMode;
+  };
+
+  Interface.prototype._getCursorPos = OwcRlBase.prototype.getCursorPos;
+
+  /* The column and row a string ends on, counted with the terminal's width: the escape sequences a
+     prompt carries are not columns, a newline always costs a row, and a surrogate pair is one. */
+  Interface.prototype._getDisplayPos = function (str) {
+    var text = typeof str === 'string' ? str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '') : '';
+    var col = this.columns;
+    if (typeof col !== 'number' || col <= 0) col = Infinity;
+    var offset = 0;
+    var rows = 0;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (ch === '\n') {
+        rows += Math.ceil(offset / col) || 1;
+        offset = 0;
+        continue;
+      }
+      var code = text.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) i++;
+      offset++;
+      if (offset >= col) {
+        rows++;
+        offset = 0;
+      }
+    }
+    return { cols: offset, rows: rows };
+  };
+
+  function rlCursor(self) {
+    if (self.cursor === undefined || self.cursor === null) self.cursor = 0;
+    return self.cursor;
+  }
+  function rlLine(self) {
+    if (self.line === undefined || self.line === null) self.line = '';
+    return self.line;
+  }
+
+  Interface.prototype._insertString = function (c) {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at < line.length) this.line = line.slice(0, at) + c + line.slice(at);
+    else this.line = line + c;
+    this.cursor = at + c.length;
+    if (this.terminal) this._refreshLine();
+  };
+
+  /* A character left of the cursor is one UTF-16 unit, or two when it is half of a surrogate pair. */
+  function charSizeLeft(line, at) {
+    if (at <= 1) return 1;
+    var code = line.charCodeAt(at - 1);
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      var lead = line.charCodeAt(at - 2);
+      if (lead >= 0xd800 && lead <= 0xdbff) return 2;
+    }
+    return 1;
+  }
+  function charSizeAt(line, at) {
+    var code = line.charCodeAt(at);
+    if (code >= 0xd800 && code <= 0xdbff && at + 1 < line.length) return 2;
+    return 1;
+  }
+
+  Interface.prototype._deleteLeft = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at <= 0 || line.length === 0) return;
+    var size = charSizeLeft(line, at);
+    this.line = line.slice(0, at - size) + line.slice(at);
+    this.cursor = at - size;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteRight = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at >= line.length) return;
+    var size = charSizeAt(line, at);
+    this.line = line.slice(0, at) + line.slice(at + size);
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteLineLeft = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    this.line = line.slice(at);
+    this.cursor = 0;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteLineRight = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    this.line = line.slice(0, at);
+    if (this.terminal) this._refreshLine();
+  };
+
+  var WORD_LEFT = /^\s*(?:[^\w\s]+|\w+)?/;
+  var WORD_RIGHT = /^(?:\s+|[^\w\s]+|\w+)\s*/;
+
+  Interface.prototype._wordLeft = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at <= 0) return;
+    var leading = line.slice(0, at);
+    var match = WORD_LEFT.exec(leading);
+    var take = match === null ? 1 : match[0].length;
+    this.cursor = at - take;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._wordRight = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at >= line.length) return;
+    var match = WORD_RIGHT.exec(line.slice(at));
+    if (match === null) return;
+    this.cursor = at + match[0].length;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteWordLeft = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at <= 0) return;
+    var leading = line.slice(0, at);
+    var match = WORD_LEFT.exec(leading);
+    var take = match === null ? 1 : match[0].length;
+    this.line = leading.slice(0, leading.length - take) + line.slice(at);
+    this.cursor = at - take;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteWordRight = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at >= line.length) return;
+    var trailing = line.slice(at);
+    var match = WORD_RIGHT.exec(trailing);
+    if (match === null) return;
+    this.line = line.slice(0, at) + trailing.slice(match[0].length);
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._moveCursor = function (dx) {
+    if (dx === 0) return;
+    var at = rlCursor(this) + dx;
+    var line = rlLine(this);
+    if (at < 0) at = 0;
+    else if (at > line.length) at = line.length;
+    this.cursor = at;
+    if (this.terminal) this._refreshLine();
+  };
+
+  /* The line, redrawn: back to the first column, clear what is below, write the prompt and the line,
+     then put the cursor where the prompt and the column inside the line put it. */
+  Interface.prototype._refreshLine = function () {
+    if (!this.terminal) return;
+    var st = this[kState];
+    var line = st.prompt + rlLine(this);
+    var dispPos = this._getDisplayPos(line);
+    if (st.prevRows > 0) moveCursor(this.output, 0, -st.prevRows);
+    cursorTo(this.output, 0);
+    clearScreenDown(this.output);
+    writeOutput(this, line);
+    var cursorPos = this.getCursorPos();
+    if (dispPos.rows > cursorPos.rows) moveCursor(this.output, 0, -(dispPos.rows - cursorPos.rows));
+    cursorTo(this.output, cursorPos.cols);
+    st.prevRows = dispPos.rows;
+    st.prevCols = dispPos.cols;
+  };
+
+  Interface.prototype._addHistory = function () {
+    var line = rlLine(this);
+    addHistory(this, line);
+    if (this.historyIndex !== undefined) this.historyIndex = -1;
+    return line;
+  };
+
+  Interface.prototype._historyNext = function () {
+    var mgr = this.historyManager;
+    if (mgr !== undefined && mgr !== null) {
+      if (!mgr.canNavigateToNext()) return;
+      this.line = mgr.navigateToNext();
+      this.historyIndex = mgr.index;
+    } else {
+      if (this.historyIndex <= 0) {
+        this.historyIndex = -1;
+        this.line = '';
+      } else {
+        this.historyIndex--;
+        this.line = this.history[this.historyIndex];
+      }
+    }
+    this.cursor = rlLine(this).length;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._historyPrev = function () {
+    var mgr = this.historyManager;
+    if (mgr !== undefined && mgr !== null) {
+      if (!mgr.canNavigateToPrevious()) return;
+      this.line = mgr.navigateToPrevious();
+      this.historyIndex = mgr.index;
+    } else {
+      if (this.historyIndex + 1 >= this.history.length) return;
+      this.historyIndex++;
+      this.line = this.history[this.historyIndex];
+    }
+    this.cursor = rlLine(this).length;
+    if (this.terminal) this._refreshLine();
+  };
+
+  /* The line is finished: it is remembered, the edit buffer is cleared and it is handed to whatever
+     is waiting for it, a question's callback or the 'line' event. */
+  Interface.prototype._line = function () {
+    var line = this._addHistory();
+    this.line = '';
+    this.cursor = 0;
+    if (this.terminal) this.clearLine();
+    this._onLine(line);
+  };
+
+  Interface.prototype._onLine = function (line) {
+    dispatchLine(this, line);
+  };
+
+  Interface.prototype._normalWrite = function (b) {
+    normalWrite(this, b);
+  };
+
+  Interface.prototype._tabComplete = function (lastKeypressWasTab) {
+    if (typeof this.completer !== 'function') return;
+    var self = this;
+    var string = rlLine(this).slice(0, rlCursor(this));
+    this.pause();
+    this.completer(string, function (err, value) {
+      self.resume();
+      if (err) {
+        self._writeToOutput('Tab completion error: ' + String(err));
+        return;
+      }
+      var hits = Array.isArray(value) ? value[0] : null;
+      if (hits === null || hits === undefined || hits.length === 0) {
+        if (lastKeypressWasTab === true) self._writeToOutput('\x07');
+        return;
+      }
+      var on = typeof value[1] === 'string' ? value[1] : string;
+      var prefix = commonPrefixOf(hits);
+      if (prefix.length > on.length) self._insertString(prefix.slice(on.length));
+      else if (lastKeypressWasTab === true && hits.length > 1) self._writeToOutput('\r\n' + hits.join('  ') + '\r\n');
+    });
+  };
+
+  /* One keypress, decoded: the keys that end a line, the keys that edit it, the history keys and the
+     two control keys. Anything else is text and joins the line. */
+  Interface.prototype._ttyWrite = function (s, key) {
+    var st = this[kState];
+    var previousKey = st.previousKey;
+    st.previousKey = key === undefined || key === null ? {} : key;
+    if (s === undefined || s === null) return;
+    var name = key !== undefined && key !== null && typeof key.name === 'string' ? key.name : '';
+    var ctrl = key !== undefined && key !== null ? !!key.ctrl : false;
+    var meta = key !== undefined && key !== null ? !!key.meta : false;
+    if (name === 'return' || name === 'enter' || s === '\r' || s === '\n') {
+      this._line();
+      return;
+    }
+    if (meta && name === 'y') return;
+    if (ctrl && name === 'c') {
+      this.emit('SIGINT');
+      return;
+    }
+    if (ctrl && name === 'd') {
+      if (rlLine(this).length === 0) this.close();
+      else this._deleteRight();
+      return;
+    }
+    if (name === 'backspace') {
+      this._deleteLeft();
+      return;
+    }
+    if (name === 'delete') {
+      this._deleteRight();
+      return;
+    }
+    if (name === 'tab') {
+      this._tabComplete(previousKey !== null && previousKey !== undefined && previousKey.name === 'tab');
+      return;
+    }
+    if (name === 'up' || (ctrl && name === 'p')) {
+      this._historyPrev();
+      return;
+    }
+    if (name === 'down' || (ctrl && name === 'n')) {
+      this._historyNext();
+      return;
+    }
+    if (name === 'left' || (ctrl && name === 'b')) {
+      this._moveCursor(-1);
+      return;
+    }
+    if (name === 'right' || (ctrl && name === 'f')) {
+      this._moveCursor(1);
+      return;
+    }
+    if (name === 'home' || (ctrl && name === 'a')) {
+      this.cursor = 0;
+      if (this.terminal) this._refreshLine();
+      return;
+    }
+    if (name === 'end' || (ctrl && name === 'e')) {
+      this.cursor = rlLine(this).length;
+      if (this.terminal) this._refreshLine();
+      return;
+    }
+    if (ctrl && name === 'u') {
+      this._deleteLineLeft();
+      return;
+    }
+    if (ctrl && name === 'k') {
+      this._deleteLineRight();
+      return;
+    }
+    if (ctrl && name === 'w') {
+      this._deleteWordLeft();
+      return;
+    }
+    if (s.length > 0) this._insertString(s);
+  };
+
+  OwcRlBase.prototype.write = function (data) {
     if (this.closed) throw errUseAfterClose();
     if (this.paused) this.resume();
     normalWrite(this, data);
   };
 
-  Interface.prototype.pause = function () {
+  OwcRlBase.prototype.pause = function () {
     if (this.paused) return this;
     this.input.pause();
     this.paused = true;
@@ -3077,7 +3571,7 @@ function owcBuildStreamCore() {
     return this;
   };
 
-  Interface.prototype.resume = function () {
+  OwcRlBase.prototype.resume = function () {
     if (!this.paused) return this;
     this.input.resume();
     this.paused = false;
@@ -3085,7 +3579,7 @@ function owcBuildStreamCore() {
     return this;
   };
 
-  Interface.prototype.close = function () {
+  OwcRlBase.prototype.close = function () {
     if (this.closed) return;
     this.pause();
     this.closed = true;
