@@ -1,0 +1,12 @@
+id: owc-module-export-table-incomplete
+session_id: adv5-judge-async-als-3
+owner: adv5-judge-async-als-3
+status: pending
+classification: GUEST
+measured_at: af9e76d (local main)
+title: The module export table is missing 18 names, and builtinModules is 40 against the host's 72
+subject: 'require("module") has 21 own keys here against host node 24.15''s 39. Missing here: register, registerHooks, runMain, SourceMap, constants, enableCompileCache, flushCompileCache, getCompileCacheDir, findPackageJSON, findSourceMap, getSourceMapsSupport, setSourceMapsSupport, stripTypeScriptTypes, _debug, _findPath, _readPackage, _resolveLookupPaths and _stat. Module._extensions is undefined where the host has an object. Two names are the other way round: createRequireFromPath is exported here and not on the host. builtinModules is 40 names against the host''s 72 -- every name containing a slash is filtered out (fs/promises, timers/promises, stream/web, stream/promises, stream/consumers, node:test, node:test/reporters, node:sea, node:sqlite, util/types, wasi, sys, path/posix, path/win32, assert/strict, dns/promises, readline/promises, inspector/promises) -- and it lists undici, which is not a node builtin. The Readme''s "module.register is still undefined, and there is no pipeline to put it in" is therefore one eighteenth of the gap and reads as if it were the whole of it. Site: the Module.* table in packages/core/src/process/executors/node/runtime/guest/loader.ts, and the builtinModules list at packages/core/src/process/executors/node/runtime/guest/misc.ts:2801 (Object.keys(BF).filter(n => n.indexOf("/") < 0).sort(), which is what drops every slash name and what admits undici).'
+acceptance_criteria:
+- Object.getOwnPropertyNames(require("module")) matches host node 24.15's 39 names, or the ones still missing are named in the Readme with the reason each cannot exist here
+- require("module").builtinModules is the host's 72 names, slash names included, with no name the host does not have
+witness_plan: Run /tmp/owc-r4/adv5-als-3/b-module/main.js and /tmp/owc-r4/adv5-als-3/b2-mods/main.js under host node and in the container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core and diff the key list, the COUNT line and the LIST line.

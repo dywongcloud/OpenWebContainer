@@ -1,0 +1,12 @@
+id: owc-worker-buffer-identity
+session_id: adv5-judge-async-als-3
+owner: adv5-judge-async-als-3
+status: pending
+classification: GUEST
+measured_at: af9e76d (local main)
+title: A Buffer posted from a worker arrives as a Buffer, where host Node delivers a Uint8Array
+subject: 'parentPort.postMessage(Buffer.from("worker-buf")) from a worker thread reaches the parent as a Buffer here and as a Uint8Array on host node 24.15: Buffer.isBuffer(m) is true here and false on the host, m.constructor.name is Buffer here and Uint8Array on the host, and String(m) is worker-buf here against the host''s 119,111,114,107,101,114,45,98,117,102. m instanceof Uint8Array, ArrayBuffer.isView(m) and Buffer.byteLength(m) are the same on both (true, true, 10), so only the class of the clone differs: the structured clone a worker message crosses hands back a Buffer where host Node''s clone of a Buffer is a Uint8Array of the same bytes. Site: the worker postMessage at packages/core/src/process/executors/node/runtime/guest/globals.ts:2777, whose clone keeps Buffer where node''s structuredClone does not.'
+acceptance_criteria:
+- 'A Buffer posted from a worker arrives as a Uint8Array on the parent: Buffer.isBuffer(m) is false and m.constructor.name is Uint8Array, as on host node 24.15'
+- The bytes, byteLength and isView of the message are unchanged
+witness_plan: Run /tmp/owc-r4/adv5-als-3/h-worker/main.js under host node and in the container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core and diff the six main.* lines.

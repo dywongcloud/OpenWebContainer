@@ -1,0 +1,13 @@
+id: owc-domain-uncaught-not-routed
+session_id: adv5-judge-async-als-3
+owner: adv5-judge-async-als-3
+status: pending
+classification: GUEST
+measured_at: af9e76d (local main)
+title: An error no caller catches is not handed to the domain the process is inside
+subject: 'owc-domain-sync-throw-routed is fixed on the path it was witnessed on -- a throw inside d.run() propagates out of run() to the caller and leaves the domain entered, as on host node 24.15 -- but the path it never tested now diverges: an error no caller catches goes to the process, not to the still-entered domain. With a domain error listener and a process uncaughtException listener both registered, d.run(() => { throw new Error("uncaught-in-run"); }) prints DOMAIN.ERROR=uncaught-in-run on host node 24.15 and exits 0, and prints UNCAUGHT=uncaught-in-run here. With no uncaughtException listener at all, the host still prints DOMAIN.ERROR=uncaught-no-listener and exits 0, while this container prints only aboutToThrow, never calls the domain listener, writes the fatal stack to stderr and exits 1. Site: emitUncaught (packages/core/src/process/executors/node/runtime/guest/loader.ts:908), uncaughtFromCallback (l.920) and the runMain catch (l.1147) test only proc.listenerCount("uncaughtException") and never consult process.domain, and packages/core/src/process/executors/node/runtime/guest/globals.ts:2897 sets proc._fatalException = noop, which is exactly the hook node''s domain module installs to route a fatal error into the entered domain. The bindings node does have are right on both sides: a throw in a timer, a tick, an immediate or a promise reaction registered inside run() reaches the domain''s error listener in the same order here as on the host. Two container runs each side of a core rebuild, identical both times, at load 16-26 with 1.9-3.2 GB free.'
+acceptance_criteria:
+- With a domain error listener and a process uncaughtException listener both registered, d.run(() => { throw new Error("uncaught-in-run"); }) prints DOMAIN.ERROR=uncaught-in-run and nothing else, and exits 0, as host node 24.15 does
+- With no uncaughtException listener, the same program prints DOMAIN.ERROR=uncaught-no-listener and exits 0, where it now writes a fatal stack to stderr and exits 1
+- With no domain entered, an uncaught error still reaches the uncaughtException listener, or ends the process when there is none, exactly as it does now
+witness_plan: Run /tmp/owc-r4/judge-als-3/c2/main.js and /tmp/owc-r4/judge-als-3/c3/main.js under host node and in the container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core and diff stdout, stderr and exit code; host prints DOMAIN.ERROR and exits 0 for both, the container prints UNCAUGHT for the first and dies with exit 1 for the second.
