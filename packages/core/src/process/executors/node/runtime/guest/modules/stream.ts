@@ -56,6 +56,13 @@ function owcBuildStreamCore() {
     return owcErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "' + name + '" argument must be ' + expected + '.' + describeReceived(value));
   }
 
+  /* Node calls a name that is not a plain identifier a property, not an argument: the message a
+     validate of an element or a nested field carries says "property" where a parameter says
+     "argument". */
+  function propTypeError(name, expected, value) {
+    return owcErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "' + name + '" property must be ' + expected + '.' + describeReceived(value));
+  }
+
   function errWriteAfterEnd() {
     return owcErr(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end');
   }
@@ -616,8 +623,7 @@ function owcBuildStreamCore() {
   };
 
   Readable.prototype.unshift = function (chunk, encoding) {
-    readableAddChunk(this, chunk, encoding, true);
-    return true;
+    return readableAddChunk(this, chunk, encoding, true);
   };
 
   Readable.prototype._read = function () {
@@ -958,6 +964,13 @@ function owcBuildStreamCore() {
               return;
             }
             if (state.closeEmitted || state.destroyed) {
+              /* A destroy that carries an error emits 'error' on a later tick. Reject only once that
+                 emission has had its listener, so a for-await loop takes the error instead of the
+                 process dying of an unhandled one. */
+              if (state.errored !== null && state.errored !== undefined && !state.errorEmitted && !state.closeEmitted) {
+                waiter = attempt;
+                return;
+              }
               cleanup();
               reject(state.errored || errPrematureClose());
               return;
@@ -1985,6 +1998,7 @@ function owcBuildStreamCore() {
     var cb = typeof options === 'function' ? options : callback;
     var opts = typeof options === 'function' ? {} : options || {};
     if (typeof cb !== 'function') throw argTypeError('callback', 'of type function', cb);
+    if (!isStreamLike(stream)) throw argTypeError('stream', 'an instance of ReadableStream, WritableStream, or Stream', stream);
     return finishedImpl(stream, opts, cb);
   }
 
@@ -2013,7 +2027,11 @@ function owcBuildStreamCore() {
   }
 
   function addAbortSignal(signal, stream) {
-    if (!signal || typeof signal !== 'object' || !('aborted' in signal)) {
+    /* typeof null is 'object', so a null signal reaches the operand test and fails as a bad 'in'
+       operand, the way it does in Node, while an undefined one fails as a type error. Node's text
+       is the one V8 gives for that operand, which this engine words differently. */
+    if (signal === null) throw new TypeError("Cannot use 'in' operator to search for 'aborted' in null");
+    if (typeof signal !== 'object' || !('aborted' in signal)) {
       throw argTypeError('signal', 'an instance of AbortSignal', signal);
     }
     if (!stream || typeof stream !== 'object' || typeof stream.destroy !== 'function') {
@@ -2302,7 +2320,7 @@ function owcBuildStreamCore() {
   function pipeline() {
     var args = Array.prototype.slice.call(arguments);
     var callback = args.length > 0 && typeof args[args.length - 1] === 'function' ? args.pop() : null;
-    if (typeof callback !== 'function') throw argTypeError('callback', 'of type function', callback);
+    if (typeof callback !== 'function') throw propTypeError('streams[stream.length - 1]', 'of type function', args[args.length - 1]);
     return pipelineStart(args, callback, null);
   }
 
@@ -2357,7 +2375,9 @@ function owcBuildStreamCore() {
     if (!stream || typeof stream !== 'object') return false;
     var r = stream._readableState;
     var w = stream._writableState;
-    return !!(stream.readableErrored ?? stream.writableErrored ?? (r && r.errorEmitted) ?? (w && w.errorEmitted) ?? (r && r.errored) ?? (w && w.errored));
+    /* Node 24 exposes no readableErrored or writableErrored: it reads the 'errorEmitted' gate, so
+       an error counts once its 'error' event has been delivered. */
+    return !!((r && r.errorEmitted) ?? (w && w.errorEmitted) ?? (r && r.errored) ?? (w && w.errored));
   }
 
   function streamIsDisturbed(stream) {
@@ -2378,19 +2398,6 @@ function owcBuildStreamCore() {
     },
     configurable: true
   });
-  Object.defineProperty(Readable.prototype, 'readableErrored', {
-    get: function () {
-      var r = this._readableState;
-      return r && r.errorEmitted ? r.errored : null;
-    },
-    configurable: true
-  });
-  function writableErroredGetter() {
-    var w = this._writableState;
-    return w && w.errorEmitted ? w.errored : null;
-  }
-  Object.defineProperty(Writable.prototype, 'writableErrored', { get: writableErroredGetter, configurable: true });
-  Object.defineProperty(Duplex.prototype, 'writableErrored', { get: writableErroredGetter, configurable: true });
 
   /* duplexPair: two duplexes wired to each other, so what one is written with the other reads.
      Each side's write pushes straight into the other's readable buffer and waits for that side to
@@ -2673,6 +2680,56 @@ function owcBuildStreamCore() {
     return out;
   }
 
+  /* The longest common prefix of the hits a completer answers: the text a completion takes. */
+  function commonPrefixOf(hits) {
+    var prefix = String(hits[0]);
+    for (var i = 1; i < hits.length; i++) {
+      var other = String(hits[i]);
+      var at = 0;
+      while (at < prefix.length && at < other.length && prefix.charAt(at) === other.charAt(at)) at++;
+      prefix = prefix.slice(0, at);
+    }
+    return prefix;
+  }
+
+  /* One tab, as Node answers it: the completer is asked for the line typed so far and the hits it
+     answers are reduced to their longest common prefix, which the line takes when it is longer than
+     the text the completer completed on. A completer that answers by returning is used at once; one
+     that answers through its callback is used when it calls. */
+  function completeOnce(self, line) {
+    var taken = line;
+    var once = false;
+    function take(value) {
+      if (once) return;
+      once = true;
+      var hits = Array.isArray(value) ? value[0] : null;
+      if (hits === null || hits === undefined || hits.length === 0) return;
+      var on = typeof value[1] === 'string' ? value[1] : line;
+      var prefix = commonPrefixOf(hits);
+      if (prefix.length > on.length) taken = prefix;
+    }
+    var direct = self.completer(line, function (err, value) { if (!err) take(value); });
+    if (direct !== undefined && direct !== null) take(direct);
+    return taken;
+  }
+
+  function completeTabs(self, base, chunk, echo) {
+    var out = base;
+    for (var i = 0; i < chunk.length; i++) {
+      var ch = chunk.charAt(i);
+      if (ch === '\t' && typeof self.completer === 'function') {
+        var completed = completeOnce(self, out);
+        if (completed !== out) echo(completed.slice(out.length));
+        out = completed;
+        continue;
+      }
+      out += ch;
+      /* The characters that join the line are echoed; the keys that end it are not. */
+      if (ch !== '\n' && ch !== '\r') echo(ch);
+    }
+    return out;
+  }
+
   function normalWrite(self, b) {
     if (b === undefined || b === null) return;
     var st = self[kState];
@@ -2685,8 +2742,15 @@ function owcBuildStreamCore() {
       if (text.charCodeAt(0) === 10) text = text.slice(1);
       st.sawReturnAt = 0;
     }
-    text = st.lineBuffer + text;
-    st.lineBuffer = '';
+    if (self.terminal) {
+      /* A terminal interface echoes the line as it is built, as Node's does: the characters typed
+         and then the text a completion adds. A non-terminal one writes nothing. */
+      text = completeTabs(self, st.lineBuffer, text, function (piece) { writeOutput(self, piece); });
+      st.lineBuffer = '';
+    } else {
+      text = st.lineBuffer + text;
+      st.lineBuffer = '';
+    }
     var pattern = /\r?\n|\r(?!\n)/g;
     var start = 0;
     var match;
@@ -2696,6 +2760,13 @@ function owcBuildStreamCore() {
     }
     st.lineBuffer = text.slice(start);
     if (text.length > 0 && text.charCodeAt(text.length - 1) === 13) st.sawReturnAt = Date.now();
+    /* A terminal interface keeps the line it is reading on the interface, as Node's does: rl.line is
+       the text typed so far and rl.cursor the column inside it. A non-terminal one only splits on
+       newlines and leaves both alone. */
+    if (self.terminal) {
+      self.line = st.lineBuffer;
+      self.cursor = st.lineBuffer.length;
+    }
   }
 
   function createLineIterator(self) {
@@ -2761,6 +2832,11 @@ function owcBuildStreamCore() {
     this.output = opts.output;
     this.terminal = opts.terminal !== undefined ? !!opts.terminal : !!(opts.output && opts.output.isTTY);
     this.line = '';
+    this.cursor = 0;
+    this.tabSize = opts.tabSize !== undefined ? opts.tabSize : 8;
+    this.escapeCodeTimeout = opts.escapeCodeTimeout !== undefined ? opts.escapeCodeTimeout : 500;
+    /* Node always sets the completer, so it is a key of the interface whether or not one was given. */
+    this.completer = typeof opts.completer === 'function' ? opts.completer : undefined;
     this.historySize = opts.historySize !== undefined ? opts.historySize : 30;
     /* The history is the array a caller reads on the interface, so it is the one the state keeps:
        a line recorded later is seen by a caller who already holds rl.history. */
@@ -2797,9 +2873,29 @@ function owcBuildStreamCore() {
     return this[kState].prompt;
   };
 
-  Interface.prototype.prompt = function () {
+  /* getCursorPos answers the column and row the cursor sits on, counted from the start of the
+     prompt: the prompt and the text of the line before the cursor give the column, and a line that
+     fits the terminal's width, or one whose width is unknown, gives no row. */
+  Interface.prototype.getCursorPos = function () {
+    var cols = this[kState].prompt.length + (this.cursor === undefined ? 0 : this.cursor);
+    var columns = this.output === null || this.output === undefined ? undefined : this.output.columns;
+    if (typeof columns === 'number' && columns > 0) return { cols: cols % columns, rows: Math.floor(cols / columns) };
+    return { cols: cols, rows: 0 };
+  };
+
+  /* A terminal interface redraws the line when it prompts, as Node does: back to the first column,
+     clear what is below, the prompt and the line being read, then the cursor where the prompt and
+     the column inside the line put it. Node leaves the cursor alone for a caller who asks it to. */
+  Interface.prototype.prompt = function (preserveCursor) {
     if (this.paused) this.resume();
-    writeOutput(this, this[kState].prompt);
+    var st = this[kState];
+    if (!this.terminal) {
+      writeOutput(this, st.prompt);
+      return;
+    }
+    if (!preserveCursor) this.cursor = 0;
+    var line = this.line === undefined ? '' : this.line;
+    writeOutput(this, '\x1b[1G\x1b[0J' + st.prompt + line + '\x1b[' + (st.prompt.length + this.cursor + 1) + 'G');
   };
 
   Interface.prototype.question = function (query, options, cb) {
@@ -3021,7 +3117,8 @@ function owcBuildStreamCore() {
   var readlineWriters = new WeakMap();
 
   function ReadlineWriter(stream, options) {
-    if (!(this instanceof ReadlineWriter)) return new ReadlineWriter(stream, options);
+    /* Node's Readline is a class, so calling it without new is a TypeError, not a construction. */
+    if (!(this instanceof ReadlineWriter)) throw new TypeError("Class constructor Readline cannot be invoked without 'new'");
     if (!isWritableStreamLike(stream)) throw argTypeError('stream', 'an instance of Writable', stream);
     readlineWriters.set(this, {
       stream: stream,
