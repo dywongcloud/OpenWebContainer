@@ -1,0 +1,65 @@
+machine:  6:54  up 3 days, 15:19, 7 users, load averages: 36.46 35.97 30.74
+free: System-wide memory free percentage: 68%
+pages free: 54177.
+---- host ----
+tcp echo
+  client local=127.0.0.1:PORT
+  client remote=127.0.0.1:PORT
+  client saw end
+  echo len=261 text=hello lastByte=255
+  listening address=127.0.0.1 family=IPv4 port=PORT
+  server conn local=127.0.0.1:PORT
+  server conn remote=127.0.0.1:PORT
+  server saw end
+tcp ports and errors
+  duplicate bind code=EADDRINUSE
+  getConnections err=null n=0
+  connect closed port code=ECONNREFUSED
+udp4
+  udp4 message text=ping from=127.0.0.1:PORT family=IPv4 size=4
+  udp4 bound address=127.0.0.1 family=IPv4 port=PORT
+udp6
+  udp6 message text=ping6 from=::1 family=IPv6 size=5
+tls over net
+  tls client authorized=true protocol=TLSv1.3
+  tls server authorized=false protocol=TLSv1.3
+  tls echo=tls:hi
+port released by an exited process
+  holder exited code=0 said=bound
+  rebind ok
+DONE
+---- container ----
+---- program output ----
+tcp echo
+  client local=127.0.0.1:PORT
+  client remote=127.0.0.1:PORT
+  client saw end
+  echo len=261 text=hello lastByte=255
+  listening address=127.0.0.1 family=IPv4 port=PORT
+  server conn local=127.0.0.1:PORT
+  server conn remote=127.0.0.1:PORT
+  server saw end
+tcp ports and errors
+  duplicate bind code=EADDRINUSE
+  getConnections err=null n=0
+  connect closed port code=ECONNREFUSED
+udp4
+  udp4 message text=ping from=127.0.0.1:PORT family=IPv4 size=4
+  udp4 bound address=127.0.0.1 family=IPv4 port=PORT
+udp6
+  udp6 message text=ping6 from=::1 family=IPv6 size=5
+tls over net
+  tls client authorized=true protocol=TLSv1.3
+  tls server authorized=false protocol=TLSv1.3
+  tls echo=tls:hi
+port released by an exited process
+  holder exited code=0 said=bound
+  rebind ok
+DONE
+---- program stderr ----
+[owc exit 0]
+
+
+==== verification re-run, own session verify-http2-net, dispatch bash-verify-http2-net-88006-1792709930202-3326 ====
+host lines=26 container lines=26
+VERDICT virtual-net: IDENTICAL
