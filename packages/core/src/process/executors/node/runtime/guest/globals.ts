@@ -490,24 +490,49 @@ function linkStdioChain() {
 }
 /*
  * What a host accepts as a chunk and what it makes of one. A string goes out as it is; a Buffer, a
- * TypedArray or a DataView is decoded as UTF-8 bytes, which is what makes
+ * TypedArray or a DataView contributes its bytes, which is what makes
  * 'stdout.write(new TextEncoder().encode('Hi!'))' print 'Hi!' and not '72,105,33'. Anything else --
  * an ArrayBuffer, a number, a plain object -- is refused with node's own ERR_INVALID_ARG_TYPE,
  * because a host refuses it too: a write that silently String()-coerced its argument turned binary
  * output into a list of numbers and answered '[object ArrayBuffer]' where a host threw.
+ *
+ * A byte chunk is handed back undecoded: a host's descriptor takes the bytes of each write as they
+ * are, so the bytes of one character may arrive in two writes and still come out as that one
+ * character, and decoding each write on its own would turn a character cut in half into one U+FFFD
+ * per byte instead. Null marks a string chunk, which carries no bytes to keep.
  */
-function stdioChunkText(chunk) {
-    if (typeof chunk === 'string') return chunk;
-    if (chunk instanceof Uint8Array) return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString('utf8');
+function stdioChunkBytes(chunk) {
+    if (typeof chunk === 'string') return null;
+    if (chunk instanceof Uint8Array) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     if (chunk && typeof chunk === 'object' && typeof chunk.buffer === 'object'
         && typeof chunk.byteOffset === 'number' && typeof chunk.byteLength === 'number') {
-        return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString('utf8');
+        return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     }
     var received = chunk === null ? 'null' : chunk === undefined ? 'undefined'
         : (chunk.constructor && chunk.constructor.name ? 'an instance of ' + chunk.constructor.name : typeof chunk);
     var bad = new TypeError('The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' + received);
     bad.code = 'ERR_INVALID_ARG_TYPE';
     throw bad;
+}
+
+/*
+ * How many of the bytes at the end of a run of UTF-8 begin a character whose rest has not arrived:
+ * 0 when the run ends on the last byte of one, and 1 to 3 when it ends on the first bytes of one the
+ * next write is to finish. A byte that cannot begin a character is not held, because a host does not
+ * wait for a continuation that cannot come either: a stray continuation byte or a lead byte for a
+ * length UTF-8 has no character of is already the replacement character there.
+ */
+function utf8PendingLength(bytes) {
+    for (var k = 1; k <= 3 && k <= bytes.length; k++) {
+        var b = bytes[bytes.length - k];
+        if (b < 0x80) return 0;
+        if (b >= 0xc0) {
+            if (b >= 0xf8) return 0;
+            var need = b < 0xe0 ? 2 : (b < 0xf0 ? 3 : 4);
+            return k < need ? k : 0;
+        }
+    }
+    return 0;
 }
 function makeStdioStream(fd, writeText) {
     function SyncWriteStream() {}
@@ -516,6 +541,39 @@ function makeStdioStream(fd, writeText) {
     proto.constructor = SyncWriteStream;
     stdioProtos.push(proto);
     linkStdioChain();
+    /*
+     * The bytes of a character a write ended in the middle of, kept for the write that finishes it,
+     * which is what makes two writes of one character print that character and not a replacement
+     * character per byte. See stdioChunkBytes.
+     */
+    var pendingBytes = null;
+    /* The end of the stream, or a write of text: neither can be put behind the bytes that are being
+       kept, because a host writes them in the order they were given. */
+    function writeOutPending() {
+        if (pendingBytes === null) return;
+        var held = pendingBytes;
+        pendingBytes = null;
+        writeText(Buffer.from(held).toString('utf8'));
+    }
+    function writeChunk(chunk) {
+        var bytes = stdioChunkBytes(chunk);
+        if (bytes === null) {
+            writeOutPending();
+            writeText(chunk);
+            return;
+        }
+        if (pendingBytes !== null) {
+            var joined = new Uint8Array(pendingBytes.length + bytes.length);
+            joined.set(pendingBytes, 0);
+            joined.set(bytes, pendingBytes.length);
+            bytes = joined;
+            pendingBytes = null;
+        }
+        var held = utf8PendingLength(bytes);
+        if (held !== 0) pendingBytes = Array.prototype.slice.call(bytes, bytes.length - held);
+        var whole = held === 0 ? bytes : bytes.subarray(0, bytes.length - held);
+        if (whole.length !== 0) writeText(Buffer.from(whole.buffer, whole.byteOffset, whole.byteLength).toString('utf8'));
+    }
     /*
      * Writable.prototype.pipe, as node writes it: nothing can be piped *out of* a stream that cannot
      * be read, and node reports that by emitting the error rather than by returning one.
@@ -542,13 +600,13 @@ function makeStdioStream(fd, writeText) {
     /* The Writable surface a package reaches for, on the prototype as a host has it rather than as
        own properties of the stream: write, end, cork, uncork, destroy and setDefaultEncoding. */
     proto.write = function (chunk, encoding, callback) {
-        writeText(stdioChunkText(chunk));
+        writeChunk(chunk);
         var done = typeof encoding === 'function' ? encoding : callback;
         if (typeof done === 'function') queueMicrotask(function () { done(); });
         return true;
     };
     proto._write = function (chunk, encoding, callback) {
-        writeText(stdioChunkText(chunk));
+        writeChunk(chunk);
         if (typeof callback === 'function') queueMicrotask(function () { callback(); });
     };
     /*
@@ -559,6 +617,7 @@ function makeStdioStream(fd, writeText) {
     proto.end = function (chunk, encoding, callback) {
         var cb = typeof chunk === 'function' ? chunk : (typeof encoding === 'function' ? encoding : callback);
         if (chunk !== undefined && typeof chunk !== 'function') this.write(chunk);
+        writeOutPending();
         var state = this._writableState;
         state.ended = true;
         var self = this;
