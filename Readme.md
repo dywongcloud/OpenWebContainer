@@ -308,10 +308,16 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
 - **`ls -f` lists in sorted order, where the host lists in its directory order.** `touch f; mkdir d; ln -s f l;
   ls -f` prints `. .. d f l` here and `. .. f d l` on the host. No entry or marker differs, only the order,
   and the host's own order is not one this file system can derive.
-- **`touch -t nonsense f` exits 0 on this host and 1 in the container.** This host's `/usr/bin/touch` reads that
-  one string of letters as a date and leaves the file's mtime in 2084; every other non-numeric stamp measured
-  (`abc`, `zz`, `sense`, `xyz`, `12345`, `99`) is refused on both sides. One accepted string is a quirk of the
-  host's binary, not a shape worth reproducing. (Open row `owc-shell-touch-t-garbage-accepted`.)
+- **`ls -ld` of a directory prints this file system's own link count and size, where the host prints the ones its
+  directory really has.** `mkdir -p d; touch d/a; ls -ld d` is `drwxr-xr-x 2 ... 2 d` here and
+  `drwxr-xr-x 3 ... 96 d` on the host, and an empty `d` is `2 ... 2` here and `2 ... 64` there. The container's
+  file system keeps no directory size and no link count for a directory, so both columns are the same for every
+  directory. (Open row `owc-shell-ls-dir-size-nlink`.)
+- **`ls` reaches a file under a directory whose mode forbids it, where the host refuses at the directory.**
+  `mkdir -p d; touch d/a; chmod 644 d; ls -l d/a` prints the file here and `ls: d/a: Permission denied` with
+  a status of 1 on the host, and `chmod 000 d` behaves the same way. The mode `chmod` set is honoured when a
+  command reads a file, not when the file system resolves a path through a directory. (Open row
+  `owc-shell-ls-dir-mode-traversal`.)
 - **`/etc/hosts` is not in the container's file system, and `/tmp` is a directory here where this host has it as
   a symlink to `private/tmp`.** Both are facts about the two trees, not about `ls`: `ls -l /etc/hosts` fails
   here with `No such file or directory` and `ls -ld /tmp` prints `drwxrwxrwt` where the host prints
@@ -842,12 +848,12 @@ Future plans:
 - [ ] `url.domainToUnicode` and `domainToASCII` off the ends -- `url.domainToUnicode('XN--BCHER-KVA.de')` is `BüCHER.de` where host Node case-folds and gives `bücher.de`; `url.domainToASCII(123)` is `123` where host gives `0.0.0.123`, and `url.domainToUnicode('xn--zzz-')` is `zzz` where host gives `''` (row owc-url-domain-unicode-edges)
 - [ ] Builtin module namespace surface -- far wider than `node:fs`: against host Node the namespaces of 20 of 26 builtins are short (`node:constants` 56 against 231, `node:process` 36 against 83, `node:crypto` 30 against 70, `node:util` 22 against 35), `node:util` adds 5 names host Node lacks, and `node:stream/consumers` and `node:assert/strict` do not resolve at all (row owc-esm-builtin-namespace-surface)
 - [x] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
-- [ ] `cmd 3>f >&3` -- a descriptor the command itself opened is not visible to its own later `>&n` (row owc-shell-fd-opened-by-command-visible-to-itself)
-- [ ] `exec >f`, `exec 2>f` and `exec 1>&2` are dropped, so they do not persist (row owc-shell-exec-standard-fd-dropped)
-- [ ] `exec 3>&1` and `exec 3>&2` are "Bad file descriptor" where a host duplicates the standard one (row owc-shell-exec-duplicating-standard-fd)
-- [ ] `exec 3<f; cat <&3` reads nothing -- input descriptors above 2 are not implemented (row owc-shell-exec-input-fd)
+- [x] `cmd 3>f >&3` -- a descriptor the command itself opened is visible to its own later `>&n`, and one a compound command opened to the whole construct, as on a host (row owc-shell-fd-opened-by-command-visible-to-itself)
+- [x] `exec >f`, `exec 2>f` and `exec 1>&2` persist, and what the commands behind them wrote stays in the file -- `exec >f; echo a; echo b` is both lines (row owc-shell-exec-standard-fd-dropped)
+- [x] `exec 3>&1`, `exec 3>&2` and `exec 3<&1` duplicate the standard descriptor a host duplicates, with no bad-descriptor diagnostic (row owc-shell-exec-duplicating-standard-fd)
+- [ ] `exec 3<f; cat <&3` reads `f`, but every read starts at the beginning again where a host's descriptor keeps one offset -- `exec 3<f; head -1 <&3; head -1 <&3` is `p` and `p` for a host's `p` and `q` (row owc-shell-exec-input-fd)
 - [ ] a failing `exec` does not end a non-interactive shell (row owc-shell-exec-failure-does-not-end-shell)
-- [ ] `echo hi >&-` writes and succeeds where a host reports a write error (row owc-shell-closed-fd-write-error)
+- [x] `echo hi >&-` reports the write error a host reports, and `echo hi >f >&-` leaves the empty `f` a host leaves behind it (row owc-shell-closed-fd-write-error)
 - [ ] a redirection’s file is created even when the command fails on a bad descriptor (row owc-shell-redirect-file-created-on-failed-command)
 - [ ] Add signal handling (SIGTERM, SIGKILL, etc.): `child.kill` sends one, `process.kill` does not reach a process
 - [ ] Create process groups and job control
@@ -956,3 +962,5 @@ re-run in isolation; the rows are open.
 - `owc-shell-syntax-error-token-named`: `if; then` -- the host names `;` where the container names `newline`; `echo |` -- the host reports an unexpected end of file where the container names `|`; `for x in a; echo hi; done` -- the host names `echo` where the container says `` `do' expected ''.
 - `owc-shell-arith-operand-error-status`: `x=$((1+))` -- host stderr `/bin/sh: 1+: syntax error: operand expected (error token is "+")` exit 127; container stderr `syntax error: operand expected` exit 1.
 - `owc-shell-command-not-found-wording`: `nosuchcmd-j4` -- host stderr `/bin/sh: nosuchcmd-j4: command not found`; container `Command not found: nosuchcmd-j4`. Not a prefix difference: the name sits in a different place in the sentence.
+- `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string.
+- `owc-json-stringify-circular-message`: `JSON.stringify(o)` where `o.o === o` -- host Node 24.15 throws `TypeError: Converting circular structure to JSON` followed by two lines naming the constructor and the property that closes the circle; the container throws `TypeError: circular reference`. It reaches `Response.json(cyclic)` through the same call.

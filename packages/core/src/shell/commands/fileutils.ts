@@ -3729,15 +3729,39 @@ function isModeWord(word: string): boolean {
     return true;
 }
 
+/**
+ * The name `chmod` prints for an entry it reached under an operand: the operand's own spelling with
+ * the entry's path below the root hung off it, one `/` between the two and none added where the
+ * operand already ends in one. `chmod -R 2755 d/` reports `d/` then `d/a`, never `d//a`, and
+ * `chmod -R 2755 d//` reports `d//` then `d//a`, which is what the host's `fts` spells.
+ */
+function shownName(file: string, root: string, entry: string): string {
+    let shown = file;
+    for (const part of entry.slice(root.length).split('/')) {
+        if (part.length === 0) continue;
+        shown = shown.endsWith('/') ? shown + part : shown + '/' + part;
+    }
+    return shown;
+}
+
 const chmod: ShellCommand = (ctx) => {
     const words = ctx.args.slice();
     let recursive = false;
+    let verbose = false;
+    let onLink = false;
+    let physical = false;
     let index = 0;
     let noMoreOptions = false;
     while (index < words.length && !noMoreOptions && isOption(words[index]) && !isModeWord(words[index])) {
         const word = words[index];
         if (word === '-R') { recursive = true; index++; }
-        else if (word === '-v' || word === '-f' || word === '-h') index++;
+        else if (word === '-v') { verbose = true; index++; }
+        else if (word === '-f') index++;
+        else if (word === '-h') { onLink = true; index++; }
+        /* `-H`, `-L` and `-P` say which links a walk follows, so they are options the host accepts
+           even where it does nothing with them: `chmod -H 644 f` is one line on stderr about their
+           needing `-R` and the mode applied, where refusing them as illegal left the mode alone. */
+        else if (word === '-H' || word === '-L' || word === '-P') { physical = true; index++; }
         /* `--` ends the options, so the mode behind it is the mode even where it starts with a `-`,
            and so is a file named like one. */
         else if (word === '--') { index++; noMoreOptions = true; }
@@ -3752,15 +3776,30 @@ const chmod: ShellCommand = (ctx) => {
        the `644: No such file or directory` that looking at operands first would print. */
     if (!isModeWord(spec)) return fail(`chmod: Invalid file mode: ${spec}\n`);
 
+    /* `-R` and `-h` contradict each other outright, and the host says so before it touches any
+       operand: `chmod -R -h 700 d` is that one line on stderr with a status of 1 and no mode
+       changed anywhere, where accepting both left every path in the tree chmod'd. */
+    if (recursive && onLink) return fail('chmod: the -R and -h options may not be specified together.\n');
+
+    let stdout = '';
     let stderr = '';
     let exitCode = 0;
+    /* One warning for the whole command, and only where no `-R` gave the three something to do:
+       `chmod -H -L 644 f` warns once, and `chmod -P -R 644 f` is silent. */
+    if (physical && !recursive) stderr += 'chmod: options -H, -L, -P only useful with -R\n';
     /* Every operand, not the first one that fails: `chmod 2755 a b` reports both, `chmod 644 nope
        alsonope` reports both, and `chmod 777 nope f` reports `nope` and still leaves 777 on `f`.
        Returning on the first failure left a valid operand behind a bad one untouched. */
     for (const file of operands.slice(1)) {
         const path = resolveAt(ctx, file);
-        const stat = statOf(ctx.fs, path);
-        if (stat === undefined) {
+        const link = isSymlink(ctx.fs, path);
+        /* What the mode lands on. `-h` names the link itself, and so does a walk, which follows no
+           link it meets: `chmod -h 700 l` leaves `l` `lrwx------` and its target alone, and
+           `chmod -R 700 dl` on a link to a directory reports `dl` and leaves that directory and
+           everything under it untouched. A link with neither is followed, as `chmod(2)` follows it,
+           so `chmod 700 dl` lands on the directory. */
+        const here = onLink || (recursive && link);
+        if (statOf(ctx.fs, path) === undefined && !(here && link)) {
             stderr += `chmod: ${file}: No such file or directory\n`;
             exitCode = 1;
             continue;
@@ -3768,23 +3807,26 @@ const chmod: ShellCommand = (ctx) => {
         /* Every name the mode lands on: the operand itself, and under `-R` the tree beneath it,
            each reported on its own line as the host reports it. The walk holds the root too, so
            it is not listed twice. */
-        const root = linkDestination(ctx.fs, path) ?? path;
+        const root = here ? path : linkDestination(ctx.fs, path) ?? path;
         let entries: string[] = [root];
         const rootStat = statOf(ctx.fs, root);
-        if (recursive && rootStat !== undefined && rootStat.type === 'dir') {
+        if (recursive && !here && rootStat !== undefined && rootStat.type === 'dir') {
             entries = walkRoot(ctx.fs, root, root, Number.MAX_SAFE_INTEGER).entries.map((entry) => entry.path);
         }
         for (const entry of entries) {
             const entryStat = statOf(ctx.fs, entry);
-            if (entryStat === undefined) {
+            /* A link the walk reached under `-h` has no target to stat, and a link is a name the
+               mode lands on whether or not what it points at is there. */
+            if (entryStat === undefined && !(here && isSymlink(ctx.fs, entry))) {
                 stderr += `chmod: ${file}: No such file or directory\n`;
                 exitCode = 1;
                 continue;
             }
             /* The operand the host names, and the entry under it by the same relative path:
                `chmod -R 2755 d` reports `d/g`, not the path the tree walk holds. */
-            const shown = file + entry.slice(root.length);
-            const parsed = parseMode(spec, modeOf(ctx.fs, entry, entryStat.type === 'dir'), umaskOf(ctx.fs));
+            const shown = shownName(file, root, entry);
+            const current = modeOf(ctx.fs, entry, entryStat?.type === 'dir');
+            const parsed = parseMode(spec, current, umaskOf(ctx.fs));
             if (parsed === undefined) {
                 stderr += `chmod: Invalid file mode: ${spec}\n`;
                 exitCode = 1;
@@ -3802,9 +3844,12 @@ const chmod: ShellCommand = (ctx) => {
                 continue;
             }
             setMode(ctx.fs, entry, parsed);
+            /* `-v` names each path whose mode actually moved, and no other: `chmod -v 644 f` on a
+               file already 644 prints nothing, and neither does a path the host refused to chmod. */
+            if (verbose && parsed !== current) stdout += `${shown}\n`;
         }
     }
-    return result('', stderr, exitCode);
+    return result(stdout, stderr, exitCode);
 };
 
 /* ------------------------------------------------------------------- touch */
@@ -3813,18 +3858,27 @@ const TOUCH_USAGE =
     'usage: touch [-A [-][[hh]mm]SS] [-achm] [-r file] [-t [[CC]YY]MMDDhhmm[.SS]]\n' +
     '       [-d YYYY-MM-DDThh:mm:SS[.frac][tz]] file ...\n';
 
-/** One character of a `-t` stamp, read the way the host reads it: a plain `c - '0'`, so a letter, a
- *  space and a piece of punctuation are digits too and no stamp is refused for holding one. `touch
- *  -t nonsense f` is Oct 12 2084 on the host, which is what this gives; a test for digits refuses
- *  it, which the host does not. */
-function stampDigit(ch: string): number {
-    return ch.charCodeAt(0) - 48;
+/** A `-t` stamp as the host's C sees it: UTF-8, and each byte a signed `char`. A stamp holding a
+ *  character outside ASCII is one to three bytes longer than the JavaScript string is long, so the
+ *  host and a string measured in UTF-16 code units disagree about the shape of every such stamp:
+ *  `2026é010000` is 12 bytes -- a `[[CC]YY]` stamp -- but 11 code units, which is no shape at all. */
+function stampBytes(spec: string): number[] {
+    return Array.from(new Int8Array(new TextEncoder().encode(spec)));
 }
 
-/** A run of characters read as decimal digits: one field of a `-t` stamp, as the host reads it. */
-function stampField(text: string): number {
+/** One byte of a `-t` stamp, read the way the host reads it: a plain `b - '0'`, so a letter, a
+ *  space, a piece of punctuation and a byte of a multi-byte character are digits too and no stamp
+ *  is refused for holding one. `touch -t nonsense f` is Oct 12 2084 on the host, which is what
+ *  this gives; a test for digits refuses it, which the host does not. A byte above 0x7F is a
+ *  negative digit here, which is what walks `touch -t 2026é010000 f` back to Nov 1 1923. */
+function stampDigit(byte: number): number {
+    return byte - 48;
+}
+
+/** A run of bytes read as decimal digits: one field of a `-t` stamp, as the host reads it. */
+function stampField(bytes: number[]): number {
     let value = 0;
-    for (const ch of text) value = value * 10 + stampDigit(ch);
+    for (const byte of bytes) value = value * 10 + stampDigit(byte);
     return value;
 }
 
@@ -3834,15 +3888,17 @@ const TOUCH_STAMP_MAX_MS = 9223372036854.775;
 
 /** The mtime `touch -t [[CC]YY]MMDDhhmm[.SS]` names, read on the local clock as the host reads it. */
 function parseTouchStamp(spec: string): number | undefined {
-    const dot = spec.indexOf('.');
-    if (spec.indexOf('.', dot + 1) !== -1) return undefined;
-    const main = dot === -1 ? spec : spec.slice(0, dot);
-    const seconds = dot === -1 ? '' : spec.slice(dot + 1);
-    /* `.SS` is two characters or the stamp is not a stamp: the host refuses `202601010000.` and
-       `00000000.5` alike, where a seconds field of one digit or of three would take both. */
+    const bytes = stampBytes(spec);
+    const dot = bytes.indexOf(46);
+    if (bytes.indexOf(46, dot + 1) !== -1) return undefined;
+    const main = dot === -1 ? bytes : bytes.slice(0, dot);
+    const seconds = dot === -1 ? [] : bytes.slice(dot + 1);
+    /* `.SS` is two bytes or the stamp is not a stamp: the host refuses `202601010000.` and
+       `00000000.5` alike, and refuses `202601010000.😀` too, whose four bytes are two code units
+       and so passed a guard that counted units. */
     if (dot !== -1 && seconds.length !== 2) return undefined;
     let year: number;
-    let rest: string;
+    let rest: number[];
     if (main.length === 12) {
         year = stampField(main.slice(0, 4));
         rest = main.slice(4);
@@ -3867,7 +3923,7 @@ function parseTouchStamp(spec: string): number | undefined {
     at.setDate(stampField(rest.slice(2, 4)));
     at.setHours(stampField(rest.slice(4, 6)));
     at.setMinutes(stampField(rest.slice(6, 8)));
-    at.setSeconds(seconds === '' ? 0 : stampField(seconds));
+    at.setSeconds(seconds.length === 0 ? 0 : stampField(seconds));
     const ms = at.getTime();
     if (Number.isNaN(ms)) return undefined;
     /* Past the largest stamp a file system carries it saturates, and before the year 1900 it is
