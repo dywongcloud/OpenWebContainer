@@ -15,6 +15,7 @@ import { CAPABILITIES } from './runtime/capabilities/index';
 import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbindVmRuntime, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs, syncRunActive } from './pump';
 import type { NodeFlagAnswer } from './flags';
+import { containerEnv } from '../default-env';
 import type { SyncChildRequest, SyncChildResult } from './pump';
 
 const RESERVED_WORDS = new Set([
@@ -346,14 +347,8 @@ export class NodeProcess extends Process {
          */
         bootModule?: QuickJSAsyncWASMModule
     ) {
-        const processEnv = new Map<string, string>([
-            ['PATH', '/bin:/usr/bin'],
-            ['HOME', '/home'],
-            ['PWD', cwd || '/'],
-        ]);
-        for (const [key, value] of Object.entries(env)) {
-            processEnv.set(key, value);
-        }
+        /* The container's own environment, with the caller's over it; see `containerEnv`. */
+        const processEnv = containerEnv(cwd, env);
         super(pid, ProcessType.JAVASCRIPT, executablePath, args, parentPid, cwd, processEnv);
         this.bootModule = bootModule;
         this.repl = executablePath === '[repl]';
@@ -488,7 +483,8 @@ export class NodeProcess extends Process {
                `node -- -e` is `Cannot find module '-e'` -- where a path is named resolved. */
             const named = file.startsWith('-') && !file.includes('/')
                 ? file
-                : normalizeAbsolute(joinPaths(this.currentCwd, file));
+                : file.startsWith('/') ? normalizeAbsolute(file)
+                    : normalizeAbsolute(joinPaths(this.currentCwd, file));
             this.emitError(`Error: Cannot find module '${named}'\n`);
             return 1;
         }
@@ -713,10 +709,13 @@ export class NodeProcess extends Process {
         const found = this.resolver.resolve(spec, this.currentCwd, 'require');
         if (found === undefined) {
             /* An entry that is not a path is named as it was written -- node's own message for
-               `node -- -e` is `Cannot find module '-e'` -- where a path is named resolved. */
+               `node -- -e` is `Cannot find module '-e'` -- where a path is named resolved: an
+               absolute one is already resolved, so the working directory is not put in front of
+               it (`node /app/nope.js` names `/app/nope.js`, not `/app/app/nope.js`). */
             const named = entry.startsWith('-') && !entry.includes('/')
                 ? entry
-                : normalizeAbsolute(joinPaths(this.currentCwd, entry));
+                : entry.startsWith('/') ? normalizeAbsolute(entry)
+                    : normalizeAbsolute(joinPaths(this.currentCwd, entry));
             throw new Error(`Cannot find module '${named}'`);
         }
         return found;
@@ -1134,9 +1133,17 @@ export class NodeProcess extends Process {
             return code;
         }
         if (this.stopped) return -1;
+        /*
+         * Only the message is written, never the stack. A fatal error raised here was raised by the
+         * host, not by the guest: its frames name the host files this bundle was built from
+         * (`.../packages/core/dist/index.js:66431`), which no differential against host Node can
+         * ever match and which tell a guest where the machine it runs on keeps its repository. What
+         * node puts on such a line is the error's name and its message, so that is what goes out;
+         * a guest's own failure is a `GuestFailure`, whose message already holds the guest's stack.
+         */
         const message = error instanceof GuestFailure
             ? error.message
-            : error instanceof Error ? (error.stack ?? error.message) : String(error);
+            : error instanceof Error ? `${error.name}: ${error.message}` : String(error);
         this.emitGuestOutput({ stderr: message + '\n' });
         return 1;
     }
