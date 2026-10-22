@@ -15,6 +15,8 @@
  *  - a for-of whose iterable holds a yield gets that iterable hoisted into a const of its own,
  *    because QuickJS 0.31 and 0.32 abort the compile with 'stack underflow' and the loop then
  *    reads the value from the const (see rxForOfYields).
+ * Function.prototype.toString puts that hoist back out before it prints, so a body that was
+ * rewritten still prints the source it was written with.
  * The scanner tracks strings, template literals, comments, regex literals (previous-token rule),
  * control headers, object literals and class bodies, so only real literals and class elements are
  * touched: a '/' is a regex where a value cannot continue and a division where one can.
@@ -468,8 +470,12 @@ function rxForOfYields(src, fors) {
       var endAt = rxStatementEnd(src, closeAt + 1);
       if (endAt <= closeAt + 1) continue;
     }
+    /* The name says whether the loop was braced: the un-hoist in Function.prototype.toString has to
+       take the brace it added back out, and a '{ ' stands before a hoist in a function body as
+       readily as before one this rewrite braced, so the text after the const cannot tell them
+       apart. The 'B' is inside the name, so no freshness check or printed shape changes. */
     var name = '';
-    do { seq++; name = '__owcOf' + seq; } while (src.indexOf(name) >= 0);
+    do { seq++; name = (brace ? '__owcOfB' : '__owcOf') + seq; } while (src.indexOf(name) >= 0);
     var declare = 'const ' + name + ' = ' + src.slice(iterS, iterE) + '; ';
     out.push({ s: insertAt, e: insertAt, text: brace ? '{ ' + declare : declare });
     out.push({ s: iterS, e: iterE, text: name });
@@ -498,6 +504,107 @@ function rxRewrite(src) {
   }
   return out + src.slice(at);
 }
+/* The third rewrite edits source text, and the engine prints the source it compiled, so without a
+   fix Function.prototype.toString shows the hoist this file added instead of the body that was
+   written. These take the hoist back out: the declaration the rewrite inserted is removed, the
+   iterable is put back where it stood and the brace a braced pair added is closed again, so a
+   function prints the text it was written with. The name the rewrite chose is fresh per source, so
+   a '__owcOf' run in a printed body is always one this file put there. */
+function rxDeclEnd(src, s) {
+  var n = src.length, depth = 0, q = s;
+  while (q < n) {
+    q = rxSkip(src, q, { nl: false });
+    if (q >= n) break;
+    var c = src.charCodeAt(q);
+    if (c === 40 || c === 91 || c === 123) { depth++; q++; continue; }
+    if (c === 41 || c === 93 || c === 125) { depth--; q++; continue; }
+    if (c === 34 || c === 39) { q = rxSkipString(src, q, c); continue; }
+    if (c === 96) { q = rxWalkTemplate(src, q).next; continue; }
+    if (c === 59 && depth === 0) return q;
+    q++;
+  }
+  return -1;
+}
+/* The ')' that closes the header of the for the hoist was written for, read the way rxForOfYields
+   reads it, so the end of that for's statement is found at the same place it was inserted. */
+function rxForClose(src, from) {
+  var n = src.length, q = rxSkip(src, from, { nl: false });
+  if (src.slice(q, q + 5) === 'await' && !rxIsIdPart(src.charCodeAt(q + 5))) q = rxSkip(src, q + 5, { nl: false });
+  if (q >= n || src.charCodeAt(q) !== 40) return -1;
+  var depth = 1, k = q + 1;
+  while (k < n) {
+    k = rxSkip(src, k, { nl: false });
+    if (k >= n) break;
+    var c = src.charCodeAt(k);
+    if (c === 40 || c === 91 || c === 123) { depth++; k++; continue; }
+    if (c === 41) { depth--; if (depth === 0) return k; k++; continue; }
+    if (c === 93 || c === 125) { depth--; k++; continue; }
+    if (c === 34 || c === 39) { k = rxSkipString(src, k, c); continue; }
+    if (c === 96) { k = rxWalkTemplate(src, k).next; continue; }
+    k++;
+  }
+  return -1;
+}
+/* One '__owcOf<digits>' run and nothing longer, so '__owcOf1' is not found inside '__owcOf10'. */
+function rxFindName(src, name, from) {
+  var n = src.length, m = name.length, k = from;
+  while (k >= 0 && k < n) {
+    k = src.indexOf('__owcOf', k);
+    if (k < 0) return -1;
+    if (src.slice(k, k + m) === name && !rxIsIdPart(src.charCodeAt(k + m))) return k;
+    k += 7;
+  }
+  return -1;
+}
+function rxUnhoist(src) {
+  var guard = 0, seek = 0;
+  while (guard++ < 64) {
+    var p = src.indexOf('const __owcOf', seek);
+    if (p < 0) break;
+    var n0 = src.length, k = p + 13, braced = false;
+    if (src.charCodeAt(k) === 66) { braced = true; k++; }
+    while (k < n0 && src.charCodeAt(k) >= 48 && src.charCodeAt(k) <= 57) k++;
+    if (k === p + 13 || (braced && k === p + 14)) { seek = p + 1; continue; }
+    var name = src.slice(p + 6, k);
+    var eq = rxSkip(src, k, { nl: false });
+    if (eq >= n0 || src.charCodeAt(eq) !== 61) { seek = p + 1; continue; }
+    var s = rxSkip(src, eq + 1, { nl: false });
+    var semi = rxDeclEnd(src, s);
+    if (semi < 0) { seek = p + 1; continue; }
+    var expr = src.slice(s, semi);
+    var end = semi + 1;
+    if (src.charCodeAt(end) === 32) end++;
+    var head = braced ? p - 2 : p;
+    var use = rxFindName(src.slice(end), name, 0);
+    /* A '__owcOf' this file did not write -- a string in the body can hold the same text -- has no
+       use to put the iterable back into, so it is skipped and the search moves past it. */
+    if (use < 0) { seek = p + 1; continue; }
+    var out = src.slice(0, head) + src.slice(end, end + use) + expr + src.slice(end + use + name.length);
+    if (braced) {
+      var close = rxForClose(out, head + 3);
+      if (close < 0) { seek = p + 1; continue; }
+      var stop = rxStatementEnd(out, close + 1);
+      if (stop < 0 || stop > out.length - 2 || out.slice(stop, stop + 2) !== ' }') { seek = p + 1; continue; }
+      out = out.slice(0, stop) + out.slice(stop + 2);
+    }
+    src = out;
+    seek = head;
+  }
+  return src;
+}
+/* Function.prototype.toString: the printed body is un-hoisted, so a generator whose for-of holds a
+   yield prints the source it was written with. Nothing else about the method changes: the native
+   one is still called, and a body with no hoist comes back exactly as it was printed. */
+(function () {
+  var RX_NATIVE_TOSTRING = Function.prototype.toString;
+  function compatToString() {
+    var text = RX_NATIVE_TOSTRING.call(this);
+    try { return rxUnhoist(text); } catch (unhoistErr) { return text; }
+  }
+  Object.defineProperty(compatToString, 'name', { value: 'toString', configurable: true });
+  Object.defineProperty(compatToString, 'length', { value: 0, configurable: true });
+  Object.defineProperty(Function.prototype, 'toString', { value: compatToString, writable: true, configurable: true });
+})();
 /* Runtime RegExp: a pattern built with new RegExp (for example camelcase joining a class that has \- with a u flag) gets the same \- fix as a literal. The wrapper only retries a u-flag SyntaxError and otherwise keeps the native constructor's behaviour: same prototype, same statics. */
 (function () {
   var NativeRegExp = RegExp;
