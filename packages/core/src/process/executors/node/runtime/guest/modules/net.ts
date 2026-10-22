@@ -338,6 +338,10 @@ BF['net'] = function () {
       this._wFinished = false;
       this._hubClosed = false;
       this._closePending = false;
+      /* Set when the peer's own end-of-stream is what ended this side (allowHalfOpen false), which is
+         the one case in which Node replaces socket.write: a write past that end is EPIPE, while a
+         write past an end this side asked for is the stream's own 'write after end'. */
+      this._finEnded = false;
       this._refed = true;
       this._holding = false;
       this._connectStarted = false;
@@ -358,6 +362,9 @@ BF['net'] = function () {
         var self = this;
         this.on('end', function () {
           self._rEnded = true;
+          /* Node swaps socket.write for its writeAfterFIN here, whatever the writable side was
+             doing, so a later write past that end reports the peer, not the stream. */
+          if (!self.allowHalfOpen) self._finEnded = true;
           // Node ends the writable side on a later tick, after the 'end' listeners have run, so a listener can still reply.
           if (!self.allowHalfOpen) {
             netDefer(function () {
@@ -599,6 +606,7 @@ BF['net'] = function () {
       if (this._rEnded) return;
       this._rEnded = true;
       this.emit('end');
+      if (!this.allowHalfOpen) this._finEnded = true;
       if (!this.allowHalfOpen && !this._wEnded && !this._dead) this.end();
       this._maybeFinish();
     }
@@ -819,8 +827,18 @@ BF['net'] = function () {
       /* A socket that sent its own end takes EPIPE, even once it has closed: only one that was
          destroyed without ending (a reset) reports the stream's own error instead. */
       if (this._wFinished || this._wEnded) {
-        var failure = netError(Error, 'EPIPE', 'This socket has been ended by the other party');
-        netDefer(function () { if (typeof callback === 'function') callback(failure); });
+        /* Which error it is depends on what ended this side, as Node 24.15 reports them: an end
+           forced by the peer's FIN is EPIPE ('This socket has been ended by the other party'), and
+           an end this side asked for is the stream's own 'write after end', which Node also emits
+           as 'error' and destroys the socket with. */
+        var failure = this._finEnded
+          ? netError(Error, 'EPIPE', 'This socket has been ended by the other party')
+          : netError(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end');
+        var failed = this;
+        netDefer(function () {
+          if (typeof callback === 'function') callback(failure);
+          if (!failed._finEnded) failed.destroy(failure);
+        });
         return false;
       }
       return duplexWrite.call(this, chunk, encoding, callback);
@@ -868,9 +886,16 @@ BF['net'] = function () {
       }
       var buf = netToBuffer(chunk, encoding);
       if (this._wFinished || this._wEnded) {
-        /* Node reports a write past this end as EPIPE, the errno the socket would have raised. */
-        var ended = netError(Error, 'EPIPE', 'This socket has been ended by the other party');
-        netDefer(function () { if (typeof callback === 'function') callback(ended); });
+        /* As in duplex mode: an end forced by the peer's FIN is EPIPE, and an end this side asked
+           for is the stream's own 'write after end', which is also emitted as 'error'. */
+        var ended = this._finEnded
+          ? netError(Error, 'EPIPE', 'This socket has been ended by the other party')
+          : netError(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end');
+        var endedSocket = this;
+        netDefer(function () {
+          if (typeof callback === 'function') callback(ended);
+          if (!endedSocket._finEnded) endedSocket.destroy(ended);
+        });
         return false;
       }
       if (this._dead) {
