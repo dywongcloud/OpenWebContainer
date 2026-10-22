@@ -274,6 +274,14 @@ proc.pid = host.pid();
 proc.ppid = 0;
 proc.argv = JSON.parse(host.argvJSON());
 proc.execPath = '/usr/local/bin/node';
+/*
+ * argv[0] exactly as this process received it. On a host that is the path node was invoked by --
+ * the same string as execPath for every run, because node is started by the node at execPath and
+ * not by a name on PATH that resolves somewhere else. A host's argv0 is a string, and a package
+ * that asks how the process was started reads it; left off, it is undefined and the same package
+ * takes the branch a host never takes.
+ */
+proc.argv0 = proc.execPath;
 proc.execArgv = [];
 proc.env = procEnv;
 proc.exitCode = undefined;
@@ -399,12 +407,71 @@ function esrchFor(pid) {
 proc.umask = function () {
   return 18;
 };
+/*
+ * The ids this process runs as, which are the ids its own os.userInfo() names: the container is one
+ * user, and that user is decided in the one place userInfo decides it. Node has these accessors on
+ * a POSIX host and not elsewhere, and a package tests for the accessor before it reads the number --
+ * the typeof process.getuid === 'function' guard -- so it is the missing function, not the
+ * number, that sends such a package down the branch a container never takes. The effective ids are
+ * the real ones because nothing here changes identity: there is no setuid, and nothing to set.
+ */
+proc.getuid = function () { return requireBuiltin('os').userInfo().uid; };
+proc.geteuid = function () { return requireBuiltin('os').userInfo().uid; };
+proc.getgid = function () { return requireBuiltin('os').userInfo().gid; };
+proc.getegid = function () { return requireBuiltin('os').userInfo().gid; };
 proc.emitWarning = function (warning) {
   host.stderr('(node) Warning: ' + (warning && warning.message ? warning.message : String(warning)) + '\n');
 };
-function makeStdioStream(writeText) {
-  var stream = Object.create(EventEmitterCls.prototype);
+/*
+ * The chain a host's process.stdout has: SyncWriteStream over Writable over Stream over
+ * EventEmitter, which is what a package looks at -- isStreamLike(process.stdout), a prototype test,
+ * a check that typeof process.stdout.pipe is a function. This container has no descriptor to open,
+ * so the chain is built by name and the state behind it sits in a _writableState, which is where a
+ * host keeps what these accessors read and why they are not own properties of the stream. A write is
+ * still one synchronous call into the host, as it always was: nothing buffers and nothing waits.
+ *
+ * The name is the one node gives the stream it opens when its output is not a socket and not a
+ * terminal -- a write that returns as soon as it is made -- which is what this stream is.
+ */
+function Stream() {}
+function Writable() {}
+function SyncWriteStream() {}
+Stream.prototype = Object.create(EventEmitterCls.prototype);
+Writable.prototype = Object.create(Stream.prototype);
+SyncWriteStream.prototype = Object.create(Writable.prototype);
+Stream.prototype.constructor = Stream;
+Writable.prototype.constructor = Writable;
+SyncWriteStream.prototype.constructor = SyncWriteStream;
+/*
+ * Writable.prototype.pipe, as node writes it: nothing can be piped *out of* a stream that cannot be
+ * read, and node reports that by emitting the error rather than by returning one.
+ */
+SyncWriteStream.prototype.pipe = function (dest) {
+  var cannot = new Error('Cannot pipe, not readable');
+  cannot.code = 'ERR_STREAM_CANNOT_PIPE';
+  var self = this;
+  queueMicrotask(function () { self.emit('error', cannot); });
+  return dest;
+};
+/* Everything a Writable reports about itself, read from the state object as node reads it. */
+[
+  ['writable', 'writable'], ['destroyed', 'destroyed'], ['writableEnded', 'ended'],
+  ['writableFinished', 'finished'], ['writableHighWaterMark', 'highWaterMark'],
+  ['writableLength', 'length'], ['writableCorked', 'corked'], ['writableNeedDrain', 'needDrain'],
+  ['writableObjectMode', 'objectMode'], ['errored', 'errored']
+].forEach(function (pair) {
+  Object.defineProperty(SyncWriteStream.prototype, pair[0], {
+    configurable: true,
+    get: function () { return this._writableState[pair[1]]; }
+  });
+});
+function makeStdioStream(fd, writeText) {
+  var stream = new SyncWriteStream();
   EventEmitterCls.call(stream);
+  stream._writableState = { writable: true, destroyed: false, ended: false, finished: false,
+    highWaterMark: 65536, length: 0, corked: 0, needDrain: false, objectMode: false, errored: null };
+  stream.fd = fd;
+  stream.readable = false;
   /*
    * No terminal is attached, and a stream node has with no terminal behind it has *no* isTTY and
    * *no* columns: a host run with its output piped reports undefined for both, not false and 80.
@@ -420,17 +487,19 @@ function makeStdioStream(writeText) {
   };
   stream.end = function (chunk) {
     if (chunk !== undefined && typeof chunk !== 'function') stream.write(chunk);
+    stream._writableState.ended = true;
+    stream._writableState.finished = true;
     return stream;
   };
-  stream.cork = function () {};
-  stream.uncork = function () {};
+  stream.cork = function () { stream._writableState.corked = stream._writableState.corked + 1; };
+  stream.uncork = function () { if (stream._writableState.corked > 0) stream._writableState.corked = stream._writableState.corked - 1; };
   stream.setEncoding = function () { return stream; };
   return stream;
 }
-proc.stdout = makeStdioStream(function (text) {
+proc.stdout = makeStdioStream(1, function (text) {
   host.stdout(text);
 });
-proc.stderr = makeStdioStream(function (text) {
+proc.stderr = makeStdioStream(2, function (text) {
   host.stderr(text);
 });
 /* stdin has no input source unless the host feeds one. A process started with a pipe on fd 0 keeps it
@@ -455,7 +524,17 @@ function stdinRef() {
 function stdinOf() {
   if (stdinStream === null) {
     var Readable = requireBuiltin('stream').Readable;
-    stdinStream = new Readable({ read: function () {} });
+    /*
+     * A ReadStream, which is what a host's process.stdin is: the Readable node wraps fd 0 in, named
+     * as node names it, so a package that asks which class it is holding gets the answer a host
+     * gives. The Readable behind it is the same one this used, built the same way.
+     */
+    function ReadStream(options) { Readable.call(this, options); }
+    ReadStream.prototype = Object.create(Readable.prototype);
+    ReadStream.prototype.constructor = ReadStream;
+    stdinStream = new ReadStream({ read: function () {} });
+    /* fd 0, the descriptor a process reads its input from, whether anything is fed through it. */
+    stdinStream.fd = 0;
     // as on stdout: a stream with no terminal behind it reports neither isTTY nor columns
     // text in, text out: a pushed chunk reaches a reader as the string it was written as
     stdinStream.setEncoding('utf8');

@@ -103,6 +103,12 @@ interface DeviceSpec {
     read(length: number): Uint8Array;
     major: number;
     minor: number;
+    /**
+     * Whether a write to the device is taken. `/dev/random` is how a host is seeded, so it takes one;
+     * `/dev/urandom` is not: a write to it is refused with `EPERM` on the host, and a guest that
+     * opens it for writing gets the same refusal rather than a silent 8 bytes written.
+     */
+    writable?: boolean;
 }
 
 function randomBytes(length: number): Uint8Array {
@@ -114,8 +120,8 @@ function randomBytes(length: number): Uint8Array {
 const DEVICES: Readonly<Record<string, DeviceSpec>> = {
     '/dev/null': { major: 1, minor: 3, read: () => new Uint8Array(0) },
     '/dev/zero': { major: 1, minor: 5, read: (length) => new Uint8Array(length) },
-    '/dev/random': { major: 1, minor: 8, read: randomBytes },
-    '/dev/urandom': { major: 1, minor: 9, read: randomBytes }
+    '/dev/random': { major: 1, minor: 8, read: randomBytes, writable: true },
+    '/dev/urandom': { major: 1, minor: 9, read: randomBytes, writable: false }
 };
 
 function driverFor(name: string, spec: DeviceSpec): DeviceDriver {
@@ -127,8 +133,10 @@ function driverFor(name: string, spec: DeviceSpec): DeviceDriver {
             new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).set(bytes, offset);
             return bytes.length;
         },
-        /* Every one of these discards what is written; the position still advances, as on a host. */
+        /* Every one of these discards what is written; the position still advances, as on a host --
+           except `/dev/urandom`, which a host refuses to be written to at all. */
         write: (file, _buffer, _offset, length) => {
+            if (spec.writable === false) throw ErrnoError.With('EPERM', `${DEVICE_DIR}/${name}`, 'write');
             file.position += length;
             return length;
         }
@@ -191,19 +199,30 @@ function deviceAt(path: string): DeviceSpec | undefined {
 
 /**
  * The files `PATH` names for the commands a guest looks for there: `sh`, `ls`, `cat` and `echo` in
- * `/bin` and `env` in `/usr/bin`. `PATH` listed both directories while `node` was the only file on
- * it, so `which sh`, `which cat` and `command -v sh` all failed -- and `readdir('/bin')` was empty
- * -- in a container that runs every one of those commands: they are built into its shell and need
- * no file to run, but a lookup is a question about the file system, and the file system had no
- * answer to give. Each is the script the shell would run to reach the same command, executable for
- * the same reason the node file is: every lookup ends in `isexe`, which reads the mode bits.
+ * `/bin`, `env` in `/usr/bin`, and `node`, `npm` and `npx` in `/usr/local/bin`. `PATH` listed all
+ * three directories while `node` was the only file on it, so `which sh`, `which cat` and
+ * `command -v sh` all failed -- and `readdir('/bin')` was empty -- in a container that runs every
+ * one of those commands: they are built into its shell and need no file to run, but a lookup is a
+ * question about the file system, and the file system had no answer to give. Each is the script the
+ * shell would run to reach the same command, executable for the same reason the node file is: every
+ * lookup ends in `isexe`, which reads the mode bits.
+ *
+ * Two things keep a name off this list. A command this container cannot run gets no file: there is
+ * no `git` here, and a file that named one would answer `command -v git` with a path and then fail
+ * the moment a line ran it. And a command the shell reaches through its runner rather than through
+ * its own built-ins -- `grep` and `sed` are two -- is left without one on purpose: a file on `PATH`
+ * outranks the runner, so giving them one makes `command -v grep` answer and `grep` itself stop
+ * working ("it is the file /usr/bin/grep, which only a child can run"). Being able to run them is
+ * worth more than being able to name them.
  */
 const PATH_COMMANDS: ReadonlyArray<readonly [string, string]> = [
     ['/bin/sh', '#!/bin/sh\n'],
     ['/bin/ls', '#!/bin/sh\nls "$@"\n'],
     ['/bin/cat', '#!/bin/sh\ncat "$@"\n'],
     ['/bin/echo', '#!/bin/sh\necho "$@"\n'],
-    ['/usr/bin/env', '#!/bin/sh\nenv "$@"\n']
+    ['/usr/bin/env', '#!/bin/sh\nenv "$@"\n'],
+    ['/usr/local/bin/npm', '#!/bin/sh\nnpm "$@"\n'],
+    ['/usr/local/bin/npx', '#!/bin/sh\nnpx "$@"\n']
 ];
 
 function writePathCommands(): void {
