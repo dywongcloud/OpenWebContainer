@@ -177,6 +177,13 @@ export interface ShellJob {
     pid: number;
     /** The command as it was written, for `jobs`. */
     text: string;
+    /**
+     * The command as it was written, quoting and all, which is what the job is run from. `text` is
+     * the words a shell *prints*, and printing them back is what took the quoting out of a job:
+     * `(echo 'a  b') &` was replayed as `echo a b`, so `(trap 'echo inner' EXIT) &` ran the trap
+     * `echo` and printed an empty line where a host prints `inner`.
+     */
+    source?: string;
     /** Run to completion: `wait` no longer has anything to wait for. */
     done: boolean;
     /** The status it left, once it has run. */
@@ -237,11 +244,20 @@ export interface ShellState {
     traps: Map<string, TrapSpec>;
     /**
      * The descriptors `exec` opened and left open: `3` is the file `exec 3>f` named, and a later
-     * `echo hi >&3` writes to it, the way it does in a shell. The two a redirection names without
-     * being opened -- 1 and 2 -- are never in here; the plan of the command that redirects them
-     * carries where they go.
+     * `echo hi >&3` writes to it, the way it does in a shell. One `exec 3>&1` opened is the shell's
+     * own standard output rather than a file, and one `exec 3<f` opened is a descriptor `cat <&3`
+     * reads. The two a redirection names without being opened -- 1 and 2 -- are never in here; they
+     * are `stdoutTarget` and `stderrTarget`, which a plan reads as the destination it starts from.
      */
-    openFds: Map<number, { file: string; append: boolean }>;
+    openFds: Map<number, StreamTarget>;
+    /**
+     * Where the shell's own standard output goes, as a plan carries it. `exec >f` and `exec 1>&2`
+     * are redirections of the shell and not of one command, so every command behind them writes
+     * where these point, as it does in a host shell; before any such `exec` they are the output
+     * and the error the shell was started with.
+     */
+    stdoutTarget: StreamTarget;
+    stderrTarget: StreamTarget;
     callStack: CallFrame[];
     /** Free slot for the host: `child.ts` stores its CapabilityContext here for its runner. */
     host?: unknown;
@@ -1228,7 +1244,11 @@ class Parser {
         this.skipSpace(true);
         if (this.pos < this.src.length) {
             const rest = this.src.slice(this.pos).trim();
-            throw new ShellSyntaxError(`syntax error near unexpected token \`${rest.split(/[\s;]/)[0] || 'newline'}'`);
+            /* A `;;` nothing is looking for -- the one a `case` item inside a `$( )` leaves behind,
+               because the `)` of its pattern is the one that closed the substitution -- is the token
+               a host names, and not the `newline` splitting the rest on whitespace and `;` gives. */
+            const token = rest.startsWith(';;') ? ';;' : rest.split(/[\s;]/)[0] || 'newline';
+            throw new ShellSyntaxError(`syntax error near unexpected token \`${token}'`);
         }
         return nodes;
     }
@@ -1908,7 +1928,12 @@ class Parser {
             words.pop();
         }
         const found = this.readRedirects();
-        if (fd !== -1) for (const redirect of found) redirect.fd = fd;
+        /* Only the operator the number was written in front of is the one it numbers: `echo hi 3>f
+           >&3` is a `3` opened on `f` and a standard output duplicated onto that `3` -- numbering
+           every operator behind it as well made the `>&3` a third descriptor pointing at `f`, so
+           the command's own output stayed where it was. An operator of its own number -- the `4<`
+           of `cat 3<f 4<g` -- read it itself, and is left alone. */
+        if (fd !== -1 && found[0] !== undefined) found[0].fd = fd;
         return found;
     }
 
@@ -2566,7 +2591,9 @@ interface Snapshot {
     dirs: string[];
     umask: number;
     traps: Map<string, TrapSpec>;
-    openFds: Map<number, { file: string; append: boolean }>;
+    openFds: Map<number, StreamTarget>;
+    stdoutTarget: StreamTarget;
+    stderrTarget: StreamTarget;
     aliases: Map<string, string>;
     functions: Map<string, FunctionDef>;
     optind: number;
@@ -2588,6 +2615,8 @@ function snapshotState(state: ShellState): Snapshot {
         umask: state.umask,
         traps: new Map([...state.traps].map(([name, spec]) => [name, { ...spec }])),
         openFds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }])),
+        stdoutTarget: { ...state.stdoutTarget },
+        stderrTarget: { ...state.stderrTarget },
         aliases: new Map(state.aliases),
         functions: new Map(state.functions),
         optind: state.optind,
@@ -2609,6 +2638,8 @@ function restoreState(state: ShellState, snapshot: Snapshot): void {
     state.umask = snapshot.umask;
     state.traps = snapshot.traps;
     state.openFds = snapshot.openFds;
+    state.stdoutTarget = { ...snapshot.stdoutTarget };
+    state.stderrTarget = { ...snapshot.stderrTarget };
     state.aliases = snapshot.aliases;
     state.functions = snapshot.functions;
     state.optind = snapshot.optind;
@@ -2673,7 +2704,7 @@ function runTrap(state: ShellState, name: string): void {
 
 let RUNNER: SimpleCommandRunner = (_state, words) => ({
     stdout: '',
-    stderr: `Command not found: ${words[0] ?? ''}`,
+    stderr: `Command not found: ${words[0] ?? ''}\n`,
     exitCode: 127
 });
 
@@ -2755,7 +2786,11 @@ function runParsed(state: ShellState, script: string): number {
         if (error instanceof ExitSignal) return error.code;
         if (error instanceof ReturnSignal) return error.code;
         if (error instanceof ShellSyntaxError) {
+            /* The message, and then the line it came from, echoed in backquotes the way a host
+               handed a script with `-c` echoes it: `/bin/sh: -c: line 0: syntax error near
+               unexpected token `)'` followed by the script that would not parse. */
             writeErr(state, `${error.message}\n`);
+            writeErr(state, `\`${script}'\n`);
             return 2;
         }
         if (error instanceof UnsetVariableError) {
@@ -3114,8 +3149,8 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
 }
 
 interface RedirectPlan {
-    stdoutTo: { kind: 'out' | 'err' | 'file' | 'null'; file?: string; append?: boolean };
-    stderrTo: { kind: 'out' | 'err' | 'file' | 'null'; file?: string; append?: boolean };
+    stdoutTo: StreamTarget;
+    stderrTo: StreamTarget;
     inputFile?: string;
     /** The input a here-string wrote: text already read, never the name of a file to open. */
     inputText?: string;
@@ -3125,104 +3160,170 @@ interface RedirectPlan {
      * the one that keeps the descriptor open for the commands behind it.
      */
     opened: { fd: number; file: string; append: boolean }[];
+    /**
+     * The descriptors this command can name with `>&n` and `<&n`, in the order its own
+     * redirections opened them: a copy of the ones `exec` left open, so `echo hi 3>f >&3` is a
+     * write to `f` -- the descriptor the command opened itself is visible to the redirection
+     * behind it -- while nothing a command opened outlives the command.
+     */
+    fds: Map<number, StreamTarget>;
     /** The message of a descriptor nothing opened, which a host reports before running anything. */
     error?: string;
 }
 
-/** Where one of the two standard descriptors goes, in the shape the plan carries. */
-type StreamTarget = { kind: 'out' | 'err' | 'file' | 'null'; file?: string; append?: boolean };
+/**
+ * Where one of the two standard descriptors goes, in the shape the plan carries -- and where a
+ * descriptor `exec` opened points, which is the same shape: the shell's own output or error, a
+ * file opened for writing (`append` once a write through it has moved its offset) or for reading,
+ * or nothing at all because it was closed.
+ */
+type StreamTarget = { kind: 'out' | 'err' | 'file' | 'null' | 'input'; file?: string; append?: boolean };
+
+/**
+ * Where `n>&m`, `n<&m` and `n>&-` point: the destination the named descriptor has *now*, the
+ * shell's own output or error for `1` and `2`, or nothing at all for `-`.
+ *
+ * Undefined for a descriptor number nothing opened, which a host names and fails the command with
+ * before it runs: `echo hi >&9` is `sh: 9: Bad file descriptor`, and the command never runs.
+ */
+function duplicateOf(
+    plan: RedirectPlan,
+    target: string,
+    stdoutTo: StreamTarget = plan.stdoutTo,
+    stderrTo: StreamTarget = plan.stderrTo
+): StreamTarget | undefined {
+    if (target === '-') return { kind: 'null' };
+    if (target === '1') return { ...stdoutTo };
+    if (target === '2') return { ...stderrTo };
+    if (!/^[0-9]+$/.test(target)) return { kind: 'file', file: target, append: false };
+    const opened = plan.fds.get(Number.parseInt(target, 10));
+    return opened === undefined ? undefined : { ...opened };
+}
 
 /**
  * `n>&m`, `n>&-`: a descriptor moved to where another one already points, or closed.
  *
  * `1` and `2` are the two every command has, and the plan carries where they go. A higher one is a
- * descriptor `exec` opened earlier -- `exec 3>f; echo hi >&3` writes `hi` to `f` -- and a number no
- * `exec` opened is a bad descriptor, which a host names and fails the command with before it runs.
+ * descriptor `exec` opened earlier -- or one this very command opened ahead of this redirection,
+ * which is why `echo hi 3>f >&3` writes `hi` into `f` -- and a number nothing opened is a bad
+ * descriptor, which a host names and fails the command with before it runs.
  */
 function planDuplicate(state: ShellState, plan: RedirectPlan, fd: number, target: string): void {
-    const sink = (kind: StreamTarget['kind']): void => {
-        if (fd === 2) plan.stderrTo = { kind };
-        else if (fd === 1) plan.stdoutTo = { kind };
+    const sink = (entry: StreamTarget): void => {
+        if (fd === 2) plan.stderrTo = { ...entry };
+        else if (fd === 1) plan.stdoutTo = { ...entry };
+        else plan.fds.set(fd, { ...entry });
     };
-    const toFile = (file: string, append: boolean): void => {
-        if (fd === 2) plan.stderrTo = { kind: 'file', file, append };
-        else if (fd === 1) plan.stdoutTo = { kind: 'file', file, append };
-        else plan.opened.push({ fd, file, append });
-    };
-    if (target === '-') {
-        sink('null');
+    const resolved = duplicateOf(plan, target);
+    if (resolved === undefined) {
+        /* `echo hi >&9` on a host: `sh: 9: Bad file descriptor`, written without the `line 0`
+           the jobspec diagnostics carry, and the command does not run. */
+        if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
         return;
     }
-    if (target === '1') {
-        if (fd === 2) plan.stderrTo = { ...plan.stdoutTo };
-        else if (fd === 1) plan.stdoutTo = { ...plan.stdoutTo };
-        return;
-    }
-    if (target === '2') {
-        if (fd === 2) plan.stderrTo = { ...plan.stderrTo };
-        else if (fd === 1) plan.stdoutTo = { ...plan.stderrTo };
-        return;
-    }
-    if (/^[0-9]+$/.test(target)) {
+    sink(resolved);
+    if (resolved.kind === 'file' && resolved.file !== undefined && /^[0-9]+$/.test(target)) {
         const number = Number.parseInt(target, 10);
-        const opened = state.openFds.get(number);
-        if (opened === undefined) {
-            /* `echo hi >&9` on a host: `sh: 9: Bad file descriptor`, written without the `line 0`
-               the jobspec diagnostics carry, and the command does not run. */
-            if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
-            return;
-        }
-        toFile(opened.file, opened.append);
-        /* A write through a descriptor moves the offset it holds: `exec 3>f; echo a >&3; echo b >&3`
-           leaves `f` holding both lines, where a write that started at the beginning every time
-           would leave only the last. */
-        state.openFds.set(number, { file: opened.file, append: true });
-        return;
+        const moved: StreamTarget = { kind: 'file', file: resolved.file, append: true };
+        plan.fds.set(number, moved);
+        /* Only a descriptor the shell keeps open -- one `exec` opened -- is the one whose offset a
+           write moved: `echo hi 3>f >&3` opens its own `3`, and nothing of it outlives the command. */
+        if (state.openFds.has(number)) state.openFds.set(number, { ...moved });
     }
-    toFile(target, false);
 }
 
 /**
  * Keeps the redirections of an `exec` that names no command, so the descriptors it opens are open
  * for the rest of the line and for the lines behind it: `exec 3>f; echo hi >&3; exec 3>&-`.
  *
- * The two standard descriptors are left to the plan of the command itself -- `exec >f` is a
- * redirection of that one command's output, which the plan already carries -- and only a descriptor
- * above 2 is one a later `>&n` can name.
+ * Every descriptor is one the shell itself keeps -- `exec >f` sends the shell's own output to `f`,
+ * `exec 3>&1` leaves `3` pointing where the output goes, and `exec 3<f` leaves it a descriptor that
+ * is read -- and every one is applied in the order it was written, so `exec 4>f 3>&4` is a `3` that
+ * names `f`, as it is in a host shell.
+ *
+ * The message of a redirection that cannot be made -- `exec 3>&4` with no `4` -- which a host
+ * reports and ends a shell that is not reading a terminal with. Undefined when every one was made.
  */
-function applyExecRedirects(state: ShellState, redirects: Redirect[]): void {
+function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | undefined {
+    const plan: RedirectPlan = {
+        stdoutTo: { ...state.stdoutTarget },
+        stderrTo: { ...state.stderrTarget },
+        opened: [],
+        fds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }]))
+    };
+    const fds = new Map(state.openFds);
+    let stdoutTo: StreamTarget = { ...state.stdoutTarget };
+    let stderrTo: StreamTarget = { ...state.stderrTarget };
+    const setFd = (fd: number, entry: StreamTarget): void => {
+        if (fd === 1) stdoutTo = entry;
+        else if (fd === 2) stderrTo = entry;
+        else if (entry.kind === 'null') fds.delete(fd);
+        else fds.set(fd, entry);
+    };
     for (const redirect of redirects) {
         const target = expandToString(redirect.target, state);
-        if (redirect.fd < 3) continue;
-        if (redirect.op === '>' || redirect.op === '>>') {
-            state.openFds.set(redirect.fd, { file: target, append: redirect.op === '>>' });
-            continue;
+        switch (redirect.op) {
+            case '>':
+            case '>>':
+                setFd(redirect.fd, { kind: 'file', file: target, append: redirect.op === '>>' });
+                break;
+            case '<':
+                /* A descriptor above 2 opened for reading: `exec 3<f; cat <&3` reads `f`. The
+                   standard input itself is the text the shell was handed, which no file replaces. */
+                if (redirect.fd >= 3) setFd(redirect.fd, { kind: 'input', file: target });
+                break;
+            case '>&':
+            case '<&': {
+                const resolved = duplicateOf(plan, target, stdoutTo, stderrTo);
+                if (resolved === undefined) return `${state.shellName}: ${target}: Bad file descriptor\n`;
+                setFd(redirect.fd, resolved);
+                break;
+            }
+            default:
+                break;
         }
-        if (redirect.op !== '>&') continue;
-        if (target === '-') {
-            state.openFds.delete(redirect.fd);
-            continue;
-        }
-        if (!/^[0-9]+$/.test(target)) continue;
-        const opened = state.openFds.get(Number.parseInt(target, 10));
-        if (opened === undefined) state.openFds.delete(redirect.fd);
-        else state.openFds.set(redirect.fd, { ...opened });
     }
+    state.openFds = fds;
+    state.stdoutTarget = stdoutTo;
+    state.stderrTarget = stderrTo;
+    return undefined;
 }
 
+/**
+ * The plan of one command: where its output and error go, what it reads, and the descriptors above
+ * 2 its own redirections opened.
+ *
+ * The two standard descriptors start where the shell's own are -- which is where `exec` last put
+ * them, so `exec >f; echo hi` writes into `f` -- and every redirection is applied in the order it
+ * was written, so `2>&1 >f` and `>f 2>&1` send the error to two different places, as they do in a
+ * host shell. A redirection nothing can be made of ends the plan: `echo hi >&3 3>f` names the bad
+ * descriptor first, and the `f` behind it is never even opened.
+ */
 function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
-    const plan: RedirectPlan = { stdoutTo: { kind: 'out' }, stderrTo: { kind: 'err' }, opened: [] };
+    const plan: RedirectPlan = {
+        stdoutTo: { ...state.stdoutTarget },
+        stderrTo: { ...state.stderrTarget },
+        opened: [],
+        fds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }]))
+    };
     for (const redirect of redirects) {
+        if (plan.error !== undefined) break;
         const target = expandToString(redirect.target, state);
         switch (redirect.op) {
             case '>':
             case '>>':
                 if (redirect.fd === 2) plan.stderrTo = { kind: 'file', file: target, append: redirect.op === '>>' };
                 else if (redirect.fd === 1) plan.stdoutTo = { kind: 'file', file: target, append: redirect.op === '>>' };
-                else plan.opened.push({ fd: redirect.fd, file: target, append: redirect.op === '>>' });
+                else {
+                    plan.fds.set(redirect.fd, { kind: 'file', file: target, append: redirect.op === '>>' });
+                    plan.opened.push({ fd: redirect.fd, file: target, append: redirect.op === '>>' });
+                }
                 break;
             case '<':
-                plan.inputFile = target;
+                /* A descriptor above 2 opened for reading is one only `>&n` and `<&n` name: `cat
+                   3<f` reads the shell's own input, not `f`, as it does on a host. */
+                if (redirect.fd >= 3) plan.fds.set(redirect.fd, { kind: 'input', file: target });
+                else plan.inputFile = target;
                 break;
             case '<<<':
                 /* A here-string is the word, expanded as one word -- no field splitting, no globbing
@@ -3245,12 +3346,31 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
                 /* A duplicate copies the destination the named descriptor has *now*, not where it
                    started: `> f 2>&1` sends both to `f`, while `2>&1 > f` leaves stderr on the
                    terminal. `2>&1` on a bare line therefore copies stdout's own destination. A
-                   higher descriptor is one `exec` opened, and `>&3` is a write to the file it holds
-                   -- which used to be read as a write to a file *named* `3`, so `echo hi >&3` made
-                   a file called `3` instead of writing `hi` where `exec 3>f` had pointed it. */
+                   higher descriptor is one `exec` opened, or one this command's own redirections
+                   opened ahead of it, and `>&3` is a write to the file it holds -- which used to be
+                   read as a write to a file *named* `3`, so `echo hi >&3` made a file called `3`
+                   instead of writing `hi` where `exec 3>f` had pointed it. */
                 planDuplicate(state, plan, redirect.fd, target);
                 break;
-            case '<&':
+            case '<&': {
+                if (target === '-') {
+                    plan.inputFile = NULL_DEVICE;
+                    break;
+                }
+                if (/^[0-9]+$/.test(target)) {
+                    const opened = plan.fds.get(Number.parseInt(target, 10));
+                    if (opened === undefined) {
+                        if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
+                        break;
+                    }
+                    if (redirect.fd >= 3) plan.fds.set(redirect.fd, { ...opened });
+                    else if (opened.kind === 'file' || opened.kind === 'input') plan.inputFile = opened.file;
+                    else if (opened.kind === 'null') plan.inputFile = NULL_DEVICE;
+                    break;
+                }
+                plan.inputFile = target;
+                break;
+            }
             default:
                 break;
         }
@@ -3299,11 +3419,23 @@ function writeOutputFile(state: ShellState, file: string, text: string, append: 
     if (!existed) setCreationMode(fs, path, false);
 }
 
-/** Applies the redirection plan and sends the result to the current output sink. */
-function finish(state: ShellState, plan: RedirectPlan, stdout: string, stderr: string, exitCode: number): number {
+/**
+ * Applies the redirection plan and sends the result to the current output sink. `name` is the
+ * command that wrote, for the one diagnostic that names it.
+ */
+function finish(
+    state: ShellState,
+    plan: RedirectPlan,
+    stdout: string,
+    stderr: string,
+    exitCode: number,
+    name?: string
+): number {
     try {
         /* A descriptor a redirection opened and nothing wrote to: `cmd 3>f` leaves `f` created and
-           empty, and `exec 3>f` opens the one the commands behind it write through with `>&3`. */
+           empty, and `exec 3>f` opens the one the commands behind it write through with `>&3`.
+           A redirection nothing could be made of leaves the ones behind it unopened, so `echo hi
+           >&3 3>f` reports the bad descriptor without ever creating `f`. */
         for (const opened of plan.opened) writeOutputFile(state, opened.file, '', Boolean(opened.append));
         if (plan.error !== undefined) {
             writeErr(state, plan.error);
@@ -3311,14 +3443,33 @@ function finish(state: ShellState, plan: RedirectPlan, stdout: string, stderr: s
         }
         if (plan.stderrTo.kind === 'null') stderr = '';
         else if (plan.stderrTo.kind === 'out') {
-            writeOut(state, stdout + stderr);
-            return exitCode;
+            if (plan.stdoutTo.kind === 'out') {
+                /* `cmd 2>&1` with nothing moved behind it: both go to the shell's own output, the
+                   output first, which is the order a host wrote them in. */
+                writeOut(state, stdout + stderr);
+                return exitCode;
+            }
+            /* `echo hi 2>&1 >f`: the error stays where the output was going when `2>&1` was read,
+               and the output behind it goes to `f` -- so the error is written to the shell's own
+               output and the output is left for the plan to place. */
+            writeOut(state, stderr);
+            stderr = '';
         } else if (plan.stderrTo.kind === 'file' && plan.stderrTo.file !== undefined) {
             writeOutputFile(state, plan.stderrTo.file, stderr, Boolean(plan.stderrTo.append));
             stderr = '';
         }
-        if (plan.stdoutTo.kind === 'null') stdout = '';
-        else if (plan.stdoutTo.kind === 'file' && plan.stdoutTo.file !== undefined) {
+        if (plan.stdoutTo.kind === 'null') {
+            /* A write to a descriptor `>&-` closed: the text reaches the shell anyway -- a host's
+               own write is held in its buffer, which is flushed once the descriptor is put back --
+               and the write is still the failure it was, reported with the status a host gives the
+               command that made it. `true >&-` writes nothing and keeps its own status. */
+            if (stdout !== '' && name !== undefined) {
+                writeOut(state, stdout);
+                writeErr(state, `${diagnosticPrefix(state)}${name}: write error: Bad file descriptor\n`);
+                exitCode = 1;
+            }
+            stdout = '';
+        } else if (plan.stdoutTo.kind === 'file' && plan.stdoutTo.file !== undefined) {
             writeOutputFile(state, plan.stdoutTo.file, stdout, Boolean(plan.stdoutTo.append));
             stdout = '';
         } else if (plan.stdoutTo.kind === 'err') {
@@ -3383,6 +3534,27 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     const words: string[] = [];
     for (const word of command.words) words.push(...expandWord(state, word));
 
+    /* `exec` with nothing to run: the redirections it carries are the shell's from here on, not one
+       command's -- `exec 3>f; echo hi >&3` writes `hi` to `f`, `exec >f` sends every command's
+       output there, and `exec 3>&-` closes the descriptor again, as they do in a host shell. They
+       are applied before this command's own plan is made, so the plan reads the destination `exec`
+       has just set: `exec >f` is a write to `f` from this command on. */
+    if (words[0] === 'exec' && words.length === 1) {
+        const failed = applyExecRedirects(state, command.redirects);
+        if (failed !== undefined) {
+            /* A redirection `exec` cannot make ends the shell, the way `exec 3>&4` ends the
+               /bin/sh a line was handed to with `-c`: the host's own message, and nothing behind
+               it -- not the `echo rc=$?` written after it -- runs at all. The files its own
+               redirections had already opened before the one that failed are still opened. */
+            writeErr(state, failed);
+            state.exitCalled = true;
+            const undone = planRedirects(state, command.redirects);
+            undone.error = undefined;
+            finish(state, undone, '', '', 1, 'exec');
+            return throwExit(1);
+        }
+    }
+
     const plan = planRedirects(state, command.redirects);
     const commandInput = plan.inputText !== undefined
         ? plan.inputText
@@ -3415,11 +3587,6 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
 
     let name = words[0];
     let args = words.slice(1);
-
-    /* `exec` with nothing to run: the redirections it carries are the shell's from here on, not one
-       command's -- `exec 3>f; echo hi >&3` writes `hi` to `f`, and `exec 3>&-` closes the descriptor
-       again, as they do in a host shell. */
-    if (name === 'exec' && args.length === 0) applyExecRedirects(state, command.redirects);
 
     /* A jobspec typed as a command is `fg` with that jobspec as its argument: `%1` on a line of
        its own resumes the job in the foreground, and where the shell has no job control it is
@@ -3483,7 +3650,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
             const status = callFunction(state, fn, args);
             for (const entry of pending) setVar(state, entry.name, entry.value);
             syncPwd(state);
-            return finish(state, plan, '', '', status);
+            return finish(state, plan, '', '', status, name);
         }
 
         const builtin = COMMANDS[name];
@@ -3512,13 +3679,13 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
             }
             for (const entry of pending) setVar(state, entry.name, entry.value);
             syncPwd(state);
-            return finish(state, plan, result.stdout, result.stderr, result.exitCode);
+            return finish(state, plan, result.stdout, result.stderr, result.exitCode, name);
         }
 
         const step = RUNNER(state, words, stdin);
         for (const entry of pending) setVar(state, entry.name, entry.value);
         syncPwd(state);
-        return finish(state, plan, step.stdout, step.stderr, step.exitCode);
+        return finish(state, plan, step.stdout, step.stderr, step.exitCode, name);
     } finally {
         if (commandInput !== null) {
             state.inputBuffer = savedBuffer;
@@ -5237,7 +5404,9 @@ function runPendingJob(state: ShellState, job: ShellJob): { stdout: string; stde
     const snapshot = snapshotState(state);
     const savedIo = state.io;
     try {
-        const result = runScriptNoExitTrap(state, job.text);
+        /* The source the `&` was written on, not the text `jobs` prints: printing a command is what
+           takes its quoting out, and a job replayed from unquoted words is a different command. */
+        const result = runScriptNoExitTrap(state, job.source ?? job.text);
         job.done = true;
         job.exitCode = result.exitCode;
         return result;
@@ -5455,6 +5624,8 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
         hash: new Map(),
         traps: new Map(),
         openFds: new Map(),
+        stdoutTarget: { kind: 'out' },
+        stderrTarget: { kind: 'err' },
         callStack: [],
         inputBuffer: '',
         inputCursor: 0,
