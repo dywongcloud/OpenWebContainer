@@ -324,11 +324,20 @@ function cpStdio(stdio) {
   return { modes: [cpMode(list[0]), cpMode(list[1]), cpMode(list[2])], ipc: ipc };
 }
 
+/* A host's spawn gives the child the environment it was handed and nothing of its own, and then
+   fills in a PATH and a TERM the environment did not name: spawnSync of sh -c 'echo [$PATH]' with
+   env { MYVAR: 'v' } reads /usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:. on a host, not an empty
+   string, and reads dumb for $TERM. */
+var CP_DEFAULT_PATH = '/usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:.';
+var CP_DEFAULT_TERM = 'dumb';
+
 function cpEnvObject(env) {
   var out = {};
   Object.keys(env).forEach(function (key) {
     if (env[key] !== undefined) out[key] = String(env[key]);
   });
+  if (out.PATH === undefined) out.PATH = CP_DEFAULT_PATH;
+  if (out.TERM === undefined) out.TERM = CP_DEFAULT_TERM;
   return out;
 }
 
@@ -412,6 +421,10 @@ function cpSpawnCore(child, file, argv, options, extra) {
   child.spawnfile = spawnfile;
   child.spawnargs = [spawnfile].concat(list);
   child.connected = ipc;
+  /* The channel a host's child carries on an IPC stdio and nothing otherwise: an object a program
+     can test and hang ref/unref or listeners on. A worker thread is not a channel child, so it
+     has none -- and a child with no IPC stdio leaves the property undefined, as a host does. */
+  child.channel = ipc && extra.kind !== 'worker' ? new (cpEE())() : undefined;
   child._cpWorker = extra.kind === 'worker';
   child._cpCluster = extra.cluster || null;
   child._cpSpawned = false;
@@ -739,12 +752,47 @@ function cpCollect(child, opts, cmdText, callback) {
   var outs = [];
   var errs = [];
   var done = false;
+  /* maxBuffer: the most either stream may hold. A host's default is a megabyte, and a run that
+     writes more ends on a RangeError named ERR_CHILD_PROCESS_STDIO_MAXBUFFER with that stream cut
+     back to the limit, which is what exec and execFile report. */
+  var maxBuffer = opts.maxBuffer === undefined || opts.maxBuffer === null ? 1024 * 1024 : Number(opts.maxBuffer);
+  var over = null;
+  function take(arr, chunk, name) {
+    arr.push(chunk);
+    if (over !== null || !(maxBuffer > 0)) return;
+    var total = 0;
+    for (var i = 0; i < arr.length; i++) total += arr[i].length;
+    if (total > maxBuffer) over = name;
+  }
+  function cut(arr) {
+    var kept = [];
+    var left = maxBuffer;
+    for (var i = 0; i < arr.length && left > 0; i++) {
+      kept.push(arr[i].length > left ? arr[i].slice(0, left) : arr[i]);
+      left -= arr[i].length;
+    }
+    return kept;
+  }
   if (child.stdout) child.stdout.on('data', function (chunk) {
-    outs.push(chunk);
+    take(outs, chunk, 'stdout');
+    if (over !== null) overflown();
   });
   if (child.stderr) child.stderr.on('data', function (chunk) {
-    errs.push(chunk);
+    take(errs, chunk, 'stderr');
+    if (over !== null) overflown();
   });
+  function overflown() {
+    if (done) return;
+    if (over === 'stdout') outs = cut(outs);
+    else errs = cut(errs);
+    /* A host ends the child that overran the buffer, then reports the limit. */
+    cpKill(child, undefined);
+    var error = cpError(over + ' maxBuffer length exceeded');
+    error.name = 'RangeError';
+    error.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+    error.cmd = cmdText;
+    finish(error);
+  }
   function finish(error) {
     if (done) return;
     done = true;
@@ -774,7 +822,10 @@ function cpCollect(child, opts, cmdText, callback) {
 function cpExec(command, rest) {
   var call = cpParseCall(rest);
   var cmd = String(command);
-  var child = cpSpawnCore(new (cpChildClass())(), 'sh', ['-c', cmd], call.opts, { kind: 'child' });
+  /* /bin/sh, the path a host's node runs an exec through: $0 inside the command reads that path, as
+     it does on a host. execSync was given the same path; the asynchronous exec had been left on the
+     bare name, which is what made exec('echo $0') print sh where a host prints /bin/sh. */
+  var child = cpSpawnCore(new (cpChildClass())(), '/bin/sh', ['-c', cmd], call.opts, { kind: 'child' });
   cpCollect(child, call.opts, cmd, call.cb);
   return child;
 }
@@ -1163,6 +1214,10 @@ BF['cluster'] = function () {
   delete env.OWC_IPC_DATA;
   if (cpState.kind === 'cluster') delete env.NODE_UNIQUE_ID;
   cpState.connected = true;
+  /* A forked or clustered child runs with a channel, as one does on a host: typeof
+     process.channel is 'object' there, and a program that tests for it before sending sees it. A
+     worker thread is not a channel child and keeps none. */
+  if (cpState.kind !== 'worker') proc.channel = new (cpEE())();
   cpState.target = createTarget(cpOnFrame);
   if (cpState.kind === 'worker') {
     var Port = cpPortClass();

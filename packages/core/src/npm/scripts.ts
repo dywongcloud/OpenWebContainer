@@ -107,7 +107,7 @@ export function missingScriptMessage(name: string): string {
 
 /** What `npm run` prints when no script is named. */
 export function scriptList(label: string, scripts: Record<string, unknown>): string {
-    const lines = [`Scripts available in ${label} via \`npm run\`:`];
+    const lines = [`Lifecycle scripts included in ${label}:`];
     for (const [name, command] of Object.entries(scripts)) {
         if (typeof command !== 'string') continue;
         lines.push(`  ${name}`, `    ${command}`);
