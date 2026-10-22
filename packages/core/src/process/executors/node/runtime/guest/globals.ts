@@ -645,11 +645,30 @@ function urlGlobalOf(nodeUrl) {
   var STATE = new WeakMap();
   var DEFAULT_PORTS = { 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21', 'file:': '' };
   var SCHEME_RE = /^([A-Za-z][A-Za-z0-9+.\-]*):/;
-  /* The path percent-encode set: C0 controls, space, '"', '#', '<', '>', '?', '{', '}', DEL and a
-     backtick -- spelled as a code point because this source is itself a template literal. */
-  var PATH_ENCODE_CHARS = '"#<>?^' + String.fromCharCode(96) + '{}';
-  function percentEncode(ch, code) {
-    return code <= 0x20 || code === 0x7f || PATH_ENCODE_CHARS.indexOf(ch) >= 0;
+  /*
+   * The percent-encode sets, as code points: every one of them holds the C0 controls and every code
+   * point past ASCII -- which is what encodes 'ü' as %C3%BC and leaves '%C3%BC' the caller wrote
+   * alone -- and they differ in the printable bytes they add. The backtick and the quote are spelled
+   * as code points because this source is itself a template literal.
+   */
+  var PATH_EXTRA = [0x22, 0x23, 0x3c, 0x3e, 0x3f, 0x60, 0x7b, 0x7d, 0x5e];
+  var QUERY_EXTRA = [0x22, 0x23, 0x3c, 0x3e];
+  /* the special-query set adds the apostrophe, for the two schemes whose queries are HTML forms */
+  var QUERY_SPECIAL_EXTRA = [0x22, 0x23, 0x27, 0x3c, 0x3e];
+  var FRAGMENT_EXTRA = [0x22, 0x3c, 0x3e, 0x60];
+  var USERINFO_EXTRA = [0x22, 0x23, 0x3c, 0x3e, 0x3f, 0x60, 0x7b, 0x7d, 0x5e,
+    0x2f, 0x3a, 0x3b, 0x3d, 0x40, 0x5b, 0x5c, 0x5d, 0x7c];
+
+  function percentEncodeIn(text, extra) {
+    var out = '';
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      var code = text.charCodeAt(i);
+      if (code <= 0x20 || code > 0x7e || extra.indexOf(code) >= 0) {
+        try { out += encodeURIComponent(ch); } catch (loneSurrogate) { out += ch; }
+      } else out += ch;
+    }
+    return out;
   }
 
   function invalidUrl(input) {
@@ -673,12 +692,7 @@ function urlGlobalOf(nodeUrl) {
   /* The path percent-encode set, and the escape it is written as. An escape already in the path is
      left as it stands, so what the caller encoded survives. */
   function encodePath(text) {
-    var out = '';
-    for (var i = 0; i < text.length; i++) {
-      var ch = text.charAt(i);
-      out += percentEncode(ch, text.charCodeAt(i)) ? encodeURIComponent(ch) : ch;
-    }
-    return out;
+    return percentEncodeIn(text, PATH_EXTRA);
   }
 
   /* RFC 3986 5.2.4: '.' and '..' segments are resolved out, and a percent-encoded dot segment
@@ -742,6 +756,245 @@ function urlGlobalOf(nodeUrl) {
     return prefix + dir + rel;
   }
 
+  /* ---- hosts ----
+   *
+   * WHATWG: what a host is depends on what it looks like. An IPv6 literal sits in brackets and is
+   * parsed and rewritten as one, so '[::ffff:1.2.3.4]' comes back as '[::ffff:102:304]'. Anything
+   * else is a domain -- except that a domain whose last label is a number is an IPv4 address, which
+   * is why '0x7f.1', '0177.0.0.1' and '2130706433' are all 127.0.0.1 while '4294967296', which is
+   * one past the last address there is, is not a host at all. A byte no host may hold -- a control,
+   * a space, '<', '>', '^', '|', a bracket or a backslash -- is refused outright.
+   */
+  var HEX_PAIR = /^[0-9A-Fa-f][0-9A-Fa-f]$/;
+  var HEX_DIGIT = /^[0-9A-Fa-f]$/;
+  var FORBIDDEN_HOST = '\u0000 <>^|[]\\';
+
+  function forbiddenIn(text) {
+    for (var i = 0; i < text.length; i++) if (FORBIDDEN_HOST.indexOf(text.charAt(i)) >= 0) return true;
+    return false;
+  }
+
+  function percentDecode(text) {
+    var out = '';
+    for (var i = 0; i < text.length; i++) {
+      if (text.charAt(i) === '%' && i + 2 < text.length && HEX_PAIR.test(text.substr(i + 1, 2))) {
+        out += String.fromCharCode(parseInt(text.substr(i + 1, 2), 16));
+        i += 2;
+      } else out += text.charAt(i);
+    }
+    return out;
+  }
+
+  /* One label of an IPv4 address, as the URL parser reads it: a run of hex digits behind '0x', a
+     run of octal digits behind a leading zero, or a run of decimal digits. */
+  function ipv4NumberOf(text) {
+    var s = text;
+    var radix = 10;
+    if (s.length > 1 && s.charAt(0) === '0' && (s.charAt(1) === 'x' || s.charAt(1) === 'X')) {
+      radix = 16;
+      s = s.slice(2);
+    } else if (s.length > 1 && s.charAt(0) === '0') {
+      radix = 8;
+      s = s.slice(1);
+    }
+    if (s === '') return 0;
+    if (radix === 16 && !/^[0-9A-Fa-f]+$/.test(s)) return null;
+    if (radix === 8 && !/^[0-7]+$/.test(s)) return null;
+    if (radix === 10 && !/^[0-9]+$/.test(s)) return null;
+    var value = parseInt(s, radix);
+    return isFinite(value) ? value : null;
+  }
+
+  /* '1.2.3.4.' is the address '1.2.3.4': a trailing empty label is dropped, the way URL drops it. */
+  function ipv4LabelsOf(host) {
+    var parts = host.split('.');
+    if (parts[parts.length - 1] === '' && parts.length > 1) parts.pop();
+    return parts;
+  }
+
+  function endsInANumber(host) {
+    var parts = ipv4LabelsOf(host);
+    var last = parts[parts.length - 1];
+    if (last === undefined || last === '') return false;
+    if (/^[0-9]+$/.test(last)) return true;
+    return ipv4NumberOf(last) !== null;
+  }
+
+  function ipv4AddressOf(host) {
+    var parts = ipv4LabelsOf(host);
+    if (parts.length > 4) return null;
+    var numbers = [];
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === '') return null;
+      var label = ipv4NumberOf(parts[i]);
+      if (label === null) return null;
+      numbers.push(label);
+    }
+    /* every label but the last is one byte, and the last is whatever is left of the 32 bits */
+    for (var j = 0; j < numbers.length - 1; j++) if (numbers[j] > 255) return null;
+    if (numbers[numbers.length - 1] >= Math.pow(256, 5 - numbers.length)) return null;
+    var address = numbers.pop();
+    for (var k = 0; k < numbers.length; k++) address += numbers[k] * Math.pow(256, 3 - k);
+    return address;
+  }
+
+  function ipv4TextOf(address) {
+    var rest = address;
+    var out = String(rest % 256);
+    rest = Math.floor(rest / 256);
+    for (var i = 1; i < 4; i++) {
+      out = (rest % 256) + '.' + out;
+      rest = Math.floor(rest / 256);
+    }
+    return out;
+  }
+
+  /* The eight 16-bit pieces of an IPv6 literal, or null for anything that is not one: zero or more
+     hex groups, at most one '::' standing for as many zero groups as are missing, and -- in the
+     last two pieces -- an IPv4 address in dotted decimal, which is what '[::ffff:1.2.3.4]' is. */
+  function ipv6PiecesOf(text) {
+    var pieces = [0, 0, 0, 0, 0, 0, 0, 0];
+    var pieceIndex = 0;
+    var compress = null;
+    var at = 0;
+    if (text.charAt(at) === ':') {
+      if (text.charAt(at + 1) !== ':') return null;
+      at += 2;
+      pieceIndex += 1;
+      compress = pieceIndex;
+    }
+    while (at < text.length) {
+      if (pieceIndex === 8) return null;
+      if (text.charAt(at) === ':') {
+        if (compress !== null) return null;
+        at += 1;
+        pieceIndex += 1;
+        compress = pieceIndex;
+        continue;
+      }
+      var value = 0;
+      var length = 0;
+      while (length < 4 && at < text.length && HEX_DIGIT.test(text.charAt(at))) {
+        value = value * 16 + parseInt(text.charAt(at), 16);
+        at += 1;
+        length += 1;
+      }
+      if (text.charAt(at) === '.') {
+        if (length === 0) return null;
+        at -= length;
+        if (pieceIndex > 6) return null;
+        var seen = 0;
+        while (at < text.length) {
+          var byteValue = null;
+          if (seen > 0) {
+            if (text.charAt(at) === '.' && seen < 4) at += 1;
+            else return null;
+          }
+          if (text.charAt(at) < '0' || text.charAt(at) > '9') return null;
+          while (at < text.length && text.charAt(at) >= '0' && text.charAt(at) <= '9') {
+            var digit = text.charCodeAt(at) - 48;
+            if (byteValue === null) byteValue = digit;
+            else if (byteValue === 0) return null;
+            else byteValue = byteValue * 10 + digit;
+            if (byteValue > 255) return null;
+            at += 1;
+          }
+          pieces[pieceIndex] = pieces[pieceIndex] * 0x100 + byteValue;
+          seen += 1;
+          if (seen === 2 || seen === 4) pieceIndex += 1;
+        }
+        if (seen !== 4) return null;
+        break;
+      }
+      if (text.charAt(at) === ':') {
+        at += 1;
+        if (at >= text.length) return null;
+      } else if (at < text.length) {
+        /* a byte that is neither a hex digit nor a colon nor the end: a zone id, say */
+        return null;
+      }
+      pieces[pieceIndex] = value;
+      pieceIndex += 1;
+    }
+    if (compress !== null) {
+      /* the groups '::' stands for are the ones that were never written: the pieces after it move
+         to the end of the address, and zeros take their place */
+      var swaps = pieceIndex - compress;
+      pieceIndex = 7;
+      while (pieceIndex !== 0 && swaps > 0) {
+        var held = pieces[compress + swaps - 1];
+        pieces[compress + swaps - 1] = pieces[pieceIndex];
+        pieces[pieceIndex] = held;
+        pieceIndex -= 1;
+        swaps -= 1;
+      }
+    } else if (pieceIndex !== 8) {
+      return null;
+    }
+    return pieces;
+  }
+
+  /* The shortest spelling of an address: the longest run of zero groups -- the first one, where two
+     are the same length -- is written as '::', and one group on its own is not compressed at all. */
+  function ipv6TextOf(pieces) {
+    var bestAt = -1;
+    var bestLen = 0;
+    var runAt = -1;
+    var runLen = 0;
+    for (var i = 0; i <= 8; i++) {
+      if (i < 8 && pieces[i] === 0) {
+        if (runAt < 0) { runAt = i; runLen = 0; }
+        runLen += 1;
+        if (runLen > bestLen) { bestLen = runLen; bestAt = runAt; }
+      } else {
+        runAt = -1;
+        runLen = 0;
+      }
+    }
+    if (bestLen <= 1) bestAt = -1;
+    var out = '';
+    var at = 0;
+    while (at < 8) {
+      if (at === bestAt) {
+        out += at === 0 ? '::' : ':';
+        at += bestLen;
+        continue;
+      }
+      out += pieces[at].toString(16);
+      if (at < 7) out += ':';
+      at += 1;
+    }
+    return out;
+  }
+
+  /*
+   * A host written with no port beside it -- the host of a URL being parsed, or one assigned to
+   * hostname. The same three readings as anywhere else: an IPv6 literal in brackets, a domain that
+   * ends in a number, or a domain. null for anything that is no host at all, which is what makes an
+   * assignment of one leave the URL as it was rather than write a host that cannot be parsed.
+   */
+  function hostNameOf(hostText, protocol, special) {
+    if (hostText.charAt(0) === '[') {
+      if (hostText.charAt(hostText.length - 1) !== ']') return null;
+      var pieces = ipv6PiecesOf(hostText.slice(1, hostText.length - 1));
+      return pieces === null ? null : '[' + ipv6TextOf(pieces) + ']';
+    }
+    if (forbiddenIn(hostText)) return null;
+    /* file: 'localhost' names no host at all, as it names none in Node */
+    if (protocol === 'file:' && hostText.toLowerCase() === 'localhost') return '';
+    /* an escape in a host is decoded, so 'h%41' is the host 'ha' */
+    var host = percentDecode(hostText).toLowerCase();
+    if (special && host !== '' && endsInANumber(host)) {
+      var address = ipv4AddressOf(host);
+      return address === null ? null : ipv4TextOf(address);
+    }
+    return host;
+  }
+
+  function specialScheme(protocol) {
+    return Object.prototype.hasOwnProperty.call(DEFAULT_PORTS, protocol);
+  }
+
   function parseUrl(input, base, raw) {
     var text = cleaned(input);
     var scheme = SCHEME_RE.exec(text);
@@ -750,9 +1003,20 @@ function urlGlobalOf(nodeUrl) {
       text = referenceAgainst(base, text);
       scheme = SCHEME_RE.exec(text);
       if (scheme === null) throw invalidUrl(raw);
+    } else if (base !== null && base !== undefined &&
+               base.protocol === scheme[1].toLowerCase() + ':' &&
+               specialScheme(scheme[1].toLowerCase() + ':')) {
+      /*
+       * A reference that repeats the base's own special scheme -- 'http:h' against 'http://c/d' --
+       * is not read as the absolute URL it looks like: the scheme is dropped and what follows it is
+       * a relative reference, so the answer is 'http://c/h' and not 'http://h/'.
+       */
+      text = referenceAgainst(base, text.slice(scheme[0].length));
+      scheme = SCHEME_RE.exec(text);
+      if (scheme === null) throw invalidUrl(raw);
     }
     var protocol = scheme[1].toLowerCase() + ':';
-    var special = Object.prototype.hasOwnProperty.call(DEFAULT_PORTS, protocol);
+    var special = specialScheme(protocol);
     var rest = text.slice(scheme[0].length);
     var state = {
       protocol: protocol, username: '', password: '', hostname: '', port: '', pathname: '',
@@ -764,11 +1028,17 @@ function urlGlobalOf(nodeUrl) {
     var hasHost = false;
     if (special) {
       var slashes = 0;
+      var eaten = '';
       while (slashes < 2 && rest.length > 0 && (rest.charAt(0) === '/' || rest.charAt(0) === '\\')) {
+        eaten += rest.charAt(0);
         rest = rest.slice(1);
         slashes++;
       }
-      hasHost = true;
+      /* file: is the one special scheme with no authority unless both slashes were written:
+         'file:/a' is a path on no host, which Node writes as 'file:///a'. The one slash it did
+         write is a slash of that path, not of an authority, so it goes back. */
+      hasHost = protocol === 'file:' ? slashes === 2 : true;
+      if (!hasHost) rest = eaten.replace(/\\/g, '/') + rest;
     } else if (rest.slice(0, 2) === '//') {
       hasHost = true;
       rest = rest.slice(2);
@@ -787,23 +1057,28 @@ function urlGlobalOf(nodeUrl) {
         var userinfo = authority.slice(0, at);
         hostport = authority.slice(at + 1);
         var colon = userinfo.indexOf(':');
-        state.username = colon >= 0 ? userinfo.slice(0, colon) : userinfo;
-        state.password = colon >= 0 ? userinfo.slice(colon + 1) : '';
+        state.username = percentEncodeIn(colon >= 0 ? userinfo.slice(0, colon) : userinfo, USERINFO_EXTRA);
+        state.password = colon >= 0 ? percentEncodeIn(userinfo.slice(colon + 1), USERINFO_EXTRA) : '';
       }
       if (hostport.charAt(0) === '[') {
         /* an IPv6 literal is one host, brackets and all: the ':' inside it is not a port */
         var close = hostport.indexOf(']');
         if (close < 0) throw invalidUrl(raw);
-        state.hostname = '[' + hostport.slice(1, close).toLowerCase() + ']';
         var after = hostport.slice(close + 1);
         if (after !== '') {
           if (after.charAt(0) !== ':') throw invalidUrl(raw);
           state.port = portOf(after.slice(1), raw);
         }
+        var pieces = ipv6PiecesOf(hostport.slice(1, close));
+        if (pieces === null) throw invalidUrl(raw);
+        state.hostname = '[' + ipv6TextOf(pieces) + ']';
       } else {
         var portAt = hostport.indexOf(':');
-        state.hostname = (portAt >= 0 ? hostport.slice(0, portAt) : hostport).toLowerCase();
+        var hostText = portAt >= 0 ? hostport.slice(0, portAt) : hostport;
         if (portAt >= 0) state.port = portOf(hostport.slice(portAt + 1), raw);
+        var named = hostNameOf(hostText, protocol, special);
+        if (named === null) throw invalidUrl(raw);
+        state.hostname = named;
       }
       state.hasHost = true;
       /* a special scheme that names no host is no URL at all -- except file:, which has none */
@@ -811,9 +1086,15 @@ function urlGlobalOf(nodeUrl) {
       if (state.port !== '' && DEFAULT_PORTS[protocol] === state.port) state.port = '';
     }
     var hashAt = rest.indexOf('#');
-    if (hashAt >= 0) { state.hash = rest.slice(hashAt + 1); rest = rest.slice(0, hashAt); }
+    if (hashAt >= 0) {
+      state.hash = percentEncodeIn(rest.slice(hashAt + 1), FRAGMENT_EXTRA);
+      rest = rest.slice(0, hashAt);
+    }
     var queryAt = rest.indexOf('?');
-    if (queryAt >= 0) { state.query = rest.slice(queryAt + 1); rest = rest.slice(0, queryAt); }
+    if (queryAt >= 0) {
+      state.query = percentEncodeIn(rest.slice(queryAt + 1), special ? QUERY_SPECIAL_EXTRA : QUERY_EXTRA);
+      rest = rest.slice(0, queryAt);
+    }
     var path = special ? rest.replace(/\\/g, '/') : rest;
     if (path === '') path = special ? '/' : '';
     else if (hasHost && path.charAt(0) !== '/') path = '/' + path;
@@ -847,18 +1128,39 @@ function urlGlobalOf(nodeUrl) {
   field('protocol', function () {
     return STATE.get(this).protocol;
   }, function (value) {
+    var state = STATE.get(this);
     var text = String(value);
-    STATE.get(this).protocol = (text.charAt(text.length - 1) === ':' ? text : text + ':').toLowerCase();
+    var next = (text.charAt(text.length - 1) === ':' ? text : text + ':').toLowerCase();
+    if (!SCHEME_RE.test(next)) return;
+    /*
+     * WHATWG: a scheme the parser will not write leaves the URL as it stands. A special URL may not
+     * become one that is not, nor one that is not become a special one -- which is why 'javascript:'
+     * on an http: URL changes nothing at all -- a URL carrying credentials or a port may not become
+     * a file: one, and a file: URL with no host may not become anything else.
+     */
+    if (specialScheme(state.protocol) !== specialScheme(next)) return;
+    if (next === 'file:' && (state.username !== '' || state.password !== '' || state.port !== '')) return;
+    if (state.protocol === 'file:' && state.hostname === '') return;
+    state.protocol = next;
+    /* the port the old scheme kept is the new scheme's own default for one URL in a thousand, and
+       a default port is no port: https://h:80/ written to http: is http://h/ */
+    if (state.port !== '' && DEFAULT_PORTS[next] === state.port) state.port = '';
   });
   field('username', function () {
     return STATE.get(this).username;
-  }, function (value) { STATE.get(this).username = String(value); });
+  }, function (value) { STATE.get(this).username = percentEncodeIn(String(value), USERINFO_EXTRA); });
   field('password', function () {
     return STATE.get(this).password;
-  }, function (value) { STATE.get(this).password = String(value); });
+  }, function (value) { STATE.get(this).password = percentEncodeIn(String(value), USERINFO_EXTRA); });
   field('hostname', function () {
     return STATE.get(this).hostname;
-  }, function (value) { STATE.get(this).hostname = String(value).toLowerCase(); });
+  }, function (value) {
+    var state = STATE.get(this);
+    var named = hostNameOf(String(value), state.protocol, specialScheme(state.protocol));
+    /* a value that is no host leaves the URL as it stands, as it does in Node */
+    if (named === null) return;
+    state.hostname = named;
+  });
   /* WHATWG: a port that is the scheme's own is not a port at all, so writing it leaves the port
      empty -- http://h/ with port 80 written is still http://h/. */
   function assignedPort(state, text, raw) {
@@ -900,7 +1202,10 @@ function urlGlobalOf(nodeUrl) {
   }, function (value) {
     var state = STATE.get(this);
     var text = String(value);
-    state.query = text === '' ? null : (text.charAt(0) === '?' ? text.slice(1) : text);
+    state.query = text === ''
+      ? null
+      : percentEncodeIn(text.charAt(0) === '?' ? text.slice(1) : text,
+        specialScheme(state.protocol) ? QUERY_SPECIAL_EXTRA : QUERY_EXTRA);
     state.dirty = false;
     state.sp = undefined;
   });
@@ -910,7 +1215,9 @@ function urlGlobalOf(nodeUrl) {
   }, function (value) {
     var state = STATE.get(this);
     var text = String(value);
-    state.hash = text === '' ? null : (text.charAt(0) === '#' ? text.slice(1) : text);
+    state.hash = text === ''
+      ? null
+      : percentEncodeIn(text.charAt(0) === '#' ? text.slice(1) : text, FRAGMENT_EXTRA);
   });
   /* WHATWG: only a scheme with a host of its own has an origin -- an opaque host, and file:, have
      the opaque origin 'null' -- except blob:, whose origin is the origin of the URL in its path. */
