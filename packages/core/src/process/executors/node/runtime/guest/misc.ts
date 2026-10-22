@@ -609,7 +609,41 @@ BF.url = function () {
   }
 
   function pathToFileURL(p) {
-    return new URL('file://' + encodeURI(P.resolve(String(p))));
+    var text = String(p);
+    var sep = P.sep || '/';
+    var resolved = P.resolve(text);
+    /*
+     * resolve drops the slash a path ended on, and that slash is what said the path was a
+     * directory, so it is put back: '/a/' is the URL 'file:///a/' and not 'file:///a'.
+     */
+    if (text.charAt(text.length - 1) === sep && resolved.charAt(resolved.length - 1) !== sep) resolved += sep;
+    /*
+     * A path is written into the URL component by component, so a '#' and a '?' of its own are
+     * escaped: both end a URL's path and start its fragment or query, so '/a#b' is the file
+     * '/a#b' and not the file '/a' carrying the fragment '#b'. encodeURI does the rest -- a space
+     * is '%20' and 'ü' is '%C3%BC'.
+     */
+    return new URL('file://' + encodeURI(resolved).replace(/#/g, '%23').replace(/\?/g, '%3F'));
+  }
+
+  /* the options an http.request takes, read off a URL: the parts as Node words them, with a port
+     only where one was written and an auth only where a userinfo was */
+  function urlToHttpOptions(u) {
+    var parsed = u instanceof URL ? u : new URL(String(u && typeof u === 'object' ? u.href : u));
+    var options = {
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      hash: parsed.hash,
+      search: parsed.search,
+      pathname: parsed.pathname,
+      path: parsed.pathname + parsed.search,
+      href: parsed.href
+    };
+    if (parsed.port !== '') options.port = Number(parsed.port);
+    if (parsed.username !== '' || parsed.password !== '') {
+      options.auth = parsed.username + (parsed.password !== '' ? ':' + parsed.password : '');
+    }
+    return options;
   }
 
   /* legacy url.parse: the fields of the WHATWG parse, in the legacy Url shape (null where Node uses null) */
@@ -679,6 +713,7 @@ BF.url = function () {
     domainToUnicode: domainToUnicode,
     fileURLToPath: fileURLToPath,
     pathToFileURL: pathToFileURL,
+    urlToHttpOptions: urlToHttpOptions,
     parse: parse,
     resolve: resolveUrl,
     format: formatUrl

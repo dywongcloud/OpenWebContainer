@@ -832,11 +832,14 @@ Current focus areas:
 - [ ] WebSocket support
 
 Future plans:
-- [ ] URL: IPv4/IPv6 host normalisation -- `new URL('http://0x7f.1/').hostname` is `0x7f.1`, host Node gives `127.0.0.1` (row owc-url-host-ipv4-ipv6-normalisation)
-- [ ] URL percent-encoding -- `u.hash = '#a b'` leaves a raw space and `new URL('http://h/ü').href` keeps `ü` (row owc-url-percent-encoding)
-- [ ] URL forbidden host code points -- `new URL('http://a b/')` is accepted where host Node throws (row owc-url-forbidden-host-code-points)
-- [ ] URL file: scheme -- `new URL('file:/a').href` is `file://a/` where host Node gives `file:///a` (row owc-url-file-scheme-host)
-- [ ] url module legacy API -- `require('url').domainToASCII` is absent and `url.parse(...).href` writes a stray `=` before the fragment (row owc-url-module-legacy-api)
+- [x] URL: IPv4/IPv6 host normalisation -- `new URL('http://0x7f.1/').hostname` is `127.0.0.1`, as in host Node, and so is `[::ffff:1.2.3.4]`, `[::1]:8080` and `0x7f.1` written to `u.host` (row owc-url-host-ipv4-ipv6-normalisation)
+- [ ] URL percent-encoding -- legacy `url.parse('http://h/a b').pathname` is `/a b`, where host Node escapes the space and gives `/a%20b`; `new URLSearchParams('a=%E9').get('a')` is `%E9` where host gives the replacement character (row owc-url-percent-encoding)
+- [x] URL forbidden host code points -- `new URL('http://a b/')` throws, and so do `http://a%00b/` and `http://a%20b/`, whose forbidden byte only appears once the escapes are decoded (row owc-url-forbidden-host-code-points)
+- [x] URL file: scheme -- `new URL('file:/a').href` is `file:///a`, as in host Node, and `file://localhost/a` is `file:///a` there too (row owc-url-file-scheme-host)
+- [ ] url module legacy API -- `url.Url` is the WHATWG class, so `url.parse('http://h/') instanceof url.Url` is `false` and `new url.Url()` throws, where host Node answers `true` and an empty `Url`; `url.format({ protocol: 'http:', pathname: 'a' })` is `http://a` where host writes `http:a` (row owc-url-module-legacy-api)
+- [ ] URL IDNA is `toLowerCase` + NFC and not UTS-46 -- `url.domainToASCII('ﬁ.de')` is `xn--jm6c.de`, where host Node maps the ligature first and gives `fi.de`; a code point UTS-46 ignores (`­`, `​`), maps (`。` for `.`) or disallows is punycoded instead (row owc-url-idn-host-not-punycoded)
+- [ ] legacy `url.parse` of a relative reference -- `url.parse('//h/x').pathname` is `/x` where host Node gives `//h/x`, `url.parse('h').href` is `/h` where host gives `h`, and `url.resolve('a', 'b')` is `/b` where host gives `b` (row owc-url-legacy-parse-old-parser)
+- [ ] `url.domainToUnicode` and `domainToASCII` off the ends -- `url.domainToUnicode('XN--BCHER-KVA.de')` is `BüCHER.de` where host Node case-folds and gives `bücher.de`; `url.domainToASCII(123)` is `123` where host gives `0.0.0.123`, and `url.domainToUnicode('xn--zzz-')` is `zzz` where host gives `''` (row owc-url-domain-unicode-edges)
 - [ ] Builtin module namespace surface -- far wider than `node:fs`: against host Node the namespaces of 20 of 26 builtins are short (`node:constants` 56 against 231, `node:process` 36 against 83, `node:crypto` 30 against 70, `node:util` 22 against 35), `node:util` adds 5 names host Node lacks, and `node:stream/consumers` and `node:assert/strict` do not resolve at all (row owc-esm-builtin-namespace-surface)
 - [x] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
 - [ ] `cmd 3>f >&3` -- a descriptor the command itself opened is not visible to its own later `>&n` (row owc-shell-fd-opened-by-command-visible-to-itself)

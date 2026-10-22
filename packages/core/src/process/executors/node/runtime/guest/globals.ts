@@ -993,18 +993,24 @@ function urlGlobalOf(nodeUrl) {
       var pieces = ipv6PiecesOf(hostText.slice(1, hostText.length - 1));
       return pieces === null ? null : '[' + ipv6TextOf(pieces) + ']';
     }
-    if (forbiddenIn(hostText)) return null;
     /* file: 'localhost' names no host at all, as it names none in Node */
     if (protocol === 'file:' && hostText.toLowerCase() === 'localhost') return '';
     /*
      * An opaque host -- the host of a scheme that is not special -- is not a domain: it keeps the
      * case it was written in and an escape it carries is left alone, and a byte that is not ASCII
      * is percent-encoded rather than punycoded. 'foo://ABC' is the host 'ABC',
-     * 'foo://exämple' the host 'ex%C3%A4mple' and 'foo://a%20b' the host 'a%20b'.
+     * 'foo://exämple' the host 'ex%C3%A4mple' and 'foo://a%20b' the host 'a%20b'. An opaque host is
+     * never decoded, so it is refused for a byte it carries exactly as it was written.
      */
-    if (!special) return encodeOpaqueHost(hostText);
+    if (!special) return forbiddenIn(hostText) ? null : encodeOpaqueHost(hostText);
     /* an escape in a host is decoded, so 'h%41' is the host 'ha' */
     var host = percentDecode(hostText).toLowerCase();
+    /*
+     * A byte no host may hold is read after the escapes are decoded, which is why
+     * 'http://a%00b/' and 'http://a%20b/' are no URL at all: what the host holds is a NUL and a
+     * space, and both are forbidden, though '%00' and '%20' as written carry neither.
+     */
+    if (forbiddenIn(host)) return null;
     if (special && host !== '' && endsInANumber(host)) {
       var address = ipv4AddressOf(host);
       return address === null ? null : ipv4TextOf(address);
@@ -1024,6 +1030,12 @@ function urlGlobalOf(nodeUrl) {
 
   function specialScheme(protocol) {
     return Object.prototype.hasOwnProperty.call(DEFAULT_PORTS, protocol);
+  }
+
+  /* Whether a URL of this scheme may hold no host: only file: may among the special schemes, and
+     every scheme that is not special may, so 'foo:///a' is a URL and 'http:///a' is not. */
+  function refusesEmptyHost(state) {
+    return specialScheme(state.protocol) && state.protocol !== 'file:';
   }
 
   function parseUrl(input, base, raw) {
@@ -1192,6 +1204,9 @@ function urlGlobalOf(nodeUrl) {
     var named = hostNameOf(String(value), state.protocol, specialScheme(state.protocol));
     /* a value that is no host leaves the URL as it stands, as it does in Node */
     if (named === null) return;
+    /* so does no host at all, for every scheme but file: and the schemes that are not special:
+       'http://h/a' with an empty hostname written is still 'http://h/a' */
+    if (named === '' && refusesEmptyHost(state)) return;
     state.hostname = named;
   });
   /* WHATWG: a port that is the scheme's own is not a port at all, so writing it leaves the port
@@ -1214,9 +1229,28 @@ function urlGlobalOf(nodeUrl) {
   }, function (value) {
     var state = STATE.get(this);
     var text = String(value);
-    var at = text.indexOf(':');
-    state.hostname = (at >= 0 ? text.slice(0, at) : text).toLowerCase();
-    state.port = at >= 0 ? assignedPort(state, text.slice(at + 1), text) : '';
+    /*
+     * The port is what follows the last ':' outside a bracketed IPv6 literal -- '[::1]:8080' is one
+     * host with the port 8080 behind it, and reading the first ':' instead would take '[' for the
+     * host and ':1]:8080' for the port.
+     */
+    var at = text.lastIndexOf(':');
+    if (text.charAt(0) === '[') {
+      var close = text.indexOf(']');
+      at = close >= 0 ? text.indexOf(':', close) : -1;
+    }
+    var hostText = at >= 0 ? text.slice(0, at) : text;
+    var portText = at >= 0 ? text.slice(at + 1) : '';
+    /* a host is read as the parser reads one: IDNA, IPv4, IPv6 and the forbidden bytes and all */
+    var named = hostNameOf(hostText, state.protocol, specialScheme(state.protocol));
+    /* a host that will not parse -- or, for every scheme but file: and the ones that are not
+       special, no host at all -- leaves the URL as it stands, as it does in Node */
+    if (named === null || (named === '' && refusesEmptyHost(state))) return;
+    var port;
+    /* a port that is no port leaves the whole assignment alone, 'h:abc' included */
+    try { port = assignedPort(state, portText, text); } catch (badPort) { return; }
+    state.hostname = named;
+    state.port = port;
   });
   field('pathname', function () {
     return STATE.get(this).pathname;
@@ -1576,7 +1610,7 @@ globalThis.crypto = nodeCrypto.webcrypto;
    */
   globalThis.CloseEvent = (function () {
     var CLOSE = new WeakMap();
-    function CloseEvent(type, init) {
+    function CloseEvent(type, init = {}) {
       if (arguments.length < 1) throw new TypeError('CloseEvent constructor: 1 argument required, but 0 found.');
       init = init || {};
       /*
@@ -1605,9 +1639,6 @@ globalThis.crypto = nodeCrypto.webcrypto;
     ['wasClean', 'code', 'reason'].forEach(function (name) {
       Object.defineProperty(CloseEvent.prototype, name, {
         get: function () { return CLOSE.get(this)[name]; },
-        set: function () {
-          throw new TypeError('Cannot set property ' + name + ' of #<_CloseEvent> which has only a getter');
-        },
         enumerable: true,
         configurable: true
       });
