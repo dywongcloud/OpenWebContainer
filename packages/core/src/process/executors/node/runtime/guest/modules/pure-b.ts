@@ -606,7 +606,11 @@ export const SRC = String.raw`
       setActive(stack.length === 0 ? undefined : stack[stack.length - 1]);
     };
 
-    // Synchronous throws are emitted as 'error' when the domain has listeners, else rethrown.
+    /*
+     * An error a bound callback throws with no caller left to receive it is what node's fatal
+     * exception path hands to the domain, so this is the shape the timer, tick and promise-reaction
+     * bindings call: the throw is emitted as 'error' when the domain has listeners, else rethrown.
+     */
     function invokeInDomain(self, fn, thisArg, args) {
       self.enter();
       var ret;
@@ -628,9 +632,23 @@ export const SRC = String.raw`
       return ret;
     }
 
+    /*
+     * run() is the one entry node leaves unguarded: it enters, calls and exits with no catch, so a
+     * synchronous throw propagates out of run() to the caller, and -- the exit not being in a
+     * finally -- leaves the domain entered, which is what node 24.15 does too. Emitting it as
+     * 'error' here was the divergence: node routes an error no caller catches, not one the caller
+     * of run() is standing right next to.
+     */
+    function runInDomain(self, fn, thisArg, args) {
+      self.enter();
+      var ret = fn.apply(thisArg, args);
+      self.exit();
+      return ret;
+    }
+
     Domain.prototype.run = function (fn) {
       installDomainPromiseHook();
-      return invokeInDomain(this, fn, this, Array.prototype.slice.call(arguments, 1));
+      return runInDomain(this, fn, this, Array.prototype.slice.call(arguments, 1));
     };
 
     Domain.prototype.bind = function (cb) {
