@@ -1077,14 +1077,36 @@ function wsCloseEvent(code, reason, clean, target) {
   return { type: 'close', code: code, reason: reason, wasClean: !!clean, target: target };
 }
 
-/* Node rejects a URL the way the platform does: a DOMException SyntaxError, not a SyntaxError. */
-function wsSyntax(message) {
+/*
+ * Node rejects the way the platform does: a DOMException, with the name a handler switches on and
+ * the legacy code that goes with it (12 SyntaxError, 11 InvalidStateError, 15 InvalidAccessError),
+ * not a plain Error.
+ */
+function wsDomError(message, name) {
   if (globalThis.DOMException !== undefined) {
     try {
-      return new globalThis.DOMException(message, 'SyntaxError');
+      return new globalThis.DOMException(message, name);
     } catch (badException) { /* no DOMException that takes a name: fall through */ }
   }
-  return new SyntaxError(message);
+  var err = new Error(message);
+  err.name = name;
+  return err;
+}
+
+/* Node rejects a URL the way the platform does: a DOMException SyntaxError, not a SyntaxError. */
+function wsSyntax(message) {
+  return wsDomError(message, 'SyntaxError');
+}
+
+/*
+ * The close code, as the platform reads it: an unsigned short, so a fraction is truncated rather
+ * than refused -- 1000.5 closes with 1000 -- and a value that is not a number at all lands on 0.
+ */
+function wsCloseCodeOf(value) {
+  var num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  num = Math.trunc(num) % 65536;
+  return num < 0 ? num + 65536 : num;
 }
 
 /*
@@ -1219,11 +1241,13 @@ WebSocket.prototype.dispatchEvent = function dispatchEvent(event) {
 };
 
 WebSocket.prototype.send = function send(data) {
-  if (this.readyState !== WS_OPEN) {
-    var closed = new Error('WebSocket is not open: readyState ' + this.readyState);
-    closed.code = 'ERR_INVALID_STATE';
-    throw closed;
-  }
+  /*
+   * Before the handshake has finished there is no socket to write to, and Node says so with a
+   * DOMException InvalidStateError rather than a state message of its own. Once the socket is
+   * closing or closed a send is dropped on the floor: no throw, nothing written, no return value.
+   */
+  if (this.readyState === WS_CONNECTING) throw wsDomError('Sent before connected.', 'InvalidStateError');
+  if (this.readyState !== WS_OPEN) return;
   var payload;
   var opcode;
   if (typeof data === 'string') {
@@ -1243,23 +1267,25 @@ WebSocket.prototype.send = function send(data) {
     opcode = 0x1;
   }
   this.bufferedAmount += payload.length;
-  var sent = wsSendFrame(this, opcode, payload);
+  wsSendFrame(this, opcode, payload);
   this.bufferedAmount = 0;
-  return sent;
 };
 
 WebSocket.prototype.close = function close(code, reason) {
   if (this.readyState === WS_CLOSED || this.readyState === WS_CLOSING) return;
-  var num = code === undefined || code === null ? 1000 : Number(code);
-  if (num !== 1000 && (num < 3000 || num > 4999)) {
-    var bad = new Error('The close code must be either 1000 or in the range 3000 to 4999. Received ' + String(code));
-    bad.code = 'ERR_OUT_OF_RANGE';
-    throw bad;
-  }
+  var num = code === undefined ? 1000 : wsCloseCodeOf(code);
+  /*
+   * The code is validated before the reason: a close carrying both an invalid code and an over-long
+   * reason is an invalid code, which is the order Node checks them in.
+   */
+  if (num !== 1000 && (num < 3000 || num > 4999)) throw wsDomError('invalid code', 'InvalidAccessError');
+  var text = reason === undefined ? '' : String(reason);
+  var bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes > 123) throw wsDomError('Reason must be less than 123 bytes; received ' + bytes, 'SyntaxError');
   this._closeCode = num;
-  this._closeReason = typeof reason === 'string' ? reason : '';
+  this._closeReason = text;
   this.readyState = WS_CLOSING;
-  wsSendFrame(this, 0x8, wsCloseBody(num, this._closeReason));
+  wsSendFrame(this, 0x8, wsCloseBody(num, text));
 };
 
 WebSocket.CONNECTING = WS_CONNECTING;
