@@ -27,12 +27,14 @@ export class NodeProcessExecutor implements ProcessExecutor {
                a `-p` or a REPL, left to the guest exactly as it was. */
             const command = nodeCommand(payload.args);
             /* What the line asked for besides what it runs: the options `process.execArgv` reports,
-               the bound `--stack-trace-limit` put on a trace, and the source as it was written. */
+               the bound `--stack-trace-limit` put on a trace, the title `process.title` reads, and
+               the source as it was written. */
             const run: NodeRunOptions = {
                 execArgv: command.execArgv,
                 ...(command.stackTraceLimit === undefined ? {} : { stackTraceLimit: command.stackTraceLimit }),
                 ...(command.evalScript === undefined ? {} : { evalScript: command.evalScript }),
-                ...(command.inputType === undefined ? {} : { inputType: command.inputType })
+                ...(command.inputType === undefined ? {} : { inputType: command.inputType }),
+                ...(command.title === undefined ? {} : { title: command.title })
             };
             return new NodeProcess(
                 pid,
