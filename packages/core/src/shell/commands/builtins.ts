@@ -669,9 +669,18 @@ function arrayElements(state: ShellState, name: string): string[] {
  * 3. Arithmetic
  * ================================================================== */
 
-class ArithError extends Error {}
+/**
+ * An expression that will not evaluate. `token` is the text a host points at with `(error token is
+ * "...")` -- `x=$((1+))` points at the `+` that has no operand behind it -- and it is left out where
+ * a host names none.
+ */
+class ArithError extends Error {
+    constructor(message: string, readonly token?: string) {
+        super(message);
+    }
+}
 
-type ArithToken = { t: 'num'; v: number } | { t: 'name'; v: string } | { t: 'op'; v: string };
+type ArithToken = { t: 'num'; v: number; at: number } | { t: 'name'; v: string; at: number } | { t: 'op'; v: string; at: number };
 
 function arithLex(text: string): ArithToken[] {
     const tokens: ArithToken[] = [];
@@ -687,12 +696,12 @@ function arithLex(text: string): ArithToken[] {
             if (ch === '0' && (text[i + 1] === 'x' || text[i + 1] === 'X')) {
                 j = i + 2;
                 while (j < text.length && /[0-9a-fA-F]/.test(text[j])) j++;
-                tokens.push({ t: 'num', v: Number.parseInt(text.slice(i + 2, j), 16) });
+                tokens.push({ t: 'num', v: Number.parseInt(text.slice(i + 2, j), 16), at: i });
             } else {
                 while (j < text.length && /[0-9]/.test(text[j])) j++;
                 const digits = text.slice(i, j);
                 const value = digits.length > 1 && digits.startsWith('0') ? Number.parseInt(digits, 8) : Number.parseInt(digits, 10);
-                tokens.push({ t: 'num', v: Number.isNaN(value) ? 0 : value });
+                tokens.push({ t: 'num', v: Number.isNaN(value) ? 0 : value, at: i });
             }
             i = j;
             continue;
@@ -700,35 +709,53 @@ function arithLex(text: string): ArithToken[] {
         if (/[A-Za-z_]/.test(ch)) {
             let j = i;
             while (j < text.length && /[A-Za-z0-9_]/.test(text[j])) j++;
-            tokens.push({ t: 'name', v: text.slice(i, j) });
+            tokens.push({ t: 'name', v: text.slice(i, j), at: i });
             i = j;
             continue;
         }
         const three = text.slice(i, i + 3);
         if (three === '<<=' || three === '>>=') {
-            tokens.push({ t: 'op', v: three });
+            tokens.push({ t: 'op', v: three, at: i });
             i += 3;
             continue;
         }
         const two = text.slice(i, i + 2);
         if (['**', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||', '++', '--', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^='].includes(two)) {
-            tokens.push({ t: 'op', v: two });
+            tokens.push({ t: 'op', v: two, at: i });
             i += 2;
             continue;
         }
         if ('+-*/%<>&^|?!~,=()'.includes(ch)) {
-            tokens.push({ t: 'op', v: ch });
+            tokens.push({ t: 'op', v: ch, at: i });
             i++;
             continue;
         }
-        throw new ArithError(`syntax error: invalid arithmetic operator (error token is "${text.slice(i)}")`);
+        throw new ArithError('syntax error: invalid arithmetic operator', text.slice(i));
     }
     return tokens;
 }
 
 class ArithParser {
     private pos = 0;
-    constructor(private readonly tokens: ArithToken[], private readonly state: ShellState) {}
+    /** Where the operator last eaten ends, so an operand that is not there can be named. */
+    private lastEnd = -1;
+    constructor(private readonly tokens: ArithToken[], private readonly state: ShellState, private readonly text: string) { }
+
+    /** The text of the expression from `at` on, as a host quotes it in `(error token is "...")`. */
+    private from(at: number): string {
+        return this.text.slice(at);
+    }
+
+    /**
+     * What a host points at when the operand behind an operator is missing: the text standing where
+     * the operand should -- `$(( 1 + ))` points at the space behind the `+` -- and the operator's
+     * own last character when nothing stands there, which is what `$((1+))` and `$((++))` point at.
+     */
+    private operandToken(): string {
+        if (this.lastEnd < 0) return '';
+        const rest = this.text.slice(this.lastEnd);
+        return rest === '' ? this.text.slice(this.lastEnd - 1) : rest;
+    }
 
     private peek(): ArithToken | undefined {
         return this.tokens[this.pos];
@@ -742,6 +769,7 @@ class ArithParser {
         const token = this.peek();
         if (token && token.t === 'op' && token.v === value) {
             this.pos++;
+            this.lastEnd = token.at + token.v.length;
             return true;
         }
         return false;
@@ -749,7 +777,9 @@ class ArithParser {
 
     parse(): number {
         const value = this.comma();
-        if (this.pos < this.tokens.length) throw new ArithError('syntax error in arithmetic expression');
+        /* Nothing behind the value: `1 2` is two where one expression was, and a host says so as
+           `syntax error in expression` and points at the second of them. */
+        if (this.pos < this.tokens.length) throw new ArithError('syntax error in expression', this.from(this.tokens[this.pos].at));
         return value;
     }
 
@@ -816,8 +846,9 @@ class ArithParser {
     private ternary(): number {
         const condition = this.logicalOr();
         if (this.eatOp('?')) {
+            const at = this.tokens[this.pos]?.at ?? this.text.length;
             const whenTrue = this.comma();
-            if (!this.eatOp(':')) throw new ArithError('syntax error: `:` expected');
+            if (!this.eatOp(':')) throw new ArithError("`:' expected for conditional expression", this.from(at));
             const whenFalse = this.comma();
             return condition !== 0 ? whenTrue : whenFalse;
         }
@@ -897,12 +928,14 @@ class ArithParser {
         for (;;) {
             if (this.eatOp('*')) left = left * this.power();
             else if (this.eatOp('/')) {
+                const at = this.tokens[this.pos]?.at ?? this.text.length;
                 const right = this.power();
-                if (right === 0) throw new ArithError('division by 0');
+                if (right === 0) throw new ArithError('division by 0', this.from(at));
                 left = Math.trunc(left / right);
             } else if (this.eatOp('%')) {
+                const at = this.tokens[this.pos]?.at ?? this.text.length;
                 const right = this.power();
-                if (right === 0) throw new ArithError('division by 0');
+                if (right === 0) throw new ArithError('division by 0', this.from(at));
                 left = left % right;
             } else return left;
         }
@@ -926,7 +959,7 @@ class ArithParser {
         if (this.eatOp('++') || this.eatOp('--')) {
             const op = this.tokens[this.pos - 1].v;
             const token = this.next();
-            if (!token || token.t !== 'name') throw new ArithError('syntax error: operand expected');
+            if (!token || token.t !== 'name') throw new ArithError('syntax error: operand expected', this.operandToken());
             const value = arithValueOf(this.state, token.v) + (op === '++' ? 1 : -1);
             setVar(this.state, token.v, String(value));
             return value;
@@ -936,8 +969,21 @@ class ArithParser {
 
     private postfix(): number {
         const token = this.next();
-        if (!token) throw new ArithError('syntax error: operand expected');
-        if (token.t === 'num') return token.v;
+        /* No operand at all: the operator behind it is the one that has none, and a host names that
+           -- `x=$((1+))` points at the `+`. */
+        if (!token) throw new ArithError('syntax error: operand expected', this.operandToken());
+        if (token.t === 'num') {
+            /* A number is nothing `++` or `--` can stand behind, and with nothing behind the
+               operator either a host names the operator as the one whose operand is missing --
+               `$((1 ++ ))` is `operand expected (error token is " ")`. */
+            const inc = this.peek();
+            if (inc !== undefined && inc.t === 'op' && (inc.v === '++' || inc.v === '--') && this.tokens[this.pos + 1] === undefined) {
+                this.pos++;
+                this.lastEnd = inc.at + inc.v.length;
+                throw new ArithError('syntax error: operand expected', this.operandToken());
+            }
+            return token.v;
+        }
         if (token.t === 'name') {
             const here = this.pos;
             if (this.eatOp('++') || this.eatOp('--')) {
@@ -950,10 +996,12 @@ class ArithParser {
         }
         if (token.t === 'op' && token.v === '(') {
             const value = this.comma();
-            if (!this.eatOp(')')) throw new ArithError('syntax error: `)` expected');
+            if (!this.eatOp(')')) throw new ArithError('syntax error: `)` expected', this.from(token.at));
             return value;
         }
-        throw new ArithError(`syntax error: operand expected (error token is "${token.v}")`);
+        /* An operator where an operand belongs: a host points at the expression from it on, so
+           `$((1+*2))` points at `*2` and not at the `*` alone. */
+        throw new ArithError('syntax error: operand expected', this.from(token.at));
     }
 }
 
@@ -972,7 +1020,22 @@ function arithValueOf(state: ShellState, name: string): number {
 
 /** Evaluates `$(( ))`, `let` and `(( ))` arithmetic. Throws `ArithError` on a bad expression. */
 export function evalArith(state: ShellState, expression: string): number {
-    return new ArithParser(arithLex(expression), state).parse();
+    return new ArithParser(arithLex(expression), state, expression).parse();
+}
+
+/**
+ * An arithmetic error the way a host writes it: the shell's name, the expression, the reason, and
+ * the text it points at -- `/bin/sh: 1+: syntax error: operand expected (error token is "+")`.
+ * `label` is the word a host puts in front of the expression when one was named with it, as `let`
+ * is: `/bin/sh: let: x=1+: syntax error: operand expected (error token is "+")`.
+ */
+function arithDiagnostic(state: ShellState, expression: string, error: ArithError, label?: string): string {
+    /* The expression as a host prints it: the text between the `$(` and the `))`, with the white
+       space it opens with left out -- `$(( 1 + ))` is `1 + :` and not ` 1 + :`. */
+    const text = expression.replace(/^[ \t\n]+/, '');
+    const at = label === undefined ? '' : `${label}: `;
+    const token = error.token === undefined || error.token === '' ? '' : ` (error token is "${error.token}")`;
+    return `${state.shellName}: ${at}${text}: ${error.message}${token}`;
 }
 
 /* ================================================================== *
@@ -1768,6 +1831,41 @@ class Parser {
         return false;
     }
 
+    /**
+     * The token a host names where it wanted something else: the two-character operators first, then
+     * the one-character ones, then the whole word that stands there -- `for x in a; echo hi; done`
+     * names `echo`, not the `do` it wanted -- and `newline` where the line or the input ends, which
+     * is what a host prints for `echo a >`. Naming one never reads it: the position is put back.
+     */
+    private tokenHere(): string {
+        const two = this.src.slice(this.pos, this.pos + 2);
+        if (two === ';;' || two === '&&' || two === '||') return two;
+        const ch = this.here();
+        if (ch === '' || ch === '\n') return 'newline';
+        if (';&|()<>'.includes(ch)) return ch;
+        const save = this.pos;
+        let word: Word | null = null;
+        try {
+            word = this.readWord();
+        } catch {
+            word = null;
+        }
+        this.pos = save;
+        return word === null ? 'newline' : rawText(word);
+    }
+
+    /**
+     * The error for a word a construct needs and does not find -- `then`, `do` and `in`. A host
+     * names the token standing in its place: `for x in a; echo hi; done` is `unexpected token
+     * `echo'', and `for x in a; done` is `unexpected token `done''. With no token left to name it
+     * says the input ended, which is what `for x`, `while true` and `if true` are.
+     */
+    private expectedKeyword(): ShellSyntaxError {
+        const token = this.eof() ? 'newline' : this.tokenHere();
+        if (token === 'newline') return new ShellSyntaxError('syntax error: unexpected end of file');
+        return new ShellSyntaxError(`syntax error near unexpected token \`${token}'`);
+    }
+
     private parseList(terminators: string[]): Node[] {
         const nodes: Node[] = [];
         let pendingOp: '&&' | '||' | null = null;
@@ -1843,7 +1941,11 @@ class Parser {
         for (;;) {
             commands.push(this.parseCommand());
             this.skipSpace(false);
-            if (this.here() === '|' && this.src[this.pos + 1] !== '|' && this.src[this.pos + 1] !== undefined) {
+            /* A `|` at the very end of the input is still the operator it is: the command behind it
+               is the one that is missing, and a host says so by saying the input ended -- `echo |`
+               is `syntax error: unexpected end of file`, where stopping at the `|` and leaving it
+               for the caller named the `|` itself as the token it did not expect. */
+            if (this.here() === '|' && this.src[this.pos + 1] !== '|') {
                 this.pos++;
                 /* The body of a here-document stands on the line behind the one its `<<` is on, so
                    a line the pipeline continues onto is not the command it continues with until that
@@ -2019,7 +2121,12 @@ class Parser {
             sawCommandWord = true;
         }
         if (words.length === 0 && assigns.length === 0 && redirects.length === 0) {
-            throw new ShellSyntaxError("syntax error near unexpected token `newline'");
+            /* What stands where the command should is what a host names, and not the `newline` it
+               names only when a line or the input ends: `if; then` and `while; do echo; done` are
+               `unexpected token `;'', and a bare `|`, `&`, `;` and `)` name themselves. It is the
+               `;` a `{ cat <<EOF\na\nEOF\n; }` is closed on too -- that is a syntax error in a host
+               as well, and the token it names for it is `;`, not `newline`. */
+            throw new ShellSyntaxError(`syntax error near unexpected token \`${this.tokenHere()}'`);
         }
         return { t: 'simple', assigns, words, redirects };
     }
@@ -2076,7 +2183,7 @@ class Parser {
         for (;;) {
             const cond = this.parseList(['then']);
             this.skipSpace(true);
-            if (!this.keywordAt(this.pos, 'then')) throw new ShellSyntaxError("syntax error: `then' expected");
+            if (!this.keywordAt(this.pos, 'then')) throw this.expectedKeyword();
             this.pos += 4;
             const body = this.parseList(['elif', 'else', 'fi']);
             branches.push({ cond, body });
@@ -2113,7 +2220,7 @@ class Parser {
             return { t: 'forarith', expr, body: tail.body, redirects: tail.redirects };
         }
         const word = this.readWord();
-        if (!word) throw new ShellSyntaxError(`syntax error near unexpected token \`${this.here() === '' ? 'newline' : this.here()}'`);
+        if (!word) throw new ShellSyntaxError(`syntax error near unexpected token \`${this.tokenHere()}'`);
         const name = rawText(word);
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new ShellSyntaxError('syntax error: bad for loop variable');
         let words: Word[] | null = null;
@@ -2163,7 +2270,7 @@ class Parser {
     /** `do ... done` and the redirects that follow it: the tail every `for` ends with. */
     private parseForTail(): { body: Node[]; redirects: Redirect[] } {
         this.skipSpace(true);
-        if (!this.keywordAt(this.pos, 'do')) throw new ShellSyntaxError("syntax error: `do' expected");
+        if (!this.keywordAt(this.pos, 'do')) throw this.expectedKeyword();
         this.pos += 2;
         const body = this.parseList(['done']);
         this.skipSpace(true);
@@ -2177,7 +2284,7 @@ class Parser {
         this.pos += 5;
         const cond = this.parseList(['do']);
         this.skipSpace(true);
-        if (!this.keywordAt(this.pos, 'do')) throw new ShellSyntaxError("syntax error: `do' expected");
+        if (!this.keywordAt(this.pos, 'do')) throw this.expectedKeyword();
         this.pos += 2;
         const body = this.parseList(['done']);
         this.skipSpace(true);
@@ -2192,7 +2299,7 @@ class Parser {
         const word = this.readWord();
         if (!word) throw new ShellSyntaxError('syntax error: case word expected');
         this.skipSpace(true);
-        if (!this.keywordAt(this.pos, 'in')) throw new ShellSyntaxError("syntax error: `in' expected");
+        if (!this.keywordAt(this.pos, 'in')) throw this.expectedKeyword();
         this.pos += 2;
         const items: { patterns: Word[]; body: Node[] }[] = [];
         for (;;) {
@@ -2451,7 +2558,16 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             continue;
         }
         if (part.t === 'arith') {
-            const value = evalArith(state, expandToString(arithText(part.expr), state));
+            /* An expression that will not evaluate fails the line it stands on, with the status a
+               host gives it: `x=$((1+))` is `sh: 1+: syntax error: operand expected (error token is
+               "+")` and 127, where the message alone and a status of 1 left the line runnable. */
+            let value: number;
+            try {
+                value = evalArith(state, expandToString(arithText(part.expr), state));
+            } catch (error) {
+                if (error instanceof ArithError) throw new ArithFailure(`${arithDiagnostic(state, part.expr, error)}\n`, 127);
+                throw error;
+            }
             appendText(target, String(Math.trunc(value)), quoted);
             continue;
         }
@@ -2827,6 +2943,17 @@ function bindState(ctx: CommandContext, state: ShellState): CommandContext {
     return ctx;
 }
 
+/**
+ * An arithmetic error written the way a host writes it, and carrying the status a host gives it.
+ * The whole line fails on it and nothing behind it runs, which is what `x=$((1+)); echo after`
+ * does on a host: no `after`, and a status of 127.
+ */
+class ArithFailure extends Error {
+    constructor(readonly detail: string, readonly status: number) {
+        super(detail);
+    }
+}
+
 /** Parses and runs a whole script, and reports one that failed the way a shell reports it. */
 function runParsed(state: ShellState, script: string): number {
     try {
@@ -2846,6 +2973,12 @@ function runParsed(state: ShellState, script: string): number {
         if (error instanceof UnsetVariableError) {
             writeErr(state, `${error.message}\n`);
             return 127;
+        }
+        /* An arithmetic error already written the way a host writes it, carrying the status a host
+           gives it -- 127 for an expression that will not evaluate, and 1 for `let` behind it. */
+        if (error instanceof ArithFailure) {
+            writeErr(state, error.detail);
+            return error.status;
         }
         writeErr(state, `${errorMessage(error)}\n`);
         return 1;
@@ -5686,10 +5819,16 @@ function letBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     if (ctx.args.length === 0) return failLine('let: requires arguments', 1);
     let value = 0;
-    try {
-        for (const arg of ctx.args) value = evalArith(state, arg);
-    } catch (error) {
-        return failLine(`let: ${errorMessage(error)}`, 1);
+    for (const arg of ctx.args) {
+        try {
+            value = evalArith(state, arg);
+        } catch (error) {
+            /* A host names the word the expression came from and the expression itself, and keeps
+               the status `let` has for a bad expression -- 1, where an expansion's own error is
+               127: `/bin/sh: let: x=1+: syntax error: operand expected (error token is "+")`. */
+            if (error instanceof ArithError) return failLine(arithDiagnostic(state, arg, error, 'let'), 1);
+            return failLine(`let: ${errorMessage(error)}`, 1);
+        }
     }
     return { stdout: '', stderr: '', exitCode: value === 0 ? 1 : 0 };
 }
