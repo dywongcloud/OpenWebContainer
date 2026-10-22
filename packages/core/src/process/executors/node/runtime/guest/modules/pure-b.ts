@@ -355,15 +355,28 @@ export const SRC = String.raw`
   }
 
   function runInRecord(rec, code) {
-    var fns = topLevelFunctionNames(code);
+    var src = vmCode(code);
+    var fns = topLevelFunctionNames(src);
     var fnSet = Object.create(null);
     for (var i = 0; i < fns.length; i++) {
       fnSet[fns[i]] = true;
       if (!(fns[i] in rec.sb)) rec.sb[fns[i]] = undefined;
     }
-    var decl = declaredNames(code);
+    var decl = declaredNames(src);
     var scope = new Proxy(rec.sb, withHandler(rec, fnSet, decl));
-    return outOfRecord(rec, runWrapped.call(rec.G, scope, rewriteTypeof(code), fns, rec.sb));
+    return outOfRecord(rec, runWrapped.call(rec.G, scope, rewriteTypeof(src), fns, rec.sb));
+  }
+
+  /* A source this module compiles for a context gets the loader's compatibility rewrite, as a
+     module body does: the engine aborts the compile of a for-of whose iterable holds a yield
+     ('stack underflow'), and a script handed to a context is as entitled to the hoist as a module.
+     The scan costs a pass over the source, so it is skipped unless the one token the rewrite
+     needs can be in it. */
+  function vmCode(code) {
+    if (typeof code !== 'string' || code.indexOf('yield') < 0) return code;
+    var fixed = null;
+    try { fixed = rxRewrite(code); } catch (rewriteErr) { fixed = null; }
+    return fixed === null ? code : fixed;
   }
 
   /**
@@ -485,7 +498,7 @@ export const SRC = String.raw`
     }
 
     Script.prototype.runInThisContext = function (options) {
-      var code = this._owcCode;
+      var code = vmCode(this._owcCode);
       return vmGuarded(options, function () { return (0, eval)(code); });
     };
     Script.prototype.runInContext = function (contextifiedObject, options) {

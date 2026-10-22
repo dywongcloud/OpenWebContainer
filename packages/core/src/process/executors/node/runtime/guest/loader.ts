@@ -119,11 +119,26 @@ var REAL_FUNCTION = globalThis.Function;
 
 globalThis.Function = function Function() {
   var argc = arguments.length;
-  if (CURRENT_FILE === '') return REAL_FUNCTION.apply(REAL_FUNCTION, arguments);
   var params = [];
   for (var k = 0; k < argc - 1; k++) params.push(String(arguments[k]));
   var body = argc === 0 ? '' : String(arguments[argc - 1]);
   var src = '(function anonymous(' + params.join(',') + '\n) {\n' + body + '\n})';
+  if (CURRENT_FILE === '') {
+    /* No module is running -- an ES module body, a -e script's top level, a REPL line -- so the
+       engine compiles the body itself and resolves an import in it from the working directory, as
+       Node resolves one there. A body the engine refuses is still given the compatibility rewrite's
+       second chance, the same one a module body gets: a for-of whose iterable holds a yield aborts
+       the compile with 'stack underflow', and a package that builds one in an ES module (or inside
+       a -e line) is as entitled to the hoist as a CommonJS module is. */
+    try {
+      return REAL_FUNCTION.apply(REAL_FUNCTION, arguments);
+    } catch (engineErr) {
+      var retry = null;
+      try { retry = rxRewrite(body); } catch (rewriteErr) { retry = null; }
+      if (retry === null) throw engineErr;
+      return REAL_FUNCTION.apply(REAL_FUNCTION, params.concat([retry]));
+    }
+  }
   var compiled = host.compileFunction(src, CURRENT_FILE);
   if (typeof compiled === 'string') {
     /* The compatibility rewrite a module gets before its second compile (see compileCjsWrapper):
