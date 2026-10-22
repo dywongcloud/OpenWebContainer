@@ -1745,6 +1745,13 @@ export class NodeProcess extends Process {
         // a built-in exposes its own enumerable keys; a CommonJS file exposes the names its source declares
         const keys = builtin ? this.builtinExportKeys(id) : [...this.cjsExportNames(id, new Set<string>())];
         let source = `const __owc_m = __owc_api.exportsOf(${JSON.stringify(id)}, ${builtin});\nexport default __owc_m;\n`;
+        if (!builtin) {
+            /* Node names the exports object in the namespace of a CommonJS module too: a key
+               'module.exports' beside default and the named exports. No identifier can spell it, so
+               it is exported under its name as a string -- the namespace of a built-in carries no
+               such key, which is the one thing that separates the two. */
+            source += `export { __owc_m as "module.exports" };\n`;
+        }
         for (const key of keys) {
             if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) && !RESERVED_WORDS.has(key) && key !== 'default' && !key.startsWith('__owc')) {
                 source += `export const ${key} = __owc_m[${JSON.stringify(key)}];\n`;

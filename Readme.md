@@ -271,6 +271,59 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   blank-run length measured. The host's list parser treats the degenerate case in a way this one does not.
 - **A trailing newline.** The container writes a command's stderr exactly as the command left it; the host
   adds one only where the text has none.
+- **`>>` fails on a target no file has yet.** `echo hi >> newfile` writes to `stderr`
+  `Failed to redirect to newfile: ENOENT` and leaves status 1, where the host creates the file and
+  writes to it; `>` creates the file on both. Appending to a file that is already there works on both,
+  and so does the failure when the *directory* is missing, so only the new-file case differs.
+
+### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
+
+Each of these was measured by running the same script under host Node 24.15 and in the container and
+diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
+
+- **`process.stdout.columns` is 80 and `isTTY` is false, where a piped host stream leaves both undefined.**
+  A package that sizes its output from `columns || 80` therefore never falls back, and `writableHighWaterMark`
+  is undefined where the host's is 65536. There is no terminal behind a guest stream to ask.
+- **A guest `err.stack` has no `Error: <message>` header line.** It begins at the first frame, so
+  `err.stack.split('\n')[0]` is `    at <anonymous> (/app/main.js:24:52)` where the host's is `Error: boom`.
+- **`e.requireStack` on a `MODULE_NOT_FOUND` error is undefined**, where host Node's is the array of files
+  that required the missing one. `e.message` still carries the same `Require stack:` block, and
+  `e.code` is `MODULE_NOT_FOUND` on both.
+- **`/dev/null` and `/dev/urandom` are not there.** `/dev` is created at boot, but a character device is a
+  kernel object and this file system has files and directories only: `fs.writeFileSync('/dev/null', '')`
+  makes an ordinary file, and a read of one gives back what was written rather than end of file. Shell
+  redirection to `/dev/null` is a sink and never touches the tree.
+- **Nothing in `/bin` or `/usr/bin` is a program.** Those directories are created at boot, and
+  `PATH` names them as a Linux image does, but the only file on it is `/usr/local/bin/node`, so
+  `which ls`, `which cat`, `which env` and `command -v sh` all fail where a host answers a path.
+  The shell's own commands are built in and run without a file.
+- **No hard links: `fs.linkSync` does not exist.** `fs.linkSync(a, b)` throws `TypeError: not a function`
+  and a host gives `b` an `st_nlink` of 2, so `fs-extra`'s `ensureLinkSync` fails here with
+  `ERR:NOCODE:not a function`. The file system has no link count and no second name for one inode,
+  which is what a link is, so `fs.symlinkSync` is the nearest thing it has.
+- **`fs.statSync` reports `ino` 0 and `blocks` 1 for every file.** The host gives a real inode number
+  and a block count derived from the size (`blocks: 8` for a 2-byte file). There is no inode table
+  and no allocation in blocks behind a file here.
+- **`require.resolve('node:fs')` returns `'fs'`, and `module.paths` is empty.** The host returns
+  `'node:fs'` from `require.resolve` and gives `module.paths` the six `node_modules` directories it
+  searched; the guest strips the `node:` prefix on resolve and has no `node_modules` to walk.
+- **`os.cpus()` is empty and `os.version`, `os.machine` and `process.versions.uv` are missing.**
+  The host returns 11 cpu objects, two functions and the libuv version string. The guest has one
+  virtual cpu, no kernel to name a version for and no libuv, so `os.availableParallelism()` is 1.
+- **`process.allowedNodeEnvironmentFlags` is undefined** where the host's is the `Set` of flags Node
+  accepts in `NODE_OPTIONS`. Nothing here reads that variable.
+- **A runtime `process.env.X = v` is not inherited by a child the process spawns.** On the host a
+  later `spawnSync('sh', ['-c', 'echo $X'])` and a later `node` child both see the new value; here
+  the child gets the environment the container booted with and prints nothing. `execa` hides this
+  because it passes `env` explicitly, so only a raw `child_process` call shows it.
+- **The default working directory is `/`, not the directory the process was started in.** `process.cwd()`
+  and a shell `pwd` both answer `/`, so a relative path written without a `cwd` option lands at the
+  root. A `cwd` passed to `spawn`/`exec` is honoured, and so is `cd`.
+- **`process.on('exit')` handlers do not run when the process dies on the fatal path.** After an
+  uncaught throw or an unhandled rejection the host still writes what an `exit` handler writes
+  (`exit=1`) before ending with status 1; the guest writes nothing more after the statement that
+  threw. A `process.on('uncaughtException')` handler is not called either: the host's catches the
+  error and can leave its own status, the guest ignores it and exits 1. A normal exit does run them.
 
 ### ⚠️ `node` with no arguments: the REPL, and where it differs from host node
 

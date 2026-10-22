@@ -17,6 +17,7 @@ import {
     COMMANDS as SHELL_BUILTIN_UTILS,
     createShellState,
     diagnosticPrefix,
+    echoWords,
     evalArith,
     formatJobText,
     killJobSpecs,
@@ -875,7 +876,7 @@ function shellBuiltin(shell: SyncShell, command: string, args: string[]): ShellS
     try {
         switch (command) {
             case 'echo':
-                return ok(args.join(' ') + '\n');
+                return ok(echoWords(args));
             case 'true':
                 return ok();
             case 'false':
@@ -965,7 +966,14 @@ function shellBuiltinWithRedirects(shell: SyncShell, command: string, args: stri
         try {
             const file = shellPath(shell, redirect.file);
             const fs = shell.ctx.fileSystem;
-            fs.writeFile(file, redirect.type === '>>' ? (fs.readFile(file) || '') + step.stdout : step.stdout);
+            /* `>>` to a name no file has yet: the host shell creates it. Reading it first to append
+               throws ENOENT on the read, so the append never reached the write -- a missing target
+               is an empty one, while a missing *directory* still fails, on the write instead. */
+            let prior = '';
+            if (redirect.type === '>>') {
+                try { prior = fs.readFile(file) ?? ''; } catch { prior = ''; }
+            }
+            fs.writeFile(file, prior + step.stdout);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return { stdout: '', stderr: `Failed to redirect to ${redirect.file}: ${message}`, exitCode: 1 };
