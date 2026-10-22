@@ -1031,27 +1031,26 @@ function wsSyntax(message) {
 function wsParseUrl(url) {
   var raw = url !== null && typeof url === 'object' && typeof url.href === 'string' ? url.href : String(url);
   /*
-   * The container's URL leaves a ws: URL written with one slash as it found it, where Node's adds
-   * the authority slashes, so 'ws:/x.test/' would keep its single slash and resolve to no host.
-   * Adding them here is what makes both spellings the same address.
+   * The container's URL leaves a ws: URL written without the two authority slashes as it found it,
+   * where Node's adds them, so 'ws:/x.test/' or 'ws:x.test/' would keep one slash or none and
+   * resolve to no host. Adding them here is what makes every spelling the same address.
    */
-  var schemeEnd = raw.indexOf(':/');
-  if (schemeEnd === 2 || schemeEnd === 3) {
-    var scheme = raw.slice(0, schemeEnd).toLowerCase();
-    if (scheme === 'ws' || scheme === 'wss') {
-      var rest = raw.slice(schemeEnd + 2);
-      if (rest.charAt(0) !== '/') raw = scheme + '://' + rest;
-    }
-  }
+  var bare = /^(ws|wss):(\/*)/i.exec(raw);
+  if (bare !== null && bare[2].length < 2) raw = bare[1].toLowerCase() + '://' + raw.slice(bare[0].length);
   var parsed = null;
   try { parsed = new globalThis.URL(raw); } catch (badUrl) { parsed = null; }
   if (parsed === null) throw wsSyntax('TypeError: Invalid URL');
-  /* a ws: URL with no host is no more a URL here than it is in Node, which will not parse one */
-  if (parsed.hostname === '') throw wsSyntax('TypeError: Invalid URL');
-  if (parsed.hash !== '') throw wsSyntax('hash');
   if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
   else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
   else if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') throw wsSyntax('expected a ws: or wss: url');
+  /*
+   * Refused on the fragment the parser found, which is not the same as a non-empty one: a bare '#'
+   * carries no fragment text and leaves hash '', yet Node still refuses it, so the raw text -- where
+   * a '#' can only start a fragment in a ws: or wss: URL -- is what decides.
+   */
+  if (raw.indexOf('#') !== -1) throw wsSyntax('hash');
+  /* a ws: URL with no host is no more a URL here than it is in Node, which will not parse one */
+  if (parsed.hostname === '') throw wsSyntax('TypeError: Invalid URL');
   if (parsed.pathname === '') parsed.pathname = '/';
   return parsed.href;
 }
