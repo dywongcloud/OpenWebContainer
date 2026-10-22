@@ -424,17 +424,41 @@ export const SRC = String.raw`
 
   // ---- REPL helpers ----
 
+  var OPEN_TO_CLOSE = { '(': ')', '[': ']', '{': '}' };
+
+  /*
+   * Whether the buffer is unfinished input rather than a syntax error. Node asks its parser where
+   * the error was raised: one raised only after the parser has read end-of-input -- a comment, a
+   * template, an unclosed bracket or an operator still waiting for its operand -- is input a later
+   * line can complete, and one raised inside what is already written is reported at once. So a
+   * buffer of 'var y = {' then '2+2' is an error and not an unfinished object, which is the whole
+   * difference: depth alone kept buffering it forever and never reported anything.
+   *
+   * This runtime's parser reports no position with its errors, so the question is put to its
+   * compiler instead: what closing its own open brackets cannot complete, with an operand offered
+   * where a trailing operator waits for one, is a syntax error.
+   */
   function replIncomplete(src) {
+    if (compiles(src)) return false;
     var lx = vmLex(src);
+    /* a comment or a template runs to the end of what is written, and the next line can close it */
     if (lx.unterminated) return true;
-    var depth = 0;
+    /* a property name is still owed after a '.' */
+    if (/[.]\s*$/.test(src)) return true;
+    var stack = [];
     for (var i = 0; i < lx.toks.length; i++) {
       var t = lx.toks[i];
       if (t.t !== 'punct') continue;
-      if (t.v === '(' || t.v === '[' || t.v === '{') depth++;
-      else if (t.v === ')' || t.v === ']' || t.v === '}') depth--;
+      var want = OPEN_TO_CLOSE[t.v];
+      if (want !== undefined) stack.push(want);
+      else if (t.v === ')' || t.v === ']' || t.v === '}') {
+        /* a closer with nothing of its own open is an error, not a bracket a line will close */
+        if (stack.length === 0 || stack[stack.length - 1] !== t.v) return false;
+        stack.pop();
+      }
     }
-    return depth > 0;
+    var tail = stack.reverse().join('');
+    return compiles(src + tail) || compiles(src + '1' + tail) || compiles(src + ' 1' + tail);
   }
 
   function replErrorHeader(err) {
