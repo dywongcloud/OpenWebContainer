@@ -205,10 +205,16 @@ function decodeInput(options: Record<string, unknown>, host: SharpAddonHost | un
     if (unsupported !== null) throw unsupportedOperationFor('input.' + unsupported);
     if (input.createWidth !== undefined) {
         const image = imageFromCreate(input);
+        // libvips has no file behind an image it was told to create, so sharp reports its format as
+        // 'raw' -- the same format a raw pixel buffer reports -- and never a size. Measured against
+        // sharp 0.33.5: metadata() of sharp({create:{...}}) is {format:'raw', width, height, space,
+        // channels, depth:'uchar', isProgressive:false, hasProfile:false, hasAlpha}, and an output
+        // with no toFormat() behind it comes out raw, not png.
         return {
             image,
-            format: 'png',
+            format: 'raw',
             size: image.data.length,
+            isProgressive: false,
             hasProfile: false,
             hasAlpha: image.channels === 2 || image.channels === 4
         };
@@ -291,7 +297,10 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
 
 function encodeOutput(image: Image, options: Record<string, unknown>, inputFormat: string): { format: string; data: Uint8Array } {
     let format = String(options.formatOut ?? 'input');
-    if (format === 'input') format = inputFormat === 'jpeg' ? 'jpeg' : 'png';
+    // 'input' keeps whatever the input was, so a raw or created image comes out raw and a jpeg comes
+    // out jpeg; only a png (and an input format with no raw form) falls back to png. Measured against
+    // sharp 0.33.5: create and raw inputs with no toFormat() both report info.format 'raw'.
+    if (format === 'input') format = inputFormat === 'jpeg' || inputFormat === 'raw' ? inputFormat : 'png';
     if (format === 'jpeg') {
         const quality = Math.max(1, Math.min(100, numberOption(options, 'jpegQuality', 80)));
         const chroma = String(options.jpegChromaSubsampling ?? '4:2:0');
