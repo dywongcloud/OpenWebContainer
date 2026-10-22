@@ -4183,20 +4183,23 @@ function lsBlockCount(row: LsRow, blockSize: number): number {
 }
 
 /**
- * True when a directory above `path` withholds the right to search it, which is what a host's file
- * system refuses on while it resolves the path: `chmod 644 d; ls -l d/a` is `ls: d/a: Permission
- * denied` and status 1 there, because reaching `a` needs the execute bit of `d`. The container's
- * file system resolves every path it holds, so the mode `chmod` set is asked for here instead --
- * the same mode `cat` already asks for before it reads, one directory further out. The root is
- * always searchable, and a directory this file system carries no mode for is taken as searchable.
+ * True when reaching `target` needs to search a directory that withholds the right, which is what a
+ * host's file system refuses on while it resolves the path: `chmod 644 d; ls -l d/a` is `ls: d/a:
+ * Permission denied` and status 1 there, because reaching `a` needs the execute bit of `d`. Only the
+ * directories `target` itself names are searched. A host resolves a name from the directory it is
+ * already in, so `cd d/e; chmod 000 ..; ls -l f` still lists `f` -- the mode of a directory above
+ * the working one never enters it, which is why the walk starts at `cwd` and not at the root, and
+ * why an absolute operand is walked from `/`. A directory this file system carries no mode for is
+ * taken as searchable.
  */
-function unsearchable(fs: Fs, path: string): boolean {
-    let dir = parentOf(clean(path));
-    while (true) {
-        if (dir !== '/' && (modeOf(fs, dir, true) & 0o100) === 0) return true;
-        if (dir === '/') return false;
-        dir = parentOf(dir);
+function unsearchable(fs: Fs, target: string, cwd: string): boolean {
+    const parts = clean(target).split('/').filter((part) => part.length > 0);
+    let at = target.startsWith('/') ? '' : clean(cwd);
+    for (let i = 0; i + 1 < parts.length; i++) {
+        at += '/' + parts[i];
+        if ((modeOf(fs, at, true) & 0o100) === 0) return true;
     }
+    return false;
 }
 
 /** Which time `ls -l` prints: `-u` the access time, `-c` and `-U` what the host calls them. */
@@ -4352,7 +4355,9 @@ function lsColumns(cells: string[], down: boolean, width: number): string {
 /** The listing of one group of rows: the names, or `total` and one line each. */
 function lsRender(rows: LsRow[], o: LsOptions, withTotal: boolean, width: number, now: number): string {
     const sized = rows.length > 0 && (o.long || o.withBlocks);
-    if (rows.length === 0) return sized ? 'total 0\n' : '';
+    /* An empty listing still prints its `total 0`, as an empty directory's does on a host:
+       `mkdir d; ls -l d` is `total 0` there, and nothing at all without `-l`. */
+    if (rows.length === 0) return o.long ? 'total 0\n' : '';
     if (o.stream) return rows.map((row) => row.name).join(', ') + '\n';
     const total = withTotal && sized
         ? `total ${rows.reduce((sum, row) => sum + lsBlockCount(row, o.blockSize), 0)}\n`
@@ -4494,9 +4499,30 @@ const ls: ShellCommand = (ctx) => {
             return lsRow(ctx.fs, child, name, now, ctx.env, ctx.cwd);
         });
 
+    /* Whether a listing has to stat each entry, which is everything that shows more than a name. */
+    const statsEntries =
+        o.long || o.classify || o.dirSlash || o.inode || o.recursive ||
+        o.byTime || o.bySize || o.withBlocks;
+
     const dirChunks: string[] = [];
     const walk = (path: string, shown: string, header: boolean): void => {
-        const names = entriesOf(path);
+        /* A listing opens a directory to read its names, and stats each one when it shows more
+           than a name. `chmod 000 d; ls -l d` is `ls: d: Permission denied` on a host because `d`
+           withholds the read bit; `chmod 644 d; ls -l d` is `ls: fts_read: Permission denied`
+           because the long form has to stat `d/a` and `d` withholds the search bit. A form that
+           stats nothing still lists what it read: `chmod 644 d; ls d` prints `a`, then fails. */
+        const mode = modeOf(ctx.fs, path, true);
+        const noRead = (mode & 0o400) === 0;
+        const noSearch = !noRead && (mode & 0o100) === 0;
+        let names = noRead ? [] : entriesOf(path);
+        if (noRead) {
+            errors.push(`ls: ${shown}: Permission denied`);
+            exitCode = 1;
+        } else if (noSearch) {
+            errors.push('ls: fts_read: Permission denied');
+            exitCode = 1;
+            if (statsEntries) names = [];
+        }
         dirChunks.push((header ? shown + ':\n' : '') +
             lsRender(marked(ordered(rowsOf(path, names))), o, true, width, now));
         if (!o.recursive) return;
@@ -4515,8 +4541,9 @@ const ls: ShellCommand = (ctx) => {
         const path = resolveAt(ctx, target);
         /* A path is reached through every directory above it, and one of them without its search
            bit stops the walk on a host: `chmod 644 d; ls -l d/a` is `ls: d/a: Permission denied`
-           and status 1 there, while this file system resolves every path it holds. */
-        if (unsearchable(ctx.fs, path)) {
+           and status 1 there, while this file system resolves every path it holds. A directory
+           above the working one is not walked -- see `unsearchable`. */
+        if (unsearchable(ctx.fs, target, ctx.cwd)) {
             errors.push(`ls: ${target}: Permission denied`);
             exitCode = 1;
             continue;
