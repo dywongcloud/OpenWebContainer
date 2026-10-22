@@ -512,6 +512,10 @@ export class Shell implements IShell {
                 }
                 if (!existed) setCreationMode(this.moduleFs, filePath, false);
             } catch (error: any) {
+                /* A target no directory holds is what a host names, not the file system's own text:
+                   `echo hi > /nosuch/x` is `sh: /nosuch/x: No such file or directory`. */
+                const missing = error?.code === 'ENOENT' || String(error?.message ?? '').startsWith('ENOENT');
+                if (missing) throw new Error(`${this.shellState.shellName}: ${redirect.file}: No such file or directory`);
                 throw new Error(`Failed to redirect to ${redirect.file}: ${error.message}`);
             }
         }
@@ -745,25 +749,68 @@ export class Shell implements IShell {
                 case 'false':
                     return fail('');
                 case 'cat': {
+                    /* An option is a word of its own and never a name to open: `cat -n` with a
+                       standard input to read is the numbered lines, where taking `-n` as a file
+                       made it an ENOENT that read nothing at all. `--` ends the options, so a file
+                       whose own name starts with a dash is still an operand. */
+                    let number = false;
+                    let noMoreOptions = false;
+                    const operands: string[] = [];
+                    for (const arg of args) {
+                        if (!noMoreOptions && arg === '--') { noMoreOptions = true; continue; }
+                        if (!noMoreOptions && arg.length > 1 && arg.startsWith('-')) {
+                            if (arg === '-n') number = true;
+                            continue;
+                        }
+                        operands.push(arg);
+                    }
+                    /* The lines of one input, numbered from 1 again for every one of them: `cat -n
+                       p1 p1` is 1 2 3 and then 1 2 3, which one counter kept over the whole output
+                       would have numbered on. The width is the six a host's `cat` writes. */
+                    const numbered = (text: string): string => {
+                        if (!number || text === '') return text;
+                        const lines = text.split('\n');
+                        if (lines[lines.length - 1] === '') lines.pop();
+                        return lines.map((line, index) => `${String(index + 1).padStart(6, ' ')}\t${line}\n`).join('');
+                    };
                     // no argument reads the standard input, as it does in a shell
-                    if (args.length === 0) return ok(input ?? '');
+                    if (operands.length === 0) return ok(numbered(input ?? ''));
                     let joined = '';
-                    for (const name of args) {
+                    let errors = '';
+                    for (const name of operands) {
                         /* `-` is the standard input, as it is for the host's `cat`: `printf 'x' |
                            cat -` prints `x`, and a name that is no file at all is still an error. */
                         if (name === '-') {
-                            joined += input ?? '';
+                            joined += numbered(input ?? '');
+                            continue;
+                        }
+                        const path = at(name);
+                        /* A directory is named and passed over, not read as if it were a file:
+                           `mkdir sd; cat sd` is `cat: sd: Is a directory` on a host, with the
+                           status 1, where reading it wrote `{}` and left 0. */
+                        if (this.isDirectorySafe(path)) {
+                            errors += `cat: ${name}: Is a directory\n`;
                             continue;
                         }
                         /* The mode `chmod` set is honoured here: a file whose owner cannot read it
                            is not read, with the message and status the host's `cat` gives, rather
                            than printed as if the mode meant nothing. */
-                        if (!readable(this.moduleFs, at(name))) return fail(`cat: ${name}: Permission denied\n`);
-                        const content = fs.readFile(at(name));
-                        if (content === undefined) return fail(`File not found: ${name}`);
-                        joined += content;
+                        if (!readable(this.moduleFs, path)) {
+                            errors += `cat: ${name}: Permission denied\n`;
+                            continue;
+                        }
+                        let content: string | undefined;
+                        try { content = fs.readFile(path); } catch { content = undefined; }
+                        /* A name no file answers to is named the way it was written -- never the
+                           container's own path for it -- and the operands behind it are still read:
+                           `cat nofile p1` is the one diagnostic, then `p1`, then the status 1. */
+                        if (content === undefined) {
+                            errors += `cat: ${name}: No such file or directory\n`;
+                            continue;
+                        }
+                        joined += numbered(content);
                     }
-                    return ok(joined);
+                    return errors === '' ? ok(joined) : { stdout: joined, stderr: errors, exitCode: 1 };
                 }
                 case 'pwd':
                     return ok(this.shellState.cwd + '\n');
