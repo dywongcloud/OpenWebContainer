@@ -507,6 +507,7 @@ The same expressions through both, measured against this machine's `node -i` (v2
 | `require("path").join("a","b")` | `'a/b'` | `'a/b'` |
 | `1+1` | `2` | `2` |
 | `}` | the line, a caret, then `Uncaught SyntaxError: Unexpected token '}'` | `Uncaught SyntaxError: expecting ')'` |
+| `var y = {` then `2+2` | the offending line, a caret, then `Uncaught SyntaxError: Unexpected token '+'` | `Uncaught SyntaxError: expecting ':'` |
 | `undefined` | `undefined` | `undefined` |
 | `const x = 5` | `undefined` | `undefined` |
 | `x` | `5` | `5` |
@@ -517,7 +518,15 @@ Recorded rather than fixed:
 - **No welcome banner.** Host node prints `Welcome to Node.js v24.15.0.` and `Type ".help" for more
   information.` above the first prompt; this one prints the prompt only.
 - **A syntax error prints its message alone.** Host node echoes the offending line and a caret under the
-  token. QuickJS reports its own message, and the REPL has no source line to echo.
+  token. QuickJS reports its own message, and the REPL has no source line to echo: bare QuickJS 0.31 with
+  no container in the way reports the same errors with a `stack` of `    at eval.js:2` — a line number and
+  nothing else — so there is no column for a caret to sit under.
+- **A syntax error inside a multi-line entry is reported, at the line that closes it and not before.**
+  Which entry is unfinished is decided the way host node decides it — by whether the parser only reaches
+  its error after it has read end-of-input — so `var y = {` on one line and `2+2` on the next is an error
+  and not an object waiting for a `}`. The two remaining shapes disagree: `return` on a line of its own
+  and the partial number `2e` are unfinished here where host node reports them, and `a.` is reported here
+  where host node waits for the property name.
 - **No line editing.** Arrow keys, history, Backspace and tab completion do nothing: the REPL reads whole
   lines, and an editing key is dropped rather than echoed into the session.
 - **Ctrl-D arrives only where the terminal sends it.** The playground's xterm pane drops every Ctrl key
@@ -976,6 +985,17 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 cwd at the app directory, one case per process. Each line below is one symptom that survives a
 re-run in isolation; the rows are open.
 
+- `owc-http-fetch-external-redirect`: `fetch(url, { redirect: 'manual' })` against a host outside the
+  container. An external request runs in the host's `fetch`, which this runtime calls with
+  `redirect: 'follow'`, so the redirect is followed before the guest ever sees it: nine probes —
+  `manual`, `error` and `follow` over `https://httpbin.org/redirect/1`, `http://github.com` and
+  `https://httpbin.org/absolute-redirect/1` — print `200 basic false "<the url asked for>" loc=null`
+  here, where host Node 24.15 prints `302 basic false "https://httpbin.org/redirect/1" loc="/get"` for
+  `manual` and `TypeError fetch failed` for all three of `error`. Against a server inside the container
+  the same nine agree with the host byte for byte, so the gap is the host capability and not the guest:
+  `packages/core/src/process/executors/node/runtime/capabilities/http.ts` hard-codes
+  `redirect: 'follow'` in its `fetch`, and the `http.fetch` payload `guest/modules/http.ts` `_dispatch`
+  sends carries no redirect mode and drops the `url` the capability answers with.
 - `owc-node-require-preload-dropped`: `node -r ./pre.js main.js` (and `--require ./pre.js`) reads the
   option, so `process.execArgv` and `process.argv` agree with the host, but the preload module is
   never run -- the host prints `preloaded` before `main`, the container prints `main` only.
@@ -993,14 +1013,18 @@ re-run in isolation; the rows are open.
   still compiled as CommonJS -- `typeof import.meta` is a `SyntaxError` and `typeof require` is
   `function`, where the host has `object` and `undefined`, and `node --input-type=module -p 1` should
   fail with `ERR_EVAL_ESM_CANNOT_PRINT` rather than print `1`.
-- `owc-esm-global-surface`: the enumerable globals are not Node's -- `Object.keys(globalThis).length`
-  is 27 here against the host's 15, and the container makes `Blob`, `Buffer`, `URL`, `URLSearchParams`,
-  `console`, `process`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `File` and
-  `CloseEvent` enumerable where the host does not, leaks `__owcErrname` as an enumerable global, and
-  has no `navigator`; `Object.getOwnPropertyNames(globalThis)` is 122 against 135, missing `Atomics`,
-  `Crypto`/`CryptoKey`/`SubtleCrypto`, `navigator`/`Navigator`, the `Performance` family,
-  `BroadcastChannel`, `CompressionStream`/`DecompressionStream`, `URLPattern`,
-  `DisposableStack`/`AsyncDisposableStack` and `SuppressedError` (row owc-esm-global-surface)
+- `owc-esm-global-surface`: `Object.keys(globalThis)` is now the host's fifteen names exactly --
+  `Blob`, `Buffer`, `URL`, `console`, `process`, the `TextCodec` pair, the abort pair, `File` and
+  `CloseEvent` are non-enumerable here as they are there, `__owcErrname` no longer leaks, and
+  `navigator` exists. `Object.keys(process)` is the host's 82 names (the three stdio streams were
+  the ones a walk could not see). `Object.getOwnPropertyNames(globalThis)` is 139 against 135: the
+  `Performance` family, `Crypto`/`CryptoKey`/`SubtleCrypto`, `Navigator`/`navigator`,
+  `BroadcastChannel`, `CompressionStream`/`DecompressionStream`,
+  `DisposableStack`/`AsyncDisposableStack` and `SuppressedError` were added and `InternalError`
+  -- QuickJS's, and no V8 has one -- dropped, leaving two the host has and this container does not:
+  `Atomics`, which this *engine* lacks (`typeof Atomics` is `'undefined'` under bare QuickJS 0.32
+  with no container in the way, where `typeof SharedArrayBuffer` is `'function'`, so there is no
+  atomic to build it over), and `URLPattern` (row owc-esm-global-surface)
 - `owc-esm-unknown-file-extension`: `import('./m.xyz')` holding `export const v = 1` -- the host
   answers `TypeError ERR_UNKNOWN_FILE_EXTENSION "Unknown file extension \".xyz\" for /app/m.xyz"`,
   the container parses it as CommonJS. The same call exposes four more: `.m` is
