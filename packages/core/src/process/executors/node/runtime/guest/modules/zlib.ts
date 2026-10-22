@@ -169,6 +169,36 @@ BF['zlib'] = function () {
     return Math.trunc(level);
   }
 
+  /*
+   * Node bounds a flush flag by the codec that reads it: zlib's own five constants plus Z_BLOCK,
+   * brotli's four operations, zstd's three directives. 'flush' is the flag an ordinary write carries
+   * and 'finishFlush' the one the last write is raised to; both are checked here, as there, before
+   * anything is compressed. The value is only stored, never applied: a finish is still a finish.
+   */
+  var FLUSH_BOUND_MAX = { brotli: 3, zstd: 2 };
+
+  function flushBound(format) {
+    return FLUSH_BOUND_MAX[format] === undefined ? 5 : FLUSH_BOUND_MAX[format];
+  }
+
+  function boundOption(format, options, name) {
+    var value = options && typeof options === 'object' ? options[name] : undefined;
+    if (value === undefined) return undefined;
+    if (typeof value !== 'number') throw argTypeError('options.' + name, 'of type number', value);
+    var max = flushBound(format);
+    if (!(value >= 0 && value <= max)) {
+      throw failure(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "options.' + name + '" is out of range. It must be >= 0 and <= ' + max +
+        '. Received ' + value);
+    }
+    return Math.trunc(value);
+  }
+
+  function flushOptions(format, options) {
+    boundOption(format, options, 'flush');
+    boundOption(format, options, 'finishFlush');
+  }
+
   /* Options only brotli and zstd read: 'params' is a map of BROTLI_PARAM_* or ZSTD_c_* / ZSTD_d_*
      keys to numbers. Node checks the key before the value, and names the key as it was written. */
   var BROTLI_PARAM_MAX = 8;
@@ -274,6 +304,7 @@ BF['zlib'] = function () {
   function syncOp(format, compress) {
     return function (buffer, options) {
       var bytes = inputBytes(buffer, 'buffer', SYNC_INPUT, true);
+      flushOptions(format, options);
       return runZlib(format, compress, bytes, levelOf(format, compress, options), dictionaryOption(options),
         codecParamsOption(format, compress, options), chunkOption(format, options), false);
     };
@@ -290,6 +321,7 @@ BF['zlib'] = function () {
       if (typeof callback !== 'function') throw argTypeError('callback', 'of type function', callback);
       var bytes = inputBytes(chunk, 'chunk', CHUNK_INPUT, false);
       var level = levelOf(format, compress, options);
+      flushOptions(format, options);
       var dictionary = dictionaryOption(options);
       var params = codecParamsOption(format, compress, options);
       var chunkSize = chunkOption(format, options);
@@ -323,6 +355,24 @@ BF['zlib'] = function () {
   var EMPTY = new Uint8Array(0);
   var CODEC_OPS = { write: 0, flush: 1, finish: 2 };
   var DEFLATE_OPS = { write: 0, flush: 3, finish: 4 };
+
+  /*
+   * A flush is not a call of its own: Node writes one of six zero-length buffers, each carrying the
+   * flag it stands for, so a flush takes its turn behind whatever is already queued instead of
+   * jumping ahead of it -- and, if it turns out to be the last chunk, it is raised to the finish
+   * exactly as a write would be.
+   */
+  var flushBuffers = [];
+
+  function flushBuffer(kind) {
+    var buf = flushBuffers[kind];
+    if (buf === undefined) {
+      buf = Buf.from(EMPTY);
+      buf._owcFlush = kind;
+      flushBuffers[kind] = buf;
+    }
+    return buf;
+  }
 
   function streamClass(name, format, compress) {
     if (streamClasses[name]) return streamClasses[name];
@@ -367,7 +417,7 @@ BF['zlib'] = function () {
       self._owcParams = codecParamsOption(format, compress, options);
       self._owcChunkSize = chunkOption(format, options);
       self._owcStream = 0;
-      self._owcEnded = false;
+      flushOptions(format, options);
       self.bytesWritten = 0;
       return self;
     }
@@ -395,6 +445,7 @@ BF['zlib'] = function () {
        * produces nothing, so there the extra call is invisible.
        */
       var op = ops.write;
+      if (typeof chunk._owcFlush === 'number') op = chunk._owcFlush;
       if (this.writableEnded && this.writableLength === chunk.byteLength) op = ops.finish;
       try {
         pushCodec(this, op, bytes);
@@ -413,7 +464,6 @@ BF['zlib'] = function () {
     };
 
     ZlibStream.prototype._flush = function (callback) {
-      this._owcEnded = true;
       var out;
       try {
         if (incremental) pushCodec(this, ops.finish, EMPTY);
@@ -446,33 +496,35 @@ BF['zlib'] = function () {
     ZlibStream.prototype.reset = function () {
       closeCodec(this);
       this._owcChunks = [];
-      this._owcEnded = false;
       this.bytesWritten = 0;
     };
 
-    // A flush is a call of its own against the codec, and what it produces reaches the readable side
-    // before the stream continues, as in Node. Past the end there is nothing left to flush.
+    /*
+     * Past the end there is nothing left to flush, and the callback can then only wait for the
+     * stream: on a later tick once the writable side has finished, on 'end' while it is still
+     * ending -- which never comes for a stream that errored. Before the end the flush goes in as a
+     * write of its own, so it lands behind the chunks already queued and the callback answers when
+     * that write does.
+     */
     ZlibStream.prototype.flush = function (kind, callback) {
       var done = typeof kind === 'function' ? kind : callback;
       if (typeof kind !== 'number') kind = ops.flush;
-      if (this._owcEnded) {
-        if (typeof done === 'function') this.once('end', done);
-        return;
-      }
-      if (!incremental) {
+      /*
+       * A stream whose readable side has ended has already run its finish, so the callback is only
+       * held until the next tick. This module emits 'end' a tick before 'finish', where Node emits
+       * 'finish' first, so waiting on 'end' here would wait forever: that is why the readable side
+       * is asked as well as the writable one.
+       */
+      var rState = this._readableState;
+      if (this.writableFinished || (rState && rState.endEmitted)) {
         if (typeof done === 'function') setImmediateImpl(done);
         return;
       }
-      try {
-        pushCodec(this, kind, EMPTY);
-      } catch (err) {
-        if (typeof done === 'function') {
-          var fail = done;
-          setImmediateImpl(function () { fail(err); });
-        }
+      if (this.writableEnded) {
+        if (typeof done === 'function') this.once('end', done);
         return;
       }
-      if (typeof done === 'function') setImmediateImpl(done);
+      this.write(flushBuffer(kind), '', typeof done === 'function' ? done : undefined);
     };
 
     ZlibStream.prototype.close = function (callback) {
