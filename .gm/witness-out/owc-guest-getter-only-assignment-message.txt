@@ -1,0 +1,78 @@
+Witness: engine-error divergences, container vs host Node 24.15 vs BARE QuickJS 0.32.
+  host        node v24.15.0 on this machine
+  container   /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, one process per case
+  bare        quickjs-emscripten 0.32 (@jitl/quickjs-wasmfile-release-sync) driven directly from
+              node with NOTHING of the container around it -- no guest globals, no bootstrap, no
+              error-constructor wrapper: /tmp/owc-r5/engerr/bare/run-bare-qjs.cjs
+  load while measured: 12.8 to 20.2, free memory 654 MB (39953 pages x 16 KB)
+  sources: /tmp/owc-r5/engerr/{cjs,mjs,probe,sh,bare}
+
+---- E: container ----
+E1-own-class.name TypeError
+E1-own-class.message no setter for property
+E1-own-class.string TypeError: no setter for property
+E2-obj-literal-get.name TypeError
+E2-obj-literal-get.message no setter for property
+E2-obj-literal-get.string TypeError: no setter for property
+E3-event-type.name TypeError
+E3-event-type.message no setter for property
+E3-event-type.string TypeError: no setter for property
+E4-response-status.name TypeError
+E4-response-status.message no setter for property
+E4-response-status.string TypeError: no setter for property
+E5-request-url.name TypeError
+E5-request-url.message no setter for property
+E5-request-url.string TypeError: no setter for property
+E6-sloppy-own-class THREW TypeError: no setter for property
+E7-reflect-set reflect=false
+E8-descriptor setter=true
+---- E: host Node 24.15 ----
+E1-own-class.name TypeError
+E1-own-class.message Cannot set property a of #<K> which has only a getter
+E1-own-class.string TypeError: Cannot set property a of #<K> which has only a getter
+E2-obj-literal-get.name TypeError
+E2-obj-literal-get.message Cannot set property a of #<Object> which has only a getter
+E2-obj-literal-get.string TypeError: Cannot set property a of #<Object> which has only a getter
+E3-event-type.name TypeError
+E3-event-type.message Cannot set property type of #<Event> which has only a getter
+E3-event-type.string TypeError: Cannot set property type of #<Event> which has only a getter
+E4-response-status.name TypeError
+E4-response-status.message Cannot set property status of #<_Response> which has only a getter
+E4-response-status.string TypeError: Cannot set property status of #<_Response> which has only a getter
+E5-request-url.name TypeError
+E5-request-url.message Cannot set property url of #<_Request> which has only a getter
+E5-request-url.string TypeError: Cannot set property url of #<_Request> which has only a getter
+E6-sloppy-own-class THREW TypeError: Cannot set property a of #<K> which has only a getter
+E7-reflect-set reflect=false
+E8-descriptor setter=true
+---- E: bare QuickJS 0.32 ----
+E1-own-class.name TypeError
+E1-own-class.message no setter for property
+E1-own-class.string TypeError: no setter for property
+E1-own-class.stack0     at <eval> (<input>:1:63)
+E2-obj-literal-get NO-THROW
+---- ESM: container ----
+---- program output ----
+M1-direct-eval THREW InternalError: stack underflow (op=110, pc=8)
+M2-indirect-eval THREW InternalError: stack underflow (op=110, pc=8)
+M3-new-function function
+M4-get-newline function
+M5-get-newline-proto constructor,foo
+M6-get-same-line number
+M7-set-get-newline function
+M8-get-blank-line function
+DONE
+---- program stderr ----
+[owc exit 0]
+
+---- ESM: host Node 24.15 ----
+M1-direct-eval function
+M2-indirect-eval function
+M3-new-function function
+M4-get-newline number
+M5-get-newline-proto constructor,foo
+M6-get-same-line number
+M7-set-get-newline undefined
+M8-get-blank-line number
+DONE
+

@@ -1,0 +1,54 @@
+Witness: engine-error divergences, container vs host Node 24.15 vs BARE QuickJS 0.32.
+  host        node v24.15.0 on this machine
+  container   /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, one process per case
+  bare        quickjs-emscripten 0.32 (@jitl/quickjs-wasmfile-release-sync) driven directly from
+              node with NOTHING of the container around it -- no guest globals, no bootstrap, no
+              error-constructor wrapper: /tmp/owc-r5/engerr/bare/run-bare-qjs.cjs
+  load while measured: 12.8 to 20.2, free memory 654 MB (39953 pages x 16 KB)
+  sources: /tmp/owc-r5/engerr/{cjs,mjs,probe,sh,bare}
+
+---- F: container ----
+F1-get-newline-mjs-note see mjs
+F2-get-newline-typeof function
+F3-get-newline-own constructor,foo
+F4-get-same-line number
+---- F: host Node 24.15 ----
+F1-get-newline-mjs-note see mjs
+F2-get-newline-typeof number
+F3-get-newline-own constructor,foo
+F4-get-same-line number
+---- F: bare QuickJS 0.32 ----
+F1-get-newline-typeof function
+F2-get-newline-proto constructor,foo
+F3-get-same-line number
+---- M: container ----
+(none)
+---- M: host Node 24.15 ----
+(none)
+---- M: bare QuickJS 0.32 ----
+(none)
+---- ESM: container ----
+---- program output ----
+M1-direct-eval THREW InternalError: stack underflow (op=110, pc=8)
+M2-indirect-eval THREW InternalError: stack underflow (op=110, pc=8)
+M3-new-function function
+M4-get-newline function
+M5-get-newline-proto constructor,foo
+M6-get-same-line number
+M7-set-get-newline function
+M8-get-blank-line function
+DONE
+---- program stderr ----
+[owc exit 0]
+
+---- ESM: host Node 24.15 ----
+M1-direct-eval function
+M2-indirect-eval function
+M3-new-function function
+M4-get-newline number
+M5-get-newline-proto constructor,foo
+M6-get-same-line number
+M7-set-get-newline undefined
+M8-get-blank-line number
+DONE
+
