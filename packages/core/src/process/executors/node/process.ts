@@ -1085,6 +1085,21 @@ export class NodeProcess extends Process {
     /** Milliseconds of guest execution with no host call in it before the guest is stopped; 0 is none. */
     private guestBudgetMs: number;
     /**
+     * Milliseconds after which the spawn that started this process kills it, 0 for a spawn with no
+     * `timeout`; `killDeadlineAt` is the same bound as a moment in time. A guest that never calls the
+     * host blocks the host thread, so the timer the spawning guest armed cannot end it -- only the
+     * interrupt handler can, and it is given what is left of this bound every time the guest is
+     * running, so the deadline stays the wall-clock one the caller asked for.
+     */
+    private killDeadlineMs = 0;
+    private killDeadlineAt = 0;
+    /** The signal the spawn's `timeout` ends this process on. */
+    private killSignalName = 'SIGTERM';
+    /** Called when the deadline stops this guest, so the parent can report the signal it died of. */
+    private onKillDeadline?: () => void;
+    /** Set once the deadline has stopped this guest: the run ends as a killed child, not as a runaway. */
+    private killDeadlineFired = false;
+    /**
      * What `node` answers for a line of flags of its own -- `node --version`, `node --nope`. Such a
      * run never reaches the guest: no QuickJS runtime is built for it, and no file is looked for.
      */
@@ -1378,7 +1393,44 @@ export class NodeProcess extends Process {
         this.wakeIfIdle();
     }
 
-    /** Delivery into this guest from the virtual network or a capability (VirtualSink). */
+    /**
+     * Arms the bound the interrupt handler interrupts this guest on: the runaway guard, or -- when a
+     * spawn gave this process a shorter `timeout` -- what is left of that deadline, rearmed at every
+     * host call so the bound stays the wall-clock one rather than a stretch of guest execution.
+     */
+    private armVmBound(): void {
+        if (this.deadlineOwnsBudget()) {
+            const left = this.killDeadlineAt - Date.now();
+            armVmBudget(this.capabilityContext, left > 0 ? left : 1);
+            return;
+        }
+        armVmBudget(this.capabilityContext, this.guestBudgetMs);
+    }
+
+    /** True when a spawn's `timeout` is the shorter of the two bounds, so an interruption on it is the timeout. */
+    private deadlineOwnsBudget(): boolean {
+        return this.killDeadlineMs > 0 && !this.killDeadlineFired && this.killDeadlineMs <= this.guestBudgetMs;
+    }
+
+    /**
+     * Puts the `timeout` of the spawn that started this process on the guest itself.
+     *
+     * A guest that never calls the host holds the host thread for as long as it runs, so no host
+     * timer -- the one the spawning guest armed for its `timeout` included -- can fire while it does,
+     * and a child busy-looping past its deadline would run to the end. The interrupt handler is the
+     * only thing that still runs there, so the deadline is handed to it: guest execution that runs
+     * past it stops the guest as a killed child, which is what a host `timeout` does. A child that
+     * does reach the host is still ended by the caller's own timer, and the deadline never fires.
+     */
+    armKillDeadline(ms: number, signal: string, onFire?: () => void): void {
+        if (!(ms > 0)) return;
+        this.killDeadlineMs = ms;
+        this.killDeadlineAt = Date.now() + ms;
+        this.killSignalName = signal;
+        this.onKillDeadline = onFire;
+        this.armVmBound();
+    }
+
     /** Delivery into this guest from the virtual network or a capability (VirtualSink). */
     deliver(targetId: number, name: string, payload: unknown): void {
         if (this.stopped || this.exitRequested !== undefined || this.context === undefined) return;
@@ -1713,7 +1765,11 @@ export class NodeProcess extends Process {
             holdRef: (delta) => this.holdRef(delta),
             onTeardown: (dispose) => this.guestTeardown.push(dispose),
             loadEsm: (file, token) => this.loadEsmSync(file, token),
-            onHostCall: () => yieldVmSlice(this.capabilityContext)
+            onHostCall: () => {
+                yieldVmSlice(this.capabilityContext);
+                // the deadline is a moment in time, not a stretch: what is left of it is rearmed here
+                if (this.deadlineOwnsBudget()) this.armVmBound();
+            }
         });
 
         const bootstrap = context.unwrapResult(context.evalCode(BOOTSTRAP_SRC, 'owc-bootstrap.js', { type: 'global' }));
@@ -1723,7 +1779,7 @@ export class NodeProcess extends Process {
         this.api = api;
         this.installRejectionTracker(context);
         bindVmRuntime(this.capabilityContext, runtime, context, api);
-        armVmBudget(this.capabilityContext, this.guestBudgetMs);
+        this.armVmBound();
         this.builtinNames = new Set<string>(JSON.parse(this.callApiString('builtinNames')));
         /* Node 22.12 and later report require_module in process.features where require() loads an
            ES module, which this loader does. Set on the guest's own object, so it is there before
@@ -1856,6 +1912,14 @@ export class NodeProcess extends Process {
         } catch (error) {
             result.status = this.handleFatal(error);
         } finally {
+            /* A run the spawn's own `timeout` stopped is reported the way Node reports it: no status,
+               the signal the caller named, and ETIMEDOUT. The deadline reaches this point only when it
+               interrupted the guest, so a run that ended on its own keeps the status it chose. */
+            if (this.killDeadlineFired) {
+                result.timedOut = true;
+                result.status = null;
+                result.signal = this.killSignalName;
+            }
             this.services.network.releaseOwner(this.pid);
             this.disposeGuest();
             leaveSyncRun();
@@ -2149,9 +2213,19 @@ export class NodeProcess extends Process {
 
     private runEsmEntry(entryPath: string): void {
         const context = this.context!;
-        const source = this.esmSource(this.fileSystem.readFile(entryPath) ?? '', entryPath, true);
+        const raw = this.fileSystem.readFile(entryPath) ?? '';
+        const source = this.esmSource(raw, entryPath, true);
         const result = context.evalCode(source, entryPath, { type: 'module' });
-        if (result.error) throw this.guestFailure(result.error);
+        if (result.error) {
+            /* A module the engine cannot compile is reported the way node reports one -- the file,
+               the line, a caret -- and not as a bare stack: see esmSyntaxFailureText. */
+            const report = this.esmSyntaxFailureText(result.error, raw, entryPath);
+            if (report !== undefined) {
+                result.error.dispose();
+                throw new GuestFailure(report, true);
+            }
+            throw this.guestFailure(result.error);
+        }
         const promise = result.value;
         /* The drain can end the process -- an unhandled rejection, a fatal error -- and it throws
            when it does. The module's evaluation promise is a handle the host owns, and one it still
@@ -2166,6 +2240,32 @@ export class NodeProcess extends Process {
         } finally {
             promise.dispose();
         }
+    }
+
+    /**
+     * A SyntaxError the engine raised compiling the entry, as node writes it; undefined for any
+     * other error, and for one the engine gave no line for, which is left to the stack it carries.
+     * The words are the engine's, not V8's: `variable name expected` where node says
+     * `Unexpected token ';'`. Only the shape of the report is node's.
+     */
+    private esmSyntaxFailureText(error: QuickJSHandle, source: string, file: string): string | undefined {
+        const context = this.context!;
+        const text = (prop: string): string => {
+            const handle = context.getProp(error, prop);
+            const value = context.typeof(handle) === 'string' ? context.getString(handle) : '';
+            handle.dispose();
+            return value;
+        };
+        const number = (prop: string): number => {
+            const handle = context.getProp(error, prop);
+            const value = context.typeof(handle) === 'number' ? context.getNumber(handle) : 0;
+            handle.dispose();
+            return value;
+        };
+        if (text('name') !== 'SyntaxError') return undefined;
+        const line = number('lineNumber');
+        if (line === 0) return undefined;
+        return esmCompileFailureText(source, file, line, number('columnNumber') || 1, text('message'), true);
     }
 
     private finishProcess(): number {
@@ -2546,6 +2646,17 @@ export class NodeProcess extends Process {
            host. A kill leaves the guest's own text: a terminated process reports no error. */
         if (interruption === 'budget') {
             armVmBudget(this.capabilityContext, 0);
+            /* It was the spawn's own `timeout` that stopped the guest, not the runaway guard: the
+               process ends as a child its caller killed -- no text of its own, no stack, and the
+               signal the spawn named -- rather than as a loop that outran its budget. */
+            if (this.deadlineOwnsBudget()) {
+                this.killDeadlineFired = true;
+                this.stopped = true;
+                const notify = this.onKillDeadline;
+                this.onKillDeadline = undefined;
+                notify?.();
+                return new GuestFailure('', true);
+            }
             return new GuestFailure(interruptedMessage(this.guestBudgetMs, message));
         }
         return new GuestFailure(message, false, thrown);
@@ -2627,8 +2738,13 @@ export class NodeProcess extends Process {
      * source that compiles reaches the engine unchanged.
      */
     private esmSource(source: string, file: string, isMain: boolean, urlSuffix = ''): string {
-        const duplicate = duplicateModuleBinding(source, file);
-        if (duplicate !== undefined) throw new GuestFailure(duplicate);
+        const duplicate = duplicateModuleBinding(source);
+        if (duplicate !== undefined) {
+            throw new GuestFailure(esmCompileFailureText(
+                source, file, duplicate.line, duplicate.column,
+                `Identifier '${duplicate.name}' has already been declared`, isMain
+            ), true);
+        }
         const prepared = prepareEsmSource(source, file, isMain, urlSuffix, (spec) => {
             const found = this.resolver.resolve(spec, dirnameOf(file), 'import');
             return found === undefined ? undefined : isDataUrl(found) ? found : toFileUrl(found);
@@ -3544,13 +3660,54 @@ function lineColumnOf(source: string, index: number): { line: number; column: nu
 }
 
 /**
- * The SyntaxError Node gives for a module that binds one name twice at its top level, already
- * formatted the way the process prints a failure; undefined when no name is bound twice.
+ * The frames node writes under a module that failed to compile: its own loader reaching the
+ * compile, and then either the run that started the entry or the link that pulled a dependency in.
+ * Captured from the build NODE_VERSION names, as the usage block is -- a frame names a file this
+ * container does not have, at a line only that build knows.
+ */
+function esmCompileFrames(isMain: boolean): string {
+    const shared = [
+        '    at compileSourceTextModule (node:internal/modules/esm/utils:318:16)',
+        '    at ModuleLoader.moduleStrategy (node:internal/modules/esm/translators:90:18)',
+        '    at #translate (node:internal/modules/esm/loader:451:20)',
+        '    at afterLoad (node:internal/modules/esm/loader:507:29)',
+        '    at ModuleLoader.loadAndTranslate (node:internal/modules/esm/loader:512:12)',
+        '    at #getOrCreateModuleJobAfterResolve (node:internal/modules/esm/loader:555:36)',
+        '    at afterResolve (node:internal/modules/esm/loader:603:52)',
+        '    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:609:12)'
+    ];
+    const last = isMain
+        ? ['    at node:internal/modules/esm/loader:628:32',
+            '    at TracingChannel.tracePromise (node:diagnostics_channel:362:14)']
+        : ['    at ModuleJob.syncLink (node:internal/modules/esm/module_job:162:33)',
+            '    at ModuleJob.link (node:internal/modules/esm/module_job:252:17)'];
+    return shared.concat(last).join('\n');
+}
+
+/**
+ * A module that does not compile, as node reports it: the file URL and the line, the line of the
+ * source, a caret under the token, the SyntaxError, the loader's own frames and the version
+ * trailer. Nothing of the module ran, so there is no frame of its own -- only the ones node's
+ * loader contributes, which differ between the entry a run started and a dependency it linked.
+ */
+function esmCompileFailureText(
+    source: string, file: string, line: number, column: number, message: string, isMain: boolean
+): string {
+    const lines = source.split('\n');
+    const shown = lines[Math.min(Math.max(line, 1), lines.length) - 1] ?? '';
+    const caret = ' '.repeat(Math.max(column - 1, 0)) + '^';
+    return `${toFileUrl(file)}:${line}\n${shown}\n${caret}\n\nSyntaxError: ${message}\n` +
+        `${esmCompileFrames(isMain)}\n\nNode.js ${NODE_VERSION}`;
+}
+
+/**
+ * The SyntaxError Node gives for a module that binds one name twice at its top level, as the name
+ * it binds again and where in the source that name stands; undefined when no name is bound twice.
  * QuickJS accepts a name brought in by an import and declared again by the module itself, and
  * accepts a redeclaration inside a block, so only names bound at module scope are counted.
  * `var` and `function` redeclaration stays legal, as it is in Node.
  */
-function duplicateModuleBinding(source: string, file: string): string | undefined {
+function duplicateModuleBinding(source: string): { name: string; line: number; column: number } | undefined {
     const tokens = tokenizeJs(source);
     const lexical = new Set<string>();
     const hoisted = new Set<string>();
@@ -3597,8 +3754,17 @@ function duplicateModuleBinding(source: string, file: string): string | undefine
         for (const name of names) {
             // a lexical name is never rebound; a var or function name is, by another var or function
             if (lexical.has(name) || (lexicalBinding && hoisted.has(name))) {
-                const at = lineColumnOf(source, tok.s);
-                return `SyntaxError: Identifier '${name}' has already been declared\n    at ${file}:${at.line}:${at.column}`;
+                /* Node points at the name bound a second time, not at the declaration that binds
+                   it: the `a` of `const a = 1`, the `a` of `import { a } from './y.mjs'`. */
+                let at = tok.s;
+                for (let k = i + 1; k < tokens.length; k++) {
+                    if (tokens[k]!.t === 'id' && tokens[k]!.v === name) {
+                        at = tokens[k]!.s;
+                        break;
+                    }
+                }
+                const where = lineColumnOf(source, at);
+                return { name, line: where.line, column: where.column };
             }
             if (lexicalBinding) lexical.add(name);
             else hoisted.add(name);
@@ -3868,6 +4034,10 @@ function runNodeSync(request: SyncChildRequest): SyncChildResult {
         request.quickJs,
         { execArgv: [] }
     );
+    /* The `timeout` of a spawnSync: a child that never calls the host holds the host thread inside
+       this very call, so the pump's own deadline check never runs and only the interrupt handler can
+       end it. Handing the bound to the handler is what makes the run answer ETIMEDOUT on time. */
+    child.armKillDeadline(request.timeoutMs, request.killSignal);
     let stdout = '';
     let stderr = '';
     child.addEventListener(ProcessEvent.MESSAGE, (data: { stdout?: string; stderr?: string }) => {
