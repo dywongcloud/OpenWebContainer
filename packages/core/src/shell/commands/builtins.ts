@@ -21,6 +21,7 @@
 
 import type { ShellCommand, CommandContext, CommandResult } from './types';
 import { atPath, inputText } from './types';
+import { setCreationMode } from './fileutils';
 
 /* ================================================================== *
  * 0. Shapes
@@ -1271,8 +1272,12 @@ class Parser {
                     this.pos += 2;
                     continue;
                 }
+                /* The backslash goes and the character behind it is left live: the body is a script
+                   a fresh parser reads, so `echo \$x` runs `echo $x`, which then expands -- a kept
+                   `\$` was a literal `$x` that never expanded -- and `echo \\` runs `echo \`, whose
+                   trailing backslash is a line that prints nothing. */
                 if ('$\\'.includes(next)) {
-                    body += ch + next;
+                    body += next;
                     this.pos += 2;
                     continue;
                 }
@@ -1491,18 +1496,26 @@ class Parser {
 
     private readRedirect(fd: number, op: Redirect['op']): Redirect {
         this.skipSpace(false);
+        const start = this.pos;
         const word = this.readWord();
         if (!word) throw new ShellSyntaxError("syntax error near unexpected token `newline'");
         const redirect: Redirect = { fd, op, target: word };
-        if (op === '<<' || op === '<<-') this.heredocs.push({ delimiter: rawText(word), strip: op === '<<-', expand: this.expandsHeredoc(word), target: redirect });
+        if (op === '<<' || op === '<<-') {
+            this.heredocs.push({ delimiter: rawText(word), strip: op === '<<-', expand: this.expandsHeredoc(word, this.src.slice(start, this.pos)), target: redirect });
+        }
         return redirect;
     }
 
     /**
      * True for a here-document whose delimiter was written unquoted: `<<EOF` expands the variables
      * and substitutions of its body, while `<<'EOF'`, `<<"EOF"` and `<<\EOF` take it literally.
+     *
+     * The backslash counts as quoting here as it does in a shell, and it is one the parsed word has
+     * already lost -- `\EOF` and `EOF` leave the same parts behind -- so the source the delimiter was
+     * read from is what says whether there was one.
      */
-    private expandsHeredoc(word: Word): boolean {
+    private expandsHeredoc(word: Word, raw = ''): boolean {
+        if (/['"\\]/.test(raw)) return false;
         for (const part of word) if (part.t === 'sq' || part.t === 'dq') return false;
         return true;
     }
@@ -1515,11 +1528,58 @@ class Parser {
      * and a body is the lines it was written with, joined by the newlines between them.
      */
     private heredocWord(text: string): Word {
+        /* A here-document body is not a word: the quotes are ordinary characters in it -- `cat <<EOF`
+           with a body of `'abc'` prints `'abc'` -- and a backslash keeps its meaning only before
+           `$`, a backquote, a backslash and the newline it continues. Lexing each line as a word
+           took the quotes as quoting and lost the continuation, so the body is scanned here. */
+        const savedSrc = this.src;
+        const savedPos = this.pos;
+        this.src = text;
+        this.pos = 0;
         const parts: Part[] = [];
-        const lines = text.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-            if (i > 0) parts.push({ t: 'lit', v: '\n' });
-            parts.push(...lexParts(lines[i], true));
+        let literal = '';
+        const flush = (): void => {
+            if (literal !== '') {
+                parts.push({ t: 'lit', v: literal });
+                literal = '';
+            }
+        };
+        try {
+            while (this.pos < this.src.length) {
+                const ch = this.src[this.pos];
+                if (ch === '\\') {
+                    const next = this.src[this.pos + 1];
+                    if (next === '\n') {
+                        this.pos += 2;
+                        continue;
+                    }
+                    if (next === '$' || next === '`' || next === '\\') {
+                        literal += next;
+                        this.pos += 2;
+                        continue;
+                    }
+                    literal += ch;
+                    this.pos++;
+                    continue;
+                }
+                if (ch === '$') {
+                    flush();
+                    parts.push(this.readDollar());
+                    continue;
+                }
+                if (ch === '`') {
+                    flush();
+                    this.pos++;
+                    parts.push({ t: 'cmd', script: this.readBackquote() });
+                    continue;
+                }
+                literal += ch;
+                this.pos++;
+            }
+            flush();
+        } finally {
+            this.src = savedSrc;
+            this.pos = savedPos;
         }
         return [{ t: 'dq', parts }];
     }
@@ -1598,8 +1658,11 @@ class Parser {
                 continue;
             }
             if (this.here() === ';') {
+                /* No body is read here: a here-document's body starts on the line behind the one its
+                   `<<` is on, so the `;` that ends `cat <<EOF1; cat <<EOF2` still has a second `<<`
+                   to parse before either body can be read -- reading it now took ` cat <<EOF2` and
+                   `a` as the body of the first, and left the real first body for the second. */
                 this.pos++;
-                this.readHeredocs();
                 continue;
             }
             if (this.here() === '&') {
@@ -2225,7 +2288,7 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             continue;
         }
         if (part.t === 'arith') {
-            const value = evalArith(state, expandToString(modifierText(part.expr), state));
+            const value = evalArith(state, expandToString(arithText(part.expr), state));
             appendText(target, String(Math.trunc(value)), quoted);
             continue;
         }
@@ -3089,11 +3152,22 @@ function writeOutputFile(state: ShellState, file: string, text: string, append: 
     if (!fs) throw new Error(`Failed to redirect to ${file}: no file system`);
     const path = resolvePath(state, file);
     if (path === NULL_DEVICE) return;
+    /* `>>` onto a name nothing has yet is a create, not a failure: the host writes `hi` into a new
+       `f` and leaves 0, where a read of the missing name threw ENOENT and the line ended at 1. */
+    const existed = fs.fileExists(path);
+    let existing = '';
+    if (append) {
+        try { existing = fs.readFile(path) ?? ''; } catch { existing = ''; }
+    }
     try {
-        fs.writeFile(path, append ? (fs.readFile(path) ?? '') + text : text);
+        fs.writeFile(path, existing + text);
     } catch (error) {
         throw new Error(`Failed to redirect to ${file}: ${errorMessage(error)}`);
     }
+    /* A name a redirection created carries the mode the umask leaves, exactly as `touch f` leaves
+       it: `umask 077; echo hi > f` is `-rw-------` on a host, and so is a here-document written
+       the same way. One that was already there keeps the mode it had. */
+    if (!existed) setCreationMode(fs, path, false);
 }
 
 /** Applies the redirection plan and sends the result to the current output sink. */
@@ -4136,10 +4210,56 @@ function umaskBuiltin(ctx: CommandContext): CommandResult {
         else value = arg;
     }
     if (value === undefined) return ok(symbolic ? `${umaskSymbolic(state.umask)}\n` : `${umaskString(state.umask)}\n`, state);
-    const mode = Number.parseInt(value.replace(/^0o?/, ''), 8);
-    if (Number.isNaN(mode)) return failLine(`umask: ${value}: invalid octal number`, 1);
-    state.umask = mode & 0o777;
+    /* A value that begins with a digit is octal, and one the host cannot read as octal is out of
+       range rather than not a number: `umask 888`, `umask 08` and `umask 7x` all say so. */
+    if (/^[0-9]/.test(value)) {
+        if (!/^[0-7]+$/.test(value)) return failLine(`umask: ${value}: octal number out of range`, 1);
+        state.umask = Number.parseInt(value, 8) & 0o777;
+        return ok();
+    }
+    /* Anything else is a symbolic mode, which the host reads too: `umask u+r` allows owner read
+       back and `umask u-r` takes it away, both leaving 0. A character that is neither a class, an
+       operator nor a permission is named back the way the host names it -- the first one it could
+       not read, or a space where the value ended before it found one. */
+    const symbolicMode = parseUmaskSymbolic(state.umask, value);
+    if (symbolicMode === undefined) {
+        const bad = /[^ugoa]/.exec(value.replace(/^[ugoa]*/, ''));
+        return failLine(`umask: \`${bad === null ? ' ' : bad[0]}': invalid symbolic mode operator`, 1);
+    }
+    state.umask = symbolicMode;
     return ok();
+}
+
+/**
+ * The mask a symbolic `umask` value leaves, or undefined where the value is not one. The mask is
+ * the permissions creation withholds, so `+` grants -- it clears bits -- and `-` withholds: from
+ * 022, `g+w` gives 002 and from 077, `u-r` gives 477 and `u=rwx` gives 077.
+ */
+function parseUmaskSymbolic(mask: number, spec: string): number | undefined {
+    let result = mask;
+    for (const clause of spec.split(',')) {
+        const match = /^([ugoa]*)([-+=])([rwxst]*)$/.exec(clause);
+        if (match === null) return undefined;
+        let who = match[1] === '' ? 'ugo' : match[1];
+        if (who.indexOf('a') >= 0) who = 'ugo';
+        let bits = 0;
+        for (const letter of match[3]) {
+            if (letter === 'r') bits |= 0o444;
+            else if (letter === 'w') bits |= 0o222;
+            else if (letter === 'x') bits |= 0o111;
+            else if (letter === 's') bits |= 0o6000;
+            else if (letter === 't') bits |= 0o1000;
+        }
+        let scope = 0;
+        if (who.indexOf('u') >= 0) scope |= 0o700;
+        if (who.indexOf('g') >= 0) scope |= 0o070;
+        if (who.indexOf('o') >= 0) scope |= 0o007;
+        if (match[2] === '+') result &= ~(bits & scope) & 0o777;
+        else if (match[2] === '-') result |= bits & scope;
+        else result = (result & ~scope) | (~bits & scope);
+        result &= 0o777;
+    }
+    return result;
 }
 
 function getoptsBuiltin(ctx: CommandContext): CommandResult {
