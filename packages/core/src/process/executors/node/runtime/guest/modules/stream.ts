@@ -210,41 +210,112 @@ function owcBuildStreamCore() {
     else defaultHighWaterMark = value;
   }
 
+  /* Node 24 keeps every ReadableState/WritableState flag behind prototype accessors over a private
+     store, so a fresh state object owns only the fields its constructor assigns: buffer,
+     bufferIndex, highWaterMark, length, pipes and awaitDrainWriters on the readable side, and
+     bufferedIndex, corked, highWaterMark, length, onwrite, pendingcb and writelen on the writable
+     side. The same layout is reproduced here with one hidden field bag per state object, so
+     Object.getOwnPropertyNames(stream._readableState) matches the host and a later assignment to a
+     flag stays hidden the way it does on the host. */
+  var kReadableFields = Symbol('owcReadableFields');
+  var kWritableFields = Symbol('owcWritableFields');
+
+  function defineStateFields(proto, bagKey, defaults) {
+    Object.keys(defaults).forEach(function (name) {
+      Object.defineProperty(proto, name, {
+        get: function () { return this[bagKey][name]; },
+        set: function (value) { this[bagKey][name] = value; },
+        enumerable: false,
+        configurable: true
+      });
+    });
+  }
+
+  function freshFields(defaults) {
+    var fields = {};
+    Object.keys(defaults).forEach(function (name) { fields[name] = defaults[name]; });
+    return fields;
+  }
+
+  var READABLE_FIELDS = {
+    objectMode: false,
+    pipeHooks: null,
+    awaitDrain: null,
+    flowing: null,
+    paused: null,
+    ended: false,
+    endEmitted: false,
+    reading: false,
+    sync: true,
+    needReadable: false,
+    emittedReadable: false,
+    readableListening: false,
+    resumeScheduled: false,
+    readingMore: false,
+    dataEmitted: false,
+    errorEmitted: false,
+    closeEmitted: false,
+    closed: false,
+    destroyed: false,
+    errored: null,
+    emitClose: true,
+    autoDestroy: true,
+    readable: true,
+    decoder: null,
+    encoding: null,
+    defaultEncoding: 'utf8'
+  };
+  var ReadableStateProto = {};
+  defineStateFields(ReadableStateProto, kReadableFields, READABLE_FIELDS);
+
+  var WRITABLE_FIELDS = {
+    objectMode: false,
+    buffered: null,
+    writing: false,
+    writecb: null,
+    writecount: 0,
+    sync: false,
+    bufferProcessing: false,
+    needDrain: false,
+    ending: false,
+    ended: false,
+    finished: false,
+    finalCalled: false,
+    prefinished: false,
+    onFinished: null,
+    errored: null,
+    errorEmitted: false,
+    destroyed: false,
+    closed: false,
+    closeEmitted: false,
+    emitClose: true,
+    autoDestroy: true,
+    writable: true,
+    decodeStrings: true,
+    defaultEncoding: 'utf8'
+  };
+  var WritableStateProto = {};
+  defineStateFields(WritableStateProto, kWritableFields, WRITABLE_FIELDS);
+
   function makeReadableState(options, isDuplex) {
     var opts = options || {};
     var objectMode = !!(opts.objectMode || (isDuplex && opts.readableObjectMode));
-    var state = {
-      objectMode: objectMode,
-      highWaterMark: pickHighWaterMark(opts, isDuplex ? 'readableHighWaterMark' : null, objectMode),
-      buffer: [],
-      length: 0,
-      pipes: [],
-      pipeHooks: [],
-      awaitDrain: [],
-      flowing: null,
-      paused: null,
-      ended: false,
-      endEmitted: false,
-      reading: false,
-      sync: true,
-      needReadable: false,
-      emittedReadable: false,
-      readableListening: false,
-      resumeScheduled: false,
-      readingMore: false,
-      dataEmitted: false,
-      errorEmitted: false,
-      closeEmitted: false,
-      closed: false,
-      destroyed: false,
-      errored: null,
-      emitClose: opts.emitClose !== false,
-      autoDestroy: opts.autoDestroy !== false,
-      readable: opts.readable !== false,
-      decoder: null,
-      encoding: null,
-      defaultEncoding: opts.defaultEncoding || 'utf8'
-    };
+    var state = Object.create(ReadableStateProto);
+    var fields = freshFields(READABLE_FIELDS);
+    fields.objectMode = objectMode;
+    fields.pipeHooks = [];
+    fields.awaitDrain = [];
+    fields.emitClose = opts.emitClose !== false;
+    fields.autoDestroy = opts.autoDestroy !== false;
+    fields.readable = opts.readable !== false;
+    fields.defaultEncoding = opts.defaultEncoding || 'utf8';
+    state[kReadableFields] = fields;
+    state.buffer = [];
+    state.bufferIndex = 0;
+    state.length = 0;
+    state.pipes = [];
+    state.awaitDrainWriters = null;
+    state.highWaterMark = pickHighWaterMark(opts, isDuplex ? 'readableHighWaterMark' : null, objectMode);
     /* Node keeps the constructor's encoding verbatim ('utf-8' stays 'utf-8') while setEncoding
        stores the decoder's normalised name; the option is validated here, at construction. */
     if (opts.encoding !== undefined && opts.encoding !== null) {
@@ -262,38 +333,24 @@ function owcBuildStreamCore() {
   function makeWritableState(options, isDuplex) {
     var opts = options || {};
     var objectMode = !!(opts.objectMode || (isDuplex && opts.writableObjectMode));
-    var state = {
-      objectMode: objectMode,
-      highWaterMark: pickHighWaterMark(opts, isDuplex ? 'writableHighWaterMark' : null, objectMode),
-      length: 0,
-      buffered: [],
-      writing: false,
-      writecb: null,
-      writelen: 0,
-      writecount: 0,
-      corked: 0,
-      sync: false,
-      bufferProcessing: false,
-      needDrain: false,
-      ending: false,
-      ended: false,
-      finished: false,
-      finalCalled: false,
-      prefinished: false,
-      pendingcb: 0,
-      onFinished: [],
-      errored: null,
-      errorEmitted: false,
-      destroyed: false,
-      closed: false,
-      closeEmitted: false,
-      emitClose: opts.emitClose !== false,
-      autoDestroy: opts.autoDestroy !== false,
-      writable: opts.writable !== false,
-      decodeStrings: opts.decodeStrings !== false,
-      defaultEncoding: opts.defaultEncoding || 'utf8'
-    };
+    var state = Object.create(WritableStateProto);
+    var fields = freshFields(WRITABLE_FIELDS);
+    fields.objectMode = objectMode;
+    fields.buffered = [];
+    fields.onFinished = [];
+    fields.emitClose = opts.emitClose !== false;
+    fields.autoDestroy = opts.autoDestroy !== false;
+    fields.writable = opts.writable !== false;
+    fields.decodeStrings = opts.decodeStrings !== false;
+    fields.defaultEncoding = opts.defaultEncoding || 'utf8';
+    state[kWritableFields] = fields;
+    state.bufferedIndex = 0;
+    state.corked = 0;
+    state.highWaterMark = pickHighWaterMark(opts, isDuplex ? 'writableHighWaterMark' : null, objectMode);
+    state.length = 0;
     state.onwrite = null;
+    state.pendingcb = 0;
+    state.writelen = 0;
     return state;
   }
 
