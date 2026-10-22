@@ -369,10 +369,13 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   `getegid` and `getgroups` answer, and `setuid`, `seteuid`, `setgid`, `setegid`, `setgroups` and
   `initgroups` throw the host's `EPERM` as they do for a process that is not root; `getgroups` returns the
   one group this process has, where a host on this machine returns sixteen.
-- **`process.ppid` is 0, and `process.argv0` is the whole path where a host's is the name.** A host's `ppid`
-  is the pid of the shell that started it and its `argv0` is `node`, because that is the word the shell
-  invoked; the container has no parent process and reports its own argv as the path it was started from, so
-  `process.title` (`'node'`) and `process.argv0` (`'/usr/local/bin/node'`) disagree where a host's agree.
+- **`process.ppid` is 0 for a process the container started itself, and a child's is the pid of the process
+  that spawned it.** A host's `ppid` is the pid of the shell that started it, and a host's child reports the
+  pid of its parent the same way; the container reports that pid for every process it starts with a parent,
+  and 0 for one it starts on its own, because there is no process behind it to name.
+- **`process.argv[0]` is the path and `process.argv0` is the name, as on a host.** A host's `argv0` is `node`,
+  because that is the word the shell invoked, while its `argv[0]` carries the resolved path; the container
+  reports the same pair, so `process.title` (`'node'`) and `process.argv0` agree as a host's agree.
 - **`os.networkInterfaces()` reports the loopback alone.** `lo` carries `127.0.0.1` and `::1` with the netmask,
   family and cidr a host's entries carry, where a host reports eleven interfaces of its own: a container's
   sockets are the host's, so it has no address of a network of its own to name, and a package that picks an
@@ -1015,3 +1018,6 @@ re-run in isolation; the rows are open.
 - `owc-shell-cat-option-operand`: `exec 0<p1; cat -n` -- the host numbers the lines it read (`     1\tp`), the container reads a file named `-n` and fails with `ENOENT: No such file or directory, '/app/D/-n'`.
 - `owc-shell-cat-directory`: `mkdir sd; cat sd` -- host stderr `cat: sd: Is a directory` and status 1; container stdout `{}` and status 0.
 - `owc-shell-exec-not-found-wording`: `exec nosuchcmdxyz` -- host stderr `/bin/sh: line 0: exec: nosuchcmdxyz: not found`; container `sh: nosuchcmdxyz: command not found`. Same status 127; a host names `exec` and carries the `line 0`.
+- `owc-engine-stack-underflow-user-eval`: a source the engine compiles because user code called `eval` still aborts -- `eval('(function*(){ for (const x of (yield 1)) {} })')` and the indirect `(0, eval)` of the same string are `function` on host Node 24.15 and throw `InternalError: stack underflow (op=110, pc=8)` in the container, in a CommonJS module, in an ES module and under `node -e`. The rewrite that hoists the iterable now reaches every source the container itself compiles (`new Function` anywhere, the `vm` surfaces, `node -p`); `eval` it cannot reach, because a wrapper over `globalThis.eval` is not the intrinsic `%eval%` and would cost every direct eval the caller's scope that `vm`'s own with-scoped eval and a package evaluating `require('x')` rely on.
+- `owc-compat-rewrite-tostring-leak`: `Function.prototype.toString` prints the compatibility rewrite instead of the source -- `new Function('return function*(){ for (const x of (yield 1)) {} }')().toString()` is `function*(){ for (const x of (yield 1)) {} }` (79 characters) on the host and `function*(){ const __owcOf1 = (yield 1); for (const x of __owcOf1) {} }` (106) in the container, and a module-level generator, a class method and a `-e` body leak the same way. The hoist is what makes the shape compile at all, so the text cannot simply be dropped; the engine would have to hand back the source it was given rather than the one it compiled.
+- `owc-stdout-split-sequence-mangled`: a multi-byte character whose bytes are split across two `process.stdout.write` calls comes out as replacement characters -- the first byte of U+20DD (`E2`) in one write and `83 9D` in the next is `?` plus U+20DD on the host and `?` plus three U+FFFD in the container. A single write of any size is byte-identical, including a 65536-byte write that ends mid-sequence, so the loss is one decode per write and not per byte; `process.ts` builds a fresh `TextDecoder` for each message instead of carrying a partial sequence from one to the next.

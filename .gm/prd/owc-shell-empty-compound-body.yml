@@ -1,0 +1,8 @@
+id: owc-shell-empty-compound-body
+description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4b), host /bin/sh (bash 3.2) against the container''s sh. A compound command whose body holds nothing is a syntax error on a host and an empty command in the container: `if true; then` newline `fi` is host stderr "/bin/sh: -c: line 1: syntax error near unexpected token `fi''\n/bin/sh: -c: line 1: `fi''\n" exit 2 and container stdout "" stderr "" exit 0; `for i in 1; do` newline `done` is host `done` exit 2 and container exit 0; `{ }` is host `}` exit 2 and container exit 0; `(  )` is host `)` exit 2 and container exit 0. `while true; do` newline `done` does not come back at all in the container -- it loops with an empty body, and no per-case timeout can fire because the shell engine blocks the event loop -- where a host rejects it as `syntax error near unexpected token `done''''. `if true; then echo y; fi` and every non-empty body match. Fix site: parseIf, parseWhile, parseFor and the `{`/`(` arms of parseCommand in packages/core/src/shell/commands/builtins.ts.'
+owner: lanmower
+rule_bindings: []
+session_id: adv3-judge-shell-diag-4
+subject: a compound command with an empty body is accepted where a host refuses the script
+witness_plan: Run `if true; then` newline `fi` and `{ }` on both sides; each must be exit 2 with `syntax error near unexpected token `fi'' / `}'.
+status: pending

@@ -1,0 +1,8 @@
+id: owc-shell-return-not-in-function-wording
+description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4b), host /bin/sh (bash 3.2) against the container''s sh. `echo a\nreturn 3\nif; then` is host stdout "a\n" stderr "/bin/sh: line 1: return: can only `return'' from a function or sourced script\n/bin/sh: -c: line 2: syntax error near unexpected token `;''\n/bin/sh: -c: line 2: `if; then''\n" exit 2, and container stdout "a\n" stderr "return: can only ''return'' from a function or sourced script\nsyntax error near unexpected token `;''\n`if; then''\n" exit 2 -- the same two reports, but the container quotes `return` with straight apostrophes where a host uses backquote and apostrophe, and (see owc-shell-diagnostic-line-position) names no shell. Fix site: the `return` builtin in packages/core/src/shell/commands/builtins.ts.'
+owner: lanmower
+rule_bindings: []
+session_id: adv3-judge-shell-diag-4
+subject: the complaint about a `return` nowhere to return from is quoted the wrong way
+witness_plan: 'Run `return 3` on both sides; stderr must be ``sh: return: can only `return'' from a function or sourced script``.'
+status: pending

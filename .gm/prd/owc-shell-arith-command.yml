@@ -1,0 +1,8 @@
+id: owc-shell-arith-command
+subject: the arithmetic command `(( ))` does not exist
+description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4b), host /bin/sh (bash 3.2) against the container''s sh. `((1)); echo $?` is host stdout "0\n" exit 0 and container stdout "127\n" with stderr "sh: 1: command not found\n"; `((0)); echo $?` is host "1\n" and container "127\n"; `((1+2)); echo $?` is host "0\n" and container "127\n"; `(( 1 + 2 )); echo $?` the same, the container naming only `1''. `((1+))` is host stderr "/bin/sh: ((: 1+: syntax error: operand expected (error token is \"+\")" exit 1 against container stderr "sh: 1+: command not found\n" exit 127 -- a status mismatch, not only a wording one. The `$(` form does work: `echo $((1+2))` and `echo $((1?2:3))` match. Fix site: parseCommand in packages/core/src/shell/commands/builtins.ts, which reads a leading `(` as a subshell and never looks for the `((` that makes the construct arithmetic.'
+owner: lanmower
+session_id: adv3-judge-shell-diag-4
+witness_plan: 'Run `((1)); echo $?`, `((0)); echo $?` and `((1+))` on both sides; the statuses must be 0, 1 and 1 and the last must name `((: 1+`.'
+rule_bindings: []
+status: pending
