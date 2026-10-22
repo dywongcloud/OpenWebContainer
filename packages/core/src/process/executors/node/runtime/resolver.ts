@@ -235,13 +235,20 @@ export class NodeResolver {
     isESM(file: string): boolean {
         if (file.endsWith('.mjs')) return true;
         if (file.endsWith('.cjs') || file.endsWith('.json')) return false;
-        if (!file.endsWith('.js')) return false;
-        const packageType = this.nearestPackageType(dirnameOf(file));
-        if (packageType === 'module') return true;
-        if (packageType === 'commonjs') return false;
-        const code = withoutLiterals(this.fileSystem.readFile(file) ?? '');
-        return /^\s*(?:import\s+[\w{*'"]|export\s+[\w{*])/m.test(code)
-            || /^(?:await\s|(?:const|let|var)\s+[^=\n]+=\s*await\s)/m.test(code);
+        /* A .js file and a file no extension follows are the two Node decides by the package "type"
+           first and by the module syntax in it second -- its detection, on by default since 22.7,
+           reads 'export' or a top-level 'await' in either and loads it as a module. Every other
+           extension the loader does not know is ERR_UNKNOWN_FILE_EXTENSION, which no detection
+           reaches, so nothing else is decided here. */
+        if (file.endsWith('.js') || extensionOf(file) === '') {
+            const packageType = this.nearestPackageType(dirnameOf(file));
+            if (packageType === 'module') return true;
+            if (packageType === 'commonjs') return false;
+            const code = withoutLiterals(this.fileSystem.readFile(file) ?? '');
+            return /^\s*(?:import\s+[\w{*'"]|export\s+[\w{*])/m.test(code)
+                || /^(?:await\s|(?:const|let|var)\s+[^=\n]+=\s*await\s)/m.test(code);
+        }
+        return false;
     }
 
     /**
@@ -478,6 +485,14 @@ export function urlSuffixOf(specifier: string): string {
     if (bare === specifier) return '';
     if (!bare.startsWith('/') && !isRelativeSpecifier(bare)) return '';
     return specifier.slice(bare.length);
+}
+
+/** The extension a filename carries, '' when it carries none -- `lib.js` is '.js', and a name whose
+ *  only dot leads it, `.babelrc`, is one Node's detection also reads as extensionless. */
+function extensionOf(file: string): string {
+    const name = file.slice(file.lastIndexOf('/') + 1);
+    const dot = name.lastIndexOf('.');
+    return dot <= 0 ? '' : name.slice(dot);
 }
 
 /** Whether the specifier names a file or directory by path rather than by package name. */
