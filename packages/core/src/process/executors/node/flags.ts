@@ -1,5 +1,5 @@
 import { printEvalSource } from './runtime/eval-source';
-import { NODE_HELP_TEXT } from './runtime/help-text';
+import { NODE_COMPLETION_BASH_TEXT, NODE_HELP_TEXT } from './runtime/help-text';
 import { NODE_VERSION } from './runtime/guest/globals';
 
 /**
@@ -42,6 +42,8 @@ export interface NodeCommand {
     execArgv: string[];
     /** `--stack-trace-limit=<n>`: the bound the line puts on the frames of a stack trace. */
     stackTraceLimit?: number;
+    /** `--input-type=<type>`: how the `-e`/`-p` source is read -- `module` or `commonjs`. */
+    inputType?: string;
     /** The answer for a run that never reaches the guest; set exactly when `file` is `[flags]`. */
     flagAnswer?: NodeFlagAnswer;
 }
@@ -51,10 +53,30 @@ export interface NodeRunOptions {
     execArgv: string[];
     stackTraceLimit?: number;
     evalScript?: string;
+    inputType?: string;
 }
 
 /** The status node exits with when it refuses its own arguments. */
 const BAD_OPTION_EXIT = 9;
+
+/**
+ * What node writes when `--print` is asked for a source it reads as an ES module: printing the
+ * completion value of a module is something node cannot do, so the run is refused before the
+ * source is read, with the frames of the two internals that refuse it. Captured from the build
+ * NODE_VERSION names, as the usage block is.
+ */
+const PRINT_WITH_ESM_INPUT =
+    'node:internal/process/execution:73\n' +
+    '    throw new ERR_EVAL_ESM_CANNOT_PRINT();\n' +
+    '    ^\n' +
+    '\n' +
+    'Error [ERR_EVAL_ESM_CANNOT_PRINT]: --print cannot be used with ESM input\n' +
+    '    at evalModuleEntryPoint (node:internal/process/execution:73:11)\n' +
+    '    at node:internal/main/eval_string:37:3 {\n' +
+    "  code: 'ERR_EVAL_ESM_CANNOT_PRINT'\n" +
+    '}\n' +
+    '\n' +
+    `Node.js ${NODE_VERSION}\n`;
 
 /**
  * The long options node reads, and what it wants behind each: the table node itself reads, taken
@@ -135,6 +157,9 @@ const VALUED_LONG_OPTIONS = new Set((
     '--trace-event-file-pattern --trace-require-module --unhandled-rejections --use-largepages ' +
     '--v8-pool-size --watch --watch-kill-signal --watch-path '
 ).split(/\s+/).filter((name) => name !== ''));
+
+/** The four types `--input-type` reads: anything else is refused, as it is on the host. */
+const INPUT_TYPES = new Set(['module', 'commonjs', 'module-typescript', 'commonjs-typescript']);
 
 /** The one of those with an effect here: the bound it puts on the frames of a stack trace. */
 const STACK_TRACE_LIMIT = '--stack-trace-limit';
@@ -225,10 +250,13 @@ export function nodeCommand(args: string[]): NodeCommand {
     let version = false;
     let help = false;
     let check = false;
+    let completionBash = false;
     let print = false;
     let script: string | undefined;
     /** `-e`/`--eval` was given, whether or not the source behind it was. */
     let evalSeen = false;
+    /** `--input-type=<type>`: how the source behind `-e`/`-p` is read. */
+    let inputType: string | undefined;
     /** The options of the line, in node's own words: what `process.execArgv` is. */
     const execArgv: string[] = [];
     let stackTraceLimit: number | undefined;
@@ -244,6 +272,27 @@ export function nodeCommand(args: string[]): NodeCommand {
             if (name === '--version') { version = true; execArgv.push(arg); continue; }
             if (name === '--help') { help = true; execArgv.push(arg); continue; }
             if (name === '--check') { check = true; execArgv.push(arg); continue; }
+            if (name === '--completion-bash') { completionBash = true; execArgv.push(arg); continue; }
+            if (name === '--input-type') {
+                /* One of the valued options, and the one a run of a source reads: node takes the
+                   value behind an `=` or as the next argument, and refuses a line with neither. */
+                const known = knownOption(arg, name, value, args, i);
+                if (known !== undefined) {
+                    if (known.refusal !== undefined) {
+                        errors.push({ text: known.refusal, badOption: false });
+                        break;
+                    }
+                    inputType = value ?? known.words[1];
+                    /* Node reads four types and refuses a fifth, however the value was written. */
+                    if (!INPUT_TYPES.has(inputType)) {
+                        errors.push({ text: `${name} must be "module","commonjs", "module-typescript" or "commonjs-typescript"`, badOption: false });
+                        break;
+                    }
+                    execArgv.push(...known.words);
+                    i = known.at;
+                    continue;
+                }
+            }
             const known = knownOption(arg, name, value, args, i);
             if (known !== undefined) {
                 if (known.refusal !== undefined) {
@@ -365,15 +414,21 @@ export function nodeCommand(args: string[]): NodeCommand {
         return refuse(kept);
     }
     if (errors.length > 0) return refuse(errors);
-    /* A version outranks a help and a help outranks a check: `node --help --version` is a version,
-       and `node --check --help` is a help. */
+    /* A version outranks a help and a help outranks a check, and a completion-bash outranks a help
+       but not a version: `node --help --version` is a version, `node --check --help` is a help, and
+       `node --help --completion-bash` is the completion script. */
     if (version) return answered({ stdout: NODE_VERSION + '\n', exitCode: 0 });
+    if (completionBash) return answered({ stdout: NODE_COMPLETION_BASH_TEXT, exitCode: 0 });
     if (help) return answered({ stdout: NODE_HELP_TEXT, exitCode: 0 });
 
     const trailing = args.slice(i);
     /* What every run carries from the line, whatever it runs: the options node read, and the bound
        one of them put on a stack trace. */
-    const carry = { execArgv, stackTraceLimit };
+    const carry = {
+        execArgv,
+        ...(stackTraceLimit === undefined ? {} : { stackTraceLimit }),
+        ...(inputType === undefined ? {} : { inputType })
+    };
     /* `--` ends the options: what follows is the script, even where it begins with a dash, so
        `node -- --version` runs the file rather than printing a version. */
     let file: string | undefined;
@@ -391,6 +446,9 @@ export function nodeCommand(args: string[]): NodeCommand {
         return answered({ exitCode: 0, ...(file === undefined ? {} : { check: file }) });
     }
     if (print || script !== undefined) {
+        /* A print of a source read as an ES module is refused before the source is read: node has
+           no completion value to print for one. */
+        if (print && inputType === 'module') return answered({ stderr: PRINT_WITH_ESM_INPUT, exitCode: 1 });
         /* No file follows a source, so `--` here is the one that ends the options: what follows is
            the first argument, which is how a caller hands a script its data. */
         return {

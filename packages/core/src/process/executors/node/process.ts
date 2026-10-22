@@ -190,6 +190,20 @@ function evalFailureText(message: string, source: string): string {
 /** What a guest is given to read a CommonJS body with: the wrapper the host compiles it inside. */
 const EVAL_WRAPPER_PREFIX = '(function (exports, require, module, __filename, __dirname) {'.length;
 
+/**
+ * True for a `-e`/`-p` source only a module can hold: one with `import.meta` in it, or one that
+ * begins a line with `import` or `export`.
+ *
+ * Node reads such a source as a module when `--input-type` never said which -- that is what makes
+ * `node -e 'console.log(typeof import.meta)'` print `object` on the host -- so a container that
+ * compiled every `-e` source inside the CommonJS wrapper answered `SyntaxError` for a line the
+ * host runs. A source that mentions `import` or `export` anywhere else -- `import(` a function
+ * call, a name in a string -- is left alone, because a CommonJS body may hold both.
+ */
+function readsAsModule(source: string): boolean {
+    return /\bimport\s*\.\s*meta\b/.test(source) || /(?:^|\n)\s*(?:import|export)\s/.test(source);
+}
+
 /** The `vm` timeout error, as Node words it, over the guest's own stack. */
 function interruptedMessage(budgetMs: number, formatted: string): string {
     const headline = `Error: Script execution timed out after ${Math.round(budgetMs)}ms`;
@@ -311,11 +325,12 @@ const REJECTION_TRACKER_SRC = String.raw`
  * it is told to, or to node's own default name when it is not. It is given `fs` rather than reaching
  * for it, because a bootstrap script has no `require` of its own.
  */
-const PROCESS_REPORT_SRC = `(function (fs) {
+const PROCESS_REPORT_SRC = `(function (fs, os) {
   var p = globalThis.process;
   if (p === undefined || p === null || p.report !== undefined) return;
   var seq = 0;
   function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function nodeName() { return '${NODE_VERSION}'; }
   /* Node's own default name for a report file: the UTC timestamp, the pid and a counter. */
   function defaultName() {
     var d = new Date();
@@ -323,22 +338,103 @@ const PROCESS_REPORT_SRC = `(function (fs) {
     return 'report.' + d.getUTCFullYear() + pad(d.getUTCMonth() + 1) + pad(d.getUTCDate()) + '.' +
       pad(d.getUTCHours()) + pad(d.getUTCMinutes()) + pad(d.getUTCSeconds()) + '.' + p.pid + '.' + seq + '.json';
   }
+  /* Node writes the moment a report was taken to the second, in UTC, with no fraction behind it. */
+  function isoSecond(d) {
+    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) + 'T' +
+      pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()) + 'Z';
+  }
+  /* A builtin or a process call that may not be there, or may throw: a report is written on the way
+     out of a process that is already dying, and it names what the machine answers, never invented. */
+  function ask(obj, name, fallback) {
+    if (obj === undefined || obj === null || typeof obj[name] !== 'function') return fallback;
+    try { var got = obj[name](); return got === undefined || got === null ? fallback : got; }
+    catch (e) { return fallback; }
+  }
+  function limit(soft) { return { soft: soft, hard: 'unlimited' }; }
+  /* The versions of the parts this node was built from, and the release it is: properties of the
+     build, not of the machine it runs on, so a container that answers as this build names these. */
+  var COMPONENT_VERSIONS = {
+    acorn: '8.16.0', ada: '3.4.4', amaro: '1.1.8', ares: '1.34.6', brotli: '1.2.0', cldr: '48.0',
+    icu: '78.2', llhttp: '9.3.1', merve: '1.2.2', modules: '137', napi: '10', nbytes: '0.1.3',
+    ncrypto: '0.0.1', nghttp2: '1.68.0', node: nodeName().slice(1), openssl: '3.5.5',
+    simdjson: '4.5.0', simdutf: '6.4.0', sqlite: '3.51.3', tz: '2026a', undici: '7.24.4',
+    unicode: '17.0', uv: '1.51.0', uvwasi: '0.0.23', v8: '13.6.233.17-node.48',
+    zlib: '1.3.1-e00f703', zstd: '1.5.7'
+  };
+  var RELEASE = {
+    name: 'node',
+    lts: 'Krypton',
+    headersUrl: 'https://nodejs.org/download/release/' + nodeName() + '/node-' + nodeName() + '-headers.tar.gz',
+    sourceUrl: 'https://nodejs.org/download/release/' + nodeName() + '/node-' + nodeName() + '.tar.gz'
+  };
+  function cpus() {
+    var list = ask(os, 'cpus', []);
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var t = list[i].times || {};
+      out.push({ model: list[i].model, speed: list[i].speed, user: t.user || 0, nice: t.nice || 0,
+        sys: t.sys || 0, idle: t.idle || 0, irq: t.irq || 0 });
+    }
+    return out;
+  }
+  function networkInterfaces() {
+    var byName = ask(os, 'networkInterfaces', {});
+    var out = [];
+    for (var name in byName) {
+      if (!Object.prototype.hasOwnProperty.call(byName, name)) continue;
+      var list = byName[name] || [];
+      for (var i = 0; i < list.length; i++) {
+        var one = { name: name, internal: !!list[i].internal, mac: list[i].mac, address: list[i].address,
+          netmask: list[i].netmask, family: list[i].family };
+        /* Only an IPv6 address is scoped, and only one carries a scope id in the report. */
+        if (list[i].family === 'IPv6') one.scopeid = list[i].scopeid === undefined ? 0 : list[i].scopeid;
+        out.push(one);
+      }
+    }
+    return out;
+  }
+  function osRelease() { return ask(os, 'release', '1.0.0'); }
+  /* The script as the line wrote it: process.argv names it by the path it was resolved to, which is
+     /app/main.js for a line that said main.js, and node reports the name the line gave. */
+  function asWritten(path) {
+    var base = p.cwd();
+    return base !== '/' && path.indexOf(base + '/') === 0 ? path.slice(base.length + 1) : path;
+  }
+  function commandLine() {
+    var argv = p.argv.slice(1);
+    var out = ['node'].concat(p.execArgv);
+    for (var i = 0; i < argv.length; i++) out.push(i === 0 ? asWritten(String(argv[i])) : argv[i]);
+    return out;
+  }
   function header() {
+    var now = new Date();
     return {
-      reportVersion: 3,
+      reportVersion: 5,
       event: 'JavaScript API',
-      trigger: 'JS API',
-      filename: p.report.filename,
-      dumpEventTime: new Date().toISOString(),
+      trigger: 'GetReport',
+      filename: p.report.filename === '' ? null : p.report.filename,
+      dumpEventTime: isoSecond(now),
+      dumpEventTimeStamp: String(now.getTime()),
       processId: p.pid,
+      threadId: 0,
       cwd: p.cwd(),
-      commandLine: p.argv.slice(),
+      /* What the process was started with: node, then the options it read and the words behind them. */
+      commandLine: commandLine(),
       nodejsVersion: p.version,
       wordSize: 64,
-      platform: p.platform,
       arch: p.arch,
-      execPath: p.execPath,
-      execArgv: p.execArgv.slice()
+      platform: p.platform,
+      componentVersions: COMPONENT_VERSIONS,
+      release: RELEASE,
+      osName: ask(os, 'type', 'Linux'),
+      osRelease: osRelease(),
+      /* The kernel's own version line: this container has no kernel to name one from, so it is
+         written in the shape node writes it -- a build mark behind the release it belongs to. */
+      osVersion: '#1 SMP ' + osRelease(),
+      osMachine: ask(os, 'machine', p.arch),
+      cpus: cpus(),
+      networkInterfaces: networkInterfaces(),
+      host: ask(os, 'hostname', 'localhost')
     };
   }
   p.report = {
@@ -351,10 +447,70 @@ const PROCESS_REPORT_SRC = `(function (fs) {
       return target;
     },
     getReport: function () {
+      var mu = ask(p, 'memoryUsage', {});
+      var cu = ask(p, 'cpuUsage', { user: 0, system: 0 });
+      var userSeconds = (cu.user || 0) / 1e6;
+      var systemSeconds = (cu.system || 0) / 1e6;
       return {
         header: header(),
-        javascriptStack: { message: '', stack: [] },
-        environmentVariables: p.report.excludeEnv ? {} : p.env
+        javascriptStack: { message: 'Error [ERR_SYNTHETIC]: JavaScript Callstack', stack: [] },
+        javascriptHeap: {
+          totalMemory: mu.heapTotal || 0,
+          executableMemory: 0,
+          totalCommittedMemory: 0,
+          availableMemory: 0,
+          totalGlobalHandlesMemory: 0,
+          usedGlobalHandlesMemory: 0,
+          usedMemory: mu.heapUsed || 0,
+          memoryLimit: 0,
+          mallocedMemory: 0,
+          externalMemory: mu.external || 0,
+          peakMallocedMemory: 0,
+          nativeContextCount: 0,
+          detachedContextCount: 0,
+          doesZapGarbage: false,
+          heapSpaces: []
+        },
+        nativeStack: [],
+        resourceUsage: {
+          free_memory: 0,
+          total_memory: 0,
+          rss: mu.rss || 0,
+          available_memory: 0,
+          userCpuSeconds: userSeconds,
+          kernelCpuSeconds: systemSeconds,
+          cpuConsumptionPercent: 0,
+          userCpuConsumptionPercent: 0,
+          kernelCpuConsumptionPercent: 0,
+          maxRss: mu.rss || 0,
+          pageFaults: { IORequired: 0, IONotRequired: 0 },
+          fsActivity: { reads: 0, writes: 0 }
+        },
+        uvthreadResourceUsage: {
+          userCpuSeconds: userSeconds,
+          kernelCpuSeconds: systemSeconds,
+          cpuConsumptionPercent: 0,
+          userCpuConsumptionPercent: 0,
+          kernelCpuConsumptionPercent: 0,
+          fsActivity: { reads: 0, writes: 0 }
+        },
+        libuv: [],
+        workers: [],
+        environmentVariables: p.report.excludeEnv ? {} : p.env,
+        /* No rlimit this container puts on a guest is less than unlimited. */
+        userLimits: {
+          core_file_size_blocks: limit(0),
+          data_seg_size_bytes: limit('unlimited'),
+          file_size_blocks: limit('unlimited'),
+          max_locked_memory_bytes: limit('unlimited'),
+          max_memory_size_bytes: limit('unlimited'),
+          open_files: limit('unlimited'),
+          stack_size_bytes: limit('unlimited'),
+          cpu_time_seconds: limit('unlimited'),
+          max_user_processes: limit('unlimited'),
+          virtual_memory_bytes: limit('unlimited')
+        },
+        sharedObjects: []
       };
     },
     directory: '',
@@ -400,6 +556,13 @@ export class NodeProcess extends Process {
     private readonly stackTraceLimit?: number;
     /** The `-e`/`-p` source as the line wrote it: the text node quotes back when the run fails. */
     private readonly evalScript?: string;
+    /**
+     * The `-e`/`-p` source is read as an ES module: `--input-type=module` said so, or the source is
+     * one only a module can hold -- `import.meta`, an `import` of a name, an `export` -- which is
+     * what makes node read it as one when `--input-type` was never given. A module source runs
+     * without the CommonJS wrapper, so it has no `require`, no `module` and no `__dirname`.
+     */
+    private readonly evalModule: boolean;
     /** The program `node -` has been piped so far, kept until the input ends and it can be run. */
     private stdinScriptText = '';
     /** The piped program has been handed to the guest; it is never run twice. */
@@ -500,6 +663,8 @@ export class NodeProcess extends Process {
         this.execArgv = run.execArgv;
         this.stackTraceLimit = run.stackTraceLimit;
         this.evalScript = run.evalScript;
+        this.evalModule = evalSource !== undefined
+            && (run.inputType === 'module' || (run.inputType === undefined && readsAsModule(evalSource)));
         this.currentCwd = cwd || CONTAINER_WORKDIR;
         this.fileSystem = fileSystem;
         this.networkManager = networkManager;
@@ -815,23 +980,28 @@ export class NodeProcess extends Process {
         }
     }
 
-    /** `process.report`, handed the `fs` builtin to write a report with: see `PROCESS_REPORT_SRC`. */
+    /** `process.report`, handed the `fs` and `os` builtins to write a report with: see `PROCESS_REPORT_SRC`. */
     private installProcessReport(): void {
         const context = this.context;
         if (context === undefined) return;
         let fs: QuickJSHandle | undefined;
+        let os: QuickJSHandle | undefined;
         let installer: QuickJSHandle | undefined;
         try {
-            const id = context.newString('fs');
-            fs = this.callApi('exportsOf', [id, context.true]);
-            id.dispose();
+            const fsId = context.newString('fs');
+            fs = this.callApi('exportsOf', [fsId, context.true]);
+            fsId.dispose();
+            const osId = context.newString('os');
+            os = this.callApi('exportsOf', [osId, context.true]);
+            osId.dispose();
             installer = context.unwrapResult(context.evalCode(PROCESS_REPORT_SRC, 'owc-report.js', { type: 'global' }));
-            const called = context.callFunction(installer, context.undefined, [fs]);
+            const called = context.callFunction(installer, context.undefined, [fs, os]);
             if (called.error) called.error.dispose(); else called.value.dispose();
         } catch {
             // a guest with no process object, or one whose fs cannot be reached: no report is put there
         } finally {
             fs?.dispose();
+            os?.dispose();
             installer?.dispose();
         }
     }
@@ -1323,11 +1493,66 @@ export class NodeProcess extends Process {
         }
     }
 
+    /**
+     * The modules `-r` / `--require` names, in the order the line named them.
+     *
+     * They are read out of `process.execArgv`, which holds each option in the words node was given
+     * it: `--require=./pre.js` in one word, `--require ./pre.js` in two.
+     */
+    private preloadSpecs(): string[] {
+        const specs: string[] = [];
+        for (let i = 0; i < this.execArgv.length; i++) {
+            const arg = this.execArgv[i];
+            const eq = arg.indexOf('=');
+            const name = eq < 0 ? arg : arg.slice(0, eq);
+            if (name !== '-r' && name !== '--require') continue;
+            if (eq >= 0) { specs.push(arg.slice(eq + 1)); continue; }
+            const next = this.execArgv[i + 1];
+            if (next === undefined) continue;
+            specs.push(next);
+            i++;
+        }
+        return specs;
+    }
+
+    /**
+     * Loads the modules `-r` / `--require` named, before the entry runs and before the REPL opens,
+     * as node loads them: a module the line names is required from the directory the process is in,
+     * and one that resolves to no file fails the run before anything else is read.
+     */
+    private runPreloads(): void {
+        const specs = this.preloadSpecs();
+        if (specs.length === 0) return;
+        const context = this.context!;
+        for (const spec of specs) {
+            const file = this.resolver.resolve(spec, this.currentCwd, 'require');
+            /* Node names the stack of a preload that is not there 'internal/preload', and the
+               module it could not find is the name the line wrote, not a path it resolved. */
+            if (file === undefined) {
+                throw new GuestFailure(`Error: Cannot find module '${spec}'\nRequire stack:\n- internal/preload`);
+            }
+            const id = context.newString(file);
+            let loaded: QuickJSHandle | undefined;
+            try {
+                loaded = this.callApi('exportsOf', [id, context.false]);
+            } finally {
+                id.dispose();
+                loaded?.dispose();
+            }
+        }
+    }
+
     private startEntry(entryPath: string | undefined): void | Promise<void> {
+        this.runPreloads();
         let started: void | Promise<void>;
         if (this.evalSource !== undefined) {
-            const source = this.context!.newString(this.evalSource);
-            started = this.guestCall('runEval', [source]);
+            if (this.evalModule) {
+                this.runEsmEval(this.evalSource);
+                started = this.drainJobs();
+            } else {
+                const source = this.context!.newString(this.evalSource);
+                started = this.guestCall('runEval', [source]);
+            }
         } else if (this.repl) {
             this.startRepl();
             started = this.drainJobs();
@@ -1373,6 +1598,30 @@ export class NodeProcess extends Process {
     private startRepl(): void {
         this.holdRef(1);
         this.callApi('startRepl', []).dispose();
+    }
+
+    /**
+     * A `-e`/`-p` source node reads as an ES module, run the way it runs a module file: the engine
+     * compiles it as one, so it has `import.meta` and no `require`, `module` or `__dirname`.
+     *
+     * Node names such a source `<cwd>/[eval1]` -- `[eval1]`, `[eval2]` and so on for each module it
+     * evaluates on the line -- and `import.meta.url` is that name as a file URL.
+     */
+    private runEsmEval(source: string): void {
+        const file = `${this.currentCwd}/[eval1]`;
+        const compiled = this.esmSource(source, file, true);
+        const result = this.context!.evalCode(compiled, file, { type: 'module' });
+        if (result.error) throw this.guestFailure(result.error);
+        const promise = result.value;
+        try {
+            this.drainJobs();
+            const state = this.context!.getPromiseState(promise);
+            if (state.type === 'rejected') throw this.guestFailure(state.error);
+        } catch (error) {
+            if (error instanceof GuestFailure) throw error;
+        } finally {
+            promise.dispose();
+        }
     }
 
     private runEsmEntry(entryPath: string): void {
