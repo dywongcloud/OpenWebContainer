@@ -57,33 +57,119 @@ export interface NodeRunOptions {
 const BAD_OPTION_EXIT = 9;
 
 /**
- * The long options node reads and this container has nothing to answer for: it emits no warnings to
- * suppress, it keeps no V8 heap a size could bound, it never aborts on an uncaught exception, and a
- * `-e` source is compiled in the goal the source itself asks for. Node accepts every one of them, so
- * a script written for node that shells out with one is accepted here too -- refusing them is what
- * turned each of `node --input-type=module`, `node --no-warnings` and the rest into a
- * `node: bad option` and an exit 9 where the host's own node ran the line.
+ * The long options node reads, and what it wants behind each: the table node itself reads, taken
+ * from the host's own `node --completion-bash` and from the answer the host's node gives each name.
+ * This container has nothing to answer for any of them -- it emits no warnings to suppress, it keeps
+ * no V8 heap a size could bound, and it never aborts on an uncaught exception -- so a script written
+ * for node that shells out with one is accepted here too, where refusing them is what turned each of
+ * `node --input-type=module`, `node --no-warnings` and the rest into a `node: bad option` and an
+ * exit 9 the host's own node never gave.
  *
- * Node reads a value behind an `=` and never in the argument after, so `--input-type module` is a
- * bad option on the host too; what is accepted here is the form node accepts.
+ * A name node does not know stays refused, as it does on the host: `node --nope` is a bad option
+ * there and here, and so is a `--no-<name>` for an option that is not a boolean one.
  */
-const IGNORED_LONG_OPTIONS = new Set([
-    '--abort-on-uncaught-exception',
-    '--conditions',
-    '--experimental-default-type',
-    '--input-type',
-    '--max-old-space-size',
-    '--max-semi-space-size',
-    '--no-deprecation',
-    '--no-warnings',
-    '--stack-size',
-    '--title',
-    '--trace-uncaught',
-    '--trace-warnings'
-]);
+const BOOLEAN_LONG_OPTIONS = new Set((
+    /* boolean: `--no-<name>` is accepted too */
+    '--abort-on-uncaught-exception --addons --allow-addons --allow-child-process ' +
+    '--allow-inspector --allow-wasi --allow-worker --async-context-frame --completion-bash ' +
+    '--cpu-prof --debug-arraybuffer-allocations --deprecation --disable-sigusr1 ' +
+    '--disable-wasm-trap-handler --disallow-code-generation-from-strings ' +
+    '--enable-etw-stack-walking --enable-network-family-autoselection --enable-source-maps ' +
+    '--entry-url --experimental-addon-modules --experimental-detect-module ' +
+    '--experimental-eventsource --experimental-global-navigator ' +
+    '--experimental-import-meta-resolve --experimental-inspector-network-resource ' +
+    '--experimental-network-inspection --experimental-print-required-tla ' +
+    '--experimental-repl-await --experimental-require-module --experimental-shadow-realm ' +
+    '--experimental-sqlite --experimental-strip-types --experimental-test-coverage ' +
+    '--experimental-test-module-mocks --experimental-transform-types --experimental-vm-modules ' +
+    '--experimental-websocket --experimental-webstorage --experimental-worker-inspection ' +
+    '--expose-gc --expose-internals --extra-info-on-fatal-exception --force-async-hooks-checks ' +
+    '--force-context-aware --force-node-api-uncaught-exceptions-policy --frozen-intrinsics ' +
+    '--global-search-paths --harmony-shadow-realm --heap-prof --insecure-http-parser ' +
+    '--interactive --interpreted-frames-native-stack --jitless --network-family-autoselection ' +
+    '--node-snapshot --openssl-legacy-provider --openssl-shared-config --pending-deprecation ' +
+    '--perf-basic-prof --perf-basic-prof-only-functions --perf-prof --perf-prof-unwinding-info ' +
+    '--permission --preserve-symlinks --preserve-symlinks-main --prof --report-compact ' +
+    '--report-exclude-env --report-exclude-network --report-on-fatalerror --report-on-signal ' +
+    '--report-uncaught-exception --require-module --strip-types --test-force-exit --test-only ' +
+    '--test-udp-no-try-send --test-update-snapshots --throw-deprecation --tls-max-v1.2 ' +
+    '--tls-max-v1.3 --tls-min-v1.0 --tls-min-v1.1 --tls-min-v1.2 --tls-min-v1.3 ' +
+    '--trace-deprecation --trace-env --trace-env-js-stack --trace-env-native-stack --trace-exit ' +
+    '--trace-promises --trace-sigint --trace-sync-io --trace-tls --trace-uncaught ' +
+    '--trace-warnings --track-heap-objects --use-bundled-ca --use-env-proxy --use-openssl-ca ' +
+    '--use-system-ca --v8-options --verify-base-objects --warnings --watch-preserve-output ' +
+    '--zero-fill-buffers '
+).split(/\s+/).filter((name) => name !== ''));
+
+const FLAG_LONG_OPTIONS = new Set((
+    /* accepted, but not negatable: node calls `--no-<name>` an invalid negation */
+    '--es-module-specifier-resolution --experimental-abortcontroller --experimental-fetch ' +
+    '--experimental-global-customevent --experimental-global-webcrypto ' +
+    '--experimental-json-modules --experimental-modules --experimental-quic ' +
+    '--experimental-report --experimental-specifier-resolution --experimental-test-snapshots ' +
+    '--experimental-top-level-await --experimental-wasi-unstable-preview1 ' +
+    '--experimental-wasm-modules --experimental-worker --http-parser --napi-modules ' +
+    '--node-memory-debug --trace-events-enabled '
+).split(/\s+/).filter((name) => name !== ''));
+
+const VALUED_LONG_OPTIONS = new Set((
+    /* valued: the value comes behind an `=`, or as the next argument */
+    '--allow-fs-read --allow-fs-write --build-snapshot --build-snapshot-config --conditions ' +
+    '--cpu-prof-dir --cpu-prof-interval --cpu-prof-name --debug --debug-brk --debug-port ' +
+    '--diagnostic-dir --disable-proto --disable-warning --dns-result-order --enable-fips ' +
+    '--env-file --env-file-if-exists --experimental-config-file ' +
+    '--experimental-default-config-file --experimental-loader --experimental-sea-config ' +
+    '--experimental-test-isolation --force-fips --heap-prof-dir --heap-prof-interval ' +
+    '--heap-prof-name --heapsnapshot-near-heap-limit --heapsnapshot-signal --icu-data-dir ' +
+    '--import --input-type --loader --localstorage-file --max-heap-size --max-http-header-size ' +
+    '--max-old-space-size --max-old-space-size-percentage --max-semi-space-size ' +
+    '--network-family-autoselection-attempt-timeout --openssl-config --prof-process ' +
+    '--redirect-warnings --report-dir --report-directory --report-filename --report-signal ' +
+    '--require --run --secure-heap --secure-heap-min --security-revert --security-reverts ' +
+    '--snapshot-blob --stack-size --test --test-concurrency --test-coverage-branches ' +
+    '--test-coverage-exclude ' +
+    '--test-coverage-functions --test-coverage-include --test-coverage-lines ' +
+    '--test-global-setup --test-isolation --test-name-pattern --test-reporter ' +
+    '--test-reporter-destination --test-rerun-failures --test-shard --test-skip-pattern ' +
+    '--test-timeout --title --tls-cipher-list --tls-keylog --trace-event-categories ' +
+    '--trace-event-file-pattern --trace-require-module --unhandled-rejections --use-largepages ' +
+    '--v8-pool-size --watch --watch-kill-signal --watch-path '
+).split(/\s+/).filter((name) => name !== ''));
 
 /** The one of those with an effect here: the bound it puts on the frames of a stack trace. */
 const STACK_TRACE_LIMIT = '--stack-trace-limit';
+
+/** True for a name in node's own table, whatever it wants behind it. */
+function isKnownOption(name: string): boolean {
+    return BOOLEAN_LONG_OPTIONS.has(name) || FLAG_LONG_OPTIONS.has(name) || VALUED_LONG_OPTIONS.has(name);
+}
+
+/** An option of node's own table, read with the value it wants, or undefined for a name it does not know. */
+interface KnownOption {
+    /** The option and its value, in node's own words: what `process.execArgv` is. */
+    words: string[];
+    /** The index of the last argument the option read: one past it when it took the argument after. */
+    at: number;
+    /** What node refuses the line with when the value the option wants is not there. */
+    refusal?: string;
+}
+
+/**
+ * One option of node's table, as this line wrote it. A valued one carries its value behind an `=`, or
+ * takes the argument after when that argument is not itself an option -- `--title foo`,
+ * `--require ./pre.js` -- and is refused as incomplete when the line ends or an option follows, the
+ * way the host refuses it.
+ */
+function knownOption(arg: string, name: string, value: string | undefined, args: string[], at: number): KnownOption | undefined {
+    if (VALUED_LONG_OPTIONS.has(name)) {
+        if (value !== undefined) return { words: [arg], at };
+        const next = args[at + 1];
+        if (next === undefined || isOption(next)) return { words: [], at, refusal: `${name} requires an argument` };
+        return { words: [name, next], at: at + 1 };
+    }
+    if (BOOLEAN_LONG_OPTIONS.has(name) || FLAG_LONG_OPTIONS.has(name)) return { words: [arg], at };
+    return undefined;
+}
 
 /** An argument node reads as one of its own options: a dash that is not the stdin `-` or the `--` that ends them. */
 function isOption(arg: string | undefined): boolean {
@@ -158,7 +244,28 @@ export function nodeCommand(args: string[]): NodeCommand {
             if (name === '--version') { version = true; execArgv.push(arg); continue; }
             if (name === '--help') { help = true; execArgv.push(arg); continue; }
             if (name === '--check') { check = true; execArgv.push(arg); continue; }
-            if (IGNORED_LONG_OPTIONS.has(name)) { execArgv.push(arg); continue; }
+            const known = knownOption(arg, name, value, args, i);
+            if (known !== undefined) {
+                if (known.refusal !== undefined) {
+                    errors.push({ text: known.refusal, badOption: false });
+                    break;
+                }
+                execArgv.push(...known.words);
+                i = known.at;
+                continue;
+            }
+            if (name.startsWith('--no-')) {
+                /* `--no-<name>` is the false of a boolean option, and only of one: node answers an
+                   option that is not boolean with the negation it refuses, not with `bad option`. */
+                const base = '--' + name.slice('--no-'.length);
+                if (BOOLEAN_LONG_OPTIONS.has(base)) { execArgv.push(arg); continue; }
+                if (isKnownOption(base)) {
+                    errors.push({ text: `${name} is an invalid negation because it is not a boolean option`, badOption: true });
+                    continue;
+                }
+                errors.push({ text: `bad option: ${arg}`, badOption: true });
+                continue;
+            }
             if (name === STACK_TRACE_LIMIT) {
                 /* Node reads the bound behind an `=` and nowhere else, and it is a count of frames:
                    anything that is not one is a bad option, as it is on the host. */
@@ -201,6 +308,19 @@ export function nodeCommand(args: string[]): NodeCommand {
         if (arg === '-v') { version = true; execArgv.push(arg); continue; }
         if (arg === '-h') { help = true; execArgv.push(arg); continue; }
         if (arg === '-c') { check = true; execArgv.push(arg); continue; }
+        if (arg === '-r') {
+            /* `-r` is node's `--require`: a module to load before the entry. This container loads
+               nothing for it, as it loads nothing for any other option of node's, but the line is
+               read as node reads one -- the module is its value, and a line without one is refused. */
+            const taken = takeScript(args, i);
+            if (taken.script === undefined) {
+                errors.push({ text: `${arg} requires an argument`, badOption: false });
+                break;
+            }
+            execArgv.push(arg, taken.script);
+            i = taken.at;
+            continue;
+        }
         if (arg === '-p' || arg === '-pe') {
             print = true;
             execArgv.push(arg);
