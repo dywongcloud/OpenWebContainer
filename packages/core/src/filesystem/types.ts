@@ -2,6 +2,10 @@
  * Result of stat-ing a path in the virtual file system
  */
 export interface PathStat {
+    /**
+     * A character device under `/dev` reports `file`, the only other kind this interface names, and
+     * is told apart by its `mode`: it carries `S_IFCHR`, the way a host's `/dev/null` carries it.
+     */
     type: 'file' | 'dir';
     size: number;
     mtimeMs: number;
