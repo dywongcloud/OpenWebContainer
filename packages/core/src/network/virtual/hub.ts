@@ -202,8 +202,12 @@ export class VirtualNetwork {
             throw new VirtualNetworkError('ENETUNREACH', `connect ENETUNREACH ${destination}:${request.port}`);
         }
         const listener = this.findEndpoint('tcp', 'IPv4', destination, request.port);
+        /* Port 0 is not a destination, so a connect to it never reaches a listener: the kernel
+           refuses it against the address alone (EADDRNOTAVAIL) rather than reporting a peer that
+           declined (ECONNREFUSED), which is what Node on a dual-stack host shows for it. */
         if (!listener) {
-            throw new VirtualNetworkError('ECONNREFUSED', `connect ECONNREFUSED ${destination}:${request.port}`);
+            throw new VirtualNetworkError(request.port === 0 ? 'EADDRNOTAVAIL' : 'ECONNREFUSED',
+                `connect ${request.port === 0 ? 'EADDRNOTAVAIL' : 'ECONNREFUSED'} ${destination}:${request.port}`);
         }
         const localPort = request.localPort || this.allocatePort('tcp', 'IPv4', '127.0.0.1');
         const client: Connection = {

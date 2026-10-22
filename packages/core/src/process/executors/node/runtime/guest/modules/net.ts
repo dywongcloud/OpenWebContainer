@@ -163,11 +163,18 @@ function netListenHub(host) {
 function netSystemError(cause, syscall, address, port) {
   var code = cause && typeof cause.code === 'string' ? cause.code : 'ERR_NET_FAILURE';
   var where = port === undefined ? address : address + ':' + port;
+  /* Port 0 is not a destination, so the kernel's EADDRNOTAVAIL names no peer port: Node reports
+     'connect EADDRNOTAVAIL 127.0.0.1' and leaves err.port unset. (Node appends the local address
+     its socket had already bound, '- Local (0.0.0.0:53326)', whose port is the host's own
+     ephemeral choice; no other implementation can print the same one.) */
+  var unnamed = syscall === 'connect' && code === 'EADDRNOTAVAIL';
   var text;
   if (syscall === 'listen' && NET_REASON_TEXT[code]) {
     text = 'listen ' + code + ': ' + NET_REASON_TEXT[code] + ' ' + where;
   } else if (syscall === 'getaddrinfo') {
     text = 'getaddrinfo ' + code + ' ' + address;
+  } else if (unnamed) {
+    text = 'connect ' + code + ' ' + address;
   } else {
     text = syscall + ' ' + code + ' ' + where;
   }
@@ -179,8 +186,18 @@ function netSystemError(cause, syscall, address, port) {
     err.hostname = address;
   } else {
     err.address = address;
-    if (port !== undefined) err.port = port;
+    if (!unnamed && port !== undefined) err.port = port;
   }
+  return err;
+}
+
+/** What Node hands back when every address of a name refused: an AggregateError of the attempts. */
+function netAggregate(failures) {
+  var first = failures[0];
+  var code = first && typeof first.code === 'string' ? first.code : 'ERR_NET_FAILURE';
+  if (typeof AggregateError !== 'function') return netError(Error, code, '');
+  var err = new AggregateError(failures, '');
+  err.code = code;
   return err;
 }
 
@@ -190,6 +207,21 @@ function netRefresh(owner) {
   if (want === owner._holding) return;
   owner._holding = want;
   holdRef(want ? 1 : -1);
+}
+
+/**
+ * Every address a connect tries, in the order Node tries them, or null when the name has to be
+ * resolved first. A loopback name is dual-stack: getaddrinfo answers '::1' before '127.0.0.1' on a
+ * dual-stack host and Node attempts each in turn, so connecting to 'localhost' -- or to no host at
+ * all, which means 'localhost' -- is two attempts, and failing both is an AggregateError.
+ */
+function netConnectList(host, family) {
+  var name = host === undefined || host === null || host === '' ? 'localhost' : String(host);
+  if (netIsIP(name)) return [name];
+  if (name.toLowerCase() !== 'localhost') return null;
+  if (family === 6) return ['::1'];
+  if (family === 4) return ['127.0.0.1'];
+  return ['::1', '127.0.0.1'];
 }
 
 /** Resolves a host to an address: IP literals and the name table synchronously, other names via dns.lookup. */
@@ -220,7 +252,15 @@ function netResolve(host, family, done, lookup) {
     }
     return;
   }
-  var mapped = callCap('net.resolveHost', { name: name });
+  var mapped = null;
+  try {
+    mapped = callCap('net.resolveHost', { name: name });
+  } catch (failure) {
+    /* A container that carries no /etc/hosts raises ENOENT for the file while reading it. That says
+       only that this name is not one the table can answer -- it is not a failure of the connect --
+       so the name falls through to dns.lookup, exactly as any other unknown name does. */
+    mapped = null;
+  }
   if (typeof mapped === 'string') {
     done(null, mapped);
     return;
@@ -373,33 +413,51 @@ BF['net'] = function () {
       this._ensureTarget();
       netRefresh(this);
       var self = this;
-      netResolve(args.host, args.family, function (failure, address) {
+      /* A name with two addresses is tried on both, as Node's happy-eyeballs does: only the caller's
+         own lookup changes that, since it is the caller who says which addresses a name has. */
+      var listed = typeof args.lookup === 'function' ? null : netConnectList(args.host, args.family);
+      var begin = function (failure, address) {
         if (failure) {
           self.destroy(failure);
           return;
         }
-        self._doConnect(address, port, args.localPort);
-      }, args.lookup);
+        self._doConnect(listed || [address], port, args.localPort);
+      };
+      try {
+        netResolve(args.host, args.family, begin, args.lookup);
+      } catch (failure) {
+        /* Nothing about a name may leave a socket holding the event loop open, so a failure found
+           before the connect was ever begun is delivered the way Node delivers one: by destroying
+           the socket, which releases the loop and reports the error on a later tick. */
+        self.destroy(failure);
+      }
       return this;
     }
 
-    _doConnect(address, port, localPort) {
-      var res;
-      try {
-        res = callCap('net.connect', { address: address, port: port, targetId: this._targetId, localPort: localPort || 0 });
-      } catch (cause) {
-        this.destroy(netSystemError(cause, 'connect', address, port));
+    /* Tries each address in turn. One address failing is that error; every address failing is the
+       AggregateError Node reports for a name the host tried on both of its families. */
+    _doConnect(addresses, port, localPort) {
+      var failures = [];
+      for (var i = 0; i < addresses.length; i++) {
+        var res;
+        try {
+          res = callCap('net.connect', { address: addresses[i], port: port, targetId: this._targetId, localPort: localPort || 0 });
+        } catch (cause) {
+          failures.push(netSystemError(cause, 'connect', addresses[i], port));
+          continue;
+        }
+        this._hubId = res.id;
+        this.localAddress = res.localAddress;
+        this.localPort = res.localPort;
+        this.localFamily = netFamilyName(res.localAddress);
+        this.remoteAddress = res.remoteAddress;
+        this.remotePort = res.remotePort;
+        this.remoteFamily = netFamilyName(res.remoteAddress);
+        netRefresh(this);
+        this._flushPending();
         return;
       }
-      this._hubId = res.id;
-      this.localAddress = res.localAddress;
-      this.localPort = res.localPort;
-      this.localFamily = netFamilyName(res.localAddress);
-      this.remoteAddress = res.remoteAddress;
-      this.remotePort = res.remotePort;
-      this.remoteFamily = netFamilyName(res.remoteAddress);
-      netRefresh(this);
-      this._flushPending();
+      this.destroy(failures.length === 1 ? failures[0] : netAggregate(failures));
     }
 
     /* The third argument is the payload on the binary channel, an ArrayBuffer the host read out of
