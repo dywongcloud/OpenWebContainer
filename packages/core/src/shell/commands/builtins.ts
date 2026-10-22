@@ -47,6 +47,57 @@ export type SimpleCommandRunner = (
 ) => { stdout: string; stderr: string; exitCode: number };
 
 /**
+ * The words `echo` writes, with the escapes the host's `/bin/sh` writes. That shell is bash running
+ * in POSIX mode, which turns `xpg_echo` on: every operand has its `\n`, `\t`, `\\` and friends
+ * translated, `\0nnn` and `\xHH` become their character, `\c` ends the line without a newline, and
+ * an escape it has no meaning for keeps its backslash. Neither `-n` nor `-e` is a flag there, so
+ * they are words like any other.
+ *
+ * Both hosts of this file's builtins keep their own `echo`, so they share this one body rather than
+ * each growing a second, slightly different, reading of the same escapes.
+ */
+export function echoWords(args: string[]): string {
+    let out = '';
+    let stopped = false;
+    for (let i = 0; i < args.length && !stopped; i++) {
+        if (i > 0) out += ' ';
+        const word = args[i];
+        for (let j = 0; j < word.length; j++) {
+            if (word[j] !== '\\' || j + 1 >= word.length) { out += word[j]; continue; }
+            const escape = word[++j];
+            switch (escape) {
+                case 'a': out += '\u0007'; break;
+                case 'b': out += '\b'; break;
+                case 'c': stopped = true; break;
+                case 'f': out += '\f'; break;
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case 'v': out += '\u000b'; break;
+                case '\\': out += '\\'; break;
+                case '0': {
+                    const octal = /^[0-7]{1,3}/.exec(word.slice(j + 1));
+                    if (octal === null) { out += '\u0000'; break; }
+                    out += String.fromCharCode(parseInt(octal[0], 8));
+                    j += octal[0].length;
+                    break;
+                }
+                case 'x': {
+                    const hex = /^[0-9a-fA-F]{1,2}/.exec(word.slice(j + 1));
+                    if (hex === null) { out += '\\x'; break; }
+                    out += String.fromCharCode(parseInt(hex[0], 16));
+                    j += hex[0].length;
+                    break;
+                }
+                default: out += '\\' + escape; break;
+            }
+            if (stopped) break;
+        }
+    }
+    return stopped ? out : out + '\n';
+}
+
+/**
  * `cmd &` where this engine parsed the `&` -- inside an `if`, a `for`, a `while`, a `case`, a group
  * or a subshell, which is every `&` the host's own line splitter never sees. Registering one is the
  * host's to do: the table `jobs` and `wait` read is the host's, and so are the words a job is run
@@ -1052,8 +1103,8 @@ function parseValueWord(text: string): Word {
 }
 
 /** Lexes a bare text into word parts (no operator handling): used for assignment values. */
-function lexParts(text: string, keepSpaces = false): Part[] {
-    const lexer = new Parser(text, null, keepSpaces);
+function lexParts(text: string, keepSpaces = false, keepParens = false): Part[] {
+    const lexer = new Parser(text, null, keepSpaces, keepParens);
     const word = lexer.readWordPublic();
     return word ?? [];
 }
@@ -1063,18 +1114,32 @@ function modifierText(text: string): Word {
     return [{ t: 'dq', parts: lexParts(text, true) }];
 }
 
+/**
+ * The text of an arithmetic expression: whitespace *and parentheses* belong to it.
+ *
+ * `readWord` stops on `(` and `)` because they open a subshell, so the modifier's own lexing cut
+ * `$(( 2 * (3 + 1) ))` off at the first paren and left `2 * ` -- and `$(( (3) ))` empty -- which
+ * failed as `syntax error: operand expected`.
+ */
+function arithText(text: string): Word {
+    return [{ t: 'dq', parts: lexParts(text, true, true) }];
+}
+
 class Parser {
     private pos = 0;
     /** True when whitespace must stay inside the word: `${x:-a b}` and `$((a + b))`. */
     private readonly keepSpaces: boolean;
+    /** True when parentheses must stay inside the word too: an arithmetic expression's own `( )`. */
+    private readonly keepParens: boolean;
     private static readonly STOP = new Set([' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>']);
     private heredocs: { delimiter: string; strip: boolean; expand: boolean; target: Redirect }[] = [];
     private expandedAliases = new Set<string>();
 
-    constructor(src: string, state: ShellState | null, keepSpaces = false) {
+    constructor(src: string, state: ShellState | null, keepSpaces = false, keepParens = false) {
         this.src = src;
         this.state = state;
         this.keepSpaces = keepSpaces;
+        this.keepParens = keepParens;
     }
 
     private src: string;
@@ -1350,7 +1415,7 @@ class Parser {
         };
         while (this.pos < this.src.length) {
             const ch = this.src[this.pos];
-            if (Parser.STOP.has(ch) && !(this.keepSpaces && (ch === ' ' || ch === '\t'))) break;
+            if (Parser.STOP.has(ch) && !(this.keepSpaces && (ch === ' ' || ch === '\t')) && !(this.keepParens && (ch === '(' || ch === ')'))) break;
             if (ch === '\\') {
                 const next = this.src[this.pos + 1];
                 if (next === '\n') {
@@ -4473,32 +4538,52 @@ const SIGNAL_DESCRIPTIONS: Record<string, string> = {
     QUIT: 'Quit',
     ILL: 'Illegal instruction',
     TRAP: 'Trace/breakpoint trap',
-    ABRT: 'Abort',
+    ABRT: 'Abort trap',
     FPE: 'Floating point exception',
     KILL: 'Killed',
     BUS: 'Bus error',
     SEGV: 'Segmentation fault',
     PIPE: 'Broken pipe',
     ALRM: 'Alarm clock',
-    TERM: 'Terminated'
+    TERM: 'Terminated',
+    USR1: 'User defined signal 1',
+    USR2: 'User defined signal 2'
 };
 
 /**
- * The signal `kill` was asked for: `-TERM`, `-SIGTERM` and `-15` are all the same one, and TERM is
- * the one `kill` sends when it is given none.
+ * The signal word `kill` was given: `-TERM` and `-15`, and the word behind `-s` or `-n`. Null when
+ * no option was given at all, which is the TERM a bare `kill` sends.
  */
-function killSignal(args: string[]): { number: number; name: string } {
-    for (const arg of args) {
-        if (/^-[0-9]+$/.test(arg)) {
-            const number = Number.parseInt(arg.slice(1), 10);
-            return { number, name: signalNames()[number - 1] ?? '' };
-        }
-        const named = /^-?(?:SIG)?([A-Za-z]+)$/.exec(arg);
-        if (named === null) continue;
-        const at = signalNames().indexOf(named[1].toUpperCase());
-        if (at !== -1) return { number: at + 1, name: signalNames()[at] };
+function killSignalWord(args: string[]): string | null {
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '-s' || arg === '-n') return args[i + 1] ?? '';
+        if (arg.startsWith('-') && arg !== '-') return arg.slice(1);
     }
-    return { number: 15, name: 'TERM' };
+    return null;
+}
+
+/**
+ * The signal `kill` was asked for: `-TERM`, `-15`, `-s TERM` and `-n 15` are all the same one, and
+ * TERM is the one `kill` sends when it is given none.
+ *
+ * Null is a specification the host refuses: bash 3.2 rejects the `SIG` prefix outright, so both
+ * `kill -SIGTERM` and `kill -s SIGTERM` answer `invalid signal specification`, and it rejects a name
+ * no signal has. A name may carry a digit -- `-USR1` is a signal, and a pattern of letters only
+ * silently turned it into the default TERM.
+ */
+function killSignal(args: string[]): { number: number; name: string } | null {
+    const word = killSignalWord(args);
+    if (word === null) return { number: 15, name: 'TERM' };
+    if (/^SIG/i.test(word)) return null;
+    if (/^[0-9]+$/.test(word)) {
+        const number = Number.parseInt(word, 10);
+        // 0 is the "does it exist" signal: `kill -0` sends nothing.
+        return number <= signalNames().length ? { number, name: signalNames()[number - 1] ?? '' } : null;
+    }
+    if (!/^[A-Za-z][A-Za-z0-9]*$/.test(word)) return null;
+    const at = signalNames().indexOf(word.toUpperCase());
+    return at === -1 ? null : { number: at + 1, name: signalNames()[at] };
 }
 
 /**
@@ -4507,19 +4592,35 @@ function killSignal(args: string[]): { number: number; name: string } {
  * it was started from -- a subshell carrying its own parens, which is how a host prints one.
  */
 function jobTerminatedNotice(state: ShellState, job: ShellJob, signal: { number: number; name: string }): string {
+    /* A job SIGINT or SIGPIPE ended gets no notice at all from a non-interactive bash: it names
+       SIGTERM, SIGKILL, SIGHUP and the rest, and stays silent on those two. */
+    if (signal.number === 2 || signal.number === 13) return '';
     const description = SIGNAL_DESCRIPTIONS[signal.name] ?? signal.name;
-    return `${diagnosticPrefix(state)}${job.pid} ${description}: ${signal.number}          ${job.text}\n`;
+    const label = `${description}: ${signal.number}`;
+    /* The host right-aligns the signal to one column, so `Hangup: 1` and `Killed: 9` both start
+       their `( exit 3 )` at the same place; a label too long for the column keeps a single space. */
+    const pad = ' '.repeat(Math.max(1, 24 - label.length));
+    return `${diagnosticPrefix(state)}${job.pid} ${label}${pad}${job.text}\n`;
 }
 
 export function killJobSpecs(state: ShellState, args: string[]): CommandResult {
+    const signal = killSignal(args);
+    /* A specification the host refuses: `kill -SIGTERM %1` is `kill: SIGTERM: invalid signal
+       specification` and status 1, and nothing is signalled. */
+    if (signal === null) {
+        return { stdout: '', stderr: `${diagnosticPrefix(state)}kill: ${killSignalWord(args) ?? ''}: invalid signal specification\n`, exitCode: 1 };
+    }
+    /* `kill -0` only asks whether the job exists: bash sends nothing, leaves the job running and
+       reports success, so a `wait` behind it still sees the job's own status -- not 128 + 0. */
+    const existenceOnly = signal.number === 0;
     let stderr = '';
     let exitCode = 0;
-    const signal = killSignal(args);
     for (const arg of args) {
         if (!arg.startsWith('%')) {
             /* A pid of this shell's own job, as `kill $!` names one: it is over, with the status a
                process killed by SIGTERM leaves, and `kill` reports the success a host reports. */
             if (isPendingJobPid(state, arg)) {
+                if (existenceOnly) continue;
                 const pid = Number.parseInt(arg, 10);
                 const job = state.jobs.find((entry) => entry.pid === pid && !entry.done);
                 if (job !== undefined) {
@@ -4537,6 +4638,7 @@ export function killJobSpecs(state: ShellState, args: string[]): CommandResult {
             exitCode = 1;
             continue;
         }
+        if (existenceOnly) continue;
         job.done = true;
         job.exitCode = 128 + signal.number;
         job.terminated = true;

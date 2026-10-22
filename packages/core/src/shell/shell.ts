@@ -19,6 +19,7 @@ import {
 import {
     COMMANDS as SHELL_BUILTIN_UTILS,
     createShellState,
+    echoWords,
     formatJobText,
     getRunner,
     runPendingJobs,
@@ -493,8 +494,9 @@ export class Shell implements IShell {
 
             try {
                 if (redirect.type === '>>') {
-                    // Append to file
-                    const existingContent = this.fileSystem.readFile(filePath) || '';
+                    // Append to file; a target no file has yet starts empty, as it does on the host
+                    let existingContent = '';
+                    try { existingContent = this.fileSystem.readFile(filePath) ?? ''; } catch { existingContent = ''; }
                     this.fileSystem.writeFile(filePath, existingContent + output);
                 } else {
                     // Overwrite file
@@ -698,7 +700,7 @@ export class Shell implements IShell {
         try {
             switch (command) {
                 case 'echo':
-                    return ok(args.join(' ') + '\n');
+                    return ok(echoWords(args));
                 case 'true':
                     return ok();
                 case 'false':
@@ -1048,7 +1050,7 @@ export class Shell implements IShell {
     }
 
     private async echo(args: string[]): Promise<ShellCommandResult> {
-        return this.success(args.join(' ') + '\n');
+        return this.success(echoWords(args));
     }
 
     /*

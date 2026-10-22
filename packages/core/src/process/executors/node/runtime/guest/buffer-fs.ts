@@ -1406,6 +1406,20 @@ BF.fs = function () {
     rec.dirty = true;
   };
 
+  /* The same truncation by name: truncateSync was the one call of the pair the file system did not
+     have, so a package that shortens a file by path threw "not a function" where the host shortened
+     it. It is the descriptor form over an 'r+' open, so a path that is not there fails with the
+     ENOENT the open gives -- the same error, with the same path, that Node reports. */
+  fs.truncateSync = function (p, len) {
+    var size = truncateLength(len);
+    var fd = fs.openSync(p, 'r+');
+    try {
+      fs.ftruncateSync(fd, size);
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+
   fs.fchmodSync = function (fd, mode) {
     var rec = descriptorOf(fd, 'fchmod');
     if (!statOf(rec.path)) throw fsError('ENOENT', 'fchmod', rec.path);
