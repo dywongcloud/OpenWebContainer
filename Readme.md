@@ -220,40 +220,44 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   `end` handler of a stream written once and ended, `writableFinished` is true on host Node 24.15 and
   false here. `zlib`'s own `flush(callback)` works around it; a caller reading those flags does not.
 
-### ⚠️ Guest network throughput, and why it is bounded by the capability boundary
+### ⚠️ Guest network throughput, and where it stands now
 
 One loopback transfer per cell, 64 KiB writes, measured in the container and beside it the same
-script on host Node 24.15. The machine was **not** idle (load average 14, other agents running), so
-treat these as a floor, not a peak.
+script on host Node 24.15. The machine was **not** idle for any run (load average 14 and worse), so
+treat every column as a floor, not a peak -- the host column moves with the machine too, which is
+why one run reads 2000 MiB/s and another 615.
 
-| 16 MiB, both ends in the container | before | after | host Node |
-| --- | --- | --- | --- |
-| TCP upload | 0.69 MiB/s (23.2 s) | 1.42 MiB/s (11.3 s) | 2000 MiB/s (0.008 s) |
-| TCP download | 0.63 MiB/s (25.5 s) | 1.31 MiB/s (12.2 s) | 2000 MiB/s (0.008 s) |
-| HTTP/1.1 upload | 0.50 MiB/s (32.0 s) | 1.11 MiB/s (14.5 s) | 1455 MiB/s (0.011 s) |
-| HTTP/1.1 download | 0.69 MiB/s (23.1 s) | 1.41 MiB/s (11.3 s) | 1600 MiB/s (0.010 s) |
-| HTTP/2 upload | 0.55 MiB/s (28.9 s) | 1.03 MiB/s (15.5 s) | 696 MiB/s (0.023 s) |
-| HTTP/2 download | 0.50 MiB/s (31.9 s) | 1.05 MiB/s (15.3 s) | 762 MiB/s (0.021 s) |
+16 MiB in the container, in the order the measurements were taken:
 
-Every transport moved together, and throughput was flat at ~0.71 MiB/s from 4 KiB to 1 MiB chunk
-sizes, so the cost is per byte and shared by all of them: not a per-message overhead, not a
-flow-control window (HTTP/2's window would show up as a chunk-size effect) and not a timer
-granularity. Profiling put 88% of it in the guest's own base64 codec
-(`process/executors/node/runtime/guest/codec.ts`), not in the hub: `decodeBase64` searched the
+| | codec as written | + codec fix | + binary channel | host Node, same run |
+| --- | --- | --- | --- | --- |
+| TCP upload | 0.69 MiB/s (23.2 s) | 1.42 (11.3 s) | 381 (0.042 s) | 615 (0.026 s) |
+| TCP download | 0.63 (25.5 s) | 1.31 (12.2 s) | 381 (0.042 s) | 500 (0.032 s) |
+| HTTP/1.1 upload | 0.50 (32.0 s) | 1.11 (14.5 s) | 203 (0.079 s) | 516 (0.031 s) |
+| HTTP/1.1 download | 0.69 (23.1 s) | 1.41 (11.3 s) | 372 (0.043 s) | 516 (0.031 s) |
+| HTTP/2 upload | 0.55 (28.9 s) | 1.03 (15.5 s) | 9.4 (1.697 s) | 200 (0.080 s) |
+| HTTP/2 download | 0.50 (31.9 s) | 1.05 (15.3 s) | 9.5 (1.679 s) | 203 (0.079 s) |
+
+**The first step: the cost was the guest's own base64 codec.** Throughput was flat at ~0.71 MiB/s
+from 4 KiB to 1 MiB chunk sizes, so the cost was per byte and shared by every transport -- not a
+per-message overhead, not a flow-control window and not a timer granularity. Profiling put 88% of it
+in `process/executors/node/runtime/guest/codec.ts`, not in the hub: `decodeBase64` searched the
 64-character alphabet with `indexOf` once per input character, and `encodeBase64` pushed one
-character at a time into an array as long as its own output. That measured 22.7 ms to encode and
-53.5 ms to decode 64 KiB -- 76.2 of the 87 ms one 64 KiB chunk cost end to end. The host side was
-never the cost: it uses `btoa`/`atob`. A lookup table for the alphabet and a table of two-character
-pieces for the encoder cut those to 10.3 ms and 21.2 ms, and end-to-end throughput by 1.9x to 2.2x.
+character at a time into an array as long as its own output -- 22.7 ms to encode and 53.5 ms to
+decode 64 KiB, 76.2 of the 87 ms one 64 KiB chunk cost. The host side was never the cost; it uses
+`btoa`/`atob`. A lookup table and a table of two-character pieces cut those to 10.3 ms and 21.2 ms,
+and end-to-end throughput by 1.9x to 2.2x.
 
-**What is left is inherent to the boundary and is recorded rather than fixed.** Capability arguments
-are JSON, so bytes have to cross as text: writing 64 KiB still means encoding it in QuickJS, handing
-87 KB of JSON to the host and decoding it again in the guest, and after the fix that is still 31 of
-the 46 ms a chunk costs. JSON marshalling was measured and is not it (0.52 ms per 87 KB); the
-remaining ~0.21 ms per KiB is spread across the guest's buffer handling and the delivery macrotask
-and was not attributed further. Getting closer to host speed means a binary channel across the
-capability boundary, which the guest/host bridge does not offer, so guest throughput stands at about
-1 MiB/s and is reported as measured.
+**The second step: what was left was the boundary, and it turned out not to be inherent.** Capability
+arguments are JSON, so bytes had to cross as text, and after the codec fix that was still 31 of the
+46 ms a chunk cost. `callCapBytes` gave the bridge a binary channel and `net.write` now hands the
+chunk over as bytes instead of base64, which is what took TCP and HTTP/1.1 to within about 1.5x of
+host Node.
+
+**HTTP/2 is now the outlier and is recorded rather than fixed.** At ~9.4 MiB/s it is about 20x
+behind host Node and about 40x behind this container's own HTTP/1.1 over the identical bridge, so
+the remaining cost is in the HTTP/2 implementation rather than in the transport. It is filed, not
+fixed, here.
 
 ### 🚧 In Progress
 
