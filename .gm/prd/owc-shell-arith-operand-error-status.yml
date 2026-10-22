@@ -1,7 +1,0 @@
-id: owc-shell-arith-operand-error-status
-subject: '`x=$((1+))` exits 1 where a host exits 127, and names no expression'
-description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4). `x=$((1+))`: host stderr "/bin/sh: 1+: syntax error: operand expected (error token is \"+\")\n" exit 127; container stderr "syntax error: operand expected\n" exit 1. Two things differ, not one: the status (a host reports a bad arithmetic substitution as 127, the status of a command it could not run, where the container reports 1), and the diagnostic, which on a host is prefixed with the expression it evaluated and names the offending token. Fix site: the arithmetic evaluator in packages/core/src/shell/commands/builtins.ts (readArith / evalArith) and the status its error returns.'
-witness_plan: Run `x=$((1+))` on both sides; exit must be 127 and stderr must name `1+` and the `+` token.
-session_id: adv2-judge-shell-diag-4
-owner: adv2-judge-shell-diag-4
-status: pending

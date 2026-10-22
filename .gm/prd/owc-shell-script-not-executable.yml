@@ -1,0 +1,8 @@
+id: owc-shell-script-not-executable
+description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4b), host /bin/sh (bash 3.2) against the container''s sh, with a 0755 file `execok.sh` holding `#!/bin/sh` newline `echo ran` copied into /app. `./execok.sh` is host stdout "ran\n" stderr "" exit 0 and container stdout "" stderr "./execok.sh: cannot run here: it is a script, which only a child can run" exit 127 -- and that stderr carries no trailing newline, where every other diagnostic of the shell''s does. The container has no child to run a script with, so this is the architecture''s own limit rather than a message to change. Fix site: the executor map in packages/core/src/process/executors/node/runtime/capabilities/child.ts, which answers ENOENT for a name that has an executor only when it is `node`, a `.js` or `sh`.'
+owner: lanmower
+rule_bindings: []
+session_id: adv3-judge-shell-diag-4
+subject: a file with a shebang and the execute bit cannot be run
+witness_plan: Write a 0755 `execok.sh` that echoes `ran`, then run `./execok.sh` on both sides; stdout must be `ran` and the status 0.
+status: pending

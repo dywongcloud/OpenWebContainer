@@ -1,7 +1,0 @@
-id: owc-shell-syntax-error-source-line
-subject: a syntax error echoes the whole script instead of the line it is on, and nothing before it runs
-description: 'Re-measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4). The row was closed as wording only; it is not. `echo a\nif; then` on a host prints stdout "a\n" then stderr "/bin/sh: -c: line 1: syntax error near unexpected token `;'\n/bin/sh: -c: line 1: `if; then'\n" exit 2 -- the host parses and runs as it goes, so `echo a` has already run and the echoed line is the one that failed. The container prints stdout "" and stderr "syntax error near unexpected token `newline'\n`echo a\nif; then'\n": it parses the whole script before running any of it, and echoes the whole script as the source line. Two more shapes echo a source line the host never writes at all: `((1+)` and `case x in` are one stderr line on a host and gain a second "`((1+)'" / "`case x in'" line in the container. Fixing this needs parsing to interleave with execution, not a message change.'
-witness_plan: Run `echo a\nif; then` on both sides; stdout must be "a\n" and the echoed source line must be `if; then`, not the whole script.
-session_id: adv2-judge-shell-diag-4
-owner: adv2-judge-shell-diag-4
-status: pending
