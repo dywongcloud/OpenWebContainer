@@ -31,6 +31,19 @@ function constructorNameOf(obj) {
   return ctor && ctor.name ? ctor.name : '';
 }
 
+/* A null-prototype object is named by its Symbol.toStringTag, not by 'Object' -- that is why a
+   module namespace prints as '[Module: null prototype]' where an untagged one prints as
+   '[Object: null prototype]'. */
+function nullPrototypeTagOf(obj) {
+  var tag = obj[Symbol.toStringTag];
+  return typeof tag === 'string' && tag !== '' ? tag : 'Object';
+}
+
+/* The symbol Node hands a class that wants to write its own inspect output. A value carrying one
+   is printed exactly as that function writes it, which is why a Response prints its fields where
+   an ordinary object of the same shape would print nothing at all. */
+var INSPECT_CUSTOM = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
+
 function inspectValue(value, opts) {
   var maxDepth = opts && typeof opts.depth === 'number' ? opts.depth : 2;
   var stack = [];
@@ -53,6 +66,13 @@ function inspectValue(value, opts) {
     if (v instanceof RegExp) return String(v);
     if (typeof Promise !== 'undefined' && v instanceof Promise) return 'Promise { <pending> }';
 
+    /* A value that writes its own output wins: Node asks the custom function before it looks at
+       the object's own keys, which is the whole of what a Response or a Headers prints. */
+    if (INSPECT_CUSTOM !== undefined && typeof v[INSPECT_CUSTOM] === 'function') {
+      var written = v[INSPECT_CUSTOM](maxDepth - depth, opts, function (inner) { return inspectValue(inner, opts); });
+      return typeof written === 'string' ? written : String(written);
+    }
+
     var ctor = constructorNameOf(v);
     if (ctor === 'Buffer') {
       var shown = [];
@@ -63,9 +83,10 @@ function inspectValue(value, opts) {
 
     var isArr = Array.isArray(v);
     var isTyped = !isArr && ArrayBuffer.isView(v) && !(v instanceof DataView);
+    var bare = Object.getPrototypeOf(v) === null;
     if (depth > maxDepth) {
       if (isArr) return '[Array]';
-      return '[' + (ctor === null ? 'Object: null prototype' : (ctor || 'Object')) + ']';
+      return '[' + (bare ? nullPrototypeTagOf(v) + ': null prototype' : (ctor || 'Object')) + ']';
     }
 
     stack.push(v);
@@ -97,7 +118,7 @@ function inspectValue(value, opts) {
         entries.push(fmt(val, depth + 1, indent + 2));
       });
     } else {
-      if (ctor === null) prefix = '[Object: null prototype] ';
+      if (bare) prefix = '[' + nullPrototypeTagOf(v) + ': null prototype] ';
       else if (ctor && ctor !== 'Object') prefix = ctor + ' ';
     }
 

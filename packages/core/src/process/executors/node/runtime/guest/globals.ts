@@ -12,17 +12,54 @@ export const NODE_VERSION = 'v24.15.0';
  */
 export const GLOBALS_SRC = String.raw`
 var EventEmitterCls = requireBuiltin('events');
-var procEnv = JSON.parse(host.envJSON());
+var envStore = JSON.parse(host.envJSON());
+/*
+ * Node's own `process.env` is not a plain object: its prototype is an object of node's that is not
+ * `Object.prototype`, and a package that asks which it is gets the answer the host gives. An empty
+ * object stands in for it, so the properties still read, write and enumerate as an ordinary
+ * object's do while `Object.getPrototypeOf(process.env) === Object.prototype` is false, as on the
+ * host.
+ */
+var ENV_PROTO = {};
+Object.setPrototypeOf(envStore, ENV_PROTO);
+/*
+ * A write to the environment is a change to *this process's* environment, and on the host that is
+ * what a child inherits: `process.env.X = v` followed by a spawn hands `X` down. Publishing the
+ * whole object after each write is what keeps the host's copy -- the one a spawn reads -- in step;
+ * a symbol key is left alone, because no environment variable has one.
+ */
+var publishEnv = function () { host.setEnvJSON(JSON.stringify(envStore)); };
+var procEnv = new Proxy(envStore, {
+  set: function (target, name, value) {
+    if (typeof name === 'symbol') { target[name] = value; return true; }
+    target[name] = String(value);
+    publishEnv();
+    return true;
+  },
+  deleteProperty: function (target, name) {
+    delete target[name];
+    if (typeof name !== 'symbol') publishEnv();
+    return true;
+  }
+});
 var proc = Object.create(EventEmitterCls.prototype);
 EventEmitterCls.call(proc);
 proc.title = 'node';
 proc.version = '${NODE_VERSION}';
-proc.versions = { node: '24.15.0', v8: '13.6.233.10-node.24', owc: '0.1.0', napi: '10' };
+proc.versions = { node: '24.15.0', v8: '13.6.233.10-node.24', uv: '1.51.0', owc: '0.1.0', napi: '10' };
 proc.arch = 'x64';
 proc.platform = 'linux';
 proc.release = { name: 'node' };
 Object.defineProperty(proc, Symbol.toStringTag, { value: 'process', configurable: true });
 proc.features = {};
+/*
+ * The flags node 24.15 accepts in NODE_OPTIONS, as the Set process.allowedNodeEnvironmentFlags is:
+ * a package asks `has()` of it before it puts a flag in the options it spawns with, and an
+ * undefined here made that ask throw. The list is the one that node's own build reports, written
+ * out rather than generated, because no guest can ask the node it models what it accepts.
+ */
+var ENV_FLAGS = ''.split(' ');
+proc.allowedNodeEnvironmentFlags = new Set(ENV_FLAGS);
 /*
  * Two internal bindings are provided: 'constants', which packages such as tmp read at load time,
  * and 'uv', which the old execa bundled into envinfo (a create-react-app dependency) reads to turn
@@ -368,8 +405,13 @@ proc.emitWarning = function (warning) {
 function makeStdioStream(writeText) {
   var stream = Object.create(EventEmitterCls.prototype);
   EventEmitterCls.call(stream);
-  stream.isTTY = false;
-  stream.columns = 80;
+  /*
+   * No terminal is attached, and a stream node has with no terminal behind it has *no* isTTY and
+   * *no* columns: a host run with its output piped reports `undefined` for both, not false and 80.
+   * The difference is observable -- `columns || 80` never falls back here, and a library that reads
+   * `isTTY` to decide whether it is talking to a person is answered with a value that says it is
+   * not rather than with nothing. Both are left off the stream, as a piped host leaves them off.
+   */
   stream.write = function (chunk, encoding, callback) {
     writeText(typeof chunk === 'string' ? chunk : String(chunk));
     var done = typeof encoding === 'function' ? encoding : callback;
@@ -414,7 +456,7 @@ function stdinOf() {
   if (stdinStream === null) {
     var Readable = requireBuiltin('stream').Readable;
     stdinStream = new Readable({ read: function () {} });
-    stdinStream.isTTY = false;
+    // as on stdout: a stream with no terminal behind it reports neither isTTY nor columns
     // text in, text out: a pushed chunk reaches a reader as the string it was written as
     stdinStream.setEncoding('utf8');
     /* newListener is emitted before the listener is added, so the count is read on the next turn */
@@ -773,7 +815,8 @@ function urlGlobalOf(nodeUrl) {
     var queryAt = rest.indexOf('?');
     if (queryAt >= 0) { state.query = rest.slice(queryAt + 1); rest = rest.slice(0, queryAt); }
     var path = special ? rest.replace(/\\/g, '/') : rest;
-    if (hasHost && path.charAt(0) !== '/') path = '/' + path;
+    if (path === '') path = special ? '/' : '';
+    else if (hasHost && path.charAt(0) !== '/') path = '/' + path;
     state.pathname = encodePath(removeDotSegments(path));
     return state;
   }
@@ -794,6 +837,8 @@ function urlGlobalOf(nodeUrl) {
 
   function URL(input, base) {
     if (!(this instanceof URL)) throw new TypeError("Class constructor URL cannot be invoked without 'new'");
+    if (arguments.length < 1) throw new TypeError('The "url" argument must be specified');
+    if (typeof input === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
     STATE.set(this, parseUrl(input, stateOf(base), String(input)));
   }
   URL.prototype = Object.create(Base.prototype);
@@ -814,12 +859,19 @@ function urlGlobalOf(nodeUrl) {
   field('hostname', function () {
     return STATE.get(this).hostname;
   }, function (value) { STATE.get(this).hostname = String(value).toLowerCase(); });
+  /* WHATWG: a port that is the scheme's own is not a port at all, so writing it leaves the port
+     empty -- http://h/ with port 80 written is still http://h/. */
+  function assignedPort(state, text, raw) {
+    var port = text === '' ? '' : portOf(text, raw);
+    return port !== '' && DEFAULT_PORTS[state.protocol] === port ? '' : port;
+  }
+
   field('port', function () {
     return STATE.get(this).port;
   }, function (value) {
     var state = STATE.get(this);
     var text = String(value);
-    state.port = text === '' ? '' : portOf(text, state.protocol + '//' + state.hostname);
+    state.port = assignedPort(state, text, state.protocol + '//' + state.hostname);
   });
   field('host', function () {
     var state = STATE.get(this);
@@ -829,14 +881,14 @@ function urlGlobalOf(nodeUrl) {
     var text = String(value);
     var at = text.indexOf(':');
     state.hostname = (at >= 0 ? text.slice(0, at) : text).toLowerCase();
-    state.port = at >= 0 ? portOf(text.slice(at + 1), text) : '';
+    state.port = at >= 0 ? assignedPort(state, text.slice(at + 1), text) : '';
   });
   field('pathname', function () {
     return STATE.get(this).pathname;
   }, function (value) {
     var state = STATE.get(this);
     var text = String(value);
-    state.pathname = encodePath(state.hasHost && text.charAt(0) !== '/' ? '/' + text : text);
+    state.pathname = encodePath(removeDotSegments(state.hasHost && text.charAt(0) !== '/' ? '/' + text : text));
   });
   field('search', function () {
     var state = STATE.get(this);
@@ -860,16 +912,23 @@ function urlGlobalOf(nodeUrl) {
     var text = String(value);
     state.hash = text === '' ? null : (text.charAt(0) === '#' ? text.slice(1) : text);
   });
+  /* WHATWG: only a scheme with a host of its own has an origin -- an opaque host, and file:, have
+     the opaque origin 'null' -- except blob:, whose origin is the origin of the URL in its path. */
   field('origin', function () {
     var state = STATE.get(this);
-    if (state.protocol === 'file:' || !state.hasHost) return 'null';
+    if (state.protocol === 'blob:') {
+      try { return new URL(state.pathname).origin; } catch (notAUrl) { return 'null'; }
+    }
+    if (state.protocol === 'file:' || !DEFAULT_PORTS.hasOwnProperty(state.protocol) || !state.hasHost) return 'null';
     return state.protocol + '//' + state.hostname + (state.port ? ':' + state.port : '');
   }, undefined);
   field('href', function () {
     var state = STATE.get(this);
     var authority = '';
     if (state.hasHost || state.protocol === 'file:') {
-      var userinfo = state.username ? state.username + (state.password ? ':' + state.password : '') + '@' : '';
+      var userinfo = (state.username || state.password)
+        ? state.username + (state.password ? ':' + state.password : '') + '@'
+        : '';
       authority = '//' + userinfo + state.hostname + (state.port ? ':' + state.port : '');
     }
     return state.protocol + authority + state.pathname + queryPartOf(state) +
@@ -903,6 +962,34 @@ function urlGlobalOf(nodeUrl) {
   });
   URL.prototype.toString = function () { return this.href; };
   URL.prototype.toJSON = function () { return this.href; };
+  /* Node's order on the prototype: toString first, then the fields in the order it declares them,
+     and toJSON last. Deleting and re-adding is what rewrites that order. */
+  ['toString', 'href', 'origin', 'protocol', 'username', 'password', 'host', 'hostname', 'port',
+   'pathname', 'search', 'searchParams', 'hash', 'toJSON'].forEach(function (name) {
+    var desc = Object.getOwnPropertyDescriptor(URL.prototype, name);
+    if (desc === undefined) return;
+    delete URL.prototype[name];
+    Object.defineProperty(URL.prototype, name, desc);
+  });
+  /* What Node prints: the same fields in the same order, each value written by util.inspect. */
+  var URL_INSPECT = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
+  if (URL_INSPECT !== undefined) {
+    Object.defineProperty(URL.prototype, URL_INSPECT, {
+      value: function (depth, options, inspect) {
+        var self = this;
+        var pairs = [['href', self.href], ['origin', self.origin], ['protocol', self.protocol],
+          ['username', self.username], ['password', self.password], ['host', self.host],
+          ['hostname', self.hostname], ['port', self.port], ['pathname', self.pathname],
+          ['search', self.search], ['searchParams', self.searchParams], ['hash', self.hash]];
+        var body = '';
+        for (var i = 0; i < pairs.length; i++) {
+          body += (i === 0 ? '' : ',\n  ') + pairs[i][0] + ': ' + inspect(pairs[i][1]);
+        }
+        return 'URL {\n  ' + body + '\n}';
+      },
+      writable: true, configurable: true
+    });
+  }
   Object.defineProperty(URL.prototype, Symbol.toStringTag, { value: 'URL', configurable: true });
   URL.canParse = function (input, base) {
     try {
@@ -914,6 +1001,8 @@ function urlGlobalOf(nodeUrl) {
   };
   /* require('url').URL and the global are one class in Node, so the module is handed this one too */
   nodeUrl.URL = URL;
+  /* Node's URL takes one argument as far as URL.length is concerned: the base is optional. */
+  Object.defineProperty(URL, 'length', { value: 1, configurable: true });
   return URL;
 }
 
@@ -1000,6 +1089,9 @@ globalThis.crypto = nodeCrypto.webcrypto;
       throw failed;
     });
   };
+  /* Node declares fetch's second argument with a default, so the function it hands out takes one
+     argument as far as fetch.length is concerned. */
+  Object.defineProperty(globalThis.fetch, 'length', { value: 1, configurable: true });
   ['Headers', 'Request', 'Response', 'FormData', 'WebSocket'].forEach(function (name) {
     Object.defineProperty(globalThis, name, {
       get: function () { return undici()[name]; },
@@ -1027,6 +1119,14 @@ globalThis.crypto = nodeCrypto.webcrypto;
     configurable: true
   });
   Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, { value: 'AbortSignal', configurable: true });
+  /* What Node prints for a signal: whether it has been aborted, and nothing else. */
+  var ABORT_INSPECT = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
+  if (ABORT_INSPECT !== undefined) {
+    Object.defineProperty(AbortSignal.prototype, ABORT_INSPECT, {
+      value: function () { return 'AbortSignal { aborted: ' + this.aborted + ' }'; },
+      writable: true, configurable: true
+    });
+  }
   AbortSignal.prototype.addEventListener = function addEventListener(type, fn) {
     if (type === 'abort') STATE.get(this).listeners.push(fn);
   };

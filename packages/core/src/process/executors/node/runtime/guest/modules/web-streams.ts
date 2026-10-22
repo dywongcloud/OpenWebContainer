@@ -655,7 +655,7 @@ export const SRC = String.raw`
       var start = methodOf(source, 'start');
       var pull = methodOf(source, 'pull');
       var cancel = methodOf(source, 'cancel');
-      SLOTS.set(this, { kind: 'ReadableStream', state: 'readable', storedError: undefined, reader: undefined, controller: undefined, disturbed: false });
+      SLOTS.set(this, { kind: 'ReadableStream', state: 'readable', storedError: undefined, reader: undefined, controller: undefined, disturbed: false, byteStream: String(type) === 'bytes' });
       if (type === undefined) {
         var highWaterMark = highWaterMarkOf(options, 1);
         var size = sizeOf(options);
@@ -713,6 +713,22 @@ export const SRC = String.raw`
     static from(asyncIterable) {
       return readableFrom(asyncIterable);
     }
+  }
+  /* What Node prints for a stream: whether a reader holds it, the state it is in, and whether it
+     can be read through a BYOB reader -- which is what a byte stream is for. */
+  function quoteStreamState(state) {
+    return "'" + String(state).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+  }
+  var STREAM_INSPECT = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
+  if (STREAM_INSPECT !== undefined) {
+    Object.defineProperty(ReadableStream.prototype, STREAM_INSPECT, {
+      value: function () {
+        var slots = readableState(this);
+        return 'ReadableStream { locked: ' + isLocked(this) + ', state: ' + quoteStreamState(slots.state) +
+          ', supportsBYOB: ' + (slots.byteStream === true) + ' }';
+      },
+      writable: true, configurable: true
+    });
   }
   Object.defineProperty(ReadableStream.prototype, Symbol.asyncIterator, {
     value: ReadableStream.prototype.values,
