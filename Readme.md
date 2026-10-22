@@ -901,9 +901,13 @@ re-run in isolation; the rows are open.
   still compiled as CommonJS -- `typeof import.meta` is a `SyntaxError` and `typeof require` is
   `function`, where the host has `object` and `undefined`, and `node --input-type=module -p 1` should
   fail with `ERR_EVAL_ESM_CANNOT_PRINT` rather than print `1`.
-- `owc-esm-require-tla-context-lines`: `require('./tla.mjs')` on a graph with top-level await -- the
-  host prints two context lines above the require stack (`  From <app>/main.js` and
-  `  Requiring <app>/tla.mjs`), the container prints the `- <app>/main.js` stack line only.
+- `owc-esm-cjs-dynamic-import-namespace`: `import('./m.mjs')` written in a CommonJS importer
+  resolves to the engine's namespace and not to Node's view of one -- `ns.a = 99` throws
+  `'a' is read-only` where the host throws `Cannot assign to read only property 'a' of object
+  '[object Module]'`, and `Object.freeze(ns)`, `Object.defineProperty(ns, 'q', { value: 1 })`,
+  `delete ns.a`, `String(ns)` and `ns + ''` read `module namespace properties have writable = false`,
+  `object is not extensible`, `could not delete property` and `toPrimitive`. The same import written
+  in an ES module importer is byte-identical to the host.
 - `owc-node-missing-entry-dump`: `node <missing>` -- the host prints its loader dump (eight
   `node:internal/modules/cjs/loader` frames, `code: 'MODULE_NOT_FOUND'`), the container prints the
   single line `Error: Cannot find module '<path>'`.
