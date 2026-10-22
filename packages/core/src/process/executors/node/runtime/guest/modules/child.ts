@@ -888,6 +888,21 @@ function cpSyncKillName(signal) {
   return String(signal === undefined || signal === null ? 'SIGTERM' : signal);
 }
 
+/* A synchronous pipe is byte-transparent: it carries what the child wrote, byte for byte. The shell
+   holds text, so text every character of which is a byte -- what printf writes for a \377 escape,
+   61 ff 62 -- is handed back as those bytes, where UTF-8 made four bytes of it (61 c3 bf 62). A
+   character no byte holds has no byte form, so such text keeps the UTF-8 it always had. */
+function cpBytesOf(text) {
+  var binary = true;
+  for (var i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 255) {
+      binary = false;
+      break;
+    }
+  }
+  return Buffer.from(text, binary ? 'latin1' : 'utf8');
+}
+
 /* one run, shaped as Node's spawnSync result: status, signal, output, pid, stdout, stderr and error */
 function cpSyncRun(file, list, opts) {
   var exe = file;
@@ -918,7 +933,7 @@ function cpSyncRun(file, list, opts) {
   var encoding = opts.encoding === undefined ? null : opts.encoding;
   function shaped(text, fd) {
     if (stdio.modes[fd] !== 'pipe' || text === null || text === undefined) return null;
-    var buffer = Buffer.from(text, 'utf8');
+    var buffer = cpBytesOf(text);
     return encoding === null || encoding === 'buffer' ? buffer : buffer.toString(encoding);
   }
   var output = raw.spawned ? [null, shaped(raw.stdout, 1), shaped(raw.stderr, 2)] : undefined;
@@ -1048,10 +1063,16 @@ function cpOnFrame(name, frame) {
 function cpWireWorkerErrors() {
   var base = api.formatUncaught;
   api.formatUncaught = function (err) {
-    try {
-      callCap('child.sendToParent', { frame: { t: 'e', v: cpErrorJson(err) } });
-    } catch (ignored) {
-      // the parent may already be gone
+    /* process.exit unwinds the thread it is called on by throwing, and the throw is what reaches
+       here: it is the exit, not an error. A worker that left on its own reports no 'error' to its
+       parent -- only its 'exit', with the status it chose -- and reporting one made a worker run
+       from process.exit(5) emit an 'error' no host emits. */
+    if (!(typeof api.isExitSignal === 'function' && api.isExitSignal(err))) {
+      try {
+        callCap('child.sendToParent', { frame: { t: 'e', v: cpErrorJson(err) } });
+      } catch (ignored) {
+        // the parent may already be gone
+      }
     }
     return base(err);
   };

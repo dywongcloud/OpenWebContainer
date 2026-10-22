@@ -507,6 +507,12 @@ interface SyncShell {
      * gives one to every shell it starts.
      */
     pid?: number;
+    /**
+     * `$PPID`: the process the shell was started from. Left out for the ordinary case -- the caller
+     * of the capability, whose pid `ctx` carries -- and set where the shell answers for a process
+     * that is not that caller.
+     */
+    ppid?: number;
 }
 
 /** Pids of synchronous shells, apart from the container's own processes and from synchronous children. */
@@ -837,6 +843,19 @@ function notSupportedNested(what: string): Error {
 function syncSpawnError(error: unknown, file: string, argv: string[]): SyncErrorInfo {
     if (isNotSupported(error)) {
         return { code: 'ERR_NOT_SUPPORTED', message: (error as Error).message };
+    }
+    /* A refusal the dispatcher raised itself -- a file with no execute bit -- carries its own code,
+       which `spawnFailure` would replace with the generic one: it is read here instead. */
+    const tagged = error as Error & { code?: unknown; errno?: unknown };
+    if (tagged?.code === 'EACCES') {
+        return {
+            code: 'EACCES',
+            message: `spawnSync ${file} EACCES`,
+            errno: typeof tagged.errno === 'number' ? tagged.errno : -13,
+            syscall: `spawnSync ${file}`,
+            path: file,
+            spawnargs: argv
+        };
     }
     const failure = spawnFailure(error, file, argv) as Error & { code?: string };
     if (failure.code === 'ENOENT') {
@@ -1503,6 +1522,12 @@ function valueOfName(shell: SyncShell, name: string): string {
             return String(positionalOf(shell).length);
         case '$':
             return String(shellPidOf(shell));
+        /* `$PPID`: the process that started this shell, which on a host is the node the shell was
+           spawned from. A synchronous shell is not a container process of its own -- `$$` is a pid
+           of its own range -- but the caller behind it is one, so that is the pid reported. A
+           subshell is the same process as the shell that made it, so it reads the same number. */
+        case 'PPID':
+            return String(shell.ppid ?? shell.ctx.pid);
         // `$!`: the pid the last `&` printed, now that this shell starts background jobs
         case '!':
             return String(shell.state?.lastBackgroundPid ?? 0);
@@ -3356,6 +3381,23 @@ function syncStep(step: ShellStep): SyncRun {
     };
 }
 
+/**
+ * Refuses a file the container would otherwise run as a program but a host cannot: one whose mode
+ * carries no execute bit. A file system that keeps no modes leaves `mode` out, and such a file is
+ * left alone -- there is no bit to read, and refusing it would break every file it holds.
+ */
+function refuseWithoutExecuteBit(ctx: CapabilityContext, file: string, found: string, argv: string[]): void {
+    const mode = ctx.fileSystem.statPath(found)?.mode;
+    if (typeof mode !== 'number' || (mode & 0o111) !== 0) return;
+    throw Object.assign(new Error(`spawnSync ${file} EACCES`), {
+        code: 'EACCES',
+        errno: -13,
+        syscall: `spawnSync ${file}`,
+        path: file,
+        spawnargs: argv
+    });
+}
+
 /** Runs an executable to completion. A spawn that cannot start (no executor, bad invocation) throws. */
 function runSyncCommand(
     ctx: CapabilityContext,
@@ -3399,6 +3441,10 @@ function runSyncCommand(
        ENOENT while `require('cowsay')` out of the same tree works. */
     const shell: SyncShell = { ctx, cwd, env, input, name: file, lastStatus: 0 };
     const found = resolveOnPath(shell, file);
+    /* A file with no execute bit is one a host's execve refuses: `spawnSync('./x.sh')` on a 0644
+       script reports EACCES there, and ran the script here -- the container took the shebang as
+       enough. The bit is what the kernel reads, so it is what is read here. */
+    if (found !== undefined) refuseWithoutExecuteBit(ctx, file, found, argv);
     const step = found === undefined ? undefined : runFileCommand(shell, found, argv, file);
     if (step !== undefined) return syncStep(step);
     throw new Error(`No executor found for: ${file}`);
