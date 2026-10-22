@@ -98,6 +98,9 @@ function owcBuildStreamCore() {
   }
 
   function normalizeEncoding(enc) {
+    /* Node's internal normalise treats a missing encoding as utf8: setEncoding(null) and
+       setEncoding(undefined) both end up decoding utf8 rather than throwing. */
+    if (enc === null || enc === undefined) return 'utf8';
     var e = String(enc).toLowerCase();
     if (e === 'utf-8') return 'utf8';
     if (e === 'ucs2' || e === 'ucs-2' || e === 'utf-16le') return 'utf16le';
@@ -405,6 +408,19 @@ function owcBuildStreamCore() {
     }
     emitSafe(dest, 'pipe', source);
     return dest;
+  };
+  /* Node declares eventNames on Stream.prototype itself (internal/streams/legacy.js), so the
+     own keys of Stream.prototype are constructor, pipe and eventNames. */
+  Stream.prototype.eventNames = function () {
+    var names = [];
+    var events = this._events || {};
+    var keys = Object.getOwnPropertyNames(events);
+    if (typeof Object.getOwnPropertySymbols === 'function') keys = keys.concat(Object.getOwnPropertySymbols(events));
+    for (var i = 0; i < keys.length; i++) {
+      var at = events[keys[i]];
+      if (typeof at === 'function' || (Array.isArray(at) && at.length > 0)) names.push(keys[i]);
+    }
+    return names;
   };
 
   // ---------------------------------------------------------------- Readable
@@ -1342,6 +1358,21 @@ function owcBuildStreamCore() {
     }
   };
 
+  /* Node raises an internal ReduceAwareErrMissingArgs subclass, so both the constructor name
+     and the code of the reduce-without-initial-value error are observable. */
+  function ReduceAwareErrMissingArgs(message) {
+    var e = new TypeError(message);
+    Object.setPrototypeOf(e, ReduceAwareErrMissingArgs.prototype);
+    e.code = 'ERR_MISSING_ARGS';
+    return e;
+  }
+  ReduceAwareErrMissingArgs.prototype = Object.create(TypeError.prototype, {
+    constructor: { value: ReduceAwareErrMissingArgs, writable: true, configurable: true }
+  });
+  function makeReduceAwareErrMissingArgs() {
+    return new ReduceAwareErrMissingArgs('Reduce of an empty stream requires an initial value');
+  }
+
   Readable.prototype.reduce = async function (fn, initialValue, options) {
     if (typeof fn !== 'function') throw argTypeError('reducer', 'of type function', fn);
     checkOperatorOptions(options);
@@ -1359,7 +1390,7 @@ function owcBuildStreamCore() {
       }
     }
     if (!hasInitial) {
-      throw owcErr(TypeError, 'ERR_MISSING_ARGS', 'Reduce of an empty stream requires an initial value');
+      throw makeReduceAwareErrMissingArgs();
     }
     return acc;
   };
@@ -1435,6 +1466,45 @@ function owcBuildStreamCore() {
     });
   }
   defineSharedGetters(Readable.prototype);
+
+  /* Node's deprecated _undestroy re-opens a destroyed stream: it resets the flags destroyImpl
+     set without touching the buffer or the pipes. */
+  Readable.prototype._undestroy = function () {
+    var r = this._readableState;
+    var w = this._writableState;
+    if (r) {
+      r.closed = false;
+      r.closeEmitted = false;
+      r.destroyed = false;
+      r.errored = null;
+      r.errorEmitted = false;
+      r.reading = false;
+      r.ended = r.readable === false;
+      r.endEmitted = r.readable === false;
+    }
+    if (w) {
+      w.destroyed = false;
+      w.closed = false;
+      w.closeEmitted = false;
+      w.errored = null;
+      w.errorEmitted = false;
+      w.finalCalled = false;
+      w.prefinished = false;
+      w.ended = w.writable === false;
+      w.ending = w.writable === false;
+      w.finished = w.writable === false;
+    }
+  };
+  Object.defineProperty(Readable.prototype, 'readableBuffer', {
+    get: function () { var r = this._readableState; return r ? r.buffer : undefined; },
+    set: function (value) { if (this._readableState) this._readableState.buffer = value; },
+    configurable: true
+  });
+  Readable.prototype.removeAllListeners = function (ev) {
+    var res = EventEmitter.prototype.removeAllListeners.apply(this, arguments);
+    if (ev === 'readable' || ev === undefined) process.nextTick(updateReadableListening, this);
+    return res;
+  };
 
   // ---------------------------------------------------------------- Writable
 
@@ -1817,6 +1887,26 @@ function owcBuildStreamCore() {
   defineWritableGetters(Writable.prototype);
   defineSharedGetters(Writable.prototype);
 
+  Writable.prototype._undestroy = Readable.prototype._undestroy;
+  /* Node declares _writev as an own null property: a stream opts in by assigning its own. */
+  Writable.prototype._writev = null;
+  Object.defineProperty(Writable.prototype, 'writableBuffer', {
+    get: function () { var w = this._writableState; return w ? w.buffered : undefined; },
+    set: function (value) { if (this._writableState) this._writableState.buffered = value; },
+    configurable: true
+  });
+  Object.defineProperty(Writable.prototype, 'writableAborted', {
+    get: function () {
+      var w = this._writableState;
+      if (!w) return false;
+      return (!!w.destroyed || !!w.errored) && !w.finished;
+    },
+    configurable: true
+  });
+  Writable.prototype.pipe = function () {
+    destroyImpl.call(this, owcErr(Error, 'ERR_STREAM_CANNOT_PIPE', 'Cannot pipe, not readable'));
+  };
+
   // ---------------------------------------------------------------- Duplex
 
   function Duplex(options) {
@@ -1838,8 +1928,12 @@ function owcBuildStreamCore() {
   }
   Object.setPrototypeOf(Duplex.prototype, Readable.prototype);
   Object.setPrototypeOf(Duplex, Readable);
-  Object.keys(Writable.prototype).forEach(function (method) {
-    if (!Duplex.prototype[method]) Duplex.prototype[method] = Writable.prototype[method];
+  /* Node re-declares every Writable member on Duplex.prototype except the destroy/error/closed
+     group, so those names are own on Duplex rather than inherited from Readable. */
+  var DUPLEX_INHERIT_SKIP = { constructor: true, _destroy: true, _undestroy: true, closed: true, errored: true, pipe: true, writableAborted: true };
+  Object.getOwnPropertyNames(Writable.prototype).forEach(function (method) {
+    if (DUPLEX_INHERIT_SKIP[method] === true) return;
+    Object.defineProperty(Duplex.prototype, method, Object.getOwnPropertyDescriptor(Writable.prototype, method));
   });
   defineWritableGetters(Duplex.prototype);
 
