@@ -15,16 +15,19 @@ export const NODE_BINARY = '/usr/local/bin/node';
  * container in a browser, whose worker has no environment to inherit, and a host `HOME` or `PATH`
  * here would tell a guest where it is running from. `TERM` and `COLORTERM` are the pair a colour
  * library reads -- `colors@1` turns a `TERM` of `xterm` into `\e[31mx\e[39m` for `'x'.red`, where
- * a guest with no `TERM` at all printed `x` -- and `LANG` is what a container image sets; the
- * values a host carries are its own and are not reproduced. `/usr/local/bin` is where the
- * container keeps its `node`, so a search of `PATH` for one finds it.
+ * a guest with no `TERM` at all printed `x` -- `LANG` is what a container image sets, and `TMPDIR`
+ * names the `os.tmpdir()` of a guest, the directory the file system mounts at `/tmp`, so a package
+ * that reads the variable and one that reads the function agree. The values a host carries are its
+ * own and are not reproduced. `/usr/local/bin` is where the container keeps its `node`, so a search
+ * of `PATH` for one finds it.
  */
 export const CONTAINER_ENV: ReadonlyArray<readonly [string, string]> = [
     ['PATH', '/bin:/usr/bin:/usr/local/bin'],
     ['HOME', '/home'],
     ['TERM', 'xterm'],
     ['COLORTERM', 'truecolor'],
-    ['LANG', 'C.UTF-8']
+    ['LANG', 'C.UTF-8'],
+    ['TMPDIR', '/tmp']
 ];
 
 /**

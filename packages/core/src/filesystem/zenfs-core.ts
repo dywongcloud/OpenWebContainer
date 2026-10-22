@@ -49,6 +49,22 @@ function writeNodeBinary(): void {
     if ((fs.statSync(NODE_BINARY).mode & 0o111) === 0) fs.chmodSync(NODE_BINARY, 0o755);
 }
 
+/**
+ * The scratch directories a Linux container image carries, made at mount the way `/` itself is:
+ * `os.tmpdir()` of a guest is `/tmp` whether or not anything set `TMPDIR`, and the directory it
+ * named was not there, so a package that wrote a temporary file -- or any probe that redirected to
+ * `/tmp` -- failed with ENOENT where a host succeeds. `/var/tmp` is the other path such a package
+ * reaches for. Both are world-writable and sticky, the mode a real `/tmp` keeps.
+ */
+const SCRATCH_DIRS: ReadonlyArray<string> = ['/tmp', '/var/tmp'];
+
+function createScratchDirectories(): void {
+    for (const dir of SCRATCH_DIRS) {
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o1777 });
+        if ((fs.statSync(dir).mode & 0o1777) !== 0o1777) fs.chmodSync(dir, 0o1777);
+    }
+}
+
 export class ZenFSCore implements IFileSystem {
     private fs: typeof fs;
 
@@ -56,6 +72,7 @@ export class ZenFSCore implements IFileSystem {
         installPrototypeNameFix();
         mountContainerRoot();
         writeNodeBinary();
+        createScratchDirectories();
         this.fs = fs;
     }
     readBuffer(path: string): Buffer | undefined {
