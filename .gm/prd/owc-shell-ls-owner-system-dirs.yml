@@ -1,0 +1,7 @@
+id: owc-shell-ls-owner-system-dirs
+subject: 'ls -ld of the container''s own directories names the shell''s user where the host names root, and ls -ln prints 0 where the host prints the real uid'
+description: 'Measured 2026-10-22 (judge shard shell-fileutils, /tmp/owc-r4/jfu). `ls -ld /bin`, `/usr`, `/dev` and `/` print `dylanwong wheel` in the container and `root wheel` on the host; `ls -ln f` prints `0 0` in the container and `501 0` on the host. The container keeps no account database and no system tree another account owns, so every name in it resolves to the one user the shell runs as -- the name a host prints for the file the shell itself made, which does match (`touch f; ls -l f` is `dylanwong wheel` on both, and `export USER=zzz` no longer moves it, as it does not on a host). A faithful owner column for those four paths needs a passwd the container does not have.'
+witness_plan: Run `ls -ld /bin /usr /dev /` and `touch f; ls -ln f` on both sides; the owner, group and both numeric ids must match.
+session_id: adv-judge-shell-fileutils-0
+owner: adv-judge-shell-fileutils-0
+status: pending

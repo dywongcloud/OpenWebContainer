@@ -1,0 +1,7 @@
+id: owc-shell-chmod-recursive-order
+subject: 'chmod -R reports the entries of a tree in the container''s walk order, not the host''s directory order'
+description: 'Measured 2026-10-22 (judge shard shell-fileutils, /tmp/owc-r4/jfu). `mkdir d; touch d/f d/g; chmod -R 2755 d` prints three "Operation not permitted" lines on both sides now -- d, then d/f, then d/g here; d, then d/g, then d/f on the host. The set and the count are the same and every operand is reached (which it was not before: only the first used to be reported); only the order differs. There is no order to reproduce: the host walks the directory in the order its own file system returns names in, which is neither creation nor sorted order -- on the same machine `touch a b c; ls -f` printed `a c b`. Fix site if one is ever wanted: the walkRoot call in chmod, packages/core/src/shell/commands/fileutils.ts.'
+witness_plan: Run `mkdir d; touch d/f d/g; chmod -R 2755 d` on both sides; stdout, stderr and exit must match exactly.
+session_id: adv-judge-shell-fileutils-0
+owner: adv-judge-shell-fileutils-0
+status: pending

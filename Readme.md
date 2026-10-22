@@ -294,6 +294,28 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
 - **`unexpand -t` with a list whose stops are adjacent (`-t 1,2`, `-t 2,3`) does not reproduce the host's
   own behaviour.** Lists whose stops are two or more columns apart (`-t 1,3`, `-t 4,8`) do, for every
   blank-run length measured. The host's list parser treats the degenerate case in a way this one does not.
+- **`chmod -R` reports the entries of a tree in this file system's walk order, not the host's directory order.**
+  `mkdir d; touch d/f d/g; chmod -R 2755 d` prints `d`, `d/f`, `d/g` here and `d`, `d/g`, `d/f` on the host.
+  Every entry is reported and the count is the same; only the order differs, and the host's own order is
+  neither creation nor sorted order -- on this machine `touch a b c; ls -f` printed `a c b`, so there is no
+  order to reproduce.
+- **`ls -ld` of the container's own directories names the user the shell runs as, where the host names `root`,
+  and `ls -ln` prints `0` where the host prints the real uid.** `ls -ld /bin` is `dylanwong wheel` here and
+  `root wheel` on the host; `ls -ln f` is `0 0` here and `501 0` there. The container keeps no account
+  database, so nothing in it can belong to another user. A name the shell itself creates does match --
+  `touch f; ls -l f` is `dylanwong wheel` on both, and `export USER=zzz` no longer moves the column, as it
+  does not on a host.
+- **`ls -f` lists in sorted order, where the host lists in its directory order.** `touch f; mkdir d; ln -s f l;
+  ls -f` prints `. .. d f l` here and `. .. f d l` on the host. No entry or marker differs, only the order,
+  and the host's own order is not one this file system can derive.
+- **`touch -t nonsense f` exits 0 on this host and 1 in the container.** This host's `/usr/bin/touch` reads that
+  one string of letters as a date and leaves the file's mtime in 2084; every other non-numeric stamp measured
+  (`abc`, `zz`, `sense`, `xyz`, `12345`, `99`) is refused on both sides. One accepted string is a quirk of the
+  host's binary, not a shape worth reproducing. (Open row `owc-shell-touch-t-garbage-accepted`.)
+- **`/etc/hosts` is not in the container's file system, and `/tmp` is a directory here where this host has it as
+  a symlink to `private/tmp`.** Both are facts about the two trees, not about `ls`: `ls -l /etc/hosts` fails
+  here with `No such file or directory` and `ls -ld /tmp` prints `drwxrwxrwt` where the host prints
+  `lrwxr-xr-x ... /tmp -> private/tmp`.
 - **A trailing newline.** The container writes a command's stderr exactly as the command left it; the host
   adds one only where the text has none.
 - **A redirection whose target is in a directory that is not there fails with the container's own message.**

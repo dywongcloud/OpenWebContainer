@@ -1,0 +1,7 @@
+id: owc-shell-ls-f-order
+subject: 'ls -f lists in the container''s sorted order where the host lists in its directory order'
+description: 'Measured 2026-10-22 (judge shard shell-fileutils, /tmp/owc-r4/jfu). `touch f; mkdir d; ln -s f l; ls -f` prints `. .. d f l` in the container and `. .. f d l` on the host. No marker or entry differs -- only the order. The host''s order is the order its file system returns names in: on the same machine, `mkdir d; touch d/a d/b d/c; ls -f d` printed `. .. a c b`, so it is neither creation nor sorted order and cannot be derived. Distinct from owc-shell-ls-f-markers, which was about the `-F` suffix characters and is closed.'
+witness_plan: Run `touch f; mkdir d; ln -s f l; ls -f` on both sides; the listing must match exactly.
+session_id: adv-judge-shell-fileutils-0
+owner: adv-judge-shell-fileutils-0
+status: pending
