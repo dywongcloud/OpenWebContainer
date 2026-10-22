@@ -1729,6 +1729,7 @@ export class NodeProcess extends Process {
            ES module, which this loader does. Set on the guest's own object, so it is there before
            any entry runs -- a file, a -e script or a REPL line alike. */
         this.setGuestFeature('require_module', true);
+        this.setGuestPpid();
         // a parent that wrote before this guest existed is answered now, before the entry runs
         this.flushStdin();
         return entryPath;
@@ -1757,6 +1758,24 @@ export class NodeProcess extends Process {
             }
         } catch {
             // a handle already gone, or a features object that takes no property
+        }
+    }
+
+    /**
+     * Hands `process.ppid` the pid of the process that spawned this one, which is what node on a
+     * host reports and what makes `process.ppid > 1` true for a real child. A process the container
+     * started on its own has no parent and keeps the 0 the guest was built with: there is no pid to
+     * report, and any number put there would be one nothing in the container owns.
+     */
+    private setGuestPpid(): void {
+        if (this.parentPid === undefined) return;
+        const context = this.context;
+        if (context === undefined) return;
+        const arg = context.newNumber(this.parentPid);
+        try {
+            this.callApi('setPpid', [arg]).dispose();
+        } finally {
+            arg.dispose();
         }
     }
 

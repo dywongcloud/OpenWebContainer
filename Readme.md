@@ -369,10 +369,15 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   `getegid` and `getgroups` answer, and `setuid`, `seteuid`, `setgid`, `setegid`, `setgroups` and
   `initgroups` throw the host's `EPERM` as they do for a process that is not root; `getgroups` returns the
   one group this process has, where a host on this machine returns sixteen.
-- **`process.ppid` is 0, and `process.argv0` is the whole path where a host's is the name.** A host's `ppid`
-  is the pid of the shell that started it and its `argv0` is `node`, because that is the word the shell
-  invoked; the container has no parent process and reports its own argv as the path it was started from, so
-  `process.title` (`'node'`) and `process.argv0` (`'/usr/local/bin/node'`) disagree where a host's agree.
+- **`process.ppid` is 0 for a process the container started itself, and a child's is the pid of the
+  process that spawned it.** A host's `ppid` is the pid of the shell that started it, and a host's
+  child reports the pid of its parent the same way; the container reports that pid for every process
+  it starts with a parent, and 0 for one it starts on its own, because there is no process behind it
+  to name.
+- **`process.argv[0]` is the path and `process.argv0` is the name, as on a host.** A host's `argv0`
+  is `node`, because that is the word the shell invoked, while its `argv[0]` carries the resolved
+  path; the container reports the same pair, so `process.title` (`'node'`) and `process.argv0` agree
+  as a host's agree.
 - **`os.networkInterfaces()` reports the loopback alone.** `lo` carries `127.0.0.1` and `::1` with the netmask,
   family and cidr a host's entries carry, where a host reports eleven interfaces of its own: a container's
   sockets are the host's, so it has no address of a network of its own to name, and a package that picks an

@@ -271,17 +271,23 @@ proc.dlopen = function dlopen(module, filename, flags) {
 };
 proc.config = {};
 proc.pid = host.pid();
+/*
+ * The process that started this one, as node reports it: 0 for a process with no parent, which is
+ * every process the container starts on its own. A child answers the pid of the process that
+ * spawned it, and only the host holds that, so api.setPpid writes it once the guest exists.
+ */
 proc.ppid = 0;
 proc.argv = JSON.parse(host.argvJSON());
 proc.execPath = '/usr/local/bin/node';
 /*
- * argv[0] exactly as this process received it. On a host that is the path node was invoked by --
- * the same string as execPath for every run, because node is started by the node at execPath and
- * not by a name on PATH that resolves somewhere else. A host's argv0 is a string, and a package
- * that asks how the process was started reads it; left off, it is undefined and the same package
- * takes the branch a host never takes.
+ * argv[0] exactly as this process received it: the word this node was invoked by, which is its
+ * name -- 'node' -- and not the path that name resolves to. On a host, 'node main.js' answers
+ * 'node' here while process.argv[0] carries the resolved path, and process.title is seeded from
+ * argv0, so the two agree; giving argv0 the path made title and argv0 disagree here. Left off
+ * entirely it is undefined, and a package that asks how the process was started takes a branch a
+ * host never takes.
  */
-proc.argv0 = proc.execPath;
+proc.argv0 = proc.execPath.slice(proc.execPath.lastIndexOf('/') + 1);
 proc.execArgv = [];
 proc.env = procEnv;
 proc.exitCode = undefined;
@@ -2282,5 +2288,13 @@ api.isExitSignal = function (value) {
 };
 api.setArgv = function (argv) {
   proc.argv = argv;
+};
+/*
+ * process.ppid of a process that has a parent. The host calls it once, before the entry runs,
+ * with the pid of the process that spawned this one -- the only place that pid lives, since the
+ * guest never sees the process table. A process with no parent keeps the 0 it was built with.
+ */
+api.setPpid = function (ppid) {
+  proc.ppid = ppid;
 };
 `;
