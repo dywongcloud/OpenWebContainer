@@ -973,6 +973,20 @@ function urlGlobalOf(nodeUrl) {
    * ends in a number, or a domain. null for anything that is no host at all, which is what makes an
    * assignment of one leave the URL as it was rather than write a host that cannot be parsed.
    */
+  /* The C0 control percent-encode set, which is all an opaque host is ever encoded with: the
+     controls and every code point past ASCII, and nothing else -- so '%20' survives as it was
+     written, where a space of its own would not. */
+  function encodeOpaqueHost(text) {
+    var out = '';
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      if (code <= 0x1f || code > 0x7e) {
+        try { out += encodeURIComponent(text.charAt(i)); } catch (loneSurrogate) { out += text.charAt(i); }
+      } else out += text.charAt(i);
+    }
+    return out;
+  }
+
   function hostNameOf(hostText, protocol, special) {
     if (hostText.charAt(0) === '[') {
       if (hostText.charAt(hostText.length - 1) !== ']') return null;
@@ -982,11 +996,28 @@ function urlGlobalOf(nodeUrl) {
     if (forbiddenIn(hostText)) return null;
     /* file: 'localhost' names no host at all, as it names none in Node */
     if (protocol === 'file:' && hostText.toLowerCase() === 'localhost') return '';
+    /*
+     * An opaque host -- the host of a scheme that is not special -- is not a domain: it keeps the
+     * case it was written in and an escape it carries is left alone, and a byte that is not ASCII
+     * is percent-encoded rather than punycoded. 'foo://ABC' is the host 'ABC',
+     * 'foo://exämple' the host 'ex%C3%A4mple' and 'foo://a%20b' the host 'a%20b'.
+     */
+    if (!special) return encodeOpaqueHost(hostText);
     /* an escape in a host is decoded, so 'h%41' is the host 'ha' */
     var host = percentDecode(hostText).toLowerCase();
     if (special && host !== '' && endsInANumber(host)) {
       var address = ipv4AddressOf(host);
       return address === null ? null : ipv4TextOf(address);
+    }
+    /*
+     * A domain is IDNA, so 'пример.рф' is the host 'xn--e1afmkfd.xn--p1ai' -- the punycode of the
+     * url module, which is the one place it lives. An opaque host, the host of a scheme that is not
+     * special, is not a domain and is left as it was written.
+     */
+    if (special && host !== '' && typeof nodeUrl.domainToASCII === 'function') {
+      var ascii = nodeUrl.domainToASCII(host);
+      /* a domain that will not turn into ASCII is no host at all */
+      return ascii === '' ? null : ascii;
     }
     return host;
   }
@@ -1097,7 +1128,9 @@ function urlGlobalOf(nodeUrl) {
     }
     var path = special ? rest.replace(/\\/g, '/') : rest;
     if (path === '') path = special ? '/' : '';
-    else if (hasHost && path.charAt(0) !== '/') path = '/' + path;
+    /* a file: URL has a path that starts at the root whether or not it named an authority, which is
+       why 'file:a' is 'file:///a' and not 'file://a' with 'a' as its host */
+    else if ((hasHost || protocol === 'file:') && path.charAt(0) !== '/') path = '/' + path;
     state.pathname = encodePath(removeDotSegments(path));
     return state;
   }
@@ -1537,41 +1570,48 @@ globalThis.crypto = nodeCrypto.webcrypto;
    * CloseEvent, which Node delivers to a WebSocket's close handler: code, reason and wasClean, and
    * the socket it happened to. The engine has no such class, so a close would otherwise arrive as a
    * plain object, so an "event instanceof CloseEvent" check -- the one a program makes to tell a
-   * real close from a hand-built one -- would be false. The attributes sit on a prototype backed by
-   * the values of the one event, the way Node's own events keep theirs on a prototype backed by
-   * internal slots: that also makes it an Event, and leaves no attribute an own property.
+   * real close from a hand-built one -- would be false. Node declares the three attributes a close
+   * adds as enumerable getters on CloseEvent.prototype and nothing else: no own property, and no
+   * per-instance prototype in the chain, so a close event reads CloseEvent > Event.
    */
   globalThis.CloseEvent = (function () {
+    var CLOSE = new WeakMap();
     function CloseEvent(type, init) {
+      if (arguments.length < 1) throw new TypeError('CloseEvent constructor: 1 argument required, but 0 found.');
       init = init || {};
-      var values = {
-        type: String(type === undefined ? 'close' : type),
-        code: init.code === undefined ? 0 : Number(init.code),
-        reason: init.reason === undefined ? '' : String(init.reason),
-        wasClean: init.wasClean === undefined ? false : !!init.wasClean,
-        target: init.target === undefined ? null : init.target,
-        currentTarget: null,
-        bubbles: false,
-        cancelable: false,
-        defaultPrevented: false,
-        timeStamp: 0
-      };
       /*
        * Node's own Event is installed further down the bootstrap than this file runs, so the
        * parent is joined on first use rather than here, or a close event would not be an Event.
        */
       var Base = typeof globalThis.Event === 'function' ? globalThis.Event.prototype : Object.prototype;
       if (Object.getPrototypeOf(CloseEvent.prototype) !== Base) Object.setPrototypeOf(CloseEvent.prototype, Base);
-      var proto = Object.create(CloseEvent.prototype);
-      Object.keys(values).forEach(function (key) {
-        Object.defineProperty(proto, key, { get: function () { return values[key]; }, configurable: true });
+      var self = this;
+      if (typeof globalThis.Event === 'function') {
+        /* Built through Event, so the slots its own accessors read -- type, timeStamp and the
+           rest -- are the ones Event's constructor fills, then moved under CloseEvent: that is
+           what leaves the chain at CloseEvent > Event rather than three prototypes deep. */
+        self = new globalThis.Event(type, init);
+        Object.setPrototypeOf(self, CloseEvent.prototype);
+      }
+      CLOSE.set(self, {
+        code: init.code === undefined ? 0 : Number(init.code),
+        reason: init.reason === undefined ? '' : String(init.reason),
+        wasClean: init.wasClean === undefined ? false : !!init.wasClean
       });
-      return Object.create(proto);
+      return self;
     }
     CloseEvent.prototype = Object.create(Object.prototype);
     Object.defineProperty(CloseEvent.prototype, 'constructor', { value: CloseEvent, writable: true, configurable: true });
-    CloseEvent.prototype.preventDefault = function () {};
-    CloseEvent.prototype.stopPropagation = function () {};
+    ['wasClean', 'code', 'reason'].forEach(function (name) {
+      Object.defineProperty(CloseEvent.prototype, name, {
+        get: function () { return CLOSE.get(this)[name]; },
+        set: function () {
+          throw new TypeError('Cannot set property ' + name + ' of #<_CloseEvent> which has only a getter');
+        },
+        enumerable: true,
+        configurable: true
+      });
+    });
     Object.defineProperty(CloseEvent.prototype, Symbol.toStringTag, { value: 'CloseEvent', configurable: true });
     return CloseEvent;
   })();
