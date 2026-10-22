@@ -1,4 +1,5 @@
 import { IFileSystem } from '../filesystem';
+import type { PathStat } from '../filesystem/types';
 import JSZip from 'jszip';
 import { IShell, ShellCommandResult, CommandParsedResult } from './types';
 import { CommandRegistry } from './commands/registry';
@@ -658,6 +659,24 @@ export class Shell implements IShell {
             }
         }
 
+        /* A path the file system holds but cannot execute is not a name nothing holds, and a host
+           says so with a status of 126 rather than 127: `/tmp` is `is a directory`, and a file with
+           no execute bit is `Permission denied` -- both were `Command not found` and 127, which is
+           the answer for a name no file answers to at all. A bare name is never such a path: only
+           one written with a `/` in it is executed as a file rather than looked up on PATH. */
+        if (command.includes('/')) {
+            let named: PathStat | undefined;
+            try { named = this.fileSystem.statPath(this.at(command)); } catch { named = undefined; }
+            if (named !== undefined) {
+                if (named.type === 'dir') {
+                    return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: is a directory\n`, exitCode: 126 };
+                }
+                if (named.mode !== undefined && (named.mode & 0o111) === 0) {
+                    return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: Permission denied\n`, exitCode: 126 };
+                }
+            }
+        }
+
         /* The message a host writes for a name no built-in, no utility and no file on PATH answers
            to, and it ends in the newline every diagnostic of a host's ends in -- which is what the
            one the script engine fell back on was missing, so the text a line wrote after it ran on
@@ -722,6 +741,12 @@ export class Shell implements IShell {
                     if (args.length === 0) return ok(input ?? '');
                     let joined = '';
                     for (const name of args) {
+                        /* `-` is the standard input, as it is for the host's `cat`: `printf 'x' |
+                           cat -` prints `x`, and a name that is no file at all is still an error. */
+                        if (name === '-') {
+                            joined += input ?? '';
+                            continue;
+                        }
                         /* The mode `chmod` set is honoured here: a file whose owner cannot read it
                            is not read, with the message and status the host's `cat` gives, rather
                            than printed as if the mode meant nothing. */

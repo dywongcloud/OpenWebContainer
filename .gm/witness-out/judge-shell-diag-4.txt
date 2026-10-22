@@ -1,0 +1,61 @@
+row: owc-shell-heredoc-background-job and the shell-diag shard
+measured: 2026-10-23T00:38:00Z
+load: 0:38 up 3 days, 9:03, 7 users, load averages: 23.15 20.75 23.43
+free: Pages free: 316584 (5.1 GB)
+claim: judge verdict on the adversary's report for shard shell-diag
+verdict: DIVERGES -- three of the five are real and are fixed here; two stay open
+
+The commit under refutation, e95916d, is a REGRESSION. Proved by running the same batch with
+`backgroundSource` reduced to the `const source = node.source` the commit replaced:
+
+case: "(cat <<EOF\nb\nEOF\n) & wait"
+  host  stdout="b\n" stderr="" exit=0
+  cont  stdout="b\n" stderr="" exit=0            <-- pre-e95916d
+  cont  stdout="b\n" stderr="Command not found: b\nCommand not found: EOF\n" exit=0   <-- e95916d
+case: "if true; then cat <<EOF\na\nEOF\nfi & wait"
+  host  stdout="a\n" stderr="" exit=0
+  cont  stdout="a\n" stderr="" exit=0            <-- pre-e95916d
+  cont  stdout="a\n" stderr="Command not found: a\nCommand not found: EOF\n" exit=0   <-- e95916d
+case: "for i in 1; do cat <<EOF\na\nEOF\ndone & wait"
+  host  stdout="a\n" stderr="" exit=0
+  cont  stdout="a\n" stderr="" exit=0            <-- pre-e95916d
+  cont  stdout="a\n" stderr="Command not found: a\nCommand not found: EOF\n" exit=0   <-- e95916d
+
+3/3 stable. `backgroundSource` appended every heredoc body to a source that already held it,
+because a compound whose `&` stands behind its closing word spans its own body. Fixed: only a body
+that starts behind where the source stopped is put back.
+
+Two pre-existing heredoc defects sat beside it, both fixed:
+
+case: "cat <<EOF\n\na\n\nEOF"
+  host  stdout="\na\n\n" stderr="" exit=0
+  cont  stdout="a\n\n"  stderr="" exit=0   <-- before: readHeredocs ate the body's first blank line
+case: "cat <<EOF |\na\nEOF\ncat & wait"
+  host  stdout="a\n" stderr="" exit=0
+  cont  stdout="" stderr="Command not found: a\n" exit=0  <-- before: the `|` crossed the newline
+                                                              and read the body as its next command
+
+After the three fixes: 10-case heredoc batch 9/10 (the one left is `; }`, a syntax-error shape),
+18-case heredoc sweep 18/18, 46-case general shell sweep 43/46 (the three are HOME, cwd contents
+and `ls /` -- environmental, not divergences).
+
+Both syntax-error rows were closed on one input each and the closing is wrong: on 10 shapes the
+container succeeded where the host exits 2 in two of them. Both are fixed -- `echo "abc` and
+`echo ${x` are now exit 2 with `unexpected EOF while looking for matching ...`. The rest of the
+syntax class is filed: owc-shell-syntax-error-source-line, owc-shell-syntax-error-token-named,
+owc-shell-arith-operand-error-status.
+
+case: "/tmp"
+  host  stderr="/bin/sh: /tmp: is a directory\n" exit=126
+  cont  stderr="Command not found: /tmp\n" exit=127           <-- before
+  cont  stderr="sh: /tmp: is a directory\n" exit=126          <-- after (prefix only)
+case: "touch /tmp/owc-j4-x1; chmod 644 /tmp/owc-j4-x1; /tmp/owc-j4-x1"
+  host  stderr="/bin/sh: /tmp/owc-j4-x1: Permission denied\n" exit=126
+  cont  stderr="sh: /tmp/owc-j4-x1: Permission denied\n" exit=126   <-- after (prefix only)
+
+The row's own claim, owc-shell-command-not-found-newline, HOLDS. The sentence around the newline
+is filed as owc-shell-command-not-found-wording.
+
+owc-shell-ls-f-order and owc-shell-ls-owner-system-dirs stay open: re-confirmed on fresh name
+sets and on `ls -ld /bin /usr /dev /`, `ls -ln f2` and `ls -l f3 | awk`. The host's `-f` order
+repeated identically across two invocations but is still not derivable.

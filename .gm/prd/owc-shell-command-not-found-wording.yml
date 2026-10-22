@@ -1,0 +1,7 @@
+id: owc-shell-command-not-found-wording
+subject: 'a name nothing answers to is "Command not found: X" where a host writes "sh: X: command not found"'
+description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4). The row owc-shell-command-not-found-newline is about the trailing newline and holds; the sentence itself is a different divergence. `nosuchcmd-j4`: host stderr "/bin/sh: nosuchcmd-j4: command not found\n" exit 127; container stderr "Command not found: nosuchcmd-j4\n" exit 127. Not a prefix difference -- the container puts the name after the sentence where a host puts it in the middle, so no choice of shell name makes them equal. Left unfixed because the row owc-shell-command-not-found-newline was closed on witnesses that assert the container text "Command not found: ..."; changing it reopens that row. Fix site: the fallback in runSimpleCommand, packages/core/src/shell/shell.ts.'
+witness_plan: Run `nosuchcmd-j4` on both sides; stderr must be "sh: nosuchcmd-j4: command not found\n" modulo the host's /bin/sh prefix.
+session_id: adv2-judge-shell-diag-4
+owner: adv2-judge-shell-diag-4
+status: pending
