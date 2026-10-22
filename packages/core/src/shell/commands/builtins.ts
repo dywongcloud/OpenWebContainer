@@ -3335,12 +3335,16 @@ function planDuplicate(state: ShellState, plan: RedirectPlan, fd: number, target
         if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
         return;
     }
-    /* `>&word` with a word that names no descriptor is both streams, the way `&>word` writes them:
-       `{ echo o; echo e >&2; } >&f` is `o` and `e` both in `f`, and `echo hi >&f` is `hi` in `f`
-       with nothing on the error. A number in front of the operator -- `2>&f`, `3>&f` -- says which
-       descriptor moves, and a host reads that as an ambiguous redirect instead, so only the form
-       with no number is read as the two of them. */
-    if (fd === 1 && !/^[0-9]+$/.test(target) && resolved.kind === 'file') {
+    /* `>&word` with a word no descriptor answers to is a name, not a number: the standard output
+       takes both streams, the way `&>word` writes them -- `{ echo o; echo e >&2; } >&f` is `o` and
+       `e` both in `f` -- while any other descriptor in front of the operator is a host's ambiguous
+       redirect, which it names and fails the command with: `echo hi 2>&f` is `sh: f: ambiguous
+       redirect` and writes nothing at all. */
+    if (target !== '-' && !/^[0-9]+$/.test(target) && resolved.kind === 'file') {
+        if (fd !== 1) {
+            if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: ambiguous redirect\n`;
+            return;
+        }
         plan.stdoutTo = { ...resolved };
         plan.stderrTo = { ...resolved };
         return;
