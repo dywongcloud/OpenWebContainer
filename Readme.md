@@ -366,7 +366,8 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   bytes and of `/dev/urandom` eight that are not; `fstatSync` of an open descriptor of one says `size` 0,
   as a host's does, and a `chmodSync` or `fchmodSync` of one is refused with the host's `EPERM` rather
   than being taken and leaving the device a regular file. A write is discarded by all four but
-  `/dev/urandom`: that is the one a host refuses to be seeded through, so it is refused here too. `/dev` itself is `dr-xr-xr-x` and nothing can be made
+  `/dev/urandom`: that is the one a host refuses to be seeded through, so it is refused here too.
+  `/dev` itself is `dr-xr-xr-x` and nothing can be made
   in it, as on a host: `mkdir /dev/sub` is refused. What is still recorded rather than fixed:
   - `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd` -- and `/dev/tty`, below -- are not there:
     `echo x > /dev/stdout` is refused in the container where a host prints `x`.
