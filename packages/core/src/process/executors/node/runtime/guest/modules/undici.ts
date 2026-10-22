@@ -1437,8 +1437,8 @@ function wsUtf8Ok(bytes) {
  * The state behind a socket, which no program is meant to see. Host Node keeps it in internal slots:
  * a socket carries no own property at all -- Object.getOwnPropertyNames(ws) is [] on the host and
  * every attribute is a prototype accessor -- so a WeakMap is the same thing here, with the socket as
- * the key and nothing about it changed. The emitter lives in that state too rather than on the
- * instance, so the three slots an emitter would otherwise own never appear on the socket either.
+ * the key and nothing about it changed. The listener list lives in that state too rather than on the
+ * instance, so the slots an emitter would otherwise own never appear on the socket either.
  */
 var WS_STATE = new WeakMap();
 
@@ -1447,25 +1447,93 @@ function wsState(ws) {
 }
 
 /*
- * The socket's events are carried by an emitter, but a socket shows EventTarget's surface and no
- * longer inherits one, so the emitter is reached through the state rather than through 'this'.
- * 'error' is still only delivered to a program that is listening for it: an unhandled one is the
- * exception a real emitter throws, not a message nobody asked for.
+ * The socket's listener list, which is EventTarget's and not an emitter's: the same listener added
+ * twice for one type is registered once, { once: true } unregisters as it fires, the capture flag is
+ * part of what removeEventListener has to match, and a listener runs with the socket as 'this' --
+ * or, for an object carrying a handleEvent, with that object. The list lives in the state beside the
+ * rest of the socket, so the socket itself still carries no property of its own. 'error' is only
+ * delivered to a program that is listening for it, as the count below decides.
  */
+function wsCaptureOf(options) {
+  if (options === true) return true;
+  return !!(options !== null && typeof options === 'object' && options.capture);
+}
+
+function wsOnceOf(options) {
+  return !!(options !== null && typeof options === 'object' && options.once);
+}
+
+function wsFindListener(st, type, listener, capture) {
+  for (var i = 0; i < st.listeners.length; i++) {
+    var entry = st.listeners[i];
+    if (entry.type === type && entry.listener === listener && entry.capture === capture) return i;
+  }
+  return -1;
+}
+
+function wsAddListener(ws, type, listener, options) {
+  var st = wsState(ws);
+  var capture = wsCaptureOf(options);
+  if (wsFindListener(st, type, listener, capture) >= 0) return;
+  st.listeners.push({ type: type, listener: listener, capture: capture, once: wsOnceOf(options) });
+}
+
+function wsRemoveListener(ws, type, listener, options) {
+  var st = wsState(ws);
+  var at = wsFindListener(st, type, listener, wsCaptureOf(options));
+  if (at >= 0) st.listeners.splice(at, 1);
+}
+
 function wsOn(ws, name, fn) {
-  wsState(ws).emitter.on(name, fn);
+  wsAddListener(ws, name, fn, undefined);
 }
 
 function wsOff(ws, name, fn) {
-  wsState(ws).emitter.removeListener(name, fn);
+  wsRemoveListener(ws, name, fn, undefined);
+}
+
+function wsInvoke(ws, entry, event) {
+  if (typeof entry.listener === 'function') entry.listener.call(ws, event);
+  else if (entry.listener !== null && typeof entry.listener.handleEvent === 'function') {
+    entry.listener.handleEvent.call(entry.listener, event);
+  }
 }
 
 function wsEmit(ws, name, event) {
-  return wsState(ws).emitter.emit(name, event);
+  var st = wsState(ws);
+  var snapshot = st.listeners.slice();
+  var fired = false;
+  for (var i = 0; i < snapshot.length; i++) {
+    var entry = snapshot[i];
+    if (entry.type !== name) continue;
+    /* A listener that is only heard once is gone before it runs, so it cannot hear itself again. */
+    if (entry.once) wsRemoveListener(ws, name, entry.listener, entry.capture ? true : undefined);
+    wsInvoke(ws, entry, event);
+    fired = true;
+  }
+  return fired;
 }
 
 function wsListenerCount(ws, name) {
-  return wsState(ws).emitter.listenerCount(name);
+  var st = wsState(ws);
+  var count = 0;
+  for (var i = 0; i < st.listeners.length; i++) if (st.listeners[i].type === name) count++;
+  return count;
+}
+
+/* What Node names the value it refused: 'Received undefined', 'Received null',
+   "Received type string ('open')" and 'Received an instance of Object' are all one shape. */
+function wsDescribeValue(value) {
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  if (typeof value === 'string') return "type string ('" + value + "')";
+  if (typeof value === 'number') return 'type number (' + value + ')';
+  if (typeof value === 'boolean') return 'type boolean (' + value + ')';
+  if (typeof value === 'bigint') return 'type bigint (' + value + ')';
+  if (typeof value === 'symbol') return 'type symbol (' + String(value) + ')';
+  if (typeof value === 'function') return 'an instance of Function';
+  var name = value.constructor && value.constructor.name ? value.constructor.name : 'Object';
+  return 'an instance of ' + name;
 }
 
 /*
@@ -1875,7 +1943,6 @@ function wsProtocols(protocols) {
 
 function WebSocket(url) {
   if (!(this instanceof WebSocket)) return new WebSocket(url, arguments[1]);
-  var EventEmitter = requireBuiltin('events');
   var self = this;
   if (arguments.length < 1) throw new TypeError('WebSocket constructor: 1 argument required, but 0 found.');
   var protocols = arguments[1];
@@ -1890,7 +1957,7 @@ function WebSocket(url) {
   var handlers = {};
   for (var h = 0; h < WS_HANDLERS.length; h++) handlers[WS_HANDLERS[h]] = null;
   var state = {
-    emitter: new EventEmitter(),
+    listeners: [],
     handlers: handlers,
     url: href,
     /* the message event's origin is the url's origin, which stops at the host and carries no path */
@@ -1996,21 +2063,37 @@ var WS_EVENT_BASE = (function () {
 })();
 
 Object.defineProperty(WS_EVENT_BASE, 'addEventListener', {
-  value: function addEventListener(type, fn) { wsOn(this, String(type), fn); },
+  value: function addEventListener(type, listener, options) {
+    /*
+     * A listener Node will not keep is dropped without a sound: null and undefined are allowed and
+     * ignored, and so is any value that is neither callable nor an object carrying a handleEvent.
+     */
+    if (listener === null || listener === undefined) return;
+    var callable = typeof listener === 'function' ||
+      (typeof listener === 'object' && listener !== null && typeof listener.handleEvent === 'function');
+    if (!callable) return;
+    wsAddListener(this, String(type), listener, options);
+  },
   writable: true,
   configurable: true,
   enumerable: true
 });
 Object.defineProperty(WS_EVENT_BASE, 'removeEventListener', {
-  value: function removeEventListener(type, fn) { wsOff(this, String(type), fn); },
+  value: function removeEventListener(type, listener, options) {
+    wsRemoveListener(this, String(type), listener, options);
+  },
   writable: true,
   configurable: true,
   enumerable: true
 });
 Object.defineProperty(WS_EVENT_BASE, 'dispatchEvent', {
   value: function dispatchEvent(event) {
-    wsEmit(this, event && event.type, event);
-    return !(event && event.defaultPrevented);
+    var Ctor = typeof globalThis.Event === 'function' ? globalThis.Event : null;
+    if (Ctor === null || !(event instanceof Ctor)) {
+      throw new TypeError('The "event" argument must be an instance of Event. Received ' + wsDescribeValue(event));
+    }
+    wsEmit(this, event.type, event);
+    return !event.defaultPrevented;
   },
   writable: true,
   configurable: true,
