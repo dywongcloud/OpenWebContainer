@@ -801,7 +801,7 @@ export function createHttp3Api(env: Http3ApiEnvironment) {
         address(): { address: string; port: number; family: string } | null {
             if (this.quicServer === null) return null;
             const a = this.quicServer.address();
-            return { address: a.address, port: a.port, family: a.family ?? 'IPv4' };
+            return a === null ? null : { address: a.address, port: a.port, family: a.family ?? 'IPv4' };
         }
 
         onStream(stream: Http3Stream, headers: IncomingHeaders, raw: string[]): void {
@@ -850,9 +850,12 @@ export function createHttp3Api(env: Http3ApiEnvironment) {
         }
         const target = parseAuthority(authority);
         const host = options.host ?? target.host;
-        const port = options.port ?? target.port;
+        const rawPort = options.port ?? target.port;
+        /* A numeric-string port is a port, as in parseAuthority above and in Node's validatePort:
+           options.port skipped that coercion, so '8443' fell at the integer check as itself. */
+        const port = typeof rawPort === 'string' && rawPort !== '' ? Number(rawPort) : rawPort;
         // Checked here: the QUIC layer would only fail when its first datagram goes out, from a timer.
-        if (!Number.isInteger(port) || port <= 0 || port > 65535) throw apiError('ERR_SOCKET_BAD_PORT', `Port should be > 0 and < 65536. Received ${String(port)}.`, RangeError);
+        if (!Number.isInteger(port) || port <= 0 || port > 65535) throw apiError('ERR_SOCKET_BAD_PORT', `Port should be > 0 and < 65536. Received ${String(rawPort)}.`, RangeError);
         const quic = env.quic.connect({
             ...(options.quic ?? {}),
             host,
