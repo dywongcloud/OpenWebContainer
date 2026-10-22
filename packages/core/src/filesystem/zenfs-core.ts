@@ -1,5 +1,7 @@
 import { fs, InMemoryStore, normalizePath, StoreFS } from '@zenfs/core';
 import { IFileSystem, PathStat } from './types';
+import { installPrototypeNameFix } from './zenfs-listing';
+import { NODE_BINARY } from '../process/executors/default-env';
 
 /**
  * Root mount for the container file system. ZenFS allocates each file as a resizable
@@ -23,11 +25,37 @@ function mountContainerRoot(): void {
     fs.mount('/', root);
 }
 
+/**
+ * Writes the file the container's `node` is, the one `{@link NODE_BINARY}` names.
+ *
+ * `process.execPath` of a guest names that path, and a spawn of it is answered by the node
+ * executor, but it was no file: a package that looks for a binary on `PATH` -- `which` is one --
+ * found nothing in a container that can run node, where a host answers a path. The file is
+ * executable, because every such lookup ends in `isexe`, which reads the mode bits, and it is a
+ * script the node executor runs rather than a binary, which no browser container can have.
+ */
+function writeNodeBinary(): void {
+    if (fs.existsSync(NODE_BINARY)) return;
+    fs.mkdirSync('/usr/local/bin', { recursive: true });
+    fs.writeFileSync(
+        NODE_BINARY,
+        '#!' + NODE_BINARY + '\n' +
+        '/* The container\'s node. A host keeps a binary here; this is the file a search of PATH finds.\n' +
+        '   Spawning it runs the interpreter, not this script: see NODE_BINARY in container.ts. */\n',
+        { mode: 0o755, encoding: 'utf-8' }
+    );
+    /* `writeFileSync` creates a file at 0o644 whatever its `mode` option says, and the executable
+       bit is the whole of what `isexe` -- which every `which`-style lookup ends in -- reads. */
+    if ((fs.statSync(NODE_BINARY).mode & 0o111) === 0) fs.chmodSync(NODE_BINARY, 0o755);
+}
+
 export class ZenFSCore implements IFileSystem {
     private fs: typeof fs;
 
     constructor() {
+        installPrototypeNameFix();
         mountContainerRoot();
+        writeNodeBinary();
         this.fs = fs;
     }
     readBuffer(path: string): Buffer | undefined {
@@ -157,13 +185,16 @@ export class ZenFSCore implements IFileSystem {
         return this.fs.lstatSync(path).isDirectory();
     }
 
+    /* `mode` is carried through: a guest's `fs.statSync` reports it, and the executable bit is
+       what a search for a binary reads. */
     statPath(path: string): PathStat | undefined {
         if (!this.fs.existsSync(path)) return undefined;
         const stat = this.fs.statSync(path);
         return {
             type: stat.isDirectory() ? 'dir' : 'file',
             size: stat.size,
-            mtimeMs: stat.mtimeMs
+            mtimeMs: stat.mtimeMs,
+            mode: stat.mode
         };
     }
 

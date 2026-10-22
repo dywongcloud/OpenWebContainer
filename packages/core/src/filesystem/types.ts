@@ -5,6 +5,12 @@ export interface PathStat {
     type: 'file' | 'dir';
     size: number;
     mtimeMs: number;
+    /**
+     * The permission bits, which a guest's `fs.statSync` reports as `mode` and every search for an
+     * executable (`isexe`, and `which` behind it) reads. A file system with no modes of its own
+     * leaves it out, and the guest falls back to `0o644` for a file and `0o755` for a directory.
+     */
+    mode?: number;
 }
 
 /**

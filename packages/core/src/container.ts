@@ -14,6 +14,7 @@ import { ServerType, VirtualServer } from "./network/types";
 import { NetworkStats } from "./network/types";
 import { HostRequest } from "process/executors/node/modules/network-module";
 import { setProcessHost } from "./shell/commands/procinfo";
+import { NODE_BINARY } from "./process/executors/default-env";
 
 
 interface ProcessEventData {
@@ -310,14 +311,19 @@ export class OpenWebContainer {
 
     async spawn(executablePath: string, args: string[] = [], parentPid?: number,options: SpawnOptions = {}): Promise<Process> {
         const cwd = options.cwd || '/';
+        /* The container's own interpreter: a spawn naming `process.execPath` runs node itself and
+           not the file that stands at that path for a search of PATH to find -- the same mapping a
+           guest's `child_process` makes, and the one that stops the shim's own shebang from running
+           it as a script. */
+        const named = executablePath === NODE_BINARY ? 'node' : executablePath;
         /* A file with no executor of its own -- a node_modules/.bin shim is one, a `node` script with
            no .js name -- runs through the interpreter its shebang names, the way the kernel runs it. */
-        const shebang = this.shebangInvocation(executablePath, args, cwd);
-        const executable = shebang?.executable ?? executablePath;
+        const shebang = this.shebangInvocation(named, args, cwd);
+        const executable = shebang?.executable ?? named;
         const argv = shebang?.args ?? args;
         const executor = this.processRegistry.findExecutor(executable);
         if (!executor) {
-            throw new Error(`No executor found for: ${executablePath}`);
+            throw new Error(`No executor found for: ${named}`);
         }
 
         const pid = options.pid ?? this.processManager.getNextPid();
