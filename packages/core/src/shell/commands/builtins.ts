@@ -3255,10 +3255,24 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
     let stdoutTo: StreamTarget = { ...state.stdoutTarget };
     let stderrTo: StreamTarget = { ...state.stderrTarget };
     const setFd = (fd: number, entry: StreamTarget): void => {
-        if (fd === 1) stdoutTo = entry;
-        else if (fd === 2) stderrTo = entry;
-        else if (entry.kind === 'null') fds.delete(fd);
-        else fds.set(fd, entry);
+        /* The plan is what a redirection further along this same `exec` reads, so it is written
+           as every descriptor is set and not only once the line ends: `exec 3>&1 4>&3` is a `4`
+           pointing where the `3` opened one operator earlier points -- which is what a host
+           gives, where each descriptor is opened in the order it was written -- while a plan
+           filled once at the start held no `3` at all and named it a bad file descriptor. */
+        if (fd === 1) {
+            stdoutTo = entry;
+            plan.stdoutTo = { ...entry };
+        } else if (fd === 2) {
+            stderrTo = entry;
+            plan.stderrTo = { ...entry };
+        } else if (entry.kind === 'null') {
+            fds.delete(fd);
+            plan.fds.delete(fd);
+        } else {
+            fds.set(fd, entry);
+            plan.fds.set(fd, { ...entry });
+        }
     };
     for (const redirect of redirects) {
         const target = expandToString(redirect.target, state);
