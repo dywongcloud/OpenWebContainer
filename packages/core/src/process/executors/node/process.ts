@@ -1729,6 +1729,7 @@ export class NodeProcess extends Process {
            ES module, which this loader does. Set on the guest's own object, so it is there before
            any entry runs -- a file, a -e script or a REPL line alike. */
         this.setGuestFeature('require_module', true);
+        this.setGuestPpid();
         // a parent that wrote before this guest existed is answered now, before the entry runs
         this.flushStdin();
         return entryPath;
@@ -1757,6 +1758,24 @@ export class NodeProcess extends Process {
             }
         } catch {
             // a handle already gone, or a features object that takes no property
+        }
+    }
+
+    /**
+     * Hands `process.ppid` the pid of the process that spawned this one, which is what node on a
+     * host reports and what makes `process.ppid > 1` true for a real child. A process the container
+     * started on its own has no parent and keeps the 0 the guest was built with: there is no pid to
+     * report, and any number put there would be one nothing in the container owns.
+     */
+    private setGuestPpid(): void {
+        if (this.parentPid === undefined) return;
+        const context = this.context;
+        if (context === undefined) return;
+        const arg = context.newNumber(this.parentPid);
+        try {
+            this.callApi('setPpid', [arg]).dispose();
+        } finally {
+            arg.dispose();
         }
     }
 
@@ -2595,9 +2614,9 @@ export class NodeProcess extends Process {
     /**
      * The ES module source the engine compiles: prepareEsmSource, then the guest's compatibility
      * rewrite (the one the CommonJS loader retries with after a SyntaxError) when the source may hold
-     * a class element named get, set or async. The rewrite is used only when it changes the source
-     * and the engine fails to parse the source as it is; a source that parses reaches the engine
-     * unchanged.
+     * a class element named get, set or async, or a for-of whose iterable holds a yield. The rewrite
+     * is used only when it changes the source and the engine fails to compile the source as it is; a
+     * source that compiles reaches the engine unchanged.
      */
     private esmSource(source: string, file: string, isMain: boolean, urlSuffix = ''): string {
         const duplicate = duplicateModuleBinding(source, file);
@@ -2606,7 +2625,7 @@ export class NodeProcess extends Process {
             const found = this.resolver.resolve(spec, dirnameOf(file), 'import');
             return found === undefined ? undefined : isDataUrl(found) ? found : toFileUrl(found);
         });
-        if (!CLASS_ELEMENT_CANDIDATE.test(prepared)) return prepared;
+        if (!CLASS_ELEMENT_CANDIDATE.test(prepared) && !FOR_OF_YIELD_CANDIDATE.test(prepared)) return prepared;
         const sourceArg = this.context!.newString(prepared);
         let rewritten: string;
         try {
@@ -2637,7 +2656,10 @@ export class NodeProcess extends Process {
             const result = context.evalCode(probe, PARSE_CHECK_ENTRY, { type: 'module' });
             const failure = result.error ? context.dump(result.error) as { name?: unknown } | undefined : undefined;
             result.dispose();
-            return failure?.name !== 'SyntaxError';
+            /* Not only a SyntaxError: QuickJS aborts the compile of a for-of whose iterable holds a
+               yield, and that abort is an InternalError ('stack underflow'), so a module that hits
+               it read as one that compiles and was handed to the engine unchanged. */
+            return failure === undefined || (failure?.name !== 'SyntaxError' && failure?.name !== 'InternalError');
         } finally {
             context.dispose();
             runtime.dispose();
@@ -2935,6 +2957,12 @@ const ERROR_MODULE_PREFIX = 'owc-error:';
  * guest's compatibility rewrite quotes, so its slower scan runs only on sources that may hold one.
  */
 const CLASS_ELEMENT_CANDIDATE = /\b(?:get|set|async)\s*(?:;|\/[/*])/;
+/**
+ * A for-of (or for-await) whose iterable holds a yield: the same cheap superset for the rewrite that
+ * hoists that iterable out, which QuickJS 0.31 and 0.32 abort the compile of. The header holds no
+ * semicolon, so stopping at the first ')' keeps a yield in an enclosing loop's body out of the test.
+ */
+const FOR_OF_YIELD_CANDIDATE = /\bfor\s*(?:await\s*)?\([^)]*\byield\b/;
 /** Module names of parsesAsModule's probe; the scheme prefix keeps them apart from file paths. */
 const PARSE_CHECK_ENTRY = 'owc:parse-check';
 const PARSE_CHECK_STOP = 'owc:parse-check-stop';

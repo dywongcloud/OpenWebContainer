@@ -369,22 +369,28 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   `getegid` and `getgroups` answer, and `setuid`, `seteuid`, `setgid`, `setegid`, `setgroups` and
   `initgroups` throw the host's `EPERM` as they do for a process that is not root; `getgroups` returns the
   one group this process has, where a host on this machine returns sixteen.
-- **`process.ppid` is 0 for a process the container started itself, and a child's is the pid of the process
-  that spawned it.** A host's `ppid` is the pid of the shell that started it, and a host's child reports the
-  pid of its parent the same way; the container reports that pid for every process it starts with a parent,
-  and 0 for one it starts on its own, because there is no process behind it to name.
-- **`process.argv[0]` is the path and `process.argv0` is the name, as on a host.** A host's `argv0` is `node`,
-  because that is the word the shell invoked, while its `argv[0]` carries the resolved path; the container
-  reports the same pair, so `process.title` (`'node'`) and `process.argv0` agree as a host's agree.
+- **`process.ppid` is 0 for a process the container started itself, and a child's is the pid of the
+  process that spawned it.** A host's `ppid` is the pid of the shell that started it, and a host's
+  child reports the pid of its parent the same way; the container reports that pid for every process
+  it starts with a parent, and 0 for one it starts on its own, because there is no process behind it
+  to name.
+- **`process.argv[0]` is the path and `process.argv0` is the name, as on a host.** A host's `argv0`
+  is `node`, because that is the word the shell invoked, while its `argv[0]` carries the resolved
+  path; the container reports the same pair, so `process.title` (`'node'`) and `process.argv0` agree
+  as a host's agree.
 - **`os.networkInterfaces()` reports the loopback alone.** `lo` carries `127.0.0.1` and `::1` with the netmask,
   family and cidr a host's entries carry, where a host reports eleven interfaces of its own: a container's
   sockets are the host's, so it has no address of a network of its own to name, and a package that picks an
   address out of the map finds the loopback and nothing else.
-- **A guest stack frame names no receiver and carries the container's own engine frames.**
-  `E.methodFrame()` gives `    at methodFrame (/app/main.js:31:3)` where the host gives
-  `    at Object.methodFrame (...)`, a top-level frame is `at <anonymous>` where the host's is
-  `at Object.<anonymous>`, and every guest trace ends with `at call (native)`,
-  `at loadCJS (owc-bootstrap.js:...)` and `at runMain (owc-bootstrap.js:...)`, which no host trace has.
+- **A guest stack frame names no receiver.** `E.methodFrame()` gives `    at methodFrame (/app/main.js:31:3)`
+  where the host gives `    at Object.methodFrame (...)`, `new Foo()` gives `at Foo` where the host gives
+  `at new Foo`, a static call `at sm` where the host gives `at Bar.sm`, and a getter `at gg` where the
+  host gives `at Object.gg`: the receiver a frame was called on is not something this engine writes into
+  a frame it writes, so no guest-side reading of the text can put it there. What a host does name is
+  named now: a trace keeps no frame of this container's own -- where it ended with `at call (native)`,
+  `at loadCJS (owc-bootstrap.js:...)` and `at runMain (owc-bootstrap.js:...)`, which no host trace has,
+  it ends with the frames of node's own CommonJS loader -- the body of a module is `at Object.<anonymous>`
+  and not `at <anonymous>`, and the anonymous function a host leaves unnamed is the bare location.
   `util.inspect(new Error('boom'))`, an uncaught throw and an error the guest constructs all carry
   the `Error: boom` header. An error the engine raises itself -- `null.x`, `JSON.parse('{')` --
   still opens with a frame, which is `owc-guest-error-engine-stack-no-header` below.
@@ -1013,7 +1019,6 @@ re-run in isolation; the rows are open.
 - `owc-shell-return-not-in-function-wording`: the complaint about a `return` outside a function is quoted with straight quotes and carries no shell name -- host ``/bin/sh: line 1: return: can only `return' from a function or sourced script``, container `return: can only 'return' from a function or sourced script`.
 - `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string.
 - `owc-guest-error-engine-stack-no-header`: an error the engine raises itself -- `null.x`, `JSON.parse('{')` -- opens with a frame where host Node 24.15 opens with the error's own name and message: container `err.stack` is `    at <anonymous> (/app/main.js:12:11)`, host `TypeError: Cannot read properties of null (reading 'x')`. An error the guest constructs does carry its header, because its constructor is wrapped; these are raised at throw sites inside the engine that no guest-side definition reaches.
-- `owc-json-stringify-replacer-cycle-message`: a cycle a replacer introduces -- `JSON.stringify({x:1}, function(k,v){ return k === 'x' ? cyc : v; })` where `cyc.a === cyc` -- still throws `TypeError: circular reference` where host Node 24.15 throws `Converting circular structure to JSON` followed by `    --- property 'a' closes the circle`. A cycle in the value handed to `JSON.stringify`, and one a `toJSON` returns, are both named; only one the replacer substitutes is not, because the walk that finds the circle sees the value as handed over and not as the replacer rewrote it.
 - `owc-shell-closed-fd-flush-target`: the text a closed descriptor could not hold lands where a host's buffer is flushed, not where the shell started -- `exec >d; echo hi >&-; exec >&2; echo O=[$(cat d)]` is host `O=[hi]` (and the text on the error stream) against the container's `O=[]` with `hi` on the original output; `{ echo hi >&-; } > f; echo O=[$(cat f)]` is host `O=[]` with `hi` on the original output against the container's `O=[hi]`; `exec 1>&-; echo hi 1>&1` is host stdout empty against the container's `hi`.
 - `owc-shell-cat-option-operand`: `exec 0<p1; cat -n` -- the host numbers the lines it read (`     1\tp`), the container reads a file named `-n` and fails with `ENOENT: No such file or directory, '/app/D/-n'`.
 - `owc-shell-cat-directory`: `mkdir sd; cat sd` -- host stderr `cat: sd: Is a directory` and status 1; container stdout `{}` and status 0.
