@@ -331,35 +331,35 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   as the host does.
 - **`command -v` answers with the path or the bare name, as a host does** -- `/bin/ls`, `/bin/sh`, `echo`,
   `cd` -- and `command -V` and `type` keep the wording that describes (`ls is /bin/ls`, `cd is a shell
-  builtin`). What is still absent is a file for a utility this shell has no builtin of its own: `command -v npm`,
-  `command -v git`, `command -v grep` and `command -v sed` exit 1 where a host names a file.
+  builtin`). Every command the container runs as one of its own built-ins also has a file on `PATH`, the way
+  `sh`, `ls`, `cat`, `echo`, `env`, `node`, `npm` and `npx` do. Three names have no file: `git` is not in the
+  container at all, and `grep` and `sed` are reached through the shell's runner, which a file on `PATH` would
+  outrank -- give them one and `command -v grep` starts answering while `grep` itself stops working, so
+  `command -v grep`, `command -v sed` and `command -v git` exit 1 where a host names a file.
 
 ### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
 
 Each of these was measured by running the same script under host Node 24.15 and in the container and
 diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
 
-- **`process.stdout` is an `EventEmitter` with a `write`, not a `Writable`.** `isTTY` and `columns` are now
-  left off a stream with no terminal behind it, as a piped host leaves them off, so a package that
-  sizes its output from `columns || 80` falls back here as it does there; but the rest of the stream is
-  not there -- `writableHighWaterMark` undefined where the host's is 65536, and `fd`, `writable`,
-  `writableEnded`, `errored` and `pipe` undefined too, so `typeof process.stdout.pipe` is `'undefined'`
-  and anything that pipes into stdout, or tests a stream by its `pipe`, takes the other branch.
-- **`process.getuid` (and `process.geteuid`) do not exist** where the host's return 501, so
-  `typeof process.getuid === 'function'` is false and a guard on it takes the other branch. The number is
-  not the obstacle: `os.userInfo()` in the same container reports `uid` 1000.
-- **`process.argv0` is undefined** where the host's is the path node was invoked by.
-- **`os.networkInterfaces()` is `{}`** where a host's holds eleven entries, one per interface, so a package
-  that picks an address out of it finds nothing.
+- **`process.stdout` is a `Writable` by shape, but not one of node's own classes.** It carries `fd` 1 (2 for
+  `stderr`), `writable` true, `readable` false, a `writableHighWaterMark` of 65536 and a `pipe` that refuses
+  with `ERR_STREAM_CANNOT_PIPE` as a host's does, and its prototype chain reads
+  `SyncWriteStream > Writable > Stream > EventEmitter > Object`, which is the chain a host gives when its
+  output goes to a file. Send a host's output to a pipe instead and that stream is a `Socket`, and its
+  `stdin` a `ReadStream` over `fd` 0 -- classes a container cannot hold -- so the constructor names agree
+  against a file and not against a pipe, and the own properties differ either way.
+- **`os.networkInterfaces()` reports the loopback alone.** `lo` carries `127.0.0.1` and `::1` with the netmask,
+  family and cidr a host's entries carry, where a host reports eleven interfaces of its own: a container's
+  sockets are the host's, so it has no address of a network of its own to name, and a package that picks an
+  address out of the map finds the loopback and nothing else.
 - **A guest stack frame names no receiver and carries the container's own engine frames.**
   `E.methodFrame()` gives `    at methodFrame (/app/main.js:31:3)` where the host gives
   `    at Object.methodFrame (...)`, a top-level frame is `at <anonymous>` where the host's is
   `at Object.<anonymous>`, and every guest trace ends with `at call (native)`,
   `at loadCJS (owc-bootstrap.js:...)` and `at runMain (owc-bootstrap.js:...)`, which no host trace has.
-  The receiver is the one thing a frame of this engine's does not carry -- it names the function and
-  the place and nothing else -- and the frames the trace ends with are the container's loader, so
-  neither is reachable from guest source. `err.stack` does open with the header now: it is an own
-  accessor, as on the host, built from the error's name and message when it is read.
+  `util.inspect(new Error('boom'))` and an uncaught throw do carry the `Error: boom` header -- the
+  formatter that writes them prepends it -- and only `err.stack` itself does not.
 - **`/dev` holds four devices where a host holds hundreds.** `/dev/null`, `/dev/zero`, `/dev/random` and
   `/dev/urandom` are mounted as character devices and `fs.statSync('/dev/null')` agrees with the host --
   `isFile()` false, `isCharacterDevice()` true, `mode` 8630 -- and a read of `/dev/zero` gives eight zero
@@ -964,4 +964,5 @@ re-run in isolation; the rows are open.
 - `owc-shell-syntax-error-token-named`: `if; then` -- the host names `;` where the container names `newline`; `echo |` -- the host reports an unexpected end of file where the container names `|`; `for x in a; echo hi; done` -- the host names `echo` where the container says `` `do' expected ''.
 - `owc-shell-arith-operand-error-status`: `x=$((1+))` -- host stderr `/bin/sh: 1+: syntax error: operand expected (error token is "+")` exit 127; container stderr `syntax error: operand expected` exit 1.
 - `owc-shell-command-not-found-wording`: `nosuchcmd-j4` -- host stderr `/bin/sh: nosuchcmd-j4: command not found`; container `Command not found: nosuchcmd-j4`. Not a prefix difference: the name sits in a different place in the sentence.
-- `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string. It is one of the two readings of one QuickJS throw site and no guest-side definition reaches it.
+- `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string.
+- `owc-json-stringify-circular-message`: `JSON.stringify(o)` where `o.o === o` -- host Node 24.15 throws `TypeError: Converting circular structure to JSON` followed by two lines naming the constructor and the property that closes the circle; the container throws `TypeError: circular reference`. It reaches `Response.json(cyclic)` through the same call.

@@ -274,6 +274,14 @@ proc.pid = host.pid();
 proc.ppid = 0;
 proc.argv = JSON.parse(host.argvJSON());
 proc.execPath = '/usr/local/bin/node';
+/*
+ * argv[0] exactly as this process received it. On a host that is the path node was invoked by --
+ * the same string as execPath for every run, because node is started by the node at execPath and
+ * not by a name on PATH that resolves somewhere else. A host's argv0 is a string, and a package
+ * that asks how the process was started reads it; left off, it is undefined and the same package
+ * takes the branch a host never takes.
+ */
+proc.argv0 = proc.execPath;
 proc.execArgv = [];
 proc.env = procEnv;
 proc.exitCode = undefined;
@@ -399,12 +407,71 @@ function esrchFor(pid) {
 proc.umask = function () {
   return 18;
 };
+/*
+ * The ids this process runs as, which are the ids its own os.userInfo() names: the container is one
+ * user, and that user is decided in the one place userInfo decides it. Node has these accessors on
+ * a POSIX host and not elsewhere, and a package tests for the accessor before it reads the number --
+ * the typeof process.getuid === 'function' guard -- so it is the missing function, not the
+ * number, that sends such a package down the branch a container never takes. The effective ids are
+ * the real ones because nothing here changes identity: there is no setuid, and nothing to set.
+ */
+proc.getuid = function () { return requireBuiltin('os').userInfo().uid; };
+proc.geteuid = function () { return requireBuiltin('os').userInfo().uid; };
+proc.getgid = function () { return requireBuiltin('os').userInfo().gid; };
+proc.getegid = function () { return requireBuiltin('os').userInfo().gid; };
 proc.emitWarning = function (warning) {
   host.stderr('(node) Warning: ' + (warning && warning.message ? warning.message : String(warning)) + '\n');
 };
-function makeStdioStream(writeText) {
-  var stream = Object.create(EventEmitterCls.prototype);
+/*
+ * The chain a host's process.stdout has: SyncWriteStream over Writable over Stream over
+ * EventEmitter, which is what a package looks at -- isStreamLike(process.stdout), a prototype test,
+ * a check that typeof process.stdout.pipe is a function. This container has no descriptor to open,
+ * so the chain is built by name and the state behind it sits in a _writableState, which is where a
+ * host keeps what these accessors read and why they are not own properties of the stream. A write is
+ * still one synchronous call into the host, as it always was: nothing buffers and nothing waits.
+ *
+ * The name is the one node gives the stream it opens when its output is not a socket and not a
+ * terminal -- a write that returns as soon as it is made -- which is what this stream is.
+ */
+function Stream() {}
+function Writable() {}
+function SyncWriteStream() {}
+Stream.prototype = Object.create(EventEmitterCls.prototype);
+Writable.prototype = Object.create(Stream.prototype);
+SyncWriteStream.prototype = Object.create(Writable.prototype);
+Stream.prototype.constructor = Stream;
+Writable.prototype.constructor = Writable;
+SyncWriteStream.prototype.constructor = SyncWriteStream;
+/*
+ * Writable.prototype.pipe, as node writes it: nothing can be piped *out of* a stream that cannot be
+ * read, and node reports that by emitting the error rather than by returning one.
+ */
+SyncWriteStream.prototype.pipe = function (dest) {
+  var cannot = new Error('Cannot pipe, not readable');
+  cannot.code = 'ERR_STREAM_CANNOT_PIPE';
+  var self = this;
+  queueMicrotask(function () { self.emit('error', cannot); });
+  return dest;
+};
+/* Everything a Writable reports about itself, read from the state object as node reads it. */
+[
+  ['writable', 'writable'], ['destroyed', 'destroyed'], ['writableEnded', 'ended'],
+  ['writableFinished', 'finished'], ['writableHighWaterMark', 'highWaterMark'],
+  ['writableLength', 'length'], ['writableCorked', 'corked'], ['writableNeedDrain', 'needDrain'],
+  ['writableObjectMode', 'objectMode'], ['errored', 'errored']
+].forEach(function (pair) {
+  Object.defineProperty(SyncWriteStream.prototype, pair[0], {
+    configurable: true,
+    get: function () { return this._writableState[pair[1]]; }
+  });
+});
+function makeStdioStream(fd, writeText) {
+  var stream = new SyncWriteStream();
   EventEmitterCls.call(stream);
+  stream._writableState = { writable: true, destroyed: false, ended: false, finished: false,
+    highWaterMark: 65536, length: 0, corked: 0, needDrain: false, objectMode: false, errored: null };
+  stream.fd = fd;
+  stream.readable = false;
   /*
    * No terminal is attached, and a stream node has with no terminal behind it has *no* isTTY and
    * *no* columns: a host run with its output piped reports undefined for both, not false and 80.
@@ -420,17 +487,19 @@ function makeStdioStream(writeText) {
   };
   stream.end = function (chunk) {
     if (chunk !== undefined && typeof chunk !== 'function') stream.write(chunk);
+    stream._writableState.ended = true;
+    stream._writableState.finished = true;
     return stream;
   };
-  stream.cork = function () {};
-  stream.uncork = function () {};
+  stream.cork = function () { stream._writableState.corked = stream._writableState.corked + 1; };
+  stream.uncork = function () { if (stream._writableState.corked > 0) stream._writableState.corked = stream._writableState.corked - 1; };
   stream.setEncoding = function () { return stream; };
   return stream;
 }
-proc.stdout = makeStdioStream(function (text) {
+proc.stdout = makeStdioStream(1, function (text) {
   host.stdout(text);
 });
-proc.stderr = makeStdioStream(function (text) {
+proc.stderr = makeStdioStream(2, function (text) {
   host.stderr(text);
 });
 /* stdin has no input source unless the host feeds one. A process started with a pipe on fd 0 keeps it
@@ -455,7 +524,17 @@ function stdinRef() {
 function stdinOf() {
   if (stdinStream === null) {
     var Readable = requireBuiltin('stream').Readable;
-    stdinStream = new Readable({ read: function () {} });
+    /*
+     * A ReadStream, which is what a host's process.stdin is: the Readable node wraps fd 0 in, named
+     * as node names it, so a package that asks which class it is holding gets the answer a host
+     * gives. The Readable behind it is the same one this used, built the same way.
+     */
+    function ReadStream(options) { Readable.call(this, options); }
+    ReadStream.prototype = Object.create(Readable.prototype);
+    ReadStream.prototype.constructor = ReadStream;
+    stdinStream = new ReadStream({ read: function () {} });
+    /* fd 0, the descriptor a process reads its input from, whether anything is fed through it. */
+    stdinStream.fd = 0;
     // as on stdout: a stream with no terminal behind it reports neither isTTY nor columns
     // text in, text out: a pushed chunk reaches a reader as the string it was written as
     stdinStream.setEncoding('utf8');
@@ -558,12 +637,7 @@ function makeCallSite(text) {
 if (!Error.captureStackTrace) {
   Error.captureStackTrace = function (target) {
     if (!target || typeof target !== 'object') return;
-    var lines = String(new Error('').stack || '').split('\n');
-    /* What the engine hands back opens with the line naming the error once the constructors below
-       are in place, and with a frame when it is not; either way the line that follows is this call,
-       which is not a frame of the caller's and is dropped with it. */
-    if (lines.length > 0 && lines[0].indexOf('    at ') !== 0) lines = lines.slice(1);
-    var frames = lines.slice(1);
+    var frames = String(new Error('').stack || '').split('\n').slice(1);
     if (typeof Error.prepareStackTrace === 'function') {
       target.stack = Error.prepareStackTrace(target, frames.map(makeCallSite));
       return;
@@ -573,73 +647,6 @@ if (!Error.captureStackTrace) {
   };
 }
 if (Error.stackTraceLimit === undefined) Error.stackTraceLimit = 10;
-
-/* The header a V8 stack starts with: the error's own name and message, then the frames. This engine
-   writes the frames alone, as a plain data property with nothing in front of them, so the first
-   line of a guest err.stack is a frame where the host's is "Error: boom". The frames are moved
-   behind an accessor -- the shape the host has -- and the header is built when the property is
-   read, which is what makes a name or a message written after the throw the one the stack shows. */
-var STACK_HEADER_CTORS = ['Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError'];
-var CONSTRUCT_FRAME = '    at construct (native)';
-
-function stackHeaderOf(err) {
-  return String(err.name || 'Error') + (err.message ? ': ' + err.message : '');
-}
-
-/* The frames of a stack the wrapper built, less the two it puts there of its own -- the
-   Reflect.construct call and the wrapper itself, neither of which was on the stack the caller
-   asked about -- and less the empty line the engine ends every stack with. */
-function framesOfEngineStack(stack, ownFrame) {
-  var lines = typeof stack === 'string' && stack !== '' ? stack.split('\n') : [];
-  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
-  var at = 0;
-  while (at < lines.length && (lines[at] === CONSTRUCT_FRAME || lines[at] === ownFrame)) at++;
-  return lines.slice(at).join('\n');
-}
-
-function installStackHeader(name) {
-  var Native = globalThis[name];
-  if (typeof Native !== 'function') return;
-  if (typeof Reflect === 'undefined' || typeof Reflect.construct !== 'function') return;
-  var ownFrame = null;
-  function Shim() {
-    var err = Reflect.construct(Native, arguments, new.target === undefined ? Shim : new.target);
-    var raw = err.stack;
-    /* The first error built names the frame the wrapper itself contributes; every later one is
-       asked to drop it. */
-    if (ownFrame === null) {
-      var built = typeof raw === 'string' && raw !== '' ? raw.split('\n') : [];
-      ownFrame = built.length > 1 ? built[1] : '';
-    }
-    var frames = framesOfEngineStack(raw, ownFrame);
-    Object.defineProperty(err, 'stack', {
-      get: function () {
-        var header = stackHeaderOf(err);
-        if (frames === '') return header;
-        /* A stack written back by captureStackTrace or by a package carries its own header. */
-        return frames.indexOf(header) === 0 ? frames : header + '\n' + frames;
-      },
-      set: function (value) { frames = value === undefined || value === null ? '' : String(value); },
-      enumerable: false,
-      configurable: true
-    });
-    return err;
-  }
-  Shim.prototype = Native.prototype;
-  Object.defineProperty(Shim, 'name', { value: name, configurable: true });
-  Object.defineProperty(Shim, 'length', { value: Native.length, configurable: true });
-  var statics = Object.getOwnPropertyNames(Native);
-  for (var s = 0; s < statics.length; s++) {
-    if (statics[s] === 'length' || statics[s] === 'name' || statics[s] === 'prototype') continue;
-    Object.defineProperty(Shim, statics[s], Object.getOwnPropertyDescriptor(Native, statics[s]));
-  }
-  /* err.constructor === Error is asked as often as err instanceof Error is, and the prototype
-     the instances keep is still the engine's own, so it is its constructor that names the
-     wrapper. */
-  Object.defineProperty(Native.prototype, 'constructor', { value: Shim, writable: true, enumerable: false, configurable: true });
-  globalThis[name] = Shim;
-}
-for (var headerAt = 0; headerAt < STACK_HEADER_CTORS.length; headerAt++) installStackHeader(STACK_HEADER_CTORS[headerAt]);
 
 var groupIndent = '';
 var counters = Object.create(null);
@@ -1767,107 +1774,6 @@ globalThis.crypto = nodeCrypto.webcrypto;
   define('$' + String.fromCharCode(96), before);
   define('rightContext', after);
   define("$'", after);
-})();
-
-/* A cycle in a value handed to JSON.stringify: the engine says "circular reference" where V8 names
-   the constructor the circle starts at, each property walked to get there and the property that
-   closes it. Only the words are asked of a value the engine has already refused, so the walk that
-   finds the circle runs after the refusal and never before it, and a value that is accepted costs
-   nothing at all. */
-function cycleConstructorName(value) {
-  var proto = Object.getPrototypeOf(value);
-  if (proto === null || proto === undefined) return 'Object';
-  var ctor = proto.constructor;
-  if (ctor !== null && ctor !== undefined && typeof ctor.name === 'string' && ctor.name !== '') return ctor.name;
-  return 'Object';
-}
-
-/* How one step of the path is named: an index of an array, and otherwise a property. */
-function cycleStepText(key, parentIsArray) {
-  return parentIsArray ? 'index ' + key : "property '" + key + "'";
-}
-
-/* The circle in a value, as the place on the path it starts at and the key that closes it, or null
-   when a walk of the value finds none -- a cycle a replacer or a toJSON built is one this walk does
-   not see, and for that one the engine's own words are left alone. */
-function findCycleIn(value) {
-  var path = [];
-  var reached = [];
-  var found = null;
-
-  function walk(node, key, parentIsArray) {
-    if (found !== null) return true;
-    if (node === null || typeof node !== 'object') return false;
-    /* V8 asks a value for its own JSON form before it walks into it, and a Date answers with a
-       string that has nothing behind it. */
-    if (typeof node.toJSON === 'function') {
-      var form;
-      try { form = node.toJSON(key); } catch (ignored) { return false; }
-      if (form === null || typeof form !== 'object') return false;
-      node = form;
-    }
-    var at = path.indexOf(node);
-    if (at >= 0) {
-      found = { start: at, key: key, parentIsArray: parentIsArray, path: path.slice(), reached: reached.slice() };
-      return true;
-    }
-    path.push(node);
-    reached.push({ key: key, parentIsArray: parentIsArray });
-    var isArray = Array.isArray(node);
-    var names = isArray ? null : Object.keys(node);
-    var count = isArray ? node.length : names.length;
-    for (var i = 0; i < count; i++) {
-      var childKey = isArray ? i : names[i];
-      var child;
-      try { child = node[childKey]; } catch (ignored) { continue; }
-      if (walk(child, childKey, isArray)) return true;
-    }
-    path.pop();
-    reached.pop();
-    return false;
-  }
-
-  walk(value, undefined, false);
-  return found;
-}
-
-function circularStructureText(value) {
-  var cycle = findCycleIn(value);
-  if (cycle === null) return null;
-  var lines = ['Converting circular structure to JSON'];
-  lines.push("    --> starting at object with constructor '" + cycleConstructorName(cycle.path[cycle.start]) + "'");
-  for (var i = cycle.start + 1; i < cycle.path.length; i++) {
-    var step = cycle.reached[i];
-    lines.push('    |     ' + cycleStepText(step.key, step.parentIsArray) +
-      " -> object with constructor '" + cycleConstructorName(cycle.path[i]) + "'");
-  }
-  lines.push('    --- ' + cycleStepText(cycle.key, cycle.parentIsArray) + ' closes the circle');
-  return lines.join('\n');
-}
-
-(function installCircularStructureMessage() {
-  var nativeStringify = JSON.stringify;
-  if (typeof nativeStringify !== 'function') return;
-  JSON.stringify = function (value) {
-    try {
-      return nativeStringify.apply(JSON, arguments);
-    } catch (err) {
-      if (!(err instanceof TypeError) || String(err.message) !== 'circular reference') throw err;
-      var text = circularStructureText(value);
-      if (text === null) throw err;
-      /* The error the engine threw carries the stack of the call that asked for the string, so it is
-         the one thrown back, with its words replaced; where a message cannot be written, a fresh
-         error of the same kind carries them instead. */
-      var rewritten = false;
-      try {
-        err.message = text;
-        rewritten = String(err.message) === text;
-      } catch (ignored) {
-        rewritten = false;
-      }
-      throw rewritten ? err : new TypeError(text);
-    }
-  };
 })();
 
 api.finalExitCode = function () {
