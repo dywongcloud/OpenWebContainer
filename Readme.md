@@ -356,8 +356,10 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   `    at Object.methodFrame (...)`, a top-level frame is `at <anonymous>` where the host's is
   `at Object.<anonymous>`, and every guest trace ends with `at call (native)`,
   `at loadCJS (owc-bootstrap.js:...)` and `at runMain (owc-bootstrap.js:...)`, which no host trace has.
-  `util.inspect(new Error('boom'))` and an uncaught throw do carry the `Error: boom` header -- the
-  formatter that writes them prepends it -- and only `err.stack` itself does not.
+  The receiver is the one thing a frame of this engine's does not carry -- it names the function and
+  the place and nothing else -- and the frames the trace ends with are the container's loader, so
+  neither is reachable from guest source. `err.stack` does open with the header now: it is an own
+  accessor, as on the host, built from the error's name and message when it is read.
 - **`/dev` holds four devices where a host holds hundreds.** `/dev/null`, `/dev/zero`, `/dev/random` and
   `/dev/urandom` are mounted as character devices and `fs.statSync('/dev/null')` agrees with the host --
   `isFile()` false, `isCharacterDevice()` true, `mode` 8630 -- and a read of `/dev/zero` gives eight zero
@@ -962,5 +964,4 @@ re-run in isolation; the rows are open.
 - `owc-shell-syntax-error-token-named`: `if; then` -- the host names `;` where the container names `newline`; `echo |` -- the host reports an unexpected end of file where the container names `|`; `for x in a; echo hi; done` -- the host names `echo` where the container says `` `do' expected ''.
 - `owc-shell-arith-operand-error-status`: `x=$((1+))` -- host stderr `/bin/sh: 1+: syntax error: operand expected (error token is "+")` exit 127; container stderr `syntax error: operand expected` exit 1.
 - `owc-shell-command-not-found-wording`: `nosuchcmd-j4` -- host stderr `/bin/sh: nosuchcmd-j4: command not found`; container `Command not found: nosuchcmd-j4`. Not a prefix difference: the name sits in a different place in the sentence.
-- `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string.
-- `owc-json-stringify-circular-message`: `JSON.stringify(o)` where `o.o === o` -- host Node 24.15 throws `TypeError: Converting circular structure to JSON` followed by two lines naming the constructor and the property that closes the circle; the container throws `TypeError: circular reference`. It reaches `Response.json(cyclic)` through the same call.
+- `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string. It is one of the two readings of one QuickJS throw site and no guest-side definition reaches it.
