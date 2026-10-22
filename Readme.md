@@ -195,6 +195,31 @@ original. Throwing was the version that lost data. The same stream is why a bare
 bytes, one byte or nothing at all now return an empty buffer as they do on the host, while input
 that is not a frame at all still raises `ZSTD_error_prefix_unknown`.
 
+### ⚠️ Guest `zlib` divergences from the host that are recorded rather than fixed
+
+Each of these was measured by running the same script under host Node 24.15 and in the container and
+diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
+
+- **`finishFlush` is range-checked but not applied.** `gunzipSync(frame.slice(0, -1), { finishFlush: Z_SYNC_FLUSH })`
+  gives host Node 24.15 the 270 bytes that decoded and no error, where this container still raises
+  `Z_BUF_ERROR unexpected end of file`; `inflateSync` is 25 bytes to 0 and `inflateRawSync` 24 to 0 the
+  same way. The other direction too: `gzipSync(buf, { finishFlush: Z_SYNC_FLUSH })` is 65 bytes on the
+  host and 68 here. Node hands the option to the codec as the operation the last chunk is written
+  with, so anything below the finish means "do not wait for the end of the stream"; this container
+  always finishes.
+- **A decompress stream emits nothing before it errors.** `createGunzip()` fed a frame with its last
+  byte removed pushes 270 bytes and then errors with `Z_BUF_ERROR` on host Node 24.15, and 0 bytes
+  here; `createInflate()` is 25 to 0, `createInflateRaw()` 46 to 0 and `createBrotliDecompress()`
+  43 to 0. Decompress streams buffer their input and inflate once, so there is no partial output to
+  push before the error.
+- **The brotli compressor accepts input after a flush that finished it.** `write(a); flush(Z_SYNC_FLUSH); write(b); end()`
+  on a `createBrotliCompress()` raises `ERR_BROTLI_COMPRESSION_FAILED` on host Node 24.15 -- brotli
+  refuses input after `BROTLI_OPERATION_FINISH` -- and yields 58 bytes, the flush's own output, with
+  `b` dropped here. gz, deflate, deflate-raw and zstd agree on the same shape.
+- **A `Transform` emits `'end'` one tick before `'finish'`, where Node emits `'finish'` first.** In the
+  `end` handler of a stream written once and ended, `writableFinished` is true on host Node 24.15 and
+  false here. `zlib`'s own `flush(callback)` works around it; a caller reading those flags does not.
+
 ### ⚠️ Guest network throughput, and why it is bounded by the capability boundary
 
 One loopback transfer per cell, 64 KiB writes, measured in the container and beside it the same
@@ -739,6 +764,13 @@ Current focus areas:
 - [ ] WebSocket support
 
 Future plans:
+- [ ] URL: IPv4/IPv6 host normalisation -- `new URL('http://0x7f.1/').hostname` is `0x7f.1`, host Node gives `127.0.0.1` (row owc-url-host-ipv4-ipv6-normalisation)
+- [ ] URL percent-encoding -- `u.hash = '#a b'` leaves a raw space and `new URL('http://h/ü').href` keeps `ü` (row owc-url-percent-encoding)
+- [ ] URL forbidden host code points -- `new URL('http://a b/')` is accepted where host Node throws (row owc-url-forbidden-host-code-points)
+- [ ] URL file: scheme -- `new URL('file:/a').href` is `file://a/` where host Node gives `file:///a` (row owc-url-file-scheme-host)
+- [ ] url module legacy API -- `require('url').domainToASCII` is absent and `url.parse(...).href` writes a stray `=` before the fragment (row owc-url-module-legacy-api)
+- [ ] Builtin module namespace surface -- `node:fs` lacks `cp`/`glob`/`statfs`/`openAsBlob` and leaks `F_OK` at top level (row owc-esm-builtin-namespace-surface)
+- [ ] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
 - [ ] Add signal handling (SIGTERM, SIGKILL, etc.): `child.kill` sends one, `process.kill` does not reach a process
 - [ ] Create process groups and job control
 - [ ] Create development tools and debugging capabilities
