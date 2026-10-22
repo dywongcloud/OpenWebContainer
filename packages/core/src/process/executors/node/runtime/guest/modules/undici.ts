@@ -1153,7 +1153,7 @@ function WebSocket(url, protocols) {
   this.url = href;
   this.protocol = '';
   this.extensions = '';
-  this.binaryType = 'blob';
+  /* binaryType is a prototype accessor: a fresh socket reads 'blob' without an own property */
   this.bufferedAmount = 0;
   this.readyState = WS_CONNECTING;
   this._socket = null;
@@ -1272,8 +1272,14 @@ WebSocket.CLOSED = WS_CLOSED;
   for (var i = 0; i < handlers.length; i++) {
     (function (name) {
       Object.defineProperty(WebSocket.prototype, 'on' + name, {
+        /* Node's own handler properties are plain enumerable accessors, and one that was never
+           assigned reads null rather than the undefined a plain slot would give. */
         configurable: true,
-        get: function () { return this['_handler_' + name]; },
+        enumerable: true,
+        get: function () {
+          var fn = this['_handler_' + name];
+          return fn === undefined ? null : fn;
+        },
         set: function (fn) {
           var previous = this['_handler_' + name];
           if (typeof previous === 'function') this.removeListener(name, previous);
@@ -1283,6 +1289,21 @@ WebSocket.CLOSED = WS_CLOSED;
       });
     })(handlers[i]);
   }
+  /*
+   * binaryType is the two kinds a message can arrive as and nothing else: Node keeps 'blob' when it
+   * is handed anything it does not recognise, so an invalid spelling never sticks.
+   */
+  Object.defineProperty(WebSocket.prototype, 'binaryType', {
+    configurable: true,
+    enumerable: true,
+    get: function () { return this._binaryType === 'arraybuffer' ? 'arraybuffer' : 'blob'; },
+    set: function (value) { this._binaryType = value === 'arraybuffer' ? 'arraybuffer' : 'blob'; }
+  });
+  /* the four states are readable off an instance, not only off the class */
+  var states = { CONNECTING: WS_CONNECTING, OPEN: WS_OPEN, CLOSING: WS_CLOSING, CLOSED: WS_CLOSED };
+  Object.keys(states).forEach(function (name) {
+    Object.defineProperty(WebSocket.prototype, name, { value: states[name], writable: false, enumerable: true, configurable: true });
+  });
 })();
 
 BF['undici'] = function () {
