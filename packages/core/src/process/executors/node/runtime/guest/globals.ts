@@ -836,6 +836,18 @@ function isBootstrapFrame(text) {
   return typeof text === 'string' && text.indexOf(BOOTSTRAP_MARK) >= 0;
 }
 
+/* The frame of a function with no name: host node writes the bare location and no name at all where
+   this engine writes <anonymous> in front of it. One whose location is not a file -- an eval, a body
+   new Function built -- is left as it stands, since a host names those after the eval that made them
+   and not after a file. */
+function anonymousFrameName(text) {
+  var parsed = /^(\s*)at <anonymous> \(([^)]+)\)\s*$/.exec(text);
+  if (parsed === null) return text;
+  var where = parsed[2];
+  if (where.charAt(0) !== '/') return text;
+  return parsed[1] + 'at ' + where;
+}
+
 /* The frame of a compiled CommonJS body: the anonymous function the engine calls it is the wrapper
    node names Object.<anonymous>. */
 function moduleFrameName(text) {
@@ -878,6 +890,7 @@ function guestFramesOf(lines) {
     out.push(line);
     at++;
   }
+  for (var n = 0; n < out.length; n++) out[n] = anonymousFrameName(out[n]);
   return out;
 }
 
