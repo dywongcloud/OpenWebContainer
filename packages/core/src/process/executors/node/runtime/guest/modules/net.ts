@@ -513,8 +513,13 @@ BF['net'] = function () {
 
     _onRemoteEnd() {
       if (this._dead) return;
+      /* An end with nothing buffered ahead of it ends the stream on the turn it arrives, as Node's
+         does: there is no read to batch it with, and waiting a turn would put this side's 'close'
+         ahead of the peer's 'end' in the order both sides observe. */
+      var batched = this._readQueue.length > 0;
       this._readQueue.push({ end: true });
-      this._scheduleRead();
+      if (batched) this._scheduleRead();
+      else this._drainReadQueue();
     }
 
     _onRemoteClose() {
@@ -554,22 +559,31 @@ BF['net'] = function () {
         used = 0;
       }
       while (!this._dead && this._readQueue.length > 0) {
-        var item = this._readQueue.shift();
+        var item = this._readQueue[0];
         if (item.end) {
+          this._readQueue.shift();
           flush();
           this.push(null);
           // As Node does at EOF: an empty buffer ends the stream even when nothing is reading it.
           this.read(0);
           return;
         }
+        /* A socket reads one buffer at a time: what its reader has not taken yet stays in the
+           kernel, so a socket nobody reads holds NET_CHUNK bytes at most and the rest is still
+           unread -- which is what makes closing it a reset instead of a clean end (Node 24.15
+           sends FIN up to 65536 unread bytes and RST from 65537 on). The read resumes from _read,
+           the way the kernel read resumes once the buffer has room. */
+        var room = NET_CHUNK - (this.readableLength + used);
+        if (room <= 0) break;
         var chunk = item.chunk;
-        var at = 0;
-        while (at < chunk.length) {
-          var take = Math.min(NET_CHUNK - used, chunk.length - at);
-          parts.push(take === chunk.length ? chunk : chunk.subarray(at, at + take));
-          used += take;
-          at += take;
-          if (used >= NET_CHUNK) flush();
+        if (chunk.length <= room) {
+          this._readQueue.shift();
+          parts.push(chunk);
+          used += chunk.length;
+        } else {
+          parts.push(chunk.subarray(0, room));
+          item.chunk = chunk.subarray(room);
+          used += room;
         }
       }
       if (!this._dead) flush();
@@ -717,14 +731,15 @@ BF['net'] = function () {
       }
     }
 
-    /** Bytes this side received and never read: closing with them is the reset Node sends. */
+    /** Bytes this side received and never handed to its reader: those are the ones a real socket
+        still holds in its kernel buffer, and closing with them is the reset Node sends. Bytes the
+        reader was given but has not consumed are not -- Node closes cleanly over 65536 of those. */
     _unreadBytes() {
       var queued = 0;
       for (var i = 0; i < this._readQueue.length; i++) {
         if (this._readQueue[i].chunk !== undefined) queued += this._readQueue[i].chunk.length;
       }
-      var buffered = duplexMode && typeof this.readableLength === 'number' ? this.readableLength : 0;
-      return queued + buffered;
+      return queued;
     }
 
     _ensureTarget() {
@@ -851,7 +866,11 @@ BF['net'] = function () {
       return duplexWrite.call(this, chunk, encoding, callback);
     };
 
-    Socket.prototype._read = function () {};
+    Socket.prototype._read = function () {
+      /* The stream asks for more once its reader has taken what it was holding: that is the kernel
+         read resuming, so what was left unread moves into the buffer. */
+      if (this._readQueue.length > 0) this._scheduleRead();
+    };
 
     Socket.prototype._write = function (chunk, encoding, callback) {
       this.bytesWritten += chunk.length;
@@ -878,13 +897,28 @@ BF['net'] = function () {
       // socket was destroyed with an error of its own: the error is the socket's, not the write's.
       this._closeHub(unread);
       this._teardown();
+      var self = this;
+      /* Node reports the error a socket was destroyed with BEFORE it cancels the writes the destroy
+         stranded: the error is the socket's own, and the cancel is the handle closing under it, so
+         Node 24.15 logs 'error', then the write callback, then 'close'. It is reported on the next
+         tick, as the stream's own error would be, and the stream is told it has been reported so its
+         close path does not repeat it. */
+      if (error) {
+        var w = this._writableState;
+        var r = this._readableState;
+        if (w) w.errorEmitted = true;
+        if (r) r.errorEmitted = true;
+        process.nextTick(function () { self.emit('error', error); });
+      }
       /* The cancel lands on the turn after the destroy, as Node's handle close does: the socket's
          own 'error' is reported first, and a write issued after the destroy is answered before the
          one that was still pending. */
-      var self = this;
       setTimeout(function () {
         self._drainWriteCbs(self._writeCancelError());
-        callback(error);
+        /* The socket's own 'close' lands a turn later still: Node's handle closes under the loop
+           turn in which the peer reads the FIN, so both sides log the peer's 'end' before this
+           side's 'close' (Node 24.15, plain net). */
+        setTimeout(function () { callback(error); }, 0);
       }, 0);
     };
 
