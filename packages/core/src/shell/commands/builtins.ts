@@ -3214,7 +3214,10 @@ function runParsed(state: ShellState, script: string): number {
             return 2;
         }
         if (error instanceof UnsetVariableError) {
-            writeErr(state, `${error.message}\n`);
+            /* The complaint about a variable `set -u` will not read is one a host writes without the
+               line it stands on -- `$0: nope: unbound variable` -- and the shell a line was handed
+               to with `-c` ends on it, leaving 127. */
+            writeErr(state, `${state.shellName}: ${error.message}\n`);
             return 127;
         }
         /* An arithmetic error already written the way a host writes it, carrying the status a host
@@ -3740,23 +3743,32 @@ interface ReadOffset { pos: number }
 
 /**
  * Where `n>&m`, `n<&m` and `n>&-` point: the destination the named descriptor has *now*, the
- * shell's own output or error for `1` and `2`, or nothing at all for `-`.
+ * shell's own output or error for `1` and `2`, the shell's own input for `0`, or nothing at all
+ * for `-`.
  *
  * Undefined for a descriptor number nothing opened, which a host names and fails the command with
  * before it runs: `echo hi >&9` is `sh: 9: Bad file descriptor`, and the command never runs.
+ *
+ * `0` is the one standard descriptor a host holds open without anything having been redirected onto
+ * it, so it is answered even where no `exec` ever named it: `exec 3>&0` duplicates the shell's own
+ * standard input, and `echo hi >&3` behind it is the write error a write through a descriptor opened
+ * for reading is -- not the `Bad file descriptor` a number nothing opened gives.
  */
 function duplicateOf(
     plan: RedirectPlan,
     target: string,
     stdoutTo: StreamTarget = plan.stdoutTo,
-    stderrTo: StreamTarget = plan.stderrTo
+    stderrTo: StreamTarget = plan.stderrTo,
+    stdinTo: StreamTarget = { kind: 'input' }
 ): StreamTarget | undefined {
     if (target === '-') return { kind: 'null' };
     if (target === '1') return { ...stdoutTo };
     if (target === '2') return { ...stderrTo };
     if (!/^[0-9]+$/.test(target)) return { kind: 'file', file: target, append: false };
     const opened = plan.fds.get(Number.parseInt(target, 10));
-    return opened === undefined ? undefined : { ...opened };
+    if (opened !== undefined) return { ...opened };
+    if (target === '0') return { ...stdinTo };
+    return undefined;
 }
 
 /**
@@ -4065,7 +4077,13 @@ function redirectFailure(state: ShellState, file: string, error: unknown): Error
  * the first left behind it -- which is nothing at all once a `cat` has been to the end of the file.
  */
 function readFdAt(state: ShellState, target: StreamTarget): string {
-    const text = readInputFile(state, target.file ?? '');
+    /* A descriptor a duplicate of the standard input left on the shell's own input: what it holds is
+       what the shell has not read of that input yet, which is what a host's `cat <&3` behind an
+       `exec 3>&0` reads. */
+    if (target.file === undefined) {
+        return state.inputCursor < state.inputBuffer.length ? state.inputBuffer.slice(state.inputCursor) : '';
+    }
+    const text = readInputFile(state, target.file);
     const offset = target.read;
     if (offset === undefined) return text;
     return offset.pos >= text.length ? '' : text.slice(offset.pos);
@@ -4214,6 +4232,17 @@ function writeOutputFile(state: ShellState, file: string, text: string, append: 
  * it closed the output. Closed by this command's own `2>&-`, it reaches the shell's error after
  * all: a host has put the descriptor back by the time it reports.
  */
+/**
+ * A descriptor a write through cannot reach: one `>&-` closed, and one a duplicate put on a file
+ * opened for reading -- `exec 3>&0; echo hi >&3`, where the `3` the standard input was duplicated
+ * onto takes no write. A host's write to either is the same failure: the text stays in the shell's
+ * own buffer, which is flushed once the descriptor is back, and the command that made the write is
+ * left with the status a failed write gives it.
+ */
+function unwritable(target: StreamTarget): boolean {
+    return target.kind === 'null' || target.kind === 'input';
+}
+
 function writeClosedWriteError(state: ShellState, plan: RedirectPlan, text: string): void {
     const target = plan.stderrTo;
     if (target.kind === 'null') {
@@ -4287,7 +4316,7 @@ function finish(
            text -- `echo hi >&-; cat p1; echo end` is a host's `p q r`, then `hi`, then `end`. */
         if (
             state.held !== ''
-            && plan.stdoutTo.kind !== 'null'
+            && !unwritable(plan.stdoutTo)
             && stdout !== ''
             && name !== undefined
             && SHELL_OWN_NAMES.has(name)
@@ -4295,7 +4324,7 @@ function finish(
             stdout = state.held + stdout;
             state.held = '';
         }
-        if (plan.stdoutTo.kind === 'null') {
+        if (unwritable(plan.stdoutTo)) {
             /* A write to a descriptor `>&-` closed: the text reaches the shell anyway -- a host's
                own write is held in its buffer, which is flushed once the descriptor is put back --
                and the write is still the failure it was, reported with the status a host gives the
@@ -4364,6 +4393,10 @@ function callFunction(state: ShellState, fn: FunctionDef, args: string[]): numbe
     state.optchar = 1;
     state.optarg = '';
     state.scopes.push(new Map());
+    /* `FUNCNAME` is the function a line stands in: it is a name the function's own scope carries, so
+       it is there while the body runs and gone -- along with the scope -- the moment it returns, the
+       way a host's own is. */
+    state.scopes[state.scopes.length - 1].set('FUNCNAME', { value: fn.name });
     state.callStack.push({ name: fn.name, source: state.source, line: state.line });
     let status = 0;
     try {
@@ -4419,7 +4452,14 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     }
 
     const plan = planRedirects(state, command.redirects);
-    const commandInput = plan.inputText !== undefined
+    /* A descriptor a duplicate put on the standard input -- `cat <&3` behind an `exec 3>&0` -- is the
+       shell's own input read through the shell's own cursor, not a copy of it: what a `read` through
+       it takes is taken from the shell too, which is why `read a <&3; read b <&3` is the first line
+       and then the second on a host and not the first one twice. */
+    const ownStdin = plan.inputFd !== undefined && plan.inputFd.file === undefined;
+    const commandInput = ownStdin
+        ? input
+        : plan.inputText !== undefined
         ? plan.inputText
         : plan.inputFd !== undefined ? readFdAt(state, plan.inputFd)
         : plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
@@ -4447,7 +4487,13 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
         const status = substitutionStatus;
         for (const entry of pending) {
             if (!setVar(state, entry.name, entry.value)) {
-                return finish(state, plan, '', `${entry.name}: readonly variable\n`, 1);
+                /* An assignment a readonly variable refuses ends the shell a line was handed to with
+                   `-c`, the way a host's own does: `readonly R=1; R=2; echo after` writes nothing
+                   behind its diagnostic and leaves 127. The complaint is one a host writes without
+                   the line it stands on -- `$0: R: readonly variable`. */
+                finish(state, plan, '', `${state.shellName}: ${entry.name}: readonly variable\n`, 127);
+                state.exitCalled = true;
+                return throwExit(127);
             }
             if (state.options.allexport) markExported(state, entry.name);
         }
@@ -4601,6 +4647,16 @@ function ok(stdout = '', _state?: ShellState): CommandResult {
 
 function failLine(message: string, code = 1): CommandResult {
     return { stdout: '', stderr: message === '' ? '' : message + '\n', exitCode: code };
+}
+
+/**
+ * A builtin's own complaint, the way a host prints one: the shell's name and the line it stands on
+ * ahead of the builtin's own words -- `sh: line 0: type: nosuchcmd: not found`. Every builtin a host
+ * names itself is named through here, so a diagnostic and the command it belongs to can never
+ * disagree about where the line stood.
+ */
+function failDiag(state: ShellState, message: string, code = 1): CommandResult {
+    return failLine(`${diagnosticPrefix(state)}${message}`, code);
 }
 
 function splitAssign(text: string): { name: string; value: string | undefined; append: boolean } | null {
@@ -4850,7 +4906,9 @@ function setBuiltin(ctx: CommandContext): CommandResult {
                     return ok(joinLines(lines), state);
                 }
                 const entry = OPTION_NAMES.find(([, name]) => name === next);
-                if (!entry) return failLine(`set: ${next}: invalid option name`, 2);
+                /* The status of a name `set -o` does not know is 1, not the 2 of an option letter it
+                   does not know: `set -o badopt; echo st=$?` is a host's `st=1`. */
+                if (!entry) return failDiag(state, `set: ${next}: invalid option name`, 1);
                 state.options[entry[0]] = enable;
                 index += 2;
                 continue;
@@ -4858,14 +4916,22 @@ function setBuiltin(ctx: CommandContext): CommandResult {
             if (body.startsWith('o') && body.length > 1) {
                 const name = body.slice(1);
                 const entry = OPTION_NAMES.find(([, option]) => option === name);
-                if (!entry) return failLine(`set: ${name}: invalid option name`, 2);
+                if (!entry) return failDiag(state, `set: ${name}: invalid option name`, 1);
                 state.options[entry[0]] = enable;
                 index++;
                 continue;
             }
             for (const ch of body) {
                 const key = SHORT_OPTIONS[ch];
-                if (!key) return failLine(`set: -${ch}: invalid option`, 2);
+                if (!key) {
+                    /* An option letter `set` does not know ends the shell a line was handed to with
+                       `-c`, the way a host's own does: `set -q; echo st=$?` prints nothing at all
+                       behind the two lines it writes and leaves 2. */
+                    writeErr(state, `${diagnosticPrefix(state)}set: -${ch}: invalid option\n`
+                        + 'set: usage: set [--abefhkmnptuvxBCHP] [-o option] [arg ...]\n');
+                    state.exitCalled = true;
+                    return throwExit(2);
+                }
                 state.options[key] = enable;
             }
             index++;
@@ -4899,7 +4965,7 @@ function exportBuiltin(ctx: CommandContext): CommandResult {
     for (const arg of ctx.args) {
         const assign = splitAssign(arg);
         if (!assign) {
-            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failLine(`export: \`${arg}': not a valid identifier`, 1);
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failDiag(state, `export: \`${arg}': not a valid identifier`, 1);
             markExported(state, arg);
             continue;
         }
@@ -4917,9 +4983,12 @@ function readonlyBuiltin(ctx: CommandContext): CommandResult {
         return ok(joinLines(names.map((name) => `readonly ${name}=${quoteDouble(getVar(state, name) ?? '')}`)), state);
     }
     for (const arg of ctx.args) {
+        /* `-f` asks for the functions, which a host names without complaining: `readonly -f` is a
+           host's plain 0 and nothing written. */
+        if (arg === '-f') continue;
         const assign = splitAssign(arg);
         if (!assign) {
-            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failLine(`readonly: \`${arg}': not a valid identifier`, 1);
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failDiag(state, `readonly: \`${arg}': not a valid identifier`, 1);
             if (!isSet(state, arg)) setVar(state, arg, '');
             markReadonly(state, arg);
             continue;
@@ -4936,6 +5005,7 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
     const args = ctx.args.slice();
     let exportFlag: boolean | null = null;
     let readonlyFlag: boolean | null = null;
+    let integer = false;
     let global = false;
     let print = false;
     let functions = false;
@@ -4955,7 +5025,13 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
         else if (flag === '+x') exportFlag = false;
         else if (flag === '-r') readonlyFlag = true;
         else if (flag === '+r') readonlyFlag = false;
-        else return failLine(`declare: ${flag}: invalid option`, 2);
+        else if (flag === '-i') integer = true;
+        else if (flag === '+i') integer = false;
+        else return failDiag(
+            state,
+            `declare: ${flag}: invalid option\ndeclare: usage: declare [-afFirtx] [-p] [name[=value] ...]`,
+            2
+        );
         index++;
     }
     const rest = args.slice(index);
@@ -4977,11 +5053,14 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
     for (const arg of rest) {
         const assign = splitAssign(arg);
         const name = assign ? assign.name : arg;
-        if (!/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?$/.test(name)) return failLine(`declare: \`${arg}': not a valid identifier`, 1);
+        if (!/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?$/.test(name)) return failDiag(state, `declare: \`${arg}': not a valid identifier`, 1);
         const scope = state.scopes.length > 1 && !global ? state.scopes[state.scopes.length - 1] : state.scopes[0];
         if (assign) {
             const base = assign.append ? getVar(state, name) ?? '' : '';
-            const value = base + (assign.value ?? '');
+            /* `-i` makes the value arithmetic: `declare -i z=1+2` is a `z` of 3, which is what a
+               host's own integer attribute leaves behind it. */
+            const raw = base + (assign.value ?? '');
+            const value = integer && !assign.append ? arithmeticValue(state, raw) : raw;
             if (!scope.has(name)) scope.set(name, { value });
             else setVar(state, name, value);
         } else if (!lookupScope(state, name)) {
@@ -4999,22 +5078,40 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
     return ok();
 }
 
+/** The value of an arithmetic expression, or the text itself where it is not one. */
+function arithmeticValue(state: ShellState, text: string): string {
+    try {
+        return String(evalArith(state, text));
+    } catch (error) {
+        if (error instanceof ArithError) return text;
+        throw error;
+    }
+}
+
 function localBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
-    if (state.scopes.length <= 1) return failLine('local: can only be used in a function', 1);
+    if (state.scopes.length <= 1) return failDiag(state, 'local: can only be used in a function', 1);
     const scope = state.scopes[state.scopes.length - 1];
     if (ctx.args.length === 0) {
         return ok(joinLines([...scope.keys()].sort().map((name) => declarePrint(name, scope.get(name) ?? { value: '' }))), state);
     }
+    let integer = false;
     for (const arg of ctx.args) {
+        /* The attributes `local` takes are the ones `declare` takes: `local -i n=3` is an integer
+           `n` in the function's own scope, as it is on a host. */
+        if (arg === '-i') {
+            integer = true;
+            continue;
+        }
         const assign = splitAssign(arg);
         if (!assign) {
-            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failLine(`local: \`${arg}': not a valid identifier`, 1);
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failDiag(state, `local: \`${arg}': not a valid identifier`, 1);
             scope.set(arg, { value: '' });
             continue;
         }
         const base = assign.append ? getVar(state, assign.name) ?? '' : '';
-        scope.set(assign.name, { value: base + (assign.value ?? '') });
+        const raw = base + (assign.value ?? '');
+        scope.set(assign.name, { value: integer && !assign.append ? arithmeticValue(state, raw) : raw });
     }
     return ok();
 }
@@ -5033,7 +5130,15 @@ function unsetBuiltin(ctx: CommandContext): CommandResult {
             variables = true;
             continue;
         }
-        if (arg.startsWith('-')) return failLine(`unset: \`${arg}': invalid option`, 2);
+        if (arg.startsWith('-')) {
+            /* An option `unset` does not know ends the shell a line was handed to with `-c`, the way
+               a host's own does: `unset -x; echo st=$?` prints nothing behind the two lines it
+               writes and leaves 2. */
+            writeErr(state, `${diagnosticPrefix(state)}unset: ${arg}: invalid option\n`
+                + 'unset: usage: unset [-f] [-v] [name ...]\n');
+            state.exitCalled = true;
+            return throwExit(2);
+        }
         if (functions) {
             state.functions.delete(arg);
             continue;
@@ -5044,7 +5149,7 @@ function unsetBuiltin(ctx: CommandContext): CommandResult {
         }
         const scope = lookupScope(state, arg);
         if (scope?.get(arg)?.readonly) {
-            writeErr(state, `unset: ${arg}: cannot unset: readonly variable\n`);
+            writeErr(state, `${diagnosticPrefix(state)}unset: ${arg}: cannot unset: readonly variable\n`);
             status = 1;
             continue;
         }
@@ -5056,7 +5161,13 @@ function unsetBuiltin(ctx: CommandContext): CommandResult {
 function shiftBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     const count = ctx.args.length === 0 ? 1 : Number.parseInt(ctx.args[0], 10);
-    if (Number.isNaN(count) || count < 0) return failLine(`shift: ${ctx.args[0]}: numeric argument required`, 1);
+    if (Number.isNaN(count) || count < 0) {
+        /* A count `shift` cannot read ends the shell a line was handed to with `-c`, the way a
+           host's own does: `shift foo; echo st=$?` prints nothing behind the diagnostic and leaves 1. */
+        writeErr(state, `${diagnosticPrefix(state)}shift: ${ctx.args[0]}: numeric argument required\n`);
+        state.exitCalled = true;
+        return throwExit(1);
+    }
     if (count > state.positional.length) {
         state.positional = [];
         return { stdout: '', stderr: '', exitCode: 1 };
@@ -5076,7 +5187,7 @@ function aliasBuiltin(ctx: CommandContext): CommandResult {
         const eq = arg.indexOf('=');
         if (eq === -1) {
             const value = state.aliases.get(arg);
-            if (value === undefined) return failLine(`alias: ${arg}: not found`, 1);
+            if (value === undefined) return failDiag(state, `alias: ${arg}: not found`, 1);
             return ok(`alias ${arg}='${value}'\n`, state);
         }
         state.aliases.set(arg.slice(0, eq), arg.slice(eq + 1));
@@ -5093,7 +5204,7 @@ function unaliasBuiltin(ctx: CommandContext): CommandResult {
             continue;
         }
         if (!state.aliases.delete(arg)) {
-            writeErr(state, `unalias: ${arg}: not found\n`);
+            writeErr(state, `${diagnosticPrefix(state)}unalias: ${arg}: not found\n`);
             status = 1;
         }
     }
@@ -5132,9 +5243,22 @@ function typeBuiltin(ctx: CommandContext): CommandResult {
             lines.push(path);
             continue;
         }
+        /* `-a` is every answer and not the first one: `type -a echo` is the builtin and then the
+           file PATH holds under the same name, in that order, as a host lists them. */
+        if (flags.has('a')) {
+            const described = describeName(state, name);
+            const onPath = findOnPath(state, name);
+            if (described !== '') lines.push(described);
+            if (onPath !== undefined) lines.push(`${name} is ${onPath}`);
+            if (described === '' && onPath === undefined) {
+                writeErr(state, `${diagnosticPrefix(state)}type: ${name}: not found\n`);
+                status = 1;
+            }
+            continue;
+        }
         const text = describeName(state, name);
         if (text === '') {
-            writeErr(state, `type: ${name}: not found\n`);
+            writeErr(state, `${diagnosticPrefix(state)}type: ${name}: not found\n`);
             status = 1;
             continue;
         }
@@ -5212,7 +5336,7 @@ function builtinBuiltin(ctx: CommandContext): CommandResult {
             const step = RUNNER(state, ctx.args, ctx.input);
             return { stdout: step.stdout, stderr: step.stderr, exitCode: step.exitCode };
         }
-        return failLine(`builtin: ${name}: not a shell builtin`, 1);
+        return failDiag(state, `builtin: ${name}: not a shell builtin`, 1);
     }
     const inner: CommandContext = { args: ctx.args.slice(1), cwd: state.cwd, env: state.env, input: ctx.input, fs: ctx.fs };
     bindState(inner, state);
@@ -5231,10 +5355,17 @@ function hashBuiltin(ctx: CommandContext): CommandResult {
             state.hash.clear();
             continue;
         }
-        if (arg.startsWith('-')) continue;
+        if (arg.startsWith('-')) {
+            /* An option `hash` does not know: the two lines a host writes, and the 2 it leaves. */
+            return failDiag(
+                state,
+                `hash: ${arg}: invalid option\nhash: usage: hash [-lr] [-p pathname] [-dt] [name ...]`,
+                2
+            );
+        }
         const path = findOnPath(state, arg);
         if (path === undefined) {
-            writeErr(state, `hash: ${arg}: not found\n`);
+            writeErr(state, `${diagnosticPrefix(state)}hash: ${arg}: not found\n`);
             status = 1;
             continue;
         }
@@ -5408,7 +5539,11 @@ function ulimitBuiltin(ctx: CommandContext): CommandResult {
         return ok('unlimited\n', state);
     }
     const entry = ULIMIT_TABLE.find((row) => row.flag === flag);
-    if (!entry) return failLine(`ulimit: ${flag}: invalid option`, 2);
+    if (!entry) return failDiag(
+        state,
+        `ulimit: ${flag}: invalid option\nulimit: usage: ulimit [-SHacdfilmnpqstuvx] [limit]`,
+        2
+    );
     if (value === undefined) return ok(`${hard ? entry.hard : entry.soft}\n`, state);
     return failLine(`ulimit: ${value}: cannot modify limit: Operation not permitted`, 1);
 }
@@ -5427,7 +5562,7 @@ function umaskBuiltin(ctx: CommandContext): CommandResult {
     /* A value that begins with a digit is octal, and one the host cannot read as octal is out of
        range rather than not a number: `umask 888`, `umask 08` and `umask 7x` all say so. */
     if (/^[0-9]/.test(value)) {
-        if (!/^[0-7]+$/.test(value)) return failLine(`/bin/sh: line 0: umask: ${value}: octal number out of range`, 1);
+        if (!/^[0-7]+$/.test(value)) return failDiag(state, `umask: ${value}: octal number out of range`, 1);
         state.umask = Number.parseInt(value, 8) & 0o777;
         return ok();
     }
@@ -5439,7 +5574,7 @@ function umaskBuiltin(ctx: CommandContext): CommandResult {
     if (symbolicMode === undefined) {
         const bad = /[^ugoa]/.exec(value.replace(/^[ugoa]*/, ''));
         /* A builtin's own complaint carries the shell's name and line, as bash prefixes it. */
-        return failLine(`/bin/sh: line 0: umask: \`${bad === null ? ' ' : bad[0]}': invalid symbolic mode operator`, 1);
+        return failDiag(state, `umask: \`${bad === null ? ' ' : bad[0]}': invalid symbolic mode operator`, 1);
     }
     state.umask = symbolicMode;
     return ok();
@@ -5481,7 +5616,7 @@ function getoptsBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     const spec = ctx.args[0];
     const name = ctx.args[1];
-    if (spec === undefined || name === undefined) return failLine('getopts: usage: getopts optstring name [arg ...]', 2);
+    if (spec === undefined || name === undefined) return failLine('getopts: usage: getopts optstring name [arg]', 2);
     const silent = spec.startsWith(':');
     const letters = silent ? spec.slice(1) : spec;
     const words = ctx.args.length > 2 ? ctx.args.slice(2) : state.positional;
@@ -5524,7 +5659,9 @@ function getoptsBuiltin(ctx: CommandContext): CommandResult {
             setVar(state, 'OPTARG', silent ? letter : '');
             state.optarg = silent ? letter : '';
             setVar(state, name, '?');
-            if (!silent) writeErr(state, `illegal option -- ${letter}\n`);
+            /* `getopts` names the option it could not read without the line a builtin's own
+               complaint carries: a host's `sh: illegal option -- x`. */
+            if (!silent) writeErr(state, `${state.shellName}: illegal option -- ${letter}\n`);
             if (state.optchar + 1 >= word.length) {
                 put(index + 2);
                 state.optchar = 1;
@@ -5546,7 +5683,7 @@ function getoptsBuiltin(ctx: CommandContext): CommandResult {
             if (state.optarg === '') {
                 setVar(state, 'OPTARG', silent ? letter : '');
                 setVar(state, name, silent ? ':' : '?');
-                if (!silent) writeErr(state, `option requires an argument -- ${letter}\n`);
+                if (!silent) writeErr(state, `${state.shellName}: option requires an argument -- ${letter}\n`);
                 return { stdout: '', stderr: '', exitCode: 0 };
             }
         } else {
@@ -5685,6 +5822,14 @@ function readBuiltin(ctx: CommandContext): CommandResult {
                 index++;
             } else if (ch === 's' || ch === 't' || ch === 'u' || ch === 'e') {
                 index++;
+            } else {
+                /* An option `read` does not know: the two lines a host writes, and the 2 it leaves. */
+                return failDiag(
+                    state,
+                    `read: -${ch}: invalid option\n`
+                        + 'read: usage: read [-ers] [-u fd] [-t timeout] [-p prompt] [-a array] [-n nchars] [-d delim] [name ...]',
+                    2
+                );
             }
         }
         index++;
@@ -5768,7 +5913,9 @@ function mapfileBuiltin(ctx: CommandContext): CommandResult {
 function callerBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     const depth = ctx.args.length > 0 ? Number.parseInt(ctx.args[0], 10) : 0;
-    if (Number.isNaN(depth)) return failLine(`caller: ${ctx.args[0]}: invalid number`, 1);
+    /* A word that is no depth says nothing at all -- a host's `caller x` is the plain false of a
+       builtin that found no frame, with no complaint about the word it could not read. */
+    if (Number.isNaN(depth)) return { stdout: '', stderr: '', exitCode: 1 };
     // `caller` is the caller of the current function: one frame below the innermost
     const frame = state.callStack[state.callStack.length - 2 - depth];
     if (frame === undefined) return { stdout: '', stderr: '', exitCode: 1 };
@@ -5785,6 +5932,11 @@ function dirsBuiltin(ctx: CommandContext): CommandResult {
         if (arg === '-c') clear = true;
         else if (arg === '-v') numbered = true;
         else if (arg === '-l') expand = true;
+        /* Any other option is `dirs`' own complaint -- a host calls the one it could not read an
+           invalid *number* -- with the usage line behind it and the 1 it leaves. */
+        else if (arg.startsWith('-') && !/^-[0-9]+$/.test(arg)) {
+            return failDiag(state, `dirs: ${arg}: invalid number\ndirs: usage: dirs [-clpv] [+N] [-N]`, 1);
+        }
     }
     if (clear) {
         state.dirs = [state.cwd];
@@ -5800,7 +5952,7 @@ function pushdBuiltin(ctx: CommandContext): CommandResult {
     const target = ctx.args.filter((arg) => !arg.startsWith('-'))[0] ?? '';
     if (target === '') {
         // no argument: rotate the top two entries, the way bash's pushd does
-        if (state.dirs.length < 2) return failLine('pushd: no other directory', 1);
+        if (state.dirs.length < 2) return failDiag(state, 'pushd: no other directory', 1);
         const first = state.dirs[0];
         state.dirs[0] = state.dirs[1];
         state.dirs[1] = first;
@@ -5810,7 +5962,15 @@ function pushdBuiltin(ctx: CommandContext): CommandResult {
     }
     const next = resolvePath(state, target);
     const fs = state.fs;
-    if (fs && !fs.isDirectory(next)) return failLine(`pushd: ${target}: No such file or directory`, 1);
+    /* A name nothing in the tree holds is the diagnostic a host writes, not the file system's own
+       error: `pushd /nosuchdir` is `sh: line 0: pushd: /nosuchdir: No such file or directory`. */
+    let isDirectory = true;
+    try {
+        if (fs) isDirectory = fs.isDirectory(next);
+    } catch {
+        isDirectory = false;
+    }
+    if (!isDirectory) return failDiag(state, `pushd: ${target}: No such file or directory`, 1);
     state.dirs.unshift(next);
     state.cwd = next;
     syncPwd(state);
@@ -5819,7 +5979,7 @@ function pushdBuiltin(ctx: CommandContext): CommandResult {
 
 function popdBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
-    if (state.dirs.length <= 1) return failLine('popd: directory stack empty', 1);
+    if (state.dirs.length <= 1) return failDiag(state, 'popd: directory stack empty', 1);
     state.dirs.shift();
     state.cwd = state.dirs[0];
     syncPwd(state);
@@ -6242,7 +6402,11 @@ function jobsBuiltin(ctx: CommandContext): CommandResult {
         // stops no job and keeps no notification history, so they narrow nothing; the dispatcher's
         // own `jobs` reads the three the same way
         else if (arg === '-r' || arg === '-s' || arg === '-n') continue;
-        else if (arg.length > 1 && arg.startsWith('-')) return failLine(`jobs: ${arg}: invalid option`, 2);
+        else if (arg.length > 1 && arg.startsWith('-')) return failDiag(
+            state,
+            `jobs: ${arg}: invalid option\njobs: usage: jobs [-lnprs] [jobspec ...] or jobs -x command [args]`,
+            2
+        );
         else specs.push(arg);
     }
     let listed = jobs;
@@ -6317,8 +6481,9 @@ function disownBuiltin(ctx: CommandContext): CommandResult {
 }
 
 function suspendBuiltin(ctx: CommandContext): CommandResult {
-    void ctx;
-    return failLine('suspend: cannot suspend a shell that has no job control', 1);
+    /* A host's own words for it, behind the shell's name and line: `suspend` on a shell with no job
+       control cannot suspend, and says so. */
+    return failDiag(stateOf(ctx), 'suspend: cannot suspend: no job control', 1);
 }
 
 /**
@@ -6395,13 +6560,17 @@ function waitBuiltin(ctx: CommandContext): CommandResult {
 }
 
 function bindBuiltin(ctx: CommandContext): CommandResult {
+    /* `bind` with nothing behind it is a host's plain failure: no line editing to list, no complaint
+       about it either -- the status 1 and nothing written at all. */
     void ctx;
-    return failLine('bind: line editing is not supported in this shell', 1);
+    return { stdout: '', stderr: '', exitCode: 1 };
 }
 
 function letBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
-    if (ctx.args.length === 0) return failLine('let: requires arguments', 1);
+    /* No expression at all is the complaint a host writes for one: `sh: line 0: let: expression
+       expected`, where `let ''` and `let 1+` are named by the expression that failed instead. */
+    if (ctx.args.length === 0) return failDiag(state, 'let: expression expected', 1);
     let value = 0;
     for (const arg of ctx.args) {
         try {
@@ -6411,7 +6580,7 @@ function letBuiltin(ctx: CommandContext): CommandResult {
                the status `let` has for a bad expression -- 1, where an expansion's own error is
                127: `/bin/sh: let: x=1+: syntax error: operand expected (error token is "+")`. */
             if (error instanceof ArithError) return failLine(arithDiagnostic(state, arg, error, 'let'), 1);
-            return failLine(`let: ${errorMessage(error)}`, 1);
+            return failDiag(state, `let: ${errorMessage(error)}`, 1);
         }
     }
     return { stdout: '', stderr: '', exitCode: value === 0 ? 1 : 0 };
