@@ -1002,6 +1002,13 @@ interface Redirect {
     /** `<<<` is a here-string: the word itself is the command's standard input. */
     op: '>' | '>>' | '<' | '&>' | '&>>' | '>&' | '<&' | '<<' | '<<-' | '<<<';
     target: Word;
+    /**
+     * The body of a `<<` or `<<-`, exactly as it was written behind the command line -- the lines
+     * of the body ended by the delimiter's own line -- which `readHeredocs` keeps because the
+     * command's `source` stops where the line stops and so carries none of it. A job is run from
+     * that source, and a `cat <<EOF &` without this ran on an empty standard input.
+     */
+    heredoc?: string;
 }
 
 interface Assignment {
@@ -1705,6 +1712,7 @@ class Parser {
         this.heredocs = [];
         for (const entry of pending) {
             if (this.here() === '\n') this.pos++;
+            const bodyStart = this.pos;
             const lines: string[] = [];
             while (!this.eof()) {
                 const end = this.src.indexOf('\n', this.pos);
@@ -1716,6 +1724,11 @@ class Parser {
                 if (end === -1) break;
             }
             const text = lines.length === 0 ? '' : lines.join('\n') + '\n';
+            /* The source of the body, kept for a job's sake: a `&` ends the command line before the
+               body starts, so the source a job is handed stops at the `&` and the body behind it is
+               not part of it. Replayed from what is kept here, `cat <<EOF &` reads what it read
+               inline, instead of an end of input that was never written. */
+            entry.target.heredoc = this.src.slice(bodyStart, this.pos);
             /* The body is the input itself, not the name of a file holding it: it stays a `<<`
                redirection, which `planRedirects` reads as text the command reads on its standard
                input. Reading it as a file looked for a file called `hi` and failed with ENOENT.
@@ -2903,9 +2916,60 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null):
  * given. Waited for, such a command is late rather than lost -- and no job is ever invented for a
  * table that cannot run it.
  */
+/**
+ * Every node list a compound command holds its words in: the bodies an `if` and a `while` branch
+ * into, the one a loop repeats, the items of a `case`.
+ */
+function nestedNodes(body: CommandBody): Node[][] {
+    switch (body.t) {
+        case 'if': {
+            const lists = body.branches.flatMap((branch) => [branch.cond, branch.body]);
+            if (body.else_ !== undefined) lists.push(body.else_);
+            return lists;
+        }
+        case 'while': return [body.cond, body.body];
+        case 'for':
+        case 'forarith': return [body.body];
+        case 'case': return body.items.map((item) => item.body);
+        case 'group':
+        case 'subshell': return [body.body];
+        default: return [];
+    }
+}
+
+/**
+ * The here-document bodies a command was written with, in the order their `<<` stand in, each one
+ * the source `readHeredocs` kept for it: the lines of the body and the delimiter line behind them.
+ */
+function collectHeredocs(command: Command, out: string[]): void {
+    const redirects = (command as { redirects?: Redirect[] }).redirects;
+    if (redirects !== undefined) {
+        for (const redirect of redirects) {
+            if (redirect.heredoc !== undefined && redirect.heredoc !== '') out.push(redirect.heredoc);
+        }
+    }
+    for (const nodes of nestedNodes(command)) {
+        for (const node of nodes) for (const inner of node.commands) collectHeredocs(inner, out);
+    }
+}
+
+/**
+ * What a job started from this pipeline is run as: the source it was written as, with the body of
+ * every here-document on it put back behind it. The source ends at the `&`, and a body starts on
+ * the line behind that one, so a job handed the source alone read an end of input its own command
+ * line never wrote -- `cat <<EOF &` printed nothing where a host printed the body.
+ */
+function backgroundSource(node: Node): string {
+    const source = node.source ?? '';
+    const bodies: string[] = [];
+    for (const command of node.commands) collectHeredocs(command, bodies);
+    if (bodies.length === 0) return source;
+    return source + '\n' + bodies.join('');
+}
+
 function startBackgroundNode(state: ShellState, node: Node): number | null {
-    const source = node.source;
-    if (source === undefined || source === '' || state.startJob === undefined) return null;
+    const source = backgroundSource(node);
+    if (source === '' || state.startJob === undefined) return null;
     const job = state.startJob(state, source);
     if (job === null || job === undefined) return null;
     state.lastBackgroundPid = job.pid;
