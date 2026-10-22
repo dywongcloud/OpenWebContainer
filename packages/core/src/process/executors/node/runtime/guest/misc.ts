@@ -169,16 +169,112 @@ BF['timers/promises'] = function () {
 BF.url = function () {
   var P = requireBuiltin('path');
 
-  function decodeComponent(s) {
-    try {
-      return decodeURIComponent(s.replace(/\+/g, ' '));
-    } catch (err) {
-      return s;
-    }
+  var HEX = '0123456789ABCDEF';
+
+  /* the UTF-8 bytes of one code point, each as '%XX' */
+  function pctCodePoint(cp) {
+    var bytes;
+    if (cp < 0x80) bytes = [cp];
+    else if (cp < 0x800) bytes = [0xc0 | (cp >> 6), 0x80 | (cp & 0x3f)];
+    else if (cp < 0x10000) bytes = [0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f)];
+    else bytes = [0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f)];
+    var out = '';
+    for (var i = 0; i < bytes.length; i++) out += '%' + HEX.charAt(bytes[i] >> 4) + HEX.charAt(bytes[i] & 0xf);
+    return out;
   }
 
+  /* the UTF-8 bytes of one UTF-16 code unit */
+  function utf8Flat(cp) {
+    if (cp < 0x80) return [cp];
+    if (cp < 0x800) return [0xc0 | (cp >> 6), 0x80 | (cp & 0x3f)];
+    return [0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f)];
+  }
+
+  /*
+   * UTF-8 decode with replacement: a byte that cannot start a sequence, a sequence cut short, an
+   * overlong one, a surrogate or one past the last code point is each one U+FFFD, which is what
+   * makes 'a=%C3' the value '�' rather than the escape '%C3' written back out.
+   */
+  function utf8Decode(bytes) {
+    var out = '';
+    var i = 0;
+    while (i < bytes.length) {
+      var b = bytes[i];
+      var need, cp, min;
+      if (b < 0x80) { out += String.fromCharCode(b); i++; continue; }
+      if (b >= 0xc2 && b <= 0xdf) { need = 1; cp = b & 0x1f; min = 0x80; }
+      else if (b >= 0xe0 && b <= 0xef) { need = 2; cp = b & 0x0f; min = 0x800; }
+      else if (b >= 0xf0 && b <= 0xf4) { need = 3; cp = b & 0x07; min = 0x10000; }
+      else { out += '�'; i++; continue; }
+      var ok = true;
+      for (var j = 1; j <= need; j++) {
+        var c = bytes[i + j];
+        if (c === undefined || (c & 0xc0) !== 0x80) { ok = false; break; }
+        cp = (cp << 6) | (c & 0x3f);
+      }
+      if (!ok || cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) { out += '�'; i++; continue; }
+      out += String.fromCodePoint(cp);
+      i += need + 1;
+    }
+    return out;
+  }
+
+  function isHexPair(text, at) {
+    return /^[0-9A-Fa-f]{2}$/.test(text.substr(at, 2));
+  }
+
+  /* the bytes a literal character contributes; a '+' is a space, as in a form body */
+  function literalBytes(code) {
+    if (code === 0x2b) return [0x20];
+    if (code >= 0xd800 && code <= 0xdfff) return [0xef, 0xbf, 0xbd];
+    return utf8Flat(code);
+  }
+
+  function decodeComponent(s) {
+    var text = String(s);
+    var bytes = [];
+    var i = 0;
+    while (i < text.length) {
+      /* a '%' that does not introduce two hex digits is itself: 'b%c' stays 'b%c' */
+      if (text.charAt(i) === '%' && i + 2 < text.length && isHexPair(text, i + 1)) {
+        bytes.push(parseInt(text.substr(i + 1, 2), 16));
+        i += 3;
+        continue;
+      }
+      var more = literalBytes(text.charCodeAt(i));
+      for (var k = 0; k < more.length; k++) bytes.push(more[k]);
+      i++;
+    }
+    return utf8Decode(bytes);
+  }
+
+  /*
+   * The application/x-www-form-urlencoded serializer: every byte of the UTF-8 encoding is '%XX'
+   * but an ASCII letter or digit, '*', '-', '.' and '_', and a space, which is '+'. '!' ''' '(' ')'
+   * '~' are escaped -- encodeURIComponent leaves them alone, which is what left them bare.
+   */
   function encodeComponent(s) {
-    return encodeURIComponent(s).replace(/%20/g, '+');
+    var text = String(s);
+    var out = '';
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      if (code === 0x20) { out += '+'; continue; }
+      if ((code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a) ||
+        code === 0x2a || code === 0x2d || code === 0x2e || code === 0x5f) {
+        out += text.charAt(i);
+        continue;
+      }
+      /* a half of a surrogate pair is read with the half behind it; a lone one is U+FFFD */
+      var next = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+      if (code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+        out += pctCodePoint(0x10000 + (code - 0xd800) * 0x400 + (next - 0xdc00));
+        i++;
+        continue;
+      }
+      if (code >= 0xd800 && code <= 0xdfff) { out += '%EF%BF%BD'; continue; }
+      out += pctCodePoint(code);
+    }
+    return out;
   }
 
   /* The pairs a caller stores: an own property in this runtime's own implementation, but not one
@@ -187,52 +283,82 @@ BF.url = function () {
     return "'" + String(text).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
   }
 
+  /* The pairs live in a side map rather than in an own property: Node's params object carries no
+     own properties at all, and Object.getOwnPropertyNames of one is empty. */
+  var PAIRS = new WeakMap();
+
+  function listOf(self) {
+    var list = PAIRS.get(self);
+    return list === undefined ? [] : list;
+  }
+
   function initList(self) {
-    Object.defineProperty(self, '_list', { value: [], writable: true, configurable: true });
-    return self._list;
+    PAIRS.set(self, []);
+    return PAIRS.get(self);
+  }
+
+  /* WebIDL's USVString: every value has a string form but a Symbol, so the conversion refuses it. */
+  function usvString(v) {
+    if (typeof v === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+    return String(v);
   }
 
   function URLSearchParams(init) {
-    initList(this);
-    if (typeof init === 'string') {
-      var s = init.charAt(0) === '?' ? init.slice(1) : init;
-      if (s.length) {
-        var pairs = s.split('&');
-        for (var i = 0; i < pairs.length; i++) {
-          if (!pairs[i]) continue;
-          var idx = pairs[i].indexOf('=');
-          var k = idx >= 0 ? pairs[i].slice(0, idx) : pairs[i];
-          var v = idx >= 0 ? pairs[i].slice(idx + 1) : '';
-          this._list.push([decodeComponent(k), decodeComponent(v)]);
+    var list = initList(this);
+    if (init !== undefined && init !== null && typeof init === 'object') {
+      if (typeof init[Symbol.iterator] === 'function') {
+        /* A sequence of pairs: an array of [name, value] tuples, another URLSearchParams, a Map, or
+           anything else iterable. Each item has to be an iterable of exactly two values -- and a
+           string is not one of those, so ['ab'] is refused the way Node refuses it. */
+        var iter = init[Symbol.iterator]();
+        var step = iter.next();
+        while (!step.done) {
+          var item = step.value;
+          var pair = [];
+          if (item !== undefined && item !== null && typeof item !== 'string' &&
+            typeof item[Symbol.iterator] === 'function') {
+            var inner = item[Symbol.iterator]();
+            var part = inner.next();
+            while (!part.done) { pair.push(part.value); part = inner.next(); }
+          }
+          if (pair.length !== 2) throw new TypeError('Each query pair must be an iterable [name, value] tuple');
+          list.push([usvString(pair[0]), usvString(pair[1])]);
+          step = iter.next();
         }
+        return;
       }
-    } else if (init && typeof init === 'object' && typeof init[Symbol.iterator] === 'function') {
-      /* A sequence of pairs: an array of [name, value] tuples, another URLSearchParams, a Map, or
-         anything else iterable. Each item has to be an iterable of exactly two values. */
-      var iter = init[Symbol.iterator]();
-      var step = iter.next();
-      while (!step.done) {
-        var item = step.value;
-        var pair = [];
-        if (item !== undefined && item !== null && typeof item[Symbol.iterator] === 'function') {
-          var inner = item[Symbol.iterator]();
-          var part = inner.next();
-          while (!part.done) { pair.push(part.value); part = inner.next(); }
-        }
-        if (pair.length !== 2) throw new TypeError('Each query pair must be an iterable [name, value] tuple');
-        this._list.push([String(pair[0]), String(pair[1])]);
-        step = iter.next();
-      }
-    } else if (init && typeof init === 'object') {
       var keys = Object.keys(init);
-      for (var j = 0; j < keys.length; j++) this._list.push([keys[j], String(init[keys[j]])]);
+      for (var j = 0; j < keys.length; j++) list.push([keys[j], usvString(init[keys[j]])]);
+      return;
+    }
+    /* Anything else is a USVString, coerced and then parsed as a query string: 'new
+       URLSearchParams(0)' holds the one pair ['0', '']. A null or an absent argument is the
+       default empty string, so both hold nothing -- Node answers size 0 for each. */
+    var s = (init === undefined || init === null) ? '' : usvString(init);
+    if (s.charAt(0) === '?') s = s.slice(1);
+    if (s.length) {
+      var pairs = s.split('&');
+      for (var i = 0; i < pairs.length; i++) {
+        if (!pairs[i]) continue;
+        var idx = pairs[i].indexOf('=');
+        var k = idx >= 0 ? pairs[i].slice(0, idx) : pairs[i];
+        var v = idx >= 0 ? pairs[i].slice(idx + 1) : '';
+        list.push([decodeComponent(k), decodeComponent(v)]);
+      }
     }
   }
+  /* the list as the methods read it, off the prototype and out of the instance's own names */
+  Object.defineProperty(URLSearchParams.prototype, '_list', {
+    get: function () { return listOf(this); },
+    set: function (list) { PAIRS.set(this, list); },
+    configurable: true
+  });
   URLSearchParams.prototype.append = function (k, v) {
-    this._list.push([String(k), String(v)]);
+    this._list.push([usvString(k), usvString(v)]);
   };
   URLSearchParams.prototype.set = function (k, v) {
-    var key = String(k);
+    var key = usvString(k);
+    var value = usvString(v);
     var found = false;
     var out = [];
     for (var i = 0; i < this._list.length; i++) {
@@ -266,15 +392,25 @@ BF.url = function () {
   };
   /* WHATWG url: the three iterators hand out an iterator, not an array -- that is what makes a
      URLSearchParams spreadable, and what for..of walks. */
-  URLSearchParams.prototype.keys = function () {
-    return this._list.map(function (pair) { return pair[0]; })[Symbol.iterator]();
-  };
-  URLSearchParams.prototype.values = function () {
-    return this._list.map(function (pair) { return pair[1]; })[Symbol.iterator]();
-  };
-  URLSearchParams.prototype.entries = function () {
-    return this._list.map(function (pair) { return [pair[0], pair[1]]; })[Symbol.iterator]();
-  };
+  /* WHATWG url: the three iterators walk the live list, so a pair appended after one was made is
+     still reached by it -- Node answers ['a', 'b'] where a snapshot taken at call time answers
+     ['a']. */
+  function pairIterator(self, kind) {
+    var at = 0;
+    var it = {
+      next: function () {
+        var list = listOf(self);
+        if (at >= list.length) return { value: undefined, done: true };
+        var pair = list[at++];
+        return { value: kind === 0 ? pair[0] : (kind === 1 ? pair[1] : [pair[0], pair[1]]), done: false };
+      }
+    };
+    it[Symbol.iterator] = function () { return it; };
+    return it;
+  }
+  URLSearchParams.prototype.keys = function () { return pairIterator(this, 0); };
+  URLSearchParams.prototype.values = function () { return pairIterator(this, 1); };
+  URLSearchParams.prototype.entries = function () { return pairIterator(this, 2); };
   URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
   /* WHATWG url: size is the number of pairs, a getter over the list rather than a field on it. */
   Object.defineProperty(URLSearchParams.prototype, 'size', {
@@ -291,7 +427,7 @@ BF.url = function () {
         for (var i = 0; i < this._list.length; i++) {
           shown += (i === 0 ? '' : ', ') + quoteString(this._list[i][0]) + ' => ' + quoteString(this._list[i][1]);
         }
-        return 'URLSearchParams {' + (shown === '' ? '' : ' ' + shown) + ' }';
+        return 'URLSearchParams {' + (shown === '' ? '' : ' ' + shown + ' ') + '}';
       },
       writable: true, configurable: true
     });
@@ -569,9 +705,53 @@ BF.url = function () {
     return 'xn--' + punyEncode(mapped);
   }
 
+  /* whether every part is a number the IPv4 parser reads: decimal, hex behind 0x, or octal */
+  var IPV4_PART_RE = /^(?:0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)$/;
+
+  function looksIpv4(text) {
+    var parts = text.split('.');
+    if (parts.length < 1 || parts.length > 4) return false;
+    for (var i = 0; i < parts.length; i++) if (!IPV4_PART_RE.test(parts[i])) return false;
+    return true;
+  }
+
+  /*
+   * The IPv4 parser the URL parser uses: the last part covers every byte the earlier ones did not,
+   * so '0x7f.1' is 127.0.0.1 and '2130706433' is 127.0.0.1 too, and a number past 2^32 is refused.
+   */
+  function parseIpv4(text) {
+    var parts = text.split('.');
+    var nums = [];
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      var radix = 10;
+      if (part.length > 2 && part.charAt(0) === '0' && (part.charAt(1) === 'x' || part.charAt(1) === 'X')) {
+        radix = 16;
+        part = part.slice(2);
+      } else if (part.length > 1 && part.charAt(0) === '0') {
+        radix = 8;
+        part = part.slice(1);
+      }
+      nums.push(parseInt(part, radix));
+    }
+    var last = nums.pop();
+    var width = 4 - nums.length;
+    if (!(last <= Math.pow(256, width) - 1)) return null;
+    for (var j = 0; j < nums.length; j++) if (nums[j] > 255) return null;
+    var tail = [];
+    for (var k = 0; k < width; k++) { tail.unshift(last % 256); last = Math.floor(last / 256); }
+    return nums.concat(tail).join('.');
+  }
+
   function domainToASCII(domain) {
     var text = String(domain);
     if (text === '') return '';
+    /* Node reads a domain that is a number as the address it names: 123 is '0.0.0.123', and one
+       too large for an address is no domain at all, which is the empty string. */
+    if (looksIpv4(text)) {
+      var address = parseIpv4(text);
+      return address === null ? '' : address;
+    }
     var labels = text.split('.');
     var out = [];
     for (var i = 0; i < labels.length; i++) {
@@ -621,6 +801,15 @@ BF.url = function () {
         'File URL host must be "localhost" or empty on ' + requireBuiltin('os').platform());
       hostErr.code = 'ERR_INVALID_FILE_URL_HOST';
       throw hostErr;
+    }
+    /*
+     * An encoded '/' is not a separator: 'file:///a%2Fb' names one file whose name holds a slash,
+     * so Node refuses it rather than handing back the two-segment path '/a/b'.
+     */
+    if (/%2f/i.test(parsed.pathname)) {
+      var slashErr = new TypeError('File URL path must not include encoded / characters');
+      slashErr.code = 'ERR_INVALID_FILE_URL_PATH';
+      throw slashErr;
     }
     return decodeURIComponent(parsed.pathname);
   }
@@ -937,9 +1126,31 @@ BF.url = function () {
     return fields;
   }
 
+  /*
+   * Node reads both arguments as strings before anything else: url.resolve('http://a/b', null) is
+   * ERR_INVALID_ARG_TYPE, not the reference resolved against the text 'null'.
+   */
+  function urlArgError(value) {
+    var err = new TypeError('The "url" argument must be of type string. Received ' +
+      (value === null ? 'null' : typeof value));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+  }
+
   function resolveUrl(from, to) {
+    if (typeof from !== 'string') throw urlArgError(from);
+    if (typeof to !== 'string') throw urlArgError(to);
     var absolute = SCHEME_RE.test(String(from)) || SCHEME_RE.test(String(to));
     var base = new URL(String(from), 'http://relative.invalid');
+    /* A reference of nothing at all, or of only the delimiter, still replaces the part it names:
+       'http://a/b' with '?' is 'http://a/b?' and not 'http://a/b'. */
+    if (absolute) {
+      var prefix = base.protocol + '//' + base.host;
+      if (to === '') return base.href;
+      if (to === '?') return prefix + base.pathname + '?';
+      if (to === '#') return prefix + base.pathname + base.search + '#';
+    }
+    var target = new URL(String(to), base);
     var target = new URL(String(to), base);
     return absolute ? target.href : target.pathname + target.search + target.hash;
   }
