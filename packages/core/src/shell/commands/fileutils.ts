@@ -397,9 +397,8 @@ function exists(fs: Fs, path: string): boolean {
 
 /**
  * The entries of a directory in the order the file system holds them, which is the order the names
- * were made in. `ls -f` -- which turns sorting off -- lists what a host's `readdir` returns, so
- * `touch f; mkdir d; ln -s f l; ls -f` is `. .. f d l` there, and `f d l` is the order the three
- * were made in here. Every other walk sorts, so a `find` is reproducible.
+ * were made in. Every other walk sorts, either by name so that a `find` is reproducible or, under
+ * `-f`, into the order a host's `readdir` returns -- see `dirOrder`.
  */
 function dirNames(fs: Fs, path: string): string[] {
     let names: string[] | undefined;
@@ -426,6 +425,42 @@ function dirNames(fs: Fs, path: string): string[] {
 /** The entries of a directory, sorted so that a walk is reproducible. */
 function dirEntries(fs: Fs, path: string): string[] {
     return dirNames(fs, path).sort(cmpStr);
+}
+
+/**
+ * The key a host directory entry is filed under, which is the order `readdir` hands names over in
+ * and so the order `ls -f` -- the one form that leaves them unsorted -- prints them in: the low 22
+ * bits of a CRC-32C carried over the folded name's UTF-32 code units, started at ~0 and never
+ * complemented, with the name's length under it and the name itself after that. It is a function
+ * of the name alone, so `touch a b c d` and `touch d c b a` list the same way on the host, and
+ * neither list is the order the four were made in.
+ */
+const DREC_POLY = 0x82f63b78;
+
+function drecHash(name: string): number {
+    const folded = name.toLowerCase().normalize('NFD');
+    let crc = 0xffffffff;
+    for (const character of folded) {
+        const point = character.codePointAt(0) as number;
+        for (let shift = 0; shift < 32; shift += 8) {
+            crc ^= (point >>> shift) & 0xff;
+            for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (-(crc & 1) & DREC_POLY);
+        }
+    }
+    return crc & 0x3fffff;
+}
+
+function cmpDrec(a: string, b: string): number {
+    const left = drecHash(a);
+    const right = drecHash(b);
+    if (left !== right) return left - right;
+    if (a.length !== b.length) return a.length - b.length;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** The entries of a directory in the order a host reads them, which is what `-f` asks for. */
+function dirOrder(fs: Fs, path: string): string[] {
+    return dirNames(fs, path).sort(cmpDrec);
 }
 
 /**
@@ -4486,9 +4521,9 @@ const ls: ShellCommand = (ctx) => {
 
     /** The names one directory lists, with `.` and `..` ahead of them under `-a` and never under `-A`. */
     const entriesOf = (path: string): string[] => {
-        /* `-f` asks for the file system's own order, so the names are left as `readdir` gave them
-           instead of being sorted the way every other listing is. */
-        const names = o.noSort ? dirNames(ctx.fs, path) : dirEntries(ctx.fs, path);
+        /* `-f` asks for the file system's own order, so the names are listed in the order a host's
+           `readdir` returns them rather than either of the two orders this file system holds. */
+        const names = o.noSort ? dirOrder(ctx.fs, path) : dirEntries(ctx.fs, path);
         const shown = o.all || o.almostAll ? names : names.filter((name) => !name.startsWith('.'));
         const sorted = o.noSort ? shown : shown.slice().sort(cmp);
         return o.all ? ['.', '..'].concat(sorted) : sorted;
