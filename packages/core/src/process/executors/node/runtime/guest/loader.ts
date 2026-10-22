@@ -123,14 +123,29 @@ globalThis.Function = function Function() {
   var params = [];
   for (var k = 0; k < argc - 1; k++) params.push(String(arguments[k]));
   var body = argc === 0 ? '' : String(arguments[argc - 1]);
-  var compiled = host.compileFunction(
-    '(function anonymous(' + params.join(',') + '\n) {\n' + body + '\n})',
-    CURRENT_FILE
-  );
-  if (typeof compiled === 'string') throw new SyntaxError(compiled);
+  var src = '(function anonymous(' + params.join(',') + '\n) {\n' + body + '\n})';
+  var compiled = host.compileFunction(src, CURRENT_FILE);
+  if (typeof compiled === 'string') {
+    /* The compatibility rewrite a module gets before its second compile (see compileCjsWrapper):
+       a body that QuickJS refuses to compile gets the same second chance, and a rewrite that does
+       not clear it still reports the engine's own message, as the module path does. */
+    var fixed = null;
+    try { fixed = rxRewrite(src); } catch (rewriteErr) { fixed = null; }
+    if (fixed !== null) {
+      var retried = host.compileFunction(fixed, CURRENT_FILE);
+      if (typeof retried !== 'string') return retried;
+    }
+    throw new SyntaxError(compiled);
+  }
   return compiled;
 };
 globalThis.Function.prototype = REAL_FUNCTION.prototype;
+
+/* eval keeps the engine's own: QuickJS grants a direct eval -- the one that reads the caller's
+   scope -- only through the real global eval, so a wrapper there would cost every direct eval its
+   scope (vm.runInContext reads its sandbox through a with-scoped direct eval, and a package that
+   evals "require('x')" reads the module's own binding). What that leaves unfixed is a string an
+   eval compiles with the one construct above in it, which no wrapper can reach without that cost. */
 
 function readSource(filename) {
   var src = host.readText(filename);
@@ -902,7 +917,7 @@ var api = {
     var filename = host.cwd() + '/[eval]';
     var mod = new Module(filename, null);
     mainModule = mod;
-    var wrapper = compileCjs(source, filename);
+    var wrapper = compileCjsWrapper(source, filename);
     wrapper.call(mod.exports, mod.exports, makeRequire(mod), mod, filename, mod.path);
   },
   uptimeMs: function () {
