@@ -647,6 +647,8 @@ export class Shell implements IShell {
         if (found !== undefined) {
             return this.cannotRun(command, `it is the file ${found}, which only a child can run`);
         }
+        const script = this.runShebangScript(command, args);
+        if (script !== undefined) return script;
         if (this.hasShebang(command)) {
             return this.cannotRun(command, `it is a script, which only a child can run`);
         }
@@ -713,6 +715,47 @@ export class Shell implements IShell {
             if (this.fileSystem.fileExists(found)) return found;
         }
         return undefined;
+    }
+
+    /**
+     * `./script.sh`: a path naming a file whose first line is a shebang is the script it names, and
+     * a host runs it -- `sh -c './execok.sh'` prints what the script prints and carries out its
+     * status -- where this shell refused it with `cannot run here: it is a script, which only a
+     * child can run` and a 127 nothing had asked for.
+     *
+     * Only an interpreter this engine is can be run here: a script behind `#!/usr/bin/env node`
+     * still needs a child, and goes on saying so. A name written with no `/` in it is never one of
+     * these either: a bare word is looked up on PATH and in no other directory, so `execok.sh` in
+     * the directory the shell stands in is `command not found` on a host however executable the
+     * file beside it is.
+     *
+     * The script is a process of its own, as it is on a host: it starts in this shell's directory
+     * with this shell's exported variables, `$0` is the path it was named by and `$1` on the words
+     * behind it, and what it does to either one stops with it.
+     */
+    private runShebangScript(command: string, args: string[]): CommandResult | undefined {
+        if (!command.includes('/')) return undefined;
+        const path = this.at(command);
+        let stat: PathStat | undefined;
+        try { stat = this.fileSystem.statPath(path); } catch { stat = undefined; }
+        if (stat === undefined || stat.type === 'dir') return undefined;
+        let content: string | undefined;
+        try { content = this.fileSystem.readFile(path); } catch { content = undefined; }
+        if (content === undefined) return undefined;
+        const shebang = /^#!(.*)/.exec(content);
+        if (shebang === null) return undefined;
+        const words = shebang[1].trim().split(/\s+/).filter((word) => word !== '');
+        const first = words[0] === '/usr/bin/env' ? words[1] : words[0];
+        const interpreter = first === undefined ? '' : first.replace(/^.*\//, '');
+        if (interpreter !== 'sh' && interpreter !== 'bash' && interpreter !== 'dash') return undefined;
+        /* The shebang's own line is no part of the script: no shell runs it. */
+        const end = content.indexOf('\n');
+        const body = end === -1 ? '' : content.slice(end + 1);
+        const child = createShellState(Object.fromEntries(this.env), this.shellState.cwd, this.moduleFs, this.process.pid);
+        child.shellName = command;
+        child.positional = args;
+        const run = runScript(child, body);
+        return { stdout: run.stdout, stderr: run.stderr, exitCode: run.exitCode };
     }
 
     /** True when `command` names a file that starts with a shebang. */
