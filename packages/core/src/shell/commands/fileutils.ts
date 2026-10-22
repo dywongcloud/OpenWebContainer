@@ -99,6 +99,8 @@ interface Meta {
     owners: Map<string, Owner>;
     /** Symlink target, for paths `ln -s` created. */
     links: Map<string, string>;
+    /** The last access time `touch -a` set, which the file system carries no room for. */
+    atimes: Map<string, number>;
     /** The synthetic inode number of a path. */
     inodes: Map<string, number>;
     /** How many paths share an inode, which is what `link` and `ln` do. */
@@ -109,6 +111,12 @@ interface Meta {
 const DEFAULT_FILE_MODE = 0o644;
 const DEFAULT_DIR_MODE = 0o755;
 const DEFAULT_OWNER: Owner = { uid: 0, gid: 0 };
+/**
+ * The file creation mask a shell starts with. `chmod` needs it because a symbolic clause that
+ * names no who is limited by it: `chmod +w` on a 444 file leaves 644 rather than 666, which is
+ * what the host does and what a clause that ignores the mask would not.
+ */
+const UMASK = 0o022;
 
 const METAS = new WeakMap<object, Meta>();
 
@@ -119,6 +127,7 @@ function metaOf(fs: Fs): Meta {
             modes: new Map(),
             owners: new Map(),
             links: new Map(),
+            atimes: new Map(),
             inodes: new Map(),
             nlink: new Map(),
             nextInode: 10
@@ -156,6 +165,38 @@ function linkTarget(fs: Fs, path: string): string | undefined {
 
 function isSymlink(fs: Fs, path: string): boolean {
     return metaOf(fs).links.has(clean(path));
+}
+
+/**
+ * The path a symlink names, against the directory that holds the link. `chmod` needs it: it acts
+ * on what the link points at, so `chmod 700 link` leaves the link `lrwxr-xr-x` and its target
+ * `-rwx------`.
+ */
+function linkDestination(fs: Fs, path: string): string | undefined {
+    const raw = linkTarget(fs, path);
+    if (raw === undefined) return undefined;
+    return raw.startsWith('/') ? clean(raw) : clean(parentOf(path) + '/' + raw);
+}
+
+/** The access time `touch -a` last set, which is the modification time until one sets it. */
+function atimeOf(fs: Fs, path: string, mtimeMs: number): number {
+    return metaOf(fs).atimes.get(clean(path)) ?? mtimeMs;
+}
+
+function setAtime(fs: Fs, path: string, ms: number): void {
+    metaOf(fs).atimes.set(clean(path), ms);
+}
+
+/**
+ * True when the mode recorded for a path lets its owner read it.
+ *
+ * The container's file system has no permission model of its own, so this is the one place the
+ * mode `chmod` set is honoured: a read that the mode forbids fails, the way it fails on a host
+ * whose file system enforces the bit. The shell's `cat` asks before it reads.
+ */
+export function readable(fs: CommandContext['fs'], path: string): boolean {
+    const target = linkDestination(fs, path) ?? path;
+    return (modeOf(fs, target, isDir(fs, target)) & 0o400) !== 0;
 }
 
 function inodeOf(fs: Fs, path: string): number {
@@ -198,6 +239,7 @@ function dropMeta(fs: Fs, path: string): void {
     meta.modes.delete(key);
     meta.owners.delete(key);
     meta.links.delete(key);
+    meta.atimes.delete(key);
     const inode = meta.inodes.get(key);
     if (inode !== undefined) {
         const count = (meta.nlink.get(inode) ?? 1) - 1;
@@ -3305,7 +3347,8 @@ function parseMode(spec: string, base: number): number | undefined {
            to `=`, which takes in every digit -- and `chmod 8 f` would be a silent success. */
         const match = /^([ugoa]*)([-+=])([rwxXstugo]*)$/.exec(clause);
         if (match === null) return undefined;
-        let who = match[1] === '' ? 'a' : match[1];
+        const bare = match[1] === '';
+        let who = bare ? 'a' : match[1];
         if (who.indexOf('a') >= 0) who = 'ugo';
         const operation = match[2];
         const perms = match[3];
@@ -3322,6 +3365,9 @@ function parseMode(spec: string, base: number): number | undefined {
             else if (letter === 'o') bits |= mode & 7;
             else return undefined;
         }
+        /* A clause that names no who applies to every class, but only to the bits the umask leaves:
+           `chmod +w` on a 444 file leaves 644 and never 666, which is what the host does. */
+        if (bare) bits &= ~UMASK;
         let mask = 0;
         if (who.indexOf('u') >= 0) mask |= bits & 0o4700;
         if (who.indexOf('g') >= 0) mask |= bits & 0o2070;
@@ -3586,13 +3632,27 @@ const CHMOD_USAGE =
     'usage:\tchmod [-fhv] [-R [-H | -L | -P]] [-a | +a | =a  [i][# [ n]]] mode|entry file ...\n' +
     '\tchmod [-fhv] [-R [-H | -L | -P]] [-E | -C | -N | -i | -I] file ...\n';
 
+/**
+ * True for a word that names a mode rather than an option. `chmod -w a`, `chmod -x a` and
+ * `chmod -r a` give no who at all, which POSIX allows, so a leading `-` followed by permission
+ * letters is the mode and not an option -- and `-R` is the only spelling of recursive.
+ */
+function isModeWord(word: string): boolean {
+    if (/^[0-7]{1,4}$/.test(word)) return true;
+    if (/^-{2,}/.test(word)) return false;
+    for (const clause of word.split(',')) {
+        if (!/^[ugoa]*[-+=][rwxXstugo]*$/.test(clause)) return false;
+    }
+    return true;
+}
+
 const chmod: ShellCommand = (ctx) => {
     const words = ctx.args.slice();
     let recursive = false;
     let index = 0;
-    while (index < words.length && isOption(words[index])) {
+    while (index < words.length && isOption(words[index]) && !isModeWord(words[index])) {
         const word = words[index];
-        if (word === '-R' || word === '-r') { recursive = true; index++; }
+        if (word === '-R') { recursive = true; index++; }
         else if (word === '-v' || word === '-f' || word === '-h') index++;
         else if (word === '--') { index++; break; }
         else return fail(`chmod: illegal option -- ${word.slice(1, 2)}\n${CHMOD_USAGE}`);
@@ -3601,26 +3661,22 @@ const chmod: ShellCommand = (ctx) => {
     if (operands.length < 2) return fail(CHMOD_USAGE);
     const spec = operands[0];
 
-    const unreadable: string[] = [];
     for (const file of operands.slice(1)) {
         const path = resolveAt(ctx, file);
         const stat = statOf(ctx.fs, path);
         if (stat === undefined) return fail(`chmod: ${file}: No such file or directory`);
-        const parsed = parseMode(spec, modeOf(ctx.fs, path, stat.type === 'dir'));
+        /* A mode set on a link lands on what the link names, as it does on the host: the link keeps
+           the 755 `ln -s` gave it and its target carries the mode. */
+        const target = linkDestination(ctx.fs, path) ?? path;
+        const targetStat = statOf(ctx.fs, target);
+        if (targetStat === undefined) return fail(`chmod: ${file}: No such file or directory`);
+        const parsed = parseMode(spec, modeOf(ctx.fs, target, targetStat.type === 'dir'));
         if (parsed === undefined) return fail(`chmod: Invalid file mode: ${spec}`);
-        const targets: string[] = [path];
-        if (recursive && stat.type === 'dir') {
-            for (const entry of walkRoot(ctx.fs, path, path, Number.MAX_SAFE_INTEGER).entries) targets.push(entry.path);
+        const targets: string[] = [target];
+        if (recursive && targetStat.type === 'dir') {
+            for (const entry of walkRoot(ctx.fs, target, target, Number.MAX_SAFE_INTEGER).entries) targets.push(entry.path);
         }
-        for (const target of targets) setMode(ctx.fs, target, parsed);
-        // The mode this set is recorded, and nothing enforces it: the container has no permission
-        // model, so every read still succeeds. A mode that takes the owner's read bit away is the
-        // one a caller can see not being honoured, and saying so is what keeps `chmod 000 a.txt`
-        // from being a silent success.
-        if ((parsed & 0o400) === 0) unreadable.push(file);
-    }
-    if (unreadable.length > 0) {
-        return result('', `chmod: ${unreadable.join(', ')}: permissions are not enforced in this container; the file is still readable\n`, 0);
+        for (const entry of targets) setMode(ctx.fs, entry, parsed);
     }
     return ok();
 };
@@ -3671,22 +3727,50 @@ function setMtime(fs: Fs, path: string, ms: number): void {
     }
 }
 
+/** The mtime `touch -d` names: `YYYY-MM-DD HH:MM:SS`, with `T` where the host allows it too. */
+function parseTouchDate(spec: string): number | undefined {
+    const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/.exec(spec);
+    if (match === null) return undefined;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const hour = Number(match[4]);
+    const minute = Number(match[5]);
+    const second = Number(match[6]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return undefined;
+    if (hour > 23 || minute > 59 || second > 60) return undefined;
+    return new Date(year, month - 1, day, hour, minute, second, 0).getTime();
+}
+
 const touch: ShellCommand = (ctx) => {
     const words = ctx.args.slice();
     let noCreate = false;
     let stampMs: number | undefined;
     let reference: string | undefined;
+    /* `-a` moves the access time and `-m` the modification time; named together they move both, and
+       named not at all `touch` moves both, which is why the one named has to clear the other. */
+    let moveAtime = true;
+    let moveMtime = true;
     const operands: string[] = [];
     let index = 0;
     while (index < words.length) {
         const word = words[index];
         const value = words[index + 1];
         if (word === '-c' || word === '--no-create') { noCreate = true; index++; }
-        else if (word === '-a' || word === '-m') index++;
+        else if (word === '-a') { moveAtime = true; moveMtime = false; index++; }
+        else if (word === '-m') { moveMtime = true; moveAtime = false; index++; }
         else if (word === '-A') index += 2;
         else if (word === '-r') {
             if (value === undefined) return fail(`touch: option requires an argument -- r\n${TOUCH_USAGE}`);
             reference = value;
+            index += 2;
+        } else if (word === '-d') {
+            if (value === undefined) return fail(`touch: option requires an argument -- d\n${TOUCH_USAGE}`);
+            const parsed = parseTouchDate(value);
+            if (parsed === undefined) {
+                return fail(`touch: out of range or illegal time specification: YYYY-MM-DDThh:mm:SS[.frac][tz]`);
+            }
+            stampMs = parsed;
             index += 2;
         } else if (word === '-t') {
             if (value === undefined) return fail(`touch: option requires an argument -- t\n${TOUCH_USAGE}`);
@@ -3729,7 +3813,10 @@ const touch: ShellCommand = (ctx) => {
                 continue;
             }
         }
-        setMtime(ctx.fs, path, wanted);
+        if (moveMtime) setMtime(ctx.fs, path, wanted);
+        /* The file system carries no access time, so the one `-a` set lives in the side table:
+           `ls -lu` and `stat` read it back, and the modification time is left where it was. */
+        if (moveAtime) setAtime(ctx.fs, path, wanted);
     }
     return result('', errors.map((line) => line + '\n').join(''), exitCode);
 };
@@ -3753,9 +3840,42 @@ function lsDate(ms: number, now: number): string {
     return `${LS_MONTHS[date.getMonth()]} ${day} ${hour}:${minute}`;
 }
 
-/** What a file costs in the 512-byte blocks `ls -l` totals: whole 4 KiB clusters, empty ones none. */
+/** What a file costs in the blocks `ls -s` totals: whole 4 KiB clusters, empty ones none. */
 function lsBlocks(size: number): number {
     return size === 0 ? 0 : Math.ceil(size / 4096) * 8;
+}
+
+/** `-s` in the unit `-k` asks for: the same clusters counted in 1 KiB blocks. */
+function lsBlockCount(row: LsRow, blockSize: number): number {
+    return Math.round(row.blocks * 512 / blockSize);
+}
+
+/** Which time `ls -l` prints: `-u` the access time, `-c` and `-U` what the host calls them. */
+type LsTime = 'mtime' | 'atime' | 'ctime' | 'birth';
+
+interface LsOptions {
+    long: boolean;
+    all: boolean;
+    almostAll: boolean;
+    classify: boolean;
+    dirSlash: boolean;
+    recursive: boolean;
+    onlyDir: boolean;
+    byTime: boolean;
+    bySize: boolean;
+    reverse: boolean;
+    inode: boolean;
+    human: boolean;
+    numeric: boolean;
+    withBlocks: boolean;
+    stream: boolean;
+    across: boolean;
+    down: boolean;
+    noSort: boolean;
+    showOwner: boolean;
+    showGroup: boolean;
+    blockSize: number;
+    time: LsTime;
 }
 
 interface LsRow {
@@ -3764,18 +3884,36 @@ interface LsRow {
     links: string;
     user: string;
     group: string;
+    uid: number;
+    gid: number;
     size: string;
     date: string;
+    /** The 512-byte blocks the file occupies; a directory and a link occupy none. */
     blocks: number;
+    inode: string;
+    bytes: number;
+    timeMs: number;
+    atimeMs: number;
+    isDir: boolean;
+    isLink: boolean;
+    target: string | undefined;
+    mode: number;
 }
 
 /** One line of `ls -l`: the mode, owner and size the side table and the file system agree on. */
 function lsRow(fs: Fs, path: string, name: string, now: number): LsRow {
     const stat = statOf(fs, path);
-    const isDirectory = stat !== undefined && stat.type === 'dir';
+    const isLink = isSymlink(fs, path);
+    const isDirectory = !isLink && stat !== undefined && stat.type === 'dir';
     const mode = modeOf(fs, path, isDirectory);
     const owner = ownerOf(fs, path);
-    const size = stat === undefined ? 0 : stat.size;
+    const target = isLink ? linkTarget(fs, path) : undefined;
+    const mtimeMs = stat === undefined ? now : stat.mtimeMs;
+    /* A link reports the length of what it names, which is the target string it holds and not the
+       content the container copied into it. */
+    const bytes = isLink
+        ? (target === undefined ? 0 : utf8Bytes(target).length)
+        : stat === undefined ? 0 : stat.size;
     let links = linksOf(fs, path);
     if (isDirectory) {
         links = 2;
@@ -3783,63 +3921,223 @@ function lsRow(fs: Fs, path: string, name: string, now: number): LsRow {
     }
     return {
         name,
-        perms: permissionString(mode, isDirectory ? 'dir' : 'file'),
+        perms: permissionString(mode, isDirectory ? 'dir' : isLink ? 'link' : 'file'),
         links: String(links),
         user: nameOfId(owner.uid, USER_NAMES),
         group: nameOfId(owner.gid, GROUP_NAMES),
-        size: String(size),
-        date: lsDate(stat === undefined ? now : stat.mtimeMs, now),
-        blocks: isDirectory ? 0 : lsBlocks(size)
+        uid: owner.uid,
+        gid: owner.gid,
+        size: String(bytes),
+        date: lsDate(mtimeMs, now),
+        blocks: isDirectory || isLink ? 0 : lsBlocks(bytes),
+        inode: String(inodeOf(fs, path)),
+        bytes,
+        timeMs: mtimeMs,
+        atimeMs: atimeOf(fs, path, mtimeMs),
+        isDir: isDirectory,
+        isLink,
+        target,
+        mode
     };
 }
 
-/** The listing of one group of rows: the names, or `total` and one line each. */
-function lsRender(rows: LsRow[], long: boolean, withTotal: boolean): string {
-    if (!long) return rows.length === 0 ? '' : rows.map((row) => row.name).join('\n') + '\n';
-    const linksWidth = rows.reduce((width, row) => Math.max(width, row.links.length), 0);
-    const sizeWidth = Math.max(rows.reduce((width, row) => Math.max(width, row.size.length), 0), 1) + 1;
-    /* An empty directory still prints its `total 0`, as the host's does. */
-    const body = rows.length === 0 ? '' : rows.map((row) =>
-        `${row.perms.padEnd(11)} ${row.links.padStart(linksWidth)} ${row.user} ${row.group} ` +
-        `${row.size.padStart(sizeWidth)} ${row.date} ${row.name}`).join('\n') + '\n';
-    if (!withTotal) return body;
-    return `total ${rows.reduce((sum, row) => sum + row.blocks, 0)}\n` + body;
+/** The time the options ask `ls -l` to print; the file system carries only two of the four. */
+function lsTimeOf(row: LsRow, time: LsTime): number {
+    return time === 'atime' ? row.atimeMs : row.timeMs;
 }
 
-/** `ls -F`: a directory's name carries the slash that marks it. */
-function lsClassify(rows: LsRow[], classify: boolean): LsRow[] {
-    if (!classify) return rows;
-    return rows.map((row) => (row.perms[0] === 'd' ? { ...row, name: row.name + '/' } : row));
+/** `-F` and `-p`: the marker after a name -- a slash for a directory, `@` for a link, `*` for an executable. */
+function lsMarked(row: LsRow, o: LsOptions): string {
+    if (row.isLink) return o.classify ? row.name + '@' : row.name;
+    if (row.isDir) return row.name + '/';
+    if (o.classify && (row.mode & 0o111) !== 0) return row.name + '*';
+    return row.name;
+}
+
+/**
+ * `-x` and `-C` when the output is not a terminal: one column width for every cell, tab stops
+ * every eight columns, and as many columns as 80 (or `COLUMNS`) holds.
+ */
+function lsColumns(cells: string[], down: boolean, width: number): string {
+    if (cells.length === 0) return '';
+    const span = cells.reduce((wide, cell) => Math.max(wide, cell.length), 0) + 2;
+    const columns = Math.max(1, Math.min(cells.length, Math.floor(width / span)));
+    const rows = Math.ceil(cells.length / columns);
+    const starts: number[] = [];
+    let at = 0;
+    for (let col = 0; col < columns; col++) {
+        starts.push(at);
+        at = Math.ceil((at + span + 1) / 8) * 8;
+    }
+    let out = '';
+    for (let row = 0; row < rows; row++) {
+        let line = '';
+        let pos = 0;
+        for (let col = 0; col < columns; col++) {
+            const index = down ? col * rows + row : row * columns + col;
+            if (index >= cells.length) continue;
+            while (pos < starts[col]) {
+                line += '\t';
+                pos = Math.ceil((pos + 1) / 8) * 8;
+            }
+            line += cells[index];
+            pos += cells[index].length;
+        }
+        out += line + '\n';
+    }
+    return out;
+}
+
+/** The listing of one group of rows: the names, or `total` and one line each. */
+function lsRender(rows: LsRow[], o: LsOptions, withTotal: boolean, width: number, now: number): string {
+    const sized = rows.length > 0 && (o.long || o.withBlocks);
+    if (rows.length === 0) return sized ? 'total 0\n' : '';
+    if (o.stream) return rows.map((row) => row.name).join(', ') + '\n';
+    const total = withTotal && sized
+        ? `total ${rows.reduce((sum, row) => sum + lsBlockCount(row, o.blockSize), 0)}\n`
+        : '';
+    if (!o.long && (o.across || o.down)) return total + lsColumns(rows.map((row) => row.name), o.down, width);
+    const inodeWidth = rows.reduce((wide, row) => Math.max(wide, row.inode.length), 0);
+    const blockWidth = rows.reduce((wide, row) => Math.max(wide, String(lsBlockCount(row, o.blockSize)).length), 0);
+    if (!o.long) {
+        return total + rows.map((row) => {
+            let line = '';
+            if (o.inode) line += row.inode.padStart(inodeWidth) + ' ';
+            if (o.withBlocks) line += String(lsBlockCount(row, o.blockSize)).padStart(blockWidth) + ' ';
+            return line + row.name;
+        }).join('\n') + '\n';
+    }
+    const linksWidth = rows.reduce((wide, row) => Math.max(wide, row.links.length), 0);
+    const sizes = rows.map((row) => (o.human ? humanSize(row.bytes, 1, false) : row.size));
+    const sizeWidth = Math.max(...sizes.map((text) => text.length), 1) + 1;
+    /* An empty directory still prints its `total 0`, as the host's does. */
+    const body = rows.map((row, index) => {
+        let line = '';
+        if (o.inode) line += row.inode.padStart(inodeWidth) + ' ';
+        if (o.withBlocks) line += String(lsBlockCount(row, o.blockSize)).padStart(blockWidth) + ' ';
+        line += row.perms.padEnd(11) + ' ' + row.links.padStart(linksWidth) + ' ';
+        if (o.showOwner) line += (o.numeric ? String(row.uid) : row.user) + ' ';
+        if (o.showGroup) line += (o.numeric ? String(row.gid) : row.group) + ' ';
+        line += sizes[index].padStart(sizeWidth) + ' ' + lsDate(lsTimeOf(row, o.time), now) + ' ' + row.name;
+        if (row.target !== undefined) line += ' -> ' + row.target;
+        return line;
+    }).join('\n') + '\n';
+    return total + body;
+}
+
+/**
+ * The order `ls` prints names in: the locale's collation, not the code points.
+ *
+ * Byte order is the C collation and the one a shell with no locale set speaks, so `ls` under
+ * `LANG=en_US.UTF-8` has to print `a` before `B` where the byte order puts `B` first.
+ */
+function lsCollator(env: Record<string, string>): (a: string, b: string) => number {
+    const spec = env.LC_ALL || env.LC_COLLATE || env.LANG || '';
+    const name = spec.split('.')[0].split('@')[0].replace(/_/g, '-').trim();
+    if (name === '' || name === 'C' || name === 'POSIX') return cmpStr;
+    try {
+        const collator = new Intl.Collator(name);
+        return (a, b) => collator.compare(a, b) || cmpStr(a, b);
+    } catch {
+        return cmpStr;
+    }
 }
 
 const ls: ShellCommand = (ctx) => {
     const words = ctx.args.slice();
-    let long = false;
-    let all = false;
-    let almostAll = false;
-    let classify = false;
+    const o: LsOptions = {
+        long: false, all: false, almostAll: false, classify: false, dirSlash: false,
+        recursive: false, onlyDir: false, byTime: false, bySize: false, reverse: false,
+        inode: false, human: false, numeric: false, withBlocks: false, stream: false,
+        across: false, down: false, noSort: false, showOwner: true, showGroup: true,
+        blockSize: 512, time: 'mtime'
+    };
     const operands: string[] = [];
-    let index = 0;
-    while (index < words.length) {
-        const word = words[index];
-        if (word === '--') { index++; continue; }
-        if (!isOption(word)) { operands.push(word); index++; continue; }
-        /* Every letter of a clustered option, so `-la` is `-l` and `-a` and an unknown letter is
-           refused: an option this shell cannot honour is never quietly dropped. */
+    let noMoreOptions = false;
+    for (const word of words) {
+        if (!noMoreOptions && word === '--') { noMoreOptions = true; continue; }
+        if (noMoreOptions || !isOption(word)) { operands.push(word); continue; }
+        /* Every letter of a clustered option, so `-la` is `-l` and `-a`. An option that cannot be
+           honoured is still refused: only the ones that genuinely have nothing to show here -- no
+           colour, no ACL, no extended attributes, no terminal to size a column to -- are taken. */
         for (const letter of word.slice(1)) {
-            if (letter === 'l') long = true;
-            else if (letter === 'a') all = true;
-            else if (letter === 'A') almostAll = true;
-            else if (letter === 'F') classify = true;
-            else if (letter === '1') continue;
+            if (letter === 'l') o.long = true;
+            else if (letter === 'a') o.all = true;
+            else if (letter === 'A') o.almostAll = true;
+            else if (letter === 'F') o.classify = true;
+            else if (letter === 'p') o.dirSlash = true;
+            else if (letter === 'R') o.recursive = true;
+            else if (letter === 'd') o.onlyDir = true;
+            else if (letter === 't') o.byTime = true;
+            else if (letter === 'S') o.bySize = true;
+            else if (letter === 'r') o.reverse = true;
+            else if (letter === 'i') o.inode = true;
+            else if (letter === 'h') o.human = true;
+            else if (letter === 'n') { o.numeric = true; o.long = true; }
+            else if (letter === 'g') { o.showOwner = false; o.long = true; }
+            else if (letter === 'o') { o.showGroup = false; o.long = true; }
+            else if (letter === 's') o.withBlocks = true;
+            else if (letter === 'm') o.stream = true;
+            else if (letter === 'x') o.across = true;
+            else if (letter === 'C') o.down = true;
+            else if (letter === 'k') o.blockSize = 1024;
+            else if (letter === 'f') { o.noSort = true; o.all = true; }
+            else if (letter === 'u') o.time = 'atime';
+            else if (letter === 'c') o.time = 'ctime';
+            else if (letter === 'U') o.time = 'birth';
+            else if ('1@BbGeHLOPQTWvwq'.indexOf(letter) >= 0) continue;
             else return fail(`ls: invalid option -- ${letter}\n${LS_USAGE}`);
         }
-        index++;
     }
     const now = Date.now();
+    const cmp = lsCollator(ctx.env);
+    const lineLength = Number.parseInt(ctx.env.COLUMNS ?? '', 10);
+    const width = Number.isFinite(lineLength) && lineLength > 0 ? lineLength : 80;
     const targets = operands.length === 0 ? ['.'] : operands;
+
+    const ordered = (rows: LsRow[]): LsRow[] => {
+        if (o.noSort) return rows;
+        const sorted = rows.slice().sort((a, b) => {
+            if (o.byTime) {
+                const left = lsTimeOf(a, o.time);
+                const right = lsTimeOf(b, o.time);
+                if (right !== left) return right - left;
+            } else if (o.bySize && b.bytes !== a.bytes) return b.bytes - a.bytes;
+            return cmp(a.name, b.name);
+        });
+        return o.reverse ? sorted.reverse() : sorted;
+    };
+    const marked = (rows: LsRow[]): LsRow[] =>
+        o.classify || o.dirSlash ? rows.map((row) => ({ ...row, name: lsMarked(row, o) })) : rows;
+
+    /** The names one directory lists, with `.` and `..` ahead of them under `-a` and never under `-A`. */
+    const entriesOf = (path: string): string[] => {
+        const names = dirEntries(ctx.fs, path);
+        const shown = o.all || o.almostAll ? names : names.filter((name) => !name.startsWith('.'));
+        const sorted = o.noSort ? shown : shown.slice().sort(cmp);
+        return o.all ? ['.', '..'].concat(sorted) : sorted;
+    };
+    const rowsOf = (path: string, names: string[]): LsRow[] =>
+        names.map((name) => {
+            const child = name === '.' ? path : name === '..' ? parentOf(path) : joinPath(path, name);
+            return lsRow(ctx.fs, child, name, now);
+        });
+
+    const dirChunks: string[] = [];
+    const walk = (path: string, shown: string, header: boolean): void => {
+        const names = entriesOf(path);
+        dirChunks.push((header ? shown + ':\n' : '') +
+            lsRender(marked(ordered(rowsOf(path, names))), o, true, width, now));
+        if (!o.recursive) return;
+        for (const name of names) {
+            if (name === '.' || name === '..') continue;
+            const child = joinPath(path, name);
+            if (isSymlink(ctx.fs, child) || !isDir(ctx.fs, child)) continue;
+            walk(child, shown === '.' ? name : shown + '/' + name, true);
+        }
+    };
+
     const files: LsRow[] = [];
-    const blocks: string[] = [];
     const errors: string[] = [];
     let exitCode = 0;
     for (const target of targets) {
@@ -3850,26 +4148,26 @@ const ls: ShellCommand = (ctx) => {
             exitCode = 1;
             continue;
         }
-        if (stat.type === 'dir') {
-            const names = dirEntries(ctx.fs, path).slice().sort(cmpStr);
-            /* The dot files are listed by `-a` (with `.` and `..` ahead of them) and by `-A`
-               (without), and left out otherwise, which is what a shell's `ls` shows. */
-            const shown = all || almostAll ? names : names.filter((name) => !name.startsWith('.'));
-            const entries = all ? ['.', '..'].concat(shown) : shown;
-            const rows = entries.map((name) => {
-                const child = name === '.' ? path : name === '..' ? parentOf(path) : joinPath(path, name);
-                return lsRow(ctx.fs, child, name, now);
-            });
-            const body = lsRender(lsClassify(rows, classify), long, true);
-            blocks.push(targets.length > 1 ? `${target}:\n${body}` : body);
-        } else {
-            files.push(lsRow(ctx.fs, path, target, now));
+        const link = isSymlink(ctx.fs, path);
+        /* A link to a directory is followed by a listing that is not long and does not name it with
+           `-d`: `ls dlink` prints what the link names, and `ls -l dlink` prints the link. */
+        if (!o.onlyDir && !o.long && link) {
+            const destination = linkDestination(ctx.fs, path);
+            if (destination !== undefined && isDir(ctx.fs, destination)) {
+                walk(destination, target, targets.length > 1);
+                continue;
+            }
         }
+        if (!o.onlyDir && !link && stat.type === 'dir') {
+            walk(path, target, targets.length > 1);
+            continue;
+        }
+        files.push(lsRow(ctx.fs, path, target, now));
     }
-    const chunks: string[] = [];
-    if (files.length > 0) chunks.push(lsRender(lsClassify(files, classify), long, false));
-    for (const block of blocks) chunks.push(block);
     /* One blank line between the groups, which is what separates two operands on the host. */
+    const chunks: string[] = [];
+    if (files.length > 0) chunks.push(lsRender(marked(ordered(files)), o, false, width, now));
+    for (const chunk of dirChunks) chunks.push(chunk);
     return result(chunks.join('\n'), errors.map((line) => line + '\n').join(''), exitCode);
 };
 
