@@ -361,6 +361,19 @@ function rehomeInto(
             const source = String(propDump(host, value, 'source') ?? '');
             const flags = String(propDump(host, value, 'flags') ?? '');
             return pin(host, context.unwrapResult(realm.evalCode(`new RegExp(${JSON.stringify(source)}, ${JSON.stringify(flags)})`)));
+        } else if (tag === '[object Error]') {
+            /* An error is the one ordinary object a context shares with the caller in host Node --
+               it is of the context's realm, so `instanceof Error` is false outside it -- and the
+               same is true of every value the caller reads off one: `err.cause`, `err.errors`. */
+            const name = typeof propDump(host, value, 'name') === 'string'
+                ? String(propDump(host, value, 'name'))
+                : 'Error';
+            const message = typeof propDump(host, value, 'message') === 'string'
+                ? String(propDump(host, value, 'message'))
+                : '';
+            const error = errorOf(host, realm, name, message);
+            if (error === undefined) return value;
+            made = error;
         } else {
             return value;
         }
@@ -411,7 +424,49 @@ function pin(host: VmHost, value: QuickJSHandle): QuickJSHandle {
     return value;
 }
 
-/** Reads `value[key]` in the guest realm and dumps it, or undefined if it cannot be read. */
+/**
+ * The error constructors of the second realm an error can be rebuilt as.
+ *
+ * An `Error` crossing out of a `vm` context is an object of another realm in host Node 24.15 --
+ * `vm.runInNewContext('new Error("x")') instanceof Error` is `false` there -- and it keeps the name
+ * of the constructor it was built with, so a `TypeError` out of a context is still named
+ * `TypeError`. Only the eight the language defines are used: any other name is an ordinary `Error`
+ * wearing it, which is the closest a rebuild can come to a class the second realm has never heard of.
+ */
+const REALM_ERRORS = ['AggregateError', 'Error', 'EvalError', 'RangeError', 'ReferenceError',
+    'SyntaxError', 'TypeError', 'URIError'];
+
+/**
+ * A new error of the second realm, carrying `message` and named `name`.
+ *
+ * An error rebuilt here answers `false` to `instanceof Error` in the guest, as an error out of a
+ * `vm` context does in host Node 24.15, while `err.message`, `err.name` and
+ * `Object.prototype.toString.call(err)` still read as they did inside the context. Its own `stack` is
+ * the second realm's, which is the honest answer: the frames of the guest's own realm are the
+ * container's, and no realm boundary makes them the host's.
+ */
+function errorOf(host: VmHost, realm: QuickJSContext, name: string, message: string): QuickJSHandle | undefined {
+    try {
+        const ctor = REALM_ERRORS.indexOf(name) >= 0 ? name : 'Error';
+        const built = realm.evalCode(
+            `(function () {` +
+            `var C = globalThis[${JSON.stringify(ctor)}];` +
+            `var m = ${JSON.stringify(message)};` +
+            `var e = typeof C === 'function' ? new C(m) : new Error(m);` +
+            `if (e.name !== ${JSON.stringify(name)}) e.name = ${JSON.stringify(name)};` +
+            `return e; })()`
+        );
+        if (built.error) {
+            built.error.dispose();
+            return undefined;
+        }
+        return host.context.unwrapResult(built);
+    } catch {
+        return undefined;
+    }
+}
+
+/** Reads and dumps `value[key]` in the guest realm, or undefined if it cannot be read. */
 function propDump(host: VmHost, value: QuickJSHandle, key: string): unknown {
     try {
         const own = host.context.getProp(value, key);

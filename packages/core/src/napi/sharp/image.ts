@@ -46,18 +46,29 @@ export function blit(dst: Image, src: Image, left: number, top: number): void {
 interface Kernel {
     /** Half the width of the filter before it is widened by the reduce factor. */
     support: number;
+    /**
+     * The support libvips counts the taps of a reduce with: `vips_reduce_get_points`
+     * (libvips 8.15, resample/reduceh.cpp) returns `2 * rint(support * shrink) + 1`. It counts
+     * LINEAR with a support of 1, and NEAREST with none at all -- a nearest reduce is one tap,
+     * wherever the output pixel lands. A reduce takes this many taps whether the kernel reaches
+     * that far or not, which is most of what separates its pixels from a plain convolution's.
+     */
+    reduce: number;
     weight: (x: number) => number;
 }
 
 const sinc = (x: number): number => (x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x));
 
 function lanczos(a: number): Kernel {
-    return { support: a, weight: (x) => (Math.abs(x) < a ? sinc(x) * sinc(x / a) : 0) };
+    /* libvips' filter<VIPS_KERNEL_LANCZOS2> tests x >= -a && x <= a, inclusive, and its
+       sinc_filter is 1 at 0 and sin(pi*x)/(pi*x) elsewhere. */
+    return { support: a, reduce: a, weight: (x) => (Math.abs(x) <= a ? sinc(x) * sinc(x / a) : 0) };
 }
 
-/** Catmull-Rom, the two-lobe cubic libvips calls VIPS_KERNEL_CUBIC. */
+/** Catmull-Rom, the two-lobe cubic libvips calls VIPS_KERNEL_CUBIC: its cubic_filter with B = 0, C = 1/2. */
 const cubic: Kernel = {
     support: 2,
+    reduce: 2,
     weight: (x) => {
         const t = Math.abs(x);
         if (t < 1) return 1.5 * t * t * t - 2.5 * t * t + 1;
@@ -66,9 +77,10 @@ const cubic: Kernel = {
     }
 };
 
-/** Mitchell-Netravali with b = c = 1/3. */
+/** Mitchell-Netravali with b = c = 1/3, libvips' cubic_filter with B = C = 1/3. */
 const mitchell: Kernel = {
     support: 2,
+    reduce: 2,
     weight: (x) => {
         const t = Math.abs(x);
         const b = 1 / 3;
@@ -81,10 +93,11 @@ const mitchell: Kernel = {
     }
 };
 
-const linear: Kernel = { support: 1, weight: (x) => (Math.abs(x) < 1 ? 1 - Math.abs(x) : 0) };
+/** libvips' filter<VIPS_KERNEL_LINEAR>: 1 - |x| for |x| < 1, and exactly 0 at 1. */
+const linear: Kernel = { support: 1, reduce: 1, weight: (x) => (Math.abs(x) < 1 ? 1 - Math.abs(x) : 0) };
 
 const KERNELS: Record<string, Kernel> = {
-    nearest: { support: 0.5, weight: () => 1 },
+    nearest: { support: 0.5, reduce: 0, weight: () => 1 },
     linear,
     cubic,
     mitchell,
@@ -98,27 +111,160 @@ export function kernelNames(): string[] {
 
 /* ----------------------------------------------------------------- resample */
 
-/** Reduce `size` to `dst` by averaging blocks of `n`, as vips_shrink does. */
+/** libvips' default `gap` for vips_resize: 2.0 (resample/resize.c, vips_resize_init). */
+const RESIZE_GAP = 2;
+
+/**
+ * libvips' vips_shrinkh / vips_shrinkv: blocks of `n` pixels averaged into one. The output is sized
+ * with ceil, the edge pixel is copied in so the last block is a full one, and the average is the
+ * integer one C computes: (sum + n / 2) / n, truncated.
+ */
 function boxShrink(image: Image, n: number, horizontal: boolean): Image {
     const srcSize = horizontal ? image.width : image.height;
     const other = horizontal ? image.height : image.width;
-    const dstSize = Math.max(1, Math.round(srcSize / n));
+    const dstSize = Math.ceil(srcSize / n);
+    const ch = image.channels;
+    const out = createImage(horizontal ? dstSize : other, horizontal ? other : dstSize, ch);
+    const half = Math.floor(n / 2);
+    for (let o = 0; o < other; o++) {
+        for (let d = 0; d < dstSize; d++) {
+            for (let c = 0; c < ch; c++) {
+                let sum = 0;
+                for (let i = 0; i < n; i++) {
+                    const s = Math.min(srcSize - 1, d * n + i);
+                    const k = horizontal ? (o * srcSize + s) * ch + c : (s * other + o) * ch + c;
+                    sum += image.data[k];
+                }
+                const j = horizontal ? (o * dstSize + d) * ch + c : (d * other + o) * ch + c;
+                out.data[j] = Math.floor((sum + half) / n);
+            }
+        }
+    }
+    return out;
+}
+/**
+ * libvips' vips_subsample: every `n`th pixel, and the output sized with floor. vips_resize uses it
+ * for the integer part of a NEAREST reduction, where a box average would invent pixels.
+ */
+function subsampleAxis(image: Image, n: number, horizontal: boolean): Image {
+    const srcSize = horizontal ? image.width : image.height;
+    const other = horizontal ? image.height : image.width;
+    const dstSize = Math.floor(srcSize / n);
     const ch = image.channels;
     const out = createImage(horizontal ? dstSize : other, horizontal ? other : dstSize, ch);
     for (let o = 0; o < other; o++) {
         for (let d = 0; d < dstSize; d++) {
-            const start = Math.min(d * n, srcSize - 1);
-            const end = Math.min(start + n, srcSize);
+            for (let c = 0; c < ch; c++) {
+                const i = horizontal ? (o * srcSize + d * n) * ch + c : (d * n * other + o) * ch + c;
+                const j = horizontal ? (o * dstSize + d) * ch + c : (d * other + o) * ch + c;
+                out.data[j] = image.data[i];
+            }
+        }
+    }
+    return out;
+}
+
+/**
+ * The two precisions libvips keeps, both of them part of what a reduce's pixels are: 6 bits for the
+ * sub-pixel phase a precomputed coefficient table is chosen by, 12 for the fixed-point coefficients
+ * in the table itself (vips/interpolate.h, VIPS_TRANSFORM_SHIFT and VIPS_INTERPOLATE_SHIFT).
+ */
+const TRANSFORM_SHIFT = 6;
+const TRANSFORM_SCALE = 1 << TRANSFORM_SHIFT;
+const INTERPOLATE_SHIFT = 12;
+const INTERPOLATE_SCALE = 1 << INTERPOLATE_SHIFT;
+
+/** C's rint(): to nearest, ties to even. libvips counts taps with it, not with round(). */
+function rint(x: number): number {
+    const f = Math.floor(x);
+    const d = x - f;
+    if (d > 0.5) return f + 1;
+    if (d < 0.5) return f;
+    return f % 2 === 0 ? f : f + 1;
+}
+
+/** libvips' vips_reduce_get_points: how many taps a reduce takes at this shrink. */
+function reducePoints(kernel: Kernel, shrink: number): number {
+    return 2 * rint(kernel.reduce * shrink) + 1;
+}
+
+/** libvips' calculate_coefficients: the kernel at every tap of the window, made to sum to one. */
+function reduceMask(kernel: Kernel, n: number, shrink: number, at: number): number[] {
+    const half = at + n / 2 - 1;
+    const c: number[] = new Array(n);
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+        const v = kernel.weight((i - half) / shrink);
+        c[i] = v;
+        sum += v;
+    }
+    if (sum !== 0) {
+        for (let i = 0; i < n; i++) c[i] /= sum;
+    }
+    return c;
+}
+
+/**
+ * libvips' matrixs[]: the same coefficients as fixed-point integers, one set for each of the 65
+ * phases, truncated the way C's (short) truncates. The truncation is what stops the coefficients
+ * summing to exactly one, and that is libvips' own arithmetic rather than a rounding to hide.
+ */
+function reduceTable(kernel: Kernel, n: number, shrink: number): number[][] {
+    const table: number[][] = [];
+    for (let phase = 0; phase <= TRANSFORM_SCALE; phase++) {
+        const c = reduceMask(kernel, n, shrink, phase / TRANSFORM_SCALE);
+        for (let i = 0; i < n; i++) c[i] = Math.trunc(c[i] * INTERPOLATE_SCALE);
+        table.push(c);
+    }
+    return table;
+}
+
+/**
+ * One axis of libvips' vips_reduceh / vips_reducev, the arithmetic and all: a window of a fixed
+ * number of taps wherever the output pixel falls in the source, coefficients chosen by the phase of
+ * that position rounded to 1/64, a sum of fixed-point coefficients rounded by adding half of
+ * 1/4096 and shifting, and an image padded at both ends by copying the edge pixel.
+ *
+ * `extra` is how many source pixels the rounding of the output size leaves unused, before the box
+ * shrink below has had its share of them; libvips moves the origin inside the source by half what
+ * is left so they are discarded equally from both ends.
+ */
+function reduceAxis(image: Image, dstSize: number, shrink: number, extra: number, horizontal: boolean, kernelName: string): Image {
+    const srcSize = horizontal ? image.width : image.height;
+    const other = horizontal ? image.height : image.width;
+    const ch = image.channels;
+    const out = createImage(horizontal ? dstSize : other, horizontal ? other : dstSize, ch);
+    const kernel = KERNELS[kernelName] ?? KERNELS.lanczos3;
+    const n = reducePoints(kernel, shrink);
+    const table = reduceTable(kernel, n, shrink);
+    /* Rounding the output size down leaves source pixels unused; libvips moves the origin inside
+       the source by half that distance so they are discarded equally from both ends. */
+    const offset = (1 + extra) / 2 - 1;
+    /* Where vips_embed puts the source inside the padded image it interpolates from. */
+    const pad = Math.ceil(n / 2) - 1;
+    /* libvips walks the output with `X += hshrink` from this start rather than multiplying, and the
+       last bit of that sum is which pixel a window lands on: at 16 -> 6 nearest the fourth output
+       falls on 11.999999999999998 and so on pixel 11, where (d + 0.5) * shrink says 12. Every
+       output row starts again from the same place. */
+    for (let o = 0; o < other; o++) {
+        let at = 0.5 * shrink - 0.5 - offset;
+        for (let d = 0; d < dstSize; d++) {
+            const start = Math.trunc(at);
+            const phase = Math.trunc(at * TRANSFORM_SCALE * 2) & (TRANSFORM_SCALE * 2 - 1);
+            const coef = table[(phase + 1) >> 1];
             for (let c = 0; c < ch; c++) {
                 let sum = 0;
-                for (let s = start; s < end; s++) {
-                    const i = horizontal ? (o * srcSize + s) * ch + c : (s * other + o) * ch + c;
-                    sum += image.data[i];
+                for (let i = 0; i < n; i++) {
+                    const s = start + i - pad;
+                    const si = s < 0 ? 0 : s >= srcSize ? srcSize - 1 : s;
+                    const k = horizontal ? (o * srcSize + si) * ch + c : (si * other + o) * ch + c;
+                    sum += coef[i] * image.data[k];
                 }
-                const v = Math.round(sum / (end - start));
+                const v = (sum + (INTERPOLATE_SCALE >> 1)) >> INTERPOLATE_SHIFT;
                 const j = horizontal ? (o * dstSize + d) * ch + c : (d * other + o) * ch + c;
-                out.data[j] = v;
+                out.data[j] = v < 0 ? 0 : v > 255 ? 255 : v;
             }
+            at += shrink;
         }
     }
     return out;
@@ -173,45 +319,51 @@ function kernelPass(image: Image, dstSize: number, horizontal: boolean, kernel: 
     return out;
 }
 
-function resampleAxis(image: Image, dstSize: number, horizontal: boolean, kernelName: string, fastShrink: boolean): Image {
-    const srcSize = horizontal ? image.width : image.height;
-    if (dstSize === srcSize) return image;
-    const kernel = KERNELS[kernelName] ?? KERNELS.lanczos3;
-    if (kernelName === 'nearest') {
-        const other = horizontal ? image.height : image.width;
-        const ch = image.channels;
-        const out = createImage(horizontal ? dstSize : other, horizontal ? other : dstSize, ch);
-        for (let o = 0; o < other; o++) {
-            for (let d = 0; d < dstSize; d++) {
-                const s = Math.min(srcSize - 1, Math.floor(((d + 0.5) * srcSize) / dstSize));
-                for (let c = 0; c < ch; c++) {
-                    const i = horizontal ? (o * srcSize + s) * ch + c : (s * other + o) * ch + c;
-                    const j = horizontal ? (o * dstSize + d) * ch + c : (d * other + o) * ch + c;
-                    out.data[j] = image.data[i];
-                }
-            }
-        }
-        return out;
-    }
-    const scale = srcSize / dstSize;
-    let work = image;
-    let residual = scale;
-    if (scale > 1 && fastShrink) {
-        const n = Math.floor(scale);
-        if (n > 1) {
-            work = boxShrink(work, n, horizontal);
-            residual = (horizontal ? work.width : work.height) / dstSize;
-        }
-    }
-    if (Math.abs(residual - 1) > 1e-9 || work !== image) {
-        work = kernelPass(work, dstSize, horizontal, kernel, residual);
-    }
-    return work;
+/** libvips' VIPS_ROUND_UINT: to nearest, halves away from zero. */
+function roundU(x: number): number {
+    return x > 0 ? Math.floor(x + 0.5) : -Math.floor(-x + 0.5);
 }
 
-export function resample(image: Image, width: number, height: number, kernel: string, fastShrink: boolean): Image {
-    let out = resampleAxis(image, width, true, kernel, fastShrink);
-    out = resampleAxis(out, height, false, kernel, fastShrink);
+function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelName: string): Image {
+    const srcSize = horizontal ? image.width : image.height;
+    const dstSize = roundU(srcSize / shrink);
+    if (dstSize === srcSize) return image;
+    const kernel = KERNELS[kernelName] ?? KERNELS.lanczos3;
+    if (dstSize > srcSize) {
+        /* An enlargement is libvips' vips_affine with the interpolator the kernel names. */
+        return kernelPass(image, dstSize, horizontal, kernel, shrink);
+    }
+    /*
+     * vips_resize's `gap` of 2: the integer part of the shrink, as far as it goes with a gap of two
+     * still to run, is taken before the kernel sees the image -- a vips_shrink box average for the
+     * kernels, and a vips_subsample for NEAREST, which must not be given pixels a box would invent
+     * -- and only the residual runs through the kernel. Below a shrink of two there is no integer
+     * part at all, which is why a 3x reduction is a pure reduce and a 4x one is not.
+     */
+    const block = Math.max(1, Math.floor(srcSize / dstSize / RESIZE_GAP));
+    const extra = (dstSize * shrink - srcSize) / block;
+    let work = image;
+    let residual = shrink;
+    if (block > 1) {
+        work = kernelName === 'nearest'
+            ? subsampleAxis(image, block, horizontal)
+            : boxShrink(image, block, horizontal);
+        residual = shrink / block;
+    }
+    const workSize = horizontal ? work.width : work.height;
+    if (dstSize === workSize) return work;
+    return reduceAxis(work, dstSize, residual, extra, horizontal, kernelName);
+}
+
+/**
+ * A two-axis resample, as libvips' vips_resize orders it: the vertical reduce first, then the
+ * horizontal one. Each takes the shrink it was asked for and rounds its own output size off it, so
+ * an axis that is only along for the ride -- `cover` with an auto height -- is still reduced at the
+ * other axis' factor.
+ */
+export function resample(image: Image, hshrink: number, vshrink: number, kernel: string): Image {
+    let out = resampleAxis(image, vshrink, false, kernel);
+    out = resampleAxis(out, hshrink, true, kernel);
     return out;
 }
 
@@ -225,6 +377,10 @@ export interface ResizeSpec {
     canvas: string;
     withoutEnlargement: boolean;
     withoutReduction: boolean;
+    /**
+     * sharp's shrink-on-load: it belongs to the decoder, which is where libvips takes it, and never
+     * to the resample -- vips_resize reduces with the kernel alone.
+     */
     fastShrinkOnLoad: boolean;
     kernel: string;
     /** 0 centre, 1 north, 2 east, 3 south, 4 west, 5 north-east, 6 south-east, 7 south-west, 8 north-west. */
@@ -265,6 +421,54 @@ function offsetXOf(position: number, outer: number, inner: number, crop: boolean
 }
 
 /**
+ * sharp's own ResolveShrink (src/common.cc): the shrink each axis is asked for, as a ratio of the
+ * source dimension to the requested one. It is asked for before either result dimension is rounded,
+ * and the rounded size follows from it -- which is not the same thing as shrinking an axis by
+ * srcSize/dstSize: with `cover` and an auto height the vertical reduce runs at the horizontal
+ * factor and rounds its own height off that, so the two axes are not independent.
+ */
+function resolveShrink(
+    width: number,
+    height: number,
+    targetWidth: number,
+    targetHeight: number,
+    canvas: string,
+    withoutEnlargement: boolean,
+    withoutReduction: boolean
+): { hshrink: number; vshrink: number } {
+    let hshrink = 1;
+    let vshrink = 1;
+    if (targetWidth > 0 && targetHeight > 0) {
+        hshrink = width / targetWidth;
+        vshrink = height / targetHeight;
+        if (canvas === 'crop' || canvas === 'min') {
+            if (hshrink < vshrink) vshrink = hshrink;
+            else hshrink = vshrink;
+        } else if (canvas === 'embed' || canvas === 'max') {
+            if (hshrink > vshrink) vshrink = hshrink;
+            else hshrink = vshrink;
+        }
+    } else if (targetWidth > 0) {
+        hshrink = width / targetWidth;
+        if (canvas !== 'ignore_aspect') vshrink = hshrink;
+    } else if (targetHeight > 0) {
+        vshrink = height / targetHeight;
+        if (canvas !== 'ignore_aspect') hshrink = vshrink;
+    }
+    if (withoutReduction) {
+        hshrink = Math.min(1, hshrink);
+        vshrink = Math.min(1, vshrink);
+    } else if (withoutEnlargement) {
+        hshrink = Math.max(1, hshrink);
+        vshrink = Math.max(1, vshrink);
+    }
+    /* Never shrink an axis away to nothing. */
+    hshrink = Math.min(hshrink, width);
+    vshrink = Math.min(vshrink, height);
+    return { hshrink, vshrink };
+}
+
+/**
  * The dimensions and the crop or pad that sharp's resize produces, measured against sharp 0.33.5 at
  * 40x30: cover/contain/inside/outside/fill over (20,10), (20,-1), (-1,10), (60,40), (60,-1), (-1,60), (40,30)
  * and (10,10), with and without withoutEnlargement.
@@ -273,38 +477,18 @@ export function resizeImage(image: Image, spec: ResizeSpec): Image {
     const W = image.width;
     const H = image.height;
     if (spec.width < 0 && spec.height < 0) return image;
-    if (spec.canvas === 'ignore_aspect') {
-        let sx = spec.width > 0 ? spec.width / W : 1;
-        let sy = spec.height > 0 ? spec.height / H : 1;
-        if (spec.withoutEnlargement) {
-            sx = Math.min(sx, 1);
-            sy = Math.min(sy, 1);
-        }
-        if (spec.withoutReduction) {
-            sx = Math.max(sx, 1);
-            sy = Math.max(sy, 1);
-        }
-        const w = Math.max(1, Math.round(W * sx));
-        const h = Math.max(1, Math.round(H * sy));
-        return resample(image, w, h, spec.kernel, spec.fastShrinkOnLoad);
-    }
-    let scale: number;
-    if (spec.width > 0 && spec.height > 0) {
-        const x = spec.width / W;
-        const y = spec.height / H;
-        scale = spec.canvas === 'crop' || spec.canvas === 'min' ? Math.max(x, y) : Math.min(x, y);
-    } else if (spec.width > 0) {
-        scale = spec.width / W;
-    } else if (spec.height > 0) {
-        scale = spec.height / H;
-    } else {
-        scale = 1;
-    }
-    if (spec.withoutEnlargement) scale = Math.min(scale, 1);
-    if (spec.withoutReduction) scale = Math.max(scale, 1);
-    const sw = Math.max(1, Math.round(W * scale));
-    const sh = Math.max(1, Math.round(H * scale));
-    const scaled = sw === W && sh === H ? image : resample(image, sw, sh, spec.kernel, spec.fastShrinkOnLoad);
+    const { hshrink, vshrink } = resolveShrink(
+        W,
+        H,
+        spec.width,
+        spec.height,
+        spec.canvas,
+        spec.withoutEnlargement,
+        spec.withoutReduction
+    );
+    const sw = roundU(W / hshrink);
+    const sh = roundU(H / vshrink);
+    const scaled = sw === W && sh === H ? image : resample(image, hshrink, vshrink, spec.kernel);
     if (spec.canvas === 'crop') {
         const w = spec.width > 0 ? Math.min(spec.width, scaled.width) : scaled.width;
         const h = spec.height > 0 ? Math.min(spec.height, scaled.height) : scaled.height;
