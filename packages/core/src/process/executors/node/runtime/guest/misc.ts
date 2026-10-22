@@ -76,7 +76,24 @@ BF.os = function () {
     freemem: function () { return 2147483648; },
     uptime: function () { return 0; },
     loadavg: function () { return [0, 0, 0]; },
-    networkInterfaces: function () { return {}; },
+    /*
+     * The loopback, which is the one interface every container and every host has and the only one
+     * this container can name: its sockets are the host's, so there is no address of a network of
+     * its own to report, but an empty map -- which this was -- leaves a package that picks an
+     * address out of it, or counts the machine's interfaces, with nothing where a host has eleven
+     * entries. 127.0.0.1 and ::1 are marked internal, as a host marks lo0, and carry the netmask,
+     * family and cidr a host's entries carry, so the shape read out of the map is the host's shape.
+     */
+    networkInterfaces: function () {
+      return {
+        lo: [
+          { address: '127.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: '00:00:00:00:00:00',
+            internal: true, cidr: '127.0.0.1/8' },
+          { address: '::1', netmask: 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', family: 'IPv6',
+            mac: '00:00:00:00:00:00', internal: true, cidr: '::1/128', scopeid: 0 }
+        ]
+      };
+    },
     userInfo: function () { return { username: 'user', uid: 1000, gid: 1000, shell: '/bin/sh', homedir: '/home' }; },
     constants: { signals: signals, errno: errno }
   };
@@ -646,36 +663,278 @@ BF.url = function () {
     return options;
   }
 
-  /* legacy url.parse: the fields of the WHATWG parse, in the legacy Url shape (null where Node uses null) */
+  /*
+   * The tables Node's legacy parser reads, and the two shapes it decides between. A slashed scheme
+   * carries its authority behind '//' and holds nothing but a path without it; any other scheme --
+   * mailto:, foo:, data: -- takes the text right after the colon as its authority whether the two
+   * slashes were written or not, which is what makes url.parse('mailto:x@y').host 'y' while
+   * url.parse('http:x@y').host is null. javascript: is the one scheme that never has a host, and
+   * the one whose text is left unescaped. The slashed table is read with the scheme as it was
+   * written, case and all, so 'HTTP:x@y' has a host in Node where 'http:x@y' has none.
+   */
+  var SLASHED_SCHEME = { 'http:': true, 'https:': true, 'ftp:': true, 'gopher:': true, 'file:': true, 'ws:': true, 'wss:': true };
+  var HOSTLESS_SCHEME = { 'javascript:': true };
+  var UNSAFE_SCHEME = { 'javascript:': true };
+  var LEGACY_SCHEME_RE = /^[A-Za-z0-9.+-]+:/;
+  /* '//user@host' with no scheme at all still denotes a host, the way a browser resolves one */
+  var LEGACY_HOST_RE = /^\/\/[^@/?#]+@[^@/?#]+/;
+  var LEGACY_PORT_RE = /:[0-9]*$/;
+  /* a byte no host may hold, from RFC 2396 -- the ones the parser moves out of the host and into
+     the path rather than refusing the URL */
+  var NON_HOST_CHARS = ' "%\';<>\\^' + String.fromCharCode(96) + '{|}';
+  var FORBIDDEN_HOST_CHARS = '\u0000"%<>[\\]^' + String.fromCharCode(96) + '{|}';
+  /* an IPv6 literal keeps its brackets, so those two are not among the bytes it may not hold */
+  var FORBIDDEN_IPV6_CHARS = '\u0000"%<>\\^' + String.fromCharCode(96) + '{|}';
+  /*
+   * The bytes Node escapes in a path of its own accord, and the ones it leaves alone in a userinfo:
+   * an unreserved byte, a sub-delim of the few it keeps, and the ':' that separates a name from a
+   * password -- everything else in an auth is written as an escape, so 'a@b' is 'a%40b'.
+   */
+  var AUTO_ESCAPE = { 9: '%09', 10: '%0A', 13: '%0D', 32: '%20', 34: '%22', 39: '%27',
+    60: '%3C', 62: '%3E', 92: '%5C', 94: '%5E', 96: '%60', 123: '%7B', 124: '%7C', 125: '%7D' };
+  var NO_ESCAPE_AUTH = '!\'()*-._~:';
+
+  function autoEscapeStr(text) {
+    var out = '';
+    for (var i = 0; i < text.length; i++) {
+      var esc = AUTO_ESCAPE[text.charCodeAt(i)];
+      out += esc === undefined ? text.charAt(i) : esc;
+    }
+    return out;
+  }
+
+  function authCharKept(code) {
+    return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) ||
+      NO_ESCAPE_AUTH.indexOf(String.fromCharCode(code)) >= 0;
+  }
+
+  function encodeAuth(text) {
+    var out = '';
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (authCharKept(text.charCodeAt(i))) out += ch;
+      else {
+        try { out += encodeURIComponent(ch); } catch (loneSurrogate) { out += ch; }
+      }
+    }
+    return out;
+  }
+
+  function isIpv6Hostname(name) {
+    return name.charAt(0) === '[' && name.charAt(name.length - 1) === ']';
+  }
+
+  /* whether any byte of text is one of the bytes in set */
+  function holdsAny(text, set) {
+    for (var i = 0; i < text.length; i++) if (set.indexOf(text.charAt(i)) >= 0) return true;
+    return false;
+  }
+
+  /*
+   * The trim and the backslash conversion that run before anything else reads the string: leading
+   * and trailing whitespace goes, and a backslash becomes a slash while no '?' or '#' has been
+   * seen -- the browser behaviour Node copies, which is what makes 'a\b' the path 'a/b'.
+   */
+  function legacyTrimmed(text) {
+    var start = -1;
+    var end = -1;
+    var lastPos = 0;
+    var acc = '';
+    var inWs = false;
+    var split = false;
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      var isWs = code < 33 || code === 0xa0 || code === 0xfeff;
+      if (start === -1) {
+        if (isWs) continue;
+        lastPos = start = i;
+      } else if (inWs) {
+        if (!isWs) { end = -1; inWs = false; }
+      } else if (isWs) { end = i; inWs = true; }
+      if (!split) {
+        if (code === 35 || code === 63) split = true;
+        else if (code === 92) {
+          if (i - lastPos > 0) acc += text.slice(lastPos, i);
+          acc += '/';
+          lastPos = i + 1;
+        }
+      }
+    }
+    if (start === -1) return '';
+    if (lastPos === start) return end === -1 ? (start === 0 ? text : text.slice(start)) : text.slice(start, end);
+    if (end === -1) return lastPos < text.length ? acc + text.slice(lastPos) : acc;
+    return lastPos < end ? acc + text.slice(lastPos, end) : acc;
+  }
+
+  /*
+   * legacy url.parse: Node's own parser, field for field. A Url is a set of strings, null where
+   * Node leaves one null -- and href is what format writes back from those fields, so the '//' a
+   * caller never wrote is not put in and an auth carrying an '@' comes out as 'a%40b'.
+   */
   function parse(input, parseQuery) {
     var text = String(input);
-    var absolute = SCHEME_RE.test(text);
-    var u = absolute ? new URL(text) : new URL(text, 'http://relative.invalid');
-    var hasHost = absolute && u.host !== '';
-    var search = u.search || null;
-    var query = search ? search.slice(1) : null;
-    if (parseQuery) {
-      query = {};
-      u.searchParams.forEach(function (value, key) {
-        if (Object.prototype.hasOwnProperty.call(query, key)) query[key] = [].concat(query[key], value);
-        else query[key] = value;
-      });
+    var rest = legacyTrimmed(text);
+    var proto = LEGACY_SCHEME_RE.exec(rest);
+    var lowerProto;
+    var protocol = null;
+    if (proto) {
+      proto = proto[0];
+      lowerProto = proto.toLowerCase();
+      protocol = lowerProto;
+      rest = rest.slice(proto.length);
     }
-    var path = u.pathname + (search || '');
-    return {
-      protocol: absolute ? u.protocol : null,
-      slashes: hasHost ? true : null,
-      auth: u.username ? decodeURIComponent(u.username) + (u.password ? ':' + decodeURIComponent(u.password) : '') : null,
-      host: hasHost ? u.host : null,
-      port: u.port || null,
-      hostname: hasHost ? u.hostname : null,
-      hash: u.hash || null,
+
+    var slashes = null;
+    var hasSlashes = false;
+    if (proto || LEGACY_HOST_RE.test(rest)) {
+      var doubled = rest.charAt(0) === '/' && rest.charAt(1) === '/';
+      if (doubled && !(proto && HOSTLESS_SCHEME[lowerProto])) {
+        rest = rest.slice(2);
+        hasSlashes = true;
+        slashes = true;
+      }
+    }
+
+    var host = null;
+    var hostname = null;
+    var port = null;
+    var auth = null;
+    if (!HOSTLESS_SCHEME[lowerProto] && (hasSlashes || (proto && !SLASHED_SCHEME[proto]))) {
+      var hostEnd = -1;
+      var atSign = -1;
+      var nonHost = -1;
+      for (var i = 0; i < rest.length; i++) {
+        var code = rest.charCodeAt(i);
+        var ch = rest.charAt(i);
+        if (code === 9 || code === 10 || code === 13) {
+          rest = rest.slice(0, i) + rest.slice(i + 1);
+          i -= 1;
+        } else if (NON_HOST_CHARS.indexOf(ch) >= 0) {
+          if (nonHost === -1) nonHost = i;
+        } else if (ch === '#' || ch === '/' || ch === '?') {
+          if (nonHost === -1) nonHost = i;
+          hostEnd = i;
+        } else if (code === 64) {
+          /* the last '@' before the host ends is the one that separates an auth from a host, and
+             it resets what was not a host, so 'a@b@c' is the auth 'a@b' over the host 'c' */
+          atSign = i;
+          nonHost = -1;
+        }
+        if (hostEnd !== -1) break;
+      }
+      var from = 0;
+      if (atSign !== -1) {
+        auth = decodeURIComponent(rest.slice(0, atSign));
+        from = atSign + 1;
+      }
+      var hostText;
+      if (nonHost === -1) {
+        hostText = rest.slice(from);
+        rest = '';
+      } else {
+        hostText = rest.slice(from, nonHost);
+        rest = rest.slice(nonHost);
+      }
+      var portText = LEGACY_PORT_RE.exec(hostText);
+      if (portText) {
+        var written = portText[0];
+        if (written !== ':') port = written.slice(1);
+        hostText = hostText.slice(0, hostText.length - written.length);
+      }
+      if (hostText) hostname = hostText;
+      /* there is a hostname, so even an empty one is present */
+      var name = typeof hostname === 'string' ? hostname : '';
+      var ipv6 = isIpv6Hostname(name);
+      if (!ipv6) {
+        for (var j = 0; j < name.length; j++) {
+          /* a ':' no host may hold ends it, and what follows it becomes the path */
+          if (name.charAt(j) === ':') {
+            var tail = name.slice(j) + rest;
+            name = name.slice(0, j);
+            rest = tail.charAt(0) === '/' ? tail : '/' + tail;
+            break;
+          }
+        }
+      }
+      if (name.length > 255) name = '';
+      else name = name.toLowerCase();
+      if (name !== '') {
+        if (ipv6) {
+          if (holdsAny(name, FORBIDDEN_IPV6_CHARS)) throw invalidUrl(text);
+        } else {
+          name = domainToASCII(name);
+          if (name === '' || holdsAny(name, FORBIDDEN_HOST_CHARS)) throw invalidUrl(text);
+        }
+      }
+      host = name + (port ? ':' + port : '');
+      hostname = name;
+      if (ipv6) {
+        hostname = name.slice(1, name.length - 1);
+        if (rest.charAt(0) !== '/') rest = '/' + rest;
+      }
+    }
+
+    if (!UNSAFE_SCHEME[lowerProto]) rest = autoEscapeStr(rest);
+
+    var hash = null;
+    var search = null;
+    var query = null;
+    var questionIdx = -1;
+    var hashIdx = -1;
+    for (var k = 0; k < rest.length; k++) {
+      var at = rest.charCodeAt(k);
+      if (at === 35) {
+        hashIdx = k;
+        hash = rest.slice(k);
+        break;
+      } else if (at === 63 && questionIdx === -1) questionIdx = k;
+    }
+    if (questionIdx !== -1) {
+      if (hashIdx === -1) {
+        search = rest.slice(questionIdx);
+        query = rest.slice(questionIdx + 1);
+      } else {
+        search = rest.slice(questionIdx, hashIdx);
+        query = rest.slice(questionIdx + 1, hashIdx);
+      }
+      if (parseQuery) {
+        query = {};
+        new URLSearchParams(rest.slice(questionIdx + 1, hashIdx === -1 ? rest.length : hashIdx)).forEach(function (value, key) {
+          if (Object.prototype.hasOwnProperty.call(query, key)) query[key] = [].concat(query[key], value);
+          else query[key] = value;
+        });
+      }
+    } else if (parseQuery) {
+      query = {};
+    }
+
+    var pathname = null;
+    var useQuestionIdx = questionIdx !== -1 && (hashIdx === -1 || questionIdx < hashIdx);
+    var firstIdx = useQuestionIdx ? questionIdx : hashIdx;
+    if (firstIdx === -1) {
+      if (rest.length > 0) pathname = rest;
+    } else if (firstIdx > 0) pathname = rest.slice(0, firstIdx);
+    /* a slashed scheme with a host always has a path, even the one the caller left out */
+    if (SLASHED_SCHEME[lowerProto] && hostname && !pathname) pathname = '/';
+
+    var path = null;
+    if (pathname || search) path = (pathname || '') + (search || '');
+
+    var fields = {
+      protocol: protocol,
+      slashes: slashes,
+      auth: auth,
+      host: host,
+      port: port,
+      hostname: hostname,
+      hash: hash,
       search: search,
       query: query,
-      pathname: u.pathname,
-      path: path,
-      href: absolute ? u.href : path + (u.hash || '')
+      pathname: pathname,
+      path: path
     };
+    fields.href = formatUrl(fields);
+    return fields;
   }
 
   function resolveUrl(from, to) {
@@ -685,23 +944,73 @@ BF.url = function () {
     return absolute ? target.href : target.pathname + target.search + target.hash;
   }
 
-  /* legacy url.format: a URL, a string, or a Url-shaped object (protocol, host or hostname and port, pathname, search or query, hash) */
+  /*
+   * A query written back out of the object a caller passed, the way querystring.stringify writes
+   * one: each name and value escaped with encodeURIComponent, and a space as %20 rather than the
+   * '+' a form body would use -- url.format and url.parse round-trip on %20, not on '+'.
+   */
+  function queryStringOf(values) {
+    var keys = Object.keys(values);
+    var parts = [];
+    for (var i = 0; i < keys.length; i++) {
+      var value = values[keys[i]];
+      var name = encodeURIComponent(keys[i]);
+      if (Array.isArray(value)) {
+        for (var j = 0; j < value.length; j++) parts.push(name + '=' + encodeURIComponent(String(value[j])));
+      } else if (value === null || value === undefined) {
+        parts.push(name + '=');
+      } else {
+        parts.push(name + '=' + encodeURIComponent(String(value)));
+      }
+    }
+    return parts.join('&');
+  }
+
+  /*
+   * legacy url.format: a URL, a string, or a Url-shaped object (protocol, host or hostname and
+   * port, pathname, search or query, hash). Only a slashed scheme -- or one the caller marked with
+   * slashes -- writes the '//', and only behind a host: that is what keeps href of url.parse
+   * ('mailto:x@y') 'mailto:x@y' and href of url.parse('http:x@y') 'http:x@y', and it is why an
+   * auth is written into the host alone, escaped with the ':' it separates a password with kept.
+   */
   function formatUrl(u) {
     if (u instanceof URL) return u.href;
     if (typeof u === 'string') return u;
+    var auth = u.auth ? encodeAuth(String(u.auth)) + '@' : '';
     var protocol = u.protocol ? String(u.protocol) : '';
     if (protocol && protocol.charAt(protocol.length - 1) !== ':') protocol += ':';
-    var host = u.host ? String(u.host) : (u.hostname ? String(u.hostname) + (u.port ? ':' + u.port : '') : '');
-    var auth = u.auth ? encodeURIComponent(String(u.auth)).replace(/%3A/i, ':') + '@' : '';
-    var slashes = (u.slashes || /^(https?|ftp|file|wss?):$/.test(protocol)) ? '//' : '';
-    var search = '';
-    if (u.search) search = String(u.search);
-    else if (u.query && typeof u.query === 'object') search = new URLSearchParams(u.query).toString();
-    else if (u.query) search = String(u.query);
-    if (search && search.charAt(0) !== '?') search = '?' + search;
+    var pathname = u.pathname ? String(u.pathname) : '';
     var hash = u.hash ? String(u.hash) : '';
+    var host = '';
+    var query = '';
+    if (u.host) {
+      host = auth + String(u.host);
+    } else if (u.hostname) {
+      var name = String(u.hostname);
+      /* a hostname holding a ':' is written back in brackets, unless it is an IPv6 literal, which
+         carries its own */
+      host = auth + (name.indexOf(':') >= 0 && !isIpv6Hostname(name) ? '[' + name + ']' : name);
+      if (u.port) host += ':' + String(u.port);
+    }
+    if (u.query !== null && typeof u.query === 'object') query = queryStringOf(u.query);
+    var search = u.search ? String(u.search) : (query && '?' + query) || '';
+    /* a '?' or '#' in the path would end it, so it is escaped: the file '/a#b' and not the path
+       '/a' carrying the fragment '#b' */
+    if (pathname.indexOf('#') >= 0 || pathname.indexOf('?') >= 0) {
+      pathname = pathname.replace(/#/g, '%23').replace(/\?/g, '%3F');
+    }
+    if (u.slashes || SLASHED_SCHEME[protocol]) {
+      if (u.slashes || host) {
+        if (pathname && pathname.charAt(0) !== '/') pathname = '/' + pathname;
+        host = '//' + host;
+      } else if (protocol.length >= 4 && protocol.slice(0, 4).toLowerCase() === 'file') {
+        host = '//';
+      }
+    }
+    if (search.indexOf('#') >= 0) search = search.replace(/#/g, '%23');
     if (hash && hash.charAt(0) !== '#') hash = '#' + hash;
-    return protocol + ((host || slashes) ? slashes + auth + host : '') + (u.pathname ? String(u.pathname) : '') + search + hash;
+    if (search && search.charAt(0) !== '?') search = '?' + search;
+    return protocol + host + pathname + search + hash;
   }
 
   return {
