@@ -351,7 +351,11 @@ function normalizeHeaderValue(value) {
    visible a record of entries could live. */
 var HEADERS_LIST = new WeakMap();
 
+/* The brand check Node makes before any of the methods: the receiver has to be a Headers, so
+   Headers.prototype.get.call({}) and a real Headers whose prototype was swapped out both report
+   'Illegal invocation' rather than reading a list that is not theirs. */
 function headersList(headers) {
+  if (!(headers instanceof Headers)) throw new TypeError('Illegal invocation');
   var list = HEADERS_LIST.get(headers);
   if (list === undefined) {
     list = [];
@@ -360,7 +364,9 @@ function headersList(headers) {
   return list;
 }
 
-function Headers(init) {
+/* Node's own signature: the parameter carries a default, so Headers.length is 0 and not the 1 a
+   bare parameter gives. */
+function Headers(init = undefined) {
   if (!(this instanceof Headers)) {
     throw new TypeError('Class constructor _Headers cannot be invoked without \'new\'');
   }
@@ -394,7 +400,7 @@ function Headers(init) {
      what a record of ByteStrings holds. */
   for (var key in init) self.append(String(key), String(init[key]));
 }
-Headers.prototype.append = function (name, value) {
+Headers.prototype.append = function append(name, value) {
   var rawName = String(name);
   if (!HEADER_NAME.test(rawName)) {
     throw new TypeError('Headers.append: "' + rawName + '" is an invalid header name.');
@@ -414,25 +420,40 @@ Headers.prototype.delete = function (name) {
   for (var i = 0; i < list.length; i++) if (list[i].name !== lower) kept.push(list[i]);
   HEADERS_LIST.set(this, kept);
 };
-Headers.prototype.get = function (name) {
+/* 'delete' cannot be written as a function's own name, so this one is given the name it has on
+   Node by hand; the rest are named function expressions. */
+Object.defineProperty(Headers.prototype.delete, 'name', { value: 'delete', configurable: true });
+Headers.prototype.get = function get(name) {
   var lower = String(name).toLowerCase();
   var found = [];
   var list = headersList(this);
   for (var i = 0; i < list.length; i++) if (list[i].name === lower) found.push(list[i].value);
   return found.length === 0 ? null : found.join(', ');
 };
-Headers.prototype.has = function (name) {
+Headers.prototype.has = function has(name) {
   var lower = String(name).toLowerCase();
   var list = headersList(this);
   for (var i = 0; i < list.length; i++) if (list[i].name === lower) return true;
   return false;
 };
 /* Node's Headers declares set after delete, so that is the order the prototype lists them in. */
-Headers.prototype.set = function (name, value) {
+Headers.prototype.set = function set(name, value) {
+  /* Node names the method a program called in the message, not the one this delegates to, so the
+     two checks are made here too and before anything is removed. */
+  var rawName = String(name);
+  if (!HEADER_NAME.test(rawName)) {
+    throw new TypeError('Headers.set: "' + rawName + '" is an invalid header name.');
+  }
+  var rawValue = String(value);
+  for (var i = 0; i < CONTROL_BYTES.length; i++) {
+    if (rawValue.indexOf(CONTROL_BYTES[i]) >= 0) {
+      throw new TypeError('Headers.set: "' + rawValue + '" is an invalid header value.');
+    }
+  }
   this.delete(name);
   this.append(name, value);
 };
-Headers.prototype.getSetCookie = function () {
+Headers.prototype.getSetCookie = function getSetCookie() {
   var found = [];
   var list = headersList(this);
   for (var i = 0; i < list.length; i++) if (list[i].name === 'set-cookie') found.push(list[i].value);
@@ -481,13 +502,13 @@ function headersInspect(inspect) {
   return shown === '' ? 'Headers {}' : 'Headers { ' + shown + ' }';
 }
 
-Headers.prototype.keys = function () {
+Headers.prototype.keys = function keys() {
   return headerEntries(headersList(this)).map(function (pair) { return pair[0]; })[Symbol.iterator]();
 };
-Headers.prototype.values = function () {
+Headers.prototype.values = function values() {
   return headerEntries(headersList(this)).map(function (pair) { return pair[1]; })[Symbol.iterator]();
 };
-Headers.prototype.entries = function () {
+Headers.prototype.entries = function entries() {
   return headerEntries(headersList(this)).map(function (pair) { return [pair[0], pair[1]]; })[Symbol.iterator]();
 };
 if (INSPECT_CUSTOM !== undefined) {
@@ -497,7 +518,7 @@ if (INSPECT_CUSTOM !== undefined) {
   });
 }
 Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
-Headers.prototype.forEach = function (fn, thisArg) {
+Headers.prototype.forEach = function forEach(fn, thisArg = undefined) {
   var entries = headerEntries(headersList(this));
   var self = this;
   for (var i = 0; i < entries.length; i++) {
@@ -654,13 +675,14 @@ function responseState(res) {
   return state;
 }
 
-/* One accessor per field, over the state object: readable and writable, as Node's are readable.
-   The four slots a body is kept in are not among them -- they are read through bodySlots, so
-   a for-in over a Response lists the fields and the methods and nothing else. */
+/* One accessor per field, over the state object: readable only, as Node's are -- a Response field
+   carries no setter, so writing one is a silent no-op outside strict mode and a TypeError within
+   it, and the descriptor is the same 'get | enumerable | configurable' Node's own is. The four
+   slots a body is kept in are not among them -- they are read through bodySlots, so a for-in over
+   a Response lists the fields and the methods and nothing else. */
 function responseField(name, key, seen) {
   Object.defineProperty(Response.prototype, name, {
     get: function () { return responseState(this)[key]; },
-    set: function (value) { responseState(this)[key] = value; },
     enumerable: seen === true,
     configurable: true
   });
@@ -919,14 +941,14 @@ function initWithContentType(init, contentType) {
 
 /* The three constructors Node hangs off Response itself, beside the one a program calls with new.
    Response.error is the one the class cannot express: its status is 0 and its type is 'error'. */
-Response.json = function (data, init) {
+Response.json = function json(data, init = {}) {
   if (arguments.length < 1) throw new TypeError('Response.json: 1 argument required, but 0 found.');
   var text = JSON.stringify(data);
   if (text === undefined) throw new TypeError('Value is not JSON serializable');
   return new Response(text, initWithContentType(init, 'application/json'));
 };
 var REDIRECT_STATUSES = [301, 302, 303, 307, 308];
-Response.redirect = function (url, status) {
+Response.redirect = function redirect(url, status = 302) {
   if (arguments.length < 1) throw new TypeError('Response.redirect: 1 argument required, but 0 found.');
   var code = status === undefined ? 302 : Number(status);
   if (REDIRECT_STATUSES.indexOf(code) < 0) throw new RangeError('Invalid status code ' + String(status));
@@ -934,7 +956,7 @@ Response.redirect = function (url, status) {
   if (parsed === null) throw unparseableUrl(url);
   return new Response(null, { status: code, headers: { location: parsed.href } });
 };
-Response.error = function () {
+Response.error = function error() {
   var res = Object.create(Response.prototype);
   RESPONSE_STATE.set(res, {
     status: 0,
@@ -948,11 +970,13 @@ Response.error = function () {
   return res;
 };
 /* Node's own order on the constructor: error, then json, then redirect. Deleting and re-adding is
-   what moves a name that was already written to the front of the order. */
+   what moves a name that was already written to the front of the order. Node's statics are
+   enumerable, and the engine here does not name a function that is assigned to a member, so each
+   one is a named function expression. */
 ['error', 'json', 'redirect'].forEach(function (name) {
   var held = Response[name];
   delete Response[name];
-  Object.defineProperty(Response, name, { value: held, writable: true, configurable: true });
+  Object.defineProperty(Response, name, { value: held, writable: true, enumerable: true, configurable: true });
 });
 
 var FORBIDDEN_METHODS = ['CONNECT', 'TRACE', 'TRACK'];
@@ -1016,7 +1040,6 @@ function requestState(req) {
 function requestField(name, key) {
   Object.defineProperty(Request.prototype, name, {
     get: function () { return requestState(this)[key]; },
-    set: function (value) { requestState(this)[key] = value; },
     enumerable: true, configurable: true
   });
 }
