@@ -1,0 +1,7 @@
+id: owc-shell-ls-dir-mode-traversal
+subject: ls reaches a file under a directory whose mode forbids it, where the host refuses at the directory
+description: 'Measured 2026-10-23 (judge shard shell-fileutils, /tmp/owc-r4/judge-shellfu7). `mkdir -p d; touch d/a; chmod 644 d; ls -l d/a` prints `-rw-r--r-- ... d/a` with status 0 in the container, and on the host prints nothing on stdout, `ls: d/a: Permission denied` on stderr and status 1; `chmod 000 d` gives the same pair. Reached through `chmod -R 644 d` too, which is how it first appeared. The mode `chmod` sets is honoured where a command reads a file (`cat` asks), not where the file system resolves a path through a directory, so clearing a directory''s execute bit locks nothing here. Fixing it means every path lookup has to walk its parent directories and test each mode, which is a file system change rather than one in fileutils.ts.'
+witness_plan: Run `mkdir -p d; touch d/a; chmod 644 d; ls -l d/a; echo rc=$?` on both sides; the container must print `ls: d/a: Permission denied` on stderr and `rc=1`.
+session_id: adv2-judge-shell-fileutils-5
+owner: adv2-judge-shell-fileutils-5
+status: pending
