@@ -305,19 +305,20 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   database, so nothing in it can belong to another user. A name the shell itself creates does match --
   `touch f; ls -l f` is `dylanwong wheel` on both, and `export USER=zzz` no longer moves the column, as it
   does not on a host.
-- **`ls -f` lists in sorted order, where the host lists in its directory order.** `touch f; mkdir d; ln -s f l;
-  ls -f` prints `. .. d f l` here and `. .. f d l` on the host. No entry or marker differs, only the order,
-  and the host's own order is not one this file system can derive.
+- **`ls -f` lists in the order this file system made the names, where the host lists in its own directory
+  order.** `touch a b c d; ls -f` prints `. .. a b c d` here and `. .. a c d b` on the host, and the host's
+  order does not follow the order the names were made in -- `touch d c b a; ls -f` is still `. .. a c d b`
+  -- so it is a hash of the names, not an order this file system can derive. Three names happen to agree,
+  which is why `touch f; mkdir d; ln -s f l; ls -f` is `. .. f d l` on both sides.
 - **`ls -ld` of a directory prints this file system's own link count and size, where the host prints the ones its
   directory really has.** `mkdir -p d; touch d/a; ls -ld d` is `drwxr-xr-x 2 ... 2 d` here and
   `drwxr-xr-x 3 ... 96 d` on the host, and an empty `d` is `2 ... 2` here and `2 ... 64` there. The container's
   file system keeps no directory size and no link count for a directory, so both columns are the same for every
   directory. (Open row `owc-shell-ls-dir-size-nlink`.)
-- **`ls` reaches a file under a directory whose mode forbids it, where the host refuses at the directory.**
-  `mkdir -p d; touch d/a; chmod 644 d; ls -l d/a` prints the file here and `ls: d/a: Permission denied` with
-  a status of 1 on the host, and `chmod 000 d` behaves the same way. The mode `chmod` set is honoured when a
-  command reads a file, not when the file system resolves a path through a directory. (Open row
-  `owc-shell-ls-dir-mode-traversal`.)
+- **`ls` ignores `-L`, `-H` and `-P`, so a link is never followed where the host follows it.** `mkdir F;
+  touch F/a; ln -s F/a FL; ls -lL FL` prints the target's `-rw-r--r-- ... FL` with a status of 0 on the
+  host and the link's `lrwxr-xr-x ... FL -> F/a` here; `chmod 644 F; ls -lL FL` is `ls: FL: No such file
+  or directory` with a status of 1 there, and the same link line with a status of 0 here.
 - **`/etc/hosts` is not in the container's file system, and `/tmp` is a directory here where this host has it as
   a symlink to `private/tmp`.** Both are facts about the two trees, not about `ls`: `ls -l /etc/hosts` fails
   here with `No such file or directory` and `ls -ld /tmp` prints `drwxrwxrwt` where the host prints
@@ -358,15 +359,17 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   `    at Object.methodFrame (...)`, a top-level frame is `at <anonymous>` where the host's is
   `at Object.<anonymous>`, and every guest trace ends with `at call (native)`,
   `at loadCJS (owc-bootstrap.js:...)` and `at runMain (owc-bootstrap.js:...)`, which no host trace has.
-  `util.inspect(new Error('boom'))` and an uncaught throw do carry the `Error: boom` header -- the
-  formatter that writes them prepends it -- and only `err.stack` itself does not.
+  `util.inspect(new Error('boom'))`, an uncaught throw and an error the guest constructs all carry
+  the `Error: boom` header. An error the engine raises itself -- `null.x`, `JSON.parse('{')` --
+  still opens with a frame, which is `owc-guest-error-engine-stack-no-header` below.
 - **`/dev` holds four devices where a host holds hundreds.** `/dev/null`, `/dev/zero`, `/dev/random` and
   `/dev/urandom` are mounted as character devices and `fs.statSync('/dev/null')` agrees with the host --
   `isFile()` false, `isCharacterDevice()` true, `mode` 8630 -- and a read of `/dev/zero` gives eight zero
   bytes and of `/dev/urandom` eight that are not; `fstatSync` of an open descriptor of one says `size` 0,
   as a host's does, and a `chmodSync` or `fchmodSync` of one is refused with the host's `EPERM` rather
   than being taken and leaving the device a regular file. A write is discarded by all four but
-  `/dev/urandom`: that is the one a host refuses to be seeded through, so it is refused here too. `/dev` itself is `dr-xr-xr-x` and nothing can be made
+  `/dev/urandom`: that is the one a host refuses to be seeded through, so it is refused here too.
+  `/dev` itself is `dr-xr-xr-x` and nothing can be made
   in it, as on a host: `mkdir /dev/sub` is refused. What is still recorded rather than fixed:
   - `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd` -- and `/dev/tty`, below -- are not there:
     `echo x > /dev/stdout` is refused in the container where a host prints `x`.
@@ -973,4 +976,9 @@ re-run in isolation; the rows are open.
 - `owc-shell-arith-operand-error-status`: `x=$((1+))` -- host stderr `/bin/sh: 1+: syntax error: operand expected (error token is "+")` exit 127; container stderr `syntax error: operand expected` exit 1.
 - `owc-shell-command-not-found-wording`: `nosuchcmd-j4` -- host stderr `/bin/sh: nosuchcmd-j4: command not found`; container `Command not found: nosuchcmd-j4`. Not a prefix difference: the name sits in a different place in the sentence.
 - `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string.
-- `owc-json-stringify-circular-message`: `JSON.stringify(o)` where `o.o === o` -- host Node 24.15 throws `TypeError: Converting circular structure to JSON` followed by two lines naming the constructor and the property that closes the circle; the container throws `TypeError: circular reference`. It reaches `Response.json(cyclic)` through the same call.
+- `owc-guest-error-engine-stack-no-header`: an error the engine raises itself -- `null.x`, `JSON.parse('{')` -- opens with a frame where host Node 24.15 opens with the error's own name and message: container `err.stack` is `    at <anonymous> (/app/main.js:12:11)`, host `TypeError: Cannot read properties of null (reading 'x')`. An error the guest constructs does carry its header, because its constructor is wrapped; these are raised at throw sites inside the engine that no guest-side definition reaches.
+- `owc-json-stringify-replacer-cycle-message`: a cycle a replacer introduces -- `JSON.stringify({x:1}, function(k,v){ return k === 'x' ? cyc : v; })` where `cyc.a === cyc` -- still throws `TypeError: circular reference` where host Node 24.15 throws `Converting circular structure to JSON` followed by `    --- property 'a' closes the circle`. A cycle in the value handed to `JSON.stringify`, and one a `toJSON` returns, are both named; only one the replacer substitutes is not, because the walk that finds the circle sees the value as handed over and not as the replacer rewrote it.
+- `owc-shell-closed-fd-flush-target`: the text a closed descriptor could not hold lands where a host's buffer is flushed, not where the shell started -- `exec >d; echo hi >&-; exec >&2; echo O=[$(cat d)]` is host `O=[hi]` (and the text on the error stream) against the container's `O=[]` with `hi` on the original output; `{ echo hi >&-; } > f; echo O=[$(cat f)]` is host `O=[]` with `hi` on the original output against the container's `O=[hi]`; `exec 1>&-; echo hi 1>&1` is host stdout empty against the container's `hi`.
+- `owc-shell-cat-option-operand`: `exec 0<p1; cat -n` -- the host numbers the lines it read (`     1\tp`), the container reads a file named `-n` and fails with `ENOENT: No such file or directory, '/app/D/-n'`.
+- `owc-shell-cat-directory`: `mkdir sd; cat sd` -- host stderr `cat: sd: Is a directory` and status 1; container stdout `{}` and status 0.
+- `owc-shell-exec-not-found-wording`: `exec nosuchcmdxyz` -- host stderr `/bin/sh: line 0: exec: nosuchcmdxyz: not found`; container `sh: nosuchcmdxyz: command not found`. Same status 127; a host names `exec` and carries the `line 0`.
