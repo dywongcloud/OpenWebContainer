@@ -1,0 +1,13 @@
+id: owc-vm-realm-rebuild-drops-keys
+session_id: adv5-judge-async-als-3
+owner: adv5-judge-async-als-3
+status: pending
+classification: GUEST
+measured_at: af9e76d (local main)
+title: A value rebuilt for a vm realm loses every key after its second nested container
+subject: 'A value a vm context hands back is copied into the second realm by rehomeInto, and the copy stops at the second child that is itself an object or an array, dropping that child and every key after it. Measured with vm.runInNewContext: ({o:{x:1}, p:{y:2}}) is {"o":{"x":1},"p":{"y":2}} on host node 24.15 and {"o":{"x":1}} here; [{q:1},{r:2}] is length 2 there and length 1 here; ({o:{x:1}, a:[1], n:5}) is all three there and {"o":{"x":1}} here. Scalars are not affected -- ({o:{x:1}, n:5, m:6}) and ({n:5, o:{x:1}, m:6}) are intact on both -- and neither are Date and RegExp children, so ({d:new Date(0), e:new Date(1)}) and ({re:/x/, re2:/y/}) agree on both sides; once one child has been rebuilt, though, the next object-, array- or Map-valued key ends the walk and the rest of the object is gone. Site: rehomeInto in packages/core/src/process/executors/node/runtime/capabilities/vm.ts keeps the source handles it has walked in `seen` so a cycle can return its twin, but the caller disposes each child handle in a finally as soon as setProp has taken it, so `seen` holds freed handles and the context.eq(seen[i], value) of the next child reads freed memory; the throw is swallowed by the catch around the key loop, which returns the half-built copy. The fix is to keep a child handle in `seen` alive for as long as the walk can compare against it, not past the setProp that consumed it. Two container runs at load 16-25 with 1.9-3.2 GB free, identical both times, and three earlier runs in the adversary pass.'
+acceptance_criteria:
+- vm.runInNewContext("({o:{x:1}, p:{y:2}})") prints {"o":{"x":1},"p":{"y":2}} here, as host node 24.15 does
+- vm.runInNewContext("[{q:1},{r:2}]") is length 2 here, and ({o:{x:1}, a:[1], n:5}) keeps all three keys
+- A cycle still comes back without recursion: ({a:{}}) with a.a = a does not hang and does not drop keys
+witness_plan: Run /tmp/owc-r4/judge-als-3/v1/main.js and /tmp/owc-r4/judge-als-3/v2/main.js under host node and in the container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core and diff stdout line by line; the two are already witness-side by side at /tmp/owc-r4/judge-als-3/v1.host.out, v2.host.out and the container transcripts.
