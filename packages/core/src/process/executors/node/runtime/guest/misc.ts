@@ -786,7 +786,7 @@ BF.url = function () {
   }
 
   function fileURLToPath(u) {
-    var parsed = typeof u === 'string' ? new URL(u) : (u instanceof URL ? u : new URL(String(u.href)));
+    var parsed = typeof u === 'string' ? new URL(u) : (u instanceof URL || u instanceof urlModule.URL ? u : new URL(String(u.href)));
     if (parsed.protocol !== 'file:') {
       var err = new TypeError('The URL must be of scheme file');
       err.code = 'ERR_INVALID_URL_SCHEME';
@@ -828,8 +828,12 @@ BF.url = function () {
      * escaped: both end a URL's path and start its fragment or query, so '/a#b' is the file
      * '/a#b' and not the file '/a' carrying the fragment '#b'. encodeURI does the rest -- a space
      * is '%20' and 'ü' is '%C3%BC'.
+     *
+     * The class is read off the module rather than captured: require('url').URL and the global URL
+     * are one class in Node, so the URL this hands back is the one a caller's 'instanceof URL'
+     * recognises -- the same one the bootstrap puts on the module once the globals are built.
      */
-    return new URL('file://' + encodeURI(resolved).replace(/#/g, '%23').replace(/\?/g, '%3F'));
+    return new (urlModule.URL)('file://' + encodeURI(resolved).replace(/#/g, '%23').replace(/\?/g, '%3F'));
   }
 
   /* the options an http.request takes, read off a URL: the parts as Node words them, with a port
@@ -922,15 +926,19 @@ BF.url = function () {
   /*
    * The trim and the backslash conversion that run before anything else reads the string: leading
    * and trailing whitespace goes, and a backslash becomes a slash while no '?' or '#' has been
-   * seen -- the browser behaviour Node copies, which is what makes 'a\b' the path 'a/b'.
+   * seen -- the browser behaviour Node copies, which is what makes 'a\b' the path 'a/b'. Whether
+   * an '@' or a '#' was seen comes back beside it: both keep the parser off its short path, the
+   * '#' because a fragment may not reach it and the '@' because a userinfo always denotes a host.
    */
-  function legacyTrimmed(text) {
+  function legacyTrim(text) {
     var start = -1;
     var end = -1;
     var lastPos = 0;
     var acc = '';
     var inWs = false;
     var split = false;
+    var hasAt = false;
+    var hasHash = false;
     for (var i = 0; i < text.length; i++) {
       var code = text.charCodeAt(i);
       var isWs = code < 33 || code === 0xa0 || code === 0xfeff;
@@ -941,28 +949,93 @@ BF.url = function () {
         if (!isWs) { end = -1; inWs = false; }
       } else if (isWs) { end = i; inWs = true; }
       if (!split) {
-        if (code === 35 || code === 63) split = true;
+        if (code === 64) hasAt = true;
+        else if (code === 35) {
+          hasHash = true;
+          split = true;
+        } else if (code === 63) split = true;
         else if (code === 92) {
           if (i - lastPos > 0) acc += text.slice(lastPos, i);
           acc += '/';
           lastPos = i + 1;
         }
-      }
+      } else if (!hasHash && code === 35) hasHash = true;
     }
-    if (start === -1) return '';
-    if (lastPos === start) return end === -1 ? (start === 0 ? text : text.slice(start)) : text.slice(start, end);
-    if (end === -1) return lastPos < text.length ? acc + text.slice(lastPos) : acc;
-    return lastPos < end ? acc + text.slice(lastPos, end) : acc;
+    var rest = '';
+    if (start === -1) rest = '';
+    else if (lastPos === start) rest = end === -1 ? (start === 0 ? text : text.slice(start)) : text.slice(start, end);
+    else if (end === -1) rest = lastPos < text.length ? acc + text.slice(lastPos) : acc;
+    else rest = lastPos < end ? acc + text.slice(lastPos, end) : acc;
+    return { rest: rest, hasAt: hasAt, hasHash: hasHash };
+  }
+
+  /* A path with no host, no userinfo and no fragment: the only shape the parser answers without
+     walking the string, which is what leaves the space of 'url.parse("/a?b c")' alone. */
+  var SIMPLE_PATH_RE = /^(\/\/?(?!\/)[^?\s]*)(\?[^\s]*)?$/;
+
+  /*
+   * A query the caller asked to have parsed. Node hands back an object with no prototype -- the
+   * querystring module's own -- so a name of '__proto__' is one pair of the query it names rather
+   * than the prototype of the object holding it, and '?__proto__=1' is the query {__proto__: '1'}.
+   */
+  function emptyQuery() {
+    return Object.create(null);
+  }
+
+  function queryOf(text) {
+    var out = emptyQuery();
+    new URLSearchParams(text).forEach(function (value, key) {
+      if (Object.prototype.hasOwnProperty.call(out, key)) out[key] = [].concat(out[key], value);
+      else out[key] = value;
+    });
+    return out;
   }
 
   /*
-   * legacy url.parse: Node's own parser, field for field. A Url is a set of strings, null where
-   * Node leaves one null -- and href is what format writes back from those fields, so the '//' a
-   * caller never wrote is not put in and an auth carrying an '@' comes out as 'a%40b'.
+   * Node's legacy Url: a set of strings, null where Node leaves one null, and href is what format
+   * writes back from those fields -- so the '//' a caller never wrote is not put in and an auth
+   * carrying an '@' comes out as 'a%40b'.
    */
-  function parse(input, parseQuery) {
-    var text = String(input);
-    var rest = legacyTrimmed(text);
+  function Url() {
+    this.protocol = null;
+    this.slashes = null;
+    this.auth = null;
+    this.host = null;
+    this.port = null;
+    this.hostname = null;
+    this.hash = null;
+    this.search = null;
+    this.query = null;
+    this.pathname = null;
+    this.path = null;
+    this.href = null;
+  }
+
+  /*
+   * Node reads the argument as a string before anything else: url.parse(1) is ERR_INVALID_ARG_TYPE,
+   * not the fields of the text '1'.
+   */
+  Url.prototype.parse = function (input, parseQuery, slashesDenoteHost) {
+    if (typeof input !== 'string') throw invalidArgType('url', 'string', input);
+    var text = input;
+    var trimmed = legacyTrim(text);
+    var rest = trimmed.rest;
+    if (!slashesDenoteHost && !trimmed.hasHash && !trimmed.hasAt) {
+      var simple = SIMPLE_PATH_RE.exec(rest);
+      if (simple) {
+        this.path = rest;
+        this.href = rest;
+        this.pathname = simple[1];
+        if (simple[2]) {
+          this.search = simple[2];
+          this.query = parseQuery ? queryOf(simple[2].slice(1)) : simple[2].slice(1);
+        } else if (parseQuery) {
+          this.search = null;
+          this.query = emptyQuery();
+        }
+        return this;
+      }
+    }
     var proto = LEGACY_SCHEME_RE.exec(rest);
     var lowerProto;
     var protocol = null;
@@ -974,12 +1047,15 @@ BF.url = function () {
     }
 
     var slashes = null;
-    var hasSlashes = false;
-    if (proto || LEGACY_HOST_RE.test(rest)) {
+    /*
+     * '//' denotes a host when the caller says it does -- as url.resolve and url.resolveObject do,
+     * since a browser resolves '//a/b' as the host 'a' over the path '/b' -- or when a scheme was
+     * written, or when the text is a bare '//user@host'.
+     */
+    if (slashesDenoteHost || proto || LEGACY_HOST_RE.test(rest)) {
       var doubled = rest.charAt(0) === '/' && rest.charAt(1) === '/';
       if (doubled && !(proto && HOSTLESS_SCHEME[lowerProto])) {
         rest = rest.slice(2);
-        hasSlashes = true;
         slashes = true;
       }
     }
@@ -988,7 +1064,7 @@ BF.url = function () {
     var hostname = null;
     var port = null;
     var auth = null;
-    if (!HOSTLESS_SCHEME[lowerProto] && (hasSlashes || (proto && !SLASHED_SCHEME[proto]))) {
+    if (!HOSTLESS_SCHEME[lowerProto] && (slashes || (proto && !SLASHED_SCHEME[proto]))) {
       var hostEnd = -1;
       var atSign = -1;
       var nonHost = -1;
@@ -1034,13 +1110,17 @@ BF.url = function () {
       /* there is a hostname, so even an empty one is present */
       var name = typeof hostname === 'string' ? hostname : '';
       var ipv6 = isIpv6Hostname(name);
+      /*
+       * A ':' is not the only byte that ends a host: a '\', a '?', a '#', a '/' and a ':' each do,
+       * and what follows the first of them becomes the path -- 'http://h\x/a' is the host 'h' over
+       * the path '/x/a', and 'http://h:80x/a' the host 'h' over '/80x/a'.
+       */
       if (!ipv6) {
         for (var j = 0; j < name.length; j++) {
-          /* a ':' no host may hold ends it, and what follows it becomes the path */
-          if (name.charAt(j) === ':') {
-            var tail = name.slice(j) + rest;
+          var at = name.charAt(j);
+          if (at === ':' || at === '\\' || at === '?' || at === '#' || at === '/') {
+            rest = '/' + name.slice(j) + rest;
             name = name.slice(0, j);
-            rest = tail.charAt(0) === '/' ? tail : '/' + tail;
             break;
           }
         }
@@ -1086,15 +1166,9 @@ BF.url = function () {
         search = rest.slice(questionIdx, hashIdx);
         query = rest.slice(questionIdx + 1, hashIdx);
       }
-      if (parseQuery) {
-        query = {};
-        new URLSearchParams(rest.slice(questionIdx + 1, hashIdx === -1 ? rest.length : hashIdx)).forEach(function (value, key) {
-          if (Object.prototype.hasOwnProperty.call(query, key)) query[key] = [].concat(query[key], value);
-          else query[key] = value;
-        });
-      }
+      if (parseQuery) query = queryOf(rest.slice(questionIdx + 1, hashIdx === -1 ? rest.length : hashIdx));
     } else if (parseQuery) {
-      query = {};
+      query = emptyQuery();
     }
 
     var pathname = null;
@@ -1109,51 +1183,305 @@ BF.url = function () {
     var path = null;
     if (pathname || search) path = (pathname || '') + (search || '');
 
-    var fields = {
-      protocol: protocol,
-      slashes: slashes,
-      auth: auth,
-      host: host,
-      port: port,
-      hostname: hostname,
-      hash: hash,
-      search: search,
-      query: query,
-      pathname: pathname,
-      path: path
-    };
-    fields.href = formatUrl(fields);
-    return fields;
-  }
+    this.protocol = protocol;
+    this.slashes = slashes;
+    this.auth = auth;
+    this.host = host;
+    this.port = port;
+    this.hostname = hostname;
+    this.hash = hash;
+    this.search = search;
+    this.query = query;
+    this.pathname = pathname;
+    this.path = path;
+    this.href = formatUrl(this);
+    return this;
+  };
 
   /*
    * Node reads both arguments as strings before anything else: url.resolve('http://a/b', null) is
-   * ERR_INVALID_ARG_TYPE, not the reference resolved against the text 'null'.
+   * ERR_INVALID_ARG_TYPE, not the reference resolved against the text 'null'. The wording is
+   * Node's own -- 'Received type number (1)', and 'Received null' for the two that are not types.
    */
-  function urlArgError(value) {
-    var err = new TypeError('The "url" argument must be of type string. Received ' +
-      (value === null ? 'null' : typeof value));
+  function specificTypeOf(value) {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    var type = typeof value;
+    if (type === 'string') return value === '' ? 'an empty string' : 'type string (' + value + ')';
+    if (type === 'number' || type === 'boolean' || type === 'bigint') return 'type ' + type + ' (' + String(value) + ')';
+    if (type === 'symbol') return 'type symbol (' + String(value) + ')';
+    if (type === 'function') return 'type function (' + (value.name || '') + ')';
+    if (Array.isArray(value)) return 'an array';
+    var ctor = value.constructor;
+    var name = ctor && typeof ctor.name === 'string' ? ctor.name : '';
+    return name ? 'an instance of ' + name : 'an instance of Object';
+  }
+
+  function invalidArgType(name, expected, value) {
+    var err = new TypeError('The "' + name + '" argument must be ' +
+      (Array.isArray(expected) ? 'one of type ' + expected.join(' or ') : 'of type ' + expected) +
+      '. Received ' + specificTypeOf(value));
     err.code = 'ERR_INVALID_ARG_TYPE';
     return err;
   }
 
-  function resolveUrl(from, to) {
-    if (typeof from !== 'string') throw urlArgError(from);
-    if (typeof to !== 'string') throw urlArgError(to);
-    var absolute = SCHEME_RE.test(String(from)) || SCHEME_RE.test(String(to));
-    var base = new URL(String(from), 'http://relative.invalid');
-    /* A reference of nothing at all, or of only the delimiter, still replaces the part it names:
-       'http://a/b' with '?' is 'http://a/b?' and not 'http://a/b'. */
-    if (absolute) {
-      var prefix = base.protocol + '//' + base.host;
-      if (to === '') return base.href;
-      if (to === '?') return prefix + base.pathname + '?';
-      if (to === '#') return prefix + base.pathname + base.search + '#';
-    }
-    var target = new URL(String(to), base);
-    var target = new URL(String(to), base);
-    return absolute ? target.href : target.pathname + target.search + target.hash;
+  function spliceOne(list, index) {
+    list.splice(index, 1);
   }
+
+  /* url.parse: a Url of the text, or the one it was handed back unchanged */
+  function parseLegacy(input, parseQuery, slashesDenoteHost) {
+    if (input instanceof Url) return input;
+    var u = new Url();
+    u.parse(input, parseQuery, slashesDenoteHost);
+    return u;
+  }
+
+  function resolveLegacy(source, relative) {
+    return parseLegacy(source, false, true).resolve(relative);
+  }
+
+  /* url.resolveObject: with no source at all, the reference is the answer */
+  function resolveObjectLegacy(source, relative) {
+    if (!source) return relative;
+    return parseLegacy(source, false, true).resolveObject(relative);
+  }
+
+  Url.prototype.format = function () {
+    return formatUrl(this);
+  };
+
+  Url.prototype.resolve = function (relative) {
+    return this.resolveObject(parseLegacy(relative, false, true)).format();
+  };
+
+  /*
+   * Url.prototype.resolveObject: RFC 3986 5.2, the way Node walks it. The base's fields are the
+   * starting point and the reference rewrites them part by part -- the hash always, the whole URL
+   * when the reference is '//host', the path and its dot segments only when it is relative.
+   */
+  Url.prototype.resolveObject = function (relative) {
+    if (typeof relative === 'string') relative = parseLegacy(relative, false, true);
+
+    var result = new Url();
+    var keys = Object.keys(this);
+    for (var i = 0; i < keys.length; i++) result[keys[i]] = this[keys[i]];
+
+    /* the hash is always the reference's, even when the reference is empty and so takes it away */
+    result.hash = relative.hash;
+
+    /* nothing at all to resolve: the base as it stands, with the hash written over it */
+    if (relative.href === '') {
+      result.href = result.format();
+      return result;
+    }
+
+    /* '//foo/bar' cuts to the protocol: everything but the protocol comes from the reference */
+    if (relative.slashes && !relative.protocol) {
+      var rkeys = Object.keys(relative);
+      for (var r = 0; r < rkeys.length; r++) {
+        if (rkeys[r] !== 'protocol') result[rkeys[r]] = relative[rkeys[r]];
+      }
+      /* a slashed scheme with a host has a path even when none was written: 'http://c' is '/' */
+      if (SLASHED_SCHEME[result.protocol] && result.hostname && !result.pathname) {
+        result.path = result.pathname = '/';
+      }
+      result.href = result.format();
+      return result;
+    }
+
+    if (relative.protocol && relative.protocol !== result.protocol) {
+      /* a scheme that carries no authority takes the reference whole */
+      if (!SLASHED_SCHEME[relative.protocol]) {
+        var all = Object.keys(relative);
+        for (var a = 0; a < all.length; a++) result[all[a]] = relative[all[a]];
+        result.href = result.format();
+        return result;
+      }
+      result.protocol = relative.protocol;
+      if (!relative.host && !/^file:?$/.test(relative.protocol) && !HOSTLESS_SCHEME[relative.protocol]) {
+        /* a slashed scheme that names no host takes the first path segment as its host: the
+           reference 'http:a/b' is the host 'a' over the path '/b' */
+        var relPath = (relative.pathname || '').split('/');
+        while (relPath.length && !(relative.host = relPath.shift())) { /* no empty segment is one */ }
+        if (!relative.host) relative.host = '';
+        if (!relative.hostname) relative.hostname = '';
+        if (relPath[0] !== '') relPath.unshift('');
+        if (relPath.length < 2) relPath.unshift('');
+        result.pathname = relPath.join('/');
+      } else {
+        result.pathname = relative.pathname;
+      }
+      result.search = relative.search;
+      result.query = relative.query;
+      result.host = relative.host || '';
+      result.auth = relative.auth;
+      result.hostname = relative.hostname || relative.host;
+      result.port = relative.port;
+      if (result.pathname || result.search) {
+        result.path = (result.pathname || '') + (result.search || '');
+      }
+      if (!result.slashes) result.slashes = relative.slashes;
+      result.href = result.format();
+      return result;
+    }
+
+    var isSourceAbs = !!(result.pathname && result.pathname.charAt(0) === '/');
+    var isRelAbs = !!(relative.host || (relative.pathname && relative.pathname.charAt(0) === '/'));
+    var mustEndAbs = isRelAbs || isSourceAbs || !!(result.host && relative.pathname);
+    var removeAllDots = mustEndAbs;
+    var srcPath = (result.pathname && result.pathname.split('/')) || [];
+    var refPath = (relative.pathname && relative.pathname.split('/')) || [];
+    var noLeadingSlashes = !!(result.protocol && !SLASHED_SCHEME[result.protocol]);
+
+    /*
+     * A scheme that carries no authority lets '../..' crawl up into the host, which is strange but
+     * is what Node does: the host is put into the path to be crawled, and taken back out of it at
+     * the end -- 'mailto:local1@domain1' with 'local2@domain2' is 'mailto:local2@domain2'.
+     */
+    if (noLeadingSlashes) {
+      result.hostname = '';
+      result.port = null;
+      if (result.host) {
+        if (srcPath[0] === '') srcPath[0] = result.host;
+        else srcPath.unshift(result.host);
+      }
+      result.host = '';
+      if (relative.protocol) {
+        relative.hostname = null;
+        relative.port = null;
+        result.auth = null;
+        if (relative.host) {
+          if (refPath[0] === '') refPath[0] = relative.host;
+          else refPath.unshift(relative.host);
+        }
+        relative.host = null;
+      }
+      mustEndAbs = mustEndAbs && (refPath[0] === '' || srcPath[0] === '');
+    }
+
+    if (isRelAbs) {
+      /* the reference is absolute: its host and its query replace the base's, path and all */
+      if (relative.host || relative.host === '') {
+        if (result.host !== relative.host) result.auth = null;
+        result.host = relative.host;
+        result.port = relative.port;
+      }
+      if (relative.hostname || relative.hostname === '') {
+        if (result.hostname !== relative.hostname) result.auth = null;
+        result.hostname = relative.hostname;
+      }
+      result.search = relative.search;
+      result.query = relative.query;
+      srcPath = refPath;
+    } else if (refPath.length) {
+      /* the reference is relative: the base's last segment goes and the reference follows it */
+      srcPath.pop();
+      srcPath = srcPath.concat(refPath);
+      result.search = relative.search;
+      result.query = relative.query;
+    } else if (relative.search !== null && relative.search !== undefined) {
+      /* nothing but a query: '?foo' */
+      if (noLeadingSlashes) {
+        result.hostname = result.host = srcPath.shift();
+        /* an auth can be left stuck in the host, as it is in 'mailto:local1@domain1' */
+        var authInHost = result.host && result.host.indexOf('@') > 0 && result.host.split('@');
+        if (authInHost) {
+          result.auth = authInHost.shift();
+          result.host = result.hostname = authInHost.shift();
+        }
+      }
+      result.search = relative.search;
+      result.query = relative.query;
+      if (result.pathname !== null || result.search !== null) {
+        result.path = (result.pathname ? result.pathname : '') + (result.search ? result.search : '');
+      }
+      result.href = result.format();
+      return result;
+    }
+
+    if (!srcPath.length) {
+      result.pathname = null;
+      /* to support http.request */
+      result.path = result.search ? '/' + result.search : null;
+      result.href = result.format();
+      return result;
+    }
+
+    /* a path that ends in '.' or '..' ends in a slash; one that ends in anything else does not */
+    var last = srcPath[srcPath.length - 1];
+    var hasTrailingSlash = (((result.host || relative.host || srcPath.length > 1) &&
+      (last === '.' || last === '..')) || last === '');
+
+    /* strip the single dots, resolve the double ones, and count the ones that went past the root */
+    var up = 0;
+    for (var d = srcPath.length - 1; d >= 0; d--) {
+      last = srcPath[d];
+      if (last === '.') spliceOne(srcPath, d);
+      else if (last === '..') {
+        spliceOne(srcPath, d);
+        up++;
+      } else if (up) {
+        spliceOne(srcPath, d);
+        up--;
+      }
+    }
+
+    /* a path that need not end absolute keeps the '..' that would have gone above the root */
+    if (!mustEndAbs && !removeAllDots) {
+      while (up-- > 0) srcPath.unshift('..');
+    }
+
+    if (mustEndAbs && srcPath[0] !== '' && (!srcPath[0] || srcPath[0].charAt(0) !== '/')) {
+      srcPath.unshift('');
+    }
+
+    var joined = srcPath.join('/');
+    if (hasTrailingSlash && joined.charAt(joined.length - 1) !== '/') srcPath.push('');
+
+    var isAbsolute = srcPath[0] === '' || (srcPath[0] && srcPath[0].charAt(0) === '/');
+
+    /* the host comes back out of the first segment, for a scheme that carries no authority */
+    if (noLeadingSlashes) {
+      result.hostname = result.host = isAbsolute ? '' : (srcPath.length ? srcPath.shift() : '');
+      var stuckAuth = result.host && result.host.indexOf('@') > 0 ? result.host.split('@') : false;
+      if (stuckAuth) {
+        result.auth = stuckAuth.shift();
+        result.host = result.hostname = stuckAuth.shift();
+      }
+    }
+
+    if (!mustEndAbs) mustEndAbs = !!(result.host && srcPath.length);
+    if (mustEndAbs && !isAbsolute) srcPath.unshift('');
+
+    if (!srcPath.length) {
+      result.pathname = null;
+      result.path = null;
+    } else {
+      result.pathname = srcPath.join('/');
+    }
+
+    if (result.pathname !== null || result.search !== null) {
+      result.path = (result.pathname ? result.pathname : '') + (result.search ? result.search : '');
+    }
+    result.auth = relative.auth || result.auth;
+    if (!result.slashes) result.slashes = relative.slashes;
+    result.href = result.format();
+    return result;
+  };
+
+  /* the port is the run of digits behind the last ':' that ends the host, read off before the
+     host is validated: 'h:' names no port at all and 'h:80' names the port 80 over the host 'h' */
+  Url.prototype.parseHost = function () {
+    var host = this.host || '';
+    var port = LEGACY_PORT_RE.exec(host);
+    if (port) {
+      port = port[0];
+      if (port !== ':') this.port = port.slice(1);
+      host = host.slice(0, host.length - port.length);
+    }
+    if (host) this.hostname = host;
+  };
 
   /*
    * A query written back out of the object a caller passed, the way querystring.stringify writes
@@ -1224,20 +1552,304 @@ BF.url = function () {
     return protocol + host + pathname + search + hash;
   }
 
-  return {
+  /*
+   * url.format: a string is parsed before it is written back, and a WHATWG URL is written with the
+   * parts the options name -- no fragment, no search, no userinfo, or a host in unicode rather
+   * than in punycode.
+   */
+  function formatUrlExport(u, options) {
+    if (typeof u === 'string') return parseLegacy(u, false, true).format();
+    if (typeof u !== 'object' || u === null) throw invalidArgType('urlObject', ['object', 'string'], u);
+    if (u instanceof URL || u instanceof urlModule.URL) {
+      var fragment = true;
+      var unicode = false;
+      var search = true;
+      var auth = true;
+      if (options) {
+        if (options.fragment != null) fragment = !!options.fragment;
+        if (options.unicode != null) unicode = !!options.unicode;
+        if (options.search != null) search = !!options.search;
+        if (options.auth != null) auth = !!options.auth;
+      }
+      var name = unicode ? domainToUnicode(u.hostname) : u.hostname;
+      var userinfo = auth && (u.username || u.password)
+        ? u.username + (u.password ? ':' + u.password : '') + '@'
+        : '';
+      /* only a URL that carries a host writes the '//', and file: writes it with no host at all */
+      var authority = '';
+      if (u.hostname || u.host || u.protocol === 'file:') {
+        authority = '//' + userinfo + (name === '' ? '' : name) + (u.port ? ':' + u.port : '');
+      }
+      return u.protocol + authority + u.pathname + (search ? u.search : '') + (fragment ? u.hash : '');
+    }
+    return formatUrl(u);
+  }
+
+  /*
+   * fileURLToPath as a Buffer: the bytes the path names, decoded one escape at a time rather than
+   * through decodeURIComponent, so a path that is not valid UTF-8 still comes back whole.
+   */
+  function fileURLToPathBuffer(u) {
+    var parsed;
+    if (typeof u === 'string') parsed = new URL(u);
+    else if (u instanceof URL || u instanceof urlModule.URL) parsed = u;
+    else throw invalidArgType('path', 'string or an instance of URL', u);
+    if (parsed.protocol !== 'file:') {
+      var err = new TypeError('The URL must be of scheme file');
+      err.code = 'ERR_INVALID_URL_SCHEME';
+      throw err;
+    }
+    /*
+     * A file: URL names no host but 'localhost', and the parser has already taken 'localhost' for
+     * no host at all, so any host that is left is one Node refuses.
+     */
+    if (parsed.hostname !== '') {
+      var hostErr = new TypeError(
+        'File URL host must be "localhost" or empty on ' + requireBuiltin('os').platform());
+      hostErr.code = 'ERR_INVALID_FILE_URL_HOST';
+      throw hostErr;
+    }
+    var pathname = parsed.pathname;
+    var bytes = [];
+    for (var i = 0; i < pathname.length; i++) {
+      var code = pathname.charCodeAt(i);
+      if (code === 37 && isHexPair(pathname, i + 1)) {
+        bytes.push(parseInt(pathname.substr(i + 1, 2), 16));
+        i += 2;
+        continue;
+      }
+      /* a half of a surrogate pair is not a code point, and Node writes it as U+FFFD */
+      var encoded = (code >= 0xd800 && code <= 0xdfff) ? [0xef, 0xbf, 0xbd] : utf8Flat(code);
+      for (var b = 0; b < encoded.length; b++) bytes.push(encoded[b]);
+    }
+    return requireBuiltin('buffer').Buffer.from(bytes);
+  }
+
+  /*
+   * URLPattern: a pattern per component -- protocol, username, password, hostname, port, pathname,
+   * search and hash -- each compiled to a regular expression, so test() answers whether a URL
+   * matches it and exec() answers what the named parts of that URL were. A component the pattern
+   * never mentions is '*', which matches anything.
+   */
+  var PATTERN_COMPONENTS = ['protocol', 'username', 'password', 'hostname', 'port', 'pathname', 'search', 'hash'];
+  /* the text one component may not hold, and so the class a named part of it is read against */
+  var PATTERN_CLASS = {
+    protocol: '[^:/?#]+?',
+    username: '[^:/?#]+?',
+    password: '[^:/?#]+?',
+    hostname: '[^/:?#]+?',
+    port: '[^/?#]+?',
+    pathname: '[^?#]+?',
+    search: '[^#]+?',
+    hash: '.+?'
+  };
+
+  var PATTERN_STATE = new WeakMap();
+  /* the bytes a regular expression reads as its own, written back escaped so they stay literal */
+  var PATTERN_SPECIAL = '.*+?^$()|[]\\{}';
+
+  function patternRegExp(text, component) {
+    var out = '';
+    var names = [];
+    var i = 0;
+    while (i < text.length) {
+      var ch = text.charAt(i);
+      /* a named part, ':id', or a wildcard, '*' */
+      if (ch === ':' && /[A-Za-z_]/.test(text.charAt(i + 1) || '')) {
+        i++;
+        var name = '';
+        while (i < text.length && /[A-Za-z0-9_$]/.test(text.charAt(i))) name += text.charAt(i++);
+        names.push(name);
+        out += '(' + PATTERN_CLASS[component] + ')';
+        continue;
+      }
+      if (ch === '*') {
+        out += '(.*)';
+        names.push(names.length ? String(names.length) : '0');
+        i++;
+        continue;
+      }
+      /* a parenthesised group is a regular expression of the caller's own */
+      if (ch === '(') {
+        var depth = 1;
+        var body = '(';
+        i++;
+        while (i < text.length && depth > 0) {
+          if (text.charAt(i) === '(') depth++;
+          else if (text.charAt(i) === ')') {
+            depth--;
+            if (depth === 0) {
+              i++;
+              break;
+            }
+          }
+          body += text.charAt(i++);
+        }
+        if (depth === 0) {
+          body += ')';
+          names.push(String(names.length));
+          out += body;
+          continue;
+        }
+        out += '\\(';
+        i++;
+        continue;
+      }
+      /* an escape is the byte it names; anything else is itself, and a byte that means something
+         to a regular expression is escaped so it stays literal */
+      out += PATTERN_SPECIAL.indexOf(ch) >= 0 ? '\\' + ch : ch;
+      i++;
+    }
+    try {
+      return { re: new RegExp('^' + out + '$'), names: names };
+    } catch (badPattern) {
+      var err = new TypeError('Failed to construct URLPattern');
+      throw err;
+    }
+  }
+
+  /* the components of whatever a caller matched against: a string, or the parts of one */
+  function patternInput(input, base) {
+    if (typeof input === 'string' || input === undefined) {
+      var parsed = new (urlModule.URL)(String(input === undefined ? '' : input), base);
+      return {
+        text: input,
+        parts: {
+          protocol: parsed.protocol.slice(0, parsed.protocol.length - 1),
+          username: parsed.username,
+          password: parsed.password,
+          hostname: parsed.hostname,
+          port: parsed.port,
+          pathname: parsed.pathname,
+          search: parsed.search ? parsed.search.slice(1) : '',
+          hash: parsed.hash ? parsed.hash.slice(1) : ''
+        }
+      };
+    }
+    var parts = {};
+    for (var i = 0; i < PATTERN_COMPONENTS.length; i++) {
+      var name = PATTERN_COMPONENTS[i];
+      parts[name] = input[name] === undefined ? '' : String(input[name]);
+    }
+    return { text: input, parts: parts };
+  }
+
+  function URLPattern(input, baseURL) {
+    var patterns = {};
+    var i;
+    for (i = 0; i < PATTERN_COMPONENTS.length; i++) patterns[PATTERN_COMPONENTS[i]] = '*';
+    if (typeof input === 'string' || input === undefined) {
+      var text = input === undefined ? '' : input;
+      var parsed = new (urlModule.URL)(text, baseURL);
+      patterns.protocol = parsed.protocol.slice(0, parsed.protocol.length - 1) || '*';
+      patterns.username = parsed.username || '*';
+      patterns.password = parsed.password || '*';
+      patterns.hostname = parsed.hostname || '*';
+      patterns.port = parsed.port;
+      patterns.pathname = parsed.pathname;
+      patterns.search = parsed.search ? parsed.search.slice(1) : '*';
+      patterns.hash = parsed.hash ? parsed.hash.slice(1) : '*';
+      /* a base supplies the parts the pattern itself did not name, as it does in Node */
+      if (baseURL !== undefined) {
+        var baseParts = patternInput(baseURL, undefined).parts;
+        if (text.indexOf('://') < 0 && text.charAt(0) !== '/') {
+          if (patterns.protocol === '*') patterns.protocol = baseParts.protocol;
+          if (patterns.hostname === '*') patterns.hostname = baseParts.hostname;
+          if (patterns.port === '' && baseParts.port) patterns.port = baseParts.port;
+        }
+      }
+    } else if (input !== null && typeof input === 'object') {
+      for (i = 0; i < PATTERN_COMPONENTS.length; i++) {
+        var name = PATTERN_COMPONENTS[i];
+        if (input[name] !== undefined) patterns[name] = String(input[name]);
+      }
+      if (baseURL !== undefined) {
+        var from = patternInput(baseURL, undefined).parts;
+        for (i = 0; i < PATTERN_COMPONENTS.length; i++) {
+          var key = PATTERN_COMPONENTS[i];
+          if (input[key] === undefined && patterns[key] === '*' && from[key]) patterns[key] = from[key];
+        }
+      }
+    }
+    var compiled = {};
+    var hasRegExpGroups = false;
+    for (i = 0; i < PATTERN_COMPONENTS.length; i++) {
+      var part = PATTERN_COMPONENTS[i];
+      compiled[part] = patternRegExp(patterns[part], part);
+      if (patterns[part].indexOf('(') >= 0) hasRegExpGroups = true;
+    }
+    PATTERN_STATE.set(this, { patterns: patterns, compiled: compiled, hasRegExpGroups: hasRegExpGroups });
+  }
+
+  function patternOf(self) {
+    return PATTERN_STATE.get(self);
+  }
+
+  for (var pc = 0; pc < PATTERN_COMPONENTS.length; pc++) {
+    (function (name) {
+      Object.defineProperty(URLPattern.prototype, name, {
+        get: function () { return patternOf(this).patterns[name]; },
+        enumerable: true,
+        configurable: true
+      });
+    })(PATTERN_COMPONENTS[pc]);
+  }
+  Object.defineProperty(URLPattern.prototype, 'hasRegExpGroups', {
+    get: function () { return patternOf(this).hasRegExpGroups; },
+    enumerable: true,
+    configurable: true
+  });
+  URLPattern.prototype.exec = function (input, base) {
+    var state = patternOf(this);
+    var given = patternInput(input, base);
+    var out = { inputs: [given.text] };
+    for (var i = 0; i < PATTERN_COMPONENTS.length; i++) {
+      var name = PATTERN_COMPONENTS[i];
+      var match = state.compiled[name].re.exec(given.parts[name]);
+      if (!match) return null;
+      var groups = {};
+      for (var g = 0; g < state.compiled[name].names.length; g++) {
+        groups[state.compiled[name].names[g]] = match[g + 1] === undefined ? '' : match[g + 1];
+      }
+      out[name] = { input: given.parts[name], groups: groups };
+    }
+    return out;
+  };
+  URLPattern.prototype.test = function (input, base) {
+    var state = patternOf(this);
+    var parts = patternInput(input, base).parts;
+    for (var i = 0; i < PATTERN_COMPONENTS.length; i++) {
+      var name = PATTERN_COMPONENTS[i];
+      if (!state.compiled[name].re.test(parts[name])) return false;
+    }
+    return true;
+  };
+  /* Node's order on the prototype: the parts, then hasRegExpGroups, exec, test and constructor.
+     Deleting the constructor and putting it back is what rewrites that order. */
+  var patternCtor = Object.getOwnPropertyDescriptor(URLPattern.prototype, 'constructor');
+  if (patternCtor !== undefined) {
+    delete URLPattern.prototype.constructor;
+    Object.defineProperty(URLPattern.prototype, 'constructor', patternCtor);
+  }
+
+  var urlModule = {
     URL: URL,
     /* Node's legacy constructor, still on the module beside the WHATWG class */
-    Url: URL,
+    Url: Url,
+    URLPattern: URLPattern,
     URLSearchParams: URLSearchParams,
     domainToASCII: domainToASCII,
     domainToUnicode: domainToUnicode,
     fileURLToPath: fileURLToPath,
+    fileURLToPathBuffer: fileURLToPathBuffer,
+    format: formatUrlExport,
+    parse: parseLegacy,
     pathToFileURL: pathToFileURL,
-    urlToHttpOptions: urlToHttpOptions,
-    parse: parse,
-    resolve: resolveUrl,
-    format: formatUrl
+    resolve: resolveLegacy,
+    resolveObject: resolveObjectLegacy,
+    urlToHttpOptions: urlToHttpOptions
   };
+  return urlModule;
 };
 
 BF.crypto = function () {
