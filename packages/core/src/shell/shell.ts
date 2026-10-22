@@ -675,6 +675,12 @@ export class Shell implements IShell {
                     return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: Permission denied\n`, exitCode: 126 };
                 }
             }
+            /* A path no file answers to is not a name nothing answers to, and a host does not say
+               `command not found` for it: `/nosuch/dir/cmd` and `./nope` are both `No such file or
+               directory` with 127, the status of a command the shell could not run. */
+            if (named === undefined) {
+                return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: No such file or directory\n`, exitCode: 127 };
+            }
         }
 
         /* The message a host writes for a name no built-in, no utility and no file on PATH answers
