@@ -7,7 +7,7 @@ import { UnzipCommand } from './commands/unzip';
 import { WgetCommand } from './commands/wget';
 import { Process } from '../process';
 import { COMMANDS as TEXT_UTILS } from './commands/textutils';
-import { COMMANDS as FILE_UTILS, readable } from './commands/fileutils';
+import { COMMANDS as FILE_UTILS, readable, setCreationMode, setUmask } from './commands/fileutils';
 import { COMMANDS as ARCHIVES } from './commands/archives';
 import { COMMANDS as PROC_INFO } from './commands/procinfo';
 import {
@@ -249,6 +249,10 @@ export class Shell implements IShell {
 
     /** The context a module command is called with: the shell's directory, environment and input. */
     private moduleContext(args: string[], input: string | null): CommandContext {
+        /* The mask `umask` last set, handed to the utilities that name a mode of their own: `umask
+           077; touch f1` has to leave `-rw-------`, and the file utilities see the shell state
+           only through this context. */
+        setUmask(this.moduleFs, this.shellState.umask);
         return {
             args,
             cwd: this.shellState.cwd,
@@ -685,6 +689,10 @@ export class Shell implements IShell {
     private runShellBuiltin(command: string, args: string[], input: string | null): CommandResult {
         const fs = this.fileSystem;
         const at = (path: string): string => this.at(path);
+        /* The mask `umask` last set, for the same reason `moduleContext` hands it over: `mkdir` is
+           one of this shell's own built-ins and never sees a context, so it would otherwise give a
+           directory the mask the shell started with rather than the one the line before set. */
+        setUmask(this.moduleFs, this.shellState.umask);
         const ok = (stdout = ''): CommandResult => ({ stdout, stderr: '', exitCode: 0 });
         const fail = (stderr: string): CommandResult => ({ stdout: '', stderr, exitCode: 1 });
         try {
@@ -723,15 +731,23 @@ export class Shell implements IShell {
                     const recursive = args.includes('-p');
                     const paths = args.filter((arg) => !arg.startsWith('-'));
                     if (paths.length === 0) return fail('No directory specified');
+                    /* A directory this shell creates carries the mode the umask leaves, which is
+                       what `umask 077; mkdir d1` leaves on a host: `drwx------`. */
                     if (recursive) {
                         for (const path of paths) this.createDirectoryTree(at(path));
                     } else {
-                        for (const path of paths) fs.createDirectory(at(path));
+                        for (const path of paths) {
+                            fs.createDirectory(at(path));
+                            /* The file utilities keep their side table against the file system they
+                               are handed, which is `moduleFs` and not the one this arm writes
+                               through, so the mode has to be recorded there or `ls -l` cannot
+                               see it. */
+                            setCreationMode(this.moduleFs, at(path), true);
+                        }
                     }
                     return ok();
                 }
                 case 'rm': {
-                    if (args.length === 0) return fail('No file specified');
                     /* `-rf`, `-fr`, `-f -r` and the long forms are all the same two flags: the
                        letters of one word are read one at a time, the way rm reads them. */
                     let force = false;
@@ -744,6 +760,18 @@ export class Shell implements IShell {
                         }
                     }
                     const paths = args.filter((arg) => !arg.startsWith('-') || arg === '-');
+                    /* No operand at all is a usage error and not a missing file, with the status a
+                       host gives for one -- 64, which `echo $?` reads where a plain failure reads
+                       1. `-f` is the one flag that swallows it: `rm -f` names nothing and says
+                       nothing, which is 0 on both sides. */
+                    if (paths.length === 0) {
+                        if (force) return ok();
+                        return {
+                            stdout: '',
+                            stderr: 'usage: rm [-f | -i] [-dIPRrvWx] file ...\n       unlink [--] file\n',
+                            exitCode: 64
+                        };
+                    }
                     let stderr = '';
                     let failed = false;
                     for (const file of paths) {
@@ -812,6 +840,7 @@ export class Shell implements IShell {
             current += '/' + part;
             if (this.isDirectorySafe(current)) continue;
             this.fileSystem.createDirectory(current);
+            setCreationMode(this.moduleFs, current, true);
         }
     }
 

@@ -105,6 +105,8 @@ interface Meta {
     inodes: Map<string, number>;
     /** How many paths share an inode, which is what `link` and `ln` do. */
     nlink: Map<number, number>;
+    /** The file creation mask `umask` last set, which `mkdir` and `touch` mask a new mode with. */
+    umask: number;
     nextInode: number;
 }
 
@@ -112,9 +114,10 @@ const DEFAULT_FILE_MODE = 0o644;
 const DEFAULT_DIR_MODE = 0o755;
 const DEFAULT_OWNER: Owner = { uid: 0, gid: 0 };
 /**
- * The file creation mask a shell starts with. `chmod` needs it because a symbolic clause that
- * names no who is limited by it: `chmod +w` on a 444 file leaves 644 rather than 666, which is
- * what the host does and what a clause that ignores the mask would not.
+ * The file creation mask a shell starts with, which `umask` then moves for every file system it
+ * touches. `chmod` needs it because a symbolic clause that names no who is limited by it: `chmod +w`
+ * on a 444 file leaves 644 rather than 666, which is what the host does and what a clause that
+ * ignores the mask would not.
  */
 const UMASK = 0o022;
 
@@ -130,6 +133,7 @@ function metaOf(fs: Fs): Meta {
             atimes: new Map(),
             inodes: new Map(),
             nlink: new Map(),
+            umask: UMASK,
             nextInode: 10
         };
         METAS.set(fs as unknown as object, meta);
@@ -145,6 +149,30 @@ function modeOf(fs: Fs, path: string, isDir: boolean): number {
     // a symlink reports 755 on the host, which is what `ln -s` leaves behind
     if (meta.links.has(key)) return 0o755;
     return isDir ? DEFAULT_DIR_MODE : DEFAULT_FILE_MODE;
+}
+
+/** The file creation mask `umask` last set on this file system, which `mkdir` and `touch` mask with. */
+function umaskOf(fs: Fs): number {
+    return metaOf(fs).umask;
+}
+
+/** `umask 077`, told to the utilities that create a name so they mask the mode they give it. */
+export function setUmask(fs: Fs, mask: number): void {
+    metaOf(fs).umask = mask & 0o777;
+}
+
+const CREATE_FILE_MODE = 0o666;
+const CREATE_DIR_MODE = 0o777;
+
+/**
+ * The mode a name this shell just created carries: the mode `creat` and `mkdir` ask for -- 666 and
+ * 777, not the 644 and 755 a name ends up with under the 022 a shell starts with -- masked by the
+ * umask, which is what `umask 077; touch f1; mkdir d1` leaves behind on a host: `-rw-------` and
+ * `drwx------`, and `umask 000` leaves `-rw-rw-rw-` and `drwxrwxrwx`. Recorded on creation only,
+ * so `touch` on a name that is already there leaves its mode alone, as the host does.
+ */
+export function setCreationMode(fs: Fs, path: string, isDir: boolean): void {
+    setMode(fs, path, (isDir ? CREATE_DIR_MODE : CREATE_FILE_MODE) & ~umaskOf(fs));
 }
 
 function setMode(fs: Fs, path: string, mode: number): void {
@@ -3101,6 +3129,30 @@ function nameOfId(id: number, table: Record<string, number>): string {
     return String(id);
 }
 
+/**
+ * The user the shell runs as, when a host process is behind it: the one name a host prints in the
+ * owner column of `ls -l`, which is the name of the account that logged in. Read once, and left
+ * undefined where there is no such process -- a container in a browser has none.
+ */
+const HOST_USER: string | undefined = ((): string | undefined => {
+    const host = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+    const env = host === undefined ? undefined : host.env;
+    return env === undefined ? undefined : env.USER ?? env.LOGNAME;
+})();
+
+/**
+ * The owner column of `ls -l` for a file no `chown` touched: the user the shell runs as, which on
+ * a host is the logged-in account and never `root`. The container keeps no accounts, so the name
+ * comes from the environment first, then from the host process behind it, and `root` is what is
+ * left where neither gives one -- the name this shell has always printed.
+ */
+function ownerName(fs: Fs, path: string, env: Record<string, string>): string {
+    if (metaOf(fs).owners.has(clean(path))) return nameOfId(ownerOf(fs, path).uid, USER_NAMES);
+    const named = env.USER ?? env.LOGNAME;
+    if (named !== undefined && named !== '') return named;
+    return HOST_USER ?? 'root';
+}
+
 /** Everything `stat` can report, invented where the file system has no such thing. */
 function statInfo(ctx: CommandContext, argument: string): StatInfo | undefined {
     const path = resolveAt(ctx, argument);
@@ -3338,7 +3390,7 @@ const stat: ShellCommand = (ctx) => {
 /* --------------------------------------------------------- install / links */
 
 /** Parses an octal or symbolic mode. Symbolic clauses start from `base`, which is 0 for install. */
-function parseMode(spec: string, base: number): number | undefined {
+function parseMode(spec: string, base: number, umask: number = UMASK): number | undefined {
     if (/^[0-7]{1,4}$/.test(spec)) return Number.parseInt(spec, 8) & 0o7777;
     let mode = base;
     for (const clause of spec.split(',')) {
@@ -3367,7 +3419,7 @@ function parseMode(spec: string, base: number): number | undefined {
         }
         /* A clause that names no who applies to every class, but only to the bits the umask leaves:
            `chmod +w` on a 444 file leaves 644 and never 666, which is what the host does. */
-        if (bare) bits &= ~UMASK;
+        if (bare) bits &= ~umask;
         let mask = 0;
         if (who.indexOf('u') >= 0) mask |= bits & 0o4700;
         if (who.indexOf('g') >= 0) mask |= bits & 0o2070;
@@ -3412,7 +3464,7 @@ const install: ShellCommand = (ctx) => {
         if (word === '-d') { makeDirs = true; index++; }
         else if (word === '-m') {
             if (value === undefined) return fail('install: option requires an argument -- m\n' + INSTALL_USAGE);
-            const parsed = parseMode(value, 0);
+            const parsed = parseMode(value, 0, umaskOf(ctx.fs));
             if (parsed === undefined) return fail(`install: invalid file mode: ${value}`, 64);
             mode = parsed;
             index += 2;
@@ -3650,11 +3702,14 @@ const chmod: ShellCommand = (ctx) => {
     const words = ctx.args.slice();
     let recursive = false;
     let index = 0;
-    while (index < words.length && isOption(words[index]) && !isModeWord(words[index])) {
+    let noMoreOptions = false;
+    while (index < words.length && !noMoreOptions && isOption(words[index]) && !isModeWord(words[index])) {
         const word = words[index];
         if (word === '-R') { recursive = true; index++; }
         else if (word === '-v' || word === '-f' || word === '-h') index++;
-        else if (word === '--') { index++; break; }
+        /* `--` ends the options, so the mode behind it is the mode even where it starts with a `-`,
+           and so is a file named like one. */
+        else if (word === '--') { index++; noMoreOptions = true; }
         else return fail(`chmod: illegal option -- ${word.slice(1, 2)}\n${CHMOD_USAGE}`);
     }
     const operands = words.slice(index);
@@ -3670,8 +3725,17 @@ const chmod: ShellCommand = (ctx) => {
         const target = linkDestination(ctx.fs, path) ?? path;
         const targetStat = statOf(ctx.fs, target);
         if (targetStat === undefined) return fail(`chmod: ${file}: No such file or directory`);
-        const parsed = parseMode(spec, modeOf(ctx.fs, target, targetStat.type === 'dir'));
+        const parsed = parseMode(spec, modeOf(ctx.fs, target, targetStat.type === 'dir'), umaskOf(ctx.fs));
         if (parsed === undefined) return fail(`chmod: Invalid file mode: ${spec}`);
+        /* The set-group-ID bit is the one the host's file system refuses outright, for a file and
+           for a directory alike: `chmod 2755 b` is `chmod: Unable to change file mode on b:
+           Operation not permitted` with status 1 and the mode it had, where the container used to
+           answer 0 and render `-rwxr-sr-x`. A package reads that status, so the refusal is what a
+           differential across the two can only call a match. `chmod g-s`, which lands on a mode
+           with no such bit, is still allowed -- the host allows it too. */
+        if ((parsed & 0o2000) !== 0) {
+            return fail(`chmod: Unable to change file mode on ${file}: Operation not permitted\n`);
+        }
         const targets: string[] = [target];
         if (recursive && targetStat.type === 'dir') {
             for (const entry of walkRoot(ctx.fs, target, target, Number.MAX_SAFE_INTEGER).entries) targets.push(entry.path);
@@ -3684,7 +3748,8 @@ const chmod: ShellCommand = (ctx) => {
 /* ------------------------------------------------------------------- touch */
 
 const TOUCH_USAGE =
-    'usage: touch [-A [-][[hh]mm]SS] [-achm] [-r file] [-t [[CC]YY]MMDDhhmm[.SS]] file ...\n';
+    'usage: touch [-A [-][[hh]mm]SS] [-achm] [-r file] [-t [[CC]YY]MMDDhhmm[.SS]]\n' +
+    '       [-d YYYY-MM-DDThh:mm:SS[.frac][tz]] file ...\n';
 
 /** The mtime `touch -t [[CC]YY]MMDDhhmm[.SS]` names, read on the local clock as the host reads it. */
 function parseTouchStamp(spec: string): number | undefined {
@@ -3711,8 +3776,11 @@ function parseTouchStamp(spec: string): number | undefined {
     const hour = Number(rest.slice(4, 6));
     const minute = Number(rest.slice(6, 8));
     const second = seconds === '' ? 0 : Number(seconds);
-    if (month < 1 || month > 12 || day < 1 || day > 31) return undefined;
-    if (hour > 23 || minute > 59 || second > 60) return undefined;
+    /* A field out of range is rolled into the field above it rather than refused: `touch -t
+       202013010000 f` is Jan 1 2021, `202000010000` is Dec 1 2019 and `202001320000` is Feb 1
+       2020, which is one `new Date` with a month of 12, of -1 or a day of 32 away. The host reads
+       the stamp the same loose way, so the only thing worth refusing is a shape that is not a
+       stamp at all, which the digit test above has already done. */
     return new Date(year, month - 1, day, hour, minute, second, 0).getTime();
 }
 
@@ -3748,42 +3816,57 @@ const touch: ShellCommand = (ctx) => {
     let stampMs: number | undefined;
     let reference: string | undefined;
     /* `-a` moves the access time and `-m` the modification time; named together they move both, and
-       named not at all `touch` moves both, which is why the one named has to clear the other. */
-    let moveAtime = true;
-    let moveMtime = true;
+       named not at all `touch` moves both. Which of the two was asked for is gathered from every
+       word before it is applied, because one word can carry both letters: `touch -am f` is 0 on
+       the host and moves both times, not the last letter it read. */
+    let askedAtime = false;
+    let askedMtime = false;
     const operands: string[] = [];
     let index = 0;
+    let noMoreOptions = false;
     while (index < words.length) {
         const word = words[index];
         const value = words[index + 1];
-        if (word === '-c' || word === '--no-create') { noCreate = true; index++; }
-        else if (word === '-a') { moveAtime = true; moveMtime = false; index++; }
-        else if (word === '-m') { moveMtime = true; moveAtime = false; index++; }
-        else if (word === '-A') index += 2;
-        else if (word === '-r') {
-            if (value === undefined) return fail(`touch: option requires an argument -- r\n${TOUCH_USAGE}`);
-            reference = value;
-            index += 2;
-        } else if (word === '-d') {
-            if (value === undefined) return fail(`touch: option requires an argument -- d\n${TOUCH_USAGE}`);
-            const parsed = parseTouchDate(value);
-            if (parsed === undefined) {
-                return fail(`touch: out of range or illegal time specification: YYYY-MM-DDThh:mm:SS[.frac][tz]`);
+        /* `--` ends the options: a name behind it is an operand even where it starts with a `-`,
+           which is the only way to name the file `-f`. */
+        if (word === '--') { noMoreOptions = true; index++; continue; }
+        if (noMoreOptions || !isOption(word)) { operands.push(word); index++; continue; }
+        if (word === '--no-create') { noCreate = true; index++; continue; }
+        /* Every letter of the word, so `-am` is `-a` and `-m` and `-cm` is `-c` and `-m`. A letter
+           that takes an argument has to be the last one, because the argument is the next word. */
+        const letters = word.slice(1).split('');
+        for (let at = 0; at < letters.length; at++) {
+            const letter = letters[at];
+            if (letter === 'a') { askedAtime = true; continue; }
+            if (letter === 'm') { askedMtime = true; continue; }
+            if (letter === 'c') { noCreate = true; continue; }
+            /* `touch -h` does not follow a link, and nothing here follows one. */
+            if (letter === 'h') continue;
+            if (at !== letters.length - 1) return fail(`touch: illegal option -- ${letter}\n${TOUCH_USAGE}`);
+            if (letter === 'A') { index++; break; }
+            if (letter === 'r' || letter === 'd' || letter === 't') {
+                if (value === undefined) return fail(`touch: option requires an argument -- ${letter}\n${TOUCH_USAGE}`);
+                if (letter === 'r') reference = value;
+                else {
+                    const parsed = letter === 'd' ? parseTouchDate(value) : parseTouchStamp(value);
+                    if (parsed === undefined) {
+                        const shape = letter === 'd'
+                            ? 'YYYY-MM-DDThh:mm:SS[.frac][tz]'
+                            : '[[CC]YY]MMDDhhmm[.SS]';
+                        return fail(`touch: out of range or illegal time specification: ${shape}\n${TOUCH_USAGE}`);
+                    }
+                    stampMs = parsed;
+                }
+                index++;
+                break;
             }
-            stampMs = parsed;
-            index += 2;
-        } else if (word === '-t') {
-            if (value === undefined) return fail(`touch: option requires an argument -- t\n${TOUCH_USAGE}`);
-            const parsed = parseTouchStamp(value);
-            if (parsed === undefined) {
-                return fail(`touch: out of range or illegal time specification: [[CC]YY]MMDDhhmm[.SS]\n${TOUCH_USAGE}`);
-            }
-            stampMs = parsed;
-            index += 2;
-        } else if (word === '--') index++;
-        else if (isOption(word)) return fail(`touch: illegal option -- ${word.slice(1, 2)}\n${TOUCH_USAGE}`);
-        else { operands.push(word); index++; }
+            return fail(`touch: illegal option -- ${letter}\n${TOUCH_USAGE}`);
+        }
+        /* One word, whether it was an option or the argument behind one. */
+        index++;
     }
+    const moveAtime = askedAtime || !askedMtime;
+    const moveMtime = askedMtime || !askedAtime;
     if (operands.length === 0) return fail(TOUCH_USAGE);
     if (stampMs === undefined && reference !== undefined) {
         const ref = statOf(ctx.fs, resolveAt(ctx, reference));
@@ -3812,6 +3895,9 @@ const touch: ShellCommand = (ctx) => {
                 exitCode = 1;
                 continue;
             }
+            /* A name it just created carries the mode the umask leaves, which is what `umask 077;
+               touch f1` leaves on a host. One that was already there keeps the mode it had. */
+            setCreationMode(ctx.fs, path, false);
         }
         if (moveMtime) setMtime(ctx.fs, path, wanted);
         /* The file system carries no access time, so the one `-a` set lives in the side table:
@@ -3901,7 +3987,7 @@ interface LsRow {
 }
 
 /** One line of `ls -l`: the mode, owner and size the side table and the file system agree on. */
-function lsRow(fs: Fs, path: string, name: string, now: number): LsRow {
+function lsRow(fs: Fs, path: string, name: string, now: number, env: Record<string, string>): LsRow {
     const stat = statOf(fs, path);
     const isLink = isSymlink(fs, path);
     const isDirectory = !isLink && stat !== undefined && stat.type === 'dir';
@@ -3923,7 +4009,7 @@ function lsRow(fs: Fs, path: string, name: string, now: number): LsRow {
         name,
         perms: permissionString(mode, isDirectory ? 'dir' : isLink ? 'link' : 'file'),
         links: String(links),
-        user: nameOfId(owner.uid, USER_NAMES),
+        user: ownerName(fs, path, env),
         group: nameOfId(owner.gid, GROUP_NAMES),
         uid: owner.uid,
         gid: owner.gid,
@@ -4120,7 +4206,7 @@ const ls: ShellCommand = (ctx) => {
     const rowsOf = (path: string, names: string[]): LsRow[] =>
         names.map((name) => {
             const child = name === '.' ? path : name === '..' ? parentOf(path) : joinPath(path, name);
-            return lsRow(ctx.fs, child, name, now);
+            return lsRow(ctx.fs, child, name, now, ctx.env);
         });
 
     const dirChunks: string[] = [];
@@ -4162,7 +4248,7 @@ const ls: ShellCommand = (ctx) => {
             walk(path, target, targets.length > 1);
             continue;
         }
-        files.push(lsRow(ctx.fs, path, target, now));
+        files.push(lsRow(ctx.fs, path, target, now, ctx.env));
     }
     /* One blank line between the groups, which is what separates two operands on the host. */
     const chunks: string[] = [];
