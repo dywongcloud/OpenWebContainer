@@ -1,0 +1,7 @@
+id: owc-shell-cat-directory
+subject: '`cat` on a directory prints `{}` and succeeds where a host names it and fails'
+description: 'Measured 2026-10-23, differential against this machine''s /bin/sh (bash 3.2.57), live container at local HEAD 91e46e7. `mkdir sd; cat sd; echo rc=$?` is host stdout "rc=1\n" stderr "cat: sd: Is a directory", container stdout "{}\nrc=0\n" and no stderr -- a directory read as a file yields the empty object rather than the diagnostic, and the status the read ended with is 0. Fix site: the `cat` builtin in packages/core/src/shell/commands/fileutils.ts.'
+owner: lanmower
+session_id: adv3-judge-shell-fd-3
+witness_plan: 'Run `mkdir sd; cat sd; echo rc=$?` on both sides; stderr must hold `cat: sd: Is a directory` and the status 1.'
+status: pending
