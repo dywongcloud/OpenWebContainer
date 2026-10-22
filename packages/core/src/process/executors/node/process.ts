@@ -296,7 +296,8 @@ export class NodeProcess extends Process {
     private idleWaiter?: () => void;
     private exitRequested?: number;
     private fatalError?: unknown;
-    private lastResolveError?: Error;
+    /** The last resolve failure, with the Node code the error it becomes is raised under. */
+    private lastResolveError?: Error & { code?: string };
     private stopped = false;
     private capabilityContext: CapabilityContext;
     /** Set for a run inside a capability call (runToCompletionSync): timers and host operations are stepped there. */
@@ -791,9 +792,39 @@ export class NodeProcess extends Process {
         bindVmRuntime(this.capabilityContext, runtime, context, api);
         armVmBudget(this.capabilityContext, this.guestBudgetMs);
         this.builtinNames = new Set<string>(JSON.parse(this.callApiString('builtinNames')));
+        /* Node 22.12 and later report require_module in process.features where require() loads an
+           ES module, which this loader does. Set on the guest's own object, so it is there before
+           any entry runs -- a file, a -e script or a REPL line alike. */
+        this.setGuestFeature('require_module', true);
         // a parent that wrote before this guest existed is answered now, before the entry runs
         this.flushStdin();
         return entryPath;
+    }
+
+    /**
+     * Sets one flag of the guest's `process.features`, leaving any flag already there alone. A
+     * guest with no process object -- one that failed to boot -- keeps the features it has.
+     */
+    private setGuestFeature(key: string, value: boolean): void {
+        const context = this.context;
+        if (context === undefined) return;
+        try {
+            const process = context.getProp(context.global, 'process');
+            try {
+                const features = context.getProp(process, 'features');
+                try {
+                    if (context.typeof(features) !== 'object') return;
+                    const flag = value ? context.true : context.false;
+                    context.setProp(features, key, flag);
+                } finally {
+                    features.dispose();
+                }
+            } finally {
+                process.dispose();
+            }
+        } catch {
+            // a handle already gone, or a features object that takes no property
+        }
     }
 
     /**
@@ -1440,10 +1471,15 @@ export class NodeProcess extends Process {
         return new GuestFailure(message);
     }
 
-    private loadModule(moduleName: string): { value: string } | { error: Error } {
+    private loadModule(moduleName: string): { value: string } | { error: Error | QuickJSHandle } {
         if (moduleName === '') {
-            // QuickJS loads an empty name only after the normalizer failed; surface that failure
-            return { error: this.lastResolveError ?? new Error('Cannot resolve module') };
+            /* QuickJS loads an empty name only after the normalizer failed, and the error the
+               normalizer raised is not the one that surfaces: this one is. It is built in the
+               guest for the same reason the normalizer's is, so the code reaches user code. */
+            const failure = this.lastResolveError;
+            if (failure === undefined) return { error: new Error('Cannot resolve module') };
+            const code = failure.code;
+            return { error: code === undefined ? failure : this.resolveErrorHandle(failure.message, code) };
         }
         try {
             if (moduleName.startsWith('builtin:')) {
@@ -1521,7 +1557,7 @@ export class NodeProcess extends Process {
     }
 
     /** Maps a specifier to the module name QuickJS will load (a plain string on success). */
-    private normalizeModule(baseName: string | undefined, requestedName: string): string | { error: Error } {
+    private normalizeModule(baseName: string | undefined, requestedName: string): string | { error: Error | QuickJSHandle } {
         const missingAttribute = requestedName.endsWith(MISSING_ATTRIBUTE_MARK);
         const spec = missingAttribute ? requestedName.slice(0, -MISSING_ATTRIBUTE_MARK.length) : requestedName;
         if (spec.startsWith(ERROR_MODULE_PREFIX)) return spec;
@@ -1542,11 +1578,9 @@ export class NodeProcess extends Process {
                ERR_PACKAGE_PATH_NOT_EXPORTED, which user code branches on. */
             if (detail.kind === 'not-exported') {
                 const where = baseName ? ` imported from ${baseName}` : '';
-                this.lastResolveError = Object.assign(new Error(
-                    `Package subpath '${detail.subpath}' is not defined by "exports" in ${joinPaths(detail.packageDir, 'package.json')}${where}`
-                ), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' });
+                const message = `Package subpath '${detail.subpath}' is not defined by "exports" in ${joinPaths(detail.packageDir, 'package.json')}${where}`;
                 this.setImportFailureCode('ERR_PACKAGE_PATH_NOT_EXPORTED');
-                return { error: this.lastResolveError };
+                return { error: this.resolveErrorHandle(message, 'ERR_PACKAGE_PATH_NOT_EXPORTED') };
             }
             /* A `#name` no "imports" map defines is ERR_PACKAGE_IMPORT_NOT_DEFINED in Node, naming
                the package.json that would have defined it; and a `file:` URL no loader can read is
@@ -1562,6 +1596,13 @@ export class NodeProcess extends Process {
                     ctor: isImport ? 'TypeError' : detail.ctor,
                     message,
                 }));
+            }
+            /* An "exports" target that names a directory: Node refuses the import outright rather
+               than reading an index out of it, and names the directory the map pointed at. */
+            if (detail.kind === 'dir-target') {
+                const message = `Directory import '${detail.dir}' is not supported resolving ES modules imported from ${baseName}`;
+                this.setImportFailureCode('ERR_UNSUPPORTED_DIR_IMPORT');
+                return { error: this.resolveErrorHandle(message, 'ERR_UNSUPPORTED_DIR_IMPORT') };
             }
             const scheme = unsupportedScheme(spec);
             // Node reports a specifier no loader can read as an unsupported scheme, one that names a
@@ -1586,9 +1627,8 @@ export class NodeProcess extends Process {
                 : scheme === undefined
                     ? `${named}${baseName ? ` imported from ${baseName}` : ''}`
                     : `Only URLs with a scheme in: file, data, and node are supported by the default ESM loader. Received protocol '${scheme}'`;
-            this.lastResolveError = Object.assign(new Error(message), { code });
             this.setImportFailureCode(code);
-            return { error: this.lastResolveError };
+            return { error: this.resolveErrorHandle(message, code) };
         }
         const found = detail.file;
         if (missingAttribute) {
@@ -1657,6 +1697,36 @@ export class NodeProcess extends Process {
             value.dispose();
         } catch {
             // a guest that is already gone cannot carry the code; the message still reports it
+        }
+    }
+
+    /**
+     * The error the engine raises for a specifier it cannot resolve, built *inside* the guest.
+     *
+     * `quickjs-emscripten` rebuilds a host `Error` it is handed as a fresh engine Error and keeps
+     * only its message, so a `code` set on a host Error never reaches the user code that branches
+     * on it -- which is every package that tests `err.code === 'ERR_MODULE_NOT_FOUND'`. A guest
+     * handle is thrown exactly as it stands, code and all, and it is the answer for both loaders:
+     * an ES module's dynamic import restores a lost code through a wrapper the source carries, but
+     * a CommonJS module's is plain compiled code with no wrapper in it, so the code has to ride on
+     * the error itself.
+     */
+    private resolveErrorHandle(message: string, code: string): QuickJSHandle | Error {
+        this.lastResolveError = Object.assign(new Error(message), { code });
+        const context = this.context;
+        if (context === undefined) return this.lastResolveError;
+        try {
+            const error = context.newError(message);
+            const codeHandle = context.newString(code);
+            try {
+                context.setProp(error, 'code', codeHandle);
+            } finally {
+                codeHandle.dispose();
+            }
+            return error;
+        } catch {
+            // a context already gone cannot hold the handle; the message is still reported
+            return this.lastResolveError;
         }
     }
 
