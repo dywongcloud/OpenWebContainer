@@ -584,6 +584,15 @@ export const SRC = String.raw`
     var exp = { active: null };
 
     /*
+     * The stack of entered domains, outermost first, as Node exposes it: domain._stack is the
+     * array enter pushes onto and exit splices, so it is two deep inside a run nested in a
+     * run and empty again once both have returned, and it is an enumerable own key of the
+     * module -- Object.keys of it is Domain, _stack, active, create, createDomain on host
+     * node 24.15, and was four names here with _stack the one missing.
+     */
+    Object.defineProperty(exp, '_stack', { get: function () { return stack; }, configurable: true, enumerable: true });
+
+    /*
      * A promise reaction registered while a domain is active runs inside it, as it does in Node.
      * Node binds promises through the promise hooks of async_hooks; this is the same binding at
      * the one place a reaction is registered, so domain.active -- and process.domain, which
