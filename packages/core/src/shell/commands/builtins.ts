@@ -3216,9 +3216,10 @@ function runCompoundRedirected(state: ShellState, command: Command, input: strin
     if (!needsInput && !needsOutput) return body();
     const savedBuffer = state.inputBuffer;
     const savedCursor = state.inputCursor;
+    const given = plan.inputFd !== undefined ? readFdAt(state, plan.inputFd) : '';
     if (needsInput) {
         state.inputBuffer = fromFile
-            ? readInputFile(state, plan.inputFile as string)
+            ? (plan.inputFd !== undefined ? given : readInputFile(state, plan.inputFile as string))
             : plan.inputText ?? (input as string);
         state.inputCursor = 0;
     }
@@ -3229,6 +3230,12 @@ function runCompoundRedirected(state: ShellState, command: Command, input: strin
         status = body();
     } finally {
         const captured = state.io;
+        /* What the construct read out of a descriptor it was handed: a `read` inside it took its
+           line through the cursor, and every command that reads in one go took the rest. */
+        const offset = plan.inputFd?.read;
+        if (offset !== undefined && needsInput) {
+            offset.pos += state.inputCursor > 0 && state.inputCursor <= given.length ? state.inputCursor : given.length;
+        }
         state.io = savedIo;
         if (needsInput) {
             state.inputBuffer = savedBuffer;
@@ -3402,6 +3409,13 @@ interface RedirectPlan {
     /** The input a here-string wrote: text already read, never the name of a file to open. */
     inputText?: string;
     /**
+     * The descriptor this command reads its standard input through -- one `exec 3<f` left open, or
+     * one this command's own redirections opened -- where `inputFile` only ever named the file. It
+     * is the descriptor and not the name because a read through it starts at the offset the reads
+     * before it left, and moves it: `cat <&3` twice is the file once.
+     */
+    inputFd?: StreamTarget;
+    /**
      * Descriptors above 2 a redirection opened for this one command: `cmd 3>f` creates `f` and
      * leaves it empty -- the command's own output still goes where it went -- and `exec 3>f` is
      * the one that keeps the descriptor open for the commands behind it.
@@ -3424,7 +3438,20 @@ interface RedirectPlan {
  * file opened for writing (`append` once a write through it has moved its offset) or for reading,
  * or nothing at all because it was closed.
  */
-type StreamTarget = { kind: 'out' | 'err' | 'file' | 'null' | 'input'; file?: string; append?: boolean };
+type StreamTarget = { kind: 'out' | 'err' | 'file' | 'null' | 'input'; file?: string; append?: boolean; read?: ReadOffset };
+
+/**
+ * The offset a descriptor opened for reading carries through the file it holds: how far into that
+ * file the reads made through the descriptor have gone. `exec 3<f` opens `f` and leaves `3` at its
+ * first byte, and every read through `3` moves the offset on -- so `cat <&3` twice is `f` then
+ * nothing, and `read x <&3; read y <&3` is the first line then the second, as they are on a host.
+ *
+ * One offset is shared by every descriptor that duplicates the same open file -- `exec 4<&3` puts
+ * `4` on the offset `3` has, not on a second one of its own, so `cat <&4` is what `cat <&3` behind
+ * it does not read again -- which is why it is a box a `{ ...entry }` copy carries with it rather
+ * than a number: `exec 3<f` a second time opens `f` again and is a fresh offset of its own.
+ */
+interface ReadOffset { pos: number }
 
 /**
  * Where `n>&m`, `n<&m` and `n>&-` point: the destination the named descriptor has *now*, the
@@ -3537,7 +3564,11 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
                the shell's own input from here on: `exec 0<f; cat` prints `f`, and `read l` reads
                its first line, as they do on a host. */
             if (fd === 0 && entry.kind === 'input' && entry.file !== undefined) {
-                state.inputBuffer = readInputFile(state, entry.file);
+                /* A descriptor put on the standard input is one the shell itself reads from, and it
+                   reads from the offset that descriptor has -- `exec 3<f; cat <&3; exec 0<&3; cat`
+                   prints nothing the second time, where the `3` the first `cat` read to the end of
+                   left nothing behind it for the shell to read. */
+                state.inputBuffer = readFdAt(state, entry);
                 state.inputCursor = 0;
             }
         }
@@ -3552,8 +3583,12 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
             case '<':
                 /* A descriptor opened for reading: `exec 3<f; cat <&3` reads `f`, and the standard
                    input itself is the file from here on -- `exec 0<f; cat` prints `f`, which is what
-                   a host's `exec 0<f` leaves behind it. */
-                if (redirect.fd === 0 || redirect.fd >= 3) setFd(redirect.fd, { kind: 'input', file: target });
+                   a host's `exec 0<f` leaves behind it. Every `<` is a new open of the file, so it
+                   starts at its first byte again even where the descriptor held it before:
+                   `exec 3<f` twice is `f` read from the beginning, as it is on a host. */
+                if (redirect.fd === 0 || redirect.fd >= 3) {
+                    setFd(redirect.fd, { kind: 'input', file: target, read: { pos: 0 } });
+                }
                 break;
             case '>&':
             case '<&': {
@@ -3623,8 +3658,10 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
                 break;
             case '<':
                 /* A descriptor above 2 opened for reading is one only `>&n` and `<&n` name: `cat
-                   3<f` reads the shell's own input, not `f`, as it does on a host. */
-                if (redirect.fd >= 3) plan.fds.set(redirect.fd, { kind: 'input', file: target });
+                   3<f` reads the shell's own input, not `f`, as it does on a host. The open is this
+                   command's own, so it starts at the first byte of `f`, whatever a descriptor `exec`
+                   opened on the same file has read of it. */
+                if (redirect.fd >= 3) plan.fds.set(redirect.fd, { kind: 'input', file: target, read: { pos: 0 } });
                 else plan.inputFile = target;
                 break;
             case '<<<':
@@ -3669,7 +3706,14 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
                         break;
                     }
                     if (redirect.fd >= 3) plan.fds.set(redirect.fd, { ...opened });
-                    else if (opened.kind === 'file' || opened.kind === 'input') plan.inputFile = opened.file;
+                    else if (opened.kind === 'file' || opened.kind === 'input') {
+                        plan.inputFile = opened.file;
+                        /* What the command reads is the file *from the offset this descriptor has*,
+                           not the file from its first byte: `exec 3<f; cat <&3; cat <&3` is `f` and
+                           then nothing, and the second `cat` has to move the offset too, so the
+                           descriptor itself is what the plan keeps. */
+                        plan.inputFd = opened;
+                    }
                     else if (opened.kind === 'null') plan.inputFile = NULL_DEVICE;
                     break;
                 }
@@ -3699,6 +3743,81 @@ function readInputFile(state: ShellState, file: string): string {
     const path = resolvePath(state, file);
     if (path === NULL_DEVICE) return '';
     return fs.readFile(path) ?? '';
+}
+
+/**
+ * What a command reads through a descriptor it was handed with `<&3`: the file that descriptor
+ * holds from the offset the reads through it have reached, so a second read through it reads what
+ * the first left behind it -- which is nothing at all once a `cat` has been to the end of the file.
+ */
+function readFdAt(state: ShellState, target: StreamTarget): string {
+    const text = readInputFile(state, target.file ?? '');
+    const offset = target.read;
+    if (offset === undefined) return text;
+    return offset.pos >= text.length ? '' : text.slice(offset.pos);
+}
+
+/**
+ * The commands that take their standard input, and so move the offset of a descriptor they were
+ * handed with `<&3`. A command that never reads -- `echo hi <&3` -- leaves the descriptor exactly
+ * where it was, as it does on a host, and so does one whose operands name the files it reads.
+ */
+const STDIN_READERS = new Set([
+    'awk', 'base32', 'base64', 'cat', 'comm', 'cut', 'dd', 'diff', 'fmt', 'grep', 'head', 'join',
+    'mapfile', 'nl', 'paste', 'pr', 'read', 'readarray', 'sed', 'sort', 'split', 'tabs', 'tac',
+    'tail', 'tr', 'unexpand', 'uniq', 'wc', 'xargs', 'xxd'
+]);
+
+/** True when `head` reads its standard input: no operand but the `-` that names it is a file. */
+function headReadsStdin(args: string[]): boolean {
+    let value = false;
+    for (const arg of args) {
+        if (value) {
+            value = false;
+            continue;
+        }
+        if (arg === '-n' || arg === '-c') {
+            value = true;
+            continue;
+        }
+        if (arg.startsWith('-')) continue;
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Moves the offset of the descriptor a command read through, by what the command took from it: the
+ * commands that read to the end of a file leave it at the end -- `cat <&3` twice is the file once --
+ * and the two that read a part of one and leave the rest, `read` and `head`, leave it behind the
+ * last byte they took: `read x <&3; read y <&3` is the first line and then the second, and
+ * `head -1 <&3` twice is the first line and then the second, as they are on a host. The command's
+ * own name and words are what says how much it took: one that never reads its standard input --
+ * `echo hi <&3` -- leaves the descriptor where it was, and `head` leaves it behind what it wrote.
+ */
+function advanceReadFd(
+    state: ShellState,
+    plan: RedirectPlan,
+    name: string,
+    args: string[],
+    stdout: string,
+    given: string
+): void {
+    const offset = plan.inputFd?.read;
+    if (offset === undefined) return;
+    if (!STDIN_READERS.has(name)) return;
+    if (state.inputCursor > 0 && state.inputCursor <= given.length) {
+        offset.pos += state.inputCursor;
+        return;
+    }
+    /* `head` writes exactly the bytes it took and puts the rest back, so what it wrote is what it
+       read: `head -1 <&3` leaves the offset behind the first line, which is where a host's own
+       `head` leaves it after it seeks back over the tail of the buffer it read. */
+    if (name === 'head' && headReadsStdin(args) && stdout !== '' && given.startsWith(stdout)) {
+        offset.pos += stdout.length;
+        return;
+    }
+    offset.pos += given.length;
 }
 
 function writeOutputFile(state: ShellState, file: string, text: string, append: boolean): void {
@@ -3875,6 +3994,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     const plan = planRedirects(state, command.redirects);
     const commandInput = plan.inputText !== undefined
         ? plan.inputText
+        : plan.inputFd !== undefined ? readFdAt(state, plan.inputFd)
         : plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
     /**
      * What a command with no input of its own reads: the rest of the input of the compound command
@@ -3997,12 +4117,16 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
                 }
                 result = { stdout: '', stderr: `${errorMessage(error)}\n`, exitCode: 1 };
             }
+            /* What the built-in read through a descriptor it was handed -- `read x <&3` -- is what
+               the descriptor's own offset moves by, so the line behind it reads on from there. */
+            advanceReadFd(state, plan, name, args, result.stdout, commandInput ?? '');
             for (const entry of pending) setVar(state, entry.name, entry.value);
             syncPwd(state);
             return finish(state, plan, result.stdout, result.stderr, result.exitCode, name);
         }
 
         const step = RUNNER(state, words, stdin);
+        advanceReadFd(state, plan, name, args, step.stdout, commandInput ?? '');
         for (const entry of pending) setVar(state, entry.name, entry.value);
         syncPwd(state);
         return finish(state, plan, step.stdout, step.stderr, step.exitCode, name);
