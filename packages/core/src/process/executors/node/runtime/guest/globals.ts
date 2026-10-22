@@ -409,6 +409,16 @@ proc.kill = function (pid, signal) {
     throw esrchFor(pid);
   }
   if (num === proc.pid) {
+    /* A signal a listener was registered for reaches that listener: Node delivers it and leaves the
+       process running, and only a name nothing listens for ends the process with 128 + its number.
+       SIGKILL and SIGSTOP are the two a listener cannot be registered for, so they end it whatever
+       is on the process. Delivery is a turn of the loop later, as it is on the host -- the line
+       written straight after the kill still runs before the handler does. */
+    if (name !== 'SIGKILL' && name !== 'SIGSTOP' && proc.listenerCount(name) > 0) {
+      var delivered = name;
+      setTimeout(function () { proc.emit(delivered); }, 0);
+      return true;
+    }
     proc.exit(128 + (LETHAL_SIGNALS[name] === undefined ? 15 : LETHAL_SIGNALS[name]));
     return true;
   }
@@ -722,16 +732,18 @@ function stdioOf(which, build) {
 }
 function stdioSlot(name, build) {
     var held = null;
+    /* Enumerable, as a host's are: 'Object.keys(process)' lists stdout, stdin and stderr. */
     Object.defineProperty(proc, name, {
         configurable: true,
+        enumerable: true,
         get: function () {
             held = stdioOf(held, build);
-            if (stdioChainLinked) Object.defineProperty(proc, name, { value: held, configurable: true, writable: true });
+            if (stdioChainLinked) Object.defineProperty(proc, name, { value: held, configurable: true, writable: true, enumerable: true });
             return held;
         },
         set: function (value) {
             held = value;
-            Object.defineProperty(proc, name, { value: held, configurable: true, writable: true });
+            Object.defineProperty(proc, name, { value: held, configurable: true, writable: true, enumerable: true });
         }
     });
 }
@@ -800,9 +812,10 @@ function stdinOf() {
 }
 Object.defineProperty(proc, 'stdin', {
   configurable: true,
+  enumerable: true,
   get: function () {
     var input = stdinOf();
-    Object.defineProperty(proc, 'stdin', { value: input, configurable: true, writable: true });
+    Object.defineProperty(proc, 'stdin', { value: input, configurable: true, writable: true, enumerable: true });
     return input;
   }
 });
@@ -2390,6 +2403,580 @@ function circularStructureText(value, replacer) {
   Object.defineProperty(stringify, 'name', { value: 'stringify', configurable: true });
   Object.defineProperty(stringify, 'length', { value: 3, configurable: true });
   JSON.stringify = stringify;
+})();
+
+/*
+ * Node's own global surface, in the two ways this container diverged from it.
+ *
+ * Which names a walk of the global object sees. Node defines 'Blob', 'Buffer', 'URL', 'console',
+ * 'process' and the rest of what it puts there as *non-enumerable* properties, so
+ * 'Object.keys(globalThis)' is fifteen names long and none of them are any of those; this file
+ * assigned them, so a walk saw twenty-seven and an internal name besides.
+ *
+ * Which names exist at all. Node 24 has a 'navigator', a 'Performance' family, the classes behind
+ * 'crypto', the two compression streams and the explicit-resource-management trio; this container
+ * had none of them, and it had 'InternalError', which QuickJS has and no V8 does.
+ */
+(function installGlobalSurface() {
+  function hide(name) {
+    var desc = Object.getOwnPropertyDescriptor(globalThis, name);
+    if (desc === undefined || desc.enumerable === false) return;
+    var next = { configurable: desc.configurable !== false, enumerable: false };
+    if (desc.get !== undefined || desc.set !== undefined) {
+      next.get = desc.get;
+      next.set = desc.set;
+    } else {
+      next.value = desc.value;
+      next.writable = desc.writable !== false;
+    }
+    Object.defineProperty(globalThis, name, next);
+  }
+  ['__owcErrname', 'AbortController', 'AbortSignal', 'Blob', 'Buffer', 'CloseEvent', 'File',
+    'TextDecoder', 'TextEncoder', 'URL', 'URLSearchParams', 'console', 'process'].forEach(hide);
+  /* InternalError is QuickJS's and no V8 has one, so a guest that asks for it here is answered
+     the way a host answers: with nothing at all. */
+  try { delete globalThis.InternalError; } catch (ignored) { /* an engine that will not give it up */ }
+
+  /*
+   * 'navigator': node 24's own, which is a 'Navigator' answering four questions -- how many cores,
+   * which language, which platform, and what it calls itself -- and nothing else. There is no
+   * 'onLine', no 'clipboard', no 'geolocation' and no 'userAgentData' in node's, so there is none
+   * here. The properties read on the prototype the way node's do, so 'Object.keys(navigator)' is
+   * empty on both sides.
+   */
+  function Navigator() {
+    throw new TypeError('Illegal constructor');
+  }
+  var NAV_PLATFORM = proc.platform === 'darwin' ? 'MacIntel'
+    : proc.platform === 'win32' ? 'Win32'
+      : proc.platform === 'linux' ? (proc.arch === 'arm64' ? 'Linux arm64' : 'Linux x86_64')
+        : proc.platform;
+  function navProp(name, read) {
+    Object.defineProperty(Navigator.prototype, name, { get: read, configurable: true, enumerable: true });
+  }
+  navProp('hardwareConcurrency', function () { return requireBuiltin('os').cpus().length; });
+  navProp('language', function () { return 'en-US'; });
+  navProp('languages', function () { return Object.freeze(['en-US']); });
+  navProp('platform', function () { return NAV_PLATFORM; });
+  navProp('userAgent', function () { return 'Node.js/' + String(proc.versions.node).split('.')[0]; });
+  Object.defineProperty(Navigator.prototype, Symbol.toStringTag, { value: 'Navigator', configurable: true });
+  Object.defineProperty(Navigator.prototype, 'constructor', { value: Navigator, writable: true, configurable: true });
+  globalThis.Navigator = Navigator;
+  Object.defineProperty(globalThis, 'navigator', { value: Object.create(Navigator.prototype), writable: true, configurable: true, enumerable: true });
+
+  /*
+   * The 'Performance' family, on the clock the rest of this file already keeps: 'performance' is a
+   * 'Performance' instance holding a buffer of marks and measures, so 'mark', 'measure' and the
+   * three 'getEntries*' answer what a host's answer. An observer is accepted and records nothing --
+   * nothing here samples the loop, so there is nothing for it to observe.
+   */
+  function PerformanceEntry(name, entryType, startTime, duration) {
+    this.name = name;
+    this.entryType = entryType;
+    this.startTime = startTime;
+    this.duration = duration;
+  }
+  PerformanceEntry.prototype.toJSON = function () {
+    return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
+  };
+  Object.defineProperty(PerformanceEntry.prototype, 'constructor', { value: PerformanceEntry, writable: true, configurable: true });
+  Object.defineProperty(PerformanceEntry.prototype, Symbol.toStringTag, { value: 'PerformanceEntry', configurable: true });
+  function entrySubclass(tag) {
+    function Sub(name, entryType, startTime, duration) {
+      PerformanceEntry.call(this, name, entryType, startTime, duration);
+    }
+    Sub.prototype = Object.create(PerformanceEntry.prototype);
+    Object.defineProperty(Sub.prototype, 'constructor', { value: Sub, writable: true, configurable: true });
+    Object.defineProperty(Sub.prototype, Symbol.toStringTag, { value: tag, configurable: true });
+    return Sub;
+  }
+  function entriesOf(list, name, type) {
+    return list.filter(function (entry) {
+      if (name !== undefined && entry.name !== name) return false;
+      if (type !== undefined && entry.entryType !== type) return false;
+      return true;
+    });
+  }
+  function without(list, type, name) {
+    return list.filter(function (entry) {
+      return entry.entryType !== type || (name !== undefined && entry.name !== name);
+    });
+  }
+  var perfBuffer = [];
+  function Performance() {
+    throw new TypeError('Illegal constructor');
+  }
+  var performance = Object.create(Performance.prototype);
+  Object.defineProperty(Performance.prototype, 'timeOrigin', {
+    get: function () { return Date.now() - (host.now() - startedAt); }, configurable: true, enumerable: true
+  });
+  Performance.prototype.now = function () { return host.now() - startedAt; };
+  Performance.prototype.mark = function (name, options) {
+    var entry = new (entryMark)(typeof name === 'string' ? name : '', 'mark', this.now(), 0);
+    if (options !== undefined && options !== null) {
+      if (options.startTime !== undefined) entry.startTime = Number(options.startTime);
+      if (options.detail !== undefined) entry.detail = options.detail;
+    }
+    perfBuffer.push(entry);
+    return entry;
+  };
+  Performance.prototype.measure = function (name, start, end) {
+    var from = start === undefined ? 0 : typeof start === 'string' ? startTimeNamed(start, this) : Number(start);
+    var to = end === undefined ? this.now() : typeof end === 'string' ? startTimeNamed(end, this) : Number(end);
+    var entry = new (entryMeasure)(typeof name === 'string' ? name : '', 'measure', from, to - from);
+    perfBuffer.push(entry);
+    return entry;
+  };
+  function startTimeNamed(name, perf) {
+    var found = null;
+    for (var i = perfBuffer.length - 1; i >= 0; i--) {
+      if (perfBuffer[i].name === name && (found === null || perfBuffer[i].startTime > found)) found = perfBuffer[i].startTime;
+    }
+    return found === null ? 0 : found;
+  }
+  Performance.prototype.getEntries = function () { return perfBuffer.slice(); };
+  Performance.prototype.getEntriesByName = function (name, type) { return entriesOf(perfBuffer, name, type); };
+  Performance.prototype.getEntriesByType = function (type) { return entriesOf(perfBuffer, undefined, type); };
+  Performance.prototype.clearMarks = function (name) { perfBuffer = without(perfBuffer, 'mark', name); };
+  Performance.prototype.clearMeasures = function (name) { perfBuffer = without(perfBuffer, 'measure', name); };
+  Performance.prototype.clearResourceTimings = function () { perfBuffer = without(perfBuffer, 'resource', undefined); };
+  Performance.prototype.setResourceTimingBufferSize = function () { /* a buffer nothing fills */ };
+  Performance.prototype.markResourceTiming = function () {
+    return new (entryResource)('', 'resource', this.now(), 0);
+  };
+  Performance.prototype.eventLoopUtilization = function () { return { idle: 0, active: 0, utilization: 1 }; };
+  Performance.prototype.timerify = function (fn) {
+    if (typeof fn !== 'function') throw new TypeError('The "fn" argument must be of type function');
+    return fn;
+  };
+  Performance.prototype.toJSON = function () {
+    return { timeOrigin: this.timeOrigin, nodeTiming: this.nodeTiming };
+  };
+  Object.defineProperty(Performance.prototype, 'nodeTiming', {
+    get: function () {
+      return { name: 'node', entryType: 'node', startTime: 0, duration: 0, nodeStart: 0, bootstrapComplete: 0 };
+    }, configurable: true, enumerable: true
+  });
+  Object.defineProperty(Performance.prototype, Symbol.toStringTag, { value: 'Performance', configurable: true });
+  Object.defineProperty(Performance.prototype, 'constructor', { value: Performance, writable: true, configurable: true });
+  var entryMark = entrySubclass('PerformanceMark');
+  var entryMeasure = entrySubclass('PerformanceMeasure');
+  var entryResource = entrySubclass('PerformanceResourceTiming');
+  function PerformanceObserverEntryList(entries) {
+    this._entries = entries;
+  }
+  PerformanceObserverEntryList.prototype.getEntries = function () { return this._entries.slice(); };
+  PerformanceObserverEntryList.prototype.getEntriesByName = function (name, type) { return entriesOf(this._entries, name, type); };
+  PerformanceObserverEntryList.prototype.getEntriesByType = function (type) { return entriesOf(this._entries, undefined, type); };
+  Object.defineProperty(PerformanceObserverEntryList.prototype, Symbol.toStringTag, { value: 'PerformanceObserverEntryList', configurable: true });
+  function PerformanceObserver(callback) {
+    if (typeof callback !== 'function') throw new TypeError('The "callback" argument must be of type function');
+    this._callback = callback;
+  }
+  PerformanceObserver.supportedEntryTypes = Object.freeze(['event', 'mark', 'measure', 'resource']);
+  PerformanceObserver.prototype.observe = function (options) {
+    if (options === null || typeof options !== 'object') throw new TypeError('The "options" argument must be of type object');
+    /* Nothing here samples the loop, so an observer is accepted and then never called: what it
+       asked for is recorded only so a second 'observe' can replace it. */
+  };
+  PerformanceObserver.prototype.disconnect = function () { /* nothing was ever observed */ };
+  PerformanceObserver.prototype.takeRecords = function () { return []; };
+  Object.defineProperty(PerformanceObserver.prototype, Symbol.toStringTag, { value: 'PerformanceObserver', configurable: true });
+  Object.defineProperty(globalThis, 'performance', { value: performance, writable: true, configurable: true, enumerable: true });
+  globalThis.Performance = Performance;
+  globalThis.PerformanceEntry = PerformanceEntry;
+  globalThis.PerformanceMark = entryMark;
+  globalThis.PerformanceMeasure = entryMeasure;
+  globalThis.PerformanceObserver = PerformanceObserver;
+  globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
+  globalThis.PerformanceResourceTiming = entryResource;
+
+  /*
+   * The three classes behind 'crypto'. The webcrypto this file installed is a plain object with the
+   * methods on it as own properties, so it is given the prototype of a 'Crypto' rather than rebuilt:
+   * the methods keep working where they are, and 'crypto instanceof Crypto' is then true, as on a
+   * host. 'CryptoKey' is the one it already carries.
+   */
+  function Crypto() {
+    throw new TypeError('Illegal constructor');
+  }
+  function SubtleCrypto() {
+    throw new TypeError('Illegal constructor');
+  }
+  var webcrypto = globalThis.crypto;
+  if (webcrypto !== undefined && webcrypto !== null) {
+    if (Object.getPrototypeOf(webcrypto) === Object.prototype) Object.setPrototypeOf(webcrypto, Crypto.prototype);
+    Object.defineProperty(Crypto.prototype, 'subtle', { get: function () { return webcrypto.subtle; }, configurable: true, enumerable: true });
+    if (typeof webcrypto.CryptoKey === 'function') globalThis.CryptoKey = webcrypto.CryptoKey;
+    if (webcrypto.subtle !== undefined && webcrypto.subtle !== null
+        && Object.getPrototypeOf(webcrypto.subtle) === Object.prototype) {
+      Object.setPrototypeOf(webcrypto.subtle, SubtleCrypto.prototype);
+    }
+  }
+  Object.defineProperty(Crypto.prototype, Symbol.toStringTag, { value: 'Crypto', configurable: true });
+  Object.defineProperty(Crypto.prototype, 'constructor', { value: Crypto, writable: true, configurable: true });
+  Object.defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, { value: 'SubtleCrypto', configurable: true });
+  Object.defineProperty(SubtleCrypto.prototype, 'constructor', { value: SubtleCrypto, writable: true, configurable: true });
+  globalThis.Crypto = Crypto;
+  globalThis.SubtleCrypto = SubtleCrypto;
+
+  /*
+   * Explicit resource management. This engine parses no 'using' declaration, so nothing builds one
+   * of these by syntax -- but the classes are what a package feature-detects, and both stacks are
+   * usable by hand: 'use', 'adopt', 'defer' and 'move' behave as the proposal says, and a disposal
+   * that throws while the stack is already unwinding an error throws a 'SuppressedError' carrying
+   * both.
+   */
+  /* The two well-known symbols of the proposal, which this engine was built without: a package
+     that marks a resource with Symbol.dispose gets the symbol node gives it, so 'use' finds the
+     method the package put there. Both are defined the way a well-known symbol is -- not
+     writable, not configurable and not enumerable. */
+  function wellKnown(name) {
+    if (typeof Symbol[name] !== 'symbol') {
+      Object.defineProperty(Symbol, name, { value: Symbol('Symbol.' + name) });
+    }
+    return Symbol[name];
+  }
+  var DISPOSE = wellKnown('dispose');
+  var ASYNC_DISPOSE = wellKnown('asyncDispose');
+  function SuppressedError(error, suppressed, message) {
+    var err = new Error(message === undefined ? '' : String(message));
+    Object.setPrototypeOf(err, SuppressedError.prototype);
+    err.error = error;
+    err.suppressed = suppressed;
+    return err;
+  }
+  SuppressedError.prototype = Object.create(Error.prototype);
+  SuppressedError.prototype.name = 'SuppressedError';
+  Object.defineProperty(SuppressedError.prototype, 'constructor', { value: SuppressedError, writable: true, configurable: true });
+
+  function disposeValue(value) {
+    if (value === null || value === undefined) return;
+    var fn = typeof value === 'function' ? value : value[DISPOSE];
+    if (typeof fn !== 'function') throw new TypeError('The value is not disposable');
+    fn.call(value);
+  }
+  function asyncDisposeValue(value) {
+    if (value === null || value === undefined) return Promise.resolve();
+    var fn = typeof value === 'function' ? value : value[ASYNC_DISPOSE];
+    if (typeof fn !== 'function') return Promise.reject(new TypeError('The value is not async disposable'));
+    return Promise.resolve(fn.call(value));
+  }
+  function makeStack(Ctor, tag, runOne) {
+    function Stack() {
+      if (!(this instanceof Ctor)) throw new TypeError('Constructor ' + tag + " requires 'new'");
+      this._held = [];
+      this._done = false;
+    }
+    Object.defineProperty(Stack.prototype, 'disposed', { get: function () { return this._done; }, configurable: true });
+    Stack.prototype[this === undefined ? 'use' : 'use'] = function (value) {
+      if (this._done) throw new ReferenceError(tag + ' is already disposed');
+      if (value === null || value === undefined) throw new TypeError('The "value" argument is not disposable');
+      this._held.push({ kind: 'use', value: value });
+      return value;
+    };
+    Stack.prototype.adopt = function (value, onDispose) {
+      if (this._done) throw new ReferenceError(tag + ' is already disposed');
+      if (typeof onDispose !== 'function') throw new TypeError('The "onDispose" argument must be of type function');
+      this._held.push({ kind: 'use', value: { dispose: onDispose } });
+      return value;
+    };
+    Stack.prototype.defer = function (onDispose) {
+      if (this._done) throw new ReferenceError(tag + ' is already disposed');
+      if (typeof onDispose !== 'function') throw new TypeError('The "onDispose" argument must be of type function');
+      this._held.push({ kind: 'use', value: { dispose: onDispose } });
+    };
+    Stack.prototype.move = function () {
+      if (this._done) throw new ReferenceError(tag + ' is already disposed');
+      var next = new Ctor();
+      next._held = this._held;
+      this._held = [];
+      this._done = true;
+      return next;
+    };
+    Object.defineProperty(Stack.prototype, Symbol.toStringTag, { value: tag, configurable: true });
+    Object.defineProperty(Stack.prototype, 'constructor', { value: Ctor, writable: true, configurable: true });
+    return Stack;
+  }
+  function DisposableStack() {
+    var self = makeStack(DisposableStack, 'DisposableStack').call(this);
+    return self === undefined ? this : self;
+  }
+  DisposableStack.prototype = makeStack(DisposableStack, 'DisposableStack').prototype;
+  DisposableStack.prototype.dispose = function () {
+    if (this._done) return;
+    this._done = true;
+    var held = this._held;
+    this._held = [];
+    var first = null;
+    for (var i = held.length - 1; i >= 0; i--) {
+      try {
+        disposeValue(held[i].value);
+      } catch (error) {
+        if (first === null) first = { error: error, suppressed: null };
+        else first = { error: first.error, suppressed: first.suppressed === null ? error : new SuppressedError(first.suppressed, error) };
+      }
+    }
+    if (first === null) return;
+    if (first.suppressed === null) throw first.error;
+    throw new SuppressedError(first.error, first.suppressed, 'An error was suppressed during disposal');
+  };
+  function AsyncDisposableStack() {
+    var self = makeStack(AsyncDisposableStack, 'AsyncDisposableStack').call(this);
+    return self === undefined ? this : self;
+  }
+  AsyncDisposableStack.prototype = makeStack(AsyncDisposableStack, 'AsyncDisposableStack').prototype;
+  AsyncDisposableStack.prototype.disposeAsync = function () {
+    if (this._done) return Promise.resolve();
+    this._done = true;
+    var held = this._held;
+    this._held = [];
+    var at = held.length - 1;
+    var first = null;
+    var self = this;
+    function step() {
+      if (at < 0) {
+        if (first === null) return Promise.resolve();
+        return Promise.reject(first.suppressed === null ? first.error
+          : new SuppressedError(first.error, first.suppressed, 'An error was suppressed during disposal'));
+      }
+      var value = held[at--].value;
+      return asyncDisposeValue(value).then(null, function (error) {
+        if (first === null) first = { error: error, suppressed: null };
+        else first = { error: first.error, suppressed: first.suppressed === null ? error : new SuppressedError(first.suppressed, error) };
+      }).then(step);
+    }
+    return Promise.resolve().then(step);
+  };
+  globalThis.SuppressedError = SuppressedError;
+  globalThis.DisposableStack = DisposableStack;
+  globalThis.AsyncDisposableStack = AsyncDisposableStack;
+
+  /*
+   * 'BroadcastChannel': node's, over the one realm there is here. A message posted on a name
+   * reaches every other channel open on that name and not the one that posted it, which is what
+   * node delivers within a process -- node goes on to reach the other threads and worker
+   * threads on the same name, and this container has none of those to reach.
+   */
+  var CHANNELS = Object.create(null);
+  function BroadcastChannel(name) {
+    if (!(this instanceof BroadcastChannel)) throw new TypeError("Constructor BroadcastChannel requires 'new'");
+    var target = new EventTarget();
+    var self = this;
+    var closed = false;
+    Object.defineProperty(this, 'name', { value: String(name), configurable: true });
+    this.onmessage = null;
+    this.onmessageerror = null;
+    var open = CHANNELS[this.name] || (CHANNELS[this.name] = []);
+    open.push(this);
+    function post(data) {
+      var event = new MessageEvent('message', { data: data });
+      if (typeof self.onmessage === 'function') self.onmessage.call(self, event);
+      target.dispatchEvent(event);
+    }
+    this.postMessage = function (data) {
+      if (closed) throw new DOMException('This BroadcastChannel is already closed', 'InvalidStateError');
+      var peers = (CHANNELS[self.name] || []).slice();
+      for (var i = 0; i < peers.length; i++) {
+        if (peers[i] === self) continue;
+        queueMicrotask((function (peer) { return function () { if (peer._post) peer._post(data); }; })(peers[i]));
+      }
+    };
+    this._post = post;
+    this.close = function () {
+      if (closed) return;
+      closed = true;
+      var list = CHANNELS[self.name] || [];
+      var at = list.indexOf(self);
+      if (at >= 0) list.splice(at, 1);
+    };
+    this.addEventListener = function () { return target.addEventListener.apply(target, arguments); };
+    this.removeEventListener = function () { return target.removeEventListener.apply(target, arguments); };
+    this.dispatchEvent = function () { return target.dispatchEvent.apply(target, arguments); };
+  }
+  Object.defineProperty(BroadcastChannel.prototype, Symbol.toStringTag, { value: 'BroadcastChannel', configurable: true });
+  Object.defineProperty(BroadcastChannel.prototype, 'constructor', { value: BroadcastChannel, writable: true, configurable: true });
+  globalThis.BroadcastChannel = BroadcastChannel;
+
+  /*
+   * The two compression streams, over the zlib this container already has: gzip, deflate and
+   * deflate-raw, the three Node accepts. A stream buffers what it is written and compresses or
+   * decompresses the whole of it when it is closed, so the bytes a reader gets are the bytes
+   * node's gzip of the same input is -- there is no incremental deflate here to differ from.
+   */
+  var CODECS = null;
+  function codecOf(format) {
+    if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
+      throw new TypeError('The "format" argument must be one of "deflate", "deflate-raw" or "gzip"');
+    }
+    if (CODECS === null) CODECS = requireBuiltin('zlib');
+    return CODECS;
+  }
+  function bytesOfChunk(chunk) {
+    if (chunk instanceof Uint8Array) return chunk;
+    if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+    if (chunk !== null && typeof chunk === 'object' && chunk.buffer instanceof ArrayBuffer) {
+      return new Uint8Array(chunk.buffer, chunk.byteOffset || 0, chunk.byteLength);
+    }
+    if (typeof chunk === 'string') return new TextEncoder().encode(chunk);
+    throw new TypeError('The chunk must be a BufferSource or a string');
+  }
+  function joinBytes(parts) {
+    var size = 0;
+    for (var i = 0; i < parts.length; i++) size += parts[i].length;
+    var out = new Uint8Array(size);
+    var at = 0;
+    for (var k = 0; k < parts.length; k++) {
+      out.set(parts[k], at);
+      at += parts[k].length;
+    }
+    return out;
+  }
+  function makeCompressionStream(Ctor, tag, run) {
+    function Stream(format) {
+      if (!(this instanceof Ctor)) throw new TypeError("Constructor " + tag + " requires 'new'");
+      codecOf(format);
+      var held = [];
+      var pair = new TransformStream({
+        transform: function (chunk) { held.push(bytesOfChunk(chunk)); },
+        flush: function (controller) {
+          var out = run(format, joinBytes(held));
+          if (out.length > 0) controller.enqueue(new Uint8Array(out));
+        }
+      });
+      Object.defineProperty(this, 'readable', { value: pair.readable, configurable: true });
+      Object.defineProperty(this, 'writable', { value: pair.writable, configurable: true });
+    }
+    Object.defineProperty(Stream.prototype, Symbol.toStringTag, { value: tag, configurable: true });
+    Object.defineProperty(Stream.prototype, 'constructor', { value: Ctor, writable: true, configurable: true });
+    return Stream;
+  }
+  function CompressionStream(format) {
+    return makeCompressionStream(CompressionStream, 'CompressionStream', function (kind, bytes) {
+      var zlib = codecOf(kind);
+      return kind === 'gzip' ? zlib.gzipSync(bytes) : kind === 'deflate' ? zlib.deflateSync(bytes) : zlib.deflateRawSync(bytes);
+    }).call(this, format) || this;
+  }
+  CompressionStream.prototype = makeCompressionStream(CompressionStream, 'CompressionStream', function () { return new Uint8Array(0); }).prototype;
+  function DecompressionStream(format) {
+    return makeCompressionStream(DecompressionStream, 'DecompressionStream', function (kind, bytes) {
+      var zlib = codecOf(kind);
+      return kind === 'gzip' ? zlib.gunzipSync(bytes) : kind === 'deflate' ? zlib.inflateSync(bytes) : zlib.inflateRawSync(bytes);
+    }).call(this, format) || this;
+  }
+  DecompressionStream.prototype = makeCompressionStream(DecompressionStream, 'DecompressionStream', function () { return new Uint8Array(0); }).prototype;
+  globalThis.CompressionStream = CompressionStream;
+  globalThis.DecompressionStream = DecompressionStream;
+
+  /* The classes above are classes, and node's are not enumerable on the global object either. */
+  ['AsyncDisposableStack', 'BroadcastChannel', 'CompressionStream', 'Crypto', 'CryptoKey',
+    'DecompressionStream', 'DisposableStack', 'Navigator', 'Performance', 'PerformanceEntry',
+    'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserver', 'PerformanceObserverEntryList',
+    'PerformanceResourceTiming', 'SubtleCrypto', 'SuppressedError'].forEach(hide);
+})();
+
+/*
+ * The rest of what a host's 'process' enumerates: the internals node's own loader, debugger and
+ * profiler reach for, the hooks a package asks for to decide what it is running under, and the
+ * three stdio streams, which node has there as ordinary properties and this container had as lazy
+ * non-enumerable ones. Each is the kind of thing a host has there -- a function, a flag, a number
+ * -- and each is a no-op or an empty answer where nothing here can answer for it, which is what
+ * the host's own would say with no inspector, no profiler and no native handles behind it.
+ */
+(function installProcessSurface() {
+  function noop() {}
+  proc._debugEnd = noop;
+  proc._debugProcess = noop;
+  proc._rawDebug = noop;
+  proc._startProfilerIdleNotifier = noop;
+  proc._stopProfilerIdleNotifier = noop;
+  proc._tickCallback = noop;
+  proc._kill = noop;
+  /* Node's own uncaught path; this container's is the host's fatal path, which is the guest's
+     formatter and not this hook, so it is here as the name a package asks for and nothing more. */
+  proc._fatalException = noop;
+  proc._preload_modules = [];
+  proc._exiting = false;
+  proc._getActiveHandles = function () { return []; };
+  proc._getActiveRequests = function () { return []; };
+  proc._linkedBinding = function (name) { throw new Error('No such module: ' + name); };
+  proc.debugPort = 9229;
+  proc.domain = null;
+  proc.sourceMapsEnabled = false;
+  proc.setSourceMapsEnabled = function (enabled) { proc.sourceMapsEnabled = Boolean(enabled); };
+  /* A host's 'abort' writes a core dump and leaves 134; there is nothing here to dump, so it
+     leaves the same status without one. */
+  proc.abort = function () { host.exit(134); throw EXIT_SIGNAL; };
+  /* 'reallyExit' is 'exit' without the exit handlers: the status is written and the process is
+     gone before a listener could run, as on a host. */
+  proc.reallyExit = function (code) {
+    var finalCode = code === undefined ? (typeof proc.exitCode === 'number' ? proc.exitCode : 0) : Number(code);
+    host.exit(finalCode);
+    throw EXIT_SIGNAL;
+  };
+  proc.execve = function () { throw new Error('process.execve is not supported'); };
+  proc.finalization = { register: noop, registerBeforeExit: noop, unregister: noop };
+  proc.getActiveResourcesInfo = function () { return []; };
+  proc.getBuiltinModule = function (name) {
+    try {
+      return requireBuiltin(name);
+    } catch (error) {
+      return undefined;
+    }
+  };
+  /* The callback node would hand an uncaught exception to instead of printing it: recorded here
+     and reported by hasUncaughtExceptionCaptureCallback, because the path that would hand it over
+     is the host's, which reads nothing of the kind. */
+  var uncaughtCapture = null;
+  proc.setUncaughtExceptionCaptureCallback = function (fn) {
+    uncaughtCapture = typeof fn === 'function' ? fn : null;
+  };
+  proc.hasUncaughtExceptionCaptureCallback = function () { return uncaughtCapture !== null; };
+  /* A '.env' file, as node reads one: one KEY=VALUE per line, a '#' begins a comment, and a
+     value's own matching quotes are taken off it. A file that is not there is an error, as on a
+     host, so a caller that expects one finds out. */
+  proc.loadEnvFile = function (path) {
+    var text = requireBuiltin('fs').readFileSync(path === undefined ? '.env' : String(path), 'utf8');
+    var lines = String(text).split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var line = String(lines[i]).trim();
+      if (line === '' || line.charAt(0) === '#') continue;
+      var at = line.indexOf('=');
+      if (at <= 0) continue;
+      var value = line.slice(at + 1).trim();
+      if (value.length > 1 && (value.charAt(0) === '"' || value.charAt(0) === "'")
+          && value.charAt(value.length - 1) === value.charAt(0)) {
+        value = value.slice(1, -1);
+      }
+      proc.env[line.slice(0, at).trim()] = value;
+    }
+  };
+  proc.moduleLoadList = ['Internal Binding builtins', 'Internal Binding module_wrap',
+    'Internal Binding errors', 'NativeModule internal/assert', 'NativeModule internal/util',
+    'Internal Binding config', 'NativeModule internal/process/per_thread',
+    'NativeModule internal/bootstrap/realm', 'NativeModule internal/bootstrap/node',
+    'NativeModule internal/errors', 'NativeModule internal/util/inspect',
+    'NativeModule internal/modules/cjs/loader', 'NativeModule internal/modules/esm/loader'];
+  proc.openStdin = function () { return proc.stdin; };
+  proc.ref = function () { holdRef(1); return proc; };
+  proc.unref = function () { holdRef(-1); return proc; };
+  proc.availableMemory = function () { return requireBuiltin('os').freemem(); };
+  /* Node reports the cgroup limit a process runs under, and 0 for one that runs under none;
+     nothing here is inside a cgroup, so it is 0. */
+  proc.constrainedMemory = function () { return 0; };
+  proc.resourceUsage = function () {
+    var cpu = proc.cpuUsage();
+    return {
+      userCPUTime: cpu.user, systemCPUTime: cpu.system, maxRSS: proc.memoryUsage().rss,
+      sharedMemorySize: 0, unsharedDataSize: 0, unsharedStackSize: 0, minorPageFault: 0,
+      majorPageFault: 0, swappedOut: 0, fsRead: 0, fsWrite: 0, ipcSent: 0, ipcReceived: 0,
+      signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0
+    };
+  };
+  proc.threadCpuUsage = function (previous) {
+    var cpu = proc.cpuUsage(previous);
+    return { user: cpu.user, system: cpu.system };
+  };
 })();
 
 api.finalExitCode = function () {
