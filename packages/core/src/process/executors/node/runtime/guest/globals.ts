@@ -409,6 +409,16 @@ proc.kill = function (pid, signal) {
     throw esrchFor(pid);
   }
   if (num === proc.pid) {
+    /* A signal a listener was registered for reaches that listener: Node delivers it and leaves the
+       process running, and only a name nothing listens for ends the process with 128 + its number.
+       SIGKILL and SIGSTOP are the two a listener cannot be registered for, so they end it whatever
+       is on the process. Delivery is a turn of the loop later, as it is on the host -- the line
+       written straight after the kill still runs before the handler does. */
+    if (name !== 'SIGKILL' && name !== 'SIGSTOP' && proc.listenerCount(name) > 0) {
+      var delivered = name;
+      setTimeout(function () { proc.emit(delivered); }, 0);
+      return true;
+    }
     proc.exit(128 + (LETHAL_SIGNALS[name] === undefined ? 15 : LETHAL_SIGNALS[name]));
     return true;
   }

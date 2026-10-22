@@ -705,9 +705,14 @@ thread, so the timer the spawning guest armed for its own `timeout` cannot fire 
 gone, and the deadline is handed to the interrupt handler instead -- rearmed at every host call, so it
 stays a moment in time and not a stretch of execution. `spawn('node', [busy 5 s], { timeout: 400,
 killSignal: 'SIGKILL' })` closes at 416 ms with code null, signal SIGKILL and `killed` true, and
-`execFile` and `spawnSync` report `ETIMEDOUT` and the same signal, as host Node 24.15 does. A kill
-with no moment attached to it -- `child.kill()` on a child that is busy-looping -- still cannot land,
-for the reason the divergence list gives under `owc-child-kill-timeout`.
+`execFile` and `spawnSync` report `ETIMEDOUT` and the same signal, as host Node 24.15 does. The
+deadline owns the bound whatever its length: the runaway budget is only a stand-in for a `timeout`
+the caller never named, so a spawn that asks for 40 s is given 40 s and not the guard's 30 --
+measured, `spawn('node', [busy 60 s], { timeout: 40000, killSignal: 'SIGTERM' })` closes at 40016 ms
+with code null and signal SIGTERM, against 40012 ms on the host -- where it used to be dropped for
+being longer than the budget and the child died on the budget at 30436 ms with code 1 instead.
+A kill with no moment attached to it -- `child.kill()` on a child that is busy-looping -- still cannot
+land, for the reason the divergence list gives under `owc-child-kill-timeout`.
 
 Known limits, measured rather than claimed:
 
@@ -720,6 +725,16 @@ Known limits, measured rather than claimed:
 - A kill (`kill <pid>`, `container` signal, `process.terminate()`) cancels the guest at its next
   interrupt check, which is the only point at which anything still runs while the guest holds the
   thread.
+- `child.kill()` on a child that is busy-looping has no moment at which to run, and that is the
+  engine's, not the container's: under bare QuickJS 0.32 with no container in the way
+  (`@jitl/quickjs-singlefile-browser-release-asyncify`, the build this container loads), a host
+  `setTimeout(..., 100)` armed before a 3 s guest loop had still not fired when the loop returned at
+  3017 ms, so no host timer -- the parent's `setTimeout(600)` before its `child.kill()` included --
+  can preempt guest execution; the interrupt handler is the only code that runs meanwhile (342 checks
+  over a 10 s loop, which it aborted at 502 ms), and it can stop a guest but never give another one a
+  turn, so the parent's callback does not run until the child has already finished (measured: it ran
+  at 5433 ms, answered `false`, and the child exited 0 at 5438 ms where the host kills it at 620 ms
+  with SIGTERM).
 - An interrupted guest leaves objects live, so QuickJS prints
   `Assertion failed: list_empty(&rt->gc_obj_list)` when its runtime is freed. It is caught during
   teardown; the process still reports its status and output, and the container keeps working.

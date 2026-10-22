@@ -1407,9 +1407,16 @@ export class NodeProcess extends Process {
         armVmBudget(this.capabilityContext, this.guestBudgetMs);
     }
 
-    /** True when a spawn's `timeout` is the shorter of the two bounds, so an interruption on it is the timeout. */
+    /**
+     * True when a spawn's `timeout` is the bound this guest runs under, so an interruption on it is
+     * the timeout and not the runaway guard.
+     *
+     * The guard is only a stand-in for a bound the caller never named, so a deadline longer than the
+     * budget still owns this guest: a caller that asked for 40 s is given the 40 s it asked for and
+     * not the guard's 30, which is what the host does -- its only bound is the one the caller named.
+     */
     private deadlineOwnsBudget(): boolean {
-        return this.killDeadlineMs > 0 && !this.killDeadlineFired && this.killDeadlineMs <= this.guestBudgetMs;
+        return this.killDeadlineMs > 0 && !this.killDeadlineFired;
     }
 
     /**
