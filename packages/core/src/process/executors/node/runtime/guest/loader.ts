@@ -332,9 +332,65 @@ function loadEsmFromRequire(filename, mod) {
      looks for __esModule finds it; one with no default export is handed over as it stands. */
   mod.exports = Object.prototype.hasOwnProperty.call(namespace, 'default')
     ? markedNamespace(namespace)
-    : namespace;
+    : moduleViewOf(namespace);
   mod.loaded = true;
   return mod;
+}
+
+/*
+ * How Node answers a program that tries to change a module namespace, or to make a primitive of
+ * one. Every property of a namespace is writable but never configurable, the object cannot be
+ * extended and its prototype is null, so all three attempts fail -- and what a program reads is
+ * Node's own message, which names the property and the object as '[object Module]', not the
+ * engine's words for a failed write. MODULE_TRAPS is that answer, over a namespace the engine
+ * built: the reads still go through to the module, so a binding it reassigns still reads as its new
+ * value, and only the three ways of changing one are answered for it.
+ */
+var MODULE_VIEWS = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+function moduleToPrimitive() {
+  throw new TypeError('Cannot convert object to primitive value');
+}
+
+function moduleKeyText(key) {
+  return typeof key === 'symbol' ? String(key) : String(key);
+}
+
+var MODULE_TRAPS = {
+  get: function (target, key) {
+    /* String(ns), ns + '' and ns == null all ask the object for a primitive, and a namespace
+       has no way to make one: Node refuses rather than reading the engine's own refusal. */
+    if (key === Symbol.toPrimitive) return moduleToPrimitive;
+    return target[key];
+  },
+  set: function (target, key) {
+    /* A binding the namespace already has is read-only; a name it does not have cannot be added to
+       an object that cannot be extended -- and Node says which of the two it was. */
+    if (Object.prototype.hasOwnProperty.call(target, key)) {
+      throw new TypeError("Cannot assign to read only property '" + moduleKeyText(key) + "' of object '[object Module]'");
+    }
+    throw new TypeError('Cannot add property ' + moduleKeyText(key) + ', object is not extensible');
+  },
+  defineProperty: function (target, key) {
+    throw new TypeError('Cannot add property ' + moduleKeyText(key) + ', object is not extensible');
+  },
+  deleteProperty: function (target, key) {
+    throw new TypeError("Cannot delete property '" + moduleKeyText(key) + "' of [object Module]");
+  }
+};
+
+/* A namespace as Node hands one out, whichever way the module was reached. Only a namespace is
+   wrapped: a module's tag is what makes it one, and whatever else an import resolves to -- a
+   CommonJS exports object, the value of a JSON module -- is left exactly as it was. */
+function moduleViewOf(value) {
+  if (value === null || typeof value !== 'object') return value;
+  if (value[Symbol.toStringTag] !== 'Module') return value;
+  if (MODULE_VIEWS === null) return value;
+  var seen = MODULE_VIEWS.get(value);
+  if (seen !== undefined) return seen;
+  var view = new Proxy(value, MODULE_TRAPS);
+  MODULE_VIEWS.set(value, view);
+  return view;
 }
 
 /* A property of Node's namespace: writable and enumerable, and never configurable, which is what
@@ -360,6 +416,7 @@ function markedNamespace(namespace) {
   Object.preventExtensions(target);
   return new Proxy(target, {
     get: function (t, key) {
+      if (key === Symbol.toPrimitive) return moduleToPrimitive;
       if (key === '__esModule') return true;
       if (key === Symbol.toStringTag) return 'Module';
       return namespace[key];
@@ -371,7 +428,11 @@ function markedNamespace(namespace) {
       if (desc === undefined || key === '__esModule' || key === Symbol.toStringTag) return desc;
       desc.value = namespace[key];
       return desc;
-    }
+    },
+    /* the three ways of changing one, answered the way Node answers them */
+    set: MODULE_TRAPS.set,
+    defineProperty: MODULE_TRAPS.defineProperty,
+    deleteProperty: MODULE_TRAPS.deleteProperty
   });
 }
 
@@ -675,7 +736,9 @@ function importArgOf(spec, options, filename) {
    rejection: a module that resolves to no file carries ERR_MODULE_NOT_FOUND, and a specifier no
    loader can read carries ERR_UNSUPPORTED_ESM_URL_SCHEME. */
 function importWrap(promise) {
-  return promise.then(null, function (err) {
+  return promise.then(function (value) {
+    return moduleViewOf(value);
+  }, function (err) {
     var code = globalThis.__owc_import_failure;
     globalThis.__owc_import_failure = undefined;
     if (typeof code === 'string' && err !== null && typeof err === 'object' && err.code === undefined) {
