@@ -798,6 +798,7 @@ Future plans:
 - [ ] a syntax error does not echo the offending source line the way a host does (row owc-shell-syntax-error-source-line)
 - [ ] the unexpected token a `$( )` reports is `newline` where a host names the real one (row owc-shell-syntax-error-token-in-substitution)
 - [ ] a here-document body is lost when its command is backgrounded (row owc-shell-heredoc-background-job)
+- [ ] a background job is replayed from its words, so its quoting is gone: `(echo 'a  b') &` prints `a b` (row owc-shell-background-job-quoting-lost)
 - [ ] the container’s "Command not found" diagnostic has no trailing newline (row owc-shell-command-not-found-newline)
 - [ ] Add signal handling (SIGTERM, SIGKILL, etc.): `child.kill` sends one, `process.kill` does not reach a process
 - [ ] Create process groups and job control
