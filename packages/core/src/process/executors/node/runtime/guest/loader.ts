@@ -123,14 +123,29 @@ globalThis.Function = function Function() {
   var params = [];
   for (var k = 0; k < argc - 1; k++) params.push(String(arguments[k]));
   var body = argc === 0 ? '' : String(arguments[argc - 1]);
-  var compiled = host.compileFunction(
-    '(function anonymous(' + params.join(',') + '\n) {\n' + body + '\n})',
-    CURRENT_FILE
-  );
-  if (typeof compiled === 'string') throw new SyntaxError(compiled);
+  var src = '(function anonymous(' + params.join(',') + '\n) {\n' + body + '\n})';
+  var compiled = host.compileFunction(src, CURRENT_FILE);
+  if (typeof compiled === 'string') {
+    /* The compatibility rewrite a module gets before its second compile (see compileCjsWrapper):
+       a body that QuickJS refuses to compile gets the same second chance, and a rewrite that does
+       not clear it still reports the engine's own message, as the module path does. */
+    var fixed = null;
+    try { fixed = rxRewrite(src); } catch (rewriteErr) { fixed = null; }
+    if (fixed !== null) {
+      var retried = host.compileFunction(fixed, CURRENT_FILE);
+      if (typeof retried !== 'string') return retried;
+    }
+    throw new SyntaxError(compiled);
+  }
   return compiled;
 };
 globalThis.Function.prototype = REAL_FUNCTION.prototype;
+
+/* eval keeps the engine's own: QuickJS grants a direct eval -- the one that reads the caller's
+   scope -- only through the real global eval, so a wrapper there would cost every direct eval its
+   scope (vm.runInContext reads its sandbox through a with-scoped direct eval, and a package that
+   evals "require('x')" reads the module's own binding). What that leaves unfixed is a string an
+   eval compiles with the one construct above in it, which no wrapper can reach without that cost. */
 
 function readSource(filename) {
   var src = host.readText(filename);
@@ -260,6 +275,196 @@ function requireFrom(parent, id) {
   return loadCJS(filename, parent, false).exports;
 }
 
+/* Every "import" token in a script that opens a dynamic import: where the token stands, where its
+   argument starts and where its call closes. "import" is a reserved word but a legal property and
+   method name, so the scan is this rewrite's whole risk -- the token is one only when no '.' or
+   '?.' stands in front of it -- and strings, template literals, comments and regular expressions
+   are walked whole, so text that merely looks like a call is never touched. Punctuator bookkeeping
+   is the same the regex compatibility scan keeps (rxRegexAllowed reads it), so a '/' is a regex
+   where a value cannot continue and a division where one can. */
+function cjsImportParens(src) {
+  var n = src.length, i = 0, st = { nl: false }, look = { nl: false };
+  var last = null, stack = [], out = [];
+  while (i < n) {
+    i = rxSkip(src, i, st);
+    if (i >= n) break;
+    var nl = st.nl;
+    st.nl = false;
+    var c = src.charCodeAt(i);
+    if (rxIsIdStart(c) || c === 92) {
+      var j = i + 1;
+      while (j < n) {
+        var d = src.charCodeAt(j);
+        if (rxIsIdPart(d)) j++;
+        else if (d === 92) j += 2;
+        else break;
+      }
+      var word = src.slice(i, j);
+      var afterDot = last !== null && last.k === 'p' && (last.v === '.' || last.v === '?.');
+      if (!afterDot && word === 'import') {
+        var open = rxSkip(src, j, look);
+        if (open < n && src.charCodeAt(open) === 40) {
+          out.push({ s: i, argAt: open + 1, close: -1 });
+          stack.push(out.length - 1);
+          last = { k: 'p', v: '(' };
+          i = open + 1;
+          continue;
+        }
+      }
+      last = afterDot ? { k: 'val', v: word }
+        : RX_REGEX_AFTER_WORD.hasOwnProperty(word) ? { k: 'kw', v: word } : { k: 'id', v: word };
+      i = j;
+      continue;
+    }
+    if ((c >= 48 && c <= 57) || (c === 46 && src.charCodeAt(i + 1) >= 48 && src.charCodeAt(i + 1) <= 57)) {
+      var k2 = i + 1;
+      while (k2 < n && (rxIsIdPart(src.charCodeAt(k2)) || src.charCodeAt(k2) === 46)) k2++;
+      last = { k: 'val', v: '' };
+      i = k2;
+      continue;
+    }
+    if (c === 34 || c === 39) {
+      var k3 = i + 1;
+      while (k3 < n) {
+        var e3 = src.charCodeAt(k3);
+        if (e3 === 92) { k3 += src.charCodeAt(k3 + 1) === 13 && src.charCodeAt(k3 + 2) === 10 ? 3 : 2; continue; }
+        if (e3 === c || rxIsNewline(e3)) break;
+        k3++;
+      }
+      last = { k: 'val', v: '' };
+      i = k3 < n && src.charCodeAt(k3) === c ? k3 + 1 : k3;
+      continue;
+    }
+    if (c === 96) {
+      var t1 = rxTemplateText(src, i + 1);
+      last = t1.sub ? { k: 'p', v: 'tsub' } : { k: 'val', v: '' };
+      if (t1.sub) stack.push('T');
+      i = t1.next;
+      continue;
+    }
+    if (c === 47) {
+      var re = rxRegexAllowed(last, nl) ? rxReadRegex(src, i) : null;
+      if (re !== null) {
+        last = { k: 'val', v: '' };
+        i = re.e;
+        continue;
+      }
+      last = { k: 'p', v: '/' };
+      i += src.charCodeAt(i + 1) === 61 ? 2 : 1;
+      continue;
+    }
+    if (c === 40) {
+      stack.push(-1);
+      last = { k: 'p', v: '(' };
+      i++;
+      continue;
+    }
+    if (c === 41) {
+      var opened = stack.pop();
+      if (typeof opened === 'number' && opened >= 0) out[opened].close = i;
+      last = { k: 'p', v: ')' };
+      i++;
+      continue;
+    }
+    if (c === 91) {
+      stack.push('A');
+      last = { k: 'p', v: '[' };
+      i++;
+      continue;
+    }
+    if (c === 93) {
+      stack.pop();
+      last = { k: 'p', v: ']' };
+      i++;
+      continue;
+    }
+    if (c === 123) {
+      stack.push('B');
+      last = { k: 'p', v: '{' };
+      i++;
+      continue;
+    }
+    if (c === 125) {
+      var brace = stack.pop();
+      if (brace === 'T') {
+        var t2 = rxTemplateText(src, i + 1);
+        last = t2.sub ? { k: 'p', v: 'tsub' } : { k: 'val', v: '' };
+        if (t2.sub) stack.push('T');
+        i = t2.next;
+        continue;
+      }
+      last = { k: 'p', v: '}' };
+      i++;
+      continue;
+    }
+    if (c === 63 && src.charCodeAt(i + 1) === 46) {
+      last = { k: 'p', v: '?.' };
+      i += 2;
+      continue;
+    }
+    if (c === 46) {
+      last = { k: 'p', v: '.' };
+      i++;
+      continue;
+    }
+    last = { k: 'p', v: src.charAt(i) };
+    i++;
+  }
+  return out;
+}
+
+/*
+ * Whether a script body is strict, which is what the language asks of its first statement: a
+ * directive is only a directive in directive position, so "use strict" after a comment or a blank
+ * line still opens a strict body and the same words after a statement are an inert string.
+ */
+function cjsIsStrict(src) {
+  var i = rxSkip(src, src.charAt(0) === '#' && src.charAt(1) === '!' ? 2 : 0, { nl: false });
+  if (i >= src.length) return false;
+  var quote = src.charCodeAt(i);
+  if (quote !== 34 && quote !== 39) return false;
+  var j = i + 1;
+  while (j < src.length) {
+    var c = src.charCodeAt(j);
+    if (c === 92) { j += 2; continue; }
+    if (c === quote || rxIsNewline(c)) break;
+    j++;
+  }
+  return src.slice(i + 1, j) === 'use strict';
+}
+
+/*
+ * A dynamic import() written in a CommonJS body is answered with the engine's own module namespace,
+ * because a script -- unlike an ES module -- is compiled with no rewrite pass, so a program that
+ * tries to change what it got reads the engine's refusal rather than Node's. This puts the same two
+ * ends around the call that prepareEsmSource puts around an ES module's -- the argument through the
+ * attribute check, the promise through moduleViewOf -- so a CommonJS importer and an ES module
+ * importer get one object, as they do in Node. A parameter list a body follows is a method named
+ * import, not a call, and a call whose close the scan never met is left alone; no edit crosses a
+ * line, so every statement keeps the line it had.
+ */
+function cjsImportSource(src, filename) {
+  if (src.indexOf('import') < 0) return src;
+  var calls = null;
+  try { calls = cjsImportParens(src); } catch (scanErr) { return src; }
+  if (calls === null || calls.length === 0) return src;
+  var file = JSON.stringify(String(filename));
+  var strict = cjsIsStrict(src) ? '' : ', false';
+  var out = '', cursor = 0;
+  for (var i = 0; i < calls.length; i++) {
+    var one = calls[i];
+    if (one.close < 0 || one.s < cursor) continue;
+    var after = rxSkip(src, one.close + 1, { nl: false });
+    if (after < src.length && src.charCodeAt(after) === 123) continue;
+    out += src.slice(cursor, one.s) + 'globalThis.__owc_importWrap(';
+    out += src.slice(one.s, one.argAt) + 'globalThis.__owc_importArg(';
+    out += src.slice(one.argAt, one.close) + ', ' + file + '))' + strict;
+    cursor = one.close;
+  }
+  if (cursor === 0) return src;
+  return out + src.slice(cursor);
+}
+
 /* The host compiles the wrapper, not an in-guest eval: the engine names eval'd code <input>, so
    every CommonJS module would share one nameless script and its stack frames would carry no path.
    Packages that locate their binary from a stack frame (bindings, and anything built on it) read
@@ -271,6 +476,14 @@ function compileCjs(src, filename) {
 }
 
 function compileCjsWrapper(src, filename) {
+  /* The wrapped body is used only when it compiles: a source the rewrite turned into something the
+     engine rejects keeps the compile it had, and so keeps the failure -- and the failure's own
+     words -- that the source as written earns. */
+  var wrapped = cjsImportSource(src, filename);
+  if (wrapped !== src) {
+    var tried = host.compileCjs(wrapped, filename);
+    if (typeof tried !== 'string') return tried;
+  }
   try {
     return compileCjs(src, filename);
   } catch (err) {
@@ -380,6 +593,8 @@ function loadEsmFromRequire(filename, mod) {
  * value, and only the three ways of changing one are answered for it.
  */
 var MODULE_VIEWS = typeof WeakMap === 'function' ? new WeakMap() : null;
+/* One for a namespace a sloppy CommonJS body reached: see SLOPPY_MODULE_TRAPS. */
+var MODULE_VIEWS_SLOPPY = typeof WeakMap === 'function' ? new WeakMap() : null;
 
 function moduleToPrimitive() {
   throw new TypeError('Cannot convert object to primitive value');
@@ -436,6 +651,23 @@ var MODULE_TRAPS = {
   }
 };
 
+/* An assignment and a delete that fail are silent in a sloppy CommonJS body -- that is the whole
+   difference between the two modes, and it is the caller's, not the object's: no trap is told
+   whether the code that reached it was strict. So a body the loader knows to be sloppy gets a view
+   whose two traps answer false instead of throwing, and the engine keeps them quiet, exactly as it
+   keeps the assignment quiet. A define is refused in both modes -- Object.defineProperty throws
+   whatever the surrounding mode is -- and so is every other way of changing a namespace. */
+var SLOPPY_MODULE_TRAPS = {
+  get: MODULE_TRAPS.get,
+  set: function (target, key) {
+    return false;
+  },
+  defineProperty: MODULE_TRAPS.defineProperty,
+  deleteProperty: function (target, key) {
+    return false;
+  }
+};
+
 /* The same three refusals read through Reflect.*, which reports one as false instead of throwing:
    a namespace refuses a set, a define and a delete of a property it has, and only a delete of a
    name it does not have is granted. The engine has no way to tell such a call from the assignment,
@@ -469,14 +701,18 @@ function isModuleNamespace(value) {
 /* A namespace as Node hands one out, whichever way the module was reached. Only a namespace is
    wrapped: a module's tag is what makes it one, and whatever else an import resolves to -- a
    CommonJS exports object, the value of a JSON module -- is left exactly as it was. */
-function moduleViewOf(value) {
+function moduleViewOf(value, strict) {
   if (value === null || typeof value !== 'object') return value;
   if (value[Symbol.toStringTag] !== 'Module') return value;
-  if (MODULE_VIEWS === null) return value;
-  var seen = MODULE_VIEWS.get(value);
+  /* A sloppy body and a strict one get two views of one namespace, because the two answer an
+     assignment differently; within either one the same import always resolves to the same object. */
+  var sloppy = strict === false;
+  var views = sloppy ? MODULE_VIEWS_SLOPPY : MODULE_VIEWS;
+  if (views === null) return value;
+  var seen = views.get(value);
   if (seen !== undefined) return seen;
-  var view = new Proxy(value, MODULE_TRAPS);
-  MODULE_VIEWS.set(value, view);
+  var view = new Proxy(value, sloppy ? SLOPPY_MODULE_TRAPS : MODULE_TRAPS);
+  views.set(value, view);
   return view;
 }
 
@@ -822,9 +1058,9 @@ function importArgOf(spec, options, filename) {
    it, so the host publishes the code of the failure it raised and this wrapper sets it back on the
    rejection: a module that resolves to no file carries ERR_MODULE_NOT_FOUND, and a specifier no
    loader can read carries ERR_UNSUPPORTED_ESM_URL_SCHEME. */
-function importWrap(promise) {
+function importWrap(promise, strict) {
   return promise.then(function (value) {
-    return moduleViewOf(value);
+    return moduleViewOf(value, strict);
   }, function (err) {
     var code = globalThis.__owc_import_failure;
     globalThis.__owc_import_failure = undefined;
@@ -902,7 +1138,7 @@ var api = {
     var filename = host.cwd() + '/[eval]';
     var mod = new Module(filename, null);
     mainModule = mod;
-    var wrapper = compileCjs(source, filename);
+    var wrapper = compileCjsWrapper(source, filename);
     wrapper.call(mod.exports, mod.exports, makeRequire(mod), mod, filename, mod.path);
   },
   uptimeMs: function () {
