@@ -12,9 +12,9 @@
  *  - a class element named get, set or async and followed by a semicolon is written as the quoted
  *    name, declaring the same field (QuickJS parses the bare form as an accessor and fails with
  *    "invalid property name");
- *  - a for-of whose iterable holds a yield at its top level gets that iterable hoisted into a const
- *    of its own, because QuickJS 0.31 and 0.32 abort the compile with 'stack underflow' and the
- *    loop then reads the value from the const (see rxForOfYields).
+ *  - a for-of whose iterable holds a yield gets that iterable hoisted into a const of its own,
+ *    because QuickJS 0.31 and 0.32 abort the compile with 'stack underflow' and the loop then
+ *    reads the value from the const (see rxForOfYields).
  * The scanner tracks strings, template literals, comments, regex literals (previous-token rule),
  * control headers, object literals and class bodies, so only real literals and class elements are
  * touched: a '/' is a regex where a value cannot continue and a division where one can.
@@ -114,8 +114,10 @@ function rxScan(src) {
   var last = null, classHead = -1, classValue = false;
   /* for the third rewrite: where the last identifier token began, what stood before it, and the
      label (if any) that the most recent ':' closed. A label is recorded only when it is a statement
-     label: 'case x:' and 'default:' open a clause, and a statement cannot be inserted before them. */
-  var lastIdStart = -1, lastIdPrev = null, pendingLabel = -1;
+     label: 'case x:' and 'default:' open a clause, and a statement cannot be inserted before them.
+     pendingLabelPrev is what stood before that label, which says whether the label is itself a bare
+     body: 'if (c) lbl: for (...)' has nowhere to put a declaration either side of the label. */
+  var lastIdStart = -1, lastIdPrev = null, pendingLabel = -1, pendingLabelPrev = null;
   while (i < n) {
     i = rxSkip(src, i, st);
     if (i >= n) break;
@@ -155,7 +157,7 @@ function rxScan(src) {
       else last = { k: 'id', v: word };
       if (last.k === 'id') { lastIdPrev = prevTok; lastIdStart = i; }
       if (word === 'for' && !afterDot) {
-        fors.push({ s: i, pk: prevTok === null ? null : prevTok.k, pv: prevTok === null ? null : prevTok.v, ls: pendingLabel });
+        fors.push({ s: i, pk: prevTok === null ? null : prevTok.k, pv: prevTok === null ? null : prevTok.v, ls: pendingLabel, lp: pendingLabelPrev });
       }
       i = j;
       continue;
@@ -264,8 +266,10 @@ function rxScan(src) {
       continue;
     }
     if (c === 58) {
-      pendingLabel = (last !== null && last.k === 'id' && last.v !== 'default' &&
-        !(lastIdPrev !== null && lastIdPrev.k === 'kw' && lastIdPrev.v === 'case')) ? lastIdStart : -1;
+      var labelled = last !== null && last.k === 'id' && last.v !== 'default' &&
+        !(lastIdPrev !== null && lastIdPrev.k === 'kw' && lastIdPrev.v === 'case');
+      pendingLabel = labelled ? lastIdStart : -1;
+      pendingLabelPrev = labelled ? lastIdPrev : null;
     }
     last = { k: 'p', v: String.fromCharCode(c) };
     i++;
@@ -324,16 +328,18 @@ function rxWalkTemplate(src, i, stop) {
   }
   return { next: k, sawYield: sawYield };
 }
-/* Whether a yield stands at the top level of the slice: one inside a nested function body (a
-   generator expression, say) belongs to that function and leaves the loop's own iterable alone. */
+/* Whether the slice holds a yield at all. Brackets do not decide it: one inside an array element, an
+   index, a group or an object literal of the iterable is still the generator's own, and one inside a
+   nested function body belongs to that function -- but hoisting that one is value- and order-neutral
+   as well, since the const only evaluates the same iterable in the same place, so any yield in the
+   iterable is reason enough to want the hoist. */
 function rxHasTopYield(src, s, e) {
-  var brace = 0, q = s;
+  var q = s;
   while (q < e) {
     q = rxSkip(src, q, { nl: false });
     if (q >= e) break;
     var c = src.charCodeAt(q);
-    if (c === 40 || c === 91 || c === 123) { if (c !== 40) brace++; q++; continue; }
-    if (c === 41 || c === 93 || c === 125) { if (c !== 41) brace--; q++; continue; }
+    if (c === 40 || c === 91 || c === 123 || c === 41 || c === 93 || c === 125) { q++; continue; }
     if (c === 34 || c === 39) { q = rxSkipString(src, q, c); continue; }
     if (c === 96) {
       var w = rxWalkTemplate(src, q, e);
@@ -344,7 +350,7 @@ function rxHasTopYield(src, s, e) {
     if (rxIsIdStart(c)) {
       var j = q + 1;
       while (j < e && rxIsIdPart(src.charCodeAt(j))) j++;
-      if (brace === 0 && src.slice(q, j) === 'yield') return true;
+      if (src.slice(q, j) === 'yield') return true;
       q = j;
       continue;
     }
@@ -354,8 +360,27 @@ function rxHasTopYield(src, s, e) {
 }
 /* Where the statement that follows a control header runs out: at its ';', or at the '}' or ')'
    that closes whatever it is standing in. Used only to brace a loop that needs a declaration of
-   its own and has nowhere to put one. */
+   its own and has nowhere to put one. A loop that owns a block body ends with that block: the
+   statements after it are siblings of the loop, not part of it, and must stay outside the brace. */
 function rxStatementEnd(src, s) {
+  var n = src.length, q = rxSkip(src, s, { nl: false });
+  if (q < n && src.charCodeAt(q) === 123) {
+    var d = 0, k = q;
+    while (k < n) {
+      k = rxSkip(src, k, { nl: false });
+      if (k >= n) break;
+      var b = src.charCodeAt(k);
+      if (b === 34 || b === 39) { k = rxSkipString(src, k, b); continue; }
+      if (b === 96) { k = rxWalkTemplate(src, k).next; continue; }
+      if (b === 123) { d++; k++; continue; }
+      if (b === 125) { k++; if (--d === 0) return k; continue; }
+      k++;
+    }
+    return n;
+  }
+  return rxStatementScan(src, q);
+}
+function rxStatementScan(src, s) {
   var n = src.length, d = 0, q = s;
   while (q < n) {
     q = rxSkip(src, q, { nl: false });
@@ -384,7 +409,12 @@ function rxForOfYields(src, fors) {
     if (t.pk === 'p' && t.pv === ':') {
       /* after a ':' a statement may start: a label keeps the loop labelled only if the const goes
          before the label, and a 'case' or 'default' clause takes the const where the loop stood */
-      if (t.ls >= 0) insertAt = t.ls;
+      if (t.ls >= 0) {
+        insertAt = t.ls;
+        /* the label may itself be the bare body of if, while, for, with, do or else, where no
+           declaration may stand before it either: there the label and its loop are braced together */
+        if (t.lp !== null && (t.lp.v === 'hdr' || t.lp.k === 'kw')) brace = true;
+      }
     } else if (t.pk === null || (t.pk === 'p' && (t.pv === '{' || t.pv === '}' || t.pv === ';' || t.pv === 'obj}'))) {
       /* a statement list: the const simply goes before the loop */
     } else if (t.pv === 'hdr' || t.pk === 'kw') {
