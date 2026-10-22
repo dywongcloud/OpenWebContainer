@@ -1033,6 +1033,13 @@ BF['http'] = function () {
         req.onSocket(socket);
         return;
       }
+      /* Node only pools a socket the request asked to keep alive: with keepAlive off the response
+         carries Connection: close, so once nothing is waiting for it the socket is destroyed and
+         never reaches freeSockets. */
+      if (!options.keepAlive && !this.keepAlive) {
+        socket.destroy();
+        return;
+      }
       var list = this.freeSockets[name] || (this.freeSockets[name] = []);
       if (list.length >= this.maxFreeSockets) {
         socket.destroy();

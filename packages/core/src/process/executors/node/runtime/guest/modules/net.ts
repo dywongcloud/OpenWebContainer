@@ -464,7 +464,12 @@ BF['net'] = function () {
         this._flushPending();
         return;
       }
-      this.destroy(failures.length === 1 ? failures[0] : netAggregate(failures));
+      /* A refused connect is not a synchronous answer: Node's comes back from the loop, so a
+         destroy() the caller issues first still wins and the socket just closes. */
+      var refused = failures.length === 1 ? failures[0] : netAggregate(failures);
+      var self = this;
+      netDefer(function () { self.destroy(refused); });
+      return;
     }
 
     /* The third argument is the payload on the binary channel, an ArrayBuffer the host read out of
@@ -679,7 +684,9 @@ BF['net'] = function () {
       if (size > NET_SNDBUF) {
         this._writeCbs.push({ cb: callback, size: size });
         var self = this;
-        setTimeout(function () { self._drainWriteCbs(null); }, 0);
+        /* Only a socket that is still alive settles its own write: one destroyed meanwhile leaves it
+           to the destroy, which cancels it with ECANCELED as Node does. */
+        setTimeout(function () { if (!self._dead) self._drainWriteCbs(null); }, 0);
         return;
       }
       if (duplexMode) callback();
@@ -853,10 +860,12 @@ BF['net'] = function () {
       this._settleWrite(callback, chunk.length);
     };
 
+    /* Node shuts a socket's writable side down on the turn after end(), so a destroy() that lands
+       first still wins and 'finish' is never emitted. */
     Socket.prototype._final = function (callback) {
       this._wFinished = true;
       this._sendEnd();
-      callback();
+      netDefer(function () { callback(); });
     };
 
     Socket.prototype._destroy = function (error, callback) {
@@ -865,11 +874,18 @@ BF['net'] = function () {
       this._hadError = !!error;
       this.connecting = false;
       this._readQueue = [];
-      // Node cancels what a destroyed socket never managed to send, and reports that first.
-      this._drainWriteCbs(error || this._writeCancelError());
+      // Node cancels what a destroyed socket never managed to send with ECANCELED, even when the
+      // socket was destroyed with an error of its own: the error is the socket's, not the write's.
       this._closeHub(unread);
       this._teardown();
-      callback(error);
+      /* The cancel lands on the turn after the destroy, as Node's handle close does: the socket's
+         own 'error' is reported first, and a write issued after the destroy is answered before the
+         one that was still pending. */
+      var self = this;
+      setTimeout(function () {
+        self._drainWriteCbs(self._writeCancelError());
+        callback(error);
+      }, 0);
     };
 
     // The stream emits 'close' with no argument; Node passes hadError.
@@ -892,6 +908,9 @@ BF['net'] = function () {
           ? netError(Error, 'EPIPE', 'This socket has been ended by the other party')
           : netError(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end');
         var endedSocket = this;
+        /* A write past this side's own end fails the write side, so the 'finish' end() scheduled is
+           never delivered -- an errored stream ends without finishing, which is what Node does. */
+        this._wFailed = true;
         netDefer(function () {
           if (typeof callback === 'function') callback(ended);
           if (!endedSocket._finEnded) endedSocket.destroy(ended);
@@ -933,7 +952,7 @@ BF['net'] = function () {
       else this._endRequested = true;
       var self = this;
       netDefer(function () {
-        if (self._dead) return;
+        if (self._dead || self._wFailed) return;
         self._wFinished = true;
         self.emit('finish');
         self._maybeFinish();
@@ -947,14 +966,19 @@ BF['net'] = function () {
       this._dead = true;
       this.connecting = false;
       this._readQueue = [];
-      // Node cancels what a destroyed socket never managed to send, and reports that first.
-      this._drainWriteCbs(error || this._writeCancelError());
+      // Node cancels what a destroyed socket never managed to send with ECANCELED, even when the
+      // socket was destroyed with an error of its own: the error is the socket's, not the write's.
       this._closeHub(unread);
       this._teardown();
       var self = this;
       netDefer(function () {
         if (error) self.emit('error', error);
-        self.emit('close', !!error);
+        /* As above: the cancel lands after the socket's own 'error' and after a write issued once
+           it was already destroyed. */
+        setTimeout(function () {
+          self._drainWriteCbs(self._writeCancelError());
+          self.emit('close', !!error);
+        }, 0);
       });
       return this;
     };
@@ -1010,6 +1034,20 @@ BF['net'] = function () {
     Object.defineProperty(Socket.prototype, 'writableEnded', { get: function () { return this._wEnded; }, configurable: true });
     Object.defineProperty(Socket.prototype, 'writableFinished', { get: function () { return this._wFinished; }, configurable: true });
   }
+
+  /* Node's destroySoon is the name destroy() had before it: a socket that has already ended is
+     destroyed now, one still writing is destroyed once 'finish' comes, and any other is ended and
+     left to close on its own -- it does not tear a socket down out from under a live write. */
+  Socket.prototype.destroySoon = function () {
+    if (this._wEnded) return this.destroy();
+    if (this._writeCbs && this._writeCbs.length > 0) {
+      var self = this;
+      this.once('finish', function () { self.destroy(); });
+      return this;
+    }
+    this.end();
+    return this;
+  };
 
   class Server extends EventEmitter {
     constructor(options, listener) {
