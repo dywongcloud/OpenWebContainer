@@ -1009,6 +1009,12 @@ interface Redirect {
      * that source, and a `cat <<EOF &` without this ran on an empty standard input.
      */
     heredoc?: string;
+    /**
+     * Where in the script that body starts, so a job can tell a body its source already holds from
+     * one that stands behind it: a `( cat <<EOF\nb\nEOF\n )` spans its own body, while a
+     * `cat <<EOF &` ends before its body begins.
+     */
+    heredocFrom?: number;
 }
 
 interface Assignment {
@@ -1041,6 +1047,8 @@ interface Node {
     background?: boolean;
     /** The pipeline as it was written: the source a job started from it is handed to run. */
     source?: string;
+    /** Where in the script that source stopped, so a job can tell what it holds from what follows. */
+    end?: number;
 }
 
 /** Words bash reserves: in command position they end the construct instead of naming a command. */
@@ -1490,6 +1498,10 @@ class Parser {
         }
         const body = this.src.slice(this.pos, i);
         this.pos = Math.min(i + 1, this.src.length);
+        /* A `${` no `}` ever closed runs to the end of the script, and that is a syntax error a
+           host reports: `echo ${x` is `unexpected EOF while looking for matching `}'` and a status
+           of 2, where reading the name as complete ran the echo and printed an empty line. */
+        if (depth !== 0) throw new ShellSyntaxError("unexpected EOF while looking for matching `}'");
         return body;
     }
 
@@ -1592,6 +1604,11 @@ class Parser {
                     text += cur;
                     this.pos++;
                 }
+                /* A `"` no second `"` ever closed runs to the end of the script, and that is the
+                   syntax error a host reports -- `echo "abc` is `unexpected EOF while looking for
+                   matching `"'` and a status of 2, where taking the quote as closed at the end of
+                   the input printed `abc`. A word that really ends in `"` leaves the loop on it. */
+                if (this.pos >= this.src.length) throw new ShellSyntaxError("unexpected EOF while looking for matching `\"'");
                 this.pos++;
                 if (text !== '') inner.push({ t: 'lit', v: text });
                 parts.push({ t: 'dq', parts: inner });
@@ -1711,7 +1728,10 @@ class Parser {
         const pending = this.heredocs;
         this.heredocs = [];
         for (const entry of pending) {
-            if (this.here() === '\n') this.pos++;
+            /* No newline is eaten here: every caller has already stepped past the one that ended
+               the command line, so what stands here is the body's own first character -- eating one
+               more took the body's leading blank line with it, and `cat <<EOF` written over
+               `\n\na\n\nEOF` printed `a\n\n` where a host printed `\na\n\n`. */
             const bodyStart = this.pos;
             const lines: string[] = [];
             while (!this.eof()) {
@@ -1729,6 +1749,7 @@ class Parser {
                not part of it. Replayed from what is kept here, `cat <<EOF &` reads what it read
                inline, instead of an end of input that was never written. */
             entry.target.heredoc = this.src.slice(bodyStart, this.pos);
+            entry.target.heredocFrom = bodyStart;
             /* The body is the input itself, not the name of a file holding it: it stays a `<<`
                redirection, which `planRedirects` reads as text the command reads on its standard
                input. Reading it as a file looked for a file called `hi` and failed with ENOENT.
@@ -1824,12 +1845,22 @@ class Parser {
             this.skipSpace(false);
             if (this.here() === '|' && this.src[this.pos + 1] !== '|' && this.src[this.pos + 1] !== undefined) {
                 this.pos++;
+                /* The body of a here-document stands on the line behind the one its `<<` is on, so
+                   a line the pipeline continues onto is not the command it continues with until that
+                   body has been read: `cat <<EOF |\na\nEOF\ncat` is `a` through `cat`, where taking
+                   the line behind the `|` as its next command made `a` a command of its own and left
+                   the here-document with an end of input nothing had written. */
+                this.skipSpace(false);
+                if (this.heredocs.length > 0 && this.here() === '\n') {
+                    this.pos++;
+                    this.readHeredocs();
+                }
                 this.skipSpace(true);
                 continue;
             }
             break;
         }
-        return { bang, commands, op, source: this.src.slice(start, this.pos).trim() };
+        return { bang, commands, op, source: this.src.slice(start, this.pos).trim(), end: this.pos };
     }
 
     private parseCommand(): Command {
@@ -2677,6 +2708,12 @@ let substitutionStatus = 0;
 function runSubstitution(state: ShellState, script: string): string {
     const snapshot = snapshotState(state);
     const savedIo = state.io;
+    /* What the substitution captures is the standard output of the script it runs, so the script
+       starts with the shell's own output target put back however `exec` had moved it: `exec >f;
+       echo [$(echo hi)]` writes `[hi]` into `f`, where inheriting the target wrote `hi` to the file
+       and captured nothing at all. The error is still the shell's own, as it is on a host -- only
+       the output is the substitution's. */
+    state.stdoutTarget = { kind: 'out' };
     const inherited = state.traps.get('EXIT');
     state.io = { stdout: '', stderr: '' };
     let status = 0;
@@ -2941,11 +2978,13 @@ function nestedNodes(body: CommandBody): Node[][] {
  * The here-document bodies a command was written with, in the order their `<<` stand in, each one
  * the source `readHeredocs` kept for it: the lines of the body and the delimiter line behind them.
  */
-function collectHeredocs(command: Command, out: string[]): void {
+function collectHeredocs(command: Command, out: { text: string; from: number }[]): void {
     const redirects = (command as { redirects?: Redirect[] }).redirects;
     if (redirects !== undefined) {
         for (const redirect of redirects) {
-            if (redirect.heredoc !== undefined && redirect.heredoc !== '') out.push(redirect.heredoc);
+            if (redirect.heredoc !== undefined && redirect.heredoc !== '') {
+                out.push({ text: redirect.heredoc, from: redirect.heredocFrom ?? -1 });
+            }
         }
     }
     for (const nodes of nestedNodes(command)) {
@@ -2961,10 +3000,15 @@ function collectHeredocs(command: Command, out: string[]): void {
  */
 function backgroundSource(node: Node): string {
     const source = node.source ?? '';
-    const bodies: string[] = [];
+    const bodies: { text: string; from: number }[] = [];
     for (const command of node.commands) collectHeredocs(command, bodies);
-    if (bodies.length === 0) return source;
-    return source + '\n' + bodies.join('');
+    /* Only a body the source does not already hold is put back: a compound whose `&` lands behind
+       its closing word -- `( cat <<EOF\nb\nEOF\n ) &`, `if ... fi &`, `for ... done &` -- spans its
+       own body, and appending it again ran `b` and `EOF` as commands behind it. A body is inside
+       the source when it starts before the source stops. */
+    const behind = bodies.filter((body) => body.from >= (node.end ?? 0)).map((body) => body.text);
+    if (behind.length === 0) return source;
+    return source + '\n' + behind.join('');
 }
 
 function startBackgroundNode(state: ShellState, node: Node): number | null {
@@ -3027,6 +3071,12 @@ function runNode(state: ShellState, node: Node, input: string | null): number {
 function runCompoundRedirected(state: ShellState, command: Command, input: string | null, body: () => number): number {
     const redirects = (command as { redirects?: Redirect[] }).redirects ?? [];
     const plan = planRedirects(state, redirects);
+    /* A redirection nothing can be made of ends the construct before a single command of it runs,
+       as it does on a host: `{ echo hi; } >&9` is the bad descriptor's diagnostic and a status of
+       1, with no `hi` written. The files the redirections ahead of the failure opened stay created
+       and empty -- `{ echo a; } 3>f 2>&9` leaves an empty `f` -- and the ones behind it are never
+       opened at all. */
+    if (plan.error !== undefined) return finish(state, plan, '', '', 1);
     const fromFile = plan.inputFile !== undefined;
     const needsInput = fromFile || plan.inputText !== undefined || input !== null;
     const needsOutput = plan.stdoutTo.kind !== 'out' || plan.stderrTo.kind !== 'err';
@@ -3285,6 +3335,16 @@ function planDuplicate(state: ShellState, plan: RedirectPlan, fd: number, target
         if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
         return;
     }
+    /* `>&word` with a word that names no descriptor is both streams, the way `&>word` writes them:
+       `{ echo o; echo e >&2; } >&f` is `o` and `e` both in `f`, and `echo hi >&f` is `hi` in `f`
+       with nothing on the error. A number in front of the operator -- `2>&f`, `3>&f` -- says which
+       descriptor moves, and a host reads that as an ambiguous redirect instead, so only the form
+       with no number is read as the two of them. */
+    if (fd === 1 && !/^[0-9]+$/.test(target) && resolved.kind === 'file') {
+        plan.stdoutTo = { ...resolved };
+        plan.stderrTo = { ...resolved };
+        return;
+    }
     sink(resolved);
     if (resolved.kind === 'file' && resolved.file !== undefined && /^[0-9]+$/.test(target)) {
         const number = Number.parseInt(target, 10);
@@ -3336,6 +3396,13 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
         } else {
             fds.set(fd, entry);
             plan.fds.set(fd, { ...entry });
+            /* The standard input is the text the commands behind it read, so a file put on it is
+               the shell's own input from here on: `exec 0<f; cat` prints `f`, and `read l` reads
+               its first line, as they do on a host. */
+            if (fd === 0 && entry.kind === 'input' && entry.file !== undefined) {
+                state.inputBuffer = readInputFile(state, entry.file);
+                state.inputCursor = 0;
+            }
         }
     };
     for (const redirect of redirects) {
@@ -3346,9 +3413,10 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
                 setFd(redirect.fd, { kind: 'file', file: target, append: redirect.op === '>>' });
                 break;
             case '<':
-                /* A descriptor above 2 opened for reading: `exec 3<f; cat <&3` reads `f`. The
-                   standard input itself is the text the shell was handed, which no file replaces. */
-                if (redirect.fd >= 3) setFd(redirect.fd, { kind: 'input', file: target });
+                /* A descriptor opened for reading: `exec 3<f; cat <&3` reads `f`, and the standard
+                   input itself is the file from here on -- `exec 0<f; cat` prints `f`, which is what
+                   a host's `exec 0<f` leaves behind it. */
+                if (redirect.fd === 0 || redirect.fd >= 3) setFd(redirect.fd, { kind: 'input', file: target });
                 break;
             case '>&':
             case '<&': {
@@ -3368,6 +3436,20 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
 }
 
 /**
+ * A target `exec` left the shell with, read as the descriptor a host's `exec` left open: it is
+ * already open, so a command writing through it writes at the offset the commands before it left.
+ *
+ * `exec >f; echo a; echo b` is both lines in `f`, which opening `f` again for `echo b` lost -- the
+ * second open truncated the `a` away -- and a command that writes nothing leaves the file exactly
+ * as it was, where opening it again emptied it: the `true` behind `exec 2>f; echo e >&2; true`
+ * wiped the `e` the echo had just written. Only a redirection this command wrote itself opens the
+ * file again, so only one of those truncates.
+ */
+function inherited(target: StreamTarget): StreamTarget {
+    return target.kind === 'file' ? { ...target, append: true } : { ...target };
+}
+
+/**
  * The plan of one command: where its output and error go, what it reads, and the descriptors above
  * 2 its own redirections opened.
  *
@@ -3379,8 +3461,8 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
  */
 function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
     const plan: RedirectPlan = {
-        stdoutTo: { ...state.stdoutTarget },
-        stderrTo: { ...state.stderrTarget },
+        stdoutTo: inherited(state.stdoutTarget),
+        stderrTo: inherited(state.stderrTarget),
         opened: [],
         fds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }]))
     };
@@ -3394,8 +3476,13 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
                 else if (redirect.fd === 1) plan.stdoutTo = { kind: 'file', file: target, append: redirect.op === '>>' };
                 else {
                     plan.fds.set(redirect.fd, { kind: 'file', file: target, append: redirect.op === '>>' });
-                    plan.opened.push({ fd: redirect.fd, file: target, append: redirect.op === '>>' });
                 }
+                /* Every file a redirection names is opened where the operator stands, the standard
+                   descriptors' with the rest: `echo hi >f >&-` leaves an empty `f` behind the write
+                   error `>&-` gave, and `echo hi >f 2>&9` leaves it behind the bad descriptor's,
+                   which is what a host leaves, where a file opened only as the command's output was
+                   written came and went with the write itself. */
+                plan.opened.push({ fd: redirect.fd, file: target, append: redirect.op === '>>' });
                 break;
             case '<':
                 /* A descriptor above 2 opened for reading is one only `>&n` and `<&n` name: `cat
@@ -3436,7 +3523,10 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
                     break;
                 }
                 if (/^[0-9]+$/.test(target)) {
-                    const opened = plan.fds.get(Number.parseInt(target, 10));
+                    /* `1` and `2` are the two every command carries, and they are where this
+                       command's own plan sends them: `exec 3<&1` duplicates the standard output,
+                       which is not a descriptor nothing opened. */
+                    const opened = duplicateOf(plan, target);
                     if (opened === undefined) {
                         if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
                         break;
@@ -3518,6 +3608,18 @@ function finish(
         if (plan.error !== undefined) {
             writeErr(state, plan.error);
             return 1;
+        }
+        /* One file both streams name -- `&>f`, and `>f 2>&1` -- is one descriptor a host opened
+           once, so what the command wrote lands in it in the order it was written: `{ echo o; echo
+           e >&2; } &>f` holds `o` then `e`. Writing each stream on its own put the second over the
+           first, and the file kept only one of them. */
+        if (
+            plan.stdoutTo.kind === 'file' && plan.stderrTo.kind === 'file'
+            && plan.stdoutTo.file !== undefined && plan.stderrTo.file !== undefined
+            && resolvePath(state, plan.stdoutTo.file) === resolvePath(state, plan.stderrTo.file)
+        ) {
+            writeOutputFile(state, plan.stdoutTo.file, stdout + stderr, Boolean(plan.stdoutTo.append));
+            return exitCode;
         }
         if (plan.stderrTo.kind === 'null') stderr = '';
         else if (plan.stderrTo.kind === 'out') {
@@ -3724,6 +3826,9 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     try {
         const fn = state.functions.get(name);
         if (fn !== undefined) {
+            /* A function its own redirections could not be made of is not called: `f >&9` with no
+               `9` is the diagnostic and a status of 1 on a host, and no `x` from the body. */
+            if (plan.error !== undefined) return finish(state, plan, '', '', 1, name);
             for (const entry of pending) setVar(state, entry.name, entry.value);
             const status = callFunction(state, fn, args);
             for (const entry of pending) setVar(state, entry.name, entry.value);
@@ -3940,15 +4045,43 @@ function functionBody(def: FunctionDef): string {
 
 function describeName(state: ShellState, name: string): string {
     if (state.aliases.has(name)) return `${name} is aliased to \`${state.aliases.get(name)}'`;
-    if (COMMANDS[name] !== undefined || HOST_BUILTINS.has(name)) return `${name} is a shell builtin`;
+    if (SHELL_OWN_NAMES.has(name)) return `${name} is a shell builtin`;
     if (state.functions.has(name)) {
         const def = state.functions.get(name) as FunctionDef;
         return `${name} is a function\n${name} () \n{ \n${functionBody(def)}\n}`;
     }
+    /* The file on PATH comes before the builtin of the same name: `ls` is one here and a file out
+       there, and a host describes the file. */
     const path = findOnPath(state, name);
     if (path !== undefined) return `${name} is ${path}`;
+    if (COMMANDS[name] !== undefined || HOST_BUILTINS.has(name)) return `${name} is a shell builtin`;
     const fs = state.fs;
     if (fs && fs.fileExists(resolvePath(state, name))) return `${name} is ${resolvePath(state, name)}`;
+    return '';
+}
+
+/** The names a POSIX shell carries in itself rather than on PATH. `command -v` names one of these
+ *  instead of a file even where the file is also there -- a host answers `echo` and not `/bin/echo`
+ *  -- because the shell's own is what a line would run. */
+const SHELL_OWN_NAMES = new Set([
+    '.', ':', '[', 'alias', 'bg', 'bind', 'break', 'builtin', 'caller', 'cd', 'command', 'continue',
+    'declare', 'dirs', 'disown', 'echo', 'enable', 'eval', 'exec', 'exit', 'export', 'false', 'fg',
+    'getopts', 'hash', 'history', 'jobs', 'kill', 'let', 'local', 'popd', 'printf', 'pushd', 'pwd',
+    'read', 'readonly', 'return', 'set', 'shift', 'shopt', 'source', 'test', 'times', 'trap', 'true',
+    'type', 'ulimit', 'umask', 'unalias', 'unset', 'wait'
+]);
+
+/** What `command -v` writes: the pathname of the file a line would run, or -- for a name the shell
+ *  carries itself, and for one no directory on PATH holds -- the name, as a host writes it. */
+function pathOfName(state: ShellState, name: string): string {
+    if (SHELL_OWN_NAMES.has(name)) return name;
+    const path = findOnPath(state, name);
+    if (path !== undefined) return path;
+    const fs = state.fs;
+    if (fs && fs.fileExists(resolvePath(state, name))) return resolvePath(state, name);
+    if (state.aliases.has(name) || state.functions.has(name) || COMMANDS[name] !== undefined || HOST_BUILTINS.has(name)) {
+        return name;
+    }
     return '';
 }
 
@@ -4342,7 +4475,8 @@ function commandBuiltin(ctx: CommandContext): CommandResult {
     const name = args[index];
     if (name === undefined) return ok();
     if (describe) {
-        const text = describeName(state, name);
+        /* `-V` is the one that describes; `-v` is the one that names, and prints the path alone. */
+        const text = describeFull ? describeName(state, name) : pathOfName(state, name);
         if (text === '') return { stdout: '', stderr: '', exitCode: 1 };
         return { stdout: (describeFull ? text.split('\n')[0] : text) + '\n', stderr: '', exitCode: 0 };
     }

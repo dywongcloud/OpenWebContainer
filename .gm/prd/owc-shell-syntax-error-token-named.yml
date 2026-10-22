@@ -1,0 +1,7 @@
+id: owc-shell-syntax-error-token-named
+subject: the token a syntax error names is not the one the host names
+description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4). The row owc-shell-syntax-error-token-in-substitution was closed on two shapes that happen to name the right token; the class does not. `if; then`: host "syntax error near unexpected token `;'" vs container "syntax error near unexpected token `newline'". Same for `while; do echo; done` and for `{ cat <<EOF\na\nEOF\n; } & wait`. `echo |`: host "syntax error: unexpected end of file" vs container "syntax error near unexpected token `|'". `for x in a; echo hi; done`: host names `echo`, container says "syntax error: `do' expected". The container reports the token its own parser stopped on, which is the newline or the operator it read, rather than the one a host's parser could not reduce.'
+witness_plan: Run `if; then`, `echo |` and `for x in a; echo hi; done` on both sides; each stderr must name `;`, end of file, and `echo` respectively.
+session_id: adv2-judge-shell-diag-4
+owner: adv2-judge-shell-diag-4
+status: pending

@@ -948,3 +948,8 @@ re-run in isolation; the rows are open.
   the frame at column 1, the container at 12, so both are wrong; the caret now tracks the frame (the
   scan that found a `throw` inside the string literal is fixed) and what is left is the frame column
   V8 gives an `&&` expression.
+
+- `owc-shell-syntax-error-source-line`: `echo a\nif; then` -- the host prints `a` first (it parses as it runs) and echoes only `if; then` as the source line; the container prints nothing and echoes the whole script. `((1+)` and `case x in` gain an echoed source line the host never writes at all.
+- `owc-shell-syntax-error-token-named`: `if; then` -- the host names `;` where the container names `newline`; `echo |` -- the host reports an unexpected end of file where the container names `|`; `for x in a; echo hi; done` -- the host names `echo` where the container says `` `do' expected ''.
+- `owc-shell-arith-operand-error-status`: `x=$((1+))` -- host stderr `/bin/sh: 1+: syntax error: operand expected (error token is "+")` exit 127; container stderr `syntax error: operand expected` exit 1.
+- `owc-shell-command-not-found-wording`: `nosuchcmd-j4` -- host stderr `/bin/sh: nosuchcmd-j4: command not found`; container `Command not found: nosuchcmd-j4`. Not a prefix difference: the name sits in a different place in the sentence.
