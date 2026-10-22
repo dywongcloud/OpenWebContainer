@@ -560,6 +560,40 @@ function bodyStream(body) {
   return stream;
 }
 
+/*
+ * What a Response holds, kept beside the instance in a WeakMap rather than on it. Node's Response
+ * carries no own properties at all -- its fields are prototype accessors -- so Object.keys() of one
+ * is [] and JSON.stringify() of one is '{}', where a plain object with the same fields written on
+ * it would serialise every one of them. A class built over a state object keeps the accessors
+ * assignable, which is the other half of what a program expects: status, url and the rest still
+ * read back what a caller wrote.
+ */
+var RESPONSE_STATE = new WeakMap();
+
+function responseState(res) {
+  var state = RESPONSE_STATE.get(res);
+  if (state === undefined) {
+    state = {
+      status: 200, statusText: '', ok: true, type: 'default', redirected: false, url: '',
+      headers: new Headers(), bytes: null, stream: null, pending: null, used: false
+    };
+    RESPONSE_STATE.set(res, state);
+  }
+  return state;
+}
+
+/* One accessor per field, over the state object: readable and writable, as Node's are readable.
+   The four slots a body is kept in are not part of Node's shape at all, so they stay unseen --
+   a for-in over a Response lists the fields and the methods and nothing else. */
+function responseField(name, key, seen) {
+  Object.defineProperty(Response.prototype, name, {
+    get: function () { return responseState(this)[key]; },
+    set: function (value) { responseState(this)[key] = value; },
+    enumerable: seen === true,
+    configurable: true
+  });
+}
+
 function Response(body, init) {
   if (!(this instanceof Response)) {
     throw new TypeError('Class constructor _Response cannot be invoked without \'new\'');
@@ -578,19 +612,33 @@ function Response(body, init) {
   if (made.has && (status === 204 || status === 205 || status === 304)) {
     throw new TypeError('Response constructor: Invalid response status code ' + status);
   }
-  this.status = status;
-  this.statusText = statusText;
-  this.ok = status >= 200 && status < 300;
-  this.type = 'default';
-  this.redirected = false;
-  this.url = init.url === undefined ? '' : String(init.url);
-  this.headers = new Headers(init.headers);
-  if (made.contentType !== null && !this.headers.has('content-type')) this.headers.set('content-type', made.contentType);
-  this._bytes = made.bytes;
-  this._stream = made.stream;
-  this._pending = made.pending;
-  this._used = false;
+  var state = {
+    status: status,
+    statusText: statusText,
+    ok: status >= 200 && status < 300,
+    type: 'default',
+    redirected: false,
+    url: init.url === undefined ? '' : String(init.url),
+    headers: new Headers(init.headers),
+    bytes: made.bytes,
+    stream: made.stream,
+    pending: made.pending,
+    used: false
+  };
+  RESPONSE_STATE.set(this, state);
+  if (made.contentType !== null && !state.headers.has('content-type')) state.headers.set('content-type', made.contentType);
 }
+responseField('status', 'status', true);
+responseField('statusText', 'statusText', true);
+responseField('ok', 'ok', true);
+responseField('type', 'type', true);
+responseField('redirected', 'redirected', true);
+responseField('url', 'url', true);
+responseField('headers', 'headers', true);
+responseField('_bytes', 'bytes', false);
+responseField('_stream', 'stream', false);
+responseField('_pending', 'pending', false);
+responseField('_used', 'used', false);
 Object.defineProperty(Response.prototype, 'body', {
   get: function () { return bodyStream(this); },
   configurable: true
@@ -628,25 +676,32 @@ Response.prototype.clone = function () {
      with, and status 0 -- the one Response.error() carries -- is not a status the constructor
      would accept again */
   var copy = Object.create(Response.prototype);
-  copy.status = this.status;
-  copy.statusText = this.statusText;
-  copy.ok = this.ok;
-  copy.type = this.type;
-  copy.redirected = this.redirected;
-  copy.url = this.url;
-  copy.headers = new Headers(this.headers);
-  copy._used = false;
-  if (this._stream !== null && this._stream !== undefined) {
-    var both = this._stream.tee();
-    this._stream = both[0];
-    copy._stream = both[1];
-    copy._bytes = null;
-    copy._pending = null;
-    this._bytes = null;
+  var source = responseState(this);
+  var state = {
+    status: source.status,
+    statusText: source.statusText,
+    ok: source.ok,
+    type: source.type,
+    redirected: source.redirected,
+    url: source.url,
+    headers: new Headers(source.headers),
+    bytes: null,
+    stream: null,
+    pending: null,
+    used: false
+  };
+  RESPONSE_STATE.set(copy, state);
+  if (source.stream !== null && source.stream !== undefined) {
+    var both = source.stream.tee();
+    source.stream = both[0];
+    state.stream = both[1];
+    state.bytes = null;
+    state.pending = null;
+    source.bytes = null;
   } else {
-    copy._bytes = this._bytes;
-    copy._pending = this._pending;
-    copy._stream = null;
+    state.bytes = source.bytes;
+    state.pending = source.pending;
+    state.stream = null;
   }
   return copy;
 };
@@ -681,17 +736,19 @@ Response.redirect = function (url, status) {
 };
 Response.error = function () {
   var res = Object.create(Response.prototype);
-  res.status = 0;
-  res.statusText = '';
-  res.ok = false;
-  res.type = 'error';
-  res.redirected = false;
-  res.url = '';
-  res.headers = new Headers();
-  res._bytes = null;
-  res._stream = null;
-  res._pending = null;
-  res._used = false;
+  RESPONSE_STATE.set(res, {
+    status: 0,
+    statusText: '',
+    ok: false,
+    type: 'error',
+    redirected: false,
+    url: '',
+    headers: new Headers(),
+    bytes: null,
+    stream: null,
+    pending: null,
+    used: false
+  });
   return res;
 };
 
@@ -1005,6 +1062,8 @@ var WS_OPEN = 1;
 var WS_CLOSING = 2;
 var WS_CLOSED = 3;
 var WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+/* the four handlers, in the order Node declares them on the prototype */
+var WS_HANDLERS = ['open', 'error', 'close', 'message'];
 
 function wsAcceptOf(key) {
   return requireBuiltin('crypto').createHash('sha1').update(key + WS_GUID).digest('base64');
@@ -1024,8 +1083,9 @@ function wsMaskFrame(opcode, payload) {
 }
 
 function wsSendFrame(ws, opcode, payload) {
-  if (ws.readyState === WS_CLOSED || !ws._socket) return false;
-  ws._socket.write(wsMaskFrame(opcode, payload));
+  var state = wsState(ws);
+  if (state.readyState === WS_CLOSED || !state.socket) return false;
+  state.socket.write(wsMaskFrame(opcode, payload));
   return true;
 }
 
@@ -1048,9 +1108,133 @@ function wsCloseCodeOk(code) {
   return code >= 3000 && code <= 4999;
 }
 
+/*
+ * Whether a byte string is well-formed UTF-8. The lead byte fixes how many continuations follow and
+ * narrows the first of them: 0xe0 needs 0xa0 and up so nothing is spelled in more bytes than it
+ * needs, 0xed stops at 0x9f so a half surrogate is refused, 0xf0 starts at 0x90 and 0xf4 stops at
+ * 0x8f so nothing above U+10FFFF is spelled -- while 0xc0, 0xc1 and 0xf5 upward name no character.
+ * Node reads a text frame this way before it delivers one and fails the connection on the first byte
+ * string that is not, rather than handing a program replacement characters.
+ */
+function wsUtf8Ok(bytes) {
+  var i = 0;
+  var n = bytes.length;
+  while (i < n) {
+    var lead = bytes[i];
+    var extra = 0;
+    var lo = 0x80;
+    var hi = 0xbf;
+    if (lead <= 0x7f) { i += 1; continue; }
+    if (lead >= 0xc2 && lead <= 0xdf) extra = 1;
+    else if (lead >= 0xe0 && lead <= 0xef) {
+      extra = 2;
+      if (lead === 0xe0) lo = 0xa0;
+      else if (lead === 0xed) hi = 0x9f;
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
+      extra = 3;
+      if (lead === 0xf0) lo = 0x90;
+      else if (lead === 0xf4) hi = 0x8f;
+    } else return false;
+    if (i + extra >= n) return false;
+    if (bytes[i + 1] < lo || bytes[i + 1] > hi) return false;
+    for (var k = 2; k <= extra; k++) {
+      var cont = bytes[i + k];
+      if (cont < 0x80 || cont > 0xbf) return false;
+    }
+    i += extra + 1;
+  }
+  return true;
+}
+
+/*
+ * The state behind a socket, which no program is meant to see. Host Node keeps it in internal slots:
+ * a socket carries no own property at all -- Object.getOwnPropertyNames(ws) is [] on the host and
+ * every attribute is a prototype accessor -- so a WeakMap is the same thing here, with the socket as
+ * the key and nothing about it changed. The emitter lives in that state too rather than on the
+ * instance, so the three slots an emitter would otherwise own never appear on the socket either.
+ */
+var WS_STATE = new WeakMap();
+
+function wsState(ws) {
+  return WS_STATE.get(ws);
+}
+
+/*
+ * The socket's events are carried by an emitter, but a socket shows EventTarget's surface and no
+ * longer inherits one, so the emitter is reached through the state rather than through 'this'.
+ * 'error' is still only delivered to a program that is listening for it: an unhandled one is the
+ * exception a real emitter throws, not a message nobody asked for.
+ */
+function wsOn(ws, name, fn) {
+  wsState(ws).emitter.on(name, fn);
+}
+
+function wsOff(ws, name, fn) {
+  wsState(ws).emitter.removeListener(name, fn);
+}
+
+function wsEmit(ws, name, event) {
+  return wsState(ws).emitter.emit(name, event);
+}
+
+function wsListenerCount(ws, name) {
+  return wsState(ws).emitter.listenerCount(name);
+}
+
+/*
+ * The message event Node delivers: a MessageEvent, whose data, origin, lastEventId, source and ports
+ * are prototype getters over state no program can see, so an instance carries no own property and a
+ * 'for (const k in event)' reads the prototype's names. 'origin' is the socket URL's origin -- it
+ * stops at the host and carries no path, unlike the url itself -- and 'target' is the socket: the
+ * container carries events on an emitter rather than dispatching them, so nothing else sets one.
+ */
+var WS_EVENT_TARGET = new WeakMap();
+
+var WS_MESSAGE_PROTO = (function () {
+  var Base = typeof globalThis.MessageEvent === 'function' ? globalThis.MessageEvent.prototype : Object.prototype;
+  var proto = Object.create(Base);
+  Object.defineProperty(proto, 'target', {
+    get: function () { return WS_EVENT_TARGET.get(this); },
+    configurable: true
+  });
+  return proto;
+})();
+
+function wsMessageEvent(ws, data) {
+  var origin = wsState(ws).origin;
+  var event = null;
+  if (typeof globalThis.MessageEvent === 'function') {
+    try {
+      event = new globalThis.MessageEvent('message', {
+        data: data,
+        origin: origin,
+        lastEventId: '',
+        source: null,
+        ports: []
+      });
+    } catch (badEvent) { event = null; }
+  }
+  if (event === null) {
+    event = { type: 'message', data: data, origin: origin, lastEventId: '', source: null, ports: [] };
+  } else {
+    Object.setPrototypeOf(event, WS_MESSAGE_PROTO);
+  }
+  WS_EVENT_TARGET.set(event, ws);
+  return event;
+}
+
 function wsDeliverMessage(ws, opcode, bytes) {
   var data;
   if (opcode === 0x1) {
+    /*
+     * A text frame that is not UTF-8: Node fails the connection there and then -- an error event and
+     * the abnormal 1006 -- and tells the peer why with a 1007 close frame.
+     */
+    if (!wsUtf8Ok(bytes)) {
+      wsSendFrame(ws, 0x8, wsCloseBody(1007, 'Received invalid UTF-8 in text frame.'));
+      wsFail(ws);
+      return;
+    }
     data = bytes.toString('utf8');
   } else if (ws.binaryType === 'arraybuffer') {
     data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
@@ -1059,10 +1243,11 @@ function wsDeliverMessage(ws, opcode, bytes) {
   } else {
     data = new globalThis.Blob([new Uint8Array(bytes)]);
   }
-  ws.emit('message', { type: 'message', data: data, origin: ws.url, lastEventId: '', target: ws });
+  wsEmit(ws, 'message', wsMessageEvent(ws, data));
 }
 
 function wsHandleFrame(ws, fin, opcode, payload) {
+  var state = wsState(ws);
   if (opcode === 0x8) {
     /*
      * A close frame the protocol does not allow: one byte of payload, which is half a code, or a
@@ -1084,10 +1269,10 @@ function wsHandleFrame(ws, fin, opcode, payload) {
      * not for the frame -- a server that sends a close frame and keeps the socket leaves the
      * client at readyState 2 for as long as the socket lives.
      */
-    ws._closeReceived = code;
-    ws._closeReceivedReason = reason;
-    if (ws.readyState === WS_OPEN) {
-      ws.readyState = WS_CLOSING;
+    state.closeReceived = code;
+    state.closeReceivedReason = reason;
+    if (state.readyState === WS_OPEN) {
+      state.readyState = WS_CLOSING;
       wsSendFrame(ws, 0x8, wsCloseBody(code, ''));
     }
     return;
@@ -1095,21 +1280,21 @@ function wsHandleFrame(ws, fin, opcode, payload) {
   if (opcode === 0x9) { wsSendFrame(ws, 0xa, payload); return; }
   if (opcode === 0xa) return;
   if (opcode === 0x1 || opcode === 0x2) {
-    ws._fragOp = opcode;
-    ws._frags = [payload];
-  } else if (opcode === 0x0 && ws._frags.length > 0) {
-    ws._frags.push(payload);
+    state.fragOp = opcode;
+    state.frags = [payload];
+  } else if (opcode === 0x0 && state.frags.length > 0) {
+    state.frags.push(payload);
   } else {
     return;
   }
   if (!fin) return;
-  var all = ws._frags.length === 1 ? ws._frags[0] : Buffer.concat(ws._frags);
-  ws._frags = [];
-  wsDeliverMessage(ws, ws._fragOp, all);
+  var all = state.frags.length === 1 ? state.frags[0] : Buffer.concat(state.frags);
+  state.frags = [];
+  wsDeliverMessage(ws, state.fragOp, all);
 }
 
 function wsFeed(ws, buf) {
-  while (ws.readyState !== WS_CLOSED) {
+  while (wsState(ws).readyState !== WS_CLOSED) {
     if (buf.length < 2) return buf;
     var b0 = buf[0];
     var b1 = buf[1];
@@ -1146,31 +1331,34 @@ function wsFeed(ws, buf) {
  * is the abnormal closure Node reports as 1006, and it carries an error first.
  */
 function wsSettle(ws, code, reason, clean) {
-  if (ws._settled) return;
-  ws._settled = true;
-  ws.readyState = WS_CLOSED;
-  if (ws._socket) {
-    try { ws._socket.destroy(); } catch (destroyError) {}
-    ws._socket = null;
+  var state = wsState(ws);
+  if (state.settled) return;
+  state.settled = true;
+  state.readyState = WS_CLOSED;
+  if (state.socket) {
+    try { state.socket.destroy(); } catch (destroyError) {}
+    state.socket = null;
   }
-  ws.emit('close', wsCloseEvent(code, reason, clean, ws));
+  wsEmit(ws, 'close', wsCloseEvent(code, reason, clean, ws));
 }
 
 function wsSocketGone(ws) {
-  if (ws._settled || ws.readyState === WS_CLOSED) return;
-  if (ws._closeReceived !== undefined && ws._closeReceived !== null) {
-    wsSettle(ws, ws._closeReceived, ws._closeReceivedReason, true);
+  var state = wsState(ws);
+  if (state.settled || state.readyState === WS_CLOSED) return;
+  if (state.closeReceived !== undefined && state.closeReceived !== null) {
+    wsSettle(ws, state.closeReceived, state.closeReceivedReason, true);
     return;
   }
-  if (ws.listenerCount('error') > 0) ws.emit('error', wsErrorEvent(ws));
+  if (wsListenerCount(ws, 'error') > 0) wsEmit(ws, 'error', wsErrorEvent(ws));
   wsSettle(ws, 1006, '', false);
 }
 
 function wsFail(ws) {
-  if (ws._settled) return;
+  var state = wsState(ws);
+  if (state.settled) return;
   /* a listener sees the socket as Node does: already CLOSED, not still connecting */
-  ws.readyState = WS_CLOSED;
-  if (ws.listenerCount('error') > 0) ws.emit('error', wsErrorEvent(ws));
+  state.readyState = WS_CLOSED;
+  if (wsListenerCount(ws, 'error') > 0) wsEmit(ws, 'error', wsErrorEvent(ws));
   wsSettle(ws, 1006, '', false);
 }
 
@@ -1318,27 +1506,39 @@ function wsProtocols(protocols) {
 function WebSocket(url, protocols) {
   if (!(this instanceof WebSocket)) return new WebSocket(url, protocols);
   var EventEmitter = requireBuiltin('events');
-  EventEmitter.call(this);
   var self = this;
   if (arguments.length < 1) throw new TypeError('WebSocket constructor: 1 argument required, but 0 found.');
   var offered = wsProtocols(protocols);
   var href = wsParseUrl(url);
   var parsed = new globalThis.URL(href);
   var secure = parsed.protocol === 'wss:';
-  this.url = href;
-  this.protocol = '';
-  this.extensions = '';
-  /* binaryType is a prototype accessor: a fresh socket reads 'blob' without an own property */
-  this.bufferedAmount = 0;
-  this.readyState = WS_CONNECTING;
-  this._socket = null;
-  this._frags = [];
-  this._fragOp = 0;
-  this._settled = false;
-  this._closeCode = undefined;
-  this._closeReason = '';
-  this._closeReceived = undefined;
-  this._closeReceivedReason = '';
+  /*
+   * The whole of a socket's state, off the socket: it is read back through the accessors on the
+   * prototype and through wsState, so the socket itself never carries a property of its own.
+   */
+  var handlers = {};
+  for (var h = 0; h < WS_HANDLERS.length; h++) handlers[WS_HANDLERS[h]] = null;
+  var state = {
+    emitter: new EventEmitter(),
+    handlers: handlers,
+    url: href,
+    /* the message event's origin is the url's origin, which stops at the host and carries no path */
+    origin: parsed.protocol + '//' + parsed.host,
+    protocol: '',
+    extensions: '',
+    binaryType: 'blob',
+    bufferedAmount: 0,
+    readyState: WS_CONNECTING,
+    socket: null,
+    frags: [],
+    fragOp: 0,
+    settled: false,
+    closeCode: undefined,
+    closeReason: '',
+    closeReceived: undefined,
+    closeReceivedReason: ''
+  };
+  WS_STATE.set(this, state);
   var key = requireBuiltin('crypto').randomBytes(16).toString('base64');
   var headers = {
     Connection: 'Upgrade',
@@ -1357,19 +1557,36 @@ function WebSocket(url, protocols) {
       wsFail(self);
       return;
     }
-    self._socket = socket;
-    if (res.headers['sec-websocket-protocol'] !== undefined) self.protocol = res.headers['sec-websocket-protocol'];
-    if (res.headers['sec-websocket-extensions'] !== undefined) self.extensions = res.headers['sec-websocket-extensions'];
+    /*
+     * A protocol the client never asked for: the server may answer with one of the offered tokens or
+     * with nothing, and anything else -- a token the client did not offer, a second one, a spelling
+     * that differs in case -- fails the handshake the way a wrong Sec-WebSocket-Accept does, with an
+     * error and no open. The client does not fall back to what the server picked.
+     */
+    var negotiated = res.headers['sec-websocket-protocol'];
+    if (negotiated !== undefined && negotiated !== null) {
+      if (Array.isArray(negotiated)) negotiated = negotiated.join(', ');
+      if (offered.indexOf(negotiated) === -1) {
+        wsFail(self);
+        return;
+      }
+      state.protocol = negotiated;
+    }
+    var negotiatedExtensions = res.headers['sec-websocket-extensions'];
+    if (negotiatedExtensions !== undefined && negotiatedExtensions !== null) {
+      state.extensions = Array.isArray(negotiatedExtensions) ? negotiatedExtensions.join(', ') : negotiatedExtensions;
+    }
+    state.socket = socket;
     var rest = Buffer.isBuffer(head) ? head : Buffer.from('');
     socket.on('data', function (chunk) {
       rest = wsFeed(self, Buffer.concat([rest, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]));
     });
-    socket.on('error', function (err) { if (self.listenerCount('error') > 0) self.emit('error', err); });
+    socket.on('error', function (err) { if (wsListenerCount(self, 'error') > 0) wsEmit(self, 'error', err); });
     /* the connection ending is what closes the socket: a FIN, or the socket going away */
     socket.on('end', function () { wsSocketGone(self); });
     socket.on('close', function () { wsSocketGone(self); });
-    self.readyState = WS_OPEN;
-    self.emit('open', { type: 'open', target: self });
+    state.readyState = WS_OPEN;
+    wsEmit(self, 'open', { type: 'open', target: self });
     if (rest.length > 0) rest = wsFeed(self, rest);
   });
   req.on('response', function (res) {
@@ -1379,18 +1596,67 @@ function WebSocket(url, protocols) {
   req.on('error', function () { wsFail(self); });
   req.end();
 }
-WebSocket.prototype = Object.create(requireBuiltin('events').prototype);
-Object.defineProperty(WebSocket.prototype, 'constructor', { value: WebSocket, writable: true, configurable: true });
+/*
+ * The surface a socket shows. Host Node's WebSocket is an EventTarget: addEventListener,
+ * removeEventListener and dispatchEvent sit on EventTarget.prototype and not on the class, so a
+ * for-in reaches them after every attribute the class declares and they never appear among the
+ * class's own property names. WS_EVENT_BASE is that prototype's shape -- constructor, then the
+ * three -- built over the real EventTarget, so 'ws instanceof EventTarget' still holds, while every
+ * attribute of the socket itself is declared on WebSocket.prototype in the order Node declares it.
+ */
+var WS_EVENT_BASE = (function () {
+  var Ctor = typeof globalThis.EventTarget === 'function' ? globalThis.EventTarget : null;
+  var proto = Object.create(Ctor === null ? Object.prototype : Ctor.prototype);
+  Object.defineProperty(proto, 'constructor', {
+    value: Ctor === null ? Object : Ctor,
+    writable: true,
+    configurable: true
+  });
+  return proto;
+})();
 
-WebSocket.prototype.addEventListener = function addEventListener(type, fn) {
-  this.on(String(type), fn);
-};
-WebSocket.prototype.removeEventListener = function removeEventListener(type, fn) {
-  this.removeListener(String(type), fn);
-};
-WebSocket.prototype.dispatchEvent = function dispatchEvent(event) {
-  this.emit(event && event.type, event);
-  return true;
+Object.defineProperty(WS_EVENT_BASE, 'addEventListener', {
+  value: function addEventListener(type, fn) { wsOn(this, String(type), fn); },
+  writable: true,
+  configurable: true,
+  enumerable: true
+});
+Object.defineProperty(WS_EVENT_BASE, 'removeEventListener', {
+  value: function removeEventListener(type, fn) { wsOff(this, String(type), fn); },
+  writable: true,
+  configurable: true,
+  enumerable: true
+});
+Object.defineProperty(WS_EVENT_BASE, 'dispatchEvent', {
+  value: function dispatchEvent(event) {
+    wsEmit(this, event && event.type, event);
+    return !(event && event.defaultPrevented);
+  },
+  writable: true,
+  configurable: true,
+  enumerable: true
+});
+
+WebSocket.prototype = Object.create(WS_EVENT_BASE);
+Object.defineProperty(WebSocket.prototype, 'constructor', { value: WebSocket, writable: true, configurable: true });
+Object.defineProperty(WebSocket.prototype, Symbol.toStringTag, { value: 'WebSocket', configurable: true });
+
+WebSocket.prototype.close = function close(code, reason) {
+  if (this.readyState === WS_CLOSED || this.readyState === WS_CLOSING) return;
+  var num = code === undefined ? 1000 : wsCloseCodeOf(code);
+  /*
+   * The code is validated before the reason: a close carrying both an invalid code and an over-long
+   * reason is an invalid code, which is the order Node checks them in.
+   */
+  if (num !== 1000 && (num < 3000 || num > 4999)) throw wsDomError('invalid code', 'InvalidAccessError');
+  var text = reason === undefined ? '' : String(reason);
+  var bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes > 123) throw wsDomError('Reason must be less than 123 bytes; received ' + bytes, 'SyntaxError');
+  var state = wsState(this);
+  state.closeCode = num;
+  state.closeReason = text;
+  state.readyState = WS_CLOSING;
+  wsSendFrame(this, 0x8, wsCloseBody(num, text));
 };
 
 WebSocket.prototype.send = function send(data) {
@@ -1419,26 +1685,10 @@ WebSocket.prototype.send = function send(data) {
     payload = Buffer.from(String(data), 'utf8');
     opcode = 0x1;
   }
-  this.bufferedAmount += payload.length;
+  var state = wsState(this);
+  state.bufferedAmount += payload.length;
   wsSendFrame(this, opcode, payload);
-  this.bufferedAmount = 0;
-};
-
-WebSocket.prototype.close = function close(code, reason) {
-  if (this.readyState === WS_CLOSED || this.readyState === WS_CLOSING) return;
-  var num = code === undefined ? 1000 : wsCloseCodeOf(code);
-  /*
-   * The code is validated before the reason: a close carrying both an invalid code and an over-long
-   * reason is an invalid code, which is the order Node checks them in.
-   */
-  if (num !== 1000 && (num < 3000 || num > 4999)) throw wsDomError('invalid code', 'InvalidAccessError');
-  var text = reason === undefined ? '' : String(reason);
-  var bytes = Buffer.byteLength(text, 'utf8');
-  if (bytes > 123) throw wsDomError('Reason must be less than 123 bytes; received ' + bytes, 'SyntaxError');
-  this._closeCode = num;
-  this._closeReason = text;
-  this.readyState = WS_CLOSING;
-  wsSendFrame(this, 0x8, wsCloseBody(num, text));
+  state.bufferedAmount = 0;
 };
 
 WebSocket.CONNECTING = WS_CONNECTING;
@@ -1446,9 +1696,22 @@ WebSocket.OPEN = WS_OPEN;
 WebSocket.CLOSING = WS_CLOSING;
 WebSocket.CLOSED = WS_CLOSED;
 
+/*
+ * The attributes, each a prototype accessor over state a program cannot see, declared in the order
+ * Node declares them: both a for-in and Object.getOwnPropertyNames read that order back.
+ */
+function wsAttribute(name, read) {
+  Object.defineProperty(WebSocket.prototype, name, { configurable: true, enumerable: true, get: read });
+}
+
+wsAttribute('readyState', function () { return wsState(this).readyState; });
+wsAttribute('bufferedAmount', function () { return wsState(this).bufferedAmount; });
+wsAttribute('url', function () { return wsState(this).url; });
+wsAttribute('extensions', function () { return wsState(this).extensions; });
+wsAttribute('protocol', function () { return wsState(this).protocol; });
+
 (function () {
-  var handlers = ['open', 'message', 'error', 'close'];
-  for (var i = 0; i < handlers.length; i++) {
+  for (var i = 0; i < WS_HANDLERS.length; i++) {
     (function (name) {
       Object.defineProperty(WebSocket.prototype, 'on' + name, {
         /* Node's own handler properties are plain enumerable accessors, and one that was never
@@ -1456,17 +1719,17 @@ WebSocket.CLOSED = WS_CLOSED;
         configurable: true,
         enumerable: true,
         get: function () {
-          var fn = this['_handler_' + name];
-          return fn === undefined ? null : fn;
+          var fn = wsState(this).handlers[name];
+          return typeof fn === 'function' ? fn : null;
         },
         set: function (fn) {
-          var previous = this['_handler_' + name];
-          if (typeof previous === 'function') this.removeListener(name, previous);
-          this['_handler_' + name] = typeof fn === 'function' ? fn : null;
-          if (typeof fn === 'function') this.on(name, fn);
+          var handlers = wsState(this).handlers;
+          if (typeof handlers[name] === 'function') wsOff(this, name, handlers[name]);
+          handlers[name] = typeof fn === 'function' ? fn : null;
+          if (typeof fn === 'function') wsOn(this, name, fn);
         }
       });
-    })(handlers[i]);
+    })(WS_HANDLERS[i]);
   }
   /*
    * binaryType is the two kinds a message can arrive as and nothing else: Node keeps 'blob' when it
@@ -1475,8 +1738,8 @@ WebSocket.CLOSED = WS_CLOSED;
   Object.defineProperty(WebSocket.prototype, 'binaryType', {
     configurable: true,
     enumerable: true,
-    get: function () { return this._binaryType === 'arraybuffer' ? 'arraybuffer' : 'blob'; },
-    set: function (value) { this._binaryType = value === 'arraybuffer' ? 'arraybuffer' : 'blob'; }
+    get: function () { return wsState(this).binaryType === 'arraybuffer' ? 'arraybuffer' : 'blob'; },
+    set: function (value) { wsState(this).binaryType = value === 'arraybuffer' ? 'arraybuffer' : 'blob'; }
   });
   /* the four states are readable off an instance, not only off the class */
   var states = { CONNECTING: WS_CONNECTING, OPEN: WS_OPEN, CLOSING: WS_CLOSING, CLOSED: WS_CLOSED };
