@@ -1,15 +1,18 @@
 import { gunzipSync } from 'fflate';
 import { BROTLI_WASM_GZIP_BASE64 } from './brotli-wasm';
+import { ZLIB_WASM_GZIP_BASE64 } from './zlib-wasm';
 import { ZSTD_WASM_GZIP_BASE64 } from './zstd-wasm';
 
 /**
- * Host side of the brotli and zstd codecs.
+ * Host side of the brotli, zstd and deflate codecs.
  *
- * Both are C libraries -- google/brotli and facebook/zstd -- compiled to WebAssembly with
- * Emscripten as standalone modules, which is what makes the container's output byte-identical to
- * Node's: Node's `zlib` is those same libraries. They are the codecs pure JavaScript cannot carry:
- * a complete brotli encoder in JS is megabytes of source, and zstd compression has no JS
- * implementation at all. A wasm module is the same idea the container already uses for sql.js and
+ * All three are C libraries -- google/brotli, facebook/zstd and the zlib Node bundles -- compiled to
+ * WebAssembly with Emscripten as standalone modules, which is what makes the container's output
+ * byte-identical to Node's: Node's `zlib` is those same libraries. They are the codecs pure
+ * JavaScript cannot carry: a complete brotli encoder in JS is megabytes of source, zstd compression
+ * has no JS implementation at all, and no JavaScript deflate is zlib's -- fflate is close enough to
+ * pass on most inputs and then misses by a byte on the next one, because the zlib Node builds is
+ * Chromium's fork, which hashes strings with the ANZAC++ hasher rather than zlib's own. A wasm module is the same idea the container already uses for sql.js and
  * hash-wasm, and here it runs where that work belongs, in the host realm that has real
  * WebAssembly; the guest reaches it through the zlib capability the way it reaches fflate.
  *
@@ -119,6 +122,7 @@ function codecModule(key: string, asset: string): WasmExports {
 }
 
 const brotliModule = (): WasmExports => codecModule('brotli', BROTLI_WASM_GZIP_BASE64);
+const zlibModule = (): WasmExports => codecModule('zlib', ZLIB_WASM_GZIP_BASE64);
 const zstdModule = (): WasmExports => codecModule('zstd', ZSTD_WASM_GZIP_BASE64);
 
 /** Reads a NUL-terminated string the module returned, out of its memory. */
@@ -248,8 +252,94 @@ export function zstdCompressBound(size: number): number {
     return zstdModule().owc_zstd_compress_bound(size) as number;
 }
 
+/** The zlib error word to the name Node puts on `err.code`; `zError` gives the message. */
+const ZLIB_ERROR_NAMES: Record<number, string> = {
+    [-1]: 'Z_ERRNO',
+    [-2]: 'Z_STREAM_ERROR',
+    [-3]: 'Z_DATA_ERROR',
+    [-4]: 'Z_MEM_ERROR',
+    [-5]: 'Z_BUF_ERROR',
+    [-6]: 'Z_VERSION_ERROR'
+};
+
+function deflateFailure(code: number, detail: number): Error {
+    if (code === RES_NOMEM) return failure(Error, 'Z_MEM_ERROR', 'not enough memory', -4);
+    if (code === RES_SET_PARAM) {
+        return failure(Error, 'ERR_ZLIB_INITIALIZATION_FAILED', 'Initialization failed');
+    }
+    const word = signed(detail);
+    const name = ZLIB_ERROR_NAMES[word] ?? 'Z_DATA_ERROR';
+    return failure(Error, name, cstring(zlibModule(), 'owc_zlib_error_string', word), word);
+}
+
+/** The windowBits zlib spells each deflate-family framing as: gzip is the zlib window plus 16. */
+const DEFLATE_WINDOW_BITS: Record<string, number> = { gzip: 31, deflate: 15, 'deflate-raw': -15 };
+
+export interface DeflateStreamOptions {
+    format: string;
+    level: number;
+    dictionary?: Uint8Array;
+}
+
+/** Opens a deflate-family compress stream. `level` is zlib's own scale: -1 asks for its default. */
+export function deflateStreamOpen(options: DeflateStreamOptions): number {
+    const exports = zlibModule();
+    const windowBits = DEFLATE_WINDOW_BITS[options.format];
+    if (windowBits === undefined) throw failure(Error, 'ERR_INVALID_ARG_VALUE', `unknown zlib stream format: ${options.format}`);
+    const dictionary = options.dictionary;
+    let dict = 0;
+    if (dictionary && dictionary.length > 0) {
+        dict = exports.malloc(dictionary.length);
+        new Uint8Array(exports.memory.buffer).set(dictionary, dict);
+    }
+    const result = exports.malloc(12);
+    let handle = 0;
+    try {
+        handle = (exports.owc_zlib_stream_new as (...args: number[]) => number)(
+            windowBits,
+            Number.isFinite(options.level) ? Math.trunc(options.level) : -1,
+            8,
+            0,
+            dict,
+            dictionary ? dictionary.length : 0,
+            result
+        );
+    } finally {
+        if (dict !== 0) exports.owc_free(dict);
+    }
+    if (handle === 0) {
+        const detail = new DataView(exports.memory.buffer).getUint32(result + 8, true);
+        exports.owc_free(result);
+        throw deflateFailure(RES_SET_PARAM, detail);
+    }
+    exports.owc_free(result);
+    const id = nextStreamId++;
+    streams.set(id, { kind: 'deflate', handle });
+    return id;
+}
+
 /**
- * A brotli or zstd stream: the module's own context, kept alive between the writes that feed it.
+ * Compresses a whole buffer of deflate-family bytes.
+ *
+ * This is the synchronous and callback forms, which hand the library everything at once under
+ * Z_FINISH; a stream is the same context driven one call at a time instead.
+ */
+export function deflateCompress(
+    format: string,
+    data: Uint8Array,
+    level: number,
+    dictionary?: Uint8Array
+): Uint8Array {
+    const id = deflateStreamOpen({ format, level, dictionary });
+    try {
+        return codecStreamWrite(id, data, 4);
+    } finally {
+        codecStreamClose(id);
+    }
+}
+
+/**
+ * A brotli, zstd or deflate stream: the module's own context, kept alive between the writes that feed it.
  *
  * A stream is not one call. Node hands each write to the library separately, a `flush()` is a call
  * of its own, and the finish is another; each one is visible in the bytes, because a flush ends the
@@ -257,17 +347,33 @@ export function zstdCompressBound(size: number): number {
  * call at a time, rather than buffering the input and compressing it in one go at the end.
  */
 interface LiveStream {
-    kind: 'brotli' | 'zstd';
+    kind: StreamKind;
     handle: number;
 }
+
+type StreamKind = 'brotli' | 'zstd' | 'deflate';
 
 const streams = new Map<number, LiveStream>();
 let nextStreamId = 1;
 
-const moduleFor = (kind: 'brotli' | 'zstd'): WasmExports => (kind === 'brotli' ? brotliModule() : zstdModule());
+const moduleFor = (kind: StreamKind): WasmExports =>
+    kind === 'brotli' ? brotliModule() : kind === 'zstd' ? zstdModule() : zlibModule();
 
-const failFor = (kind: 'brotli' | 'zstd', code: number, detail: number): Error =>
-    kind === 'brotli' ? brotliFailure(code, detail) : zstdFailure(code, detail);
+const failFor = (kind: StreamKind, code: number, detail: number): Error =>
+    kind === 'brotli' ? brotliFailure(code, detail) : kind === 'zstd' ? zstdFailure(code, detail) : deflateFailure(code, detail);
+
+/** The module's own per-call stream entry points, by codec: they all take (handle, input, length, op, result). */
+const STREAM_WRITE: Record<StreamKind, string> = {
+    brotli: 'owc_brotli_stream_write',
+    zstd: 'owc_zstd_stream_write',
+    deflate: 'owc_zlib_stream_write'
+};
+
+const STREAM_FREE: Record<StreamKind, string> = {
+    brotli: 'owc_brotli_stream_free',
+    zstd: 'owc_zstd_stream_free',
+    deflate: 'owc_zlib_stream_free'
+};
 
 /** Opens a stream and returns the id the guest drives it with. `params` are set before any input. */
 export function codecStreamOpen(kind: 'brotli' | 'zstd', params?: CodecParams, chunkSize = 0): number {
@@ -321,10 +427,7 @@ export function codecStreamWrite(id: number, data: Uint8Array, op: number): Uint
     const result = exports.malloc(12);
     let code = 0;
     try {
-        const write =
-            entry.kind === 'brotli'
-                ? (exports.owc_brotli_stream_write as (h: number, i: number, n: number, o: number, r: number) => number)
-                : (exports.owc_zstd_stream_write as (h: number, i: number, n: number, o: number, r: number) => number);
+        const write = exports[STREAM_WRITE[entry.kind]] as (h: number, i: number, n: number, o: number, r: number) => number;
         code = write(entry.handle, input, data.length, op, result);
     } finally {
         exports.owc_free(input);
@@ -348,9 +451,6 @@ export function codecStreamClose(id: number): void {
     if (!entry) return;
     streams.delete(id);
     const exports = moduleFor(entry.kind);
-    const free =
-        entry.kind === 'brotli'
-            ? (exports.owc_brotli_stream_free as (h: number) => void)
-            : (exports.owc_zstd_stream_free as (h: number) => void);
+    const free = exports[STREAM_FREE[entry.kind]] as (h: number) => void;
     free(entry.handle);
 }

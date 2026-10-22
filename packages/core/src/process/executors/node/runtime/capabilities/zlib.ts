@@ -1,5 +1,5 @@
 import { CapabilityHandler } from './types';
-import { FlateErrorCode, deflateSync, gzipSync, inflateSync, zlibSync } from 'fflate';
+import { FlateErrorCode, inflateSync } from 'fflate';
 import {
     CodecParams,
     brotliCompress,
@@ -7,22 +7,25 @@ import {
     codecStreamClose,
     codecStreamOpen,
     codecStreamWrite,
+    deflateCompress,
+    deflateStreamOpen,
     zstdCompress,
     zstdDecompress,
     zstdParamKnown
 } from './codec';
 
 /**
- * Host operations for the zlib family. fflate does the raw DEFLATE work (its `deflateSync` and
- * `inflateSync` are raw streams; `zlibSync` and `unzlibSync` are the zlib framing). The framing Node
- * checks and fflate does not (CRC-32 and size for gzip, Adler-32 for zlib, multi-member gzip, the
- * zero-byte stop rule) is reproduced here, with zlib's error codes and wording. Brotli and zstd come
- * from wasm codecs, which Node also builds on the same C libraries. Bytes cross the capability
- * boundary as base64 strings because capability arguments are JSON.
+ * Host operations for the zlib family. Compression of the deflate family -- gzip, deflate and
+ * deflate-raw -- is the zlib Node bundles, compiled to wasm: Chromium's fork of zlib 1.3.1, whose
+ * deflate output is Node's byte for byte, which no JavaScript deflate is. Decompression stays on
+ * fflate, which does the raw DEFLATE work (its `inflateSync` is a raw stream), wrapped in the framing
+ * zlib checks and fflate does not: CRC-32 and size for gzip, Adler-32 for zlib, multi-member gzip,
+ * the zero-byte stop rule, with zlib's error codes and wording. Brotli and zstd come from wasm
+ * codecs, which Node also builds on the same C libraries. Bytes cross the capability boundary as
+ * base64 strings because capability arguments are JSON.
  */
 
 type Bytes = Uint8Array;
-type FlateLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
 
 const Z_NEED_DICT = 2;
 const Z_DATA_ERROR = -3;
@@ -268,7 +271,13 @@ function inflateBytes(format: string, data: Bytes, dictionary?: Bytes, params?: 
     }
 }
 
-/** Level -1 is zlib's default, which is 6; fflate takes 0-9. Brotli and zstd take parameters instead. */
+/** The formats whose compression is zlib's own; `unzip` is a decompress-only format. */
+const DEFLATE_FORMATS = new Set(['gzip', 'deflate', 'deflate-raw']);
+
+/**
+ * Compresses one buffer. Level -1 is zlib's default, which it picks itself; brotli and zstd take
+ * parameters instead, and `chunkSize` and `streamed` are zstd's own two shapes.
+ */
 function deflateBytes(
     format: string,
     data: Bytes,
@@ -278,15 +287,11 @@ function deflateBytes(
     chunkSize = 0,
     streamed = false
 ): Bytes {
-    const lvl = (level < 0 ? 6 : Math.min(9, Math.trunc(level))) as FlateLevel;
-    const options = dictionary ? { level: lvl, dictionary } : { level: lvl };
     switch (format) {
         case 'gzip':
-            return gzipSync(data, { level: lvl, mtime: 0 });
         case 'deflate':
-            return zlibSync(data, options);
         case 'deflate-raw':
-            return deflateSync(data, options);
+            return deflateCompress(format, data, typeof level === 'number' ? level : -1, dictionary);
         case 'brotli':
             return brotliCompress(data, params);
         case 'zstd':
@@ -312,7 +317,7 @@ function bytesToBase64(bytes: Bytes): string {
 const argBytes = (value: unknown): Bytes => base64ToBytes(typeof value === 'string' ? value : '');
 const argDictionary = (value: unknown): Bytes | undefined => (typeof value === 'string' ? base64ToBytes(value) : undefined);
 
-/** Zlib host operations: compress and decompress whole buffers. The guest buffers stream input and calls these once. */
+/** Zlib host operations: compress and decompress whole buffers, and drive a compress stream. */
 export const ZLIB_CAPABILITIES: Record<string, CapabilityHandler> = {
     'zlib.compress': (args) => {
         const format = String(args.format);
@@ -335,9 +340,16 @@ export const ZLIB_CAPABILITIES: Record<string, CapabilityHandler> = {
         const params = format === 'zstd' ? zstdParams(args.params, false) : paramPairs(args.params);
         return bytesToBase64(inflateBytes(format, argBytes(args.data), argDictionary(args.dictionary), params));
     },
-    /* A brotli or zstd compress stream, driven one write, flush or finish at a time. */
+    /* A compress stream, driven one write, flush or finish at a time. */
     'zlib.streamOpen': (args) => {
         const format = String(args.format);
+        if (DEFLATE_FORMATS.has(format)) {
+            return deflateStreamOpen({
+                format,
+                level: typeof args.level === 'number' ? args.level : -1,
+                dictionary: argDictionary(args.dictionary)
+            });
+        }
         if (format !== 'brotli' && format !== 'zstd') throw new Error(`unknown zlib stream format: ${format}`);
         const params = format === 'zstd' ? zstdParams(args.params, true) : paramPairs(args.params);
         const chunk = typeof args.chunkSize === 'number' && args.chunkSize > 0 ? Math.trunc(args.chunkSize) : 0;

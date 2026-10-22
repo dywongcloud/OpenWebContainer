@@ -49,7 +49,7 @@ The architecture consists of three main layers:
 - **JavaScript Runtime**
   - QuickJS-based execution
   - CommonJS and ES Modules, with `node_modules` resolution, `package.json` `main`/`exports`/`imports`, and CJS/ESM interop
-  - Node built-ins: `path`, `events`, `util`, `assert`, `fs` (sync, callback and promises, plus read and write streams and file descriptors — `openSync`, `writeSync`, `readSync`, `closeSync`, `fstatSync`, `ftruncateSync` — over the virtual file system), `buffer`, `os`, `timers`, `url` (WHATWG URL and legacy `parse`/`resolve`/`format`), `crypto` (random values, `createHash`, `createHmac`, `pbkdf2`, `timingSafeEqual`, and `createCipheriv`/`createDecipheriv` over `@noble/ciphers`: AES-ECB, AES-CBC, AES-CTR, AES-CFB and AES-GCM at 128, 192 and 256 bits and ChaCha20-Poly1305, byte-identical to host Node 24.15 and with Node's `ERR_CRYPTO_INVALID_KEYLEN` and `ERR_CRYPTO_INVALID_IV` codes), `process` (including `chdir`/`cwd` over the virtual file system), `console`, `module`, `stream` and `readline`, `querystring`, `string_decoder`, `punycode`, `diagnostics_channel`, `async_hooks` (AsyncLocalStorage across timers, ticks and `.then` callbacks), `perf_hooks`, `v8`, `vm`, `domain`, `inspector` and `repl` (partial), `zlib` (gzip, deflate and raw, backed by fflate; brotli and zstd, backed by WebAssembly codecs built from the same C libraries Node uses, byte-identical to host Node 24.15 — see "Codecs")
+  - Node built-ins: `path`, `events`, `util`, `assert`, `fs` (sync, callback and promises, plus read and write streams and file descriptors — `openSync`, `writeSync`, `readSync`, `closeSync`, `fstatSync`, `ftruncateSync` — over the virtual file system), `buffer`, `os`, `timers`, `url` (WHATWG URL and legacy `parse`/`resolve`/`format`), `crypto` (random values, `createHash`, `createHmac`, `pbkdf2`, `timingSafeEqual`, and `createCipheriv`/`createDecipheriv` over `@noble/ciphers`: AES-ECB, AES-CBC, AES-CTR, AES-CFB and AES-GCM at 128, 192 and 256 bits and ChaCha20-Poly1305, byte-identical to host Node 24.15 and with Node's `ERR_CRYPTO_INVALID_KEYLEN` and `ERR_CRYPTO_INVALID_IV` codes), `process` (including `chdir`/`cwd` over the virtual file system), `console`, `module`, `stream` and `readline`, `querystring`, `string_decoder`, `punycode`, `diagnostics_channel`, `async_hooks` (AsyncLocalStorage across timers, ticks and `.then` callbacks), `perf_hooks`, `v8`, `vm`, `domain`, `inspector` and `repl` (partial), `zlib` (gzip, deflate and raw, compressed by the zlib Node bundles and decompressed by fflate; brotli and zstd, backed by WebAssembly codecs built from the same C libraries Node uses, byte-identical to host Node 24.15 — see "Codecs")
   - Express 4 apps run: responses with bodies, POST bodies, chunked responses and the 404 handler are verified against real Node
   - `child_process` (spawn, exec, execFile, fork, running as container processes), `worker_threads` and `cluster`, with message passing between processes
   - `net`, `dgram` and `dns` over the container's virtual network (loopback TCP and UDP between processes, a virtual name table), `http`, `https` and `http2`: servers and clients inside the container, and external requests through `fetch` (browser CORS applies); `tls` and `https` run TLS 1.3 inside the container (certificates are verified against the `ca` option only, with no built-in roots); `http2` is native HTTP/2 (RFC 9113 framing with RFC 7541 HPACK, flow control, trailers and the compat API), as h2c with prior knowledge and as h2 over TLS with ALPN through `http2.createSecureServer` and `https://` sessions
@@ -101,47 +101,77 @@ same machine: 0.353 to 0.143 ms per call at 16 pages, 3.389 to 2.456 at 256, 6.5
 13.369 to 10.828 at 1024 and 26.664 to 20.609 at 2048 -- between 1.2x and 2.5x fewer, with the
 small-memory end gaining most.
 
-### ✅ Brotli and zstd: what they are built from, and where they differ from Node
+### ✅ Brotli, zstd and the deflate family: what they are built from, and where they differ from Node
 
 `zlib.brotliCompressSync`, `brotliDecompressSync`, `brotliCompress`, `brotliDecompress`,
-`createBrotliCompress`/`BrotliCompress` and the six `zstd` equivalents are real codecs, not stubs.
-Neither has a JavaScript implementation worth its size: a complete brotli encoder in JS is megabytes
-of source, and zstd compression has no JS implementation at all. So both are WebAssembly, and not
-guest WebAssembly — the bridge copies a whole module memory per crossing, which a bulk codec cannot
-pay — but modules the host instantiates, in the same realm the bridge runs guest modules in. They are
-built from the same C libraries Node's own `zlib` is:
+`createBrotliCompress`/`BrotliCompress`, the six `zstd` equivalents, and the compression half of
+gzip, deflate and deflate-raw -- `gzipSync`, `deflateSync`, `deflateRawSync`, their callback forms
+and their streams -- are real codecs, not stubs. None has a JavaScript implementation that is the
+one Node uses: a complete brotli encoder in JS is megabytes of source, zstd compression has no JS
+implementation at all, and no JS deflate is zlib's. So all three are WebAssembly, and not guest
+WebAssembly -- the bridge copies a whole module memory per crossing, which a bulk codec cannot pay --
+but modules the host instantiates, in the same realm the bridge runs guest modules in. They are built
+from the same C libraries Node's own `zlib` is:
 
 | | upstream | version | module | source |
 | --- | --- | --- | --- | --- |
 | brotli | google/brotli (`c/common`, `c/enc`, `c/dec`) | v1.1.0 | 762 KB | 445 KB of base64 |
 | zstd | facebook/zstd (`lib/common`, `lib/compress`, `lib/decompress`) | v1.5.7 | 447 KB | 157 KB of base64 |
+| zlib | nodejs/node `deps/zlib` (Chromium's fork of madler/zlib) | v24.15.0 | 49 KB | 29 KB of base64 |
+
+The zlib row is the one that is not an upstream release. Node 24.15 reports `zlib 1.3.1`, but the
+1.3.1 on zlib.org is not the 1.3.1 it bundles: Node builds Chromium's fork, which replaces
+`INSERT_STRING` with the ANZAC++ hasher in `contrib/optimizations/insert_string.h`, whose own header
+says the result "is a valid DEFLATE stream, but will differ from canonical zlib output". It does
+differ -- by one byte on 5000 bytes of repeated text, gzip/deflate/deflate-raw alike, and by more on
+other inputs -- so a canonical zlib, and every JavaScript deflate, misses it. The fork also writes
+`OS_CODE` 19 into the gzip header, where a build that is not `__APPLE__` writes 3, so the module is
+compiled with `-DOS_CODE=19` to match the host it is measured against. Decompression of the deflate
+family stays on fflate, which already agrees with Node on the framing and the errors.
 
 Each is compiled with Emscripten as a standalone module (`-O3 -flto -sSTANDALONE_WASM=1
 -sALLOW_MEMORY_GROWTH=1 -Wl,--no-entry`) over the entry points in
 `packages/core/src/process/executors/node/runtime/capabilities/codec/csrc`, gzipped and written as
-base64 into `brotli-wasm.ts` and `zstd-wasm.ts`, inflated by fflate on first use and then kept. They
-ask for two imports between them — a memory-growth notification and WASI's `proc_exit` — and both are
-stubbed. To rebuild one, from a checkout of the upstream tag:
+base64 into `brotli-wasm.ts`, `zstd-wasm.ts` and `zlib-wasm.ts`, inflated by fflate on first use and
+then kept. They ask for two imports between them — a memory-growth notification and WASI's
+`proc_exit` — and both are stubbed. To rebuild one, from a checkout of the upstream tag:
 
     emcc -O3 -flto -sSTANDALONE_WASM=1 -sALLOW_MEMORY_GROWTH=1 -Wl,--no-entry -I<upstream include> \
       -sEXPORTED_FUNCTIONS='["_owc_brotli_compress","_owc_brotli_decompress","_owc_brotli_error_string","_owc_brotli_stream_new","_owc_brotli_stream_write","_owc_brotli_stream_free","_malloc","_owc_free"]' \
       -o brotli.wasm csrc/brotli_codec.c <upstream>/c/{common,dec,enc}/*.c
 
-The `*_stream_*` entry points are what the stream classes use. A brotli or zstd stream cannot be a
-one-shot call: Node hands each write to the library separately, a `flush()` is a call of its own, and
-the end is another, and every one of them is visible in the bytes — a flush ends the meta-block or
-block that is open, and a zstd flush leaves a frame the next call continues in a new one. So the
-stream keeps a context in the module and the guest drives it one call at a time, over the same output
-buffer size Node uses. The deflate family needs none of this: its output is the same however the
-input is split, so those streams are still buffered and compressed once, at the end.
+and, for the deflate family, from `deps/zlib` in a nodejs/node v24.15.0 checkout -- `-DCPU_NO_SIMD`
+keeps the fork's SIMD paths out, which are faster but not different, and `-DOS_CODE=19` is the gzip
+header byte a macOS host Node writes:
 
-Node 24.15 bundles those same two libraries, which is what makes the bytes match: a differential over
+    emcc -O3 -flto -sSTANDALONE_WASM=1 -sALLOW_MEMORY_GROWTH=1 -Wl,--no-entry -I<deps/zlib> \
+      -DCPU_NO_SIMD -DHAVE_HIDDEN -DOS_CODE=19 \
+      -sEXPORTED_FUNCTIONS='["_owc_zlib_stream_new","_owc_zlib_stream_write","_owc_zlib_stream_free","_owc_zlib_error_string","_malloc","_owc_free"]' \
+      -o zlib.wasm csrc/zlib_codec.c <deps/zlib>/{adler32,crc32,deflate,trees,zutil}.c
+
+The `*_stream_*` entry points are what the stream classes use. A compress stream cannot be a one-shot
+call: Node hands each write to the library separately, a `flush()` is a call of its own, and the end
+is another, and every one of them is visible in the bytes — a flush ends the meta-block or block that
+is open, and a zstd flush leaves a frame the next call continues in a new one. So the stream keeps a
+context in the module and the guest drives it one call at a time, over the same output buffer size
+Node uses: 16 KiB, which is `Z_DEFAULT_CHUNK`, and it is not only a size — when a call fills it Node
+calls the library again with the same flush flag, and zlib, having set `last_flush` to -1 on the way
+out, opens the block again, so where those boundaries fall is in the bytes too. A `flush()` with no
+argument is `Z_FULL_FLUSH` here as in Node, not `Z_SYNC_FLUSH`: the two leave the same empty stored
+block, but only one clears the history, so the bytes that follow are not the same. Decompress streams
+are the other way: they still buffer and inflate once, because what comes out is the same whatever
+the split.
+
+Node 24.15 bundles those same libraries, which is what makes the bytes match: a differential over
 8 inputs (0 B to 200 KB) × 8 brotli parameter sets and 6 zstd parameter sets × 5 write shapes (one
 write, three writes, a flush before / between / after the writes), in the sync, callback and stream
 forms, produced byte-identical output, and the same errors — brotli's
 `ERR__ERROR_FORMAT_PADDING_2` and `Z_BUF_ERROR`, zstd's `ZSTD_error_prefix_unknown` with its `errno`
-and `ZSTD_getErrorString` message. Every compressed form round-trips in both directions: bytes Node
-compressed decompress here, and bytes compressed here decompress in Node.
+and `ZSTD_getErrorString` message. The deflate family's own differential is 6 inputs (11 B to 70 KB)
+× 3 formats × levels -1, 1, 6 and 9 × 3 write shapes (one write, a flush between two halves, a flush
+after the write), in the sync, callback and stream forms: byte-identical too, and every compressed
+form round-trips in both directions — bytes Node compressed decompress here, and bytes compressed
+here decompress in Node.
 
 One thing the differential needs to be fair: the writes must be paced, each one waiting for its own
 callback before the next. Node's zlib streams give a chunk the stream's *finish* operation when the
@@ -149,15 +179,21 @@ stream has already ended and that chunk is the last one left queued, so writes s
 `end()` lands are compressed with a different operation — and whether a write is still queued is a
 race. Left unpaced, Node's own output varies run to run; paced, it is stable and it matches here.
 
-Two places where this deliberately differs from Node 24.15, both measured:
+One place where this deliberately differs from Node 24.15, measured:
 
 - `zstdCompressSync(buf, { level: n })` — Node **ignores** `level` for zstd: levels 1, 3, 19, 22 and
   -3 all produce its default level-3 output. A level asked for here is applied, as
   `ZSTD_c_compressionLevel`, before any `params`. Use `{ params: { 100: n } }` to see Node's own
   behaviour change.
-- `zstdDecompressSync` of a short or undecodable frame — Node returns an empty buffer for a truncated
-  frame and for a bare magic number. This throws instead (`ZSTD_error_srcSize_wrong`), because
-  answering corrupt input with a silent empty result is lost data.
+
+A truncated zstd frame used to be a second one, and no longer is: this threw
+`ZSTD_error_srcSize_wrong` where Node answers with what decoded and no error. Node decompresses
+through a stream, so a frame cut short is input the stream has not seen yet rather than input it
+cannot read -- and the bytes it hands back are real, not an empty apology: cutting the last byte off
+a frame holding 1,077,781 bytes returns 1,048,576, and every one of them is a prefix of the
+original. Throwing was the version that lost data. The same stream is why a bare magic number, three
+bytes, one byte or nothing at all now return an empty buffer as they do on the host, while input
+that is not a frame at all still raises `ZSTD_error_prefix_unknown`.
 
 ### ⚠️ Guest network throughput, and why it is bounded by the capability boundary
 
@@ -353,6 +389,10 @@ is still byte-identical to host Node 24.15 after these changes.
 - Processes now match Node where this entry used to diverge: an unhandled promise rejection is reported with its error and ends the process with status 1, and a `domain` catches a rejection thrown inside a `.then` callback inside `d.run()` (`domain.promise` is the error's message in both)
 - A rejection of an `async function`'s own promise is not reported: `(async function () { throw new Error('x'); })();` goes on to the next statement and ends the process with status 0, where host Node 24.15 writes the error to stderr and exits 1 without running a later timer. Every promise the guest builds itself is tracked — one `Promise` subclass records a rejection when it happens and records a handler when one is attached — but the engine builds the result of an async function with its intrinsic `%Promise%` and not through `Promise[Symbol.species]`, so no cell exists for it; measured with `then`, `catch` and `finally` patched on that intrinsic's prototype, a discarded async function's promise is never touched at all, so nothing in the guest can see the rejection. It needs the hook QuickJS's C API names `JS_SetHostPromiseRejectionTracker`, or a hook on job enqueue, and `quickjs-emscripten` 0.32 exports neither that nor `addFunction`, so no callback can be installed. A rejection of a promise the guest did build, and one an `await` or a `.then` reaches, are reported and end the process with status 1, as they do on the host
 - `readline` keypress events are delivered: `readline.emitKeypressEvents(stream)` makes the stream emit `keypress` with the character and Node's key record, and `createInterface({ terminal: true })` installs it on its input. Measured against host Node 24.15 over 35 sequences, the name, the `ctrl`/`meta`/`shift` flags, the `sequence` and the `code` agree for every one of them except the malformed `ESC [ 1 ; 1 0 A`, which the host splits into two keys and this one reads as one; a lone escape is not a key in either, and a sequence split across two `write`s is held until it is complete. A `Promise` reaction registered inside `d.run()` sees `domain.active` as the domain, as it does on the host
+- **The container's environment is its own, and none of the host's is inherited**: a process starts with `PATH=/bin:/usr/bin:/usr/local/bin`, `HOME=/home`, `PWD`, `TERM=xterm`, `COLORTERM=truecolor` and `LANG=C.UTF-8` and nothing else, so `Object.keys(process.env)` is those six where a host process on this machine carries 60-odd. It cannot be inherited: the container runs in a browser worker, which has no environment to read, and a host `HOME` or `PATH` here would tell a guest where it is running from. `TERM` is what makes `colors@1` agree with host Node 24.15 (`'x'.red` is `\e[31mx\e[39m` on both)
+- **No terminal is attached, so `process.stdout.isTTY` is `false`**: a library that gates colour on a TTY (`chalk` 4 and later, `supports-color`) reports no colour support here where a host run in a real terminal reports some. One that reads the environment alone — `colors@1` does, and calls `supportsColor()` with no stream — matches the host. There is no terminal to attach: the playground's output is a stream the container writes to
+- **`node` on `PATH` is a file, not a binary**: `/usr/local/bin/node` exists and is mode `0755`, so `which.sync('node')` returns it as the host returns a path, but `fs.readFileSync('/usr/local/bin/node')` hands back the shim's script text where a host hands back an executable's bytes. A browser container cannot have a binary, and a spawn of that path runs the interpreter, not the script
+- **An unresolved entry is reported without node's own dump**: `node missing.js` writes `Error: Cannot find module '/app/missing.js'` and exits 1, where host Node 24.15 writes the `node:internal/modules/cjs/loader:1479` preamble, the resolved path, eight frames of its loader, `code: 'MODULE_NOT_FOUND'`, `requireStack` and `Node.js v24.15.0`. The frames name node's own internals with line numbers that belong to that build, so they are not reproduced; the path is now resolved against the process's working directory, and no frame names a host path
 
 ### 🛑 Stopping a runaway guest
 
