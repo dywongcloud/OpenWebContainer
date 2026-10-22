@@ -511,6 +511,11 @@ Recorded rather than fixed:
   class element at the line break, V8 does not. Recorded rather than fixed: the engine accepts this
   source, so it reaches the engine unchanged, and no rewrite that leaves every line where it was makes
   the two agree — QuickJS also ends the element at a line terminator inside a `/* */` comment.
+  It is not only that shape: `static get`, `set`, and numeric, string and computed names misparse the
+  same way (`static get` on one line and `foo() {}` on the next becomes an instance method here —
+  `A.foo` undefined and `A.prototype.foo` a function, where host is the reverse), and
+  `class A { get` on one line and `async foo() { }` on the next — which host Node rejects outright
+  with `SyntaxError: Unexpected identifier 'foo'` — is accepted and run here.
 
 ### ⚠️ Old toolchains that call Node internals: `npx create-react-app my-app`
 
