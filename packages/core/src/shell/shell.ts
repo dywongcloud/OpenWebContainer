@@ -193,6 +193,9 @@ export class Shell implements IShell {
             id,
             pid: this.nextBackgroundPid++,
             text: formatJobText(source),
+            /* What the job is run from when `wait` asks for it: the source the `&` was written on,
+               with its quoting, which is not what `jobs` prints it as. */
+            source,
             done: false,
             exitCode: 0
         };
@@ -655,7 +658,11 @@ export class Shell implements IShell {
             }
         }
 
-        return { stdout: '', stderr: `Command not found: ${command}`, exitCode: 127 };
+        /* The message a host writes for a name no built-in, no utility and no file on PATH answers
+           to, and it ends in the newline every diagnostic of a host's ends in -- which is what the
+           one the script engine fell back on was missing, so the text a line wrote after it ran on
+           into it. */
+        return { stdout: '', stderr: `Command not found: ${command}\n`, exitCode: 127 };
     };
 
     /** The status and message of a command this shell cannot run inside the script engine. */

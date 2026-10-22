@@ -526,7 +526,7 @@ is still byte-identical to host Node 24.15 after these changes.
 - **The container's environment is its own, and none of the host's is inherited**: a process starts with `PATH=/bin:/usr/bin:/usr/local/bin`, `HOME=/home`, `PWD`, `TERM=xterm`, `COLORTERM=truecolor` and `LANG=C.UTF-8` and nothing else, so `Object.keys(process.env)` is those six where a host process on this machine carries 60-odd. It cannot be inherited: the container runs in a browser worker, which has no environment to read, and a host `HOME` or `PATH` here would tell a guest where it is running from. `TERM` is what makes `colors@1` agree with host Node 24.15 (`'x'.red` is `\e[31mx\e[39m` on both)
 - **No terminal is attached, and `process.stdout.isTTY` is left undefined rather than set false**: a piped host stream carries neither `isTTY` nor `columns`, and the same library that gates colour on a TTY (`chalk` 4 and later, `supports-color`) reads the absent value as no terminal here too. One that reads the environment alone — `colors@1` does, and calls `supportsColor()` with no stream — matches the host. There is no terminal to attach: the playground's output is a stream the container writes to
 - **`node` on `PATH` is a file, not a binary**: `/usr/local/bin/node` exists and is mode `0755`, so `which.sync('node')` returns it as the host returns a path, but `fs.readFileSync('/usr/local/bin/node')` hands back the shim's script text where a host hands back an executable's bytes. A browser container cannot have a binary, and a spawn of that path runs the interpreter, not the script
-- **An unresolved entry is reported without node's own dump**: `node missing.js` writes `Error: Cannot find module '/app/missing.js'` and exits 1, where host Node 24.15 writes the `node:internal/modules/cjs/loader:1479` preamble, the resolved path, eight frames of its loader, `code: 'MODULE_NOT_FOUND'`, `requireStack` and `Node.js v24.15.0`. The frames name node's own internals with line numbers that belong to that build, so they are not reproduced; the path is now resolved against the process's working directory, and no frame names a host path
+- **An unresolved entry is reported with node's own dump**: `node missing.js` writes the `node:internal/modules/cjs/loader:1479` preamble, the resolved path, the eight frames of node's CommonJS loader, `code: 'MODULE_NOT_FOUND'`, `requireStack: []` and `Node.js v24.15.0`, and exits 1, as host Node 24.15 does. The frames name node's own internals at lines that belong to the build `NODE_VERSION` names, so they are carried as text captured from it and not read from anything here — the same way the `--print` refusal and the usage block are. `node --check` of a file that is not there is the one still left short: it writes `Error: Cannot find module '<path>'` where host Node writes the `check_syntax` dump, with `node:internal/main/check_syntax:33:20` behind it
 
 ### 🛑 Stopping a runaway guest
 
@@ -816,12 +816,6 @@ Future plans:
 - [ ] a failing `exec` does not end a non-interactive shell (row owc-shell-exec-failure-does-not-end-shell)
 - [ ] `echo hi >&-` writes and succeeds where a host reports a write error (row owc-shell-closed-fd-write-error)
 - [ ] a redirection’s file is created even when the command fails on a bad descriptor (row owc-shell-redirect-file-created-on-failed-command)
-- [ ] a job's or a substitution's OWN EXIT trap never fires (row owc-shell-subshell-own-exit-trap)
-- [ ] a syntax error does not echo the offending source line the way a host does (row owc-shell-syntax-error-source-line)
-- [ ] the unexpected token a `$( )` reports is `newline` where a host names the real one (row owc-shell-syntax-error-token-in-substitution)
-- [ ] a here-document body is lost when its command is backgrounded (row owc-shell-heredoc-background-job)
-- [ ] a background job is replayed from its words, so its quoting is gone: `(echo 'a  b') &` prints `a b` (row owc-shell-background-job-quoting-lost)
-- [ ] the container’s "Command not found" diagnostic has no trailing newline (row owc-shell-command-not-found-newline)
 - [ ] Add signal handling (SIGTERM, SIGKILL, etc.): `child.kill` sends one, `process.kill` does not reach a process
 - [ ] Create process groups and job control
 - [ ] Create development tools and debugging capabilities
