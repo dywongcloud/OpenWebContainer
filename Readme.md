@@ -351,6 +351,20 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   Six that do answer print the bare name where a host prints a path (`mkdir`, `rm`, `cp`, `mv`, `touch`,
   `which`), and `npx --version` exits 1 with `npx: a command or package is required` where a host prints
   `11.12.1`.
+- **`owc-shell-bash32-extensions`: this machine's `/bin/sh` is bash 3.2, and the guest shell has none of the
+  syntax that makes it one.** `arr=(x y z); echo ${arr[1]}` is `y` on the host and a syntax error here,
+  `[[ abc == a* ]]` is `matched` against `sh: [[: command not found` with 127, `echo a{b,c}d` is `abd acd`
+  against the literal `a{b,c}d`, `true | false | true; echo ${PIPESTATUS[1]}` is `1` against nothing, and
+  `k=target; target=hit; echo ${!k}` is `hit` against nothing -- with `set -o` naming 27 options on the host
+  and 17 here, `$-` `hBc` against `h`, `declare -i n=1; n=n+1` `2` against `n+1`, `export -n` and `hash -d`
+  rejected, and `read` not splitting on IFS. Each case was run one per process on both sides and re-run three
+  times byte-identical. The whole measured list is the row's subject.
+- **A mode `chmod` sets does not outlive the `sh -c` line that set it.** The metadata side table it writes is
+  keyed by the file system object a line was handed, so `chmod 700 f` in one `sh -c` and `ls -l f` in the next
+  prints `-rw-r--r--`, where a host prints `-rwx------`; within one line the mode is there. Separately, a
+  directory the walk has no read bit for is still descended: `chmod -R 000 d; cat d/c` is `Permission denied`
+  on the host and prints the file here, though `chmod -R 000 d` itself now reports the same
+  `chmod: d: Permission denied` and status 1 on both.
 
 ### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
 
