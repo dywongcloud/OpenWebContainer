@@ -179,15 +179,21 @@ stream has already ended and that chunk is the last one left queued, so writes s
 `end()` lands are compressed with a different operation — and whether a write is still queued is a
 race. Left unpaced, Node's own output varies run to run; paced, it is stable and it matches here.
 
-Two places where this deliberately differs from Node 24.15, both measured:
+One place where this deliberately differs from Node 24.15, measured:
 
 - `zstdCompressSync(buf, { level: n })` — Node **ignores** `level` for zstd: levels 1, 3, 19, 22 and
   -3 all produce its default level-3 output. A level asked for here is applied, as
   `ZSTD_c_compressionLevel`, before any `params`. Use `{ params: { 100: n } }` to see Node's own
   behaviour change.
-- `zstdDecompressSync` of a short or undecodable frame — Node returns an empty buffer for a truncated
-  frame and for a bare magic number. This throws instead (`ZSTD_error_srcSize_wrong`), because
-  answering corrupt input with a silent empty result is lost data.
+
+A truncated zstd frame used to be a second one, and no longer is: this threw
+`ZSTD_error_srcSize_wrong` where Node answers with what decoded and no error. Node decompresses
+through a stream, so a frame cut short is input the stream has not seen yet rather than input it
+cannot read -- and the bytes it hands back are real, not an empty apology: cutting the last byte off
+a frame holding 1,077,781 bytes returns 1,048,576, and every one of them is a prefix of the
+original. Throwing was the version that lost data. The same stream is why a bare magic number, three
+bytes, one byte or nothing at all now return an empty buffer as they do on the host, while input
+that is not a frame at all still raises `ZSTD_error_prefix_unknown`.
 
 ### ⚠️ Guest network throughput, and why it is bounded by the capability boundary
 
