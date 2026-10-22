@@ -363,7 +363,10 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
 - **`/dev` holds four devices where a host holds hundreds.** `/dev/null`, `/dev/zero`, `/dev/random` and
   `/dev/urandom` are mounted as character devices and `fs.statSync('/dev/null')` agrees with the host --
   `isFile()` false, `isCharacterDevice()` true, `mode` 8630 -- and a read of `/dev/zero` gives eight zero
-  bytes and of `/dev/urandom` eight that are not. `/dev` itself is `dr-xr-xr-x` and nothing can be made
+  bytes and of `/dev/urandom` eight that are not; `fstatSync` of an open descriptor of one says `size` 0,
+  as a host's does, and a `chmodSync` or `fchmodSync` of one is refused with the host's `EPERM` rather
+  than being taken and leaving the device a regular file. A write is discarded by all four but
+  `/dev/urandom`: that is the one a host refuses to be seeded through, so it is refused here too. `/dev` itself is `dr-xr-xr-x` and nothing can be made
   in it, as on a host: `mkdir /dev/sub` is refused. What is still recorded rather than fixed:
   - `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd` -- and `/dev/tty`, below -- are not there:
     `echo x > /dev/stdout` is refused in the container where a host prints `x`.
@@ -373,9 +376,10 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   - A whole-file read of a stream device is bounded here and endless on a host: `readFileSync('/dev/zero')`
     hands back 4096 bytes, where the host call never returns at all.
   - `ls /dev` lists four names; this host lists 354, and the container owns no disks or terminals to list.
-  - A device cannot be moved or removed, but the codes differ: `renameSync('/dev/null', x)` is `EIO` where
-    a host's is `EXDEV`, `unlinkSync('/dev/null')` `EIO` where a host's is `EPERM`, `rmdir /dev`
-    `ENOTEMPTY` where a host's is `EBUSY`.
+  - A device cannot be moved or removed, and the code is now the host's own: `renameSync('/dev/null', x)`,
+    `unlinkSync('/dev/null')`, `rmSync('/dev/null')`, `mkdir /dev/sub`, a write of `/dev/newfile` and a
+    symlink in `/dev` are all `EPERM` on both. Two still differ: `rmdir /dev` is `ENOTEMPTY` here where a
+    host's is `EBUSY`, and `utimesSync('/dev/null')` is accepted here where a host's is `EACCES`.
   - A trailing slash is dropped, so `/dev/null/` exists and reads 0 where a host answers `ENOTDIR`, and
     `ls -d /dev/null/` lists it where a host says "Not a directory".
   - `ls -l /dev/null` prints `-rw-rw-rw-` and a size of 0 where a host prints `crw-rw-rw-` and the device

@@ -1573,9 +1573,16 @@ BF.fs = function () {
 
   function descriptorStats(rec) {
     var st = statOf(rec.path);
+    /*
+     * A descriptor of a device holds the one chunk a read of it yields -- 4096 bytes of zeroes or of
+     * entropy -- and not its size, so the buffer's length is not what to report for it: a host's
+     * fstat of an open /dev/zero says 0, and this file system's own statSync of the same path says 0
+     * with it. Saying 4096 for one and 0 for the other made the pair contradict each other.
+     */
+    var size = isCharacterDevice(st) ? st.size : rec.bytes.length;
     return makeStats({
       type: st ? st.type : (rec.isDir ? 'dir' : 'file'),
-      size: rec.bytes.length,
+      size: size,
       mtimeMs: st ? st.mtimeMs : 0,
       mode: st ? st.mode : undefined
     });
@@ -1687,9 +1694,17 @@ BF.fs = function () {
 
   // A mode is kept per path, with the type bits Node puts above it: statSync is what makes the
   // change observable, and a chmod no later stat reports is a no-op that reports success.
-  function setModeOf(file, mode) {
+  /*
+   * A device's kind is the format its mode carries -- S_IFCHR, the bits that make /dev/zero a
+   * character device and not a file -- so the mode written here used to overwrite those bits with
+   * S_IFREG and leave /dev/zero a regular file that answered isFile() true, where a host refuses the
+   * chmod of a node in /dev with EPERM and leaves the device alone. Refusing is what a host does,
+   * and it is what keeps the type: no caller reaches the mode it would have overwritten.
+   */
+  function setModeOf(file, mode, syscall) {
     var st = statOf(file);
     if (!st) return null;
+    if (isCharacterDevice(st)) throw fsError('EPERM', syscall, file);
     var bits = typeof mode === 'string' ? parseInt(mode, 8) : Number(mode);
     if (!isFinite(bits)) bits = 0;
     MODES[file] = (st.type === 'dir' ? 16384 : 32768) | (bits & 4095);
@@ -1698,12 +1713,12 @@ BF.fs = function () {
 
   fs.chmodSync = function (p, mode) {
     var file = toPathString(p);
-    if (!setModeOf(file, mode)) throw fsError('ENOENT', 'chmod', file);
+    if (!setModeOf(file, mode, 'chmod')) throw fsError('ENOENT', 'chmod', file);
   };
 
   fs.fchmodSync = function (fd, mode) {
     var rec = descriptorOf(fd, 'fchmod');
-    if (!setModeOf(rec.path, mode)) throw fsError('ENOENT', 'fchmod', rec.path);
+    if (!setModeOf(rec.path, mode, 'fchmod')) throw fsError('ENOENT', 'fchmod', rec.path);
   };
 
   fs.chownSync = function (p, uid, gid) {

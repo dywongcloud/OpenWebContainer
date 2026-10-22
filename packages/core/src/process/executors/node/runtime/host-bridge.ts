@@ -108,12 +108,25 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
     };
     const text = (handle: QuickJSHandle) => context.getString(handle);
     const nullable = (value: string | undefined | null) => (value === undefined || value === null ? context.null : context.newString(value));
+    /*
+     * The file system under this bridge has an errno class of its own -- ZenFS's `ErrnoError`, which
+     * the device mount raises when a name is made in `/dev`, a device is moved or removed, or a
+     * device that takes no write is written -- and every one of those used to reach the guest as
+     * `EIO`, so `mkdirSync('/dev/sub')` reported EIO where a host reports EPERM. A code the file
+     * system itself named is the code to report; EIO is for an error that named none at all, and the
+     * errno shape is what tells the two apart from a JavaScript error carrying some other `code`.
+     */
+    const fsCodeOf = (error: unknown): string => {
+        if (error instanceof FsCodeError) return error.code;
+        const code = (error as { code?: unknown } | null | undefined)?.code;
+        return typeof code === 'string' && /^E[A-Z][A-Z0-9]*$/.test(code) ? code : 'EIO';
+    };
     const guardFs = (action: () => void): string => {
         try {
             action();
             return '';
         } catch (error) {
-            return error instanceof FsCodeError ? error.code : 'EIO';
+            return fsCodeOf(error);
         }
     };
     const requireParentDirectory = (file: string) => {
