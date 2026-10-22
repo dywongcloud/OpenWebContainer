@@ -587,6 +587,336 @@ var consoleObj = {
 consoleObj.groupCollapsed = consoleObj.group;
 globalThis.console = consoleObj;
 
+/*
+ * The URL global -- and the URL the url module hands out, since in Node the two are one class.
+ * What this parser adds to the url module's own is the normalisation Node does: a path is
+ * percent-encoded, a tab or newline inside the input is dropped rather than kept, an IPv6 literal
+ * in brackets is one host instead of a stray bracket and a path behind it, a query or fragment
+ * that carries no value still shows in href, and a special scheme written without its two slashes
+ * still has an authority. State lives in a WeakMap, so a URL carries no own properties of its own,
+ * as in Node, and every field is a prototype accessor: a caller that assigns one -- the WebSocket
+ * client rewrites the scheme and the path of the URL it parsed -- sets what href reads back.
+ */
+function urlGlobalOf(nodeUrl) {
+  var Base = nodeUrl.URL;
+  var URLSearchParams = nodeUrl.URLSearchParams;
+  var STATE = new WeakMap();
+  var DEFAULT_PORTS = { 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21', 'file:': '' };
+  var SCHEME_RE = /^([A-Za-z][A-Za-z0-9+.\-]*):/;
+  /* The path percent-encode set: C0 controls, space, '"', '#', '<', '>', '?', '{', '}', DEL and a
+     backtick -- spelled as a code point because this source is itself a template literal. */
+  var PATH_ENCODE_CHARS = '"#<>?^' + String.fromCharCode(96) + '{}';
+  function percentEncode(ch, code) {
+    return code <= 0x20 || code === 0x7f || PATH_ENCODE_CHARS.indexOf(ch) >= 0;
+  }
+
+  function invalidUrl(input) {
+    var err = new TypeError('Invalid URL');
+    err.code = 'ERR_INVALID_URL';
+    err.input = input;
+    return err;
+  }
+
+  /* WHATWG: leading and trailing C0 controls and spaces go, and every tab, line feed and carriage
+     return inside the string is removed before anything else reads it. */
+  function cleaned(text) {
+    var stripped = String(text).replace(/[\t\n\r]/g, '');
+    var start = 0;
+    var end = stripped.length;
+    while (start < end && stripped.charCodeAt(start) <= 0x20) start++;
+    while (end > start && stripped.charCodeAt(end - 1) <= 0x20) end--;
+    return stripped.slice(start, end);
+  }
+
+  /* The path percent-encode set, and the escape it is written as. An escape already in the path is
+     left as it stands, so what the caller encoded survives. */
+  function encodePath(text) {
+    var out = '';
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      out += percentEncode(ch, text.charCodeAt(i)) ? encodeURIComponent(ch) : ch;
+    }
+    return out;
+  }
+
+  /* RFC 3986 5.2.4: '.' and '..' segments are resolved out, and a percent-encoded dot segment
+     counts as one, the way the url module's own parser reads it. */
+  function removeDotSegments(pathname) {
+    if (pathname.charAt(0) !== '/') return pathname;
+    var segments = pathname.split('/');
+    var out = [''];
+    var trailing = false;
+    for (var i = 1; i < segments.length; i++) {
+      var segment = segments[i];
+      var decoded = segment;
+      try { decoded = decodeURIComponent(segment); } catch (err) { /* an invalid escape is itself */ }
+      if (decoded === '.') { trailing = true; continue; }
+      if (decoded === '..') { if (out.length > 1) out.pop(); trailing = true; continue; }
+      if (segment === '' && i === segments.length - 1) { trailing = true; continue; }
+      trailing = false;
+      out.push(segment);
+    }
+    var resolved = out.join('/');
+    if (trailing && resolved.charAt(resolved.length - 1) !== '/') resolved += '/';
+    return resolved === '' ? '/' : resolved;
+  }
+
+  function portOf(text, raw) {
+    if (text === '') return '';
+    if (!/^[0-9]+$/.test(text)) throw invalidUrl(raw);
+    var digits = text.replace(/^0+/, '');
+    if (digits === '') digits = '0';
+    if (Number(digits) > 65535) throw invalidUrl(raw);
+    return digits;
+  }
+
+  /* The query as it is serialised: the searchParams the caller was handed once it has been changed,
+     and otherwise the query the parser read -- which is the empty string, not nothing, for a '?'
+     that carries no name. */
+  function queryPartOf(state) {
+    if (state.dirty) {
+      var written = state.sp.toString();
+      return written === '' ? '' : '?' + written;
+    }
+    return state.query === null ? '' : '?' + state.query;
+  }
+
+  /* A reference resolved against a base: the pieces of the base it keeps, the same way the url
+     module resolves one, rewritten here against the parser's own state. */
+  function referenceAgainst(base, rel) {
+    var prefix = base.protocol +
+      (base.hasHost || base.protocol === 'file:' ? '//' + base.hostname + (base.port ? ':' + base.port : '') : '');
+    var search = base.query === null ? '' : '?' + base.query;
+    var fragment = base.hash === null ? '' : '#' + base.hash;
+    if (rel.slice(0, 2) === '//') return base.protocol + rel;
+    if (rel === '') return prefix + base.pathname + search + fragment;
+    if (rel.charAt(0) === '/') return prefix + rel;
+    if (rel.charAt(0) === '?') return prefix + base.pathname + rel;
+    if (rel.charAt(0) === '#') return prefix + base.pathname + search + rel;
+    /* a base path that ends in '/' names a directory, so the reference goes inside it; only
+       otherwise is the last segment the file it replaces */
+    var cut = base.pathname.lastIndexOf('/');
+    var dir = cut >= 0 ? base.pathname.slice(0, cut + 1) : (base.hasHost ? '/' : '');
+    return prefix + dir + rel;
+  }
+
+  function parseUrl(input, base, raw) {
+    var text = cleaned(input);
+    var scheme = SCHEME_RE.exec(text);
+    if (scheme === null) {
+      if (base === null || base === undefined) throw invalidUrl(raw);
+      text = referenceAgainst(base, text);
+      scheme = SCHEME_RE.exec(text);
+      if (scheme === null) throw invalidUrl(raw);
+    }
+    var protocol = scheme[1].toLowerCase() + ':';
+    var special = Object.prototype.hasOwnProperty.call(DEFAULT_PORTS, protocol);
+    var rest = text.slice(scheme[0].length);
+    var state = {
+      protocol: protocol, username: '', password: '', hostname: '', port: '', pathname: '',
+      query: null, hash: null, hasHost: false, dirty: false, sp: undefined
+    };
+    /* A special scheme has an authority whether the caller wrote the two slashes or not -- and a
+       backslash counts as one of them, as it does everywhere else in a special URL. Anything else
+       has one only where '//' was written. */
+    var hasHost = false;
+    if (special) {
+      var slashes = 0;
+      while (slashes < 2 && rest.length > 0 && (rest.charAt(0) === '/' || rest.charAt(0) === '\\')) {
+        rest = rest.slice(1);
+        slashes++;
+      }
+      hasHost = true;
+    } else if (rest.slice(0, 2) === '//') {
+      hasHost = true;
+      rest = rest.slice(2);
+    }
+    if (hasHost) {
+      var stop = rest.length;
+      for (var i = 0; i < rest.length; i++) {
+        var ch = rest.charAt(i);
+        if (ch === '/' || ch === '?' || ch === '#' || (special && ch === '\\')) { stop = i; break; }
+      }
+      var authority = rest.slice(0, stop);
+      rest = rest.slice(stop);
+      var at = authority.lastIndexOf('@');
+      var hostport = authority;
+      if (at >= 0) {
+        var userinfo = authority.slice(0, at);
+        hostport = authority.slice(at + 1);
+        var colon = userinfo.indexOf(':');
+        state.username = colon >= 0 ? userinfo.slice(0, colon) : userinfo;
+        state.password = colon >= 0 ? userinfo.slice(colon + 1) : '';
+      }
+      if (hostport.charAt(0) === '[') {
+        /* an IPv6 literal is one host, brackets and all: the ':' inside it is not a port */
+        var close = hostport.indexOf(']');
+        if (close < 0) throw invalidUrl(raw);
+        state.hostname = '[' + hostport.slice(1, close).toLowerCase() + ']';
+        var after = hostport.slice(close + 1);
+        if (after !== '') {
+          if (after.charAt(0) !== ':') throw invalidUrl(raw);
+          state.port = portOf(after.slice(1), raw);
+        }
+      } else {
+        var portAt = hostport.indexOf(':');
+        state.hostname = (portAt >= 0 ? hostport.slice(0, portAt) : hostport).toLowerCase();
+        if (portAt >= 0) state.port = portOf(hostport.slice(portAt + 1), raw);
+      }
+      state.hasHost = true;
+      /* a special scheme that names no host is no URL at all -- except file:, which has none */
+      if (special && state.hostname === '' && protocol !== 'file:') throw invalidUrl(raw);
+      if (state.port !== '' && DEFAULT_PORTS[protocol] === state.port) state.port = '';
+    }
+    var hashAt = rest.indexOf('#');
+    if (hashAt >= 0) { state.hash = rest.slice(hashAt + 1); rest = rest.slice(0, hashAt); }
+    var queryAt = rest.indexOf('?');
+    if (queryAt >= 0) { state.query = rest.slice(queryAt + 1); rest = rest.slice(0, queryAt); }
+    var path = special ? rest.replace(/\\/g, '/') : rest;
+    if (hasHost && path.charAt(0) !== '/') path = '/' + path;
+    state.pathname = encodePath(removeDotSegments(path));
+    return state;
+  }
+
+  /* The parsed state of whatever a caller passed as the base: another URL's own, or one read from
+     a string -- including a URL the url module's parser built, which carries no state of ours. */
+  function stateOf(value) {
+    if (value === null || value === undefined) return null;
+    var own = STATE.get(value);
+    if (own !== undefined) return own;
+    if (typeof value === 'object' && typeof value.href === 'string') return parseUrl(value.href, null, value.href);
+    return parseUrl(value, null, String(value));
+  }
+
+  function field(name, get, set) {
+    Object.defineProperty(URL.prototype, name, { get: get, set: set, enumerable: true, configurable: true });
+  }
+
+  function URL(input, base) {
+    if (!(this instanceof URL)) throw new TypeError("Class constructor URL cannot be invoked without 'new'");
+    STATE.set(this, parseUrl(input, stateOf(base), String(input)));
+  }
+  URL.prototype = Object.create(Base.prototype);
+  Object.defineProperty(URL.prototype, 'constructor', { value: URL, writable: true, configurable: true });
+
+  field('protocol', function () {
+    return STATE.get(this).protocol;
+  }, function (value) {
+    var text = String(value);
+    STATE.get(this).protocol = (text.charAt(text.length - 1) === ':' ? text : text + ':').toLowerCase();
+  });
+  field('username', function () {
+    return STATE.get(this).username;
+  }, function (value) { STATE.get(this).username = String(value); });
+  field('password', function () {
+    return STATE.get(this).password;
+  }, function (value) { STATE.get(this).password = String(value); });
+  field('hostname', function () {
+    return STATE.get(this).hostname;
+  }, function (value) { STATE.get(this).hostname = String(value).toLowerCase(); });
+  field('port', function () {
+    return STATE.get(this).port;
+  }, function (value) {
+    var state = STATE.get(this);
+    var text = String(value);
+    state.port = text === '' ? '' : portOf(text, state.protocol + '//' + state.hostname);
+  });
+  field('host', function () {
+    var state = STATE.get(this);
+    return state.hostname + (state.port ? ':' + state.port : '');
+  }, function (value) {
+    var state = STATE.get(this);
+    var text = String(value);
+    var at = text.indexOf(':');
+    state.hostname = (at >= 0 ? text.slice(0, at) : text).toLowerCase();
+    state.port = at >= 0 ? portOf(text.slice(at + 1), text) : '';
+  });
+  field('pathname', function () {
+    return STATE.get(this).pathname;
+  }, function (value) {
+    var state = STATE.get(this);
+    var text = String(value);
+    state.pathname = encodePath(state.hasHost && text.charAt(0) !== '/' ? '/' + text : text);
+  });
+  field('search', function () {
+    var state = STATE.get(this);
+    if (state.dirty) {
+      var written = state.sp.toString();
+      return written === '' ? '' : '?' + written;
+    }
+    return state.query === null || state.query === '' ? '' : '?' + state.query;
+  }, function (value) {
+    var state = STATE.get(this);
+    var text = String(value);
+    state.query = text === '' ? null : (text.charAt(0) === '?' ? text.slice(1) : text);
+    state.dirty = false;
+    state.sp = undefined;
+  });
+  field('hash', function () {
+    var state = STATE.get(this);
+    return state.hash === null || state.hash === '' ? '' : '#' + state.hash;
+  }, function (value) {
+    var state = STATE.get(this);
+    var text = String(value);
+    state.hash = text === '' ? null : (text.charAt(0) === '#' ? text.slice(1) : text);
+  });
+  field('origin', function () {
+    var state = STATE.get(this);
+    if (state.protocol === 'file:' || !state.hasHost) return 'null';
+    return state.protocol + '//' + state.hostname + (state.port ? ':' + state.port : '');
+  }, undefined);
+  field('href', function () {
+    var state = STATE.get(this);
+    var authority = '';
+    if (state.hasHost || state.protocol === 'file:') {
+      var userinfo = state.username ? state.username + (state.password ? ':' + state.password : '') + '@' : '';
+      authority = '//' + userinfo + state.hostname + (state.port ? ':' + state.port : '');
+    }
+    return state.protocol + authority + state.pathname + queryPartOf(state) +
+      (state.hash === null ? '' : '#' + state.hash);
+  }, function (value) {
+    var state = STATE.get(this);
+    var made = parseUrl(value, null, String(value));
+    for (var key in made) state[key] = made[key];
+  });
+  /* The params of the query, kept: a caller that changes them changes href, as in Node, so the
+     mutators mark the state dirty and the serialiser reads them back rather than the raw query. */
+  Object.defineProperty(URL.prototype, 'searchParams', {
+    get: function () {
+      var state = STATE.get(this);
+      if (state.sp !== undefined) return state.sp;
+      var sp = new URLSearchParams(state.query === null ? '' : state.query);
+      var proto = URLSearchParams.prototype;
+      ['append', 'set', 'delete', 'sort'].forEach(function (name) {
+        Object.defineProperty(sp, name, {
+          value: function () {
+            state.dirty = true;
+            return proto[name].apply(sp, arguments);
+          },
+          writable: true, configurable: true
+        });
+      });
+      state.sp = sp;
+      return sp;
+    },
+    enumerable: true, configurable: true
+  });
+  URL.prototype.toString = function () { return this.href; };
+  URL.prototype.toJSON = function () { return this.href; };
+  Object.defineProperty(URL.prototype, Symbol.toStringTag, { value: 'URL', configurable: true });
+  URL.canParse = function (input, base) {
+    try {
+      new URL(input, base);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  };
+  /* require('url').URL and the global are one class in Node, so the module is handed this one too */
+  nodeUrl.URL = URL;
+  return URL;
+}
+
 var nodeUrl = requireBuiltin('url');
 var nodeUtil = requireBuiltin('util');
 var nodeBuffer = requireBuiltin('buffer');
@@ -622,7 +952,7 @@ globalThis.File = (function () {
   Object.defineProperty(File.prototype, Symbol.toStringTag, { value: 'File', configurable: true });
   return File;
 })();
-globalThis.URL = nodeUrl.URL;
+globalThis.URL = typeof nodeUrl.URL === 'function' ? urlGlobalOf(nodeUrl) : nodeUrl.URL;
 globalThis.URLSearchParams = nodeUrl.URLSearchParams;
 globalThis.atob = function (input) {
   return decodeBytes(decodeBase64(String(input)), 'latin1');
