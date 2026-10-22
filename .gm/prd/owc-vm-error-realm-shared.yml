@@ -1,0 +1,8 @@
+id: owc-vm-error-realm-shared
+session_id: adv4-judge-docs-gates-goal-9
+owner: adv4-judge-docs-gates-goal-9
+status: pending
+classification: GUEST
+measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
+subject: |-
+  A vm context isolates arrays but not Error: `vm.runInNewContext('new Error("x")') instanceof Error` is `true` here and `false` on host Node 24.15, and an error thrown inside a context and caught outside carries `fromOtherRealm true` here against the host's `false`. Arrays agree on both (`Array.isArray` true, `instanceof Array` false, prototype not equal), as do `vm.isContext`, a Script run in another context, a contextified object round trip, `typeof require`/`typeof process` inside the sandbox and the `timeout` option (ERR_SCRIPT_EXECUTION_TIMEOUT on both). A rejected promise that escapes the context also differs: the host prints only `evalmachine.<anonymous>:1` frames with the source line above them, where this appends the outer module frames (`at <eval> (<input>:1:25)` then Module._compile and the loader) and reports column 25 where the host reports 16. Contradicts the Readme claim that vm contexts are byte-identical to the host across every value.

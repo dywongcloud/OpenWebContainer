@@ -1,0 +1,8 @@
+id: owc-process-kill-signal-fatal
+session_id: adv4-judge-docs-gates-goal-9
+owner: adv4-judge-docs-gates-goal-9
+status: pending
+classification: GUEST
+measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
+subject: |-
+  `process.kill(process.pid, 'SIGUSR1')` ends the process with exit 143 (128+15) even when a handler was registered for SIGUSR1: the output stops right after the line printed before the kill, `sent SIGUSR1` and the handler's own line never come, and a timer due 120 ms later never fires. Host Node 24.15 prints `sent SIGUSR1`, then `handler SIGUSR1`, then `survived, got= SIGUSR1`, and exits 0. Reproduced twice with byte-identical output on both sides, one case per process. Registering SIGUSR1, SIGUSR2, SIGINT, SIGTERM and SIGHUP succeeds on both. `process.kill(process.pid)` with no signal ending the process at 143 is Node's own behaviour and does match; what does not is a named signal reaching a handler instead of ending the process.

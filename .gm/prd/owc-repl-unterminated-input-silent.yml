@@ -1,0 +1,8 @@
+id: owc-repl-unterminated-input-silent
+session_id: adv4-judge-docs-gates-goal-9
+owner: adv4-judge-docs-gates-goal-9
+status: pending
+classification: GUEST
+measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
+subject: |-
+  A repl fed `1+1`, `var y = {`, `2+2` on a non-terminal PassThrough prints `> 2\n> | | ` here -- the unterminated input produces no error text at all -- where host Node 24.15 prints `> 2\n> | 2+2\n ^\n\nUncaught SyntaxError: Unexpected token '+'\n> `. A clean session is byte-identical: eight evals including a ReferenceError, a function defined across two evals and an `await` all agree, so the gap is the syntax error a multi-line input raises and not the repl's output loop.

@@ -74,7 +74,15 @@ BF.os = function () {
     machine: function () { return 'x86_64'; },
     totalmem: function () { return 4294967296; },
     freemem: function () { return 2147483648; },
-    uptime: function () { return 0; },
+    /*
+     * System uptime, which for this container is how long it has been up: there is no host behind
+     * it to ask, and a flat 0 -- which this was -- is the one answer no host ever gives, so a
+     * package that divides by it divides by zero and one that prints it prints "0 seconds".
+     */
+    uptime: function () {
+      var proc = globalThis.process;
+      return proc && typeof proc.uptime === 'function' ? proc.uptime() : 0;
+    },
     loadavg: function () { return [0, 0, 0]; },
     /*
      * The loopback, which is the one interface every container and every host has and the only one
