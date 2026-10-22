@@ -831,7 +831,11 @@ function fireTimer(id) {
     if (t.refed) host.ref(-1);
   }
   runInAsyncContext(t.ctx, function () {
-    t.fn.apply(undefined, t.args);
+    try {
+      t.fn.apply(undefined, t.args);
+    } catch (err) {
+      uncaughtFromCallback(err);
+    }
   });
 }
 
@@ -879,6 +883,29 @@ function reportUncaught(err) {
   if (PENDING_UNCAUGHT === null) PENDING_UNCAUGHT = { error: err };
 }
 
+/*
+ * An 'uncaughtException' listener, given an error no caller is going to receive: true once one has
+ * run, and true as well when the listener itself throws something other than the exit signal, since
+ * node lets that one end the process too. The listener is counted when the error is in hand and not
+ * when the callback was scheduled, because a program registers it at the top and throws at the
+ * bottom. False when there is none, which leaves the caller the fatal path.
+ */
+function emitUncaught(err) {
+  var proc = globalThis.process;
+  if (!(proc && typeof proc.emit === 'function' && proc.listenerCount('uncaughtException') > 0)) return false;
+  try {
+    proc.emit('uncaughtException', err);
+  } catch (again) {
+    if (again !== EXIT_SIGNAL) throw again;
+  }
+  return true;
+}
+
+/* what an error out of a timer or a tick does: a listener is given it, or it ends the process */
+function uncaughtFromCallback(err) {
+  if (!emitUncaught(err)) reportUncaught(err);
+}
+
 function drainTicks() {
   while (TICK_QUEUE.length > 0) {
     var job = TICK_QUEUE.shift();
@@ -887,7 +914,7 @@ function drainTicks() {
         job.fn.apply(undefined, job.args);
       });
     } catch (err) {
-      reportUncaught(err);
+      uncaughtFromCallback(err);
     }
   }
 }
