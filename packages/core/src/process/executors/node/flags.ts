@@ -44,6 +44,8 @@ export interface NodeCommand {
     stackTraceLimit?: number;
     /** `--input-type=<type>`: how the `-e`/`-p` source is read -- `module` or `commonjs`. */
     inputType?: string;
+    /** `--title=<name>`: what `process.title` reads, and what the process is named to the system. */
+    title?: string;
     /** The answer for a run that never reaches the guest; set exactly when `file` is `[flags]`. */
     flagAnswer?: NodeFlagAnswer;
 }
@@ -54,6 +56,7 @@ export interface NodeRunOptions {
     stackTraceLimit?: number;
     evalScript?: string;
     inputType?: string;
+    title?: string;
 }
 
 /** The status node exits with when it refuses its own arguments. */
@@ -257,6 +260,8 @@ export function nodeCommand(args: string[]): NodeCommand {
     let evalSeen = false;
     /** `--input-type=<type>`: how the source behind `-e`/`-p` is read. */
     let inputType: string | undefined;
+    /** `--title=<name>`: what `process.title` reads once the guest is up. */
+    let title: string | undefined;
     /** The options of the line, in node's own words: what `process.execArgv` is. */
     const execArgv: string[] = [];
     let stackTraceLimit: number | undefined;
@@ -300,6 +305,9 @@ export function nodeCommand(args: string[]): NodeCommand {
                     break;
                 }
                 execArgv.push(...known.words);
+                /* `--title` is the one option of node's table a script can read back: node changes
+                   `process.title` for it, and the OS name of the process with it. */
+                if (name === '--title') title = value ?? known.words[1];
                 i = known.at;
                 continue;
             }
@@ -427,7 +435,8 @@ export function nodeCommand(args: string[]): NodeCommand {
     const carry = {
         execArgv,
         ...(stackTraceLimit === undefined ? {} : { stackTraceLimit }),
-        ...(inputType === undefined ? {} : { inputType })
+        ...(inputType === undefined ? {} : { inputType }),
+        ...(title === undefined ? {} : { title })
     };
     /* `--` ends the options: what follows is the script, even where it begins with a dash, so
        `node -- --version` runs the file rather than printing a version. */
@@ -440,6 +449,10 @@ export function nodeCommand(args: string[]): NodeCommand {
         file = rest[0];
         rest = rest.slice(1);
     }
+    /* An empty script argument names no script at all, the way node reads one: `node ''` reads its
+       program from stdin and leaves with status 0 once the input ends, and `node --check ''` checks
+       nothing and reports nothing. Only a real name reaches the loader. */
+    if (file === '') file = undefined;
     /* `node --check` with no script checks nothing and reports nothing, as node does. It outranks a
        `-p` that was left without its source: `node -c -p` is a check of nothing, not a print. */
     if (check) {
