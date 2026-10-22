@@ -352,6 +352,25 @@ function moduleToPrimitive() {
   throw new TypeError('Cannot convert object to primitive value');
 }
 
+/* Whether a descriptor asks for the property that is already there: every field it carries is absent
+   or already has the value it names, so carrying it out would change nothing. */
+function describesSameProperty(current, desc) {
+  if (desc === null || typeof desc !== 'object') return true;
+  if ('get' in desc || 'set' in desc) return false;
+  var fields = ['value', 'writable', 'enumerable', 'configurable'];
+  for (var i = 0; i < fields.length; i++) {
+    var field = fields[i];
+    if (!(field in desc)) continue;
+    /* A value is compared the way the language compares it: NaN is the NaN it already is. */
+    if (field === 'value' ? !sameValue(desc.value, current.value) : desc[field] !== current[field]) return false;
+  }
+  return true;
+}
+
+function sameValue(a, b) {
+  return a === b || (a !== a && b !== b);
+}
+
 function moduleKeyText(key) {
   return typeof key === 'symbol' ? String(key) : String(key);
 }
@@ -371,13 +390,48 @@ var MODULE_TRAPS = {
     }
     throw new TypeError('Cannot add property ' + moduleKeyText(key) + ', object is not extensible');
   },
-  defineProperty: function (target, key) {
-    throw new TypeError('Cannot add property ' + moduleKeyText(key) + ', object is not extensible');
+  /* Node lets a define through when it changes nothing -- that is what makes Object.seal() succeed
+     on a namespace, whose properties are already non-configurable -- and refuses one that would
+     change anything with the same words whether the name is already there or not. */
+  defineProperty: function (target, key, desc) {
+    var current = Object.getOwnPropertyDescriptor(target, key);
+    if (current !== undefined && describesSameProperty(current, desc)) return true;
+    throw new TypeError('Cannot redefine property: ' + moduleKeyText(key));
   },
   deleteProperty: function (target, key) {
     throw new TypeError("Cannot delete property '" + moduleKeyText(key) + "' of [object Module]");
   }
 };
+
+/* The same three refusals read through Reflect.*, which reports one as false instead of throwing:
+   a namespace refuses a set, a define and a delete of a property it has, and only a delete of a
+   name it does not have is granted. The engine has no way to tell such a call from the assignment,
+   the define and the delete that must throw, so Reflect answers for a namespace itself and leaves
+   every other object -- a proxy among them -- to the engine. */
+function isModuleNamespace(value) {
+  return value !== null && typeof value === 'object' && value[Symbol.toStringTag] === 'Module';
+}
+
+(function () {
+  if (typeof Reflect !== 'object' || Reflect === null) return;
+  var set = Reflect.set;
+  var define = Reflect.defineProperty;
+  var drop = Reflect.deleteProperty;
+  if (typeof set !== 'function' || typeof define !== 'function' || typeof drop !== 'function') return;
+  Reflect.set = function (target) {
+    return isModuleNamespace(target) ? false : set.apply(Reflect, arguments);
+  };
+  Reflect.defineProperty = function (target, key, desc) {
+    if (!isModuleNamespace(target)) return define.apply(Reflect, arguments);
+    var current = Object.getOwnPropertyDescriptor(target, key);
+    return current !== undefined && describesSameProperty(current, desc);
+  };
+  Reflect.deleteProperty = function (target, key) {
+    return isModuleNamespace(target)
+      ? !Object.prototype.hasOwnProperty.call(target, key)
+      : drop.apply(Reflect, arguments);
+  };
+})();
 
 /* A namespace as Node hands one out, whichever way the module was reached. Only a namespace is
    wrapped: a module's tag is what makes it one, and whatever else an import resolves to -- a
@@ -749,6 +803,7 @@ function importWrap(promise) {
 }
 
 Object.defineProperty(globalThis, '__owc_importMeta', { value: importMetaOf, writable: true, configurable: true });
+Object.defineProperty(globalThis, '__owc_moduleView', { value: moduleViewOf, writable: true, configurable: true });
 Object.defineProperty(globalThis, '__owc_importArg', { value: importArgOf, writable: true, configurable: true });
 Object.defineProperty(globalThis, '__owc_importWrap', { value: importWrap, writable: true, configurable: true });
 

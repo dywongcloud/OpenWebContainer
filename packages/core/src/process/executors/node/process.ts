@@ -2317,6 +2317,7 @@ export class NodeProcess extends Process {
             // a .json import without `with { type: 'json' }`: evaluating the module throws ERR_IMPORT_ATTRIBUTE_MISSING
             return ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
                 code: 'ERR_IMPORT_ATTRIBUTE_MISSING',
+                ctor: 'TypeError',
                 message: `Module "${isDataUrl(found) ? found : toFileUrl(found)}" needs an import attribute of "type: json"`,
             }));
         }
@@ -2965,6 +2966,29 @@ function rewriteModuleSpecifier(
 }
 
 /**
+ * `import * as ns from '...'` binds the namespace the engine built, and that object answers an
+ * attempt to change it in the engine's words rather than Node's. The binding is renamed and
+ * rebound, right after the import, to the view that answers in Node's -- the same view a dynamic
+ * `import()` of the module gets, so the two are one object, as they are in Node. Reads still go
+ * through to the engine's namespace, so a binding the module later reassigns still reads as new.
+ */
+function wrapNamespaceImport(tokens: JsToken[], i: number, edits: SourceEdit[]): void {
+    if (!isPunc(tokens[i + 1], '*') || !isId(tokens[i + 2], 'as') || tokens[i + 3]?.t !== 'id') return;
+    const name = tokens[i + 3];
+    if (name.v === 'from' || name.v === 'with' || name.v === 'assert') return;
+    if (!isId(tokens[i + 4], 'from') || tokens[i + 5]?.t !== 'str') return;
+    const temp = `__owc_ns${i}`;
+    let end = tokens[i + 5].e;
+    const after = tokens[i + 6];
+    if ((isId(after, 'with') || isId(after, 'assert')) && isPunc(tokens[i + 7], '{')) {
+        const close = matchingClose(tokens, i + 7);
+        if (close > 0 && tokens[close].e > end) end = tokens[close].e;
+    }
+    edits.push({ start: name.s, end: name.e, text: temp });
+    edits.push({ start: end, end: end, text: `;\nconst ${name.v} = globalThis.__owc_moduleView(${temp});` });
+}
+
+/**
  * Rewrites one ES module source: `import.meta` becomes a per-module object, dynamic import()
  * arguments pass through the attribute check, static attribute clauses are resolved, and
  * `export const { a } = ...` (a binding pattern the engine does not export) becomes a plain
@@ -3005,6 +3029,7 @@ function prepareEsmSource(
                 }
             } else if (next !== undefined && (next.t === 'str' || next.t === 'id' || isPunc(next, '*') || isPunc(next, '{'))) {
                 rewriteModuleSpecifier(tokens, source, i, edits, resolveUrl);
+                wrapNamespaceImport(tokens, i, edits);
             }
         } else if (tok.v === 'export') {
             const next = tokens[i + 1];

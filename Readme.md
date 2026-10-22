@@ -807,8 +807,8 @@ Future plans:
 - [ ] URL forbidden host code points -- `new URL('http://a b/')` is accepted where host Node throws (row owc-url-forbidden-host-code-points)
 - [ ] URL file: scheme -- `new URL('file:/a').href` is `file://a/` where host Node gives `file:///a` (row owc-url-file-scheme-host)
 - [ ] url module legacy API -- `require('url').domainToASCII` is absent and `url.parse(...).href` writes a stray `=` before the fragment (row owc-url-module-legacy-api)
-- [ ] Builtin module namespace surface -- `node:fs` lacks `cp`/`glob`/`statfs`/`openAsBlob` and leaks `F_OK` at top level (row owc-esm-builtin-namespace-surface)
-- [ ] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
+- [ ] Builtin module namespace surface -- far wider than `node:fs`: against host Node the namespaces of 20 of 26 builtins are short (`node:constants` 56 against 231, `node:process` 36 against 83, `node:crypto` 30 against 70, `node:util` 22 against 35), `node:util` adds 5 names host Node lacks, and `node:stream/consumers` and `node:assert/strict` do not resolve at all (row owc-esm-builtin-namespace-surface)
+- [x] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
 - [ ] `cmd 3>f >&3` -- a descriptor the command itself opened is not visible to its own later `>&n` (row owc-shell-fd-opened-by-command-visible-to-itself)
 - [ ] `exec >f`, `exec 2>f` and `exec 1>&2` are dropped, so they do not persist (row owc-shell-exec-standard-fd-dropped)
 - [ ] `exec 3>&1` and `exec 3>&2` are "Bad file descriptor" where a host duplicates the standard one (row owc-shell-exec-duplicating-standard-fd)
@@ -860,6 +860,9 @@ re-run in isolation; the rows are open.
   still compiled as CommonJS -- `typeof import.meta` is a `SyntaxError` and `typeof require` is
   `function`, where the host has `object` and `undefined`, and `node --input-type=module -p 1` should
   fail with `ERR_EVAL_ESM_CANNOT_PRINT` rather than print `1`.
+- `owc-esm-require-tla-context-lines`: `require('./tla.mjs')` on a graph with top-level await -- the
+  host prints two context lines above the require stack (`  From <app>/main.js` and
+  `  Requiring <app>/tla.mjs`), the container prints the `- <app>/main.js` stack line only.
 - `owc-node-missing-entry-dump`: `node <missing>` -- the host prints its loader dump (eight
   `node:internal/modules/cjs/loader` frames, `code: 'MODULE_NOT_FOUND'`), the container prints the
   single line `Error: Cannot find module '<path>'`.
