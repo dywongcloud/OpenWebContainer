@@ -177,6 +177,13 @@ export interface ShellJob {
     pid: number;
     /** The command as it was written, for `jobs`. */
     text: string;
+    /**
+     * The command as it was written, quoting and all, which is what the job is run from. `text` is
+     * the words a shell *prints*, and printing them back is what took the quoting out of a job:
+     * `(echo 'a  b') &` was replayed as `echo a b`, so `(trap 'echo inner' EXIT) &` ran the trap
+     * `echo` and printed an empty line where a host prints `inner`.
+     */
+    source?: string;
     /** Run to completion: `wait` no longer has anything to wait for. */
     done: boolean;
     /** The status it left, once it has run. */
@@ -1237,7 +1244,11 @@ class Parser {
         this.skipSpace(true);
         if (this.pos < this.src.length) {
             const rest = this.src.slice(this.pos).trim();
-            throw new ShellSyntaxError(`syntax error near unexpected token \`${rest.split(/[\s;]/)[0] || 'newline'}'`);
+            /* A `;;` nothing is looking for -- the one a `case` item inside a `$( )` leaves behind,
+               because the `)` of its pattern is the one that closed the substitution -- is the token
+               a host names, and not the `newline` splitting the rest on whitespace and `;` gives. */
+            const token = rest.startsWith(';;') ? ';;' : rest.split(/[\s;]/)[0] || 'newline';
+            throw new ShellSyntaxError(`syntax error near unexpected token \`${token}'`);
         }
         return nodes;
     }
@@ -2688,7 +2699,7 @@ function runTrap(state: ShellState, name: string): void {
 
 let RUNNER: SimpleCommandRunner = (_state, words) => ({
     stdout: '',
-    stderr: `Command not found: ${words[0] ?? ''}`,
+    stderr: `Command not found: ${words[0] ?? ''}\n`,
     exitCode: 127
 });
 
@@ -2770,7 +2781,11 @@ function runParsed(state: ShellState, script: string): number {
         if (error instanceof ExitSignal) return error.code;
         if (error instanceof ReturnSignal) return error.code;
         if (error instanceof ShellSyntaxError) {
+            /* The message, and then the line it came from, echoed in backquotes the way a host
+               handed a script with `-c` echoes it: `/bin/sh: -c: line 0: syntax error near
+               unexpected token `)'` followed by the script that would not parse. */
             writeErr(state, `${error.message}\n`);
+            writeErr(state, `\`${script}'\n`);
             return 2;
         }
         if (error instanceof UnsetVariableError) {
@@ -3232,7 +3247,13 @@ function planDuplicate(state: ShellState, plan: RedirectPlan, fd: number, target
  * The message of a redirection that cannot be made -- `exec 3>&4` with no `4` -- which a host
  * reports and ends a shell that is not reading a terminal with. Undefined when every one was made.
  */
-function applyExecRedirects(state: ShellState, redirects: Redirect[], plan: RedirectPlan): string | undefined {
+function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | undefined {
+    const plan: RedirectPlan = {
+        stdoutTo: { ...state.stdoutTarget },
+        stderrTo: { ...state.stderrTarget },
+        opened: [],
+        fds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }]))
+    };
     const fds = new Map(state.openFds);
     let stdoutTo: StreamTarget = { ...state.stdoutTarget };
     let stderrTo: StreamTarget = { ...state.stderrTarget };
@@ -3507,6 +3528,27 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     const words: string[] = [];
     for (const word of command.words) words.push(...expandWord(state, word));
 
+    /* `exec` with nothing to run: the redirections it carries are the shell's from here on, not one
+       command's -- `exec 3>f; echo hi >&3` writes `hi` to `f`, `exec >f` sends every command's
+       output there, and `exec 3>&-` closes the descriptor again, as they do in a host shell. They
+       are applied before this command's own plan is made, so the plan reads the destination `exec`
+       has just set: `exec >f` is a write to `f` from this command on. */
+    if (words[0] === 'exec' && words.length === 1) {
+        const failed = applyExecRedirects(state, command.redirects);
+        if (failed !== undefined) {
+            /* A redirection `exec` cannot make ends the shell, the way `exec 3>&4` ends the
+               /bin/sh a line was handed to with `-c`: the host's own message, and nothing behind
+               it -- not the `echo rc=$?` written after it -- runs at all. The files its own
+               redirections had already opened before the one that failed are still opened. */
+            writeErr(state, failed);
+            state.exitCalled = true;
+            const undone = planRedirects(state, command.redirects);
+            undone.error = undefined;
+            finish(state, undone, '', '', 1, 'exec');
+            return throwExit(1);
+        }
+    }
+
     const plan = planRedirects(state, command.redirects);
     const commandInput = plan.inputText !== undefined
         ? plan.inputText
@@ -3539,11 +3581,6 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
 
     let name = words[0];
     let args = words.slice(1);
-
-    /* `exec` with nothing to run: the redirections it carries are the shell's from here on, not one
-       command's -- `exec 3>f; echo hi >&3` writes `hi` to `f`, and `exec 3>&-` closes the descriptor
-       again, as they do in a host shell. */
-    if (name === 'exec' && args.length === 0) applyExecRedirects(state, command.redirects);
 
     /* A jobspec typed as a command is `fg` with that jobspec as its argument: `%1` on a line of
        its own resumes the job in the foreground, and where the shell has no job control it is
@@ -3607,7 +3644,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
             const status = callFunction(state, fn, args);
             for (const entry of pending) setVar(state, entry.name, entry.value);
             syncPwd(state);
-            return finish(state, plan, '', '', status);
+            return finish(state, plan, '', '', status, name);
         }
 
         const builtin = COMMANDS[name];
@@ -3636,13 +3673,13 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
             }
             for (const entry of pending) setVar(state, entry.name, entry.value);
             syncPwd(state);
-            return finish(state, plan, result.stdout, result.stderr, result.exitCode);
+            return finish(state, plan, result.stdout, result.stderr, result.exitCode, name);
         }
 
         const step = RUNNER(state, words, stdin);
         for (const entry of pending) setVar(state, entry.name, entry.value);
         syncPwd(state);
-        return finish(state, plan, step.stdout, step.stderr, step.exitCode);
+        return finish(state, plan, step.stdout, step.stderr, step.exitCode, name);
     } finally {
         if (commandInput !== null) {
             state.inputBuffer = savedBuffer;
@@ -5361,7 +5398,9 @@ function runPendingJob(state: ShellState, job: ShellJob): { stdout: string; stde
     const snapshot = snapshotState(state);
     const savedIo = state.io;
     try {
-        const result = runScriptNoExitTrap(state, job.text);
+        /* The source the `&` was written on, not the text `jobs` prints: printing a command is what
+           takes its quoting out, and a job replayed from unquoted words is a different command. */
+        const result = runScriptNoExitTrap(state, job.source ?? job.text);
         job.done = true;
         job.exitCode = result.exitCode;
         return result;
