@@ -129,6 +129,13 @@ export interface ShellJob {
     done: boolean;
     /** The status it left, once it has run. */
     exitCode: number;
+    /**
+     * Ended by a signal rather than by running out: a job `kill` ended never runs at all, and the
+     * shell reports it -- during `wait`, which is when a host notices a job its own `kill` ended.
+     */
+    terminated?: boolean;
+    /** The signal that ended it, for the notice `wait` writes. */
+    signal?: { number: number; name: string };
 }
 
 export interface ShellState {
@@ -176,6 +183,13 @@ export interface ShellState {
     /** `hash`'s remembered command paths. */
     hash: Map<string, string>;
     traps: Map<string, TrapSpec>;
+    /**
+     * The descriptors `exec` opened and left open: `3` is the file `exec 3>f` named, and a later
+     * `echo hi >&3` writes to it, the way it does in a shell. The two a redirection names without
+     * being opened -- 1 and 2 -- are never in here; the plan of the command that redirects them
+     * carries where they go.
+     */
+    openFds: Map<number, { file: string; append: boolean }>;
     callStack: CallFrame[];
     /** Free slot for the host: `child.ts` stores its CapabilityContext here for its runner. */
     host?: unknown;
@@ -1054,7 +1068,7 @@ class Parser {
     /** True when whitespace must stay inside the word: `${x:-a b}` and `$((a + b))`. */
     private readonly keepSpaces: boolean;
     private static readonly STOP = new Set([' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>']);
-    private heredocs: { delimiter: string; strip: boolean; target: Redirect }[] = [];
+    private heredocs: { delimiter: string; strip: boolean; expand: boolean; target: Redirect }[] = [];
     private expandedAliases = new Set<string>();
 
     constructor(src: string, state: ShellState | null, keepSpaces = false) {
@@ -1154,6 +1168,115 @@ class Parser {
         return body;
     }
 
+    /**
+     * Reads a backquoted command substitution: the body ends at the next *unescaped* backquote.
+     *
+     * A backquote is its own delimiter, so the one that closes the substitution is not an opener --
+     * read as one, as `readDelimited` reads it, the body swallowed the rest of the line and every
+     * command behind the substitution was lost. Inside the body a backslash escapes only `$`, a
+     * backquote, a backslash and a newline; before anything else it is an ordinary character, which
+     * is why a body is kept whole and handed to a fresh parser rather than unescaped here.
+     */
+    private readBackquote(): string {
+        let body = '';
+        while (this.pos < this.src.length) {
+            const ch = this.src[this.pos];
+            if (ch === '`') {
+                this.pos++;
+                return body;
+            }
+            if (ch === '\\') {
+                const next = this.src[this.pos + 1];
+                if (next === undefined) {
+                    body += ch;
+                    this.pos++;
+                    continue;
+                }
+                if (next === '\n') {
+                    this.pos += 2;
+                    continue;
+                }
+                /* A backslash escapes a backquote into a nested substitution -- ``echo `echo \`echo
+                   deep\`` `` prints `deep` -- and escapes `$` and `\` into themselves; before
+                   anything else it is an ordinary character, and before a newline it is a
+                   continuation. The escapes are kept, because the body is handed to a fresh parser
+                   rather than unescaped here. */
+                if (next === '`') {
+                    body += next;
+                    this.pos += 2;
+                    continue;
+                }
+                if ('$\\'.includes(next)) {
+                    body += ch + next;
+                    this.pos += 2;
+                    continue;
+                }
+                body += ch;
+                this.pos++;
+                continue;
+            }
+            body += ch;
+            this.pos++;
+        }
+        throw new ShellSyntaxError('unexpected EOF while looking for matching `\'');
+    }
+
+    /**
+     * Reads a `$( )` command substitution: the body ends at the `)` closing the one that opened it,
+     * however many parentheses the commands inside it open and close on the way.
+     *
+     * Counting only `$(` and `)` -- which is what `readDelimited` does -- stops at the first `)` of
+     * the command's own: `$( (exit 5) & wait $! )` ended at the `)` of `(exit 5)` and the rest of
+     * the substitution was left behind as a syntax error. Parentheses inside single quotes, double
+     * quotes and backquotes are not counted, because a command inside them does not open one.
+     */
+    private readCommandSubst(): string {
+        const start = this.pos;
+        let depth = 0;
+        let i = this.pos;
+        while (i < this.src.length) {
+            const ch = this.src[i];
+            if (ch === '\\') {
+                i += 2;
+                continue;
+            }
+            if (ch === "'") {
+                const end = this.src.indexOf("'", i + 1);
+                i = end === -1 ? this.src.length : end + 1;
+                continue;
+            }
+            if (ch === '"') {
+                i++;
+                while (i < this.src.length && this.src[i] !== '"') i += this.src[i] === '\\' ? 2 : 1;
+                i++;
+                continue;
+            }
+            if (ch === '`') {
+                i++;
+                while (i < this.src.length && this.src[i] !== '`') i += this.src[i] === '\\' ? 2 : 1;
+                i++;
+                continue;
+            }
+            if (ch === '(') {
+                depth++;
+                i++;
+                continue;
+            }
+            if (ch === ')') {
+                if (depth === 0) {
+                    this.pos = i + 1;
+                    return this.src.slice(start, i);
+                }
+                depth--;
+                i++;
+                continue;
+            }
+            i++;
+        }
+        this.pos = this.src.length;
+        return this.src.slice(start);
+    }
+
     /** Reads `${ ... }`, honouring nested braces and quotes. */
     private readBraced(): string {
         let depth = 1;
@@ -1196,7 +1319,7 @@ class Parser {
                 return { t: 'arith', expr: this.readDelimited('$(', '))') };
             }
             this.pos++;
-            return { t: 'cmd', script: this.readDelimited('$(', ')') };
+            return { t: 'cmd', script: this.readCommandSubst() };
         }
         if (next === '{') {
             this.pos++;
@@ -1272,7 +1395,7 @@ class Parser {
                             text = '';
                         }
                         this.pos++;
-                        inner.push({ t: 'cmd', script: this.readDelimited('`', '`') });
+                        inner.push({ t: 'cmd', script: this.readBackquote() });
                         continue;
                     }
                     text += cur;
@@ -1286,7 +1409,7 @@ class Parser {
             if (ch === '`') {
                 flush();
                 this.pos++;
-                parts.push({ t: 'cmd', script: this.readDelimited('`', '`') });
+                parts.push({ t: 'cmd', script: this.readBackquote() });
                 continue;
             }
             if (ch === '$') {
@@ -1306,8 +1429,34 @@ class Parser {
         const word = this.readWord();
         if (!word) throw new ShellSyntaxError("syntax error near unexpected token `newline'");
         const redirect: Redirect = { fd, op, target: word };
-        if (op === '<<' || op === '<<-') this.heredocs.push({ delimiter: rawText(word), strip: op === '<<-', target: redirect });
+        if (op === '<<' || op === '<<-') this.heredocs.push({ delimiter: rawText(word), strip: op === '<<-', expand: this.expandsHeredoc(word), target: redirect });
         return redirect;
+    }
+
+    /**
+     * True for a here-document whose delimiter was written unquoted: `<<EOF` expands the variables
+     * and substitutions of its body, while `<<'EOF'`, `<<"EOF"` and `<<\EOF` take it literally.
+     */
+    private expandsHeredoc(word: Word): boolean {
+        for (const part of word) if (part.t === 'sq' || part.t === 'dq') return false;
+        return true;
+    }
+
+    /**
+     * The body of an expanding here-document, as one word: its variables, substitutions and
+     * arithmetic are expanded when the command is run, as a host shell expands them.
+     *
+     * The newline that ends each line is put back as literal text: a word is read a line at a time,
+     * and a body is the lines it was written with, joined by the newlines between them.
+     */
+    private heredocWord(text: string): Word {
+        const parts: Part[] = [];
+        const lines = text.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            if (i > 0) parts.push({ t: 'lit', v: '\n' });
+            parts.push(...lexParts(lines[i], true));
+        }
+        return [{ t: 'dq', parts }];
     }
 
     /** Reads the here-document bodies that follow the newline ending the command line. */
@@ -1330,8 +1479,9 @@ class Parser {
             const text = lines.length === 0 ? '' : lines.join('\n') + '\n';
             /* The body is the input itself, not the name of a file holding it: it stays a `<<`
                redirection, which `planRedirects` reads as text the command reads on its standard
-               input. Reading it as a file looked for a file called `hi` and failed with ENOENT. */
-            entry.target.target = [{ t: 'sq', v: text }];
+               input. Reading it as a file looked for a file called `hi` and failed with ENOENT.
+               A quoted delimiter takes the body as it was written; an unquoted one expands it. */
+            entry.target.target = entry.expand ? this.heredocWord(text) : [{ t: 'sq', v: text }];
         }
     }
 
@@ -2194,6 +2344,7 @@ interface Snapshot {
     dirs: string[];
     umask: number;
     traps: Map<string, TrapSpec>;
+    openFds: Map<number, { file: string; append: boolean }>;
     aliases: Map<string, string>;
     functions: Map<string, FunctionDef>;
     optind: number;
@@ -2214,6 +2365,7 @@ function snapshotState(state: ShellState): Snapshot {
         dirs: state.dirs.slice(),
         umask: state.umask,
         traps: new Map([...state.traps].map(([name, spec]) => [name, { ...spec }])),
+        openFds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }])),
         aliases: new Map(state.aliases),
         functions: new Map(state.functions),
         optind: state.optind,
@@ -2234,6 +2386,7 @@ function restoreState(state: ShellState, snapshot: Snapshot): void {
     state.dirs = snapshot.dirs;
     state.umask = snapshot.umask;
     state.traps = snapshot.traps;
+    state.openFds = snapshot.openFds;
     state.aliases = snapshot.aliases;
     state.functions = snapshot.functions;
     state.optind = snapshot.optind;
@@ -2367,28 +2520,45 @@ function bindState(ctx: CommandContext, state: ShellState): CommandContext {
     return ctx;
 }
 
+/** Parses and runs a whole script, and reports one that failed the way a shell reports it. */
+function runParsed(state: ShellState, script: string): number {
+    try {
+        const nodes = new Parser(script, state).parse();
+        return runCommandList(state, nodes, null);
+    } catch (error) {
+        if (error instanceof ExitSignal) return error.code;
+        if (error instanceof ReturnSignal) return error.code;
+        if (error instanceof ShellSyntaxError) {
+            writeErr(state, `${error.message}\n`);
+            return 2;
+        }
+        if (error instanceof UnsetVariableError) {
+            writeErr(state, `${error.message}\n`);
+            return 127;
+        }
+        writeErr(state, `${errorMessage(error)}\n`);
+        return 1;
+    }
+}
+
 /** The front door: parses and runs a whole script. */
 export function runScript(state: ShellState, script: string): { stdout: string; stderr: string; exitCode: number } {
     state.io = { stdout: '', stderr: '' };
-    let exitCode = 0;
-    try {
-        const nodes = new Parser(script, state).parse();
-        exitCode = runCommandList(state, nodes, null);
-    } catch (error) {
-        if (error instanceof ExitSignal) exitCode = error.code;
-        else if (error instanceof ReturnSignal) exitCode = error.code;
-        else if (error instanceof ShellSyntaxError) {
-            writeErr(state, `${error.message}\n`);
-            exitCode = 2;
-        } else if (error instanceof UnsetVariableError) {
-            writeErr(state, `${error.message}\n`);
-            exitCode = 127;
-        } else {
-            writeErr(state, `${errorMessage(error)}\n`);
-            exitCode = 1;
-        }
-    }
+    const exitCode = runParsed(state, script);
     runTrap(state, 'EXIT');
+    return { stdout: state.io.stdout, stderr: state.io.stderr, exitCode };
+}
+
+/**
+ * One script run without the shell's EXIT trap: a job, a subshell and a substitution are not the
+ * shell's own exit, and only the shell's own exit runs the trap -- `trap 'echo t' EXIT; (exit 0) &
+ * wait; echo main` prints `main` then `t`, once, as it does in a host shell. Running a job through
+ * `runScript` fired the trap for the job as well, which is why it came out before the rest of the
+ * line and then again at the end of it.
+ */
+function runScriptNoExitTrap(state: ShellState, script: string): { stdout: string; stderr: string; exitCode: number } {
+    state.io = { stdout: '', stderr: '' };
+    const exitCode = runParsed(state, script);
     return { stdout: state.io.stdout, stderr: state.io.stderr, exitCode };
 }
 
@@ -2687,22 +2857,112 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
 }
 
 interface RedirectPlan {
-    stdoutTo: { kind: 'out' | 'err' | 'file'; file?: string; append?: boolean };
-    stderrTo: { kind: 'out' | 'err' | 'file'; file?: string; append?: boolean };
+    stdoutTo: { kind: 'out' | 'err' | 'file' | 'null'; file?: string; append?: boolean };
+    stderrTo: { kind: 'out' | 'err' | 'file' | 'null'; file?: string; append?: boolean };
     inputFile?: string;
     /** The input a here-string wrote: text already read, never the name of a file to open. */
     inputText?: string;
+    /**
+     * Descriptors above 2 a redirection opened for this one command: `cmd 3>f` creates `f` and
+     * leaves it empty -- the command's own output still goes where it went -- and `exec 3>f` is
+     * the one that keeps the descriptor open for the commands behind it.
+     */
+    opened: { fd: number; file: string; append: boolean }[];
+    /** The message of a descriptor nothing opened, which a host reports before running anything. */
+    error?: string;
+}
+
+/** Where one of the two standard descriptors goes, in the shape the plan carries. */
+type StreamTarget = { kind: 'out' | 'err' | 'file' | 'null'; file?: string; append?: boolean };
+
+/**
+ * `n>&m`, `n>&-`: a descriptor moved to where another one already points, or closed.
+ *
+ * `1` and `2` are the two every command has, and the plan carries where they go. A higher one is a
+ * descriptor `exec` opened earlier -- `exec 3>f; echo hi >&3` writes `hi` to `f` -- and a number no
+ * `exec` opened is a bad descriptor, which a host names and fails the command with before it runs.
+ */
+function planDuplicate(state: ShellState, plan: RedirectPlan, fd: number, target: string): void {
+    const sink = (kind: StreamTarget['kind']): void => {
+        if (fd === 2) plan.stderrTo = { kind };
+        else if (fd === 1) plan.stdoutTo = { kind };
+    };
+    const toFile = (file: string, append: boolean): void => {
+        if (fd === 2) plan.stderrTo = { kind: 'file', file, append };
+        else if (fd === 1) plan.stdoutTo = { kind: 'file', file, append };
+        else plan.opened.push({ fd, file, append });
+    };
+    if (target === '-') {
+        sink('null');
+        return;
+    }
+    if (target === '1') {
+        if (fd === 2) plan.stderrTo = { ...plan.stdoutTo };
+        else if (fd === 1) plan.stdoutTo = { ...plan.stdoutTo };
+        return;
+    }
+    if (target === '2') {
+        if (fd === 2) plan.stderrTo = { ...plan.stderrTo };
+        else if (fd === 1) plan.stdoutTo = { ...plan.stderrTo };
+        return;
+    }
+    if (/^[0-9]+$/.test(target)) {
+        const number = Number.parseInt(target, 10);
+        const opened = state.openFds.get(number);
+        if (opened === undefined) {
+            /* `echo hi >&9` on a host: `sh: 9: Bad file descriptor`, written without the `line 0`
+               the jobspec diagnostics carry, and the command does not run. */
+            if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
+            return;
+        }
+        toFile(opened.file, opened.append);
+        /* A write through a descriptor moves the offset it holds: `exec 3>f; echo a >&3; echo b >&3`
+           leaves `f` holding both lines, where a write that started at the beginning every time
+           would leave only the last. */
+        state.openFds.set(number, { file: opened.file, append: true });
+        return;
+    }
+    toFile(target, false);
+}
+
+/**
+ * Keeps the redirections of an `exec` that names no command, so the descriptors it opens are open
+ * for the rest of the line and for the lines behind it: `exec 3>f; echo hi >&3; exec 3>&-`.
+ *
+ * The two standard descriptors are left to the plan of the command itself -- `exec >f` is a
+ * redirection of that one command's output, which the plan already carries -- and only a descriptor
+ * above 2 is one a later `>&n` can name.
+ */
+function applyExecRedirects(state: ShellState, redirects: Redirect[]): void {
+    for (const redirect of redirects) {
+        const target = expandToString(redirect.target, state);
+        if (redirect.fd < 3) continue;
+        if (redirect.op === '>' || redirect.op === '>>') {
+            state.openFds.set(redirect.fd, { file: target, append: redirect.op === '>>' });
+            continue;
+        }
+        if (redirect.op !== '>&') continue;
+        if (target === '-') {
+            state.openFds.delete(redirect.fd);
+            continue;
+        }
+        if (!/^[0-9]+$/.test(target)) continue;
+        const opened = state.openFds.get(Number.parseInt(target, 10));
+        if (opened === undefined) state.openFds.delete(redirect.fd);
+        else state.openFds.set(redirect.fd, { ...opened });
+    }
 }
 
 function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
-    const plan: RedirectPlan = { stdoutTo: { kind: 'out' }, stderrTo: { kind: 'err' } };
+    const plan: RedirectPlan = { stdoutTo: { kind: 'out' }, stderrTo: { kind: 'err' }, opened: [] };
     for (const redirect of redirects) {
         const target = expandToString(redirect.target, state);
         switch (redirect.op) {
             case '>':
             case '>>':
                 if (redirect.fd === 2) plan.stderrTo = { kind: 'file', file: target, append: redirect.op === '>>' };
-                else plan.stdoutTo = { kind: 'file', file: target, append: redirect.op === '>>' };
+                else if (redirect.fd === 1) plan.stdoutTo = { kind: 'file', file: target, append: redirect.op === '>>' };
+                else plan.opened.push({ fd: redirect.fd, file: target, append: redirect.op === '>>' });
                 break;
             case '<':
                 plan.inputFile = target;
@@ -2727,15 +2987,11 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
             case '>&':
                 /* A duplicate copies the destination the named descriptor has *now*, not where it
                    started: `> f 2>&1` sends both to `f`, while `2>&1 > f` leaves stderr on the
-                   terminal. `2>&1` on a bare line therefore copies stdout's own destination. */
-                if (target === '2') {
-                    if (redirect.fd === 2) plan.stderrTo = { ...plan.stderrTo };
-                    else plan.stdoutTo = { ...plan.stderrTo };
-                } else if (target === '1') {
-                    if (redirect.fd === 2) plan.stderrTo = { ...plan.stdoutTo };
-                    else plan.stdoutTo = { ...plan.stdoutTo };
-                } else if (redirect.fd === 2) plan.stderrTo = { kind: 'file', file: target };
-                else plan.stdoutTo = { kind: 'file', file: target };
+                   terminal. `2>&1` on a bare line therefore copies stdout's own destination. A
+                   higher descriptor is one `exec` opened, and `>&3` is a write to the file it holds
+                   -- which used to be read as a write to a file *named* `3`, so `echo hi >&3` made
+                   a file called `3` instead of writing `hi` where `exec 3>f` had pointed it. */
+                planDuplicate(state, plan, redirect.fd, target);
                 break;
             case '<&':
             default:
@@ -2778,15 +3034,23 @@ function writeOutputFile(state: ShellState, file: string, text: string, append: 
 /** Applies the redirection plan and sends the result to the current output sink. */
 function finish(state: ShellState, plan: RedirectPlan, stdout: string, stderr: string, exitCode: number): number {
     try {
-        if (plan.stderrTo.kind === 'out') {
+        /* A descriptor a redirection opened and nothing wrote to: `cmd 3>f` leaves `f` created and
+           empty, and `exec 3>f` opens the one the commands behind it write through with `>&3`. */
+        for (const opened of plan.opened) writeOutputFile(state, opened.file, '', Boolean(opened.append));
+        if (plan.error !== undefined) {
+            writeErr(state, plan.error);
+            return 1;
+        }
+        if (plan.stderrTo.kind === 'null') stderr = '';
+        else if (plan.stderrTo.kind === 'out') {
             writeOut(state, stdout + stderr);
             return exitCode;
-        }
-        if (plan.stderrTo.kind === 'file' && plan.stderrTo.file !== undefined) {
+        } else if (plan.stderrTo.kind === 'file' && plan.stderrTo.file !== undefined) {
             writeOutputFile(state, plan.stderrTo.file, stderr, Boolean(plan.stderrTo.append));
             stderr = '';
         }
-        if (plan.stdoutTo.kind === 'file' && plan.stdoutTo.file !== undefined) {
+        if (plan.stdoutTo.kind === 'null') stdout = '';
+        else if (plan.stdoutTo.kind === 'file' && plan.stdoutTo.file !== undefined) {
             writeOutputFile(state, plan.stdoutTo.file, stdout, Boolean(plan.stdoutTo.append));
             stdout = '';
         } else if (plan.stdoutTo.kind === 'err') {
@@ -2884,6 +3148,11 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     let name = words[0];
     let args = words.slice(1);
 
+    /* `exec` with nothing to run: the redirections it carries are the shell's from here on, not one
+       command's -- `exec 3>f; echo hi >&3` writes `hi` to `f`, and `exec 3>&-` closes the descriptor
+       again, as they do in a host shell. */
+    if (name === 'exec' && args.length === 0) applyExecRedirects(state, command.redirects);
+
     /* A jobspec typed as a command is `fg` with that jobspec as its argument: `%1` on a line of
        its own resumes the job in the foreground, and where the shell has no job control it is
        `fg`'s own error that comes back -- `sh: line 0: fg: no job control`, never `Command not
@@ -2897,7 +3166,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
      * the container's processes, and a job's pid is not one of them, so a jobspec ends here. A
      * signal name or number in front of it is kept: `kill -TERM %1` is the same kill.
      */
-    if (name === 'kill' && args.some((arg) => arg.startsWith('%'))) {
+    if (name === 'kill' && args.some((arg) => arg.startsWith('%') || isPendingJobPid(state, arg))) {
         const killed = killJobSpecs(state, args);
         return finish(state, plan, killed.stdout, killed.stderr, killed.exitCode);
     }
@@ -4169,7 +4438,9 @@ export function runPendingJobs(state: ShellState): { stdout: string; stderr: str
     let stdout = '';
     let stderr = '';
     for (const job of jobs) {
-        if (job.done) continue;
+        /* A job `kill` ended and `wait` never asked for still gets its notice written here, which is
+           the only "later" a line handed to `sh -c` has. */
+        if (job.done && job.terminated !== true) continue;
         const step = runPendingJob(state, job);
         stdout += step.stdout;
         stderr += step.stderr;
@@ -4183,11 +4454,83 @@ export function runPendingJobs(state: ShellState): { stdout: string; stderr: str
  * jobspec that names no job is bash's own `kill: %1: no such job`, with status 1 -- not the
  * `illegal process id` a word that is no pid at all gets.
  */
+/**
+ * True when `word` is the pid of a job this shell has started and not run yet: the pid `$!` holds.
+ *
+ * Such a job has no process behind it -- it runs when the line around it is through -- which is why
+ * the `kill` of `procinfo.ts` cannot reach it and answered `kill $!` with `No such process` and 1.
+ */
+function isPendingJobPid(state: ShellState, word: string): boolean {
+    if (word === '' || !/^[0-9]+$/.test(word)) return false;
+    const pid = Number.parseInt(word, 10);
+    return state.jobs.some((job) => job.pid === pid && !job.done);
+}
+
+/** What a host writes for a process a signal ended: `Terminated` for SIGTERM, `Killed` for SIGKILL. */
+const SIGNAL_DESCRIPTIONS: Record<string, string> = {
+    HUP: 'Hangup',
+    INT: 'Interrupt',
+    QUIT: 'Quit',
+    ILL: 'Illegal instruction',
+    TRAP: 'Trace/breakpoint trap',
+    ABRT: 'Abort',
+    FPE: 'Floating point exception',
+    KILL: 'Killed',
+    BUS: 'Bus error',
+    SEGV: 'Segmentation fault',
+    PIPE: 'Broken pipe',
+    ALRM: 'Alarm clock',
+    TERM: 'Terminated'
+};
+
+/**
+ * The signal `kill` was asked for: `-TERM`, `-SIGTERM` and `-15` are all the same one, and TERM is
+ * the one `kill` sends when it is given none.
+ */
+function killSignal(args: string[]): { number: number; name: string } {
+    for (const arg of args) {
+        if (/^-[0-9]+$/.test(arg)) {
+            const number = Number.parseInt(arg.slice(1), 10);
+            return { number, name: signalNames()[number - 1] ?? '' };
+        }
+        const named = /^-?(?:SIG)?([A-Za-z]+)$/.exec(arg);
+        if (named === null) continue;
+        const at = signalNames().indexOf(named[1].toUpperCase());
+        if (at !== -1) return { number: at + 1, name: signalNames()[at] };
+    }
+    return { number: 15, name: 'TERM' };
+}
+
+/**
+ * The line a shell writes when a job it started ends on a signal: `sh: line 0: 62000 Terminated:
+ * 15          ( exit 3 )`, with the pid the job was given, the signal that ended it and the command
+ * it was started from -- a subshell carrying its own parens, which is how a host prints one.
+ */
+function jobTerminatedNotice(state: ShellState, job: ShellJob, signal: { number: number; name: string }): string {
+    const description = SIGNAL_DESCRIPTIONS[signal.name] ?? signal.name;
+    return `${diagnosticPrefix(state)}${job.pid} ${description}: ${signal.number}          ${job.text}\n`;
+}
+
 export function killJobSpecs(state: ShellState, args: string[]): CommandResult {
     let stderr = '';
     let exitCode = 0;
+    const signal = killSignal(args);
     for (const arg of args) {
-        if (!arg.startsWith('%')) continue;
+        if (!arg.startsWith('%')) {
+            /* A pid of this shell's own job, as `kill $!` names one: it is over, with the status a
+               process killed by SIGTERM leaves, and `kill` reports the success a host reports. */
+            if (isPendingJobPid(state, arg)) {
+                const pid = Number.parseInt(arg, 10);
+                const job = state.jobs.find((entry) => entry.pid === pid && !entry.done);
+                if (job !== undefined) {
+                    job.done = true;
+                    job.exitCode = 128 + signal.number;
+                    job.terminated = true;
+                    job.signal = signal;
+                }
+            }
+            continue;
+        }
         const job = findJob(state.jobs, arg);
         if (job === undefined) {
             stderr += `${diagnosticPrefix(state)}kill: ${arg}: no such job\n`;
@@ -4195,9 +4538,15 @@ export function killJobSpecs(state: ShellState, args: string[]): CommandResult {
             continue;
         }
         job.done = true;
-        job.exitCode = 143;
+        job.exitCode = 128 + signal.number;
+        job.terminated = true;
+        job.signal = signal;
     }
-    reapJobs(state);
+    /* A job `kill` ended stays in the table for `wait` to report: a host reaps it -- and writes the
+       notice that names it -- while `wait` is waiting, not at the moment of the `kill`. */
+    for (let i = state.jobs.length - 1; i >= 0; i--) {
+        if (state.jobs[i].done && state.jobs[i].terminated !== true) state.jobs.splice(i, 1);
+    }
     return { stdout: '', stderr, exitCode };
 }
 
@@ -4526,10 +4875,17 @@ function suspendBuiltin(ctx: CommandContext): CommandResult {
  * run of it at the end of the line no longer runs it a second time.
  */
 function runPendingJob(state: ShellState, job: ShellJob): { stdout: string; stderr: string; exitCode: number } {
+    /* A job `kill` ended never runs: a host writes the notice for it while `wait` is waiting, which
+       is when it reaps the process, so the notice comes out after the `kill` that sent the signal
+       and before the command behind `wait` -- not at the moment of the `kill` itself. */
+    if (job.terminated === true) {
+        job.terminated = false;
+        return { stdout: '', stderr: jobTerminatedNotice(state, job, job.signal ?? { number: 15, name: 'TERM' }), exitCode: job.exitCode };
+    }
     const snapshot = snapshotState(state);
     const savedIo = state.io;
     try {
-        const result = runScript(state, job.text);
+        const result = runScriptNoExitTrap(state, job.text);
         job.done = true;
         job.exitCode = result.exitCode;
         return result;
@@ -4548,7 +4904,9 @@ function waitBuiltin(ctx: CommandContext): CommandResult {
         // no argument waits for every job, in the order it was started, and its status is 0 -- a
         // shell reports what a job failed with only when the job is named
         for (const job of jobs) {
-            if (job.done) continue;
+            /* A job `kill` ended is `wait`ed for like any other: it is over, and the shell writes
+               the notice for it here rather than keeping it to write later. */
+            if (job.done && job.terminated !== true) continue;
             const step = runPendingJob(state, job);
             stdout += step.stdout;
             stderr += step.stderr;
@@ -4571,7 +4929,9 @@ function waitBuiltin(ctx: CommandContext): CommandResult {
             exitCode = arg.startsWith('%') || /^[0-9]+$/.test(arg) ? 127 : 1;
             continue;
         }
-        const step = job.done ? { stdout: '', stderr: '', exitCode: job.exitCode } : runPendingJob(state, job);
+        const step = job.done && job.terminated !== true
+            ? { stdout: '', stderr: '', exitCode: job.exitCode }
+            : runPendingJob(state, job);
         stdout += step.stdout;
         stderr += step.stderr;
         exitCode = step.exitCode;
@@ -4742,6 +5102,7 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
         umask: 0o022,
         hash: new Map(),
         traps: new Map(),
+        openFds: new Map(),
         callStack: [],
         inputBuffer: '',
         inputCursor: 0,
