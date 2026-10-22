@@ -36,18 +36,7 @@ BF.os = function () {
     release: function () { return '6.0.0'; },
     hostname: function () { return 'localhost'; },
     homedir: function () { return (globalThis.process && process.env.HOME) || '/home'; },
-    /*
-     * Node reads TMPDIR fresh on every call, so a process that sets it and then asks sees its own
-     * value from that point on, and falls back to TMP, TEMP and then /tmp. A fixed /tmp answered
-     * the value the environment happened to carry at boot and nothing after it.
-     */
-    tmpdir: function () {
-      var env = (globalThis.process && process.env) || {};
-      var path = env.TMPDIR || env.TMP || env.TEMP || '/tmp';
-      while (path.length > 1 && path.charAt(path.length - 1) === '/') path = path.slice(0, -1);
-      return path;
-    },
-
+    tmpdir: function () { return '/tmp'; },
     endianness: function () { return 'LE'; },
     cpus: function () { return []; },
     availableParallelism: function () { return 1; },

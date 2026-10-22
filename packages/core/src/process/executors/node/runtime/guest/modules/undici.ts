@@ -222,7 +222,10 @@ function streamOfBytes(readBytes, markUsed) {
   var Ctor = globalThis.ReadableStream;
   if (typeof Ctor !== 'function') return undefined;
   var sent = false;
+  /* A byte stream, as undici makes one: a body is bytes, so a caller can take a BYOB reader to it
+     -- which is the 'supportsBYOB: true' Node prints for the body of a Response. */
   return new Ctor({
+    type: 'bytes',
     pull: function (controller) {
       if (sent) { controller.close(); return; }
       sent = true;
@@ -347,7 +350,9 @@ function Headers(init) {
   if (!(this instanceof Headers)) {
     throw new TypeError('Class constructor _Headers cannot be invoked without \'new\'');
   }
-  this._list = [];
+  /* The list a Headers keeps is an own property here, but not one Node's shows: Object.keys,
+     JSON.stringify and for-in of a Headers are all empty. */
+  Object.defineProperty(this, '_list', { value: [], writable: true, configurable: true });
   if (init === undefined || init === null) return;
   var self = this;
   /* A sequence of pairs: an array of arrays, another Headers, or anything else iterable. */
@@ -390,12 +395,11 @@ Headers.prototype.append = function (name, value) {
   }
   this._list.push({ name: rawName.toLowerCase(), value: normalizeHeaderValue(rawValue) });
 };
-Headers.prototype.set = function (name, value) {
+Headers.prototype.delete = function (name) {
   var lower = String(name).toLowerCase();
   var kept = [];
   for (var i = 0; i < this._list.length; i++) if (this._list[i].name !== lower) kept.push(this._list[i]);
   this._list = kept;
-  this.append(name, value);
 };
 Headers.prototype.get = function (name) {
   var lower = String(name).toLowerCase();
@@ -408,11 +412,10 @@ Headers.prototype.has = function (name) {
   for (var i = 0; i < this._list.length; i++) if (this._list[i].name === lower) return true;
   return false;
 };
-Headers.prototype.delete = function (name) {
-  var lower = String(name).toLowerCase();
-  var kept = [];
-  for (var i = 0; i < this._list.length; i++) if (this._list[i].name !== lower) kept.push(this._list[i]);
-  this._list = kept;
+/* Node's Headers declares set after delete, so that is the order the prototype lists them in. */
+Headers.prototype.set = function (name, value) {
+  this.delete(name);
+  this.append(name, value);
 };
 Headers.prototype.getSetCookie = function () {
   var found = [];
@@ -435,6 +438,33 @@ function headerEntries(list) {
   for (var j = 0; j < names.length; j++) out.push([names[j], byName[names[j]].join(', ')]);
   return out;
 }
+/* The symbol Node hands a class that writes its own inspect output, and the shape it writes: the
+   name, then each field on its own line under a two-space indent, with every value printed by
+   util.inspect itself -- which is the whole of what a Response or a Headers shows, since neither
+   carries an own property of its own for inspect to walk. */
+var INSPECT_CUSTOM = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
+
+function keyTextOf(key) {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? key : "'" + key.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+}
+
+function inspectBlock(name, pairs, inspect) {
+  var body = '';
+  for (var i = 0; i < pairs.length; i++) {
+    body += (i === 0 ? '' : ',\n  ') + pairs[i][0] + ': ' + inspect(pairs[i][1]);
+  }
+  return name + ' {\n  ' + body + '\n}';
+}
+
+function headersInspect(inspect) {
+  var entries = headerEntries(this._list);
+  var shown = '';
+  for (var i = 0; i < entries.length; i++) {
+    shown += (i === 0 ? '' : ', ') + keyTextOf(entries[i][0]) + ': ' + inspect(entries[i][1]);
+  }
+  return shown === '' ? 'Headers {}' : 'Headers { ' + shown + ' }';
+}
+
 Headers.prototype.keys = function () {
   return headerEntries(this._list).map(function (pair) { return pair[0]; })[Symbol.iterator]();
 };
@@ -444,6 +474,12 @@ Headers.prototype.values = function () {
 Headers.prototype.entries = function () {
   return headerEntries(this._list).map(function (pair) { return [pair[0], pair[1]]; })[Symbol.iterator]();
 };
+if (INSPECT_CUSTOM !== undefined) {
+  Object.defineProperty(Headers.prototype, INSPECT_CUSTOM, {
+    value: function (depth, options, inspect) { return headersInspect.call(this, inspect); },
+    writable: true, configurable: true
+  });
+}
 Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
 Headers.prototype.forEach = function (fn, thisArg) {
   var entries = headerEntries(this._list);
@@ -518,18 +554,19 @@ function unusableBody() {
 /* The bytes a body holds, whichever of the three kinds it is: what is in hand is returned as it is,
    what has to be read is read once and kept, and a body the caller owns is drained. */
 function bodyBuffer(body) {
-  if (body._bytes !== null && body._bytes !== undefined) return Promise.resolve(body._bytes);
-  if (body._pending !== null && body._pending !== undefined) {
-    return Promise.resolve(body._pending).then(function (bytes) {
-      body._pending = null;
-      body._bytes = bytes;
+  var slots = bodySlots(body);
+  if (slots.bytes !== null && slots.bytes !== undefined) return Promise.resolve(slots.bytes);
+  if (slots.pending !== null && slots.pending !== undefined) {
+    return Promise.resolve(slots.pending).then(function (bytes) {
+      slots.pending = null;
+      slots.bytes = bytes;
       return bytes;
     });
   }
-  if (body._stream !== null && body._stream !== undefined) {
-    return readStream(body._stream).then(function (bytes) {
-      body._stream = null;
-      body._bytes = bytes;
+  if (slots.stream !== null && slots.stream !== undefined) {
+    return readStream(slots.stream).then(function (bytes) {
+      slots.stream = null;
+      slots.bytes = bytes;
       return bytes;
     });
   }
@@ -539,17 +576,18 @@ function bodyBuffer(body) {
 /* The stream a body is read through. A body the caller owns is handed back unchanged; bytes in hand
    are wrapped, and the wrapper marks the body used when something first pulls on it. */
 function bodyStream(body) {
-  if (body._stream !== null && body._stream !== undefined) return body._stream;
-  if (body._bytes === null && body._pending === null) return null;
+  var slots = bodySlots(body);
+  if (slots.stream !== null && slots.stream !== undefined) return slots.stream;
+  if (slots.bytes === null && slots.pending === null) return null;
   var self = body;
-  var stream = streamOfBytes(function () { return self._bytes; }, function () { self._used = true; });
+  var stream = streamOfBytes(function () { return slots.bytes; }, function () { slots.used = true; });
   if (stream === undefined) return undefined;
-  if (body._pending !== null && body._pending !== undefined) {
+  if (slots.pending !== null && slots.pending !== undefined) {
     /* the bytes do not exist yet: the first pull waits for them */
     var Ctor = globalThis.ReadableStream;
     return new Ctor({
       pull: function (controller) {
-        self._used = true;
+        slots.used = true;
         return bodyBuffer(self).then(function (bytes) {
           controller.enqueue(new Uint8Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
           controller.close();
@@ -570,12 +608,30 @@ function bodyStream(body) {
  */
 var RESPONSE_STATE = new WeakMap();
 
+/*
+ * The four slots a body is kept in -- the bytes in hand, the stream to drain, the promise that will
+ * resolve to one of them, and whether the body has been read. Node keeps them nowhere a program can
+ * see: a Response prototype carries no '_'-prefixed name at all, and a Request carries no own
+ * property a for-in or a JSON.stringify would show. So they live in a WeakMap of their own, and
+ * every read and write in this file goes through it.
+ */
+var BODY_SLOTS = new WeakMap();
+
+function bodySlots(body) {
+  var slots = BODY_SLOTS.get(body);
+  if (slots === undefined) {
+    slots = { bytes: null, stream: null, pending: null, used: false };
+    BODY_SLOTS.set(body, slots);
+  }
+  return slots;
+}
+
 function responseState(res) {
   var state = RESPONSE_STATE.get(res);
   if (state === undefined) {
     state = {
       status: 200, statusText: '', ok: true, type: 'default', redirected: false, url: '',
-      headers: new Headers(), bytes: null, stream: null, pending: null, used: false
+      headers: new Headers()
     };
     RESPONSE_STATE.set(res, state);
   }
@@ -583,7 +639,7 @@ function responseState(res) {
 }
 
 /* One accessor per field, over the state object: readable and writable, as Node's are readable.
-   The four slots a body is kept in are not part of Node's shape at all, so they stay unseen --
+   The four slots a body is kept in are not among them -- they are read through bodySlots, so
    a for-in over a Response lists the fields and the methods and nothing else. */
 function responseField(name, key, seen) {
   Object.defineProperty(Response.prototype, name, {
@@ -619,59 +675,151 @@ function Response(body, init) {
     type: 'default',
     redirected: false,
     url: init.url === undefined ? '' : String(init.url),
-    headers: new Headers(init.headers),
-    bytes: made.bytes,
-    stream: made.stream,
-    pending: made.pending,
-    used: false
+    headers: new Headers(init.headers)
   };
   RESPONSE_STATE.set(this, state);
+  var slots = bodySlots(this);
+  slots.bytes = made.bytes;
+  slots.stream = made.stream;
+  slots.pending = made.pending;
+  slots.used = false;
   if (made.contentType !== null && !state.headers.has('content-type')) state.headers.set('content-type', made.contentType);
 }
-responseField('status', 'status', true);
-responseField('statusText', 'statusText', true);
-responseField('ok', 'ok', true);
+/* The order Node declares them in, which is the order a for-in and getOwnPropertyNames walk. */
 responseField('type', 'type', true);
-responseField('redirected', 'redirected', true);
 responseField('url', 'url', true);
+responseField('redirected', 'redirected', true);
+responseField('status', 'status', true);
+responseField('ok', 'ok', true);
+responseField('statusText', 'statusText', true);
 responseField('headers', 'headers', true);
-responseField('_bytes', 'bytes', false);
-responseField('_stream', 'stream', false);
-responseField('_pending', 'pending', false);
-responseField('_used', 'used', false);
+/* Node's Response takes no arguments -- the two a class body would declare are the body and the
+   init, and neither is optional in the signature the way Node's is written. */
+Object.defineProperty(Response, 'length', { value: 0, configurable: true });
 Object.defineProperty(Response.prototype, 'body', {
   get: function () { return bodyStream(this); },
-  configurable: true
+  enumerable: true, configurable: true
 });
 Object.defineProperty(Response.prototype, 'bodyUsed', {
-  get: function () { return this._used; },
-  configurable: true
+  get: function () { return bodySlots(this).used; },
+  enumerable: true, configurable: true
 });
-Object.defineProperty(Response.prototype, Symbol.toStringTag, { value: 'Response', configurable: true });
-Response.prototype.bytes = function () {
-  if (this._used) return Promise.reject(unusableBody());
-  this._used = true;
-  return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
-};
-Response.prototype.text = function () {
-  if (this._used) return Promise.reject(unusableBody());
-  this._used = true;
-  return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
-};
-Response.prototype.json = function () {
-  if (this._used) return Promise.reject(unusableBody());
-  this._used = true;
-  return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
-};
-Response.prototype.arrayBuffer = function () {
-  if (this._used) return Promise.reject(unusableBody());
-  this._used = true;
-  return bodyBuffer(this).then(function (buffer) {
-    return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+
+if (INSPECT_CUSTOM !== undefined) {
+  /* What Node prints: the fields in the order it declares them, and nothing of the body beyond the
+     stream it hands out. */
+  Object.defineProperty(Response.prototype, INSPECT_CUSTOM, {
+    value: function (depth, options, inspect) {
+      var self = this;
+      return inspectBlock('Response', [
+        ['status', self.status], ['statusText', self.statusText], ['headers', self.headers],
+        ['body', self.body], ['bodyUsed', self.bodyUsed], ['ok', self.ok],
+        ['redirected', self.redirected], ['type', self.type], ['url', self.url]
+      ], inspect);
+    },
+    writable: true, configurable: true
   });
-};
+}
+Object.defineProperty(Response.prototype, Symbol.toStringTag, { value: 'Response', configurable: true });/* The type a Blob is made with: the content type as the header writes it, lower-cased, and nothing
+   at all when there is no header. */
+function blobTypeOf(headers) {
+  var raw = headers === undefined || headers === null ? null : headers.get('content-type');
+  if (raw === null || raw === undefined) return '';
+  return String(raw).trim().toLowerCase();
+}
+
+/* The MIME type the body says it is, split from its parameters the way undici splits it, and
+   matched without regard to case. */
+function mimeOf(headers) {
+  var raw = headers === undefined || headers === null ? '' : String(headers.get('content-type') || '');
+  var at = raw.indexOf(';');
+  return (at < 0 ? raw : raw.slice(0, at)).trim().toLowerCase();
+}
+
+/* The boundary a multipart body is split on: the parameter of its content type. */
+function boundaryOf(headers) {
+  var raw = headers === undefined || headers === null ? '' : String(headers.get('content-type') || '');
+  var match = /boundary=(?:"([^"]*)"|([^;]*))/i.exec(raw);
+  if (match === null) return null;
+  var value = (match[1] !== undefined ? match[1] : match[2]).trim();
+  return value === '' ? null : value;
+}
+
+/* One part of a multipart body: the headers above the blank line, and the raw bytes below it. */
+function splitMultipart(bytes, boundary) {
+  var text = bytes.toString('latin1');
+  var delimiter = '--' + boundary;
+  var parts = text.split('\r\n' + delimiter);
+  var out = [];
+  for (var i = 0; i < parts.length; i++) {
+    var chunk = parts[i];
+    if (i > 0) chunk = chunk.replace(/^[^\S\r\n]*\r\n/, '');
+    var head = chunk.indexOf('\r\n\r\n');
+    if (head < 0) continue;
+    var headerText = chunk.slice(0, head);
+    if (headerText.indexOf(':') < 0) continue;
+    if (chunk.slice(0, 2) === '--') break;
+    out.push({ headers: headerText, body: chunk.slice(head + 4).replace(/\r\n$/, '') });
+  }
+  return out;
+}
+
+/* The name and filename a part's content-disposition carries. */
+function dispositionOf(headerText) {
+  var name = null;
+  var filename = null;
+  var match = /name=(?:"([^"]*)"|([^;]*))/i.exec(headerText);
+  if (match !== null) name = match[1] !== undefined ? match[1] : match[2];
+  var file = /filename=(?:"([^"]*)"|([^;]*))/i.exec(headerText);
+  if (file !== null) filename = file[1] !== undefined ? file[1] : file[2];
+  return { name: name, filename: filename };
+}
+
+/* A body read as a FormData, which is what Node offers beside text and json: a urlencoded body and
+   a multipart one are the two it will parse, and anything else is refused by its content type
+   before a byte of it is read. */
+/* Node's formData is an async function, so a content type it will not parse is a rejected promise
+   rather than a throw -- and it is refused before a byte of the body is read. */
+function bodyFormData(body) {
+  var mime = mimeOf(body.headers);
+  if (mime !== 'multipart/form-data' && mime !== 'application/x-www-form-urlencoded') {
+    return Promise.reject(new TypeError('Content-Type was not one of "multipart/form-data" or "application/x-www-form-urlencoded".'));
+  }
+  var slots = bodySlots(body);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  var made = new globalThis.FormData();
+  return bodyBuffer(body).then(function (bytes) {
+    if (mime === 'application/x-www-form-urlencoded') {
+      new globalThis.URLSearchParams(bytes.toString('utf8')).forEach(function (value, key) {
+        made.append(key, value);
+      });
+      return made;
+    }
+    var boundary = boundaryOf(body.headers);
+    if (boundary === null) return made;
+    var parts = splitMultipart(bytes, boundary);
+    for (var i = 0; i < parts.length; i++) {
+      var named = dispositionOf(parts[i].headers);
+      if (named.name === null || named.name === undefined) continue;
+      var typeMatch = /content-type\s*:\s*([^\r\n]*)/i.exec(parts[i].headers);
+      var partType = typeMatch === null ? '' : typeMatch[1].trim();
+      var raw = Buffer.from(parts[i].body, 'latin1');
+      if (named.filename !== null && named.filename !== undefined && named.filename !== '') {
+        made.append(named.name, new globalThis.File([raw], named.filename, { type: partType }), named.filename);
+      } else if (partType === '' || partType === 'text/plain') {
+        made.append(named.name, parts[i].body);
+      } else {
+        made.append(named.name, new globalThis.Blob([raw], { type: partType }));
+      }
+    }
+    return made;
+  });
+}
+
+/* Node's order on the prototype: clone, then the five ways to read a body. */
 Response.prototype.clone = function () {
-  if (this._used) throw new TypeError('Response.clone: Body has already been consumed.');
+  if (bodySlots(this).used) throw new TypeError('Response.clone: Body has already been consumed.');
   /* built beside the constructor rather than through it: a clone keeps the status it was made
      with, and status 0 -- the one Response.error() carries -- is not a status the constructor
      would accept again */
@@ -684,26 +832,62 @@ Response.prototype.clone = function () {
     type: source.type,
     redirected: source.redirected,
     url: source.url,
-    headers: new Headers(source.headers),
-    bytes: null,
-    stream: null,
-    pending: null,
-    used: false
+    headers: new Headers(source.headers)
   };
   RESPONSE_STATE.set(copy, state);
-  if (source.stream !== null && source.stream !== undefined) {
-    var both = source.stream.tee();
-    source.stream = both[0];
-    state.stream = both[1];
-    state.bytes = null;
-    state.pending = null;
-    source.bytes = null;
+  var from = bodySlots(this);
+  var into = bodySlots(copy);
+  into.used = false;
+  if (from.stream !== null && from.stream !== undefined) {
+    var both = from.stream.tee();
+    from.stream = both[0];
+    into.stream = both[1];
+    into.bytes = null;
+    into.pending = null;
+    from.bytes = null;
   } else {
-    state.bytes = source.bytes;
-    state.pending = source.pending;
-    state.stream = null;
+    into.bytes = from.bytes;
+    into.pending = from.pending;
+    into.stream = null;
   }
   return copy;
+};
+
+Response.prototype.blob = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  var type = blobTypeOf(this.headers);
+  return bodyBuffer(this).then(function (bytes) { return new globalThis.Blob([bytes], { type: type }); });
+};
+Response.prototype.arrayBuffer = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  return bodyBuffer(this).then(function (buffer) {
+    return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+  });
+};
+Response.prototype.text = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
+};
+Response.prototype.json = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
+};
+Response.prototype.formData = function () {
+  return bodyFormData(this);
+};
+Response.prototype.bytes = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
 };
 
 /* init with one content-type added to whatever headers the caller passed, for the two static
@@ -743,14 +927,17 @@ Response.error = function () {
     type: 'error',
     redirected: false,
     url: '',
-    headers: new Headers(),
-    bytes: null,
-    stream: null,
-    pending: null,
-    used: false
+    headers: new Headers()
   });
   return res;
 };
+/* Node's own order on the constructor: error, then json, then redirect. Deleting and re-adding is
+   what moves a name that was already written to the front of the order. */
+['error', 'json', 'redirect'].forEach(function (name) {
+  var held = Response[name];
+  delete Response[name];
+  Object.defineProperty(Response, name, { value: held, writable: true, configurable: true });
+});
 
 var FORBIDDEN_METHODS = ['CONNECT', 'TRACE', 'TRACK'];
 var METHOD_TOKEN = /^[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+$/;
@@ -789,6 +976,35 @@ function unparseableUrl(raw) {
   return failed;
 }
 
+/*
+ * What a Request holds, kept beside the instance the way a Response's fields are. Node's Request
+ * carries no own property at all -- every field is a prototype accessor -- so Object.keys() of one
+ * is [] and a for-in lists the accessors and the methods in the order Node defines them.
+ */
+var REQUEST_STATE = new WeakMap();
+
+function requestState(req) {
+  var state = REQUEST_STATE.get(req);
+  if (state === undefined) {
+    state = {
+      method: 'GET', url: '', headers: new Headers(), destination: '', referrer: 'about:client',
+      referrerPolicy: '', mode: 'cors', credentials: 'same-origin', cache: 'default',
+      redirect: 'follow', integrity: '', keepalive: false, isReloadNavigation: false,
+      isHistoryNavigation: false, signal: undefined
+    };
+    REQUEST_STATE.set(req, state);
+  }
+  return state;
+}
+
+function requestField(name, key) {
+  Object.defineProperty(Request.prototype, name, {
+    get: function () { return requestState(this)[key]; },
+    set: function (value) { requestState(this)[key] = value; },
+    enumerable: true, configurable: true
+  });
+}
+
 function Request(target, options) {
   if (!(this instanceof Request)) {
     throw new TypeError('Class constructor _Request cannot be invoked without \'new\'');
@@ -800,15 +1016,16 @@ function Request(target, options) {
   var headersInit = undefined;
   var bodyIn = null;
   if (target instanceof Request) {
-    if (target._used) {
+    var given = bodySlots(target);
+    if (given.used) {
       throw new TypeError('Cannot construct a Request with a Request object that has already been used.');
     }
     url = target.url;
     rawMethod = target.method;
     headersInit = target.headers;
-    if (target._bytes !== null && target._bytes !== undefined) bodyIn = target._bytes;
-    else if (target._stream !== null && target._stream !== undefined) bodyIn = target._stream;
-    else if (target._pending !== null && target._pending !== undefined) bodyIn = target._pending;
+    if (given.bytes !== null && given.bytes !== undefined) bodyIn = given.bytes;
+    else if (given.stream !== null && given.stream !== undefined) bodyIn = given.stream;
+    else if (given.pending !== null && given.pending !== undefined) bodyIn = given.pending;
   } else {
     url = target === undefined || target === null ? '' : (target.href !== undefined ? String(target.href) : String(target));
   }
@@ -824,83 +1041,139 @@ function Request(target, options) {
   if (made.has && (method === 'GET' || method === 'HEAD')) {
     throw new TypeError('Request with GET/HEAD method cannot have body.');
   }
-  this.url = parsed.href;
-  this.method = method;
-  this.headers = new Headers(headersInit);
-  if (made.contentType !== null && !this.headers.has('content-type')) this.headers.set('content-type', made.contentType);
-  this._bytes = made.bytes;
-  this._stream = made.stream;
-  this._pending = made.pending;
-  this._used = false;
-  this._signal = options.signal !== undefined && options.signal !== null ? options.signal : undefined;
-  this.mode = options.mode === undefined ? 'cors' : String(options.mode);
-  this.credentials = options.credentials === undefined ? 'same-origin' : String(options.credentials);
-  this.cache = options.cache === undefined ? 'default' : String(options.cache);
-  this.redirect = options.redirect === undefined ? 'follow' : String(options.redirect);
-  this.referrer = options.referrer === undefined ? 'about:client' : String(options.referrer);
-  this.referrerPolicy = options.referrerPolicy === undefined ? '' : String(options.referrerPolicy);
-  this.integrity = options.integrity === undefined ? '' : String(options.integrity);
-  this.keepalive = options.keepalive === undefined ? false : !!options.keepalive;
-  this.destination = '';
-  this.isReloadNavigation = false;
+  var state = requestState(this);
+  state.url = parsed.href;
+  state.method = method;
+  state.headers = new Headers(headersInit);
+  if (made.contentType !== null && !state.headers.has('content-type')) state.headers.set('content-type', made.contentType);
+  var slots = bodySlots(this);
+  slots.bytes = made.bytes;
+  slots.stream = made.stream;
+  slots.pending = made.pending;
+  slots.used = false;
+  state.signal = options.signal !== undefined && options.signal !== null ? options.signal : undefined;
+  state.mode = options.mode === undefined ? 'cors' : String(options.mode);
+  state.credentials = options.credentials === undefined ? 'same-origin' : String(options.credentials);
+  state.cache = options.cache === undefined ? 'default' : String(options.cache);
+  state.redirect = options.redirect === undefined ? 'follow' : String(options.redirect);
+  state.referrer = options.referrer === undefined ? 'about:client' : String(options.referrer);
+  state.referrerPolicy = options.referrerPolicy === undefined ? '' : String(options.referrerPolicy);
+  state.integrity = options.integrity === undefined ? '' : String(options.integrity);
+  state.keepalive = options.keepalive === undefined ? false : !!options.keepalive;
+  state.destination = '';
+  state.isReloadNavigation = false;
 }
-Object.defineProperty(Request.prototype, 'duplex', { get: function () { return 'half'; }, configurable: true });
-Object.defineProperty(Request.prototype, 'body', {
-  get: function () { return bodyStream(this); },
-  configurable: true
-});
-Object.defineProperty(Request.prototype, 'bodyUsed', {
-  get: function () { return this._used; },
-  configurable: true
-});
+requestField('method', 'method');
+requestField('url', 'url');
+requestField('headers', 'headers');
+requestField('destination', 'destination');
+requestField('referrer', 'referrer');
+requestField('referrerPolicy', 'referrerPolicy');
+requestField('mode', 'mode');
+requestField('credentials', 'credentials');
+requestField('cache', 'cache');
+requestField('redirect', 'redirect');
+requestField('integrity', 'integrity');
+requestField('keepalive', 'keepalive');
+requestField('isReloadNavigation', 'isReloadNavigation');
+requestField('isHistoryNavigation', 'isHistoryNavigation');
 /* Every Request carries a signal, whether the caller passed one or not. */
 Object.defineProperty(Request.prototype, 'signal', {
   get: function () {
-    if (this._signal === undefined || this._signal === null) {
-      this._signal = globalThis.AbortController !== undefined ? new globalThis.AbortController().signal : undefined;
+    var state = requestState(this);
+    if (state.signal === undefined || state.signal === null) {
+      state.signal = globalThis.AbortController !== undefined ? new globalThis.AbortController().signal : undefined;
     }
-    return this._signal;
+    return state.signal;
   },
-  configurable: true
+  enumerable: true, configurable: true
 });
-Object.defineProperty(Request.prototype, Symbol.toStringTag, { value: 'Request', configurable: true });
-Request.prototype.bytes = function () {
-  if (this._used) return Promise.reject(unusableBody());
-  this._used = true;
-  return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
+Object.defineProperty(Request.prototype, 'body', {
+  get: function () { return bodyStream(this); },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Request.prototype, 'bodyUsed', {
+  get: function () { return bodySlots(this).used; },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Request.prototype, 'duplex', { get: function () { return 'half'; }, enumerable: true, configurable: true });
+
+if (INSPECT_CUSTOM !== undefined) {
+  /* What Node prints: every field but the body, and the signal a Request always carries. */
+  Object.defineProperty(Request.prototype, INSPECT_CUSTOM, {
+    value: function (depth, options, inspect) {
+      var self = this;
+      return inspectBlock('Request', [
+        ['method', self.method], ['url', self.url], ['headers', self.headers],
+        ['destination', self.destination], ['referrer', self.referrer],
+        ['referrerPolicy', self.referrerPolicy], ['mode', self.mode],
+        ['credentials', self.credentials], ['cache', self.cache], ['redirect', self.redirect],
+        ['integrity', self.integrity], ['keepalive', self.keepalive],
+        ['isReloadNavigation', self.isReloadNavigation], ['isHistoryNavigation', self.isHistoryNavigation],
+        ['signal', self.signal]
+      ], inspect);
+    },
+    writable: true, configurable: true
+  });
+}
+Object.defineProperty(Request.prototype, Symbol.toStringTag, { value: 'Request', configurable: true });Object.defineProperty(Request, 'length', { value: 1, configurable: true });
+/* Node's order on the prototype: clone, then the ways to read a body, then the attribute slot. */
+Request.prototype.clone = function () {
+  if (bodySlots(this).used) throw new TypeError('unusable');
+  var copy = new Request(this.url, { method: this.method, headers: this.headers });
+  var from = bodySlots(this);
+  var into = bodySlots(copy);
+  if (from.stream !== null && from.stream !== undefined) {
+    var both = from.stream.tee();
+    from.stream = both[0];
+    into.stream = both[1];
+    from.bytes = null;
+  } else {
+    into.bytes = from.bytes;
+    into.pending = from.pending;
+  }
+  requestState(copy).signal = requestState(this).signal;
+  return copy;
 };
-Request.prototype.text = function () {
-  if (this._used) return Promise.reject(unusableBody());
-  this._used = true;
-  return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
-};
-Request.prototype.json = function () {
-  if (this._used) return Promise.reject(unusableBody());
-  this._used = true;
-  return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
+Request.prototype.blob = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  var type = blobTypeOf(this.headers);
+  return bodyBuffer(this).then(function (bytes) { return new globalThis.Blob([bytes], { type: type }); });
 };
 Request.prototype.arrayBuffer = function () {
-  if (this._used) return Promise.reject(unusableBody());
-  this._used = true;
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
   return bodyBuffer(this).then(function (buffer) {
     return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
   });
 };
-Request.prototype.clone = function () {
-  if (this._used) throw new TypeError('unusable');
-  var copy = new Request(this.url, { method: this.method, headers: this.headers });
-  if (this._stream !== null && this._stream !== undefined) {
-    var both = this._stream.tee();
-    this._stream = both[0];
-    copy._stream = both[1];
-    this._bytes = null;
-  } else {
-    copy._bytes = this._bytes;
-    copy._pending = this._pending;
-  }
-  copy._signal = this._signal;
-  return copy;
+Request.prototype.text = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
 };
+Request.prototype.json = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
+};
+Request.prototype.formData = function () {
+  return bodyFormData(this);
+};
+Request.prototype.bytes = function () {
+  var slots = bodySlots(this);
+  if (slots.used) return Promise.reject(unusableBody());
+  slots.used = true;
+  return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
+};
+/* Node hangs a plain 'attribute' slot on the prototype, the one its own Request carries and never
+   fills: it reads as undefined, and it is a data property like the rest of the prototype's. */
+Object.defineProperty(Request.prototype, 'attribute', { value: undefined, writable: true, enumerable: true, configurable: true });
 
 /* An error that is the caller's, not the network's: fetch rejects with it as it is, and it is never
    wrapped in 'fetch failed'. */
@@ -933,19 +1206,20 @@ function dataResponse(url) {
 function fetch(target, options) {
   var init = options || {};
   if (target instanceof Request) {
-    if (target._used) {
+    var held = bodySlots(target);
+    if (held.used) {
       /* not a transport failure, so it travels out of fetch exactly as Node reports it */
       var used = notTransport(new TypeError('Cannot construct a Request with a Request object that has already been used.'));
       return Promise.reject(used);
     }
-    var carried = target._bytes !== null && target._bytes !== undefined
-      ? target._bytes
-      : (target._stream !== null && target._stream !== undefined
-        ? target._stream
-        : (target._pending !== null && target._pending !== undefined ? target._pending : null));
+    var carried = held.bytes !== null && held.bytes !== undefined
+      ? held.bytes
+      : (held.stream !== null && held.stream !== undefined
+        ? held.stream
+        : (held.pending !== null && held.pending !== undefined ? held.pending : null));
     init = { method: target.method, headers: target.headers, body: carried };
     for (var key in options) init[key] = options[key];
-    target._used = true;
+    held.used = true;
     target = target.url;
   }
   var url = String(target && target.href !== undefined ? target.href : target);
