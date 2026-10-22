@@ -258,6 +258,13 @@ export interface ShellState {
      */
     stdoutTarget: StreamTarget;
     stderrTarget: StreamTarget;
+    /**
+     * Whether the shell's own standard input has been closed by an `exec 0<&-`. A host keeps the
+     * number for a closed descriptor and then refuses to hand it out again: `exec 0<&-; exec 3<&0`
+     * is `sh: 0: Bad file descriptor` with the status 1, where answering a duplicate of `0` from
+     * thin air left the second `exec` a success and the shell a descriptor nothing was behind.
+     */
+    stdinClosed: boolean;
     callStack: CallFrame[];
     /** Free slot for the host: `child.ts` stores its CapabilityContext here for its runner. */
     host?: unknown;
@@ -627,6 +634,16 @@ function getVar(state: ShellState, name: string): string | undefined {
     if (all) {
         const values = arrayElements(state, `${all[1]}[0]`);
         return values.length === 0 ? undefined : values.join(' ');
+    }
+    /* `${v[0]}` on a name that is not an array is the name itself: a host's `FUNCNAME` inside a
+       function is one string and `${FUNCNAME[0]}` is it, where reading `[0]` as a subscript of a
+       name no array was made of answered nothing at all and left the function nameless. */
+    const subscripted = ARRAY_RE.exec(name);
+    if (subscripted !== null && subscripted[2] === '0') {
+        const values = arrayElements(state, name);
+        if (values.length > 0) return values[0];
+        const scalar = lookupScope(state, subscripted[1])?.get(subscripted[1])?.value;
+        if (scalar !== undefined) return scalar;
     }
     const scope = lookupScope(state, name);
     if (scope) return scope.get(name)?.value;
@@ -1193,6 +1210,15 @@ function parseVarRef(body: string): VarRef {
         if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(rest)) return { raw, name: rest, op: 'len', arg: '' };
         if (/^[0-9]$/.test(rest)) return { raw, name: rest, op: 'len', arg: '' };
     }
+    /* `${x:3}` is a substring and `${x:-3}` is a default, and a host tells them apart by the one
+       character behind the colon -- `-`, `=`, `+` and `?` are the operators that name a default and
+       every other character, a space and a digit among them, opens a substring. So the colon is
+       looked at before any operator is searched for: a scan that found the `-` first read
+       `${v: -3}` as the default `3` and not as the last three characters of `hello`. */
+    const colon = body.indexOf(':');
+    if (colon > 0 && !'-+=?'.includes(body[colon + 1] ?? '')) {
+        return { raw, name: body.slice(0, colon), op: 'substr', arg: body.slice(colon + 1) };
+    }
     const operators = ['##', '%%', ':-', ':=', ':+', ':?', '//', '#', '%', '-', '=', '+', '?', '/'];
     let cut = -1;
     let op = '';
@@ -1203,16 +1229,12 @@ function parseVarRef(body: string): VarRef {
             op = operator;
         }
     }
-    if (cut === -1 && body.includes(':')) {
-        // `${x:3}` is a substring; `${x:-3}` is a default -- bash decides on the next character
-        const at = body.indexOf(':');
-        const after = body[at + 1];
-        if (after !== undefined && !'-+=?'.includes(after)) {
-            cut = at;
-            op = 'substr';
-        }
-    }
-    if (cut > 0) return { raw, name: body.slice(0, cut), op, arg: body.slice(cut + op.length) };
+    /* `substr` is not an operator that was written: the `:` that opened it was, one character long,
+       so the argument starts one past *it* and not one past the name this file gives the operator.
+       Reading the name's length sliced the argument away -- `${v:1:3}` asked for six characters
+       behind the `:` and got none, which is the whole `hello` and not the `ell` a host prints. */
+    const operator = op === 'substr' ? ':' : op;
+    if (cut > 0) return { raw, name: body.slice(0, cut), op, arg: body.slice(cut + operator.length) };
     return { raw, name: body, op: '', arg: '' };
 }
 
@@ -2890,6 +2912,7 @@ interface Snapshot {
     openFds: Map<number, StreamTarget>;
     stdoutTarget: StreamTarget;
     stderrTarget: StreamTarget;
+    stdinClosed: boolean;
     held: string;
     aliases: Map<string, string>;
     functions: Map<string, FunctionDef>;
@@ -2914,6 +2937,7 @@ function snapshotState(state: ShellState): Snapshot {
         openFds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }])),
         stdoutTarget: { ...state.stdoutTarget },
         stderrTarget: { ...state.stderrTarget },
+        stdinClosed: state.stdinClosed,
         held: state.held,
         aliases: new Map(state.aliases),
         functions: new Map(state.functions),
@@ -2938,6 +2962,7 @@ function restoreState(state: ShellState, snapshot: Snapshot): void {
     state.openFds = snapshot.openFds;
     state.stdoutTarget = { ...snapshot.stdoutTarget };
     state.stderrTarget = { ...snapshot.stderrTarget };
+    state.stdinClosed = snapshot.stdinClosed;
     /* A subshell and a pipeline stage are processes of their own on a host, so what either held
        when it ended went with it: `(echo hi) >&-` and `echo hi >&- | cat` print no `hi` at all. */
     state.held = snapshot.held;
@@ -3716,6 +3741,8 @@ interface RedirectPlan {
      * behind it -- while nothing a command opened outlives the command.
      */
     fds: Map<number, StreamTarget>;
+    /** Whether `exec 0<&-` closed the standard input: a duplicate of `0` is then a bad descriptor. */
+    stdinClosed?: boolean;
     /** The message of a descriptor nothing opened, which a host reports before running anything. */
     error?: string;
 }
@@ -3767,7 +3794,7 @@ function duplicateOf(
     if (!/^[0-9]+$/.test(target)) return { kind: 'file', file: target, append: false };
     const opened = plan.fds.get(Number.parseInt(target, 10));
     if (opened !== undefined) return { ...opened };
-    if (target === '0') return { ...stdinTo };
+    if (target === '0') return plan.stdinClosed === true ? undefined : { ...stdinTo };
     return undefined;
 }
 
@@ -3843,6 +3870,7 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
     const plan: RedirectPlan = {
         stdoutTo: { ...state.stdoutTarget },
         stderrTo: { ...state.stderrTarget },
+        stdinClosed: state.stdinClosed,
         opened: [],
         fds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }]))
     };
@@ -3864,9 +3892,20 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
         } else if (entry.kind === 'null') {
             fds.delete(fd);
             plan.fds.delete(fd);
+            /* A closed standard input is a number a host keeps and then refuses to hand out again,
+               so the close is remembered and not only the missing descriptor: without it a later
+               `exec 3<&0` answered a duplicate of nothing at all and succeeded. */
+            if (fd === 0) {
+                state.stdinClosed = true;
+                plan.stdinClosed = true;
+            }
         } else {
             fds.set(fd, entry);
             plan.fds.set(fd, { ...entry });
+            if (fd === 0) {
+                state.stdinClosed = false;
+                plan.stdinClosed = false;
+            }
             /* The standard input is the text the commands behind it read, so a file put on it is
                the shell's own input from here on: `exec 0<f; cat` prints `f`, and `read l` reads
                its first line, as they do on a host. */
@@ -3943,6 +3982,7 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
     const plan: RedirectPlan = {
         stdoutTo: inherited(state.stdoutTarget),
         stderrTo: inherited(state.stderrTarget),
+        stdinClosed: state.stdinClosed,
         opened: [],
         fds: new Map([...state.openFds].map(([fd, entry]) => [fd, { ...entry }]))
     };
@@ -6734,6 +6774,7 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
         openFds: new Map(),
         stdoutTarget: { kind: 'out' },
         stderrTarget: { kind: 'err' },
+        stdinClosed: false,
         callStack: [],
         inputBuffer: '',
         inputCursor: 0,

@@ -1993,10 +1993,17 @@ function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcom
                     break;
                 case '-r':
                 case '-w':
-                case '-x':
-                    // the container has no permission model and runs as the superuser
-                    value = testFile(ctx, args[index + 1] ?? '').exists;
+                case '-x': {
+                    /* The mode is the permission model, and it is the one the container's own
+                       reads and writes are already refused by -- `cat` on a 000 file is
+                       `Permission denied` -- so `test` reads it too: `test -x f` on a 644 file is
+                       false, where answering every permission question with the file's existence
+                       made `chmod -R a+rX` look like it had made every regular file executable. */
+                    const file = testFile(ctx, args[index + 1] ?? '');
+                    const bit = word === '-r' ? 0o400 : word === '-w' ? 0o200 : 0o100;
+                    value = file.exists && (file.mode & bit) !== 0;
                     break;
+                }
                 case '-s': {
                     const file = testFile(ctx, args[index + 1] ?? '');
                     value = file.exists && file.size > 0;
@@ -2126,7 +2133,7 @@ function decodeEscapes(text: string): { text: string; stop: boolean } {
 
 /** Applies one conversion to one argument, honouring flags, width and precision. */
 function applyConversion(spec: string, argument: string): string {
-    const match = /^([-+# 0]*)(\*|[0-9]+)?(?:\.(\*|[0-9]+))?([diouxXsceEfFgGbaA%])$/.exec(spec);
+    const match = /^([-+# 0]*)(\*|[0-9]+)?(?:\.(\*|[0-9]+))?([diouxXsceEfFgGbaAq%])$/.exec(spec);
     if (match === null) return spec;
     const flags = match[1];
     const widthText = match[2];
@@ -2148,9 +2155,18 @@ function applyConversion(spec: string, argument: string): string {
     if (conversion === 'b') {
         return decodeEscapes(argument).text;
     }
+    /* `%q` writes the argument the way it would have to be written to mean itself again: a space, a
+       quote, a `$` and a glob character each take a backslash in front of them, and an argument of
+       no characters at all is `''`, which is what a host prints for it. */
+    if (conversion === 'q') {
+        if (argument === '') return "''";
+        let quoted = '';
+        for (const ch of argument) quoted += /[A-Za-z0-9_.,:/@%^+=?~-]/.test(ch) ? ch : `\\${ch}`;
+        return quoted;
+    }
     if (conversion === 'd' || conversion === 'i') {
         const value = Number.parseInt(argument, 10);
-        if (Number.isNaN(value)) throw new Error(`${argument}: expected numeric value`);
+        if (Number.isNaN(value)) throw new Error(`${argument}: invalid number`);
         let digits = String(Math.abs(value));
         const sign = value < 0 ? '-' : flags.indexOf('+') >= 0 ? '+' : flags.indexOf(' ') >= 0 ? ' ' : '';
         if (precision >= 0 && digits.length < precision) digits = '0'.repeat(precision - digits.length) + digits;
@@ -2164,7 +2180,7 @@ function applyConversion(spec: string, argument: string): string {
     }
     if (conversion === 'o' || conversion === 'u' || conversion === 'x' || conversion === 'X') {
         const parsed = Number.parseInt(argument, 10);
-        if (Number.isNaN(parsed)) throw new Error(`${argument}: expected numeric value`);
+        if (Number.isNaN(parsed)) throw new Error(`${argument}: invalid number`);
         const base = conversion === 'o' ? 8 : conversion === 'u' ? 10 : 16;
         let digits = (parsed < 0 ? parsed >>> 0 : parsed).toString(base);
         if (conversion === 'X') digits = digits.toUpperCase();
@@ -2182,7 +2198,7 @@ function applyConversion(spec: string, argument: string): string {
     }
     // floating point
     const value = Number(argument);
-    if (Number.isNaN(value)) throw new Error(`${argument}: expected numeric value`);
+    if (Number.isNaN(value)) throw new Error(`${argument}: invalid number`);
     let text: string;
     if (conversion === 'e' || conversion === 'E') {
         text = value.toExponential(precision < 0 ? 6 : precision);
@@ -2263,7 +2279,7 @@ const printf: ShellCommand = (ctx) => {
                 continue;
             }
             const rest = format.slice(i + 1);
-            const match = /^([-+# 0]*)(\*|[0-9]+)?(?:\.(\*|[0-9]+))?([diouxXsceEfFgGbaA])/.exec(rest);
+            const match = /^([-+# 0]*)(\*|[0-9]+)?(?:\.(\*|[0-9]+))?([diouxXsceEfFgGbaAq])/.exec(rest);
             if (match === null) {
                 out += ch;
                 i++;
@@ -2280,7 +2296,14 @@ const printf: ShellCommand = (ctx) => {
             try {
                 out += applyConversion(spec, value ?? '');
             } catch (error) {
-                out += '0';
+                /* A host prints the conversion applied to a zero and then complains: `printf '%f'
+                   notanumber` is `0.000000` and only then the line about the number, where a bare
+                   `0` lost the shape of the conversion the argument was handed to. */
+                try {
+                    out += applyConversion(spec, '0');
+                } catch {
+                    out += '0';
+                }
                 badNumber = `printf: ${message(error)}\n`;
             }
             i += 1 + spec.length;
@@ -3519,7 +3542,7 @@ const stat: ShellCommand = (ctx) => {
 /* --------------------------------------------------------- install / links */
 
 /** Parses an octal or symbolic mode. Symbolic clauses start from `base`, which is 0 for install. */
-function parseMode(spec: string, base: number, umask: number = UMASK): number | undefined {
+function parseMode(spec: string, base: number, umask: number = UMASK, dir = false): number | undefined {
     /* Five digits, not four: `chmod 02000 f` and `chmod 02755 f` are a mode the host reads and then
        refuses (see below), where a four-digit test rejected them as no mode at all. */
     if (/^[0-7]{1,5}$/.test(spec)) return Number.parseInt(spec, 8) & 0o7777;
@@ -3540,7 +3563,11 @@ function parseMode(spec: string, base: number, umask: number = UMASK): number | 
             if (letter === 'r') bits |= 0o444;
             else if (letter === 'w') bits |= 0o222;
             else if (letter === 'x') bits |= 0o111;
-            else if (letter === 'X') bits |= 0o111;
+            /* `X` is the execute bit a host sets only where one is already there or the entry is a
+               directory: `chmod a+X f` leaves a 644 `f` at 644 and takes a 700 `f` to 711, where
+               setting all three unconditionally made every regular file under `chmod -R a+rX`
+               executable, which is the one thing `X` is for never doing. */
+            else if (letter === 'X') bits |= dir || (mode & 0o111) !== 0 ? 0o111 : 0;
             else if (letter === 's') bits |= 0o6000;
             else if (letter === 't') bits |= 0o1000;
             else if (letter === 'u') bits |= (mode >> 6) & 7;
@@ -3854,18 +3881,32 @@ const chmod: ShellCommand = (ctx) => {
     let noMoreOptions = false;
     while (index < words.length && !noMoreOptions && isOption(words[index]) && !isModeWord(words[index])) {
         const word = words[index];
-        if (word === '-R') { recursive = true; index++; }
-        else if (word === '-v') { verbose = true; index++; }
-        else if (word === '-f') index++;
-        else if (word === '-h') { onLink = true; index++; }
-        /* `-H`, `-L` and `-P` say which links a walk follows, so they are options the host accepts
-           even where it does nothing with them: `chmod -H 644 f` is one line on stderr about their
-           needing `-R` and the mode applied, where refusing them as illegal left the mode alone. */
-        else if (word === '-H' || word === '-L' || word === '-P') { physical = true; index++; }
+        /* The letters behind one `-` are read one at a time, the way `getopt` reads them: `chmod
+           -Rv 700 d` and `chmod -vR 700 d` are two spellings of one command on a host, where a word
+           taken whole made every clustered spelling an option this command never heard of and an
+           `illegal option -- R` out of the mode's own recursive walk. */
+        if (word !== '--') {
+            let rejected: string | undefined;
+            for (const letter of word.slice(1)) {
+                if (letter === 'R') recursive = true;
+                else if (letter === 'v') verbose = true;
+                else if (letter === 'f') continue;
+                else if (letter === 'h') onLink = true;
+                /* `-H`, `-L` and `-P` say which links a walk follows, so they are options the host
+                   accepts even where it does nothing with them: `chmod -H 644 f` is one line on
+                   stderr about their needing `-R` and the mode applied, where refusing them as
+                   illegal left the mode alone. */
+                else if (letter === 'H' || letter === 'L' || letter === 'P') physical = true;
+                else { rejected = letter; break; }
+            }
+            if (rejected !== undefined) return fail(`chmod: illegal option -- ${rejected}\n${CHMOD_USAGE}`);
+            index++;
+            continue;
+        }
         /* `--` ends the options, so the mode behind it is the mode even where it starts with a `-`,
            and so is a file named like one. */
-        else if (word === '--') { index++; noMoreOptions = true; }
-        else return fail(`chmod: illegal option -- ${word.slice(1, 2)}\n${CHMOD_USAGE}`);
+        index++;
+        noMoreOptions = true;
     }
     const operands = words.slice(index);
     if (operands.length < 2) return fail(CHMOD_USAGE);
@@ -3913,7 +3954,11 @@ const chmod: ShellCommand = (ctx) => {
         if (recursive && !here && rootStat !== undefined && rootStat.type === 'dir') {
             entries = walkRoot(ctx.fs, root, root, Number.MAX_SAFE_INTEGER).entries.map((entry) => entry.path);
         }
+        let blocked: string | undefined;
         for (const entry of entries) {
+            /* A directory already walked into is one whose mode now refuses the way down: every
+               entry below it is left alone, the way a host leaves them. */
+            if (blocked !== undefined && entry.startsWith(`${blocked}/`)) continue;
             const entryStat = statOf(ctx.fs, entry);
             /* A link the walk reached under `-h` has no target to stat, and a link is a name the
                mode lands on whether or not what it points at is there. */
@@ -3926,7 +3971,7 @@ const chmod: ShellCommand = (ctx) => {
                `chmod -R 2755 d` reports `d/g`, not the path the tree walk holds. */
             const shown = shownName(file, root, entry);
             const current = modeOf(ctx.fs, entry, entryStat?.type === 'dir');
-            const parsed = parseMode(spec, current, umaskOf(ctx.fs));
+            const parsed = parseMode(spec, current, umaskOf(ctx.fs), entryStat?.type === 'dir');
             if (parsed === undefined) {
                 stderr += `chmod: Invalid file mode: ${spec}\n`;
                 exitCode = 1;
@@ -3944,6 +3989,18 @@ const chmod: ShellCommand = (ctx) => {
                 continue;
             }
             setMode(ctx.fs, entry, parsed);
+            /* A directory the walk has still to go on into: the mode just put on it is the mode the
+               next read of it is refused by. No read bit at all is the error a host names --
+               `chmod -R 000 d` is `chmod: d: Permission denied` with the status 1 and the files
+               under `d` keeping the mode they had -- and a read bit with no search bit beside it
+               is a host's silence: `chmod -R 400 d` says nothing and still leaves the children. */
+            if (recursive && !here && entryStat?.type === 'dir') {
+                if ((parsed & 0o400) === 0) {
+                    stderr += `chmod: ${shown}: Permission denied\n`;
+                    exitCode = 1;
+                    blocked = entry;
+                } else if ((parsed & 0o100) === 0) blocked = entry;
+            }
             /* `-v` names each path whose mode actually moved, and no other: `chmod -v 644 f` on a
                file already 644 prints nothing, and neither does a path the host refused to chmod. */
             if (verbose && parsed !== current) stdout += `${shown}\n`;
