@@ -59,7 +59,8 @@ function httpOptions(options) {
   for (var key in options) {
     /* body is put on the wire separately and signal drives the abort below; neither is an http option */
     if (key === 'body' || key === 'dispatcher' || key === 'maxRedirections' || key === 'onInfo' || key === 'throwOnError') continue;
-    if (key === 'signal' || key === 'headers' || key === 'method') continue;
+    /* redirect is fetch's own: this module follows a hop itself and never hands the mode to http */
+    if (key === 'redirect' || key === 'signal' || key === 'headers' || key === 'method') continue;
     opts[key] = options[key];
   }
   if (options.headers) opts.headers = headersToObject(options.headers);
@@ -1246,7 +1247,45 @@ function dataResponse(url) {
   } catch (undecodable) {
     bytes = Buffer.from(payload, 'utf8');
   }
-  return new Response(bytes, { status: 200, headers: { 'content-type': base64 ? meta.slice(0, meta.length - 7) : (meta === '' ? 'text/plain;charset=US-ASCII' : meta) } });
+  var made = new Response(bytes, { status: 200, headers: { 'content-type': base64 ? meta.slice(0, meta.length - 7) : (meta === '' ? 'text/plain;charset=US-ASCII' : meta) } });
+  /* the bytes came from the url itself rather than from another origin, as Node reports it */
+  RESPONSE_STATE.get(made).type = 'basic';
+  return made;
+}
+
+/*
+ * Redirects, which fetch follows itself: the status it follows, the count it stops at, and the
+ * headers a cross-origin hop may not carry on. Node follows at most twenty hops and then rejects
+ * with 'fetch failed' -- the same TypeError every transport failure gives, carrying 'redirect
+ * count exceeded' as its cause -- and with redirect 'error' a first hop rejects the same way with
+ * 'unexpected redirect'.
+ */
+var REDIRECT_STATUSES = { 301: true, 302: true, 303: true, 307: true, 308: true };
+var MAX_REDIRECTS = 20;
+var CREDENTIAL_HEADERS = { authorization: true, cookie: true, 'proxy-authorization': true };
+
+/* The origin a URL belongs to, as the tuple a redirect compares: scheme, host and port. */
+function originOf(url) {
+  var parsed = requestableUrl(url);
+  return parsed === null ? '' : parsed.protocol + '//' + parsed.host;
+}
+
+/* A response is 'basic' when it comes back from the origin it was asked for and 'cors' when a
+   redirect took it to another one, which is how Node reports the two. */
+function responseType(requested, answered) {
+  var from = originOf(requested);
+  if (from === '' || from !== originOf(answered)) return 'cors';
+  return 'basic';
+}
+
+/* The headers a hop to another origin goes on with: a credential does not travel there. */
+function withoutCredentials(headers) {
+  var out = headersToObject(headers);
+  var names = Object.keys(out);
+  for (var i = 0; i < names.length; i++) {
+    if (CREDENTIAL_HEADERS[String(names[i]).toLowerCase()] === true) delete out[names[i]];
+  }
+  return out;
 }
 
 /* fetch(target, options): target is a URL string, a URL, or a Request -- a Request carries its own
@@ -1265,7 +1304,7 @@ function fetch(target, options) {
       : (held.stream !== null && held.stream !== undefined
         ? held.stream
         : (held.pending !== null && held.pending !== undefined ? held.pending : null));
-    init = { method: target.method, headers: target.headers, body: carried };
+    init = { method: target.method, headers: target.headers, body: carried, redirect: target.redirect };
     for (var key in options) init[key] = options[key];
     held.used = true;
     target = target.url;
@@ -1292,11 +1331,61 @@ function fetch(target, options) {
   if (parsed.protocol === 'data:') return Promise.resolve(dataResponse(url));
   /* a scheme the container has no client for is a failed fetch, not a parse error */
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return Promise.reject(new Error('unknown scheme'));
-  return request(url, init).then(function (res) {
+  /* a redirect mode that is not one of the three is refused before anything is dialled */
+  var redirectMode = init.redirect === undefined || init.redirect === null ? 'follow' : String(init.redirect);
+  if (redirectMode !== 'follow' && redirectMode !== 'manual' && redirectMode !== 'error') {
+    return Promise.reject(notTransport(new TypeError('undefined: ' + String(init.redirect) +
+      ' is not an accepted type. Expected one of follow, manual, error.')));
+  }
+  var asked = parsed.href;
+  /* The response a hop hands back, with the three fields a redirect decides: the url it was
+     answered from, whether a hop was taken to get there, and whether that left the origin. */
+  function answer(res, at, hops) {
     /* a status that carries no body gets none, so a 204 is not built with an empty one */
     var payload = (res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304) ? null : res.body.buffer;
-    return new Response(payload, { status: res.statusCode, statusText: res.statusText, headers: res.headers, url: url });
-  });
+    var response = new Response(payload, { status: res.statusCode, statusText: res.statusText, headers: res.headers, url: at });
+    var state = RESPONSE_STATE.get(response);
+    state.redirected = hops > 0;
+    state.type = responseType(asked, at);
+    return response;
+  }
+  function send(at, name, headers, body) {
+    var opts = {};
+    for (var carried in init) opts[carried] = init[carried];
+    opts.method = name;
+    opts.headers = headers;
+    if (body === undefined || body === null) delete opts.body;
+    else opts.body = body;
+    return request(at, opts);
+  }
+  function hop(at, name, headers, body, hops) {
+    return send(at, name, headers, body).then(function (res) {
+      var location = res.headers === undefined || res.headers === null ? null : res.headers.location;
+      /* a redirect status with nowhere to go is an ordinary response, as it is in Node */
+      if (REDIRECT_STATUSES[res.statusCode] !== true || location === null || location === undefined || location === '') {
+        return answer(res, at, hops);
+      }
+      if (redirectMode === 'error') throw new Error('unexpected redirect');
+      if (redirectMode === 'manual') return answer(res, at, hops);
+      if (hops >= MAX_REDIRECTS) throw new Error('redirect count exceeded');
+      var next = requestableUrl(String(location));
+      try {
+        /* a Location that is not a URL of its own is one relative to the url it came with */
+        if (next === null || next.hostname === '') next = new globalThis.URL(String(location), at);
+      } catch (unresolvable) {
+        return answer(res, at, hops);
+      }
+      if (next === null || next.hostname === '' || (next.protocol !== 'http:' && next.protocol !== 'https:')) {
+        return answer(res, at, hops);
+      }
+      /* 303 always becomes a GET, and so does a POST that a 301 or a 302 answers */
+      var nextName = (res.statusCode === 303 || ((res.statusCode === 301 || res.statusCode === 302) && name === 'POST')) ? 'GET' : name;
+      var nextBody = (nextName === 'GET' || nextName === 'HEAD') ? null : body;
+      var nextHeaders = originOf(at) === originOf(next.href) ? headers : withoutCredentials(headers);
+      return hop(next.href, nextName, nextHeaders, nextBody, hops + 1);
+    });
+  }
+  return hop(asked, method, init.headers, init.body, 0);
 }
 
 /* A dispatcher over the container's keep-alive pool. undici's Agent is per-origin and queues requests;

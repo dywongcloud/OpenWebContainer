@@ -355,15 +355,28 @@ export const SRC = String.raw`
   }
 
   function runInRecord(rec, code) {
-    var fns = topLevelFunctionNames(code);
+    var src = vmCode(code);
+    var fns = topLevelFunctionNames(src);
     var fnSet = Object.create(null);
     for (var i = 0; i < fns.length; i++) {
       fnSet[fns[i]] = true;
       if (!(fns[i] in rec.sb)) rec.sb[fns[i]] = undefined;
     }
-    var decl = declaredNames(code);
+    var decl = declaredNames(src);
     var scope = new Proxy(rec.sb, withHandler(rec, fnSet, decl));
-    return outOfRecord(rec, runWrapped.call(rec.G, scope, rewriteTypeof(code), fns, rec.sb));
+    return outOfRecord(rec, runWrapped.call(rec.G, scope, rewriteTypeof(src), fns, rec.sb));
+  }
+
+  /* A source this module compiles for a context gets the loader's compatibility rewrite, as a
+     module body does: the engine aborts the compile of a for-of whose iterable holds a yield
+     ('stack underflow'), and a script handed to a context is as entitled to the hoist as a module.
+     The scan costs a pass over the source, so it is skipped unless the one token the rewrite
+     needs can be in it. */
+  function vmCode(code) {
+    if (typeof code !== 'string' || code.indexOf('yield') < 0) return code;
+    var fixed = null;
+    try { fixed = rxRewrite(code); } catch (rewriteErr) { fixed = null; }
+    return fixed === null ? code : fixed;
   }
 
   /**
@@ -411,17 +424,41 @@ export const SRC = String.raw`
 
   // ---- REPL helpers ----
 
+  var OPEN_TO_CLOSE = { '(': ')', '[': ']', '{': '}' };
+
+  /*
+   * Whether the buffer is unfinished input rather than a syntax error. Node asks its parser where
+   * the error was raised: one raised only after the parser has read end-of-input -- a comment, a
+   * template, an unclosed bracket or an operator still waiting for its operand -- is input a later
+   * line can complete, and one raised inside what is already written is reported at once. So a
+   * buffer of 'var y = {' then '2+2' is an error and not an unfinished object, which is the whole
+   * difference: depth alone kept buffering it forever and never reported anything.
+   *
+   * This runtime's parser reports no position with its errors, so the question is put to its
+   * compiler instead: what closing its own open brackets cannot complete, with an operand offered
+   * where a trailing operator waits for one, is a syntax error.
+   */
   function replIncomplete(src) {
+    if (compiles(src)) return false;
     var lx = vmLex(src);
+    /* a comment or a template runs to the end of what is written, and the next line can close it */
     if (lx.unterminated) return true;
-    var depth = 0;
+    /* a property name is still owed after a '.' */
+    if (/[.]\s*$/.test(src)) return true;
+    var stack = [];
     for (var i = 0; i < lx.toks.length; i++) {
       var t = lx.toks[i];
       if (t.t !== 'punct') continue;
-      if (t.v === '(' || t.v === '[' || t.v === '{') depth++;
-      else if (t.v === ')' || t.v === ']' || t.v === '}') depth--;
+      var want = OPEN_TO_CLOSE[t.v];
+      if (want !== undefined) stack.push(want);
+      else if (t.v === ')' || t.v === ']' || t.v === '}') {
+        /* a closer with nothing of its own open is an error, not a bracket a line will close */
+        if (stack.length === 0 || stack[stack.length - 1] !== t.v) return false;
+        stack.pop();
+      }
     }
-    return depth > 0;
+    var tail = stack.reverse().join('');
+    return compiles(src + tail) || compiles(src + '1' + tail) || compiles(src + ' 1' + tail);
   }
 
   function replErrorHeader(err) {
@@ -485,7 +522,7 @@ export const SRC = String.raw`
     }
 
     Script.prototype.runInThisContext = function (options) {
-      var code = this._owcCode;
+      var code = vmCode(this._owcCode);
       return vmGuarded(options, function () { return (0, eval)(code); });
     };
     Script.prototype.runInContext = function (contextifiedObject, options) {
@@ -593,7 +630,11 @@ export const SRC = String.raw`
       setActive(stack.length === 0 ? undefined : stack[stack.length - 1]);
     };
 
-    // Synchronous throws are emitted as 'error' when the domain has listeners, else rethrown.
+    /*
+     * An error a bound callback throws with no caller left to receive it is what node's fatal
+     * exception path hands to the domain, so this is the shape the timer, tick and promise-reaction
+     * bindings call: the throw is emitted as 'error' when the domain has listeners, else rethrown.
+     */
     function invokeInDomain(self, fn, thisArg, args) {
       self.enter();
       var ret;
@@ -615,9 +656,23 @@ export const SRC = String.raw`
       return ret;
     }
 
+    /*
+     * run() is the one entry node leaves unguarded: it enters, calls and exits with no catch, so a
+     * synchronous throw propagates out of run() to the caller, and -- the exit not being in a
+     * finally -- leaves the domain entered, which is what node 24.15 does too. Emitting it as
+     * 'error' here was the divergence: node routes an error no caller catches, not one the caller
+     * of run() is standing right next to.
+     */
+    function runInDomain(self, fn, thisArg, args) {
+      self.enter();
+      var ret = fn.apply(thisArg, args);
+      self.exit();
+      return ret;
+    }
+
     Domain.prototype.run = function (fn) {
       installDomainPromiseHook();
-      return invokeInDomain(this, fn, this, Array.prototype.slice.call(arguments, 1));
+      return runInDomain(this, fn, this, Array.prototype.slice.call(arguments, 1));
     };
 
     Domain.prototype.bind = function (cb) {

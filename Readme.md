@@ -351,14 +351,21 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   Six that do answer print the bare name where a host prints a path (`mkdir`, `rm`, `cp`, `mv`, `touch`,
   `which`), and `npx --version` exits 1 with `npx: a command or package is required` where a host prints
   `11.12.1`.
-- **`owc-shell-bash32-extensions`: this machine's `/bin/sh` is bash 3.2, and the guest shell has none of the
-  syntax that makes it one.** `arr=(x y z); echo ${arr[1]}` is `y` on the host and a syntax error here,
-  `[[ abc == a* ]]` is `matched` against `sh: [[: command not found` with 127, `echo a{b,c}d` is `abd acd`
-  against the literal `a{b,c}d`, `true | false | true; echo ${PIPESTATUS[1]}` is `1` against nothing, and
-  `k=target; target=hit; echo ${!k}` is `hit` against nothing -- with `set -o` naming 27 options on the host
-  and 17 here, `$-` `hBc` against `h`, `declare -i n=1; n=n+1` `2` against `n+1`, `export -n` and `hash -d`
-  rejected, and `read` not splitting on IFS. Each case was run one per process on both sides and re-run three
-  times byte-identical. The whole measured list is the row's subject.
+- **`owc-shell-bash32-extensions` (closed): this machine's `/bin/sh` is bash 3.2, and the guest shell
+  now has the syntax that makes it one.** `arr=(x y z); echo ${arr[1]}` is `y`, `[[ abc == a* ]]` is
+  `matched` (it was `sh: [[: command not found` with 127), `echo a{b,c}d` is `abd acd`,
+  `true | false | true; echo ${PIPESTATUS[1]}` is `1`, `k=target; target=hit; echo ${!k}` is `hit`,
+  `set -o` names the same 27 options in the same order with the same `on`/`off` behind a tab (it named
+  17), `$-` is `hBc` (it was `h`), `declare -i n=1; n=n+1` is `2` (it was `n+1`), `export -n FOO` and
+  `hash -d ls` both leave 0, and `IFS=: read x y` splits on the colon -- an assignment in front of a
+  builtin is one the builtin sees and one the shell does not keep, which is what a host does. Brace
+  expansion is the expansion a host does first, so `x=q; echo pre{a,b}$x` is `preaq prebq` and
+  `echo a\{b,c\}d` stays the text `a{b,c}d`; `set +B` turns it off, as on a host. Each case was run one
+  per process on both sides; the 214-line differential (the row's own eleven, the arrays, the
+  conditional, the braces, `PIPESTATUS`, indirection, the options and a general shell regression set)
+  leaves 11 differences and none of them is this row's: `set -n` runs where a host stops, `set -v`
+  traces where a host does not, and `$HOME`, `ls /`, `[[ -f /etc/hosts ]]` and every `sh -c` of a
+  nested shell are the two trees and the container's own no-nested-`sh` boundary.
 - **A mode `chmod` sets does not outlive the `sh -c` line that set it.** The metadata side table it writes is
   keyed by the file system object a line was handed, so `chmod 700 f` in one `sh -c` and `ls -l f` in the next
   prints `-rw-r--r--`, where a host prints `-rwx------`; within one line the mode is there. Separately, a
@@ -507,6 +514,7 @@ The same expressions through both, measured against this machine's `node -i` (v2
 | `require("path").join("a","b")` | `'a/b'` | `'a/b'` |
 | `1+1` | `2` | `2` |
 | `}` | the line, a caret, then `Uncaught SyntaxError: Unexpected token '}'` | `Uncaught SyntaxError: expecting ')'` |
+| `var y = {` then `2+2` | the offending line, a caret, then `Uncaught SyntaxError: Unexpected token '+'` | `Uncaught SyntaxError: expecting ':'` |
 | `undefined` | `undefined` | `undefined` |
 | `const x = 5` | `undefined` | `undefined` |
 | `x` | `5` | `5` |
@@ -517,7 +525,15 @@ Recorded rather than fixed:
 - **No welcome banner.** Host node prints `Welcome to Node.js v24.15.0.` and `Type ".help" for more
   information.` above the first prompt; this one prints the prompt only.
 - **A syntax error prints its message alone.** Host node echoes the offending line and a caret under the
-  token. QuickJS reports its own message, and the REPL has no source line to echo.
+  token. QuickJS reports its own message, and the REPL has no source line to echo: bare QuickJS 0.31 with
+  no container in the way reports the same errors with a `stack` of `    at eval.js:2` — a line number and
+  nothing else — so there is no column for a caret to sit under.
+- **A syntax error inside a multi-line entry is reported, at the line that closes it and not before.**
+  Which entry is unfinished is decided the way host node decides it — by whether the parser only reaches
+  its error after it has read end-of-input — so `var y = {` on one line and `2+2` on the next is an error
+  and not an object waiting for a `}`. The two remaining shapes disagree: `return` on a line of its own
+  and the partial number `2e` are unfinished here where host node reports them, and `a.` is reported here
+  where host node waits for the property name.
 - **No line editing.** Arrow keys, history, Backspace and tab completion do nothing: the REPL reads whole
   lines, and an editing key is dropped rather than echoed into the session.
 - **Ctrl-D arrives only where the terminal sends it.** The playground's xterm pane drops every Ctrl key
@@ -672,6 +688,15 @@ without ever running away. The budget bounds one *uninterrupted stretch*: every 
 timer wait or step of the event loop starts it again, so a program that reaches the host in bursts is
 never stopped by it, however long it runs. `new OpenWebContainer({ guestBudgetMs: ms })` sets it, and
 `0` disarms it, which is the old behaviour.
+
+The same handler carries the `timeout` of a `spawn`: a child that never calls the host holds the host
+thread, so the timer the spawning guest armed for its own `timeout` cannot fire until the child has
+gone, and the deadline is handed to the interrupt handler instead -- rearmed at every host call, so it
+stays a moment in time and not a stretch of execution. `spawn('node', [busy 5 s], { timeout: 400,
+killSignal: 'SIGKILL' })` closes at 416 ms with code null, signal SIGKILL and `killed` true, and
+`execFile` and `spawnSync` report `ETIMEDOUT` and the same signal, as host Node 24.15 does. A kill
+with no moment attached to it -- `child.kill()` on a child that is busy-looping -- still cannot land,
+for the reason the divergence list gives under `owc-child-kill-timeout`.
 
 Known limits, measured rather than claimed:
 
@@ -933,6 +958,7 @@ Future plans:
 - [ ] Builtin module namespace surface -- far wider than `node:fs`: measured against host Node 24.15, 19 of 34 builtins differ (`node:fs` 90 against 105, `node:process` 46 against 83, `node:crypto` 30 against 70, `node:util` 22 against 35, `node:os` 22 against 24, `node:path` 16 against 18); `node:cluster` exposes `worker` where Node has `Worker`, `node:util` leaks `__isDeepEqual`/`isFunction`/`isNumber`/`isObject`/`isString`, `node:module` still exports `createRequireFromPath`/`wrap`/`wrapper` that Node 24 dropped, and `node:fs` carries `F_OK`/`R_OK`/`W_OK`/`X_OK` at top level (row owc-esm-builtin-namespace-surface)
 - [x] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
 - [x] A multi-byte character split across two `process.stdout.write` calls, and a lone surrogate written as text -- `write([e4,b8])` then `write([ad])` is U+4E2D as on a host, including across an intervening empty-string write, and `write('\ud83d')` then `write('\ude00')` is two U+FFFD as on a host (row owc-stdout-split-sequence-mangled)
+- [x] bash 3.2 syntax this machine's `/bin/sh` has -- arrays (`a=(x y z)`, `${a[1]}`, `${#a[@]}`), the conditional command `[[ a == a* ]]`, brace expansion (`a{b,c}d`, `{1..3}`, `set +B`), `PIPESTATUS`, indirection `${!k}`, the full 27-name `set -o` list and `$-` of `hBc`, `declare -i`, `export -n`, `hash -d`, and an assignment in front of a builtin (`IFS=: read x y`) (row owc-shell-bash32-extensions)
 - [x] `cmd 3>f >&3` -- a descriptor the command itself opened is visible to its own later `>&n`, and one a compound command opened to the whole construct, as on a host (row owc-shell-fd-opened-by-command-visible-to-itself)
 - [x] `exec >f`, `exec 2>f` and `exec 1>&2` persist, and what the commands behind them wrote stays in the file -- `exec >f; echo a; echo b` is both lines (row owc-shell-exec-standard-fd-dropped)
 - [x] `exec 3>&1`, `exec 3>&2` and `exec 3<&1` duplicate the standard descriptor a host duplicates, with no bad-descriptor diagnostic (row owc-shell-exec-duplicating-standard-fd)
@@ -967,6 +993,17 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 cwd at the app directory, one case per process. Each line below is one symptom that survives a
 re-run in isolation; the rows are open.
 
+- `owc-http-fetch-external-redirect`: `fetch(url, { redirect: 'manual' })` against a host outside the
+  container. An external request runs in the host's `fetch`, which this runtime calls with
+  `redirect: 'follow'`, so the redirect is followed before the guest ever sees it: nine probes —
+  `manual`, `error` and `follow` over `https://httpbin.org/redirect/1`, `http://github.com` and
+  `https://httpbin.org/absolute-redirect/1` — print `200 basic false "<the url asked for>" loc=null`
+  here, where host Node 24.15 prints `302 basic false "https://httpbin.org/redirect/1" loc="/get"` for
+  `manual` and `TypeError fetch failed` for all three of `error`. Against a server inside the container
+  the same nine agree with the host byte for byte, so the gap is the host capability and not the guest:
+  `packages/core/src/process/executors/node/runtime/capabilities/http.ts` hard-codes
+  `redirect: 'follow'` in its `fetch`, and the `http.fetch` payload `guest/modules/http.ts` `_dispatch`
+  sends carries no redirect mode and drops the `url` the capability answers with.
 - `owc-node-require-preload-dropped`: `node -r ./pre.js main.js` (and `--require ./pre.js`) reads the
   option, so `process.execArgv` and `process.argv` agree with the host, but the preload module is
   never run -- the host prints `preloaded` before `main`, the container prints `main` only.
@@ -984,14 +1021,18 @@ re-run in isolation; the rows are open.
   still compiled as CommonJS -- `typeof import.meta` is a `SyntaxError` and `typeof require` is
   `function`, where the host has `object` and `undefined`, and `node --input-type=module -p 1` should
   fail with `ERR_EVAL_ESM_CANNOT_PRINT` rather than print `1`.
-- `owc-esm-global-surface`: the enumerable globals are not Node's -- `Object.keys(globalThis).length`
-  is 27 here against the host's 15, and the container makes `Blob`, `Buffer`, `URL`, `URLSearchParams`,
-  `console`, `process`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `File` and
-  `CloseEvent` enumerable where the host does not, leaks `__owcErrname` as an enumerable global, and
-  has no `navigator`; `Object.getOwnPropertyNames(globalThis)` is 122 against 135, missing `Atomics`,
-  `Crypto`/`CryptoKey`/`SubtleCrypto`, `navigator`/`Navigator`, the `Performance` family,
-  `BroadcastChannel`, `CompressionStream`/`DecompressionStream`, `URLPattern`,
-  `DisposableStack`/`AsyncDisposableStack` and `SuppressedError` (row owc-esm-global-surface)
+- `owc-esm-global-surface`: `Object.keys(globalThis)` is now the host's fifteen names exactly --
+  `Blob`, `Buffer`, `URL`, `console`, `process`, the `TextCodec` pair, the abort pair, `File` and
+  `CloseEvent` are non-enumerable here as they are there, `__owcErrname` no longer leaks, and
+  `navigator` exists. `Object.keys(process)` is the host's 82 names (the three stdio streams were
+  the ones a walk could not see). `Object.getOwnPropertyNames(globalThis)` is 139 against 135: the
+  `Performance` family, `Crypto`/`CryptoKey`/`SubtleCrypto`, `Navigator`/`navigator`,
+  `BroadcastChannel`, `CompressionStream`/`DecompressionStream`,
+  `DisposableStack`/`AsyncDisposableStack` and `SuppressedError` were added and `InternalError`
+  -- QuickJS's, and no V8 has one -- dropped, leaving two the host has and this container does not:
+  `Atomics`, which this *engine* lacks (`typeof Atomics` is `'undefined'` under bare QuickJS 0.32
+  with no container in the way, where `typeof SharedArrayBuffer` is `'function'`, so there is no
+  atomic to build it over), and `URLPattern` (row owc-esm-global-surface)
 - `owc-esm-unknown-file-extension`: `import('./m.xyz')` holding `export const v = 1` -- the host
   answers `TypeError ERR_UNKNOWN_FILE_EXTENSION "Unknown file extension \".xyz\" for /app/m.xyz"`,
   the container parses it as CommonJS. The same call exposes four more: `.m` is
@@ -1091,7 +1132,13 @@ re-run in isolation; the rows are open.
 - `owc-engine-stack-underflow-user-eval`: a source the engine compiles because user code called `eval` still aborts -- `eval('(function*(){ for (const x of (yield 1)) {} })')` and the indirect `(0, eval)` of the same string are `function` on host Node 24.15 and throw `InternalError: stack underflow (op=110, pc=8)` in the container, in a CommonJS module, in an ES module and under `node -e`. The rewrite that hoists the iterable now reaches every source the container itself compiles (`new Function` anywhere, the `vm` surfaces, `node -p`); `eval` it cannot reach, because a wrapper over `globalThis.eval` is not the intrinsic `%eval%` and would cost every direct eval the caller's scope that `vm`'s own with-scoped eval and a package evaluating `require('x')` rely on. Re-measured at HEAD: the container exits 1 with `InternalError: stack underflow (op=110, pc=8)` where the host exits 0 printing `function`, in a CommonJS module, in an ES module and under `node -e`. Bare QuickJS 0.32 with no container in the way aborts on all three spellings -- direct `eval`, `(0, eval)` and `new Function` -- so the abort is the engine's own compile, and the container's rewrite is exactly what makes `new Function` print `function` there where bare QuickJS does not.
 - `owc-compat-rewrite-tostring-leak`: `Function.prototype.toString` prints the compatibility rewrite instead of the source -- `new Function('return function*(){ for (const x of (yield 1)) {} }')().toString()` is `function*(){ for (const x of (yield 1)) {} }` (79 characters) on the host and `function*(){ const __owcOf1 = (yield 1); for (const x of __owcOf1) {} }` (106) in the container, and a module-level generator, a class method and a `-e` body leak the same way. The hoist is what makes the shape compile at all, so the text cannot simply be dropped; the engine would have to hand back the source it was given rather than the one it compiled.
 - `owc-engine-error-message-wording`: the message of an error the engine raises itself is QuickJS's wording and not Node's, and it diverges on every one of them -- `null.x` is `cannot read property 'x' of null` where host Node 24.15 says `Cannot read properties of null (reading 'x')`, `undefinedFn()` is `'undefinedFn' is not defined` where the host says `undefinedFn is not defined`, `JSON.parse('{')` is `expecting property name` where the host says `Expected property name or '}' in JSON at position 1 (line 1 column 2)`, `new Array(-1)` is `invalid array length` against `Invalid array length`, `decodeURIComponent('%')` is `expecting hex digit` against `URI malformed`, a call of a non-function is `not a function` against `f is not a function`, and a strict-mode write to a non-writable or frozen data property is `'z' is read-only` against `Cannot assign to read only property 'z' of object '#<Object>'`. The same wall as `owc-guest-error-engine-stack-no-header`, and a wider blast radius: the message is what `String(e)`, `util.inspect` and every log line print, where the stack header is one line of one property. A getter-only accessor's `no setter for property` is `owc-guest-getter-only-assignment-message`. Re-measured at HEAD, all seven, and bare QuickJS 0.32 with no container in the way prints every one of the seven strings -- `cannot read property 'x' of null`, `'undefinedFn' is not defined`, `expecting property name`, `invalid array length`, `expecting hex digit`, `not a function`, `'z' is read-only` -- so all seven are the engine's own text and none is a wording this container chose. One of them is out of reach however the string is handled: the host's `f is not a function` names the expression that was called, where QuickJS's `not a function` names nothing at all, so there is nothing to rewrite it into.
-- `owc-child-kill-timeout`: an asynchronous child cannot be killed or timed out -- `spawn('node', [busy 5 s], { timeout: 400, killSignal: 'SIGKILL' })` closes at 5415 ms with code 0 and killed false where host Node 24.15 closes at 425 ms with signal SIGKILL, `child.kill()` returns false and `process.kill(child.pid, 0)` throws ESRCH for a node child as well as a shell one, `execFile`/`exec`'s `timeout` reports no error at all, `spawnSync`'s `timeout` reports status 0 where the host reports ETIMEDOUT, and a `while(1){}` child ends only on the container's ~30 s watchdog with status 1 where the host ends it with SIGTERM in 5 ms.
+- `owc-child-kill-timeout`: what is left of a child that cannot be stopped. A spawn's `timeout` now ends a guest child on time -- `spawn('node', [busy 5 s], { timeout: 400, killSignal: 'SIGKILL' })` closes at 416 ms with code null, signal SIGKILL and killed true where host Node 24.15 closes at 416 ms with the same three, `execFile`'s `timeout` reports killed true, signal SIGTERM and `Command failed: ...` at 423 ms (host 421), and `spawnSync`'s `timeout` reports status null, signal SIGKILL and error ETIMEDOUT at 411 ms (host 407), because the bound is put on the child's interrupt handler -- the only thing that runs while guest code holds the host thread -- rather than on a host timer. What no bound can reach is a kill with no moment attached to it: `child.kill()` 600 ms into a 5 s busy child still answers false and `process.kill(child.pid, 0)` still throws ESRCH, and a `while(1){}` child still ends on the container's ~30 s runaway budget with status 1 where the host ends it with SIGTERM in 5 ms. Bare QuickJS 0.32 with no container in the way says why: a host `setTimeout(..., 100)` armed before a 3 s guest loop fires at 3012 ms and not at 100, and the interrupt handler -- 1595 checks during one `while(1){}`, ending it at 501 ms with `InternalError: interrupted` -- can only abort a guest, never resume one, so a parent's kill has no moment at which to run. A `sh` child's `timeout` is still ignored for the same reason one level up, because `ShellProcess` carries no `armKillDeadline` (`owc-sh-child-kill-timeout`).
 - `owc-stream-internal-surface`: the internal surface of `stream` and `readline` is this implementation's own and not Node's -- `readline.Interface.prototype` carries 10 own keys (`close` through `write`) where host Node 24.15 carries 41 (`_ttyWrite`, `_refreshLine`, `_insertString`, `_deleteLeft`, `_historyNext`, `_tabComplete`, `_getDisplayPos`, `_setRawMode`, `_line`, `_sawKeyPress`, ...), a terminal interface has no `historyIndex`, `historyManager`, `isCompletionEnabled` or `isFlushing` own key, `Readable.prototype` has no `_undestroy`, `readableBuffer` or `removeAllListeners`, `Writable.prototype` has no `_writev`, `writableBuffer`, `writableAborted` or `pipe`, and the own keys of `_readableState` and `_writableState` are this implementation's field set (19 keys) rather than Node's (6). Nothing a program reads to move data differs: `rl.line`, `rl.cursor`, `rl.getCursorPos()`, `rl.tabSize`, `rl.escapeCodeTimeout`, tab completion and the escape sequences `prompt()` writes all agree with the host.
 - `owc-als-across-await-engine`: an `AsyncLocalStorage` store survives every `await` on host node 24.15 and is lost across every one of them here -- `als.run('S', async () => { ... })` reads `S` after `await null`, `await 42`, `await Promise.resolve(1)`, `await` a timer promise, `await` a thenable, `await` a tick, `await` an immediate and after two awaits in a row on the host, and `undefined` after all nine in the container, while `setTimeout`, `nextTick`, `setImmediate` and a promise `.then` keep `S` on both sides. Bare QuickJS 0.32 with no container in the way says why: `await` never reaches the JS-visible `Promise.prototype.then` at all -- one instrumented `then` counts 1 call for an explicit `.then`, 0 for `await <native promise>` and 0 for `await <thenable>` -- because the engine registers an await's reaction with its own `js_promise_then`, so no guest-side wrapper over `Promise.prototype.then` is ever handed the resumption, and there is no host hook on job enqueue or async context to stand in for it: an exhaustive scan of quickjs-emscripten 0.32.0's 18 files finds neither `HostPromiseRejectionTracker` nor `PromiseHook`.
 - `owc-asyncfn-rejection-unreported`: a rejection of an async function's own promise is never reported -- `(async function () { throw new Error('asyncfn-throw'); })();` with a 20 ms timer after it exits 1 with the error on stderr and never runs the timer on host node 24.15, and exits 0 printing `end` in the container. QuickJS builds an async function's result with the intrinsic `%Promise%` and not through the global binding: with `globalThis.Promise` replaced by a subclass, bare QuickJS 0.32 reports `p instanceof Tracked` false, `Object.getPrototypeOf(p) === %Promise%.prototype` true, and 0 constructor calls and 0 `Symbol.species` gets, so the rejection tracker that covers promises built through the container's own `Promise` has no cell for this one; reaching it needs `JS_SetHostPromiseRejectionTracker` or a job-enqueue hook, and quickjs-emscripten 0.32.0 exports neither.
+
+## The `lean-net-negative` walk gate (measured, not waived)
+
+- `owc-lean-net-gate` (open): exactly one edge carries a lean gate, `G_NET -> NODELETE` at `.gm/config-source-cache-default/fsm/graph.json:1486-1493` with gates `["lean-net-negative"]`, and measured live at HEAD `0cc7ab2` a `transition` to `NODELETE` is refused `gate_denied` / `lean-net-negative` -- "the working change adds more lines than it removes" -- against a working tree of 232 files changed, `+5512 / -1481`, net `+4031`, which is other lanes' in-flight feature work (`crypto.ts +1140`, `builtins.ts +876`, `globals.ts +583`, `misc.ts +410`, `stream.ts +283`, `undici.ts +101`) and not superseded code. The predicate is compiled, `.gm/config-source-cache-default/fsm/predicates.md:31`, and reads no growth reason, so nothing in this repository can waive it; it is satisfied by a clean working tree instead, where added and removed lines are both 0, so the route is to publish before taking the edge, and the shared-tree publish -- a temporary `GIT_INDEX_FILE` built on `origin/main`, pushed by sha -- reaches that without touching another lane's staged paths. No graph was vendored and no override was taken, because re-scoping a compiled predicate is a one-way door.
+- `owc-sr-blocker-nodelete` (retired, stale): the edge it names, `NODELETE -> COHESION`, carries `"gates": []` at `.gm/config-source-cache-default/fsm/graph.json:3023-3032`; the lean gate is on `G_NET -> NODELETE`, and the diff the row cites, 13 files at `+733 / -298`, has been committed and pushed. The fact that survives -- the predicate counts net lines and reads no growth reason -- is carried by the open row above.
+- `owc-wc-lean-sweep` (retired, stale): no removal of superseded code can bring a shared worktree that every lane writes to down to net zero or negative, and the files holding the `+4031` are `packages/core/src/**`, owned by shards this one must not edit, so the row's own fallback applies and its residual is the open row above.
