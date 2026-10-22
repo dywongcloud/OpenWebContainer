@@ -3495,6 +3495,14 @@ function planDuplicate(state: ShellState, plan: RedirectPlan, fd: number, target
         if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
         return;
     }
+    /* A number whose descriptor this very line closed: `echo hi 3>&- 2>&3` is `sh: 3: Bad file
+       descriptor` on a host, because duplicating a descriptor that is no longer open is the
+       failure a host names before the command runs -- not a sink the write disappears into. The
+       `>&-` that does the closing is the word `-`, which is the close itself and never this. */
+    if (resolved.kind === 'null' && /^[0-9]+$/.test(target)) {
+        if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: Bad file descriptor\n`;
+        return;
+    }
     /* `>&word` with a word no descriptor answers to is a name, not a number: the standard output
        takes both streams, the way `&>word` writes them -- `{ echo o; echo e >&2; } >&f` is `o` and
        `e` both in `f` -- while any other descriptor in front of the operator is a host's ambiguous
@@ -3820,6 +3828,51 @@ function advanceReadFd(
     offset.pos += given.length;
 }
 
+/**
+ * True when a command's operands name a file it reads instead of its standard input: `cat g <&3`
+ * reads `g` and leaves the descriptor it was handed exactly where it was, as it does on a host.
+ */
+function readsNamedFile(state: ShellState, args: string[]): boolean {
+    const fs = state.fs;
+    if (!fs) return false;
+    for (const arg of args) {
+        if (arg === '-' || arg.startsWith('-')) continue;
+        try {
+            if (fs.fileExists(resolvePath(state, arg))) return true;
+        } catch {
+            /* a word that is not a path the file system can answer for is not a file it reads */
+        }
+    }
+    return false;
+}
+
+/**
+ * Moves the shell's own standard input by what a command took out of it. That input is the file an
+ * `exec 0<f` or an `exec 0<&3` put there, and a host shares one read offset across the commands
+ * that read it, so `exec 0<f; cat; cat` is `f` once and not twice -- the first `cat` leaves the
+ * offset at the end -- and `exec 0<f; read x; cat` is the rest `read` left behind it.
+ *
+ * A command that moved the cursor itself -- `read`, `mapfile`, which take their line through it --
+ * has already said how far it got, and one that never reads leaves it where it was.
+ */
+function advanceShellInput(
+    state: ShellState,
+    name: string,
+    args: string[],
+    stdout: string,
+    given: string,
+    cursorBefore: number
+): void {
+    if (!STDIN_READERS.has(name)) return;
+    if (state.inputCursor !== cursorBefore) return;
+    if (readsNamedFile(state, args)) return;
+    if (name === 'head' && headReadsStdin(args) && stdout !== '' && given.startsWith(stdout)) {
+        state.inputCursor += stdout.length;
+        return;
+    }
+    state.inputCursor += given.length;
+}
+
 function writeOutputFile(state: ShellState, file: string, text: string, append: boolean): void {
     const fs = state.fs;
     if (!fs) throw new Error(`Failed to redirect to ${file}: no file system`);
@@ -3841,6 +3894,69 @@ function writeOutputFile(state: ShellState, file: string, text: string, append: 
        it: `umask 077; echo hi > f` is `-rw-------` on a host, and so is a here-document written
        the same way. One that was already there keeps the mode it had. */
     if (!existed) setCreationMode(fs, path, false);
+}
+
+/**
+ * Where the shell's own standard output goes *now* -- `state.stdoutTarget`, which is the output the
+ * shell was started with until an `exec >f` or an `exec 1>&2` moves it somewhere else.
+ *
+ * Text a closed descriptor could not hold still reaches the shell -- a host holds the write in its
+ * own buffer and flushes it once the descriptor is put back -- and it reaches the place the shell's
+ * output is at when it is flushed, so behind `exec >f` it is `f` that ends up holding it and not the
+ * output the shell was started with: `exec >f; echo hi >&-` leaves `hi` in `f` and prints nothing.
+ */
+function writeShellOut(state: ShellState, text: string): void {
+    const target = state.stdoutTarget;
+    /* `exec >f` opened the file once, so a write that reaches it goes in behind what is already
+       there rather than truncating it again. */
+    if (target.kind === 'file' && target.file !== undefined) {
+        writeOutputFile(state, target.file, text, true);
+    } else if (target.kind === 'err') {
+        writeErr(state, text);
+    } else {
+        writeOut(state, text);
+    }
+}
+
+/**
+ * Where the shell's own error goes *now*: `state.stderrTarget`, which `exec 2>f` and `exec 2>&1`
+ * move. A diagnostic a command's own redirections could not carry falls back to it, the way a
+ * host's does once it has put the descriptors back.
+ */
+function writeShellErr(state: ShellState, text: string): void {
+    const target = state.stderrTarget;
+    if (target.kind === 'file' && target.file !== undefined) {
+        writeOutputFile(state, target.file, text, true);
+    } else if (target.kind === 'out') {
+        writeOut(state, text);
+    } else {
+        writeErr(state, text);
+    }
+}
+
+/**
+ * Where one command's own error goes, which is where its `2>` and `2>&1` sent it and not always the
+ * shell's: `echo hi 2>&1 >&-` writes the write error on the standard output, because `2>&1` had
+ * pointed the error there before `>&-` closed the output behind it.
+ */
+function writePlanErr(state: ShellState, plan: RedirectPlan, text: string): void {
+    const target = plan.stderrTo;
+    /* Closed by this command's own `2>&-`: a host has put the descriptor back by the time it
+       reports, so the message reaches the shell's error after all -- `echo hi >&- 2>&-` is the
+       write error on the error stream, not nowhere. */
+    if (target.kind === 'null') {
+        writeShellErr(state, text);
+        return;
+    }
+    if (target.kind === 'out') {
+        writeOut(state, text);
+        return;
+    }
+    if (target.kind === 'file' && target.file !== undefined) {
+        writeOutputFile(state, target.file, text, Boolean(target.append));
+        return;
+    }
+    writeErr(state, text);
 }
 
 /**
@@ -3900,8 +4016,8 @@ function finish(
                and the write is still the failure it was, reported with the status a host gives the
                command that made it. `true >&-` writes nothing and keeps its own status. */
             if (stdout !== '' && name !== undefined) {
-                writeOut(state, stdout);
-                writeErr(state, `${diagnosticPrefix(state)}${name}: write error: Bad file descriptor\n`);
+                writePlanErr(state, plan, `${diagnosticPrefix(state)}${name}: write error: Bad file descriptor\n`);
+                writeShellOut(state, stdout);
                 exitCode = 1;
             }
             stdout = '';
@@ -4076,6 +4192,10 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
 
     const savedBuffer = state.inputBuffer;
     const savedCursor = state.inputCursor;
+    /* A command with no input of its own reads the shell's, so what it takes out of that is what the
+       commands behind it do not read again: `exec 0<f; cat; cat` is `f` once, as it is on a host. */
+    const cursorBefore = state.inputCursor;
+    const shellInput = commandInput === null ? stdin : null;
     if (commandInput !== null) {
         state.inputBuffer = commandInput;
         state.inputCursor = 0;
@@ -4120,6 +4240,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
             /* What the built-in read through a descriptor it was handed -- `read x <&3` -- is what
                the descriptor's own offset moves by, so the line behind it reads on from there. */
             advanceReadFd(state, plan, name, args, result.stdout, commandInput ?? '');
+            if (shellInput !== null) advanceShellInput(state, name, args, result.stdout, shellInput, cursorBefore);
             for (const entry of pending) setVar(state, entry.name, entry.value);
             syncPwd(state);
             return finish(state, plan, result.stdout, result.stderr, result.exitCode, name);
@@ -4127,6 +4248,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
 
         const step = RUNNER(state, words, stdin);
         advanceReadFd(state, plan, name, args, step.stdout, commandInput ?? '');
+        if (shellInput !== null) advanceShellInput(state, name, args, step.stdout, shellInput, cursorBefore);
         for (const entry of pending) setVar(state, entry.name, entry.value);
         syncPwd(state);
         return finish(state, plan, step.stdout, step.stderr, step.exitCode, name);
