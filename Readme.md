@@ -259,6 +259,16 @@ behind host Node and about 40x behind this container's own HTTP/1.1 over the ide
 the remaining cost is in the HTTP/2 implementation rather than in the transport. It is filed, not
 fixed, here.
 
+**The cause, measured live, and why it is not a transport bug.** 16 MiB of HTTP/2 costs this guest
+about 50 ns of CPU per byte against host Node's 6 ns -- the same script run at 1 MiB and at 16 MiB,
+two runs each, the difference attributed to the 15 MiB -- which is a ~9x floor, about 19 MiB/s worth
+of CPU, that no change to the bridge can move: Node frames, windows and streams HTTP/2 in nghttp2, in
+C++, while the guest does all three in JavaScript that QuickJS runs, and the framing on its own, with
+no socket and no bridge at all, is 2-3 ns/byte here against 0.2-0.4 on host. Add the waiting the
+bridge costs and the same 16 MiB takes 2.1-2.8 s in the container against 0.09-0.12 s on host, so the
+~9 MiB/s is the price of a JavaScript HTTP/2 on this engine and not of the transport: the identical
+bytes over this container's own HTTP/1.1, on the identical bridge, are 372 MiB/s.
+
 ### 🚧 In Progress
 
 - **Network Simulation hardening**
@@ -1036,11 +1046,20 @@ re-run in isolation; the rows are open.
   atomic to build it over), and `URLPattern` (row owc-esm-global-surface)
 - `owc-esm-unknown-file-extension`: `import('./m.xyz')` holding `export const v = 1` -- the host
   answers `TypeError ERR_UNKNOWN_FILE_EXTENSION "Unknown file extension \".xyz\" for /app/m.xyz"`,
-  the container parses it as CommonJS. The same call exposes four more: `.m` is
-  `ERR_UNKNOWN_FILE_EXTENSION` on the host, `.ts` and `.mts` LOAD (Node 24 strips types) where the
-  container raises `unsupported keyword: export`, `.node` is `ERR_UNKNOWN_FILE_EXTENSION` where the
-  container gives `ERR_DLOPEN_FAILED`, and `.wasm` is a wasm module on the host and CommonJS here
-  (row owc-esm-unknown-file-extension)
+  the container parses it as CommonJS. The same call exposes two more: `.m` is
+  `ERR_UNKNOWN_FILE_EXTENSION` on the host, and `.node` is `ERR_UNKNOWN_FILE_EXTENSION` where the
+  container gives `ERR_DLOPEN_FAILED` (row owc-esm-unknown-file-extension)
+- The two module formats behind that row are now there. `.wasm` is a format of its own: the bytes
+  are read and compiled as WebAssembly, and bytes that are not a wasm module give the CompileError
+  the host gives -- `CompileError` with `"/app/m.wasm: WebAssembly.Module(): expected magic word
+  00 61 73 6d, found 65 78 70 6f @+0"`, line for line the host's own words. `.ts`, `.mts` and
+  `.cts` are stripped of their types the way Node 24 strips them, on the token stream and never on
+  the text, so the `:` of a ternary, of an object literal, of a `case` and of a label survives: a
+  `.ts` file holding an `interface`, a `type`, an `import type`, a `private` member, a typed
+  parameter, a return type, a function type, an `Array<T>` and an `as` cast is byte-identical to
+  the host's own run of it. What Node refuses rather than rewrites is refused here too -- an
+  `enum`, a `namespace`, a parameter property -- and the parse of what is left fails in the same
+  words (row owc-esm-wasm-and-typescript-format)
 - `owc-esm-main-syntax-error-frame`: a syntax error in an **ES module main** now carries Node's whole
   report -- the file URL and line, the source line, a caret under the token, the `SyntaxError`, the
   ten loader frames (the entry's own `.../esm/loader:628:32` + `TracingChannel.tracePromise`, or a
@@ -1137,3 +1156,9 @@ re-run in isolation; the rows are open.
 - `owc-stream-internal-surface`: the internal surface of `stream` and `readline` is this implementation's own and not Node's -- `readline.Interface.prototype` carries 10 own keys (`close` through `write`) where host Node 24.15 carries 41 (`_ttyWrite`, `_refreshLine`, `_insertString`, `_deleteLeft`, `_historyNext`, `_tabComplete`, `_getDisplayPos`, `_setRawMode`, `_line`, `_sawKeyPress`, ...), a terminal interface has no `historyIndex`, `historyManager`, `isCompletionEnabled` or `isFlushing` own key, `Readable.prototype` has no `_undestroy`, `readableBuffer` or `removeAllListeners`, `Writable.prototype` has no `_writev`, `writableBuffer`, `writableAborted` or `pipe`, and the own keys of `_readableState` and `_writableState` are this implementation's field set (19 keys) rather than Node's (6). Nothing a program reads to move data differs: `rl.line`, `rl.cursor`, `rl.getCursorPos()`, `rl.tabSize`, `rl.escapeCodeTimeout`, tab completion and the escape sequences `prompt()` writes all agree with the host.
 - `owc-als-across-await-engine`: an `AsyncLocalStorage` store survives every `await` on host node 24.15 and is lost across every one of them here -- `als.run('S', async () => { ... })` reads `S` after `await null`, `await 42`, `await Promise.resolve(1)`, `await` a timer promise, `await` a thenable, `await` a tick, `await` an immediate and after two awaits in a row on the host, and `undefined` after all nine in the container, while `setTimeout`, `nextTick`, `setImmediate` and a promise `.then` keep `S` on both sides. Bare QuickJS 0.32 with no container in the way says why: `await` never reaches the JS-visible `Promise.prototype.then` at all -- one instrumented `then` counts 1 call for an explicit `.then`, 0 for `await <native promise>` and 0 for `await <thenable>` -- because the engine registers an await's reaction with its own `js_promise_then`, so no guest-side wrapper over `Promise.prototype.then` is ever handed the resumption, and there is no host hook on job enqueue or async context to stand in for it: an exhaustive scan of quickjs-emscripten 0.32.0's 18 files finds neither `HostPromiseRejectionTracker` nor `PromiseHook`.
 - `owc-asyncfn-rejection-unreported`: a rejection of an async function's own promise is never reported -- `(async function () { throw new Error('asyncfn-throw'); })();` with a 20 ms timer after it exits 1 with the error on stderr and never runs the timer on host node 24.15, and exits 0 printing `end` in the container. QuickJS builds an async function's result with the intrinsic `%Promise%` and not through the global binding: with `globalThis.Promise` replaced by a subclass, bare QuickJS 0.32 reports `p instanceof Tracked` false, `Object.getPrototypeOf(p) === %Promise%.prototype` true, and 0 constructor calls and 0 `Symbol.species` gets, so the rejection tracker that covers promises built through the container's own `Promise` has no cell for this one; reaching it needs `JS_SetHostPromiseRejectionTracker` or a job-enqueue hook, and quickjs-emscripten 0.32.0 exports neither.
+
+## The `lean-net-negative` walk gate (measured, not waived)
+
+- `owc-lean-net-gate` (open): exactly one edge carries a lean gate, `G_NET -> NODELETE` at `.gm/config-source-cache-default/fsm/graph.json:1486-1493` with gates `["lean-net-negative"]`, and measured live at HEAD `0cc7ab2` a `transition` to `NODELETE` is refused `gate_denied` / `lean-net-negative` -- "the working change adds more lines than it removes" -- against a working tree of 232 files changed, `+5512 / -1481`, net `+4031`, which is other lanes' in-flight feature work (`crypto.ts +1140`, `builtins.ts +876`, `globals.ts +583`, `misc.ts +410`, `stream.ts +283`, `undici.ts +101`) and not superseded code. The predicate is compiled, `.gm/config-source-cache-default/fsm/predicates.md:31`, and reads no growth reason, so nothing in this repository can waive it; it is satisfied by a clean working tree instead, where added and removed lines are both 0, so the route is to publish before taking the edge, and the shared-tree publish -- a temporary `GIT_INDEX_FILE` built on `origin/main`, pushed by sha -- reaches that without touching another lane's staged paths. No graph was vendored and no override was taken, because re-scoping a compiled predicate is a one-way door.
+- `owc-sr-blocker-nodelete` (retired, stale): the edge it names, `NODELETE -> COHESION`, carries `"gates": []` at `.gm/config-source-cache-default/fsm/graph.json:3023-3032`; the lean gate is on `G_NET -> NODELETE`, and the diff the row cites, 13 files at `+733 / -298`, has been committed and pushed. The fact that survives -- the predicate counts net lines and reads no growth reason -- is carried by the open row above.
+- `owc-wc-lean-sweep` (retired, stale): no removal of superseded code can bring a shared worktree that every lane writes to down to net zero or negative, and the files holding the `+4031` are `packages/core/src/**`, owned by shards this one must not edit, so the row's own fallback applies and its residual is the open row above.

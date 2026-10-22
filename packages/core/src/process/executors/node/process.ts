@@ -2714,6 +2714,9 @@ export class NodeProcess extends Process {
             if (moduleName.startsWith(ERROR_MODULE_PREFIX)) {
                 return { value: errorModuleSource(moduleName) };
             }
+            if (moduleName.startsWith(WASM_MODULE_PREFIX)) {
+                return this.wasmModule(moduleName.slice(WASM_MODULE_PREFIX.length));
+            }
             if (isDataUrl(moduleName)) return this.dataModule(moduleName);
             /* A module name may carry the query and fragment of the specifier that named it, which
                are part of the module's identity but not of the file it is loaded from. */
@@ -2738,14 +2741,17 @@ export class NodeProcess extends Process {
      * source that compiles reaches the engine unchanged.
      */
     private esmSource(source: string, file: string, isMain: boolean, urlSuffix = ''): string {
-        const duplicate = duplicateModuleBinding(source);
+        /* Node 24 strips the types out of a `.ts`, `.mts` or `.cts` file before it compiles what
+           is left, and so does this: see stripTsTypes. */
+        const text = TS_EXTENSION.test(file) ? stripTsTypes(source) : source;
+        const duplicate = duplicateModuleBinding(text);
         if (duplicate !== undefined) {
             throw new GuestFailure(esmCompileFailureText(
-                source, file, duplicate.line, duplicate.column,
+                text, file, duplicate.line, duplicate.column,
                 `Identifier '${duplicate.name}' has already been declared`, isMain
             ), true);
         }
-        const prepared = prepareEsmSource(source, file, isMain, urlSuffix, (spec) => {
+        const prepared = prepareEsmSource(text, file, isMain, urlSuffix, (spec) => {
             const found = this.resolver.resolve(spec, dirnameOf(file), 'import');
             return found === undefined ? undefined : isDataUrl(found) ? found : toFileUrl(found);
         });
@@ -2817,6 +2823,10 @@ export class NodeProcess extends Process {
         const detail = resolved.kind === 'unknown-extension' && resolved.file === this.requireFile
             ? { kind: 'file' as const, file: resolved.file }
             : resolved;
+        /* A `.wasm` name is a module format of its own -- node compiles the bytes -- and not an
+           extension no loader knows, so it leaves the resolver's answer here with a name the
+           loader reads those bytes behind. */
+        if (detail.kind === 'unknown-extension' && detail.ext === '.wasm') return WASM_MODULE_PREFIX + detail.file;
         if (detail.kind !== 'file') {
             if (detail.kind === 'unknown-extension') {
                 return ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
@@ -2895,6 +2905,42 @@ export class NodeProcess extends Process {
            two halves can be told apart again in loadModule even when the file's own name holds a
            '?', a '#' or a '%'. */
         return escapePathChars(found) + urlSuffixOf(spec);
+    }
+
+    /**
+     * A `.wasm` module: the bytes are compiled as WebAssembly and every export the module declares
+     * becomes a named export of the ES module, which is what node hands an importer. Bytes that
+     * are not a wasm module at all are the CompileError node gives -- the magic word it expected
+     * and the four bytes it found there instead -- and not the ERR_UNKNOWN_FILE_EXTENSION an
+     * extension no loader knows would give.
+     */
+    private wasmModule(file: string): { value: string } {
+        const compileError = (message: string): string => errorModuleSource(
+            ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({ ctor: 'CompileError', message }))
+        );
+        const bytes = this.fileSystem.readBytes(file);
+        if (bytes === undefined) return { value: compileError(`${file}: could not be read`) };
+        const found = Array.from(bytes.slice(0, 4)).map((b) => b.toString(16).padStart(2, '0')).join(' ');
+        if (bytes.length < 4 || found !== '00 61 73 6d') {
+            return { value: compileError(`${file}: WebAssembly.Module(): expected magic word 00 61 73 6d, found ${found} @+0`) };
+        }
+        let names: string[] = [];
+        try {
+            names = WebAssembly.Module.exports(new WebAssembly.Module(bytes as BufferSource)).map((e) => e.name);
+        } catch (error) {
+            return { value: compileError(`${file}: ${error instanceof Error ? error.message : String(error)}`) };
+        }
+        /* The bytes reach the guest as base64, which is what a bundle of guest source can carry;
+           an export whose name is not an identifier is still reachable, off the instance. */
+        const body = Buffer.from(bytes).toString('base64');
+        let source = `const __owc_wasm = new WebAssembly.Instance(new WebAssembly.Module(Buffer.from(${JSON.stringify(body)}, 'base64'))).exports;\n`;
+        source += `export default __owc_wasm;\n`;
+        for (const name of names) {
+            if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) && !RESERVED_WORDS.has(name)) {
+                source += `export const ${name} = __owc_wasm[${JSON.stringify(name)}];\n`;
+            }
+        }
+        return { value: source };
     }
 
     /**
@@ -3093,6 +3139,8 @@ export class NodeProcess extends Process {
 const MISSING_ATTRIBUTE_MARK = '\u0001owc-attr-missing';
 /** Module-name prefix of a synthetic module whose evaluation throws a recorded error. */
 const ERROR_MODULE_PREFIX = 'owc-error:';
+/** Marks a module that is a WebAssembly module: everything after the mark is the file it reads. */
+const WASM_MODULE_PREFIX = 'owc-wasm:';
 /**
  * get, set or async followed by a semicolon or a comment: a cheap superset of the class elements the
  * guest's compatibility rewrite quotes, so its slower scan runs only on sources that may hold one.
@@ -3700,6 +3748,242 @@ function esmCompileFailureText(
         `${esmCompileFrames(isMain)}\n\nNode.js ${NODE_VERSION}`;
 }
 
+/** The three extensions Node strips types out of before it compiles the file. */
+const TS_EXTENSION = /\.[cm]?ts$/;
+
+/**
+ * The types of a TypeScript file, erased the way Node's own stripping erases them: an annotation
+ * behind a binding, a parameter or a return type is cut, an `interface` or `type` declaration is
+ * cut whole, an `import type` is cut with its statement, and an `as` or `satisfies` cast is cut
+ * with the type behind it. Nothing else is touched -- no `enum`, no `namespace`, no parameter
+ * property -- because Node refuses those rather than rewriting them, and the parse of what is
+ * left fails here in the same words it fails there.
+ *
+ * The cuts are made on the token stream and not on the text: a `:` is only an annotation when the
+ * token behind it is a binding and the brackets around it say where a binding can stand, so the
+ * `:` of a ternary, of a labelled statement, of an object literal and of a `case` are all left
+ * where they are.
+ */
+function stripTsTypes(source: string): string {
+    const tokens = tokenizeJs(source);
+    const edits: SourceEdit[] = [];
+    const stack: Array<{ open: string; at: number; specifier: boolean; classBody: boolean; params: boolean }> = [];
+    let lastParams = false;
+    let declLimit = -1;
+    /* A `class` opens its body with the `{` behind its name, so the brace that follows a class
+       name -- and not the one that follows a block or an object -- is the one marked. */
+    let classAhead = false;
+
+    /** The first token of the code behind a type that starts at `k`. */
+    function typeEnd(k: number): number {
+        let depth = 0;
+        /* A type that opened a bracket of its own -- a function type, a tuple, an object type --
+           owns the `=>` and the `>` behind it, so those do not end it; the bracket that closes
+           the group the annotation stands in does. */
+        let opened = false;
+        for (let j = k; j < tokens.length; j++) {
+            const tok = tokens[j]!;
+            if (tok.t === 'punc') {
+                if (tok.v === '<' || tok.v === '(' || tok.v === '[' || tok.v === '{') { depth++; opened = true; }
+                else if (tok.v === '>' || tok.v === ')' || tok.v === ']' || tok.v === '}') {
+                    if (depth === 0) return j;
+                    depth--;
+                } else if (depth === 0 && (tok.v === ',' || tok.v === ';' || tok.v === '='
+                    || (tok.v === '=>' && !opened))) return j;
+                /* A `{` that is not the type's own first token is the body of the function whose
+                   return type this is, and so no part of the type. */
+                if (depth === 1 && tok.v === '{' && j > k) return j;
+            }
+            if (depth === 0 && tok.nl) return j;
+        }
+        return tokens.length;
+    }
+
+    /** Where the binding of a `const`, `let` or `var` ends: its `=`, its `,` or its `;` at depth
+        0 -- a `:` after that is not an annotation but the `:` of a ternary, of an object literal
+        or of a `case`, and is left alone. */
+    function declEnd(k: number): number {
+        let depth = 0;
+        for (let j = k; j < tokens.length; j++) {
+            const tok = tokens[j]!;
+            if (tok.t === 'punc') {
+                if (tok.v === '(' || tok.v === '[' || tok.v === '{') depth++;
+                else if (tok.v === ')' || tok.v === ']' || tok.v === '}') {
+                    if (depth === 0) return j;
+                    depth--;
+                } else if (depth === 0 && (tok.v === '=' || tok.v === ';' || tok.v === ',')) return j;
+            }
+            if (depth === 0 && tok.nl) return j;
+        }
+        return tokens.length;
+    }
+
+    /** Where the statement holding `k` ends: its `;` at depth 0, or the line it ends on. */
+    function statementEnd(k: number): number {
+        let depth = 0;
+        for (let j = k; j < tokens.length; j++) {
+            const tok = tokens[j]!;
+            if (tok.t === 'punc') {
+                if (tok.v === '(' || tok.v === '[' || tok.v === '{') depth++;
+                else if (tok.v === ')' || tok.v === ']' || tok.v === '}') {
+                    if (depth === 0) return j;
+                    depth--;
+                } else if (tok.v === ';' && depth === 0) return j;
+            }
+            if (depth === 0 && tok.nl) return j;
+        }
+        return tokens.length;
+    }
+
+    /** The token a cut stops in front of: a token that begins a line keeps its own line. */
+    function stopAt(index: number): number {
+        const tok = tokens[index];
+        if (tok === undefined) return source.length;
+        return tok.nl ? tok.s : tok.s;
+    }
+
+    for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!;
+        const prev = tokens[i - 1];
+        const next = tokens[i + 1];
+        const top = stack[stack.length - 1];
+        if (tok.t === 'punc') {
+            if (tok.v === '(' || tok.v === '[' || tok.v === '{') {
+                let params = false;
+                const openingClass = classAhead;
+                classAhead = false;
+                if (tok.v === '(') {
+                    /* A parameter list, and not a call: its `)` is followed by a body, by a return
+                       type or by `=>`, or it is the one `function` opens. */
+                    const close = matchingClose(tokens, i);
+                    const after = close > 0 ? tokens[close + 1] : undefined;
+                    params = close > 0 && (isPunc(after, '{') || isPunc(after, ':') || isPunc(after, '=>')
+                        || (isPunc(after, '=') && isPunc(tokens[close + 2], '>'))
+                        || isId(tokens[i - 1], 'function') || isId(tokens[i - 2], 'function'));
+                }
+                stack.push({
+                    open: tok.v,
+                    at: i,
+                    specifier: tok.v === '{' && (isId(prev, 'import') || isId(prev, 'export')),
+                    classBody: tok.v === '{' && openingClass,
+                    params
+                });
+                continue;
+            }
+            if (tok.v === ')' || tok.v === ']' || tok.v === '}') {
+                const gone = stack.pop();
+                lastParams = gone !== undefined && gone.params;
+                continue;
+            }
+            if (tok.v !== ':' || top === undefined && prev === undefined) continue;
+            if (top !== undefined && top.specifier) continue;
+            if (prev === undefined) continue;
+            const behind = prev.t === 'id' || isPunc(prev, ')') || isPunc(prev, ']') || isPunc(prev, '}') || prev.v === '...';
+            if (!behind) continue;
+            const inParams = (top !== undefined && top.open === '(' && top.params)
+                || (isPunc(prev, ')') && lastParams)
+                || (top !== undefined && top.classBody)
+                || i < declLimit;
+            if (!inParams) continue;
+            const end = typeEnd(i + 1);
+            edits.push({ start: tok.s, end: stopAt(end), text: '' });
+            i = end - 1;
+            continue;
+        }
+        if (tok.t !== 'id' || (top !== undefined && top.specifier && tok.v !== 'type')) continue;
+        const atStatement = prev === undefined || isPunc(prev, ';') || isPunc(prev, '}') || isId(prev, 'export') || tok.nl;
+        /* `export interface` and `export type` declare nothing at run time either, so the
+           `export` they stand behind goes with them. */
+        const from = isId(prev, 'export') ? prev.s : tok.s;
+        if (tok.v === 'interface' && atStatement) {
+            let brace = -1;
+            for (let j = i + 1; j < tokens.length; j++) {
+                if (isPunc(tokens[j], '{')) { brace = j; break; }
+                if (isPunc(tokens[j], ';') || tokens[j]!.nl) break;
+            }
+            if (brace > 0) {
+                const close = matchingClose(tokens, brace);
+                const last = close > 0 ? close : brace;
+                edits.push({ start: from, end: tokens[last]!.e, text: '' });
+                i = last;
+                continue;
+            }
+        }
+        if (tok.v === 'type' && atStatement && next !== undefined && next.t === 'id'
+            && (isPunc(tokens[i + 2], '=') || isPunc(tokens[i + 2], '<'))) {
+            const end = statementEnd(i + 1);
+            edits.push({ start: from, end: stopAt(end), text: '' });
+            i = end - 1;
+            continue;
+        }
+        /* `import type { A } from './a'` imports nothing, so the whole statement goes. */
+        if (tok.v === 'import' && isId(next, 'type')) {
+            const end = statementEnd(i + 1);
+            edits.push({ start: tok.s, end: tokens[end] !== undefined && !tokens[end]!.nl ? tokens[end]!.e : stopAt(end), text: '' });
+            i = end;
+            continue;
+        }
+        /* `import { type A, b }` keeps b and drops the type beside it. */
+        if (tok.v === 'type' && top !== undefined && top.specifier && next !== undefined && next.t === 'id') {
+            const comma = isPunc(tokens[i + 2], ',');
+            edits.push({ start: tok.s, end: comma ? tokens[i + 2]!.e : next.e, text: '' });
+            i = comma ? i + 2 : i + 1;
+            continue;
+        }
+        if ((tok.v === 'as' || tok.v === 'satisfies') && prev !== undefined) {
+            const end = typeEnd(i + 1);
+            edits.push({ start: prev.e, end: stopAt(end), text: '' });
+            i = end - 1;
+            continue;
+        }
+        /* `private`, `protected`, `public`, `readonly`, `abstract`, `declare` and `override` are
+           type-only words in front of a member or a declaration, and a member they stand in front
+           of is the member the file declares. */
+        if ((tok.v === 'private' || tok.v === 'protected' || tok.v === 'public' || tok.v === 'readonly'
+            || tok.v === 'abstract' || tok.v === 'declare' || tok.v === 'override')
+            && next !== undefined && (next.t === 'id' || isPunc(next, '['))) {
+            edits.push({ start: tok.s, end: next.s, text: '' });
+            continue;
+        }
+        /* The type parameters of a function or a class: `function f<T>(x: T)`. Only the ones a
+           `function` or a `class` opens are cut, and never a `<` in an expression. */
+        if (tok.v === 'class') classAhead = true;
+        if (tok.v === 'function' || tok.v === 'class') {
+            let at = i + 1;
+            if (tokens[at] !== undefined && tokens[at]!.t === 'id') at++;
+            if (isPunc(tokens[at], '<')) {
+                let depth = 0;
+                for (let j = at; j < tokens.length; j++) {
+                    const t = tokens[j]!;
+                    if (t.t === 'punc' && t.v === '<') depth++;
+                    else if (t.t === 'punc' && t.v === '>') {
+                        depth--;
+                        if (depth === 0) {
+                            edits.push({ start: tokens[at]!.s, end: t.e, text: '' });
+                            break;
+                        }
+                    } else if (t.t === 'punc' && (t.v === '(' || t.v === '{')) break;
+                }
+            }
+        }
+        if ((tok.v === 'const' || tok.v === 'let' || tok.v === 'var') && atStatement) {
+            declLimit = declEnd(i + 1);
+            continue;
+        }
+    }
+
+    edits.sort((a, b) => a.start - b.start || a.end - b.end);
+    let out = '';
+    let cursor = 0;
+    for (const edit of edits) {
+        if (edit.start < cursor) continue;
+        out += source.slice(cursor, edit.start) + edit.text;
+        cursor = edit.end;
+    }
+    out += source.slice(cursor);
+    return out;
+}
+
 /**
  * The SyntaxError Node gives for a module that binds one name twice at its top level, as the name
  * it binds again and where in the source that name stands; undefined when no name is bound twice.
@@ -3774,12 +4058,32 @@ function duplicateModuleBinding(source: string): { name: string; line: number; c
 }
 
 /** The module source for a recorded error: evaluating it throws the error with its Node code. */
+/**
+ * An error under a name this engine has no constructor for -- QuickJS has no `CompileError` -- as
+ * an Error whose prototype carries that name, so `err.name`, `err.constructor.name` and
+ * `String(err)` all read the way they do for the real one, and `instanceof Error` still holds.
+ */
+function namedErrorSource(ctorName: string, message: string): string {
+    return '(function () {\n' +
+        '  function ' + ctorName + ' (m) {\n' +
+        '    var err = new Error(m);\n' +
+        '    Object.setPrototypeOf(err, ' + ctorName + '.prototype);\n' +
+        '    return err;\n' +
+        '  }\n' +
+        '  ' + ctorName + '.prototype = Object.create(Error.prototype);\n' +
+        "  Object.defineProperty(" + ctorName + ".prototype, 'constructor', { value: " + ctorName + ', writable: true, configurable: true });\n' +
+        '  ' + ctorName + '.prototype.name = ' + JSON.stringify(ctorName) + ';\n' +
+        '  return new ' + ctorName + '(' + JSON.stringify(message) + ');\n' +
+        '})()';
+}
+
 function errorModuleSource(name: string): string {
     const info = JSON.parse(decodeURIComponent(name.slice(ERROR_MODULE_PREFIX.length))) as { code: string; message: string; ctor?: string; exports?: string[] };
     /* The constructor Node builds the error with, which user code reads as `err.name`: most loader
        errors are TypeErrors, but an unknown module format is a RangeError and a path a URL cannot
        decode is a URIError, and neither is recoverable from a plain Error. */
-    const ctorName = info.ctor === 'TypeError' || info.ctor === 'RangeError' || info.ctor === 'URIError' ? info.ctor : 'Error';
+    const ctorName = info.ctor === 'TypeError' || info.ctor === 'RangeError' || info.ctor === 'URIError'
+        || info.ctor === 'CompileError' ? info.ctor : 'Error';
     // the default export, and every name the importing declaration binds, exist so that a static
     // import links; evaluation of the module then throws, which is where Node raises these errors
     let source = 'export default undefined;\n';
@@ -3788,7 +4092,13 @@ function errorModuleSource(name: string): string {
             source += `export const ${key} = undefined;\n`;
         }
     }
-    return source + `throw Object.assign(new ${ctorName}(${JSON.stringify(info.message)}), { code: ${JSON.stringify(info.code)} });\n`;
+    /* An engine with no constructor of that name -- QuickJS has no CompileError -- still throws
+       something a caller reads as one: an Error carrying the name, which is what `err.name` is
+       read from here. */
+    const built = ctorName === 'Error' || ctorName === 'TypeError' || ctorName === 'RangeError' || ctorName === 'URIError'
+        ? `new ${ctorName}(${JSON.stringify(info.message)})`
+        : namedErrorSource(ctorName, info.message);
+    return source + `throw Object.assign(${built}, { code: ${JSON.stringify(info.code)} });\n`;
 }
 
 /** Whether a specifier is a `data:` URL: the scheme is read case-insensitively, as a URL's is. */
