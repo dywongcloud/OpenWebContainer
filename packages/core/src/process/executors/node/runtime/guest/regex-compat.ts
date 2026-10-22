@@ -5,13 +5,16 @@
  * rewritten. An ES module cannot be recompiled after it fails, so the host asks for its rewrite
  * through api.compatRewrite and uses it only when it changes the source and a test compile shows
  * the engine rejects the source as it is (esmSource in process.ts).
- * Two rewrites, each exact in meaning:
+ * Three rewrites, each exact in meaning:
  *  - a regex literal the engine rejects gets each identity hyphen escape replaced by the hex
  *    escape of the same character (QuickJS rejects backslash-minus inside a class under the u
  *    flag; a hex escape is an atom, never a range operator);
  *  - a class element named get, set or async and followed by a semicolon is written as the quoted
  *    name, declaring the same field (QuickJS parses the bare form as an accessor and fails with
- *    "invalid property name").
+ *    "invalid property name");
+ *  - a for-of whose iterable holds a yield gets that iterable hoisted into a const of its own,
+ *    because QuickJS 0.31 and 0.32 abort the compile with 'stack underflow' and the loop then
+ *    reads the value from the const (see rxForOfYields).
  * The scanner tracks strings, template literals, comments, regex literals (previous-token rule),
  * control headers, object literals and class bodies, so only real literals and class elements are
  * touched: a '/' is a regex where a value cannot continue and a division where one can.
@@ -107,8 +110,14 @@ function rxValuePosition(last) {
 }
 function rxScan(src) {
   var n = src.length, i = 0, st = { nl: false }, look = { nl: false };
-  var stack = [], regexes = [], names = [];
+  var stack = [], regexes = [], names = [], fors = [];
   var last = null, classHead = -1, classValue = false;
+  /* for the third rewrite: where the last identifier token began, what stood before it, and the
+     label (if any) that the most recent ':' closed. A label is recorded only when it is a statement
+     label: 'case x:' and 'default:' open a clause, and a statement cannot be inserted before them.
+     pendingLabelPrev is what stood before that label, which says whether the label is itself a bare
+     body: 'if (c) lbl: for (...)' has nowhere to put a declaration either side of the label. */
+  var lastIdStart = -1, lastIdPrev = null, pendingLabel = -1, pendingLabelPrev = null;
   while (i < n) {
     i = rxSkip(src, i, st);
     if (i >= n) break;
@@ -142,9 +151,14 @@ function rxScan(src) {
           if (semi < n && src.charCodeAt(semi) === 59) names.push({ s: i, e: j, text: '"' + word + '"' });
         }
       }
+      var prevTok = last;
       if (!afterDot && RX_REGEX_AFTER_WORD.hasOwnProperty(word)) last = { k: 'kw', v: word };
       else if (afterDot || RX_VALUE_WORD.hasOwnProperty(word)) last = { k: 'val', v: word };
       else last = { k: 'id', v: word };
+      if (last.k === 'id') { lastIdPrev = prevTok; lastIdStart = i; }
+      if (word === 'for' && !afterDot) {
+        fors.push({ s: i, pk: prevTok === null ? null : prevTok.k, pv: prevTok === null ? null : prevTok.v, ls: pendingLabel, lp: pendingLabelPrev });
+      }
       i = j;
       continue;
     }
@@ -251,10 +265,16 @@ function rxScan(src) {
       i += 2;
       continue;
     }
+    if (c === 58) {
+      var labelled = last !== null && last.k === 'id' && last.v !== 'default' &&
+        !(lastIdPrev !== null && lastIdPrev.k === 'kw' && lastIdPrev.v === 'case');
+      pendingLabel = labelled ? lastIdStart : -1;
+      pendingLabelPrev = labelled ? lastIdPrev : null;
+    }
     last = { k: 'p', v: String.fromCharCode(c) };
     i++;
   }
-  return { regexes: regexes, names: names };
+  return { regexes: regexes, names: names, fors: fors };
 }
 function rxCompiles(body, flags) {
   try { new RX_NATIVE_REGEXP(body, flags); return true; } catch (e) { return false; }
@@ -274,6 +294,189 @@ function rxFixBody(body) {
   }
   return out;
 }
+function rxSkipString(src, i, quote) {
+  var n = src.length, k = i + 1;
+  while (k < n) {
+    var c = src.charCodeAt(k);
+    if (c === 92) { k += src.charCodeAt(k + 1) === 13 && src.charCodeAt(k + 2) === 10 ? 3 : 2; continue; }
+    if (c === quote || rxIsNewline(c)) break;
+    k++;
+  }
+  return k < n && src.charCodeAt(k) === quote ? k + 1 : k;
+}
+/* A template literal is walked rather than skipped whole, so a yield inside a substitution is seen
+   and the substitution's own '}' is not taken for the '}' of an enclosing block: the braces of the
+   substitution and of any object literal in it balance, so '}' closes the innermost one. */
+function rxWalkTemplate(src, i, stop) {
+  var n = stop === undefined ? src.length : stop;
+  var td = 0, sawYield = false, k = i + 1;
+  while (k < n) {
+    var c = src.charCodeAt(k);
+    if (c === 92) { k += 2; continue; }
+    if (c === 96 && td === 0) { k++; break; }
+    if (c === 36 && src.charCodeAt(k + 1) === 123) { td++; k += 2; continue; }
+    if (c === 123) { td++; k++; continue; }
+    if (c === 125) { if (td > 0) td--; k++; continue; }
+    if (td > 0 && rxIsIdStart(c)) {
+      var j = k + 1;
+      while (j < n && rxIsIdPart(src.charCodeAt(j))) j++;
+      if (src.slice(k, j) === 'yield') sawYield = true;
+      k = j;
+      continue;
+    }
+    k++;
+  }
+  return { next: k, sawYield: sawYield };
+}
+/* Whether the slice holds a yield at all. Brackets do not decide it: one inside an array element, an
+   index, a group or an object literal of the iterable is still the generator's own, and one inside a
+   nested function body belongs to that function -- but hoisting that one is value- and order-neutral
+   as well, since the const only evaluates the same iterable in the same place, so any yield in the
+   iterable is reason enough to want the hoist. */
+function rxHasTopYield(src, s, e) {
+  var q = s;
+  while (q < e) {
+    q = rxSkip(src, q, { nl: false });
+    if (q >= e) break;
+    var c = src.charCodeAt(q);
+    if (c === 40 || c === 91 || c === 123 || c === 41 || c === 93 || c === 125) { q++; continue; }
+    if (c === 34 || c === 39) { q = rxSkipString(src, q, c); continue; }
+    if (c === 96) {
+      var w = rxWalkTemplate(src, q, e);
+      if (w.sawYield) return true;
+      q = w.next;
+      continue;
+    }
+    if (rxIsIdStart(c)) {
+      var j = q + 1;
+      while (j < e && rxIsIdPart(src.charCodeAt(j))) j++;
+      if (src.slice(q, j) === 'yield') return true;
+      q = j;
+      continue;
+    }
+    q++;
+  }
+  return false;
+}
+/* Where the statement that follows a control header runs out: at its ';', or at the '}' or ')'
+   that closes whatever it is standing in. Used only to brace a loop that needs a declaration of
+   its own and has nowhere to put one. A loop that owns a block body ends with that block: the
+   statements after it are siblings of the loop, not part of it, and must stay outside the brace. */
+function rxStatementEnd(src, s) {
+  var n = src.length, q = rxSkip(src, s, { nl: false });
+  if (q < n && src.charCodeAt(q) === 123) {
+    var d = 0, k = q;
+    while (k < n) {
+      k = rxSkip(src, k, { nl: false });
+      if (k >= n) break;
+      var b = src.charCodeAt(k);
+      if (b === 34 || b === 39) { k = rxSkipString(src, k, b); continue; }
+      if (b === 96) { k = rxWalkTemplate(src, k).next; continue; }
+      if (b === 123) { d++; k++; continue; }
+      if (b === 125) { k++; if (--d === 0) return k; continue; }
+      k++;
+    }
+    return n;
+  }
+  return rxStatementScan(src, q);
+}
+function rxStatementScan(src, s) {
+  var n = src.length, d = 0, q = s;
+  while (q < n) {
+    q = rxSkip(src, q, { nl: false });
+    if (q >= n) break;
+    var c = src.charCodeAt(q);
+    if (c === 40 || c === 91 || c === 123) { d++; q++; continue; }
+    if (c === 41 || c === 93 || c === 125) { if (d === 0) return q; d--; q++; continue; }
+    if (c === 59 && d === 0) return q + 1;
+    if (c === 34 || c === 39) { q = rxSkipString(src, q, c); continue; }
+    if (c === 96) { q = rxWalkTemplate(src, q).next; continue; }
+    q++;
+  }
+  return n;
+}
+/* QuickJS 0.31 and 0.32 raise 'stack underflow' while compiling 'for (const x of (yield e))' and
+   the same shape under 'for await', so the iterable is evaluated into a const of its own and the
+   loop reads it from there. The iterable of a for-of is evaluated once, before the first step of
+   the iterator, so hoisting it changes no value and no order. The const goes before the for only
+   where a statement may start (and before its label when the for carries one); anywhere else the
+   loop is left alone rather than rewritten into something that does not parse. */
+function rxForOfYields(src, fors) {
+  var out = [], seq = 0;
+  for (var f = 0; f < fors.length; f++) {
+    var t = fors[f];
+    var insertAt = t.s, brace = false;
+    if (t.pk === 'p' && t.pv === ':') {
+      /* after a ':' a statement may start: a label keeps the loop labelled only if the const goes
+         before the label, and a 'case' or 'default' clause takes the const where the loop stood */
+      if (t.ls >= 0) {
+        insertAt = t.ls;
+        /* the label may itself be the bare body of if, while, for, with, do or else, where no
+           declaration may stand before it either: there the label and its loop are braced together */
+        if (t.lp !== null && (t.lp.v === 'hdr' || t.lp.k === 'kw')) brace = true;
+      }
+    } else if (t.pk === null || (t.pk === 'p' && (t.pv === '{' || t.pv === '}' || t.pv === ';' || t.pv === 'obj}'))) {
+      /* a statement list: the const simply goes before the loop */
+    } else if (t.pv === 'hdr' || t.pk === 'kw') {
+      /* the bare body of if, while, for, with, do or else: no declaration can stand before the
+         loop there, so the loop and its declaration are braced together */
+      brace = true;
+    } else continue;
+    var n = src.length;
+    var p = rxSkip(src, t.s + 3, { nl: false });
+    if (src.slice(p, p + 5) === 'await') {
+      var an = p + 5;
+      if (an >= n || !rxIsIdPart(src.charCodeAt(an))) p = rxSkip(src, an, { nl: false });
+    }
+    if (p >= n || src.charCodeAt(p) !== 40) continue;
+    var depth = 1, ofAt = -1, closeAt = -1, semi = false, dotBefore = false, q = p + 1;
+    while (q < n) {
+      q = rxSkip(src, q, { nl: false });
+      if (q >= n) break;
+      var c = src.charCodeAt(q);
+      if (c === 40 || c === 91 || c === 123) { depth++; dotBefore = false; q++; continue; }
+      if (c === 41) {
+        depth--;
+        if (depth === 0) { closeAt = q; break; }
+        dotBefore = false;
+        q++;
+        continue;
+      }
+      if (c === 93 || c === 125) { depth--; dotBefore = false; q++; continue; }
+      if (c === 59 && depth === 1) semi = true;
+      if (c === 46) { dotBefore = true; q++; continue; }
+      if (c === 34 || c === 39) { q = rxSkipString(src, q, c); dotBefore = false; continue; }
+      if (c === 96) { q = rxWalkTemplate(src, q).next; dotBefore = false; continue; }
+      if (rxIsIdStart(c)) {
+        var j = q + 1;
+        while (j < n && rxIsIdPart(src.charCodeAt(j))) j++;
+        if (!dotBefore && depth === 1 && !semi && ofAt < 0 && src.slice(q, j) === 'of') ofAt = q;
+        dotBefore = false;
+        q = j;
+        continue;
+      }
+      if (c === 63 && src.charCodeAt(q + 1) === 46) { dotBefore = true; q += 2; continue; }
+      dotBefore = false;
+      q++;
+    }
+    if (ofAt < 0 || closeAt < 0) continue;
+    var iterS = rxSkip(src, ofAt + 2, { nl: false });
+    var iterE = closeAt;
+    while (iterE > iterS && rxIsSpace(src.charCodeAt(iterE - 1))) iterE--;
+    if (iterE <= iterS || !rxHasTopYield(src, iterS, iterE)) continue;
+    if (brace) {
+      var endAt = rxStatementEnd(src, closeAt + 1);
+      if (endAt <= closeAt + 1) continue;
+    }
+    var name = '';
+    do { seq++; name = '__owcOf' + seq; } while (src.indexOf(name) >= 0);
+    var declare = 'const ' + name + ' = ' + src.slice(iterS, iterE) + '; ';
+    out.push({ s: insertAt, e: insertAt, text: brace ? '{ ' + declare : declare });
+    out.push({ s: iterS, e: iterE, text: name });
+    if (brace) out.push({ s: endAt, e: endAt, text: ' }' });
+  }
+  return out;
+}
 function rxRewrite(src) {
   var scan = rxScan(src);
   var edits = [];
@@ -284,6 +487,8 @@ function rxRewrite(src) {
     if (fixed !== re.body && rxCompiles(fixed, re.flags)) edits.push({ s: re.s, e: re.e, text: '/' + fixed + '/' + re.flags });
   }
   for (var m = 0; m < scan.names.length; m++) edits.push(scan.names[m]);
+  var hoisted = rxForOfYields(src, scan.fors);
+  for (var h = 0; h < hoisted.length; h++) edits.push(hoisted[h]);
   if (edits.length === 0) return null;
   edits.sort(function (a, b) { return a.s - b.s; });
   var out = '', at = 0;

@@ -1,0 +1,7 @@
+id: owc-shell-ls-dir-size-nlink
+subject: ls -ld of a directory prints this file system's own link count and size, not the host's
+description: 'Measured 2026-10-23 (judge shard shell-fileutils, /tmp/owc-r4/judge-shellfu7). `mkdir -p d; touch d/a; ls -ld d` is `drwxr-xr-x  2 dylanwong wheel 2 <now> d` in the container and `drwxr-xr-x  3 dylanwong wheel 96 <now> d` on the host; an empty `mkdir -p d; ls -ld d` is `2 ... 2` here and `2 ... 64` there; `mkdir -p d/e; touch d/e/a; ls -ld d/e` is `2 ... 2` here and `3 ... 96` there. Two columns differ at once, and neither is about `chmod`: the same divergence appears with no `chmod` in the case at all. The container''s file system keeps no directory size and no link count for a directory, so every directory reports the same two numbers. Found while re-running the chmod -R differential, where it masked a chmod case that now matches; it is filed separately because fixing it needs the file system to synthesise both, not a change in fileutils.ts.'
+witness_plan: Run `mkdir -p d; touch d/a; ls -ld d` on both sides; the link count and the size column must match.
+session_id: adv2-judge-shell-fileutils-5
+owner: adv2-judge-shell-fileutils-5
+status: pending
