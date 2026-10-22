@@ -1,0 +1,51 @@
+=== HOST node v24.15.0: /tmp/owc-r4/judge-guest-errors-1/b/main.js
+B1-msg "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'o' closes the circle"
+B2-name "TypeError"
+B3-msg "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'self' closes the circle"
+B4-depth0 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth1 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth2 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth3 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth4 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     ...\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth5 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     ...\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth6 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     ...\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B5-replacer-built "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'a' closes the circle"
+B6-tojson-built "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'a' closes the circle"
+=== CONTAINER (packages/core HEAD + fix): /tmp/owc-r4/judge-guest-errors-1/b/main.js
+B1-msg "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'o' closes the circle"
+B2-name "TypeError"
+B3-msg "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'self' closes the circle"
+B4-depth0 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth1 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth2 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth3 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth4 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     ...\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth5 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     ...\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B4-depth6 "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     property 'next' -> object with constructor 'Object'\n    |     ...\n    |     property 'next' -> object with constructor 'Object'\n    --- property 'back' closes the circle"
+B5-replacer-built "circular reference"
+B6-tojson-built "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'a' closes the circle"
+=== HOST: /tmp/owc-r4/judge-guest-errors-1/h/main.js
+H1-plain "{\"a\":1,\"b\":[1,2]}"
+H2-spaces "{\n  \"a\": 1\n}"
+H3-tojson "{\"d\":\"1970-01-01T00:00:00.000Z\"}"
+H4-undefined undefined
+H5-bigint "TypeError: Do not know how to serialize a BigInt"
+H6-response "TypeError: Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'c' closes the circle"
+H7-throwing-tojson "Error: x"
+H8-array-cycle "Converting circular structure to JSON\n    --> starting at object with constructor 'Array'\n    --- index 0 closes the circle"
+H9-two-step "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'inner' -> object with constructor 'Object'\n    --- property 'up' closes the circle"
+H10-getter-throws "Error: nope"
+=== CONTAINER: /tmp/owc-r4/judge-guest-errors-1/h/main.js
+---- program output ----
+H1-plain "{\"a\":1,\"b\":[1,2]}"
+H2-spaces "{\n  \"a\": 1\n}"
+H3-tojson "{\"d\":\"1970-01-01T00:00:00.000Z\"}"
+H4-undefined undefined
+H5-bigint "TypeError: Do not know how to serialize a BigInt"
+H6-response "TypeError: Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    --- property 'c' closes the circle"
+H7-throwing-tojson "Error: x"
+H8-array-cycle "Converting circular structure to JSON\n    --> starting at object with constructor 'Array'\n    --- index 0 closes the circle"
+H9-two-step "Converting circular structure to JSON\n    --> starting at object with constructor 'Object'\n    |     property 'inner' -> object with constructor 'Object'\n    --- property 'up' closes the circle"
+H10-getter-throws "Error: nope"
+---- program stderr ----
+[owc exit 0]
