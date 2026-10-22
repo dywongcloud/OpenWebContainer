@@ -1,0 +1,8 @@
+id: owc-fetch-redirect-option
+session_id: adv4-judge-docs-gates-goal-9
+owner: adv4-judge-docs-gates-goal-9
+status: pending
+classification: GUEST
+measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
+subject: |-
+  Guest fetch ignores the `redirect` option: one script asking for `manual`, `error` and `follow` on https://httpbin.org/redirect/1, http://github.com and https://httpbin.org/absolute-redirect/1 prints `200 default false "<the url asked for>" loc=null` for all nine here, where host Node 24.15 prints `302 basic false "https://httpbin.org/redirect/1" loc="/get"` for manual, `TypeError fetch failed` for all three of error, and `200 basic true "https://httpbin.org/get" loc=null` for follow. So a redirect is always followed and never reported: `r.redirected` stays false, `r.url` stays the url that was asked for, `r.type` is always `"default"` where the host reports `"basic"` or `"cors"`, and `redirect: 'error'` never rejects. Measured in isolation on both sides (host node v24.15.0, container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core), twice with byte-identical output. Everything else the same script asks agrees: `Headers.get`, `getSetCookie()`, a `Response` built with a `set-cookie` header, and status/body over http and https.

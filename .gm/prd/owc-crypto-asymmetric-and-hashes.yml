@@ -1,0 +1,8 @@
+id: owc-crypto-asymmetric-and-hashes
+session_id: adv4-judge-docs-gates-goal-9
+owner: adv4-judge-docs-gates-goal-9
+status: pending
+classification: GUEST
+measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
+subject: |-
+  The crypto surface behind createHash/createHmac/pbkdf2 stops short of everything asymmetric: `crypto.scrypt` is `ERR not a function` here where host Node 24.15 returns a key (`c0b515908e61334cae6d6003c00be60e`), `crypto.createDiffieHellman` is `undefined` where the host has `function`, `crypto.generateKeyPairSync('ed25519')` raises `ERR not a function` where the host returns a key pair, and `crypto.createSign` raises `ERR not a function` where the host returns an object. createHash, createHmac, pbkdf2, randomBytes and randomUUID are byte-identical to the host on the same script. `getHashes()` returns 6 names where the host returns 52: sha3-256, blake2b512, shake256, sm3 and ripemd160 are all absent (md5, sha1, sha256, sha512 present). `getCiphers()` returns 16 where the host returns 130, and the gap shows in the code a caller sees: a cipher the host knows and this does not raises ERR_CRYPTO_UNKNOWN_CIPHER here where the host names the real fault -- ERR_CRYPTO_INVALID_KEYLEN for camellia/sm4/aria/cfb1/cfb8/ofb, ERR_CRYPTO_INVALID_IV for des-ede/des-ede3/aes-128-ccm/ocb/wrap, ERR_OSSL_XTS_DUPLICATED_KEYS for aes-128-xts, and bare `chacha20` works on the host and is unknown here.

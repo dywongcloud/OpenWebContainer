@@ -472,7 +472,16 @@ function headerEntries(list) {
   }
   names.sort();
   var out = [];
-  for (var j = 0; j < names.length; j++) out.push([names[j], byName[names[j]].join(', ')]);
+  for (var j = 0; j < names.length; j++) {
+    /* set-cookie is the one name a Headers iterates more than once, which is the whole reason
+       getSetCookie exists: a host yields each cookie as its own entry and only get() joins them
+       into the one ', '-separated value a header field carries. */
+    if (names[j] === 'set-cookie' && byName[names[j]].length > 1) {
+      for (var k = 0; k < byName[names[j]].length; k++) out.push([names[j], byName[names[j]][k]]);
+      continue;
+    }
+    out.push([names[j], byName[names[j]].join(', ')]);
+  }
   return out;
 }
 /* The symbol Node hands a class that writes its own inspect output, and the shape it writes: the

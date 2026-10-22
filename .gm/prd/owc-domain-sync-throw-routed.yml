@@ -1,0 +1,8 @@
+id: owc-domain-sync-throw-routed
+session_id: adv4-judge-docs-gates-goal-9
+owner: adv4-judge-docs-gates-goal-9
+status: pending
+classification: GUEST
+measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
+subject: |-
+  A synchronous throw inside `d.run(() => { throw new Error('sync-throw'); })` is routed to the domain's error handler here -- `HANDLED sync-throw`, `run()` returns normally and the domain's log gains the entry -- where host Node 24.15 propagates it out of `run()` (the caller catches `sync-thrown sync-throw` and the log holds only the async and timer entries). The binding Node does have is right on both: a Promise reaction registered inside `run()` and a timer set inside `run()` both see `domain.active === d` and both have their throw routed to the handler. `domain.create`, `d.enter()`/`d.exit()` and `domain.active` outside a domain agree.

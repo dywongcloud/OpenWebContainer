@@ -51,7 +51,26 @@ proc.arch = 'x64';
 proc.platform = 'linux';
 proc.release = { name: 'node' };
 Object.defineProperty(proc, Symbol.toStringTag, { value: 'process', configurable: true });
-proc.features = {};
+/*
+ * The flags node 24.15 reports in process.features that this container can answer for itself: an
+ * inspector that answers Runtime.evaluate, a tls module that does SNI and ALPN, a loopback that has
+ * an IPv6 address, a loader that requires an ES module, and an engine that is not BoringSSL and is
+ * not built with --debug. What node answers and this container cannot is left out rather than
+ * claimed: tls_ocsp (the tls module has no OCSP stapling) and typescript (a .ts file is not
+ * stripped of its types here).
+ */
+proc.features = {
+  inspector: true,
+  debug: false,
+  uv: true,
+  ipv6: true,
+  tls_alpn: true,
+  tls_sni: true,
+  tls: true,
+  cached_builtins: true,
+  openssl_is_boringssl: false,
+  require_module: true
+};
 /*
  * The flags node 24.15 accepts in NODE_OPTIONS, as the Set process.allowedNodeEnvironmentFlags is:
  * a package asks has() of it before it puts a flag in the options it spawns with, and an
@@ -858,16 +877,44 @@ function makeCallSite(text) {
 }
 
 if (!Error.captureStackTrace) {
-  Error.captureStackTrace = function (target) {
+  Error.captureStackTrace = function (target, constructorOpt) {
     if (!target || typeof target !== 'object') return;
+    /* A prepareStackTrace of the caller's must not decide what this call captures: the frames are
+       read through one of ours that hands the engine's text straight back, so a prepareStackTrace
+       that keeps the raw array -- the form depd and every package over it reads -- is still given
+       every frame the host would give it, and not the one comma-joined line String() made of it. */
+    var keepPrepare = Error.prepareStackTrace;
+    Error.prepareStackTrace = function (err, sites) {
+      var out = [];
+      for (var i = 0; i < sites.length; i++) out.push('    at ' + sites[i]);
+      return out.join('\n');
+    };
     var lines = String(new Error('').stack || '').split('\n');
+    Error.prepareStackTrace = keepPrepare;
     /* What the engine hands back opens with the line naming the error once the constructors below
-       are in place, and with a frame when it is not; either way the line that follows is this call,
-       which is not a frame of the caller's and is dropped with it. */
+       are in place, and with a frame when it is not. */
     if (lines.length > 0 && lines[0].indexOf('    at ') !== 0) lines = lines.slice(1);
-    var frames = guestFramesOf(lines.slice(1));
-    if (typeof Error.prepareStackTrace === 'function') {
-      target.stack = Error.prepareStackTrace(target, frames.map(makeCallSite));
+    /* The frame of this call is one of the container's own, and the engine has taken it out on the
+       way in more often than not; it is dropped again only where it is still there, because a frame
+       dropped here is a frame of the caller's lost, which is what left a captured trace one short. */
+    var frames = guestFramesOf(lines);
+    while (frames.length > 0 && (isBootstrapFrame(frames[0]) || frames[0].indexOf('captureStackTrace') >= 0)) {
+      frames = frames.slice(1);
+    }
+    /* The constructor the host is asked to stop at: everything from the topmost frame of that
+       constructor down is the caller's own, so it and what is above it are dropped, the way
+       http-errors and every package that hands its own constructor here expects. */
+    if (typeof constructorOpt === 'function' && constructorOpt.name) {
+      var own = constructorOpt.name;
+      for (var c = 0; c < frames.length; c++) {
+        if (frames[c].indexOf('at new ' + own + ' (') >= 0 || frames[c].indexOf('at ' + own + ' (') >= 0) {
+          frames = frames.slice(c + 1);
+          break;
+        }
+      }
+    }
+    if (typeof keepPrepare === 'function') {
+      target.stack = keepPrepare(target, frames.map(makeCallSite));
       return;
     }
     var header = String(target.name || 'Error') + (target.message ? ': ' + target.message : '');
