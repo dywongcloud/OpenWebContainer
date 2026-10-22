@@ -107,12 +107,13 @@ interface Meta {
     nlink: Map<number, number>;
     /** The file creation mask `umask` last set, which `mkdir` and `touch` mask a new mode with. */
     umask: number;
+    /** The directory the shell was started in: the tree its own account owns. */
+    home?: string;
     nextInode: number;
 }
 
 const DEFAULT_FILE_MODE = 0o644;
 const DEFAULT_DIR_MODE = 0o755;
-const DEFAULT_OWNER: Owner = { uid: 0, gid: 0 };
 /**
  * The file creation mask a shell starts with, which `umask` then moves for every file system it
  * touches. `chmod` needs it because a symbolic clause that names no who is limited by it: `chmod +w`
@@ -187,8 +188,58 @@ export function setMode(fs: object, path: string, mode: number): void {
     metaOf(fs as Fs).modes.set(clean(path), mode & 0o7777);
 }
 
-function ownerOf(fs: Fs, path: string): Owner {
-    return metaOf(fs).owners.get(clean(path)) ?? DEFAULT_OWNER;
+/**
+ * The id of the account the shell runs as, which is the number a host prints in the owner column of
+ * `ls -ln` for a name the shell itself made. Read once from the host process behind the container,
+ * the way `HOST_USER` reads that account's name, and left at root's where there is no such process.
+ */
+const HOST_UID: number = ((): number => {
+    const host = (globalThis as { process?: { getuid?: () => number } }).process;
+    return typeof host?.getuid === 'function' ? Number(host.getuid()) || 0 : 0;
+})();
+
+/**
+ * The owner of a name the shell made: the account it runs as, in the group the container's tree
+ * carries, which is the pair a host prints beside a name the shell made in it.
+ */
+const SHELL_OWNER: Owner = { uid: HOST_UID, gid: 0 };
+
+/**
+ * The owner of the container's own file system: the root that owns `/`, `/bin`, `/usr` and `/dev`,
+ * which is what a host prints for those four and for every name in the image it booted.
+ */
+const ROOT_OWNER: Owner = { uid: 0, gid: 0 };
+
+/** True when `path` is `dir` or something under it. */
+function withinDir(dir: string, path: string): boolean {
+    return path === dir || path.startsWith(dir === '/' ? '/' : dir + '/');
+}
+
+/**
+ * The owner of a path: the one `chown` set, or the one the tree the path stands in has.
+ *
+ * The container keeps no account database, so ownership is decided by where a path is. The tree the
+ * shell was started in -- the project a host bind-mounts into a container -- belongs to the account
+ * the shell runs as, and everything the file system was built with belongs to root, as it does on
+ * a host: `ls -ld /bin /usr /dev /` is `root wheel` there, while `touch f; ls -ln f` is the id of
+ * the account that logged in. A container that called every name in it its own printed one owner
+ * for both, and agreed with the host on neither.
+ */
+function ownerOf(fs: Fs, path: string, cwd?: string): Owner {
+    const meta = metaOf(fs);
+    const key = clean(path);
+    const recorded = meta.owners.get(key);
+    if (recorded !== undefined) return recorded;
+    /* A name one of this module's own utilities made is the shell user's wherever it stands:
+       `touch /tmp/x` is `dylanwong` on a host, though `/tmp` is not the tree the shell was
+       started in. */
+    if (meta.modes.has(key) || meta.links.has(key) || meta.atimes.has(key)) return SHELL_OWNER;
+    /* Recorded once, on the first owner a command asks for, which is before any `cd` a script
+       runs after it can move the directory out from under the answer. */
+    if (cwd !== undefined && meta.home === undefined) meta.home = clean(cwd);
+    const home = meta.home;
+    if (home === undefined) return SHELL_OWNER;
+    return withinDir(home, key) ? SHELL_OWNER : ROOT_OWNER;
 }
 
 function setOwner(fs: Fs, path: string, owner: Owner): void {
@@ -344,8 +395,13 @@ function exists(fs: Fs, path: string): boolean {
     }
 }
 
-/** The entries of a directory, sorted so that a walk is reproducible. */
-function dirEntries(fs: Fs, path: string): string[] {
+/**
+ * The entries of a directory in the order the file system holds them, which is the order the names
+ * were made in. `ls -f` -- which turns sorting off -- lists what a host's `readdir` returns, so
+ * `touch f; mkdir d; ln -s f l; ls -f` is `. .. f d l` there, and `f d l` is the order the three
+ * were made in here. Every other walk sorts, so a `find` is reproducible.
+ */
+function dirNames(fs: Fs, path: string): string[] {
     let names: string[] | undefined;
     try {
         names = fs.readdirNames(path);
@@ -364,7 +420,12 @@ function dirEntries(fs: Fs, path: string): string[] {
         const trimmed = name.replace(/\/+$/, '');
         if (trimmed !== '' && trimmed !== '.' && trimmed !== '..') out.push(trimmed);
     }
-    return out.sort(cmpStr);
+    return out;
+}
+
+/** The entries of a directory, sorted so that a walk is reproducible. */
+function dirEntries(fs: Fs, path: string): string[] {
+    return dirNames(fs, path).sort(cmpStr);
 }
 
 /**
@@ -3166,14 +3227,18 @@ const HOST_USER: string | undefined = ((): string | undefined => {
  * a host is the logged-in account and never `root`. The container keeps no accounts, so the name
  * comes from the host process behind it, or from its own environment where there is none, and
  * `root` is what is left where neither gives one -- the name this shell has always printed.
+ * The container's own tree answers `root` instead, as the host's own `/bin`, `/usr`, `/dev` and `/`
+ * do, which is the owner `ownerOf` gives a path that stands outside the shell's.
  *
  * The shell's own `USER` and `LOGNAME` are deliberately not consulted: a host reads the owner out
  * of the file system and never out of the environment, so `export USER=zzz; ls -l f` prints the
  * account that logged in and not `zzz`, and a container that echoed the variable back would differ
  * on a line the host cannot be moved on.
  */
-function ownerName(fs: Fs, path: string, env: Record<string, string>): string {
-    if (metaOf(fs).owners.has(clean(path))) return nameOfId(ownerOf(fs, path).uid, USER_NAMES);
+function ownerName(fs: Fs, path: string, env: Record<string, string>, cwd?: string): string {
+    const owner = ownerOf(fs, path, cwd);
+    if (metaOf(fs).owners.has(clean(path))) return nameOfId(owner.uid, USER_NAMES);
+    if (owner.uid === 0) return 'root';
     return HOST_USER ?? env.USER ?? env.LOGNAME ?? 'root';
 }
 
@@ -3188,7 +3253,7 @@ function statInfo(ctx: CommandContext, argument: string, dereference = false): S
     const link = isSymlink(ctx.fs, path);
     const type: 'file' | 'dir' | 'link' = link && !dereference ? 'link' : stat.type;
     const mode = modeOf(ctx.fs, subject, stat.type === 'dir');
-    const owner = ownerOf(ctx.fs, path);
+    const owner = ownerOf(ctx.fs, path, ctx.cwd);
     const typeBits = type === 'dir' ? 0o40000 : type === 'link' ? 0o120000 : 0o100000;
     return {
         name: argument,
@@ -3702,7 +3767,7 @@ const chown: ShellCommand = (ctx) => {
             for (const entry of walkRoot(ctx.fs, path, path, Number.MAX_SAFE_INTEGER).entries) targets.push(entry.path);
         }
         for (const target of targets) {
-            const owner = ownerOf(ctx.fs, target);
+            const owner = ownerOf(ctx.fs, target, ctx.cwd);
             setOwner(ctx.fs, target, { uid: uid ?? owner.uid, gid: gid ?? owner.gid });
         }
     }
@@ -4117,6 +4182,23 @@ function lsBlockCount(row: LsRow, blockSize: number): number {
     return Math.round(row.blocks * 512 / blockSize);
 }
 
+/**
+ * True when a directory above `path` withholds the right to search it, which is what a host's file
+ * system refuses on while it resolves the path: `chmod 644 d; ls -l d/a` is `ls: d/a: Permission
+ * denied` and status 1 there, because reaching `a` needs the execute bit of `d`. The container's
+ * file system resolves every path it holds, so the mode `chmod` set is asked for here instead --
+ * the same mode `cat` already asks for before it reads, one directory further out. The root is
+ * always searchable, and a directory this file system carries no mode for is taken as searchable.
+ */
+function unsearchable(fs: Fs, path: string): boolean {
+    let dir = parentOf(clean(path));
+    while (true) {
+        if (dir !== '/' && (modeOf(fs, dir, true) & 0o100) === 0) return true;
+        if (dir === '/') return false;
+        dir = parentOf(dir);
+    }
+}
+
 /** Which time `ls -l` prints: `-u` the access time, `-c` and `-U` what the host calls them. */
 type LsTime = 'mtime' | 'atime' | 'ctime' | 'birth';
 
@@ -4168,29 +4250,41 @@ interface LsRow {
 }
 
 /** One line of `ls -l`: the mode, owner and size the side table and the file system agree on. */
-function lsRow(fs: Fs, path: string, name: string, now: number, env: Record<string, string>): LsRow {
+function lsRow(
+    fs: Fs,
+    path: string,
+    name: string,
+    now: number,
+    env: Record<string, string>,
+    cwd?: string
+): LsRow {
     const stat = statOf(fs, path);
     const isLink = isSymlink(fs, path);
     const isDirectory = !isLink && stat !== undefined && stat.type === 'dir';
     const mode = modeOf(fs, path, isDirectory);
-    const owner = ownerOf(fs, path);
+    const owner = ownerOf(fs, path, cwd);
     const target = isLink ? linkTarget(fs, path) : undefined;
     const mtimeMs = stat === undefined ? now : stat.mtimeMs;
     /* A link reports the length of what it names, which is the target string it holds and not the
        content the container copied into it. */
-    const bytes = isLink
+    let bytes = isLink
         ? (target === undefined ? 0 : utf8Bytes(target).length)
         : stat === undefined ? 0 : stat.size;
     let links = linksOf(fs, path);
     if (isDirectory) {
-        links = 2;
-        for (const entry of dirEntries(fs, path)) if (isDir(fs, joinPath(path, entry))) links++;
+        /* The size and the link count the container's file system has no room to carry: a
+           directory on the host holds 64 bytes and two links of its own -- `.` and the one its
+           parent holds -- and every name in it adds 32 bytes and a link, so `mkdir d; touch d/a;
+           ls -ld d` is `3 ... 96` there and the same two numbers whatever a directory holds here. */
+        const entries = dirEntries(fs, path).length;
+        links = 2 + entries;
+        bytes = 64 + 32 * entries;
     }
     return {
         name,
         perms: permissionString(mode, isDirectory ? 'dir' : isLink ? 'link' : 'file'),
         links: String(links),
-        user: ownerName(fs, path, env),
+        user: ownerName(fs, path, env, cwd),
         group: nameOfId(owner.gid, GROUP_NAMES),
         uid: owner.uid,
         gid: owner.gid,
@@ -4387,7 +4481,9 @@ const ls: ShellCommand = (ctx) => {
 
     /** The names one directory lists, with `.` and `..` ahead of them under `-a` and never under `-A`. */
     const entriesOf = (path: string): string[] => {
-        const names = dirEntries(ctx.fs, path);
+        /* `-f` asks for the file system's own order, so the names are left as `readdir` gave them
+           instead of being sorted the way every other listing is. */
+        const names = o.noSort ? dirNames(ctx.fs, path) : dirEntries(ctx.fs, path);
         const shown = o.all || o.almostAll ? names : names.filter((name) => !name.startsWith('.'));
         const sorted = o.noSort ? shown : shown.slice().sort(cmp);
         return o.all ? ['.', '..'].concat(sorted) : sorted;
@@ -4395,7 +4491,7 @@ const ls: ShellCommand = (ctx) => {
     const rowsOf = (path: string, names: string[]): LsRow[] =>
         names.map((name) => {
             const child = name === '.' ? path : name === '..' ? parentOf(path) : joinPath(path, name);
-            return lsRow(ctx.fs, child, name, now, ctx.env);
+            return lsRow(ctx.fs, child, name, now, ctx.env, ctx.cwd);
         });
 
     const dirChunks: string[] = [];
@@ -4417,6 +4513,14 @@ const ls: ShellCommand = (ctx) => {
     let exitCode = 0;
     for (const target of targets) {
         const path = resolveAt(ctx, target);
+        /* A path is reached through every directory above it, and one of them without its search
+           bit stops the walk on a host: `chmod 644 d; ls -l d/a` is `ls: d/a: Permission denied`
+           and status 1 there, while this file system resolves every path it holds. */
+        if (unsearchable(ctx.fs, path)) {
+            errors.push(`ls: ${target}: Permission denied`);
+            exitCode = 1;
+            continue;
+        }
         const stat = statOf(ctx.fs, path);
         if (stat === undefined) {
             errors.push(`ls: ${target}: No such file or directory`);
@@ -4437,7 +4541,7 @@ const ls: ShellCommand = (ctx) => {
             walk(path, target, targets.length > 1);
             continue;
         }
-        files.push(lsRow(ctx.fs, path, target, now, ctx.env));
+        files.push(lsRow(ctx.fs, path, target, now, ctx.env, ctx.cwd));
     }
     /* One blank line between the groups, which is what separates two operands on the host. */
     const chunks: string[] = [];
