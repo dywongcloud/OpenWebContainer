@@ -1,7 +1,7 @@
 id: owc-fs-device-files-absent
-description: 'Measured 2026-10-22 (judge, shard guest-fs). `/dev` is now created at boot, but `/dev/null` and `/dev/urandom` are still ENOENT where a host has both as character devices: `fs.existsSync(''/dev/null'')` is false and only a write creates the name, as an ordinary file, so a read of it gives back what was written instead of end of file and `stat().isCharacterDevice()` is false. A device is a kernel object and this file system holds files and directories only, so it cannot be made honestly; shell redirection to `/dev/null` is already a sink that never touches the tree. Recorded.'
-owner: judge-guest-fs
-session_id: adv-judge-guest-fs-5
-subject: /dev/null and /dev/urandom are not there, so a guest that opens them gets ENOENT where a host gets a device
-witness_plan: Stat /dev/null in the container and on the host; both must exist, and a read of one must be empty on both.
+description: 'SUPERSEDED 2026-10-23 by a judge (shard guest) at HEAD f5d5931. cebc45f mounted /dev/null, /dev/zero, /dev/random and /dev/urandom: fs.existsSync(''/dev/null'') is true with mode 8630 (S_IFCHR | 0666), a read of /dev/null ends at once, /dev/zero gives eight zero bytes and /dev/urandom eight that are not, and `echo hi > /dev/null` leaves 0, as on a host. Their stat shape was still wrong and is now fixed under owc-guest-stat-character-device. What is left is the size of the set -- `ls /dev` lists four names against the host''s hundreds and /dev/tty is absent -- which is one line in Readme.md. See .gm/witness-out/owc-fs-device-files-absent.txt.'
+owner: judge-guest-6
+session_id: adv2-judge-guest-6
+subject: '/dev/null and /dev/urandom are not there, so a guest that opens them gets ENOENT where a host gets a device'
+witness_plan: 'Stat /dev/null in the container and on the host; both must exist, and a read of one must be empty on both.'
 status: pending

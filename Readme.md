@@ -323,29 +323,40 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   where the host writes `/bin/sh: /nodir/f: No such file or directory`. Both leave status 1 and write
   nothing. The new-file case itself is fixed: `echo hi >> newfile` creates the file and writes to it,
   as the host does.
-- **`command -v` names the built-ins as built-ins.** `command -v ls` answers `ls is a shell builtin` on a
-  container whose `ls` is one, where the host answers `/bin/ls`; `command -v sh` answers `/bin/sh` now
-  that `/bin/sh` is a file. Both answer *something* for every one of `sh`, `ls`, `cat`, `echo` and `env`,
-  which is what a lookup that used to fail on all five now does. The wording is the shell's own, and it
-  is about a command this shell does not have to find a file for.
+- **`command -v` answers with the path or the bare name, as a host does** -- `/bin/ls`, `/bin/sh`, `echo`,
+  `cd` -- and `command -V` and `type` keep the wording that describes (`ls is /bin/ls`, `cd is a shell
+  builtin`). What is still absent is a file for a utility this shell has no builtin of its own: `command -v npm`,
+  `command -v git`, `command -v grep` and `command -v sed` exit 1 where a host names a file.
 
 ### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
 
 Each of these was measured by running the same script under host Node 24.15 and in the container and
 diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
 
-- **`process.stdout.writableHighWaterMark` is undefined** where the host's is 65536. `isTTY` and `columns`
-  are now left off a stream with no terminal behind it, as a piped host leaves them off, so a package that
-  sizes its output from `columns || 80` falls back here as it does there.
-- **A guest `err.stack` has no `Error: <message>` header line.** It begins at the first frame, so
-  `err.stack.split('\n')[0]` is `    at <anonymous> (/app/main.js:24:52)` where the host's is `Error: boom`.
-- **`e.requireStack` on a `MODULE_NOT_FOUND` error is undefined**, where host Node's is the array of files
-  that required the missing one. `e.message` still carries the same `Require stack:` block, and
-  `e.code` is `MODULE_NOT_FOUND` on both.
-- **`/dev/null` and `/dev/urandom` are not there.** `/dev` is created at boot, but a character device is a
-  kernel object and this file system has files and directories only: `fs.writeFileSync('/dev/null', '')`
-  makes an ordinary file, and a read of one gives back what was written rather than end of file. Shell
-  redirection to `/dev/null` is a sink and never touches the tree.
+- **`process.stdout` is an `EventEmitter` with a `write`, not a `Writable`.** `isTTY` and `columns` are now
+  left off a stream with no terminal behind it, as a piped host leaves them off, so a package that
+  sizes its output from `columns || 80` falls back here as it does there; but the rest of the stream is
+  not there -- `writableHighWaterMark` undefined where the host's is 65536, and `fd`, `writable`,
+  `writableEnded`, `errored` and `pipe` undefined too, so `typeof process.stdout.pipe` is `'undefined'`
+  and anything that pipes into stdout, or tests a stream by its `pipe`, takes the other branch.
+- **`process.getuid` (and `process.geteuid`) do not exist** where the host's return 501, so
+  `typeof process.getuid === 'function'` is false and a guard on it takes the other branch. The number is
+  not the obstacle: `os.userInfo()` in the same container reports `uid` 1000.
+- **`process.argv0` is undefined** where the host's is the path node was invoked by.
+- **`os.networkInterfaces()` is `{}`** where a host's holds eleven entries, one per interface, so a package
+  that picks an address out of it finds nothing.
+- **A guest stack frame names no receiver and carries the container's own engine frames.**
+  `E.methodFrame()` gives `    at methodFrame (/app/main.js:31:3)` where the host gives
+  `    at Object.methodFrame (...)`, a top-level frame is `at <anonymous>` where the host's is
+  `at Object.<anonymous>`, and every guest trace ends with `at call (native)`,
+  `at loadCJS (owc-bootstrap.js:...)` and `at runMain (owc-bootstrap.js:...)`, which no host trace has.
+  `util.inspect(new Error('boom'))` and an uncaught throw do carry the `Error: boom` header -- the
+  formatter that writes them prepends it -- and only `err.stack` itself does not.
+- **`/dev` holds four devices where a host holds hundreds.** `/dev/null`, `/dev/zero`, `/dev/random` and
+  `/dev/urandom` are mounted as character devices and `fs.statSync('/dev/null')` agrees with the host --
+  `isFile()` false, `isCharacterDevice()` true, `mode` 8630 -- and a read of `/dev/zero` gives eight zero
+  bytes and of `/dev/urandom` eight that are not. `/dev/tty` is the one a guest reaches for that is not
+  there: `fs.existsSync('/dev/tty')` is false and `test -e /dev/tty` leaves 1, where a host leaves 0.
 - **The files on `PATH` are scripts, not binaries.** `/bin/sh`, `/bin/ls`, `/bin/cat`, `/bin/echo` and
   `/usr/bin/env` are created at boot beside `/usr/local/bin/node`, as executable files holding the script
   that runs the command, so `which ls`, `which cat`, `which env` and `command -v sh` all answer where they

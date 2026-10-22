@@ -1,0 +1,17 @@
+WITNESS FAIL (judge, shard guest, 2026-10-23, HEAD f5d5931) -- PARTLY FIXED BY ANOTHER LANE, STILL OPEN
+Input: print ctor name, prototype chain, own props and typeof pipe/write, plus fd/writable/readable/
+destroyed/writableEnded/writableFinished/writableHighWaterMark/readableHighWaterMark/writableLength/
+writableCorked/writableNeedDrain/writableObjectMode/errored/readableEncoding/columns/isTTY, for stdout,
+stderr and stdin, with stdout piped on both sides.
+Container stdout: ctor EventEmitter, proto EventEmitter>Object, own [_events,_eventsCount,_maxListeners,
+cork,end,setEncoding,uncork,write], typeofPipe "undefined", columns undef, isTTY undef.
+Host stdout (redirected to a file): ctor SyncWriteStream, proto SyncWriteStream>Writable>Stream>
+EventEmitter>Object, fd 1, writable true, readable false, destroyed false, writableEnded false,
+writableFinished false, writableHighWaterMark 65536, writableLength 0, writableCorked 0,
+writableNeedDrain false, writableObjectMode false, errored null, typeofPipe "function".
+columns and isTTY now agree -- both undefined on a pipe -- so the row's own subject is fixed. What is left
+is that the object is not a Writable at all: fd, writable, writableEnded, errored and pipe are all
+undefined, so `typeof process.stdout.pipe === 'undefined'` and isStreamLike(process.stdout) is false.
+stdin adds: ctor Readable vs ReadStream, fd undefined vs 0, readableEncoding 'utf8' vs null.
+readableHighWaterMark 65536 agrees on both. Machine: load 24.28 (1-min), 5.2 GB free. Row kept open,
+rewritten onto the symptom that remains.

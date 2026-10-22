@@ -1,0 +1,7 @@
+WITNESS SUPERSEDED (judge, shard guest, 2026-10-23, HEAD f5d5931)
+The row records /dev/null and /dev/urandom as ENOENT. They are not: cebc45f ("fs: mount /dev with null,
+zero, random, urandom") mounted them, and fs.existsSync('/dev/null') is now true with mode 8630
+(S_IFCHR | 0666), as on a host. Their stat shape was still wrong and is now fixed too -- see
+owc-guest-stat-character-device, closed by this witness. What is left is the size of the device set:
+`ls /dev` lists null, random, urandom and zero where a host lists hundreds, and /dev/tty is absent, which
+is one line in Readme.md under "Guest fs and process divergences". Row closed as superseded.

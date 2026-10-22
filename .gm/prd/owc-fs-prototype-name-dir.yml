@@ -1,0 +1,7 @@
+id: owc-fs-prototype-name-dir
+description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931 and CLOSED. All ten names -- normal, constructor, toString, valueOf, hasOwnProperty, __proto__, isPrototypeOf, __defineGetter__, toJSON, then -- mkdirSync, statSync().isDirectory(), existsSync, writeFileSync and readFileSync identically on both sides, with an identical sorted readdirSync and renameSync/rmdirSync working. Measured in a fresh container, so no EEXIST carried over from an earlier run. See .gm/witness-out/owc-fs-prototype-name-dir.txt.'
+owner: drain-corpus
+session_id: adv2-judge-guest-6
+subject: 'a directory named like an Object.prototype member (constructor, toString) cannot be created or written into'
+witness_plan: 'With OpenWebContainer, createDirectory(''/d1/constructor'') then writeFile(''/d1/constructor/f.txt'', bytes); both must succeed, as they do for ''/d1/normal''.'
+status: pending

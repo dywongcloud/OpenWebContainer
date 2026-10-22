@@ -1,0 +1,7 @@
+id: owc-guest-error-stack-frame-shape
+description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931. Host V8 prints the receiver: `E.methodFrame()` gives "    at Object.methodFrame (/.../main.js:30:44)" and a top-level frame "    at Object.<anonymous> (...)". The container prints "    at methodFrame (/app/main.js:31:3)" and "    at <anonymous> (/app/main.js:44:16)" -- no `Object.` receiver, and none at all where the host has `Object.<anonymous>`. Every container trace also carries three engine frames no host trace has: "    at call (native)", "    at loadCJS (owc-bootstrap.js:1006:21)" and "    at runMain (owc-bootstrap.js:1484:14)" (the line numbers move with the bootstrap source), where the host ends with its own node:internal/modules/cjs/loader frames. A try/catch stack is 5 lines against the host''s 9. Recorded in Readme.md. See .gm/witness-out/owc-guest-error-stack-frame-shape.txt.'
+owner: judge-guest-6
+session_id: adv2-judge-guest-6
+subject: 'a guest stack frame names no receiver and every guest trace ends with the container''s own engine frames'
+witness_plan: 'Throw an Error from a method and from a top-level frame in the container and under host Node 24.15; compare the frame text line by line.'
+status: pending

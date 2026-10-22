@@ -1,0 +1,10 @@
+WITNESS FAIL (judge, shard guest, 2026-10-23, HEAD f5d5931) -- NEW ROW
+Input: typeof process.getuid === 'function' ? process.getuid() : 'no-getuid', and the same for geteuid,
+next to os.userInfo().
+Container: getuid "no-getuid", geteuid "no-geteuid", userInfo {"uid":1000,"gid":1000,"username":"user",
+"homedir":"/home","shell":"/bin/sh"}
+Host     : getuid 501, geteuid 501, userInfo {"uid":501,"gid":20,"username":"dylanwong","homedir":
+"/Users/dylanwong","shell":"/bin/zsh"}
+The container's own os.userInfo() reports uid 1000, so the number it would return is already decided; only
+the accessor is missing. A package that guards on `typeof process.getuid === 'function'` takes the other
+branch. Machine: load 23.77 (1-min), 5.3 GB free.

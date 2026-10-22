@@ -41,19 +41,28 @@ function dirnameOf(p) {
    made the require first, then the one that required it, and so on up to the entry. A require with
    no module behind it -- one the host made, or one made from a path with no file of its own -- has
    no stack, as it has in Node. */
-function requireStackOf(parent) {
+function requireStackNames(parent) {
   var names = [];
   var cursor = parent;
   while (cursor !== null && cursor !== undefined) {
     names.push(cursor.filename || cursor.id);
     cursor = cursor.parent;
   }
+  return names;
+}
+
+function requireStackOf(parent) {
+  var names = requireStackNames(parent);
   return names.length === 0 ? '' : '\nRequire stack:\n- ' + names.join('\n- ');
 }
 
 function moduleNotFound(id, parent) {
   var err = new Error("Cannot find module '" + id + "'" + requireStackOf(parent));
   err.code = 'MODULE_NOT_FOUND';
+  /* Node carries the same list on the error as a field, not only in the message: a package that
+     prints where a dependency was asked for reads err.requireStack, and a resolve failure names the
+     file it was asked from just as a require does. */
+  err.requireStack = requireStackNames(parent);
   return err;
 }
 

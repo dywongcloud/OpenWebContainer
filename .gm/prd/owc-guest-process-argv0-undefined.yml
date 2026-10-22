@@ -1,0 +1,7 @@
+id: owc-guest-process-argv0-undefined
+description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931. process.argv0 is undefined in the container against the host''s "/Users/dylanwong/.nvm/versions/node/v24.15.0/bin/node", while process.execPath is right in the container ("/usr/local/bin/node") -- so the value argv0 would carry is one the container already knows. Recorded in Readme.md. See .gm/witness-out/owc-guest-process-argv0-undefined.txt.'
+owner: judge-guest-6
+session_id: adv2-judge-guest-6
+subject: 'process.argv0 is undefined in the container where host Node sets it to the path node was invoked by'
+witness_plan: 'Print process.argv0 and process.execPath in the container and under host Node 24.15; argv0 must be a string on both.'
+status: pending

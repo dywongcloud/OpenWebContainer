@@ -1,0 +1,9 @@
+WITNESS FAIL (judge, shard guest, 2026-10-23, HEAD f5d5931) -- NEW ROW
+Input: throw new Error('boom') from a method on an object and from a named function; compare the frame text.
+Container: "    at methodFrame (/app/main.js:31:3)" and "    at <anonymous> (/app/main.js:44:16)"
+Host     : "    at Object.methodFrame (.../main.js:30:44)" and "    at Object.<anonymous> (.../main.js:...)"
+The container prints no receiver (`Object.`) and no receiver for a top-level frame at all, where host V8
+prints both. Every container trace also ends with three engine frames no host trace has --
+"    at call (native)", "    at loadCJS (owc-bootstrap.js:1006:21)", "    at runMain (owc-bootstrap.js:1484:14)"
+-- where the host ends with its own node:internal/modules/cjs/loader frames. Line counts, try/catch stack:
+5 against 9. Machine: load 24.28 (1-min), 5.2 GB free.
