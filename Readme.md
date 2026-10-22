@@ -336,20 +336,43 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   `sh`, `ls`, `cat`, `echo`, `env`, `node`, `npm` and `npx` do. Three names have no file: `git` is not in the
   container at all, and `grep` and `sed` are reached through the shell's runner, which a file on `PATH` would
   outrank -- give them one and `command -v grep` starts answering while `grep` itself stops working, so
-  `command -v grep`, `command -v sed` and `command -v git` exit 1 where a host names a file.
+  `command -v grep`, `command -v sed` and `command -v git` exit 1 where a host names a file. That is three
+  names because they are built-ins, not because the coverage stops there: a further **46 names a host
+  resolves have no file here at all and `command -v` of them exits 1** -- `bash awk tar curl python3 head wc
+  sort find uname date sleep chmod id dirname basename xargs tr uniq tail tee make cc git yarn pnpm tsc perl
+  ruby less man vi sudo bun clear hostname ps ln du df stat file diff patch ssh openssl zip unzip gzip
+  gunzip` -- and of those, the ones the shell runs as built-ins anyway (`head`, `tail`, `wc`, `sort`,
+  `uniq`, `grep`, `sed`, `awk`, `cut`, `tr`, `xargs`, `tee`, `dirname`, `basename`, `date`, `chmod`, `sleep`)
+  produce byte-identical output for a host, so `command -v` under-reports what the container can run.
+  Six that do answer print the bare name where a host prints a path (`mkdir`, `rm`, `cp`, `mv`, `touch`,
+  `which`), and `npx --version` exits 1 with `npx: a command or package is required` where a host prints
+  `11.12.1`.
 
 ### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
 
 Each of these was measured by running the same script under host Node 24.15 and in the container and
 diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
 
-- **`process.stdout` is a `Writable` by shape, but not one of node's own classes.** It carries `fd` 1 (2 for
-  `stderr`), `writable` true, `readable` false, a `writableHighWaterMark` of 65536 and a `pipe` that refuses
-  with `ERR_STREAM_CANNOT_PIPE` as a host's does, and its prototype chain reads
-  `SyncWriteStream > Writable > Stream > EventEmitter > Object`, which is the chain a host gives when its
-  output goes to a file. Send a host's output to a pipe instead and that stream is a `Socket`, and its
-  `stdin` a `ReadStream` over `fd` 0 -- classes a container cannot hold -- so the constructor names agree
-  against a file and not against a pipe, and the own properties differ either way.
+- **`process.stdout` is one of node's own classes, with the gaps a container leaves.** It carries `fd` 1 (2
+  for `stderr`), `writable` true, `readable` false, a `writableHighWaterMark` of 65536 and a `pipe` that
+  refuses with `ERR_STREAM_CANNOT_PIPE` as a host's does. Its prototype chain is the stream module's own
+  `Writable > Stream > EventEmitter` under a `SyncWriteStream`, so `process.stdout instanceof
+  require('stream').Stream` is true as on a host, and `write`, `end`, `cork`, `uncork`, `destroy`,
+  `destroySoon`, `setDefaultEncoding` and `_write` are all there -- `end()` emits `finish` then `close`, and
+  a chunk that is a `Buffer`, a `TypedArray` or a `DataView` is decoded as UTF-8 bytes, so
+  `stdout.write(new TextEncoder().encode('Hi!'))` prints `Hi!` and `stdout.write(new ArrayBuffer(0))` throws
+  the host's `ERR_INVALID_ARG_TYPE`. Send a host's output to a pipe instead and *that* stream is a `Socket`,
+  and its `stdin` a `ReadStream` over `fd` 0 -- classes a container cannot hold -- so the shape agrees
+  against a file and not against a pipe, and `process.stdout` keeps one own property a host's does not
+  (`_eventsCount`).
+- **`process.setuid` and the rest of the id surface are refused, not missing.** `getuid`, `geteuid`, `getgid`,
+  `getegid` and `getgroups` answer, and `setuid`, `seteuid`, `setgid`, `setegid`, `setgroups` and
+  `initgroups` throw the host's `EPERM` as they do for a process that is not root; `getgroups` returns the
+  one group this process has, where a host on this machine returns sixteen.
+- **`process.ppid` is 0, and `process.argv0` is the whole path where a host's is the name.** A host's `ppid`
+  is the pid of the shell that started it and its `argv0` is `node`, because that is the word the shell
+  invoked; the container has no parent process and reports its own argv as the path it was started from, so
+  `process.title` (`'node'`) and `process.argv0` (`'/usr/local/bin/node'`) disagree where a host's agree.
 - **`os.networkInterfaces()` reports the loopback alone.** `lo` carries `127.0.0.1` and `::1` with the netmask,
   family and cidr a host's entries carry, where a host reports eleven interfaces of its own: a container's
   sockets are the host's, so it has no address of a network of its own to name, and a package that picks an
@@ -371,8 +394,10 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   `/dev/urandom`: that is the one a host refuses to be seeded through, so it is refused here too.
   `/dev` itself is `dr-xr-xr-x` and nothing can be made
   in it, as on a host: `mkdir /dev/sub` is refused. What is still recorded rather than fixed:
-  - `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd` -- and `/dev/tty`, below -- are not there:
-    `echo x > /dev/stdout` is refused in the container where a host prints `x`.
+  - `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd`, `/dev/console` and `/dev/ptmx` -- and
+    `/dev/tty`, below -- are not there: `echo x > /dev/stdout` is refused in the container where a host
+    prints `x`, and `fs.writeFileSync('/dev/stdout', ...)`, which is a common CLI idiom, is `EPERM` here
+    against `ok` on a host.
   - `stat` carries `mode`, `size` and `type` only: `rdev` is 0 where a host's is 50331650 for
     `/dev/null`, and `dev`, `ino`, `nlink` and `blksize` differ. A host's `rdev` encodes *this* macOS
     major/minor (3,2) while the container is Linux-shaped, so even a derived one would not agree here.
@@ -977,10 +1002,12 @@ re-run in isolation; the rows are open.
   scan that found a `throw` inside the string literal is fixed) and what is left is the frame column
   V8 gives an `&&` expression.
 
-- `owc-shell-syntax-error-source-line`: `echo a\nif; then` -- the host prints `a` first (it parses as it runs) and echoes only `if; then` as the source line; the container prints nothing and echoes the whole script. `((1+)` and `case x in` gain an echoed source line the host never writes at all.
-- `owc-shell-syntax-error-token-named`: `if; then` -- the host names `;` where the container names `newline`; `echo |` -- the host reports an unexpected end of file where the container names `|`; `for x in a; echo hi; done` -- the host names `echo` where the container says `` `do' expected ''.
-- `owc-shell-arith-operand-error-status`: `x=$((1+))` -- host stderr `/bin/sh: 1+: syntax error: operand expected (error token is "+")` exit 127; container stderr `syntax error: operand expected` exit 1.
-- `owc-shell-command-not-found-wording`: `nosuchcmd-j4` -- host stderr `/bin/sh: nosuchcmd-j4: command not found`; container `Command not found: nosuchcmd-j4`. Not a prefix difference: the name sits in a different place in the sentence.
+- `owc-shell-arith-command`: the arithmetic command `(( ))` is not one -- `((1)); echo $?` is host `0` and container `127` with `sh: 1: command not found`; `((1+))` is host status 1 with ``/bin/sh: ((: 1+: syntax error: operand expected (error token is "+")`` against the container's `sh: 1+: command not found` and 127. (`$(( ))` and `$((1?2:3))` do evaluate.)
+- `owc-shell-dollar-bracket-arith`: the old `$[...]` form is never expanded -- `echo $[1+1]` prints `2` on a host and the literal `$[1+1]` in the container, and `$[1+]` is an operand error on a host where the container reports `$[1+]` as `command not found`.
+- `owc-shell-empty-compound-body`: a body with nothing in it is accepted where a host refuses the script -- `if true; then` newline `fi` is host ``syntax error near unexpected token `fi'`` (exit 2) and container exit 0 with nothing written; `while`/`until`/`for`, `{ }` and `( )` take the same shape, and `while true; do` newline `done` never returns in the container at all instead of failing to parse.
+- `owc-shell-script-not-executable`: a file with a shebang and the execute bit cannot be run -- `./execok.sh` prints `ran` on a host and fails in the container with `./execok.sh: cannot run here: it is a script, which only a child can run`, exit 127.
+- `owc-shell-diagnostic-line-position`: no diagnostic carries the position a host's does -- a host writes `/bin/sh: -c: line 1: syntax error near unexpected token `;'` and `/bin/sh: line 0: .: filename argument required`, the container the bare sentence; of 94 measured cases 37 differ on that prefix alone and nothing else.
+- `owc-shell-return-not-in-function-wording`: the complaint about a `return` outside a function is quoted with straight quotes and carries no shell name -- host ``/bin/sh: line 1: return: can only `return' from a function or sourced script``, container `return: can only 'return' from a function or sourced script`.
 - `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string.
 - `owc-guest-error-engine-stack-no-header`: an error the engine raises itself -- `null.x`, `JSON.parse('{')` -- opens with a frame where host Node 24.15 opens with the error's own name and message: container `err.stack` is `    at <anonymous> (/app/main.js:12:11)`, host `TypeError: Cannot read properties of null (reading 'x')`. An error the guest constructs does carry its header, because its constructor is wrapped; these are raised at throw sites inside the engine that no guest-side definition reaches.
 - `owc-json-stringify-replacer-cycle-message`: a cycle a replacer introduces -- `JSON.stringify({x:1}, function(k,v){ return k === 'x' ? cyc : v; })` where `cyc.a === cyc` -- still throws `TypeError: circular reference` where host Node 24.15 throws `Converting circular structure to JSON` followed by `    --- property 'a' closes the circle`. A cycle in the value handed to `JSON.stringify`, and one a `toJSON` returns, are both named; only one the replacer substitutes is not, because the walk that finds the circle sees the value as handed over and not as the replacer rewrote it.

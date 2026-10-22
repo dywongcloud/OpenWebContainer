@@ -419,6 +419,28 @@ proc.getuid = function () { return requireBuiltin('os').userInfo().uid; };
 proc.geteuid = function () { return requireBuiltin('os').userInfo().uid; };
 proc.getgid = function () { return requireBuiltin('os').userInfo().gid; };
 proc.getegid = function () { return requireBuiltin('os').userInfo().gid; };
+/*
+ * The rest of the id surface, which is the half a package reaches for after the guard passes: it
+ * asks typeof process.getuid === 'function', finds it, and then calls process.setuid or
+ * process.getgroups on the strength of it -- and got a TypeError here where a host, which has every
+ * one of these and refuses the ones that would change identity, gives an EPERM. The setters are
+ * refused rather than absent, because that is what a host does to a process that is not root: this
+ * process runs as the one user the container has and cannot become another.
+ */
+function epermFor(syscall) {
+  var denied = new Error('EPERM: Operation not permitted, ' + syscall);
+  denied.code = 'EPERM';
+  denied.errno = -1;
+  denied.syscall = syscall;
+  return denied;
+}
+proc.getgroups = function () { return [requireBuiltin('os').userInfo().gid]; };
+proc.setuid = function () { throw epermFor('setuid'); };
+proc.seteuid = function () { throw epermFor('seteuid'); };
+proc.setgid = function () { throw epermFor('setgid'); };
+proc.setegid = function () { throw epermFor('setegid'); };
+proc.setgroups = function () { throw epermFor('setgroups'); };
+proc.initgroups = function () { throw epermFor('initgroups'); };
 proc.emitWarning = function (warning) {
   host.stderr('(node) Warning: ' + (warning && warning.message ? warning.message : String(warning)) + '\n');
 };
@@ -435,73 +457,192 @@ proc.emitWarning = function (warning) {
  */
 function Stream() {}
 function Writable() {}
-function SyncWriteStream() {}
 Stream.prototype = Object.create(EventEmitterCls.prototype);
 Writable.prototype = Object.create(Stream.prototype);
-SyncWriteStream.prototype = Object.create(Writable.prototype);
 Stream.prototype.constructor = Stream;
 Writable.prototype.constructor = Writable;
-SyncWriteStream.prototype.constructor = SyncWriteStream;
 /*
- * Writable.prototype.pipe, as node writes it: nothing can be piped *out of* a stream that cannot be
- * read, and node reports that by emitting the error rather than by returning one.
+ * The prototypes of the two stdio streams, and the link that puts the stream module's own Writable
+ * under them. A package asks 'process.stdout instanceof require('stream').Stream' and a host answers
+ * true; while the whole chain was local lookalikes the answer was false, and 'x instanceof
+ * require('stream').Writable' was true only because a lookalike carries the same name. The link is
+ * made as late as it can be -- the stream module registers its builtin after this file runs -- so a
+ * stream read before then keeps the local chain and is rebased the moment the module is there.
  */
-SyncWriteStream.prototype.pipe = function (dest) {
-  var cannot = new Error('Cannot pipe, not readable');
-  cannot.code = 'ERR_STREAM_CANNOT_PIPE';
-  var self = this;
-  queueMicrotask(function () { self.emit('error', cannot); });
-  return dest;
-};
-/* Everything a Writable reports about itself, read from the state object as node reads it. */
-[
-  ['writable', 'writable'], ['destroyed', 'destroyed'], ['writableEnded', 'ended'],
-  ['writableFinished', 'finished'], ['writableHighWaterMark', 'highWaterMark'],
-  ['writableLength', 'length'], ['writableCorked', 'corked'], ['writableNeedDrain', 'needDrain'],
-  ['writableObjectMode', 'objectMode'], ['errored', 'errored']
-].forEach(function (pair) {
-  Object.defineProperty(SyncWriteStream.prototype, pair[0], {
-    configurable: true,
-    get: function () { return this._writableState[pair[1]]; }
-  });
-});
-function makeStdioStream(fd, writeText) {
-  var stream = new SyncWriteStream();
-  EventEmitterCls.call(stream);
-  stream._writableState = { writable: true, destroyed: false, ended: false, finished: false,
-    highWaterMark: 65536, length: 0, corked: 0, needDrain: false, objectMode: false, errored: null };
-  stream.fd = fd;
-  stream.readable = false;
-  /*
-   * No terminal is attached, and a stream node has with no terminal behind it has *no* isTTY and
-   * *no* columns: a host run with its output piped reports undefined for both, not false and 80.
-   * The difference is observable -- columns || 80 never falls back here, and a library that reads
-   * isTTY to decide whether it is talking to a person is answered with a value that says it is
-   * not rather than with nothing. Both are left off the stream, as a piped host leaves them off.
-   */
-  stream.write = function (chunk, encoding, callback) {
-    writeText(typeof chunk === 'string' ? chunk : String(chunk));
-    var done = typeof encoding === 'function' ? encoding : callback;
-    if (typeof done === 'function') queueMicrotask(function () { done(); });
-    return true;
-  };
-  stream.end = function (chunk) {
-    if (chunk !== undefined && typeof chunk !== 'function') stream.write(chunk);
-    stream._writableState.ended = true;
-    stream._writableState.finished = true;
-    return stream;
-  };
-  stream.cork = function () { stream._writableState.corked = stream._writableState.corked + 1; };
-  stream.uncork = function () { if (stream._writableState.corked > 0) stream._writableState.corked = stream._writableState.corked - 1; };
-  stream.setEncoding = function () { return stream; };
-  return stream;
+var stdioProtos = [];
+var stdioChainLinked = false;
+function linkStdioChain() {
+    if (stdioChainLinked) return;
+    var mod = requireBuiltin('stream');
+    if (!mod || !mod.Writable) return;
+    for (var i = 0; i < stdioProtos.length; i++) {
+        Object.setPrototypeOf(stdioProtos[i], mod.Writable.prototype);
+    }
+    /* Only once there is a prototype to rebase: there is none until the first stream is built, and
+       a flag set on an empty list would keep every later stream on the local chain. */
+    if (stdioProtos.length > 0) stdioChainLinked = true;
 }
-proc.stdout = makeStdioStream(1, function (text) {
-  host.stdout(text);
-});
-proc.stderr = makeStdioStream(2, function (text) {
-  host.stderr(text);
-});
+/*
+ * What a host accepts as a chunk and what it makes of one. A string goes out as it is; a Buffer, a
+ * TypedArray or a DataView is decoded as UTF-8 bytes, which is what makes
+ * 'stdout.write(new TextEncoder().encode('Hi!'))' print 'Hi!' and not '72,105,33'. Anything else --
+ * an ArrayBuffer, a number, a plain object -- is refused with node's own ERR_INVALID_ARG_TYPE,
+ * because a host refuses it too: a write that silently String()-coerced its argument turned binary
+ * output into a list of numbers and answered '[object ArrayBuffer]' where a host threw.
+ */
+function stdioChunkText(chunk) {
+    if (typeof chunk === 'string') return chunk;
+    if (chunk instanceof Uint8Array) return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString('utf8');
+    if (chunk && typeof chunk === 'object' && typeof chunk.buffer === 'object'
+        && typeof chunk.byteOffset === 'number' && typeof chunk.byteLength === 'number') {
+        return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString('utf8');
+    }
+    var received = chunk === null ? 'null' : chunk === undefined ? 'undefined'
+        : (chunk.constructor && chunk.constructor.name ? 'an instance of ' + chunk.constructor.name : typeof chunk);
+    var bad = new TypeError('The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' + received);
+    bad.code = 'ERR_INVALID_ARG_TYPE';
+    throw bad;
+}
+function makeStdioStream(fd, writeText) {
+    function SyncWriteStream() {}
+    var proto = Object.create(Writable.prototype);
+    SyncWriteStream.prototype = proto;
+    proto.constructor = SyncWriteStream;
+    stdioProtos.push(proto);
+    linkStdioChain();
+    /*
+     * Writable.prototype.pipe, as node writes it: nothing can be piped *out of* a stream that cannot
+     * be read, and node reports that by emitting the error rather than by returning one.
+     */
+    proto.pipe = function (dest) {
+        var cannot = new Error('Cannot pipe, not readable');
+        cannot.code = 'ERR_STREAM_CANNOT_PIPE';
+        var self = this;
+        queueMicrotask(function () { self.emit('error', cannot); });
+        return dest;
+    };
+    /* Everything a Writable reports about itself, read from the state object as node reads it. */
+    [
+        ['writable', 'writable'], ['destroyed', 'destroyed'], ['writableEnded', 'ended'],
+        ['writableFinished', 'finished'], ['writableHighWaterMark', 'highWaterMark'],
+        ['writableLength', 'length'], ['writableCorked', 'corked'], ['writableNeedDrain', 'needDrain'],
+        ['writableObjectMode', 'objectMode'], ['errored', 'errored']
+    ].forEach(function (pair) {
+        Object.defineProperty(proto, pair[0], {
+            configurable: true,
+            get: function () { return this._writableState[pair[1]]; }
+        });
+    });
+    /* The Writable surface a package reaches for, on the prototype as a host has it rather than as
+       own properties of the stream: write, end, cork, uncork, destroy and setDefaultEncoding. */
+    proto.write = function (chunk, encoding, callback) {
+        writeText(stdioChunkText(chunk));
+        var done = typeof encoding === 'function' ? encoding : callback;
+        if (typeof done === 'function') queueMicrotask(function () { done(); });
+        return true;
+    };
+    proto._write = function (chunk, encoding, callback) {
+        writeText(stdioChunkText(chunk));
+        if (typeof callback === 'function') queueMicrotask(function () { callback(); });
+    };
+    /*
+     * end() reports what a host's does: writableEnded at once, then a 'finish' and a 'close' once the
+     * write has gone out -- a host emits both, and a package that awaits once(stdout, 'finish') or
+     * stream.finished() hung here for want of them.
+     */
+    proto.end = function (chunk, encoding, callback) {
+        var cb = typeof chunk === 'function' ? chunk : (typeof encoding === 'function' ? encoding : callback);
+        if (chunk !== undefined && typeof chunk !== 'function') this.write(chunk);
+        var state = this._writableState;
+        state.ended = true;
+        var self = this;
+        queueMicrotask(function () {
+            if (state.finished) return;
+            state.finished = true;
+            self.emit('finish');
+            self.emit('close');
+            if (typeof cb === 'function') cb();
+        });
+        return this;
+    };
+    proto.cork = function () { this._writableState.corked = this._writableState.corked + 1; };
+    proto.uncork = function () { if (this._writableState.corked > 0) this._writableState.corked = this._writableState.corked - 1; };
+    proto.destroy = function (error, callback) {
+        var state = this._writableState;
+        var self = this;
+        if (state.destroyed) {
+            if (typeof callback === 'function') queueMicrotask(function () { callback(error || null); });
+            return this;
+        }
+        state.destroyed = true;
+        queueMicrotask(function () {
+            if (typeof callback === 'function') callback(error || null);
+            self.emit('close');
+        });
+        return this;
+    };
+    proto.setDefaultEncoding = function () { return this; };
+    var stream = new SyncWriteStream();
+    EventEmitterCls.call(stream);
+    stream._writableState = { writable: true, destroyed: false, ended: false, finished: false,
+      highWaterMark: 65536, length: 0, corked: 0, needDrain: false, objectMode: false, errored: null };
+    stream.fd = fd;
+    stream.readable = false;
+    /* The two a host's stdio stream carries as its own: destroySoon is the name node gave destroy
+       before it had one, and _destroy is the hook Writable.destroy calls. */
+    stream.destroySoon = function () { return stream.destroy(); };
+    stream._destroy = function (error, callback) { if (typeof callback === 'function') callback(error || null); };
+    /*
+     * The three a host's stdio stream carries as a marker of what it is, and which this stream is:
+     * node's own stdio, written to a file system stream, closed by nobody but the process.
+     */
+    stream._isStdio = true;
+    stream._type = 'fs';
+    stream.autoClose = false;
+    /*
+     * No terminal is attached, and a stream node has with no terminal behind it has *no* isTTY and
+     * *no* columns: a host run with its output piped reports undefined for both, not false and 80.
+     * The difference is observable -- columns || 80 never falls back here, and a library that reads
+     * isTTY to decide whether it is talking to a person is answered with a value that says it is
+     * not rather than with nothing. Both are left off the stream, as a piped host leaves them off.
+     */
+    return stream;
+}
+/*
+ * Read lazily, as process.stdin already is: the stream module registers its builtin after this file
+ * runs, and a stream built before that would keep the local chain for the life of the process.
+ */
+function stdioOf(which, build) {
+    if (which === null) which = build();
+    /* Rebased on every read until it takes: the first read can be a bootstrap-time one, before the
+       stream module has registered its builtin, and a chain left local then is local forever. */
+    if (!stdioChainLinked) linkStdioChain();
+    return which;
+}
+function stdioSlot(name, build) {
+    var held = null;
+    Object.defineProperty(proc, name, {
+        configurable: true,
+        get: function () {
+            held = stdioOf(held, build);
+            if (stdioChainLinked) Object.defineProperty(proc, name, { value: held, configurable: true, writable: true });
+            return held;
+        },
+        set: function (value) {
+            held = value;
+            Object.defineProperty(proc, name, { value: held, configurable: true, writable: true });
+        }
+    });
+}
+stdioSlot('stdout', function () { return makeStdioStream(1, function (text) { host.stdout(text); }); });
+stdioSlot('stderr', function () { return makeStdioStream(2, function (text) { host.stderr(text); }); });
+/* Nothing now keeps the chain unlinked but a run that never reads either stream: link it as the
+   entry is loaded, so a package that reads process.stdout from a module body sees the real chain. */
+if (typeof api.runMain === 'function' && !api.runMain.__owcLinksStdio) {
+    var baseRunMain = api.runMain;
+    api.runMain = function (filename) { linkStdioChain(); return baseRunMain(filename); };
+    api.runMain.__owcLinksStdio = true;
+}
 /* stdin has no input source unless the host feeds one. A process started with a pipe on fd 0 keeps it
    open until the host ends it, so a parent's write reaches a reader there as it does in Node; every
    other run's stdin ends at once, so a reader sees end of input. A REPL is the run the terminal feeds:
@@ -642,7 +783,7 @@ if (!Error.captureStackTrace) {
        are in place, and with a frame when it is not; either way the line that follows is this call,
        which is not a frame of the caller's and is dropped with it. */
     if (lines.length > 0 && lines[0].indexOf('    at ') !== 0) lines = lines.slice(1);
-    var frames = lines.slice(1);
+    var frames = guestFramesOf(lines.slice(1));
     if (typeof Error.prepareStackTrace === 'function') {
       target.stack = Error.prepareStackTrace(target, frames.map(makeCallSite));
       return;
@@ -665,6 +806,80 @@ var STACK_HEADER_CTORS = [
   'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'AggregateError'
 ];
 var CONSTRUCT_FRAME = '    at construct (native)';
+
+/*
+ * The frames host node writes behind the body of a CommonJS module: the compile of the module and
+ * the load it is part of, and then either the require that asked for it or the entry that started
+ * the run. Captured from the build NODE_VERSION names, as the frames of a module that is not there
+ * are: they name files this container does not have, at lines only that build knows.
+ */
+var CJS_MODULE_FRAMES = [
+  '    at Module._compile (node:internal/modules/cjs/loader:1830:14)',
+  '    at Object..js (node:internal/modules/cjs/loader:1961:10)',
+  '    at Module.load (node:internal/modules/cjs/loader:1553:32)',
+  '    at Module._load (node:internal/modules/cjs/loader:1355:12)',
+  '    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)'
+];
+var CJS_MAIN_TAIL = [
+  '    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)',
+  '    at node:internal/main/run_main_module:33:47'
+];
+var CJS_REQUIRE_TAIL = [
+  '    at Module.require (node:internal/modules/cjs/loader:1576:12)',
+  '    at require (node:internal/modules/helpers:153:16)'
+];
+var BOOTSTRAP_MARK = 'owc-bootstrap.js:';
+var CJS_CALL_FRAME = '    at call (native)';
+
+/* One frame of this container's own: every frame the bootstrap puts on a stack names its file. */
+function isBootstrapFrame(text) {
+  return typeof text === 'string' && text.indexOf(BOOTSTRAP_MARK) >= 0;
+}
+
+/* The frame of a compiled CommonJS body: the anonymous function the engine calls it is the wrapper
+   node names Object.<anonymous>. */
+function moduleFrameName(text) {
+  var parsed = /^(\s*)at <anonymous> \((.*)\)\s*$/.exec(text);
+  return parsed === null ? text : parsed[1] + 'at Object.<anonymous> (' + parsed[2] + ')';
+}
+
+/*
+ * A guest's frames with this container's own taken out and node's put in their place: the call into
+ * a compiled CommonJS body, the loader that made it and the require or the entry behind it are one
+ * run of frames of ours, and a host node names the frames of its own loader there and nothing of
+ * ours. A run that names neither the entry nor a require -- the eval path, the REPL -- is dropped
+ * without anything put in its place, which is what its own caller does with it.
+ */
+function guestFramesOf(lines) {
+  var out = [];
+  var at = 0;
+  while (at < lines.length) {
+    var line = lines[at];
+    if (isBootstrapFrame(line)) { at++; continue; }
+    if (line === CJS_CALL_FRAME && at + 1 < lines.length && isBootstrapFrame(lines[at + 1])) {
+      var end = at + 1;
+      while (end < lines.length && isBootstrapFrame(lines[end])) end++;
+      var run = lines.slice(at + 1, end);
+      var main = false;
+      var asked = false;
+      for (var r = 0; r < run.length; r++) {
+        if (run[r].indexOf('    at runMain (') === 0) main = true;
+        if (run[r].indexOf('    at require (') === 0 || run[r].indexOf('    at requireFrom (') === 0) asked = true;
+      }
+      if (main || asked) {
+        if (out.length > 0) out[out.length - 1] = moduleFrameName(out[out.length - 1]);
+        var tail = main ? CJS_MAIN_TAIL : CJS_REQUIRE_TAIL;
+        for (var m = 0; m < CJS_MODULE_FRAMES.length; m++) out.push(CJS_MODULE_FRAMES[m]);
+        for (var t = 0; t < tail.length; t++) out.push(tail[t]);
+      }
+      at = end;
+      continue;
+    }
+    out.push(line);
+    at++;
+  }
+  return out;
+}
 
 function stackHeaderOf(err) {
   var name = 'Error';
@@ -689,10 +904,13 @@ function framesOfEngineStack(stack, ownFrame) {
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   var at = 0;
   while (at < lines.length && (lines[at] === CONSTRUCT_FRAME || lines[at] === ownFrame)) at++;
-  lines = lines.slice(at);
+  /* The bound the host keeps on Error.stackTraceLimit is a bound on the whole trace, the frames of
+     node's own loader behind a guest's included, so it is put on the frames once node's are among
+     them and not on the frames the engine handed over before that. */
+  var frames = guestFramesOf(lines.slice(at));
   var limit = Error.stackTraceLimit;
-  if (typeof limit === 'number' && limit >= 0 && lines.length > limit) lines = lines.slice(0, limit);
-  return lines.join('\n');
+  if (typeof limit === 'number' && limit >= 0 && frames.length > limit) frames = frames.slice(0, limit);
+  return frames.join('\n');
 }
 
 /*
@@ -1921,25 +2139,34 @@ function cycleStepText(key, parentIsArray) {
 
 /*
  * The circle in a value, as the place on the path it starts at and the key that closes it, or null
- * when a walk of the value finds none -- a cycle a replacer or a toJSON built is one this walk does
- * not see, and for that one the engine's own words are left alone.
+ * when a walk of the value finds none. The walk is the stringifier's own: what a holder holds under
+ * a key is asked for its JSON form and then handed to the replacer -- the order V8 asks in, with the
+ * holder and the key V8 hands -- so the graph walked is the one the stringifier walks, which is not
+ * the value handed over when a replacer builds a cycle of its own in place of a value that has none.
  */
-function findCycleIn(value) {
+function findCycleIn(value, replacer) {
   var path = [];
   var reached = [];
   var found = null;
 
-  function walk(node, key, parentIsArray) {
+  function walk(holder, key, raw, parentIsArray) {
     if (found !== null) return true;
-    if (node === null || typeof node !== 'object') return false;
+    var node = raw;
     /* V8 asks a value for its own JSON form before it walks into it, and a Date answers with a
        string that has nothing behind it. */
-    if (typeof node.toJSON === 'function') {
+    if (node !== null && typeof node === 'object' && typeof node.toJSON === 'function') {
       var form;
       try { form = node.toJSON(key); } catch (ignored) { return false; }
-      if (form === null || typeof form !== 'object') return false;
       node = form;
     }
+    /* Then the replacer, which may answer with a value altogether different from the one the holder
+       held -- a cycle the value handed over never had is built exactly here. */
+    if (typeof replacer === 'function') {
+      var given;
+      try { given = replacer.call(holder, key, node); } catch (ignored) { return false; }
+      node = given;
+    }
+    if (node === null || typeof node !== 'object') return false;
     var at = path.indexOf(node);
     if (at >= 0) {
       found = { start: at, key: key, parentIsArray: parentIsArray, path: path.slice(), reached: reached.slice() };
@@ -1951,17 +2178,21 @@ function findCycleIn(value) {
     var names = isArray ? null : Object.keys(node);
     var count = isArray ? node.length : names.length;
     for (var i = 0; i < count; i++) {
-      var childKey = isArray ? i : names[i];
+      var childKey = isArray ? String(i) : names[i];
       var child;
       try { child = node[childKey]; } catch (ignored) { continue; }
-      if (walk(child, childKey, isArray)) return true;
+      if (walk(node, childKey, child, isArray)) return true;
     }
     path.pop();
     reached.pop();
     return false;
   }
 
-  walk(value, undefined, false);
+  /* V8 hands the value it was given to the replacer under the key '' of a wrapper it holds it in,
+     so a replacer that answers on the key it is asked about sees '' first and not undefined. */
+  var wrapper = {};
+  wrapper[''] = value;
+  walk(wrapper, '', value, false);
   return found;
 }
 
@@ -1970,8 +2201,8 @@ function findCycleIn(value) {
  * two, a line of dots, and the step that closed it -- a chain a hundred long is four lines and not
  * a hundred.
  */
-function circularStructureText(value) {
-  var cycle = findCycleIn(value);
+function circularStructureText(value, replacer) {
+  var cycle = findCycleIn(value, replacer);
   if (cycle === null) return null;
   var lines = ['Converting circular structure to JSON'];
   lines.push("    --> starting at object with constructor '" + cycleConstructorName(cycle.path[cycle.start]) + "'");
@@ -1994,7 +2225,11 @@ function circularStructureText(value) {
       return nativeStringify.apply(JSON, arguments);
     } catch (err) {
       if (!(err instanceof TypeError) || String(err.message) !== 'circular reference') throw err;
-      var text = circularStructureText(arguments[0]);
+      /* The replacer is handed on, so the walk reads the graph the stringifier read and not the one
+         it was given: a circle a replacer substitutes is a circle here too. A replacer is asked
+         again by that walk, which is what a toJSON it asks has always been. */
+      var replacer = typeof arguments[1] === 'function' ? arguments[1] : undefined;
+      var text = circularStructureText(arguments[0], replacer);
       if (text === null) throw err;
       /* The error the engine threw carries the stack of the call that asked for the string, so it
          is the one thrown back, with its words replaced; where a message cannot be written, a fresh

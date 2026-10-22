@@ -2596,6 +2596,23 @@ function owcBuildStreamCore() {
   Stream.isDisturbed = streamIsDisturbed;
   Stream.isDestroyed = streamIsDestroyed;
   Stream.duplexPair = duplexPair;
+  /*
+   * The four a host's stream module exports beside these and this one did not: 'destroy' is the
+   * destroy a caller hands a stream -- an aborted signal's handler gives it one -- and the three
+   * underscore helpers are what Node's own consumers of bytes ask for, so a package that reads
+   * 'require('stream')._isUint8Array' to classify a chunk found undefined here and went to a branch
+   * a host never takes.
+   */
+  Stream.destroy = function (stream, err) {
+    if (!stream || streamIsDestroyed(stream)) return;
+    if (typeof stream.destroy !== 'function') return;
+    stream.destroy(err);
+  };
+  Stream._isUint8Array = function (value) { return value instanceof Uint8Array; };
+  Stream._isArrayBufferView = function (value) { return ArrayBuffer.isView(value); };
+  Stream._uint8ArrayToBuffer = function (chunk) {
+    return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  };
 
   // ---------------------------------------------------------------- readline
 
