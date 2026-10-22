@@ -1,4 +1,4 @@
-import { DeviceFS, fs, InMemoryStore, normalizePath, StoreFS, type DeviceDriver } from '@zenfs/core';
+import { DeviceFS, ErrnoError, fs, InMemoryStore, normalizePath, StoreFS, type DeviceDriver } from '@zenfs/core';
 import { IFileSystem, PathStat } from './types';
 import { installPrototypeNameFix } from './zenfs-listing';
 import { NODE_BINARY } from '../process/executors/default-env';
@@ -135,6 +135,29 @@ function driverFor(name: string, spec: DeviceSpec): DeviceDriver {
     };
 }
 
+/**
+ * The `/dev` of a host is not scratch: it is a directory the kernel owns, and a name made in it is
+ * refused with `EPERM` -- `mkdir /dev/sub`, `mkdir -p /dev/a/b` and a write of `/dev/newfile` all
+ * report "Operation not permitted" there, where the plain `DeviceFS` this mounts is an ordinary
+ * writable store and let every one of them through, and left `/dev` looking like world-writable
+ * scratch. Only the four devices belong in it, and they are made by `createDevice`, which none of
+ * these calls reach.
+ */
+class ContainerDeviceFS extends DeviceFS {
+    createFileSync(path: string, _flag?: string, _mode?: number): never {
+        throw ErrnoError.With('EPERM', path, 'open');
+    }
+    mkdirSync(path: string, _mode?: number): never {
+        throw ErrnoError.With('EPERM', path, 'mkdir');
+    }
+    writeFileSync(path: string, _data?: unknown, ..._rest: unknown[]): never {
+        throw ErrnoError.With('EPERM', path, 'open');
+    }
+    symlinkSync(_target: string, path: string): never {
+        throw ErrnoError.With('EPERM', path, 'symlink');
+    }
+}
+
 let devicesMounted = false;
 
 /**
@@ -145,7 +168,7 @@ let devicesMounted = false;
 function mountDeviceDirectory(): void {
     if (devicesMounted) return;
     devicesMounted = true;
-    const dev = new DeviceFS();
+    const dev = new ContainerDeviceFS();
     dev.checkRootSync();
     for (const path of Object.keys(DEVICES)) {
         dev.createDevice(path.slice(DEVICE_DIR.length), driverFor(path.slice(DEVICE_DIR.length + 1), DEVICES[path]));
@@ -225,6 +248,12 @@ export class ZenFSCore implements IFileSystem {
     }
 
     readFile(path: string): string | undefined {
+        /* A device reports a size of 0, and `readFileSync` reads exactly that many bytes, so `cat`
+           and `head` of one -- which is what the shell reads a file with -- got nothing at all:
+           `head -c 4 /dev/zero | wc -c` printed 0 where a host prints 4. One read of the device is
+           what a read of the path can be, the same bound `readBytes` already keeps. */
+        const device = deviceAt(path);
+        if (device) return new TextDecoder().decode(device.read(DEVICE_CHUNK));
         return this.fs.readFileSync(path, 'utf-8');
     }
 
@@ -348,13 +377,18 @@ export class ZenFSCore implements IFileSystem {
     statPath(path: string): PathStat | undefined {
         if (!this.fs.existsSync(path)) return undefined;
         const stat = this.fs.statSync(path);
+        /* A host's `/dev` is `dr-xr-xr-x`, the kernel's directory rather than the user's, so that is
+           the mode it is given. The root a `DeviceFS` makes for itself is 0o777 and `chmod` of it
+           fails in this ZenFS build -- "Size mismatch: buffer length 2, stats size 4096" -- so the
+           mode is set where it is read instead of where it is kept. */
+        const mode = normalizePath(path) === DEVICE_DIR ? 0o40555 : stat.mode;
         /* A character device is `file` here, the only other kind `PathStat` names; what makes it a
            device is the `S_IFCHR` its mode carries, which is what a host's own stat of one reports. */
         return {
             type: stat.isDirectory() ? 'dir' : 'file',
             size: stat.size,
             mtimeMs: stat.mtimeMs,
-            mode: stat.mode
+            mode
         };
     }
 

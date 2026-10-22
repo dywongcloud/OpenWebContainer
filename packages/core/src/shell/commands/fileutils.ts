@@ -1852,11 +1852,20 @@ function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcom
             let value: boolean;
             switch (word) {
                 case '-b':
-                case '-c':
                 case '-p':
                 case '-S':
                     value = false;
                     break;
+                case '-c': {
+                    /* A character device is told apart by the `S_IFCHR` its mode carries, not by
+                       the kind the file system records -- which is only ever `dir` or `file`. The
+                       mode `testFile` reports is masked to the permission bits for `ls`, so the
+                       unmasked one is read here: `test -c /dev/zero` and `[ -c /dev/urandom ]` are
+                       true, as on a host. */
+                    const entry = ctx.fs.statPath(resolveAt(ctx, args[index + 1] ?? ''));
+                    value = entry !== undefined && (Number(entry.mode ?? 0) & 0o170000) === 0o020000;
+                    break;
+                }
                 case '-d': {
                     const file = testFile(ctx, args[index + 1] ?? '');
                     value = file.exists && file.type === 'dir';
@@ -1867,7 +1876,11 @@ function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcom
                     break;
                 case '-f': {
                     const file = testFile(ctx, args[index + 1] ?? '');
-                    value = file.exists && file.type === 'file' && !file.symlink;
+                    const raw = ctx.fs.statPath(resolveAt(ctx, args[index + 1] ?? ''));
+                    const device = raw !== undefined && (Number(raw.mode ?? 0) & 0o170000) === 0o020000;
+                    /* A character device is not a regular file: `test -f /dev/null` is false on a
+                       host, for the same reason `test -c /dev/null` there is true. */
+                    value = file.exists && file.type === 'file' && !file.symlink && !device;
                     break;
                 }
                 case '-g': {

@@ -323,29 +323,59 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   where the host writes `/bin/sh: /nodir/f: No such file or directory`. Both leave status 1 and write
   nothing. The new-file case itself is fixed: `echo hi >> newfile` creates the file and writes to it,
   as the host does.
-- **`command -v` names the built-ins as built-ins.** `command -v ls` answers `ls is a shell builtin` on a
-  container whose `ls` is one, where the host answers `/bin/ls`; `command -v sh` answers `/bin/sh` now
-  that `/bin/sh` is a file. Both answer *something* for every one of `sh`, `ls`, `cat`, `echo` and `env`,
-  which is what a lookup that used to fail on all five now does. The wording is the shell's own, and it
-  is about a command this shell does not have to find a file for.
+- **`command -v` answers with the path or the bare name, as a host does** -- `/bin/ls`, `/bin/sh`, `echo`,
+  `cd` -- and `command -V` and `type` keep the wording that describes (`ls is /bin/ls`, `cd is a shell
+  builtin`). What is still absent is a file for a utility this shell has no builtin of its own: `command -v npm`,
+  `command -v git`, `command -v grep` and `command -v sed` exit 1 where a host names a file.
 
 ### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
 
 Each of these was measured by running the same script under host Node 24.15 and in the container and
 diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
 
-- **`process.stdout.writableHighWaterMark` is undefined** where the host's is 65536. `isTTY` and `columns`
-  are now left off a stream with no terminal behind it, as a piped host leaves them off, so a package that
-  sizes its output from `columns || 80` falls back here as it does there.
-- **A guest `err.stack` has no `Error: <message>` header line.** It begins at the first frame, so
-  `err.stack.split('\n')[0]` is `    at <anonymous> (/app/main.js:24:52)` where the host's is `Error: boom`.
-- **`e.requireStack` on a `MODULE_NOT_FOUND` error is undefined**, where host Node's is the array of files
-  that required the missing one. `e.message` still carries the same `Require stack:` block, and
-  `e.code` is `MODULE_NOT_FOUND` on both.
-- **`/dev/null` and `/dev/urandom` are not there.** `/dev` is created at boot, but a character device is a
-  kernel object and this file system has files and directories only: `fs.writeFileSync('/dev/null', '')`
-  makes an ordinary file, and a read of one gives back what was written rather than end of file. Shell
-  redirection to `/dev/null` is a sink and never touches the tree.
+- **`process.stdout` is an `EventEmitter` with a `write`, not a `Writable`.** `isTTY` and `columns` are now
+  left off a stream with no terminal behind it, as a piped host leaves them off, so a package that
+  sizes its output from `columns || 80` falls back here as it does there; but the rest of the stream is
+  not there -- `writableHighWaterMark` undefined where the host's is 65536, and `fd`, `writable`,
+  `writableEnded`, `errored` and `pipe` undefined too, so `typeof process.stdout.pipe` is `'undefined'`
+  and anything that pipes into stdout, or tests a stream by its `pipe`, takes the other branch.
+- **`process.getuid` (and `process.geteuid`) do not exist** where the host's return 501, so
+  `typeof process.getuid === 'function'` is false and a guard on it takes the other branch. The number is
+  not the obstacle: `os.userInfo()` in the same container reports `uid` 1000.
+- **`process.argv0` is undefined** where the host's is the path node was invoked by.
+- **`os.networkInterfaces()` is `{}`** where a host's holds eleven entries, one per interface, so a package
+  that picks an address out of it finds nothing.
+- **A guest stack frame names no receiver and carries the container's own engine frames.**
+  `E.methodFrame()` gives `    at methodFrame (/app/main.js:31:3)` where the host gives
+  `    at Object.methodFrame (...)`, a top-level frame is `at <anonymous>` where the host's is
+  `at Object.<anonymous>`, and every guest trace ends with `at call (native)`,
+  `at loadCJS (owc-bootstrap.js:...)` and `at runMain (owc-bootstrap.js:...)`, which no host trace has.
+  `util.inspect(new Error('boom'))` and an uncaught throw do carry the `Error: boom` header -- the
+  formatter that writes them prepends it -- and only `err.stack` itself does not.
+- **`/dev` holds four devices where a host holds hundreds.** `/dev/null`, `/dev/zero`, `/dev/random` and
+  `/dev/urandom` are mounted as character devices and `fs.statSync('/dev/null')` agrees with the host --
+  `isFile()` false, `isCharacterDevice()` true, `mode` 8630 -- and a read of `/dev/zero` gives eight zero
+  bytes and of `/dev/urandom` eight that are not. `/dev` itself is `dr-xr-xr-x` and nothing can be made
+  in it, as on a host: `mkdir /dev/sub` is refused. What is still recorded rather than fixed:
+  - `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd` -- and `/dev/tty`, below -- are not there:
+    `echo x > /dev/stdout` is refused in the container where a host prints `x`.
+  - `stat` carries `mode`, `size` and `type` only: `rdev` is 0 where a host's is 50331650 for
+    `/dev/null`, and `dev`, `ino`, `nlink` and `blksize` differ. A host's `rdev` encodes *this* macOS
+    major/minor (3,2) while the container is Linux-shaped, so even a derived one would not agree here.
+  - A whole-file read of a stream device is bounded here and endless on a host: `readFileSync('/dev/zero')`
+    hands back 4096 bytes, where the host call never returns at all.
+  - `ls /dev` lists four names; this host lists 354, and the container owns no disks or terminals to list.
+  - A device cannot be moved or removed, but the codes differ: `renameSync('/dev/null', x)` is `EIO` where
+    a host's is `EXDEV`, `unlinkSync('/dev/null')` `EIO` where a host's is `EPERM`, `rmdir /dev`
+    `ENOTEMPTY` where a host's is `EBUSY`.
+  - A trailing slash is dropped, so `/dev/null/` exists and reads 0 where a host answers `ENOTDIR`, and
+    `ls -d /dev/null/` lists it where a host says "Not a directory".
+  - `ls -l /dev/null` prints `-rw-rw-rw-` and a size of 0 where a host prints `crw-rw-rw-` and the device
+    number in the size column.
+  - Binary bytes read through the shell's text pipeline are not byte-exact: `head -c 8 /dev/urandom | wc -c`
+    counted 12 where a host counts 8, and `dd if=/dev/zero bs=1 count=4` reads 0 where a host reads 4.
+  `/dev/tty` is the one a guest reaches for that is not
+  there: `fs.existsSync('/dev/tty')` is false and `test -e /dev/tty` leaves 1, where a host leaves 0.
 - **The files on `PATH` are scripts, not binaries.** `/bin/sh`, `/bin/ls`, `/bin/cat`, `/bin/echo` and
   `/usr/bin/env` are created at boot beside `/usr/local/bin/node`, as executable files holding the script
   that runs the command, so `which ls`, `which cat`, `which env` and `command -v sh` all answer where they
@@ -807,8 +837,8 @@ Future plans:
 - [ ] URL forbidden host code points -- `new URL('http://a b/')` is accepted where host Node throws (row owc-url-forbidden-host-code-points)
 - [ ] URL file: scheme -- `new URL('file:/a').href` is `file://a/` where host Node gives `file:///a` (row owc-url-file-scheme-host)
 - [ ] url module legacy API -- `require('url').domainToASCII` is absent and `url.parse(...).href` writes a stray `=` before the fragment (row owc-url-module-legacy-api)
-- [ ] Builtin module namespace surface -- `node:fs` lacks `cp`/`glob`/`statfs`/`openAsBlob` and leaks `F_OK` at top level (row owc-esm-builtin-namespace-surface)
-- [ ] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
+- [ ] Builtin module namespace surface -- far wider than `node:fs`: against host Node the namespaces of 20 of 26 builtins are short (`node:constants` 56 against 231, `node:process` 36 against 83, `node:crypto` 30 against 70, `node:util` 22 against 35), `node:util` adds 5 names host Node lacks, and `node:stream/consumers` and `node:assert/strict` do not resolve at all (row owc-esm-builtin-namespace-surface)
+- [x] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
 - [ ] `cmd 3>f >&3` -- a descriptor the command itself opened is not visible to its own later `>&n` (row owc-shell-fd-opened-by-command-visible-to-itself)
 - [ ] `exec >f`, `exec 2>f` and `exec 1>&2` are dropped, so they do not persist (row owc-shell-exec-standard-fd-dropped)
 - [ ] `exec 3>&1` and `exec 3>&2` are "Bad file descriptor" where a host duplicates the standard one (row owc-shell-exec-duplicating-standard-fd)
@@ -860,14 +890,61 @@ re-run in isolation; the rows are open.
   still compiled as CommonJS -- `typeof import.meta` is a `SyntaxError` and `typeof require` is
   `function`, where the host has `object` and `undefined`, and `node --input-type=module -p 1` should
   fail with `ERR_EVAL_ESM_CANNOT_PRINT` rather than print `1`.
+- `owc-esm-require-tla-context-lines`: `require('./tla.mjs')` on a graph with top-level await -- the
+  host prints two context lines above the require stack (`  From <app>/main.js` and
+  `  Requiring <app>/tla.mjs`), the container prints the `- <app>/main.js` stack line only.
 - `owc-node-missing-entry-dump`: `node <missing>` -- the host prints its loader dump (eight
   `node:internal/modules/cjs/loader` frames, `code: 'MODULE_NOT_FOUND'`), the container prints the
   single line `Error: Cannot find module '<path>'`.
 - `owc-node-check-syntax-message`: `node --check bad.js` -- the host reports `SyntaxError: Function
   statements require a function name` with a caret under `function`, the container reports
   `SyntaxError: function name expected` with the caret elsewhere and no `Node.js v24.15.0` trailer.
+  Also on `const x = ;`: the container's frame carries the CommonJS wrapper's column offset, so an
+  eleven-character line is reported as `at /app/bad.js:1:72` where the host reports no frame at all.
 - `owc-node-spawned-command-redirect`: a spawned command used with a redirection or inside a
   subshell or `if` -- `node - < main.js`, `node main.js > out.txt`, `(node --version)` -- is refused
   with `node: cannot run here: it can only be run on a line of its own` and exit 127, where the host
   runs the command. The root cause is the shell's, not node's: `splitCompoundLine` hands any line
   holding `<`, `>`, `(`, `)` or a backtick to the script engine, which cannot spawn.
+- `owc-node-preload-missing-dump`: `node -r nopre.js -e 'console.log(1)'` -- the host prints its
+  loader dump (`node:internal/modules/cjs/loader:1479`, `Error: Cannot find module 'nopre.js'`,
+  `Require stack:` `- internal/preload`, nine frames through `loadPreloadModules`, and
+  `requireStack: [ 'internal/preload' ]`); the container reports it as the eval body having thrown
+  (`[eval]:1` / `console.log(1)` / `^` / `Error: Cannot find module 'nopre.js'` / `at [eval]:1:1`).
+  A preload that does exist fails the same way (see owc-node-require-preload-dropped).
+- `owc-node-require-missing-dump`: `node -e 'require("totally-missing-mod")'` -- the host prints its
+  loader dump with `Require stack:` `- /app/[eval]`, `Module.require`, `require
+  (node:internal/modules/helpers:153:16)` and `code: 'MODULE_NOT_FOUND'`; the container prints the
+  five-line `-e` dump (`[eval]:1` / the source / `^` / `Error: Cannot find module ...` /
+  `at [eval]:1:1`), so a `require` failure is shaped like an uncaught throw.
+- `owc-node-stack-trace-limit-ignored`: `--stack-trace-limit=N` is parsed but never bounds a trace --
+  with `=0` the host wraps the whole dump as `[[eval]:1 ... Error: x]` and prints no frame, with `=1`
+  it prints `at f ([eval]:1:20)` only and with `=2` the two source frames only, while the container
+  prints the source frames plus all seven internal ones in every case.
+- `owc-node-title-not-applied`: `--title=x` is accepted but does not set the title --
+  `node --title=x -e 'console.log(process.title)'` prints `x` on the host and `node` in the
+  container, both exiting 0 with empty stderr.
+- `owc-node-throw-nonerror-shape`: `node -e 'throw 42'` -- the host's stderr opens with a blank line
+  and ends the value with ``(Use `node --trace-uncaught ...` to show where the exception was
+  thrown)`` and prints no frame; the container has no leading blank line, prints a frame
+  `at [eval]:1:1` that node does not print for a non-Error throw, and omits the hint.
+- `owc-node-check-missing-dump`: `node --check /app/nope.js` (and `--check nope.js`) -- the host
+  prints its MODULE_NOT_FOUND dump (`node:internal/modules/cjs/loader:1479` ...
+  `at node:internal/main/check_syntax:33:20`, `code: 'MODULE_NOT_FOUND'`); the container prints the
+  single line `Error: Cannot find module '/app/nope.js'` -- the shape owc-node-missing-entry-dump
+  had before the run path was fixed, still open on the `--check` path.
+- `owc-node-empty-entry-arg`: `node ''` -- the host exits 0 with empty stdout and stderr; the
+  container resolves the empty argument to `/app` and exits 1 with the full MODULE_NOT_FOUND dump.
+- `owc-node-report-writereport-filename`: `process.report.writeReport()` -- the host returns
+  `report.20261023.003448.19534.0.001.json` (local time, pid, a `.0.` sequence and a three-digit
+  trailer); the container returns `report.20261022.163657.1.1.json` -- UTC, eight hours behind local,
+  and missing the sequence fields, so owc-node-report-getreport-shape's "writeReport is
+  byte-identical" no longer holds.
+- `owc-node-column-member-read-over-call`: a property read off a receiver that holds a call --
+  `node -e 'const f = () => ({}); f().a.b'` -- is reported one column to the right: the host puts the
+  caret and the frame at 28, on the dot, the container puts both at 29, on the `b`. V8 names the dot
+  for `f().a.b` but the property for `o.a.b`, and the two are not told apart.
+- `owc-node-column-shortcircuit-and`: `node -e '"throw" && nosuch()'` -- the host puts the caret and
+  the frame at column 1, the container at 12, so both are wrong; the caret now tracks the frame (the
+  scan that found a `throw` inside the string literal is fixed) and what is left is the frame column
+  V8 gives an `&&` expression.

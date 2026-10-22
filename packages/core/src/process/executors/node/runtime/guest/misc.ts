@@ -328,7 +328,12 @@ BF.url = function () {
   }
 
   var SCHEME_RE = /^([A-Za-z][A-Za-z0-9+.\-]*:)/;
-  var DEFAULT_PORTS = { 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21' };
+  /*
+   * A bracketed IPv6 literal is one host, brackets and all, so it is read whole and the ':' inside
+   * it is never taken for the start of a port -- which is what left 'http://[::1]:99/a' as the host
+   * '[' with the path ':1]:99/a' behind it.
+   */
+  var AUTHORITY_RE = /^([A-Za-z][A-Za-z0-9+.\-]*:)(\/\/(?:([^:@\/?#]*)(?::([^@\/?#]*))?@)?(\[[^\]\/?#]*\]|[^:\/?#]*)(?::(\d*))?)?([^?#]*)(\?[^#]*)?(#.*)?$/;
 
   function invalidUrl(input) {
     var err = new TypeError('Invalid URL');
@@ -344,15 +349,24 @@ BF.url = function () {
       var b = base instanceof URL ? base : new URL(String(base));
       str = resolveAgainst(b, str);
     }
-    var m = /^([A-Za-z][A-Za-z0-9+.\-]*:)(\/\/(?:([^:@\/?#]*)(?::([^@\/?#]*))?@)?([^:\/?#]*)(?::(\d*))?)?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(str);
+    var m = AUTHORITY_RE.exec(str);
     if (!m) throw invalidUrl(String(input));
     this.protocol = m[1].toLowerCase();
     var authority = m[2] !== undefined;
     this.username = authority ? (m[3] || '') : '';
     this.password = authority ? (m[4] || '') : '';
-    this.hostname = authority ? (m[5] || '').toLowerCase() : '';
-    var port = authority && m[6] ? m[6] : '';
-    this.port = DEFAULT_PORTS[this.protocol] === port ? '' : port;
+    var written = authority ? (m[5] || '') : '';
+    /* hostname carries the address without its brackets; host writes them back */
+    if (written.charAt(0) === '[' && written.charAt(written.length - 1) === ']') {
+      written = written.slice(1, written.length - 1);
+    }
+    /* a host is IDNA: 'пример.рф' is the host 'xn--e1afmkfd.xn--p1ai', as it is in Node */
+    this.hostname = written === '' ? '' : domainToASCII(written);
+    /*
+     * The port stays exactly as it was written. The WHATWG parser drops a port that is the scheme's
+     * own default, but url.parse reports '80' for 'http://h:80/' and 'h:80' as its host.
+     */
+    this.port = authority && m[6] ? m[6] : '';
     this.pathname = removeDotSegments(m[7] !== undefined && m[7] !== '' ? m[7] : (authority ? '/' : ''));
     this.search = m[8] && m[8].length > 1 ? m[8] : '';
     this.hash = m[9] && m[9].length > 1 ? m[9] : '';
@@ -373,7 +387,10 @@ BF.url = function () {
   }
 
   Object.defineProperty(URL.prototype, 'host', {
-    get: function () { return this.hostname + (this.port ? ':' + this.port : ''); }
+    get: function () {
+      var name = this.hostname.indexOf(':') >= 0 ? '[' + this.hostname + ']' : this.hostname;
+      return name + (this.port ? ':' + this.port : '');
+    }
   });
   Object.defineProperty(URL.prototype, 'origin', {
     get: function () { return this.protocol === 'file:' ? 'null' : this.protocol + '//' + this.host; }
@@ -385,8 +402,9 @@ BF.url = function () {
         var userinfo = this.username ? this.username + (this.password ? ':' + this.password : '') + '@' : '';
         auth = '//' + userinfo + this.host;
       }
-      var query = this.searchParams.toString();
-      return this.protocol + auth + this.pathname + (query ? '?' + query : '') + this.hash;
+      /* the query as it was written, not as the params re-serialise it: a '?' carrying no '=' is
+         '?q' in href, where the params would write '?q=' */
+      return this.protocol + auth + this.pathname + this.search + this.hash;
     }
   });
   URL.prototype.toString = function () { return this.href; };
@@ -400,14 +418,194 @@ BF.url = function () {
     }
   };
 
+  /*
+   * IDNA: punycode (RFC 3492) over one label, and the two domain functions Node's url module hands
+   * out beside it. A domain is a run of dot-separated labels, each mapped on its own -- NFC and
+   * case-folded, the way UTS-46 maps it -- and any label that will not map makes the whole domain
+   * the empty string, which is what Node answers for a domain it cannot turn into ASCII.
+   */
+  var PUNY_BASE = 36, PUNY_TMIN = 1, PUNY_TMAX = 26, PUNY_SKEW = 38, PUNY_DAMP = 700;
+  var PUNY_INITIAL_N = 128, PUNY_INITIAL_BIAS = 72, PUNY_MAX = 0x10FFFF;
+
+  function punyAdapt(delta, numPoints, firstTime) {
+    delta = firstTime ? Math.floor(delta / PUNY_DAMP) : Math.floor(delta / 2);
+    delta += Math.floor(delta / numPoints);
+    var k = 0;
+    while (delta > Math.floor((PUNY_BASE - PUNY_TMIN) * PUNY_TMAX / 2)) {
+      delta = Math.floor(delta / (PUNY_BASE - PUNY_TMIN));
+      k += PUNY_BASE;
+    }
+    return k + Math.floor((PUNY_BASE - PUNY_TMIN + 1) * delta / (delta + PUNY_SKEW));
+  }
+
+  function punyDigitToBasic(digit) {
+    return digit + 22 + 75 * (digit < 26 ? 1 : 0);
+  }
+
+  function punyBasicToDigit(code) {
+    if (code - 48 < 10) return code - 22;
+    if (code - 65 < 26) return code - 65;
+    if (code - 97 < 26) return code - 97;
+    return PUNY_BASE;
+  }
+
+  function punyEncode(text) {
+    var input = [];
+    for (var i = 0; i < text.length; i++) input.push(text.codePointAt(i));
+    var output = [];
+    var n = PUNY_INITIAL_N, delta = 0, bias = PUNY_INITIAL_BIAS;
+    var h = 0, b = 0, j, k, q, t, m;
+    for (j = 0; j < input.length; j++) if (input[j] < 0x80) output.push(String.fromCharCode(input[j]));
+    h = b = output.length;
+    if (b > 0) output.push('-');
+    while (h < input.length) {
+      m = PUNY_MAX;
+      for (j = 0; j < input.length; j++) if (input[j] >= n && input[j] < m) m = input[j];
+      delta += (m - n) * (h + 1);
+      n = m;
+      for (j = 0; j < input.length; j++) {
+        if (input[j] < n) delta++;
+        if (input[j] !== n) continue;
+        q = delta;
+        for (k = PUNY_BASE; ; k += PUNY_BASE) {
+          t = k <= bias + PUNY_TMIN ? PUNY_TMIN : (k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias);
+          if (q < t) break;
+          output.push(String.fromCharCode(punyDigitToBasic(t + (q - t) % (PUNY_BASE - t))));
+          q = Math.floor((q - t) / (PUNY_BASE - t));
+        }
+        output.push(String.fromCharCode(punyDigitToBasic(q)));
+        bias = punyAdapt(delta, h + 1, h === b);
+        delta = 0;
+        h++;
+      }
+      delta++;
+      n++;
+    }
+    return output.join('');
+  }
+
+  function punyDecode(text) {
+    var output = [];
+    var n = PUNY_INITIAL_N, i = 0, bias = PUNY_INITIAL_BIAS, at = 0;
+    var split = text.lastIndexOf('-');
+    if (split > 0) {
+      for (var j = 0; j < split; j++) output.push(text.charCodeAt(j));
+      at = split + 1;
+    }
+    while (at < text.length) {
+      var oldi = i;
+      var w = 1;
+      var k = PUNY_BASE;
+      for (;;) {
+        var digit = punyBasicToDigit(text.charCodeAt(at++));
+        if (digit >= PUNY_BASE) throw invalidUrl(text);
+        i += digit * w;
+        var t = k <= bias + PUNY_TMIN ? PUNY_TMIN : (k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias);
+        if (digit < t) break;
+        w *= (PUNY_BASE - t);
+        k += PUNY_BASE;
+      }
+      bias = punyAdapt(i - oldi, output.length + 1, oldi === 0);
+      n += Math.floor(i / (output.length + 1));
+      i = i % (output.length + 1);
+      output.splice(i, 0, n);
+      i++;
+    }
+    return output.map(function (code) { return String.fromCodePoint(code); }).join('');
+  }
+
+  function isAsciiLabel(text) {
+    for (var i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0x7f) return false;
+    return true;
+  }
+
+  /* UTS-46 DISALLOWED, in the rough: a label holding a control or one of the C1 bytes is refused. */
+  function idnaValid(text) {
+    for (var i = 0; i < text.length; i++) {
+      var code = text.codePointAt(i);
+      if (code > 0xffff) i++;
+      if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) return false;
+    }
+    return true;
+  }
+
+  function mapLabel(label) {
+    var folded = label.toLowerCase();
+    return typeof folded.normalize === 'function' ? folded.normalize('NFC') : folded;
+  }
+
+  function asciiLabelOf(label) {
+    if (label.length >= 4 && label.slice(0, 4).toLowerCase() === 'xn--') {
+      var inner = label.slice(4);
+      if (inner === '') return null;
+      var decoded;
+      try { decoded = punyDecode(inner); } catch (notPunycode) { return null; }
+      if (!idnaValid(decoded)) return null;
+      var recoded = punyEncode(decoded);
+      /* an escape that does not re-encode to itself is not a domain: 'xn--abc' is refused */
+      if (recoded.toLowerCase() !== inner.toLowerCase()) return null;
+      return 'xn--' + recoded;
+    }
+    var mapped = mapLabel(label);
+    if (isAsciiLabel(mapped)) return mapped;
+    if (!idnaValid(mapped)) return null;
+    return 'xn--' + punyEncode(mapped);
+  }
+
+  function domainToASCII(domain) {
+    var text = String(domain);
+    if (text === '') return '';
+    var labels = text.split('.');
+    var out = [];
+    for (var i = 0; i < labels.length; i++) {
+      if (labels[i] === '') { out.push(''); continue; }
+      var ascii = asciiLabelOf(labels[i]);
+      if (ascii === null) return '';
+      out.push(ascii);
+    }
+    return out.join('.');
+  }
+
+  function domainToUnicode(domain) {
+    var text = String(domain);
+    if (text === '') return '';
+    var labels = text.split('.');
+    var out = [];
+    for (var i = 0; i < labels.length; i++) {
+      var label = labels[i];
+      if (label.length >= 4 && label.slice(0, 4).toLowerCase() === 'xn--') {
+        var inner = label.slice(4);
+        if (inner === '') return '';
+        var decoded;
+        try { decoded = punyDecode(inner); } catch (notPunycode) { return ''; }
+        if (!idnaValid(decoded)) return '';
+        if (punyEncode(decoded).toLowerCase() !== inner.toLowerCase()) return '';
+        out.push(decoded);
+        continue;
+      }
+      out.push(label);
+    }
+    return out.join('.');
+  }
+
   function fileURLToPath(u) {
-    var href = typeof u === 'string' ? u : u.href;
-    if (href.indexOf('file://') !== 0) {
+    var parsed = typeof u === 'string' ? new URL(u) : (u instanceof URL ? u : new URL(String(u.href)));
+    if (parsed.protocol !== 'file:') {
       var err = new TypeError('The URL must be of scheme file');
       err.code = 'ERR_INVALID_URL_SCHEME';
       throw err;
     }
-    return decodeURIComponent(new URL(href).pathname);
+    /*
+     * A file: URL names no host but 'localhost', which names none at all. Node words the refusal
+     * with the platform under it, and the platform this runtime reports is its own.
+     */
+    if (parsed.hostname !== '' && parsed.hostname !== 'localhost') {
+      var hostErr = new TypeError(
+        'File URL host must be "localhost" or empty on ' + requireBuiltin('os').platform());
+      hostErr.code = 'ERR_INVALID_FILE_URL_HOST';
+      throw hostErr;
+    }
+    return decodeURIComponent(parsed.pathname);
   }
 
   function pathToFileURL(p) {
@@ -474,7 +672,11 @@ BF.url = function () {
 
   return {
     URL: URL,
+    /* Node's legacy constructor, still on the module beside the WHATWG class */
+    Url: URL,
     URLSearchParams: URLSearchParams,
+    domainToASCII: domainToASCII,
+    domainToUnicode: domainToUnicode,
     fileURLToPath: fileURLToPath,
     pathToFileURL: pathToFileURL,
     parse: parse,

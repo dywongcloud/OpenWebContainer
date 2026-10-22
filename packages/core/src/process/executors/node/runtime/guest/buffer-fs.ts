@@ -910,14 +910,30 @@ BF.fs = function () {
   function Stats() {}
   Object.defineProperty(Stats.prototype, Symbol.toStringTag, { value: 'Stats', configurable: true });
 
+  /* The bits of st_mode that say what a path is, and the value each kind leaves in them. A mode the
+     file system already carries is the authority -- it is what makes a character device a device and
+     not a file -- and only a mode with no format in it falls back to the type the store reports. */
+  var S_IFMT = 61440;
+  var S_IFREG = 32768;
+  var S_IFDIR = 16384;
+  var S_IFLNK = 40960;
+  var S_IFCHR = 8192;
+  var S_IFBLK = 24576;
+  var S_IFIFO = 4096;
+  var S_IFSOCK = 49152;
+
   function makeStats(st, opts, isLink) {
     var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
     // With bigint every numeric field is a BigInt; the four date fields stay Date objects.
     var num = bigint ? function (value) { return BigInt(value); } : function (value) { return value; };
     var mtime = new Date(st.mtimeMs);
+    var mode = st.mode !== undefined ? st.mode : (st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188));
+    var format = Number(mode) & S_IFMT;
+    /* The kind a mode says, or -- with no format in it -- the one the store recorded. */
+    var kindOf = function (bit, type) { return format === 0 ? st.type === type : format === bit; };
     var out = {
       dev: num(0),
-      mode: num(st.mode !== undefined ? st.mode : (st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188))),
+      mode: num(mode),
       nlink: num(st.nlink !== undefined ? st.nlink : 1),
       uid: num(0),
       gid: num(0),
@@ -934,13 +950,13 @@ BF.fs = function () {
       mtime: mtime,
       ctime: mtime,
       birthtime: mtime,
-      isFile: function () { return !isLink && st.type === 'file'; },
-      isDirectory: function () { return !isLink && st.type === 'dir'; },
+      isFile: function () { return !isLink && kindOf(S_IFREG, 'file'); },
+      isDirectory: function () { return !isLink && kindOf(S_IFDIR, 'dir'); },
       isSymbolicLink: function () { return !!isLink; },
-      isBlockDevice: function () { return false; },
-      isCharacterDevice: function () { return false; },
-      isFIFO: function () { return false; },
-      isSocket: function () { return false; }
+      isBlockDevice: function () { return format === S_IFBLK; },
+      isCharacterDevice: function () { return format === S_IFCHR; },
+      isFIFO: function () { return format === S_IFIFO; },
+      isSocket: function () { return format === S_IFSOCK; }
     };
     Object.setPrototypeOf(out, Stats.prototype);
     return out;
@@ -958,7 +974,10 @@ BF.fs = function () {
   Dirent.prototype.isDirectory = function () { return this[kDirentType] === 'dir'; };
   Dirent.prototype.isSymbolicLink = function () { return this[kDirentType] === 'link'; };
   Dirent.prototype.isBlockDevice = function () { return false; };
-  Dirent.prototype.isCharacterDevice = function () { return false; };
+  // A character device is its own kind here, as it is in Node: readdir of /dev with file types
+  // names every one of the four a character device on a host, and a Dirent that called one a file
+  // made isCharacterDevice() of the entries false.
+  Dirent.prototype.isCharacterDevice = function () { return this[kDirentType] === 'chr'; };
   Dirent.prototype.isFIFO = function () { return false; };
   Dirent.prototype.isSocket = function () { return false; };
   Object.defineProperty(Dirent.prototype, Symbol.toStringTag, { value: 'Dirent', configurable: true });
@@ -969,8 +988,14 @@ BF.fs = function () {
     return SYMLINKS[abs] !== undefined ? { type: 'link', size: st.size, mtimeMs: st.mtimeMs } : st;
   }
 
+  /* The kind the file system recorded is only dir or file; what makes a device a device is the
+     S_IFCHR its mode carries, which is how its own Stats tells one apart and how a host reads one. */
+  function isCharacterDevice(st) {
+    return st !== null && st !== undefined && st.mode !== undefined && (Number(st.mode) & 61440) === 8192;
+  }
+
   function makeDirent(name, st, parentPath) {
-    return new Dirent(name, parentPath, st.type === 'link' ? 'link' : (st.type === 'dir' ? 'dir' : 'file'));
+    return new Dirent(name, parentPath, st.type === 'link' ? 'link' : (st.type === 'dir' ? 'dir' : isCharacterDevice(st) ? 'chr' : 'file'));
   }
 
   function readBytesOf(file) {
@@ -1435,6 +1460,7 @@ BF.fs = function () {
     DESCRIPTORS[fd] = {
       path: file,
       flags: f,
+      device: !isDir && !!st && isCharacterDevice(st),
       bytes: bytes,
       position: letter === 'a' ? bytes.length : 0,
       writable: creates || f.indexOf('+') >= 0,
@@ -1486,6 +1512,26 @@ BF.fs = function () {
       : (typeof length === 'number' ? length : buffer.length - off);
     var at = opts ? (typeof opts.position === 'number' ? opts.position : rec.position)
       : (typeof position === 'number' ? position : rec.position);
+    /* A device has no bytes of its own, so the chunk openSync read of it -- 4096 of them -- was
+       all a descriptor ever had: a second readSync past it reported end of file, and a guest that
+       looped drawing entropy from /dev/zero or /dev/urandom got one chunk and then stopped, where
+       a host never reaches an end at all. Each read asks the device for more. A device that is at
+       end of file, /dev/null, hands back nothing, which is the end it really has. */
+    if (rec.device) {
+      var limit = Math.min(len, (buffer.length || 0) - off);
+      var target2 = ArrayBuffer.isView(buffer) ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength) : buffer;
+      var got = 0;
+      var rounds = 0;
+      while (got < limit && rounds++ < 64) {
+        var chunk = readBytesOf(rec.path);
+        if (chunk.length === 0) break;
+        var take = Math.min(chunk.length, limit - got);
+        for (var j = 0; j < take; j++) target2[off + got + j] = chunk[j];
+        got += take;
+      }
+      if (!explicitRead(offset, length, position)) rec.position = at + got;
+      return got;
+    }
     var available = rec.bytes.length - at;
     if (available <= 0 || len <= 0) return 0;
     var n = Math.min(len, available, buffer.length - off);
