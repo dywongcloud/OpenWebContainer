@@ -113,7 +113,15 @@ function readOne(ctx: CommandContext, path: string): { text: string | undefined;
         isDir = false;
     }
     if (isDir) return { text: undefined, isDir: true };
-    return { text: ctx.fs.readFile(full), isDir: false };
+    /* A file that is not there is a missing file, not an exception: the filesystem says so by
+       throwing, and a command turns that into its own diagnostic -- `head: nope.txt: No such file
+       or directory`, the line a host's head writes -- which the thrown ENOENT was hiding behind a
+       Node-style `ENOENT: No such file or directory, '/app/nope.txt'`. */
+    try {
+        return { text: ctx.fs.readFile(full), isDir: false };
+    } catch {
+        return { text: undefined, isDir: false };
+    }
 }
 
 /** Recursively collect regular files below a directory, depth first and sorted. */
