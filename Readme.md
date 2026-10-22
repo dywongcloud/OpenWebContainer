@@ -260,8 +260,8 @@ the remaining cost is in the HTTP/2 implementation rather than in the transport.
 fixed, here.
 
 **The cause, measured live, and why it is not a transport bug.** 16 MiB of HTTP/2 costs this guest
-about 50 ns of CPU per byte against host Node's 6 ns -- the same script run at 1 MiB and at 16 MiB,
-two runs each, the difference attributed to the 15 MiB -- which is a ~9x floor, about 19 MiB/s worth
+about 50 ns of CPU per byte against host Node's 5-6 ns -- the same script run at 1 MiB and at 16 MiB,
+two runs each, the difference attributed to the 15 MiB -- which is a ~9-10x floor, about 19 MiB/s worth
 of CPU, that no change to the bridge can move: Node frames, windows and streams HTTP/2 in nghttp2, in
 C++, while the guest does all three in JavaScript that QuickJS runs, and the framing on its own, with
 no socket and no bridge at all, is 2-3 ns/byte here against 0.2-0.4 on host. Add the waiting the

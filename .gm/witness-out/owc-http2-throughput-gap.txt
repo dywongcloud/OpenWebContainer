@@ -1,0 +1,79 @@
+machine:  6:56  up 3 days, 15:21, 7 users, load averages: 37.63 37.21 31.91
+free: System-wide memory free percentage: 68%  pages free: 215639.
+
+=== 1. end-to-end HTTP/2, 16 MiB, 64 KiB writes ===
+--- host ---
+h2 up ms=120
+h2 up ms=93
+--- container ---
+h2 up ms=2073
+h2 up ms=2764
+
+=== 2. CPU per byte: same script at 1 MiB and 16 MiB, two runs each ===
+--- host ---
+-n size=1048576 run1  
+ real	0m0.127s user	0m0.062s sys	0m0.023s 
+-n size=1048576 run2  
+ real	0m0.112s user	0m0.063s sys	0m0.022s 
+-n size=16777216 run1  
+ real	0m0.233s user	0m0.089s sys	0m0.078s 
+-n size=16777216 run2  
+ real	0m0.197s user	0m0.094s sys	0m0.080s 
+--- container ---
+-n size=1048576 run1  
+ real	0m2.674s user	0m1.992s sys	0m0.308s 
+-n size=1048576 run2  
+ real	0m2.637s user	0m1.974s sys	0m0.287s 
+-n size=16777216 run1  
+ real	0m5.077s user	0m2.701s sys	0m0.361s 
+-n size=16777216 run2  
+ real	0m4.162s user	0m2.716s sys	0m0.351s 
+
+=== 3. the framing work alone, no socket, no bridge ===
+--- host ---
+frame+pushed 16 MiB in 3 ms (6044.3 MiB/s), got=0
+per byte ns=0.2
+DONE
+--- container ---
+frame+pushed 16 MiB in 45 ms (357.5 MiB/s), got=0
+per byte ns=2.7
+
+=== 4. guest macrotask hops for the same 16 MiB: HTTP/1.1 vs HTTP/2 ===
+--- host ---
+h1 up ms=60 setTimeout=0 setImmediate=0 nextTick=1035 microtask=0
+h2 up ms=93 setTimeout=0 setImmediate=0 nextTick=4356 microtask=0
+DONE
+--- container ---
+h1 up ms=646 setTimeout=259 setImmediate=0 nextTick=1047 microtask=3
+h2 up ms=2131 setTimeout=771 setImmediate=7 nextTick=3348 microtask=773
+
+=== 5. raw (non-compat) HTTP/2, 16 MiB ===
+--- host ---
+raw h2 up ms=99 MiB/s=161.0
+--- container ---
+raw h2 up ms=2062 MiB/s=7.8
+
+
+==== verification re-run, own session verify-http2-net, dispatch bash-verify-http2-net-88006-1792709930202-3326 ====
+container CPU delta 15 MiB = (2.629+0.354)-(1.953+0.279) = 0.751 s -> 50.1 ns/byte (19.9 MiB/s ceiling)
+host      CPU delta 15 MiB = (0.085+0.075)-(0.062+0.021) = 0.077 s -> 5.1 ns/byte
+ratio 9.8x on CPU alone; wall 2070 ms container vs 87 ms host
+
+machine:  6:58  up 3 days, 15:24, 7 users, load averages: 28.98 35.43 32.16
+free: System-wide memory free percentage: 67%  pages free: 162627.
+== 1. virtual network surface: host Node 24.15 vs container ==
+host lines=26 container lines=26
+VERDICT virtual-net: IDENTICAL
+== 2. HTTP/2: 16 MiB end to end, and CPU per byte ==
+-n host 16 MiB: 
+h2 up ms=87
+-n container 16 MiB: 
+h2 up ms=2070
+-n container cpu size=1048576: 
+ real	0m2.323s user	0m1.953s sys	0m0.279s 
+-n container cpu size=16777216: 
+ real	0m4.294s user	0m2.629s sys	0m0.354s 
+-n host cpu size=1048576: 
+ real	0m0.109s user	0m0.062s sys	0m0.021s 
+-n host cpu size=16777216: 
+ real	0m0.194s user	0m0.085s sys	0m0.075s 
