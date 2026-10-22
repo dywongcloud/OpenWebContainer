@@ -149,42 +149,178 @@ const REQUIRE_ASYNC_MESSAGE = 'require() cannot be used on an ESM graph with top
     ' To see where the top-level await comes from, use --experimental-print-required-tla.';
 
 /**
- * A failure of a `-e`/`-p` run, in the shape node prints one: the file and the line, the offending
- * line of the source, a caret under it, then the error and the one frame that is the script's own.
+ * What node writes for a `node <entry>` whose entry resolves to nothing: the preamble of the loader
+ * line that threw, the name of what it could not find, the eight frames of its CommonJS loader, the
+ * error's own `code` and `requireStack`, and the trailer. Captured from the build NODE_VERSION names,
+ * as the usage block is: a frame names a file this container does not have, at a line only that build
+ * knows, so there is nothing here to read them from.
  *
- * The frames behind that one are the container's -- `runEval`, `owc-bootstrap.js` -- and no host
- * node names anything of ours, so they are dropped rather than printed: what is left is the dump
- * node writes, minus the `node:internal` frames of its own loader, which no build here can name
- * without inventing their line numbers. The engine's wording of the error is its own too, and that
- * is not something a QuickJS run can change.
+ * `requireStack` is empty because the run never got as far as a module that requires: the entry is
+ * the one module node loads with nothing behind it. A `require()` of a module that is not there,
+ * which has a stack of its own, is built in the guest and reads differently.
+ */
+function entryNotFoundText(named: string): string {
+    return 'node:internal/modules/cjs/loader:1479\n' +
+        '  throw err;\n' +
+        '  ^\n' +
+        '\n' +
+        `Error: Cannot find module '${named}'\n` +
+        '    at Module._resolveFilename (node:internal/modules/cjs/loader:1476:15)\n' +
+        '    at wrapResolveFilename (node:internal/modules/cjs/loader:1049:27)\n' +
+        '    at defaultResolveImplForCJSLoading (node:internal/modules/cjs/loader:1073:10)\n' +
+        '    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1094:12)\n' +
+        '    at Module._load (node:internal/modules/cjs/loader:1262:25)\n' +
+        '    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)\n' +
+        '    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)\n' +
+        '    at node:internal/main/run_main_module:33:47 {\n' +
+        "  code: 'MODULE_NOT_FOUND',\n" +
+        '  requireStack: []\n' +
+        '}\n' +
+        '\n' +
+        `Node.js ${NODE_VERSION}`;
+}
+
+/**
+ * The frames node writes behind the frame of the source's own on a `-e`/`-p` run that threw: the
+ * compile of the source, the wrapper it was run in, and the two internals that got there. Captured
+ * from the build NODE_VERSION names, as the usage block is -- a frame names a file this container
+ * does not have, at a line only that build knows, so there is nothing here to read them from.
+ */
+const EVAL_RUNTIME_FRAMES = [
+    '    at runScriptInThisContext (node:internal/vm:219:10)',
+    '    at node:internal/process/execution:451:12',
+    '    at [eval]-wrapper:6:24',
+    '    at runScriptInContext (node:internal/process/execution:449:60)',
+    '    at evalFunction (node:internal/process/execution:283:30)',
+    '    at evalTypeScript (node:internal/process/execution:295:3)',
+    '    at node:internal/main/eval_string:71:3'
+];
+
+/**
+ * The frames node writes for a source it could not compile. There is no frame of the source's own
+ * in front of them: a source that did not compile never ran, so nothing of it was ever on the stack.
+ */
+const EVAL_SYNTAX_FRAMES = [
+    '    at makeContextifyScript (node:internal/vm:194:14)',
+    '    at compileScript (node:internal/process/execution:388:10)',
+    '    at evalTypeScript (node:internal/process/execution:260:22)',
+    '    at node:internal/main/eval_string:71:3'
+];
+
+/**
+ * The column node points at for a failure the engine reported at `column` of `line`.
+ *
+ * The two engines name different characters of one construct: QuickJS names the parenthesis a
+ * function is called with, where V8 names the start of the expression that calls it -- `new` and a
+ * member chain in front of it included -- and it names the dot of a property read, where V8 names
+ * the property. The dump is the one node writes, so the column is moved onto the character node
+ * would have named: back over the callee, or one past the dot. A column that is neither is left
+ * where the engine put it rather than guessed at.
+ */
+function nodeColumn(text: string, column: number): number {
+    const at = column - 1;
+    const ch = text[at];
+    if (ch === undefined) return column;
+    if (ch === '.') return column + 1;
+    if (ch !== '(') return column;
+    let end = at - 1;
+    while (end >= 0 && /\s/.test(text[end] ?? '')) end--;
+    if (end < 0 || text[end] === ')') return column;
+    /* The callee: a name, or names read off one another -- `a.b.c()` -- walked backwards. */
+    let start = end;
+    for (;;) {
+        while (start >= 0 && /[A-Za-z0-9_$]/.test(text[start] ?? '')) start--;
+        let dot = start;
+        while (dot >= 0 && /\s/.test(text[dot] ?? '')) dot--;
+        if (dot < 0 || text[dot] !== '.') break;
+        start = dot - 1;
+    }
+    let head = start + 1;
+    /* `new` in front of the callee is part of the expression V8 names: `new Error()` is reported at
+       the `new`, not at the parenthesis. */
+    let word = head - 1;
+    while (word >= 0 && /\s/.test(text[word] ?? '')) word--;
+    if (word >= 2 && text.slice(word - 2, word + 1) === 'new'
+        && !/[A-Za-z0-9_$]/.test(text[word - 3] ?? '')) {
+        head = word - 2;
+    }
+    return head + 1;
+}
+
+/**
+ * The column node points the caret at, which is not always the column of the frame: a `throw` is
+ * marked at the `throw` and reported at the expression it throws, so `throw new Error('x')` is a
+ * caret under `throw` and a frame at `new`. The `throw` that raised the error is the last one behind
+ * it on the line, and one behind a `;`, `{` or `}` belongs to an earlier statement, so the walk
+ * stops there. A failure no `throw` raised keeps the column the frame has.
+ */
+function caretColumn(text: string, column: number): number {
+    for (let at = column - 1; at >= 0; at--) {
+        const ch = text[at];
+        if (ch === ';' || ch === '{' || ch === '}') break;
+        if (ch === 'w' && at >= 4 && text.slice(at - 4, at + 1) === 'throw'
+            && !/[A-Za-z0-9_$]/.test(text[at - 5] ?? '')) {
+            return at - 3;
+        }
+    }
+    return column;
+}
+
+/**
+ * A failure of a `-e`/`-p` run, in the shape node prints one: the file and the line, the offending
+ * line of the source, a caret under it, then the error, the frames of the source's own, and the
+ * frames of node's internals behind them.
+ *
+ * The wording of the error is the engine's and not V8's -- `cannot read property 'x' of null` where
+ * node says `Cannot read properties of null (reading 'x')` -- and so is the detail line V8 puts under
+ * a syntax error (`Expression expected`): neither is something a QuickJS run can change.
  */
 function evalFailureText(message: string, source: string): string {
     const lines = message.split('\n');
     const first = lines[0] ?? '';
-    const frames = lines.slice(1);
     /*
-     * Where the failure is in the source the line gave: the frame of the indirect eval `-p` runs the
-     * source through names the engine's `<input>`, and its line and column are the source's own; a
-     * `-e` source is compiled inside the CommonJS wrapper, so the frame names `[eval]` and its
-     * column carries the wrapper's length in front of the source's.
+     * The frames of the source the line gave, innermost first, up to the first one that is not:
+     * behind them come the container's own -- `runEval`, `owc-bootstrap.js`, `(native)` -- and no
+     * host node names anything of ours, so they are dropped rather than printed.
+     *
+     * `<input>` is the indirect eval a `-p` source runs through; `[eval]` is the file a `-e` source
+     * is compiled as, which the engine names with its directory in front of it (`/app/[eval]`), and
+     * whose first line carries the CommonJS wrapper in front of the source.
      */
-    const frame = (pattern: RegExp): RegExpExecArray | undefined => {
-        const found = frames.map((line) => pattern.exec(line)).find((match) => match !== null);
-        return found === undefined ? undefined : found;
-    };
-    const inner = frame(/^\s*at (?:.*?)<input>:(\d+):(\d+)\s*$/);
-    const outer = frame(/^\s*at (?:.*?)\((?:\/\/)?\[eval\]:(\d+):(\d+)\)\s*$/);
-    const at = inner ?? outer;
-    const line = at === undefined ? 1 : Number(at[1]);
-    const column = at === undefined ? 1
-        : inner !== undefined ? Number(at[2])
-            : Math.max(1, Number(at[2]) - EVAL_WRAPPER_PREFIX);
+    const frames: string[] = [];
+    let line = 1;
+    let column = 1;
+    for (const text of lines.slice(1)) {
+        const match = /^\s*at (?:(.*?) )?\(?\s*(?:<input>|[^\s()]*\[eval\]):(\d+):(\d+)\s*\)?\s*$/.exec(text);
+        if (match === null) break;
+        const atLine = Number(match[2]);
+        const raw = Number(match[3]);
+        const shifted = text.includes('<input>') || atLine !== 1 ? 0 : EVAL_WRAPPER_PREFIX;
+        const shownColumn = nodeColumn(source.split('\n')[atLine - 1] ?? '', Math.max(1, raw - shifted));
+        const name = match[1] === undefined || match[1] === '<anonymous>' || match[1] === '<eval>'
+            ? undefined
+            : match[1];
+        if (frames.length === 0) {
+            line = atLine;
+            column = shownColumn;
+        }
+        frames.push(name === undefined
+            ? `    at [eval]:${atLine}:${shownColumn}`
+            : `    at ${name} ([eval]:${atLine}:${shownColumn})`);
+    }
     const shown = (source.split('\n')[line - 1] ?? '').replace(/\t/g, ' ');
+    const marked = caretColumn(shown, column);
     /* Node points past the end of the line with spaces and no caret -- a syntax error at the end of
        `1+` sits one column past the `+` -- so a column past the text is shown the way it shows one. */
-    const caret = column > shown.length ? ' '.repeat(shown.length) : ' '.repeat(column - 1) + '^';
-    return `[eval]:${line}\n${shown}\n${caret}\n\n` +
-        `${first}\n    at [eval]:${line}:${column}\n\nNode.js ${NODE_VERSION}`;
+    const caret = marked > shown.length ? ' '.repeat(shown.length) : ' '.repeat(marked - 1) + '^';
+    const header = `[eval]:${line}\n${shown}\n${caret}\n\n`;
+    const trailer = `\n\nNode.js ${NODE_VERSION}`;
+    /* A source node could not compile is a SyntaxError with no frame of its own: nothing of it ran.
+       A stack with no frame of the source in it at all -- a source read as an ES module, which is
+       compiled as a module and named after it -- is reported as it always was. */
+    if (frames.length === 0) return `${header}${first}\n    at [eval]:1:1${trailer}`;
+    if (first.startsWith('SyntaxError')) return `${header}${first}\n${EVAL_SYNTAX_FRAMES.join('\n')}${trailer}`;
+    return `${header}${first}\n${frames.join('\n')}\n${EVAL_RUNTIME_FRAMES.join('\n')}${trailer}`;
 }
 
 /** What a guest is given to read a CommonJS body with: the wrapper the host compiles it inside. */
@@ -1149,7 +1285,7 @@ export class NodeProcess extends Process {
                 ? entry
                 : entry.startsWith('/') ? normalizeAbsolute(entry)
                     : normalizeAbsolute(joinPaths(this.currentCwd, entry));
-            throw new Error(`Cannot find module '${named}'`);
+            throw new GuestFailure(entryNotFoundText(named));
         }
         return found;
     }
