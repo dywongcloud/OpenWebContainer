@@ -430,6 +430,11 @@ export function createAddon(host: SharpAddonHost = {}): object {
                 info.cropOffsetTop = cropTop;
             }
             if (fileOut !== '') {
+                // A raw file is not a format sharp can write to disk: the extension names the format,
+                // and .raw names none, so the add-on is never reached and sharp itself refuses with
+                // "Unsupported output format <path>". The shim's own format table says the same thing
+                // (raw output.file is false), so refuse rather than write bytes no reader can open.
+                if (encoded.format === 'raw') throw unsupportedFormat(fileOut, 'output');
                 if (!host || !host.fs || typeof host.fs.write !== 'function') throw noHostFileSystem();
                 host.fs.write(fileOut, bytes);
                 // A file write resolves with the info object, not the bytes: lib/output.js passes the

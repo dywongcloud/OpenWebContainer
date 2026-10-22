@@ -128,9 +128,20 @@ function tokenize(text: string): string[] {
 }
 
 /** How the add-on writes font back: the size in px, then the family when there is one. */
+/**
+ * The shorthand back the way node-canvas reports it, which is the CSS serialization order: style,
+ * variant and weight in front of the size, each omitted while it is still `normal`. Dropping them
+ * would answer `bold 20px sans-serif` with `20px sans-serif`, so the weight and the style a caller
+ * set have to survive the round trip.
+ */
 export function formatFont(f: FontSpec): string {
+    const prefix: string[] = [];
+    if (f.style !== 'normal') prefix.push(f.style);
+    if (f.variant !== 'normal') prefix.push(f.variant);
+    if (f.weight !== 'normal') prefix.push(f.weight);
+    const head = prefix.length === 0 ? '' : prefix.join(' ') + ' ';
     const size = String(f.size) + 'px';
-    return f.family === '' ? size : size + ' ' + f.family;
+    return f.family === '' ? head + size : head + size + ' ' + f.family;
 }
 
 export function defaultFont(): FontSpec {

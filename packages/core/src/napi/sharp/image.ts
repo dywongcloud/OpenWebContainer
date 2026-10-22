@@ -7,6 +7,8 @@
  * then the named kernel for what is left, with the kernel widened by the reduce factor. A resample is
  * separable, so a resize runs across rows and then down columns.
  */
+import { badExtractArea } from './errors';
+
 /** The only band counts an image can have, which is also what the codecs' own Image type allows. */
 export type ChannelCount = 1 | 2 | 3 | 4;
 
@@ -334,14 +336,17 @@ export function resizeImage(image: Image, spec: ResizeSpec): Image {
 /* ------------------------------------------------------- geometry operations */
 
 /**
- * The region of `width` x `height` at (left, top). sharp clamps the region to the image, so a region
- * hanging off the edge is shorter, never padded.
+ * The region of `width` x `height` at (left, top). A region that hangs off the edge is refused, as
+ * libvips refuses it: `extract_area: bad extract area` (measured on sharp 0.33.5). Clamping instead
+ * would hand back a smaller image than the caller asked for and say nothing, which is the one thing
+ * worse than a refusal here.
  */
 export function extractImage(image: Image, left: number, top: number, width: number, height: number): Image {
-    const l = Math.max(0, Math.min(Math.floor(left), image.width));
-    const t = Math.max(0, Math.min(Math.floor(top), image.height));
-    const w = Math.max(0, Math.min(Math.floor(width), image.width - l));
-    const h = Math.max(0, Math.min(Math.floor(height), image.height - t));
+    const l = Math.floor(left);
+    const t = Math.floor(top);
+    const w = Math.floor(width);
+    const h = Math.floor(height);
+    if (l < 0 || t < 0 || l + w > image.width || t + h > image.height) throw badExtractArea();
     const out = createImage(w, h, image.channels);
     const rowBytes = w * image.channels;
     for (let y = 0; y < h; y++) {

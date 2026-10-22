@@ -36,6 +36,11 @@ export function unsupportedOperationFor(option: string): Error {
     return unsupportedOperation(`option ${option}`);
 }
 
+/** The message libvips gives for a region that is not inside the image, which sharp passes through. */
+export function badExtractArea(): Error {
+    return new Error('extract_area: bad extract area');
+}
+
 /** A limit the shim honours exactly as sharp does: 0x3FFF x 0x3FFF pixels by default. */
 export function pixelLimit(width: number, height: number, limit: number): Error {
     return new Error(`Input image exceeds pixel limit of ${limit} (${width} x ${height})`);
