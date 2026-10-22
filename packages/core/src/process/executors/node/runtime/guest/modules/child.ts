@@ -529,7 +529,11 @@ function cpExit(child, code, signal) {
   if (child._cpExited) return;
   child._cpExited = true;
   if (child._cpTimer) clearTimeout(child._cpTimer);
-  var exitCode = child._cpWorker && code === null ? 0 : code;
+  /* A terminated worker ends with status 1: the thread did not choose to exit, it was stopped. A
+     worker that ends on its own keeps the status it chose, and one with no status keeps 0. */
+  var exitCode = child._cpWorker
+    ? (child._cpTerminated ? 1 : (code === null ? 0 : code))
+    : code;
   child.exitCode = exitCode;
   child.signalCode = signal;
   cpRefChild(child, false);
@@ -698,6 +702,9 @@ function cpWorkerClass() {
   };
   Worker.prototype.terminate = function () {
     var self = this;
+    /* Node ends a terminated worker with status 1: the thread did not choose to exit, it was stopped.
+       A worker that ends on its own keeps the status it chose. */
+    self._cpTerminated = true;
     return new Promise(function (resolve) {
       if (self._cpExited) {
         resolve(self.exitCode === null ? 0 : self.exitCode);
@@ -836,7 +843,9 @@ function cpSyncRun(file, list, opts) {
   var argv = list;
   if (opts.shell) {
     argv = ['-c', [exe].concat(list).join(' ')];
-    exe = 'sh';
+    /* /bin/sh, the path a host runs its shell by, because that path is what a script of the
+       command reads out of $0: sh -c 'echo $0' prints /bin/sh on a host, not sh. */
+    exe = '/bin/sh';
   }
   var stdio = cpStdio(opts.stdio);
   var cwd = opts.cwd === undefined || opts.cwd === null ? undefined : String(opts.cwd);
@@ -911,7 +920,9 @@ function cpSpawnSyncApi(file, args, options) {
 function cpExecSyncApi(command, options) {
   var opts = options && typeof options === 'object' ? options : {};
   var cmd = String(command);
-  var ret = cpSyncRun('sh', ['-c', cmd], opts);
+  /* execSync runs the command through /bin/sh, the path a host's node runs it by: $0 inside the
+     command reads that path, as it does on a host. */
+  var ret = cpSyncRun('/bin/sh', ['-c', cmd], opts);
   if (opts.stdio === undefined && ret.stderr) proc.stderr.write(ret.stderr);
   var failure = cpSyncFailure(ret, cmd);
   if (failure) throw failure;

@@ -202,7 +202,8 @@ function registryByPidOf(record: ChildRecord): Map<number, ChildRecord> {
 
 const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
     const registry = registryFor(ctx);
-    const file = executableOf(String(args.file));
+    const cwd = typeof args.cwd === 'string' ? args.cwd : ctx.cwd();
+    const file = spawnExecutableOf(ctx, executableOf(String(args.file)), args.env ? { ...args.env } : childEnvOf(ctx), cwd);
     const argv: string[] = Array.isArray(args.args) ? args.args.map(String) : [];
     const env: Record<string, string> = args.env ? { ...args.env } : childEnvOf(ctx);
     if (args.ipc) {
@@ -232,7 +233,7 @@ const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
             parentPid: ctx.pid,
             executable: file,
             args: argv,
-            cwd: typeof args.cwd === 'string' ? args.cwd : ctx.cwd(),
+            cwd,
             env,
             pid: Number.isInteger(reserved) && reserved > 0 ? reserved : undefined,
             beforeStart: (started) => {
@@ -417,6 +418,32 @@ function executableOf(file: string): string {
     return file === NODE_BINARY ? 'node' : file;
 }
 
+/**
+ * The executable an asynchronous spawn starts, with a bare name resolved to the file PATH holds for
+ * it -- but only when that file is one the container can run: a node script by its name, or a file
+ * whose shebang names node or a shell. Anything else keeps the name it was given, so a name with no
+ * file behind it still fails exactly as it failed before. A `node_modules/.bin` shim (`cowsay`) is
+ * the file this was written for: a spawn of it reported ENOENT while the very same package ran when
+ * it was required.
+ */
+function spawnExecutableOf(ctx: CapabilityContext, file: string, env: Record<string, string>, cwd: string): string {
+    /* `sh` and `node` are the container's own executors and are named as they are, never by a path;
+       `npm` and `npx` are the npm process, which PATH also has an entry for and which has to stay
+       that process -- a spawn of it as a file would run the shell's npm, which refuses everywhere
+       but a line of its own. */
+    if (file.includes('/') || CONTAINER_EXECUTABLES.has(file)) return file;
+    const found = resolveOnPath({ ctx, cwd, env, input: null, lastStatus: 0 }, file);
+    if (found === undefined) return file;
+    const base = found.split('/').pop() ?? '';
+    if (base === 'sh' || base === 'bash' || base === 'node') return file;
+    if (found.endsWith('.js')) return found;
+    const interpreter = shebangInterpreter(ctx.fileSystem, found);
+    return interpreter === 'node' || interpreter === 'sh' || interpreter === 'bash' ? found : file;
+}
+
+/** The names the container runs itself, so a spawn of one is never rewritten into a file on PATH. */
+const CONTAINER_EXECUTABLES = new Set(['node', 'npm', 'npx', 'sh', 'bash']);
+
 /** Pids of synchronous children, counted apart from the container's own process pids. */
 let nextSyncPid = 61000;
 
@@ -447,6 +474,8 @@ interface ShellStep {
     stdout: string;
     stderr: string;
     exitCode: number;
+    /** Set when the shell ended on a signal rather than a status: the run reports null and this name. */
+    signal?: string;
 }
 
 /** A step that produced nothing, for the paths that run no command at all. */
@@ -472,6 +501,20 @@ interface SyncShell {
      * it -- so a command that would suspend is only started where the suspend can be honoured.
      */
     suspendable?: boolean;
+    /**
+     * `$$`: the pid this shell answers with. A synchronous shell is not a container process, so it
+     * takes a pid of its own from a range no container process is given -- one per shell, as a host
+     * gives one to every shell it starts.
+     */
+    pid?: number;
+}
+
+/** Pids of synchronous shells, apart from the container's own processes and from synchronous children. */
+let nextShellPid = 63000;
+
+/** `$$` of one shell: taken once, and kept for as long as the shell runs. */
+function shellPidOf(shell: SyncShell): number {
+    return (shell.pid ??= nextShellPid++);
 }
 
 /**
@@ -619,6 +662,9 @@ function shellStateFor(shell: SyncShell): ShellState {
             return startBackgroundJob(shell, stages);
         };
         if (shell.name !== undefined) state.shellName = shell.name;
+        /* `$$` is this shell's pid in the script engine too, which reads it out of the state: a
+           compound line and a simple one have to answer the same number. */
+        state.pid = shellPidOf(shell);
         shell.state = state;
     }
     // `cd` moves the shell's directory; `pushd` moves the state's. The two are one directory.
@@ -1456,7 +1502,7 @@ function valueOfName(shell: SyncShell, name: string): string {
         case '#':
             return String(positionalOf(shell).length);
         case '$':
-            return '1';
+            return String(shellPidOf(shell));
         // `$!`: the pid the last `&` printed, now that this shell starts background jobs
         case '!':
             return String(shell.state?.lastBackgroundPid ?? 0);
@@ -1527,6 +1573,8 @@ function runSubstitution(shell: SyncShell, script: string): { text: string; stat
         env: { ...shell.env },
         input: shell.input,
         name: shell.name,
+        // a substitution is a subshell, and a subshell is the same process: `$$` reads the same in it
+        pid: shell.pid,
         lastStatus: shell.lastStatus,
         // one job table: a job a substitution started is the shell's own, and `wait` can wait for it
         jobs: shell.jobs,
@@ -2370,7 +2418,7 @@ function finishRedirects(shell: SyncShell, dest: (RedirectDest | null)[], step: 
     // `> f 2>&1`: one destination, so the two streams reach it in the order the command wrote them
     if (one !== null && one === two && one.kind === 'file') {
         write(one, step.stdout + step.stderr);
-        return { stdout: '', stderr: '', exitCode: step.exitCode };
+        return { stdout: '', stderr: '', exitCode: step.exitCode, signal: step.signal };
     }
     for (const fd of [1, 2] as const) {
         const d = dest[fd];
@@ -2380,7 +2428,7 @@ function finishRedirects(shell: SyncShell, dest: (RedirectDest | null)[], step: 
         else if (d.kind === 'stderr') stderr += text;
         else write(d, text);
     }
-    return { stdout, stderr, exitCode: step.exitCode };
+    return { stdout, stderr, exitCode: step.exitCode, signal: step.signal };
 }
 
 /**
@@ -2460,7 +2508,7 @@ function shellPipeline(shell: SyncShell, stages: RawWord[][]): ShellStep {
         if (i < stages.length - 1) stderr += step.stderr;
     }
     const exitCode = shell.state?.options.pipefail === true && firstFailure !== null ? firstFailure : step.exitCode;
-    return { stdout: step.stdout, stderr: stderr + step.stderr, exitCode };
+    return { stdout: step.stdout, stderr: stderr + step.stderr, exitCode, signal: step.signal };
 }
 
 /** The command as `jobs` prints it: the words of every stage, joined as they were written. */
@@ -2742,6 +2790,8 @@ function shellLine(shell: SyncShell, line: string, deferPendingJobs = false): Sh
         stdout += step.stdout;
         stderr += step.stderr;
         exitCode = step.exitCode;
+        // a command that signalled this shell ends the line on the signal: nothing after it runs
+        if (step.signal !== undefined) return { stdout, stderr, exitCode: 0, signal: step.signal };
         // `$?` is what the last command left, for the expansions of the next one
         shell.lastStatus = exitCode;
         if (shell.state !== undefined) shell.state.lastStatus = exitCode;
@@ -3023,6 +3073,138 @@ function npmInstallStep(shell: SyncShell, args: string[]): Promise<ShellStep> | 
     })();
 }
 
+/** PATH as a host falls back to when a command asks for one and the environment carries none. */
+const DEFAULT_PATH = '/bin:/usr/bin:/usr/local/bin';
+
+function isFileAt(fs: IFileSystem, path: string): boolean {
+    try {
+        return fs.statPath(path)?.type === 'file';
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * The file a command or a spawn names, as a host finds it.
+ *
+ * A name holding a slash is a path of its own: absolute, or relative to the caller's directory. Any
+ * other name is looked for in the directories of PATH, and an empty entry of PATH -- `PATH=:/bin` --
+ * means the current directory, as it does on a host. Undefined when no file stands at any of them.
+ */
+function resolveOnPath(shell: SyncShell, name: string): string | undefined {
+    const fs = shell.ctx.fileSystem;
+    if (name.includes('/')) {
+        const path = fs.normalizePath(name.startsWith('/') ? name : `${shell.cwd.replace(/\/+$/, '')}/${name}`);
+        return isFileAt(fs, path) ? path : undefined;
+    }
+    for (const entry of (shell.env.PATH ?? DEFAULT_PATH).split(':')) {
+        const base = entry === '' ? shell.cwd : entry.endsWith('/') ? entry.slice(0, -1) : entry;
+        const path = fs.normalizePath(`${base}/${name}`);
+        if (isFileAt(fs, path)) return path;
+    }
+    return undefined;
+}
+
+/** The interpreter the first line of a file names, as the kernel reads it: `#!/usr/bin/env node` gives `node`. */
+function shebangInterpreter(fs: IFileSystem, path: string): string | undefined {
+    const first = readFirstLine(fs, path);
+    if (first === undefined) return undefined;
+    const match = /^#!([^\n]*)/.exec(first);
+    if (match === null) return undefined;
+    const tokens = match[1].trim().split(/\s+/).filter((token) => token !== '');
+    if (tokens.length === 0) return undefined;
+    return tokens[0] === 'env' || tokens[0].endsWith('/env')
+        ? tokens.slice(1).find((token) => !token.startsWith('-'))
+        : tokens[0].split('/').pop();
+}
+
+/**
+ * One file the shell was asked to run, through the interpreter its name or its shebang names. A
+ * `node_modules/.bin` shim is such a file -- a script with no .js name, so nothing claims it by
+ * name -- and so is a script whose first line is `#!/bin/sh`. Undefined when neither this shell nor
+ * the container has an interpreter for it, which is when the caller reports why.
+ */
+function runFileCommand(shell: SyncShell, path: string, args: string[], typed = path): ShellStep | undefined {
+    const base = path.split('/').pop() ?? '';
+    /* `sh -c <line>` and `sh <file> <args>`: the shell itself, named by what `$0` reads inside it,
+       which is argv[0] -- the name the caller typed, not the path PATH resolved it to. */
+    if (base === 'sh' || base === 'bash') {
+        const inner = innerShell(shell, typed);
+        return shellLine(inner, args[0] === '-c' ? (args[1] ?? '') : args.join(' '));
+    }
+    if (path.endsWith('.js') || base === 'node') return shellNode(shell, { file: path, args });
+    const interpreter = shebangInterpreter(shell.ctx.fileSystem, path);
+    if (interpreter === 'node') return shellNode(shell, { file: path, args });
+    /* A script the kernel runs through its shebang is named by the path it was started from: the one
+       PATH resolved when a name was typed, the one that was typed when a path was. */
+    if (interpreter === 'sh' || interpreter === 'bash') {
+        return shellScriptStep(shell, path, args, typed.includes('/') ? typed : path);
+    }
+    return undefined;
+}
+
+/** A shell of its own for one file: the caller's directory, environment and input, and its own state. */
+function innerShell(shell: SyncShell, name: string): SyncShell {
+    return { ctx: shell.ctx, cwd: shell.cwd, env: shell.env, input: shell.input, name, lastStatus: shell.lastStatus };
+}
+
+/**
+ * A file whose shebang names a shell: its body runs in a shell of its own -- the shebang is the
+ * kernel's line, not the script's -- with the words behind the file as its positional parameters, as
+ * `sh <file> <args>` runs it on a host.
+ */
+function shellScriptStep(shell: SyncShell, path: string, args: string[], argv0 = path): ShellStep {
+    let body = '';
+    try {
+        body = (shell.ctx.fileSystem.readFile(path) ?? '').replace(/^#![^\n]*\n?/, '');
+    } catch {
+        body = '';
+    }
+    const inner = innerShell(shell, argv0);
+    shellStateFor(inner).positional = args;
+    return runCompoundLine(inner, body);
+}
+
+/** The signal table of `kill` on the host, by number; index 0 is the null signal that only asks. */
+const SIGNAL_NAMES = [
+    '0', 'HUP', 'INT', 'QUIT', 'ILL', 'TRAP', 'ABRT', 'EMT', 'FPE', 'KILL', 'BUS', 'SEGV', 'SYS',
+    'PIPE', 'ALRM', 'TERM', 'URG', 'STOP', 'TSTP', 'CONT', 'CHLD', 'TTIN', 'TTOU', 'IO', 'XCPU',
+    'XFSZ', 'VTALRM', 'PROF', 'WINCH', 'INFO', 'USR1', 'USR2'
+];
+
+/**
+ * `kill` aimed at this shell's own pid, which is the step that ends the line on a signal. Undefined
+ * when the command names no pid of this shell, or asks only whether one is alive.
+ */
+function selfSignal(shell: SyncShell, args: string[]): ShellStep | undefined {
+    const pid = shell.pid ?? shellPidOf(shell);
+    let signal = 'TERM';
+    const pids: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+        const word = args[i];
+        if (word === '-s' || word === '-n') {
+            signal = args[i + 1] ?? signal;
+            i += 1;
+            continue;
+        }
+        if (word.startsWith('-') && word !== '-' && !/^-\d+$/.test(word)) {
+            signal = word.slice(1);
+            continue;
+        }
+        if (word.startsWith('-')) {
+            signal = word.slice(1);
+            continue;
+        }
+        pids.push(word);
+    }
+    if (!pids.includes(String(pid))) return undefined;
+    const bare = signal.toUpperCase().replace(/^SIG/, '');
+    const name = /^\d+$/.test(bare) ? SIGNAL_NAMES[Number(bare)] : (SIGNAL_NAMES.includes(bare) ? bare : undefined);
+    /* The null signal only asks whether the process is there, and this one is: nothing ends. */
+    if (name === undefined || name === '0') return { stdout: '', stderr: '', exitCode: 0 };
+    return { stdout: '', stderr: '', exitCode: 0, signal: `SIG${name}` };
+}
+
 /** ShellProcess.executeCommand for one command, in the same order of dispatch. */
 function shellCommand(shell: SyncShell, words: string[]): ShellStep {
     if (words.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
@@ -3046,6 +3228,15 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
            container's processes, and a job's pid is not one of them. */
         if (command === 'kill' && cmdArgs.some((arg) => arg.startsWith('%'))) {
             return killJobSpecs(shellStateFor(shell), cmdArgs);
+        }
+        /* `kill -9 $$` signals this shell, and a shell that is signalled ends on the signal rather
+           than on a status: the run that started it reports null and the name, as a host reports a
+           child the shell died from. Without this the pid went to the container's own process table,
+           where no such pid exists, and `kill -9 $$` inside a synchronous run reached the guest that
+           was running it -- the one pid `$$` used to answer -- and killed the program itself. */
+        if (command === 'kill') {
+            const own = selfSignal(shell, cmdArgs);
+            if (own !== undefined) return own;
         }
         if (SHELL_BUILTINS.has(command)) return shellBuiltinWithRedirects(shell, command, cmdArgs);
         const version = externalVersion(command, cmdArgs);
@@ -3071,20 +3262,11 @@ function shellCommand(shell: SyncShell, words: string[]): ShellStep {
         if (command === 'node' || command === NODE_BINARY) return shellNode(shell, nodeInvocation(cmdArgs));
         // A builtin is never looked for on PATH, the way it never is in a shell: `.` is the source
         // builtin, not the current directory, and `env` is not `/usr/bin/env`.
-        const PATH = SHELL_BUILTIN_NAMES.has(command) ? undefined : shell.env.PATH;
-        if (PATH) {
-            for (const dir of PATH.split(':')) {
-                // joined against the directory: fs.resolvePath answers a relative name from the root
-                const base = dir.endsWith('/') ? dir.slice(0, -1) : dir;
-                const found = shell.ctx.fileSystem.normalizePath(`${base}/${command}`);
-                if (!shell.ctx.fileSystem.fileExists(found)) continue;
-                if (found.endsWith('.js')) return shellNode(shell, { file: found, args: cmdArgs });
-                // a node_modules/.bin shim: a node script with no .js name, run through its shebang
-                const content = readFirstLine(shell.ctx.fileSystem, found);
-                const shebang = content === undefined ? null : /^#!(.*)/.exec(content);
-                const tokens = shebang === null ? [] : shebang[1].trim().split(/\s+/);
-                const interpreter = tokens[0] === '/usr/bin/env' ? tokens.slice(1).find((t) => !t.startsWith('-')) : tokens[0]?.split('/').pop();
-                if (interpreter === 'node') return shellNode(shell, { file: found, args: cmdArgs });
+        if (!SHELL_BUILTIN_NAMES.has(command)) {
+            const found = resolveOnPath(shell, command);
+            if (found !== undefined) {
+                const step = runFileCommand(shell, found, cmdArgs, command);
+                if (step !== undefined) return step;
                 return { stdout: '', stderr: diagnostic(`No executor found for: ${found}`), exitCode: 1 };
             }
         }
@@ -3134,7 +3316,7 @@ function runShell(
     cwd: string,
     input: string | null,
     name: string
-): MaybeAsync<{ status: number; stdout: string; stderr: string }> {
+): MaybeAsync<{ status: number | null; signal: string | null; stdout: string; stderr: string }> {
     if (argv.length === 0) throw notSupportedSync('an interactive sh (no command given)');
     const line = argv[0] === '-c' ? (argv[1] ?? '') : argv.join(' ');
     const shell: SyncShell = { ctx, cwd, env, input, name, lastStatus: 0 };
@@ -3145,10 +3327,16 @@ function runShell(
         if (!isShellSuspend(error)) throw error;
         step = error.work.then((done) => endOfLine(shell, done.stdout, done.stderr, done.exitCode, false));
     }
-    if (step instanceof Promise) {
-        return step.then((settled) => ({ status: settled.exitCode, stdout: settled.stdout, stderr: ended(settled.stderr) }));
-    }
-    return { status: step.exitCode, stdout: step.stdout, stderr: ended(step.stderr) };
+    /* A shell the line signalled -- `sh -c 'kill -9 $$'` -- ends on the signal: no status, as a host
+       reports for a child that died from one. */
+    const shaped = (settled: ShellStep) => ({
+        status: settled.signal === undefined ? settled.exitCode : null,
+        signal: settled.signal ?? null,
+        stdout: settled.stdout,
+        stderr: ended(settled.stderr)
+    });
+    if (step instanceof Promise) return step.then(shaped);
+    return shaped(step);
 }
 
 /** `sh` ends a diagnostic with a newline; a command that wrote its own already ends in one. */
@@ -3156,9 +3344,16 @@ function ended(stderr: string): string {
     return stderr === '' || stderr.endsWith('\n') ? stderr : stderr + '\n';
 }
 
-/** One completed shell step as a synchronous run: the pid npm and the shell commands get, and no signal. */
+/** One completed shell step as a synchronous run: the pid npm and the shell commands get. */
 function syncStep(step: ShellStep): SyncRun {
-    return { pid: nextSyncPid++, status: step.exitCode, signal: null, stdout: step.stdout, stderr: step.stderr, timedOut: false };
+    return {
+        pid: nextSyncPid++,
+        status: step.signal === undefined ? step.exitCode : null,
+        signal: step.signal ?? null,
+        stdout: step.stdout,
+        stderr: step.stderr,
+        timedOut: false
+    };
 }
 
 /** Runs an executable to completion. A spawn that cannot start (no executor, bad invocation) throws. */
@@ -3174,8 +3369,8 @@ function runSyncCommand(
 ): SyncRun | Promise<SyncRun> {
     if (file === 'sh' || file === '/bin/sh') {
         const step = runShell(ctx, argv, env, cwd, input, file);
-        const done = (r: { status: number; stdout: string; stderr: string }): SyncRun =>
-            ({ pid: nextSyncPid++, status: r.status, signal: null, stdout: r.stdout, stderr: r.stderr, timedOut: false });
+        const done = (r: { status: number | null; signal: string | null; stdout: string; stderr: string }): SyncRun =>
+            ({ pid: nextSyncPid++, status: r.status, signal: r.signal, stdout: r.stdout, stderr: r.stderr, timedOut: false });
         return step instanceof Promise ? step.then(done) : done(step);
     }
     if (file === 'node' || file === NODE_BINARY) return nodeRun(ctx, nodeInvocation(argv), env, cwd, timeoutMs, killSignal, input);
@@ -3198,6 +3393,14 @@ function runSyncCommand(
         const step = shellCommand({ ctx, cwd, env, input, lastStatus: 0 }, [file, ...argv]);
         return syncStep(step);
     }
+    /* Nothing claims the name, so it is looked for on PATH, the way a host looks for it, and runs
+       through the interpreter its name or its shebang names: that is what makes
+       `spawnSync('cowsay')` run the shim a package left in node_modules/.bin instead of failing with
+       ENOENT while `require('cowsay')` out of the same tree works. */
+    const shell: SyncShell = { ctx, cwd, env, input, name: file, lastStatus: 0 };
+    const found = resolveOnPath(shell, file);
+    const step = found === undefined ? undefined : runFileCommand(shell, found, argv, file);
+    if (step !== undefined) return syncStep(step);
     throw new Error(`No executor found for: ${file}`);
 }
 

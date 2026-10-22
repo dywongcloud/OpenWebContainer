@@ -15,8 +15,8 @@ export const LIFECYCLE_COMMANDS: Record<string, string> = {
     restart: 'restart'
 };
 
-/** The npm version this runtime answers `--version` with. */
-export const NPM_VERSION = '10.9.0';
+/** The npm version this runtime answers `--version` with: the one the host's Node 24 ships. */
+export const NPM_VERSION = '11.12.1';
 
 export interface ParsedScriptArgs {
     /** The script to run: the one the lifecycle command names, or the first bare word of the line. */
@@ -107,7 +107,7 @@ export function missingScriptMessage(name: string): string {
 
 /** What `npm run` prints when no script is named. */
 export function scriptList(label: string, scripts: Record<string, unknown>): string {
-    const lines = [`Scripts available in ${label} via \`npm run-script\`:`];
+    const lines = [`Scripts available in ${label} via \`npm run\`:`];
     for (const [name, command] of Object.entries(scripts)) {
         if (typeof command !== 'string') continue;
         lines.push(`  ${name}`, `    ${command}`);
@@ -115,9 +115,12 @@ export function scriptList(label: string, scripts: Record<string, unknown>): str
     return lines.join('\n') + '\n';
 }
 
-/** The header npm prints above each script it is about to run. */
+/**
+ * The header npm prints above each script it is about to run: a blank line before it, then the
+ * `> <package> <event>` line, the command, and a blank line between the command and what it prints.
+ */
 export function scriptHeader(label: string, event: string, line: string): string {
-    return `\n> ${label} ${event}\n> ${line}\n`;
+    return `\n> ${label} ${event}\n> ${line}\n\n`;
 }
 
 /** The `npm error` block of a script that failed, carrying the status npm exits with. */
