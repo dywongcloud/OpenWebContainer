@@ -3800,37 +3800,69 @@ const TOUCH_USAGE =
     'usage: touch [-A [-][[hh]mm]SS] [-achm] [-r file] [-t [[CC]YY]MMDDhhmm[.SS]]\n' +
     '       [-d YYYY-MM-DDThh:mm:SS[.frac][tz]] file ...\n';
 
+/** One character of a `-t` stamp, read the way the host reads it: a plain `c - '0'`, so a letter, a
+ *  space and a piece of punctuation are digits too and no stamp is refused for holding one. `touch
+ *  -t nonsense f` is Oct 12 2084 on the host, which is what this gives; a test for digits refuses
+ *  it, which the host does not. */
+function stampDigit(ch: string): number {
+    return ch.charCodeAt(0) - 48;
+}
+
+/** A run of characters read as decimal digits: one field of a `-t` stamp, as the host reads it. */
+function stampField(text: string): number {
+    let value = 0;
+    for (const ch of text) value = value * 10 + stampDigit(ch);
+    return value;
+}
+
+/** The largest mtime a host file system carries: `INT64_MAX` nanoseconds, which is where a stamp
+ *  past it lands. `touch -t 999901010000 f` and `touch -t a000000000 f` are both Apr 12 2262. */
+const TOUCH_STAMP_MAX_MS = 9223372036854.775;
+
 /** The mtime `touch -t [[CC]YY]MMDDhhmm[.SS]` names, read on the local clock as the host reads it. */
 function parseTouchStamp(spec: string): number | undefined {
-    const parts = spec.split('.');
-    if (parts.length > 2) return undefined;
-    const main = parts[0];
-    const seconds = parts.length === 2 ? parts[1] : '';
-    if (!/^[0-9]+$/.test(main) || (seconds !== '' && !/^[0-9]{1,2}$/.test(seconds))) return undefined;
+    const dot = spec.indexOf('.');
+    if (spec.indexOf('.', dot + 1) !== -1) return undefined;
+    const main = dot === -1 ? spec : spec.slice(0, dot);
+    const seconds = dot === -1 ? '' : spec.slice(dot + 1);
+    /* `.SS` is two characters or the stamp is not a stamp: the host refuses `202601010000.` and
+       `00000000.5` alike, where a seconds field of one digit or of three would take both. */
+    if (dot !== -1 && seconds.length !== 2) return undefined;
     let year: number;
     let rest: string;
     if (main.length === 12) {
-        year = Number(main.slice(0, 4));
+        year = stampField(main.slice(0, 4));
         rest = main.slice(4);
     } else if (main.length === 10) {
-        const two = Number(main.slice(0, 2));
+        const two = stampField(main.slice(0, 2));
         year = two < 69 ? 2000 + two : 1900 + two;
         rest = main.slice(2);
     } else if (main.length === 8) {
         year = new Date().getFullYear();
         rest = main;
     } else return undefined;
-    const month = Number(rest.slice(0, 2));
-    const day = Number(rest.slice(2, 4));
-    const hour = Number(rest.slice(4, 6));
-    const minute = Number(rest.slice(6, 8));
-    const second = seconds === '' ? 0 : Number(seconds);
     /* A field out of range is rolled into the field above it rather than refused: `touch -t
        202013010000 f` is Jan 1 2021, `202000010000` is Dec 1 2019 and `202001320000` is Feb 1
        2020, which is one `new Date` with a month of 12, of -1 or a day of 32 away. The host reads
        the stamp the same loose way, so the only thing worth refusing is a shape that is not a
-       stamp at all, which the digit test above has already done. */
-    return new Date(year, month - 1, day, hour, minute, second, 0).getTime();
+       stamp at all, which the length above has already done. `setFullYear` rather than the `new
+       Date` constructor, which reads a year of 0 to 99 as 1900 to 1999: `touch -t 000000000000 f`
+       names the year 0, which the host refuses, and never the 1899 that reading would leave. */
+    const at = new Date(0, 0, 1, 0, 0, 0, 0);
+    at.setFullYear(year);
+    at.setMonth(stampField(rest.slice(0, 2)) - 1);
+    at.setDate(stampField(rest.slice(2, 4)));
+    at.setHours(stampField(rest.slice(4, 6)));
+    at.setMinutes(stampField(rest.slice(6, 8)));
+    at.setSeconds(seconds === '' ? 0 : stampField(seconds));
+    const ms = at.getTime();
+    if (Number.isNaN(ms)) return undefined;
+    /* Past the largest stamp a file system carries it saturates, and before the year 1900 it is
+       refused: `touch -t aaaaaaaa f` is May 14 2072, `touch -t 190001010000 f` is Jan 1 1900 and
+       `touch -t 189901010000 f` is one line on stderr with a status of 1 and the mtime it had. */
+    if (ms > TOUCH_STAMP_MAX_MS) return TOUCH_STAMP_MAX_MS;
+    if (at.getFullYear() < 1900) return undefined;
+    return ms;
 }
 
 /** Sets a path's mtime where the file system carries one; one that does not keeps what it has. */
