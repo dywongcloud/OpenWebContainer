@@ -57,7 +57,10 @@ function withoutLiterals(source: string): string {
             if (ch === '/' && next === '*') { state = 'block'; out.push(' ', ' '); i += 2; continue; }
             if (ch === "'" || ch === '"' || ch === '`') {
                 state = ch === "'" ? 'single' : ch === '"' ? 'double' : 'template';
-                out.push(' ');
+                /* The delimiter itself is kept, and only what it holds is blanked: a bare specifier
+                   -- `import"node:fs"`, `import './m.mjs'` -- is module syntax by its quote, and
+                   dropping the quote would leave the line reading as no syntax at all. */
+                out.push(ch);
                 i += 1;
                 continue;
             }
@@ -115,6 +118,38 @@ function withoutLiterals(source: string): string {
         i += 1;
     }
     return out.join('');
+}
+
+/** An `import` at the head of a line Node reads as module syntax. A bare specifier carries no space
+ *  after the keyword -- `import"node:fs"` -- and `import.meta` is module syntax wherever it is
+ *  written, so it is read on its own below. `import(...)` is a dynamic import, which a CommonJS file
+ *  may use, and `import:` is an object key: Node keeps both CommonJS, so neither matches. */
+const MODULE_IMPORT = /^\s*import(?:\s*["'{*]|\s+[\w{*{])/m;
+/** An `export` at the head of a line: `export{a}` and `export*from'x'` carry no space after the
+ *  keyword, while `export:` is an object key and `exportable` an identifier -- not module syntax. */
+const MODULE_EXPORT = /^\s*export(?:\s*[{*]|\s+[A-Za-z_$])/m;
+const MODULE_IMPORT_META = /(?<![\w$.])import\s*\.\s*meta/;
+
+/** Whether the source awaits outside every brace, which only a module may do: an `await` at the head
+ *  of a line inside an async function is one brace in, and the file is CommonJS however it reads. */
+function hasTopLevelAwait(code: string): boolean {
+    const awaiting = /(?:await\s|(?:const|let|var)\s+[^=\n]+=\s*await\s)/y;
+    let depth = 0;
+    let head = true;
+    for (let i = 0; i < code.length; i += 1) {
+        const ch = code[i];
+        if (ch === '\n') { head = true; continue; }
+        if (head && ch !== ' ' && ch !== '\t' && ch !== '\r') {
+            head = false;
+            if (depth === 0) {
+                awaiting.lastIndex = i;
+                if (awaiting.test(code)) return true;
+            }
+        }
+        if (ch === '{') depth += 1;
+        else if (ch === '}') depth = Math.max(0, depth - 1);
+    }
+    return false;
 }
 
 /**
@@ -232,21 +267,26 @@ export class NodeResolver {
         return file.startsWith('data:') ? file : fileUrlOf(file) + suffix;
     }
 
-    isESM(file: string): boolean {
+    /**
+     * Whether a file is read as an ES module. `forRequire` is the CommonJS loader asking, and it
+     * decides a name whose extension the loader does not know: require has no handler for one, so it
+     * falls back to the handler for `.js`, which detects -- `require('./m.xyz')` holding `export
+     * const v = 1` loads as a module, as in Node. The ES module loader names such an extension
+     * ERR_UNKNOWN_FILE_EXTENSION before any detection runs, so it never detects one.
+     */
+    isESM(file: string, forRequire = false): boolean {
         if (file.endsWith('.mjs')) return true;
         if (file.endsWith('.cjs') || file.endsWith('.json')) return false;
         /* A .js file and a file no extension follows are the two Node decides by the package "type"
            first and by the module syntax in it second -- its detection, on by default since 22.7,
-           reads 'export' or a top-level 'await' in either and loads it as a module. Every other
-           extension the loader does not know is ERR_UNKNOWN_FILE_EXTENSION, which no detection
-           reaches, so nothing else is decided here. */
-        if (file.endsWith('.js') || extensionOf(file) === '') {
+           reads 'export' or a top-level 'await' in either and loads it as a module. */
+        if (forRequire || file.endsWith('.js') || extensionOf(file) === '') {
             const packageType = this.nearestPackageType(dirnameOf(file));
             if (packageType === 'module') return true;
             if (packageType === 'commonjs') return false;
             const code = withoutLiterals(this.fileSystem.readFile(file) ?? '');
-            return /^\s*(?:import\s+[\w{*'"]|export\s+[\w{*])/m.test(code)
-                || /^(?:await\s|(?:const|let|var)\s+[^=\n]+=\s*await\s)/m.test(code);
+            return MODULE_IMPORT.test(code) || MODULE_EXPORT.test(code)
+                || MODULE_IMPORT_META.test(code) || hasTopLevelAwait(code);
         }
         return false;
     }
