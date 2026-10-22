@@ -22,8 +22,9 @@ export interface NodeFlagAnswer {
  * What a `node` command line runs.
  *
  * `file` is the path the guest opens, or one of the sentinels: `[eval]` for a `-e`/`-p` source,
- * `[repl]` for a bare `node`, and `[flags]` for a line the flags answer on their own -- which is
- * the only case that carries `flagAnswer`.
+ * `[repl]` for a bare `node`, `[stdin]` for a `node -` that reads the program from its input, and
+ * `[flags]` for a line the flags answer on their own -- which is the only case that carries
+ * `flagAnswer`.
  */
 export interface NodeCommand {
     file: string;
@@ -31,12 +32,58 @@ export interface NodeCommand {
     args: string[];
     /** The source `-e`/`-p` supplied, already wrapped to print when `-p` asked for it. */
     evalSource?: string;
+    /** The source as the line wrote it, before `-p` wrapped it to print: the text node quotes back. */
+    evalScript?: string;
+    /**
+     * `process.execArgv`: the options of the line, in the order node read them and in the words it
+     * was given them, `-e` and its source included. Empty for a run of a file and for one read from
+     * stdin, which is where node leaves it empty too.
+     */
+    execArgv: string[];
+    /** `--stack-trace-limit=<n>`: the bound the line puts on the frames of a stack trace. */
+    stackTraceLimit?: number;
     /** The answer for a run that never reaches the guest; set exactly when `file` is `[flags]`. */
     flagAnswer?: NodeFlagAnswer;
 }
 
+/** What a run carries over from the line beyond the file it was given. */
+export interface NodeRunOptions {
+    execArgv: string[];
+    stackTraceLimit?: number;
+    evalScript?: string;
+}
+
 /** The status node exits with when it refuses its own arguments. */
 const BAD_OPTION_EXIT = 9;
+
+/**
+ * The long options node reads and this container has nothing to answer for: it emits no warnings to
+ * suppress, it keeps no V8 heap a size could bound, it never aborts on an uncaught exception, and a
+ * `-e` source is compiled in the goal the source itself asks for. Node accepts every one of them, so
+ * a script written for node that shells out with one is accepted here too -- refusing them is what
+ * turned each of `node --input-type=module`, `node --no-warnings` and the rest into a
+ * `node: bad option` and an exit 9 where the host's own node ran the line.
+ *
+ * Node reads a value behind an `=` and never in the argument after, so `--input-type module` is a
+ * bad option on the host too; what is accepted here is the form node accepts.
+ */
+const IGNORED_LONG_OPTIONS = new Set([
+    '--abort-on-uncaught-exception',
+    '--conditions',
+    '--experimental-default-type',
+    '--input-type',
+    '--max-old-space-size',
+    '--max-semi-space-size',
+    '--no-deprecation',
+    '--no-warnings',
+    '--stack-size',
+    '--title',
+    '--trace-uncaught',
+    '--trace-warnings'
+]);
+
+/** The one of those with an effect here: the bound it puts on the frames of a stack trace. */
+const STACK_TRACE_LIMIT = '--stack-trace-limit';
 
 /** An argument node reads as one of its own options: a dash that is not the stdin `-` or the `--` that ends them. */
 function isOption(arg: string | undefined): boolean {
@@ -66,12 +113,12 @@ interface Refusal {
 
 function refuse(errors: Refusal[]): NodeCommand {
     const stderr = errors.map((error) => `node: ${error.text}\n`).join('');
-    return { file: '[flags]', args: [], flagAnswer: { stderr, exitCode: BAD_OPTION_EXIT } };
+    return { file: '[flags]', args: [], execArgv: [], flagAnswer: { stderr, exitCode: BAD_OPTION_EXIT } };
 }
 
 /** A line the flags answer on their own. */
 function answered(answer: NodeFlagAnswer): NodeCommand {
-    return { file: '[flags]', args: [], flagAnswer: answer };
+    return { file: '[flags]', args: [], execArgv: [], flagAnswer: answer };
 }
 
 /**
@@ -96,6 +143,9 @@ export function nodeCommand(args: string[]): NodeCommand {
     let script: string | undefined;
     /** `-e`/`--eval` was given, whether or not the source behind it was. */
     let evalSeen = false;
+    /** The options of the line, in node's own words: what `process.execArgv` is. */
+    const execArgv: string[] = [];
+    let stackTraceLimit: number | undefined;
     const errors: Refusal[] = [];
     let i = 0;
     for (; i < args.length; i++) {
@@ -105,10 +155,23 @@ export function nodeCommand(args: string[]): NodeCommand {
             const eq = arg.indexOf('=');
             const name = eq < 0 ? arg : arg.slice(0, eq);
             const value = eq < 0 ? undefined : arg.slice(eq + 1);
-            if (name === '--version') { version = true; continue; }
-            if (name === '--help') { help = true; continue; }
-            if (name === '--check') { check = true; continue; }
+            if (name === '--version') { version = true; execArgv.push(arg); continue; }
+            if (name === '--help') { help = true; execArgv.push(arg); continue; }
+            if (name === '--check') { check = true; execArgv.push(arg); continue; }
+            if (IGNORED_LONG_OPTIONS.has(name)) { execArgv.push(arg); continue; }
+            if (name === STACK_TRACE_LIMIT) {
+                /* Node reads the bound behind an `=` and nowhere else, and it is a count of frames:
+                   anything that is not one is a bad option, as it is on the host. */
+                if (value !== undefined && /^\d+$/.test(value)) {
+                    stackTraceLimit = Number(value);
+                    execArgv.push(arg);
+                    continue;
+                }
+                errors.push({ text: `bad option: ${arg}`, badOption: true });
+                continue;
+            }
             if (name === '--print') {
+                execArgv.push(arg);
                 print = true;
                 /* `--print=<source>` prints `undefined`: node runs an empty script and ignores the
                    value, unlike `--eval=<source>`, which runs it. */
@@ -119,7 +182,7 @@ export function nodeCommand(args: string[]): NodeCommand {
             }
             if (name === '--eval') {
                 evalSeen = true;
-                if (value !== undefined) { script = value; continue; }
+                if (value !== undefined) { script = value; execArgv.push(arg); continue; }
                 const taken = takeScript(args, i);
                 if (taken.script === undefined) {
                     /* Nothing more is read after this: `--nope` behind a source that never came is
@@ -128,17 +191,19 @@ export function nodeCommand(args: string[]): NodeCommand {
                     break;
                 }
                 script = taken.script;
+                execArgv.push(arg, taken.script);
                 i = taken.at;
                 continue;
             }
             errors.push({ text: `bad option: ${arg}`, badOption: true });
             continue;
         }
-        if (arg === '-v') { version = true; continue; }
-        if (arg === '-h') { help = true; continue; }
-        if (arg === '-c') { check = true; continue; }
+        if (arg === '-v') { version = true; execArgv.push(arg); continue; }
+        if (arg === '-h') { help = true; execArgv.push(arg); continue; }
+        if (arg === '-c') { check = true; execArgv.push(arg); continue; }
         if (arg === '-p' || arg === '-pe') {
             print = true;
+            execArgv.push(arg);
             if (arg === '-pe') {
                 /* The bundle is read as `--print --eval`, and it is the long name node prints when
                    the script the `--eval` needs is missing. */
@@ -149,10 +214,11 @@ export function nodeCommand(args: string[]): NodeCommand {
                     break;
                 }
                 script = taken.script;
+                execArgv.push(taken.script);
                 i = taken.at;
             } else {
                 const taken = takeScript(args, i);
-                if (taken.script !== undefined) script = taken.script;
+                if (taken.script !== undefined) { script = taken.script; execArgv.push(taken.script); }
                 i = taken.at;
             }
             continue;
@@ -165,6 +231,7 @@ export function nodeCommand(args: string[]): NodeCommand {
                 break;
             }
             script = taken.script;
+            execArgv.push(arg, taken.script);
             i = taken.at;
             continue;
         }
@@ -184,6 +251,9 @@ export function nodeCommand(args: string[]): NodeCommand {
     if (help) return answered({ stdout: NODE_HELP_TEXT, exitCode: 0 });
 
     const trailing = args.slice(i);
+    /* What every run carries from the line, whatever it runs: the options node read, and the bound
+       one of them put on a stack trace. */
+    const carry = { execArgv, stackTraceLimit };
     /* `--` ends the options: what follows is the script, even where it begins with a dash, so
        `node -- --version` runs the file rather than printing a version. */
     let file: string | undefined;
@@ -206,11 +276,16 @@ export function nodeCommand(args: string[]): NodeCommand {
         return {
             file: '[eval]',
             args: trailing[0] === '--' ? trailing.slice(1) : trailing,
-            evalSource: print ? printEvalSource(script ?? '') : script ?? ''
+            evalSource: print ? printEvalSource(script ?? '') : script ?? '',
+            ...(script === undefined ? {} : { evalScript: script }),
+            ...carry
         };
     }
-    if (file !== undefined) return { file, args: rest };
+    /* `node -` reads the program from stdin, as the host does: what is piped in is the script, and
+       the `-` stays the first argument the script sees, which is where node leaves it too. */
+    if (file === '-') return { file: '[stdin]', args: trailing, ...carry };
+    if (file !== undefined) return { file, args: rest, ...carry };
     /* Node starts a REPL when it is given no file; it does not complain. The sentinel is read the
        way `[eval]` is: no file is resolved for it. */
-    return { file: '[repl]', args: [] };
+    return { file: '[repl]', args: [], ...carry };
 }
