@@ -1,8 +1,9 @@
 /**
  * Guest-side `zlib` built-in for the in-browser Node runtime. Sync, callback and stream forms share
- * the host's zlib capabilities: fflate underneath for deflate, gzip and zlib framing, and -- since
- * brotli and zstd have no JavaScript implementation worth its size -- wasm codecs the host builds
- * from the same C libraries Node does. Plain JavaScript inside a String.raw snippet: no backticks
+ * the host's zlib capabilities: the zlib Node bundles, compiled to wasm, for the deflate family's
+ * compression -- no JavaScript deflate is that zlib's output -- fflate for its raw DEFLATE on the way
+ * back in, and wasm codecs for brotli and zstd, which have no JavaScript implementation worth their
+ * size. Plain JavaScript inside a String.raw snippet: no backticks
  * and no template interpolation.
  */
 export const SRC = String.raw`
@@ -306,18 +307,18 @@ BF['zlib'] = function () {
     };
   }
 
-  // Stream classes extend the stream module's Transform. Brotli and zstd are driven one call at a
-  // time -- a write, a flush or the finish is its own call against a context the host keeps -- because
-  // each one is visible in the bytes: a flush ends the block or meta-block that is open. The deflate
-  // family's output is the same however the input is split, so it is buffered and compressed once.
-  // The stream module is looked up when a class is first used.
+  // Stream classes extend the stream module's Transform. Every compress stream is driven one call
+  // at a time -- a write, a flush or the finish is its own call against a context the host keeps --
+  // because each one is visible in the bytes: a flush ends the block or meta-block that is open, and
+  // in the deflate family it leaves the history where it was or clears it, which is two different
+  // streams. Decompressing is the same bytes whatever the split, so those still buffer and inflate
+  // once. The stream module is looked up when a class is first used.
   var streamClasses = Object.create(null);
 
   /*
    * The operation a call hands the codec. Brotli numbers process, flush and finish 0, 1, 2 and zstd
-   * numbers continue, flush and end the same way; the deflate family uses zlib's own flush constants.
-   * Only brotli and zstd streams are driven one call at a time; the deflate family's output is the
-   * same however the input is split, so it is buffered and compressed once, at the end.
+   * numbers continue, flush and end the same way; the deflate family uses zlib's own flush constants,
+   * and Node's own default for a flush() with no argument is Z_FULL_FLUSH, not Z_SYNC_FLUSH.
    */
   var EMPTY = new Uint8Array(0);
   var CODEC_OPS = { write: 0, flush: 1, finish: 2 };
@@ -329,14 +330,15 @@ BF['zlib'] = function () {
     var Transform = streamModule && streamModule.Transform;
     if (typeof Transform !== 'function') throw new Error('zlib streams need the stream module');
 
-    var incremental = isCodecFormat(format) && compress;
-    var ops = incremental ? CODEC_OPS : DEFLATE_OPS;
+    var incremental = compress;
+    var ops = isCodecFormat(format) ? CODEC_OPS : DEFLATE_OPS;
 
     function openCodec(self) {
       if (self._owcStream) return self._owcStream;
-      var args = { format: format };
+      var args = { format: format, level: self._owcLevel };
       if (self._owcParams !== undefined) args.params = self._owcParams;
       if (self._owcChunkSize !== undefined) args.chunkSize = self._owcChunkSize;
+      if (self._owcDictionary !== undefined) args.dictionary = self._owcDictionary;
       self._owcStream = callCap('zlib.streamOpen', args);
       return self._owcStream;
     }
@@ -356,9 +358,6 @@ BF['zlib'] = function () {
       if (out.length > 0) self.push(Buf.from(out.buffer));
     }
     if (streamClasses[name]) return streamClasses[name];
-    var streamModule = requireBuiltin('stream');
-    var Transform = streamModule && streamModule.Transform;
-    if (typeof Transform !== 'function') throw new Error('zlib streams need the stream module');
 
     function ZlibStream(options) {
       var self = Reflect.construct(Transform, [options || {}], ZlibStream);

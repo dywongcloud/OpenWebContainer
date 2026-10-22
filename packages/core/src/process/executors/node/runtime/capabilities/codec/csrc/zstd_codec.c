@@ -187,11 +187,14 @@ int owc_zstd_decompress(const uint8_t *in, size_t in_len, const uint32_t *params
         }
         if (remaining == 0) break;
         if (input.pos >= input.size && output.pos == 0) {
-            /* The frame ended before it was complete: the source is short. */
-            result[2] = (uint32_t)(0 - (size_t)ZSTD_error_srcSize_wrong);
-            ZSTD_freeDCtx(ctx);
-            free(out);
-            return RES_DECODE;
+            /*
+             * The source ran out with the frame still open. Node decompresses through a stream and
+             * answers with what the call produced and no error -- nothing at all for a frame that
+             * was only a header, every whole block before the cut for one that was not -- so this
+             * stops here and hands back what there is, rather than calling the short source a
+             * failure and losing it.
+             */
+            break;
         }
         {
             uint8_t *bigger = (uint8_t *)realloc(out, cap * 2);
