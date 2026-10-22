@@ -613,10 +613,15 @@ export class ShellProcess extends Process {
             const env = Object.fromEntries(this.env);
             /* The child reads its stdin only when it is told it has one, the way a pipe tells it */
             if (input !== null) env.OWC_STDIN = 'pipe';
-            return await this.spawnChild(command, args, env, this.shell.getWorkingDirectory(), {
+            const run = await this.spawnChild(command, args, env, this.shell.getWorkingDirectory(), {
                 stdin: input ?? undefined,
                 silent: true
             });
+            /* A child runs beside the script engine, never through it, so the engine's own `$?` is
+               still the one the line before this one left: without this, `node -e 'process.exit(3)';
+               echo $?` prints 0, where a host shell prints 3. */
+            this.shell.noteChildStatus(run.exitCode);
+            return run;
         }
         return this.shell.executeLine(text, input);
     }

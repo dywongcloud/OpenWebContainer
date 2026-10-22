@@ -7,7 +7,7 @@ import { UnzipCommand } from './commands/unzip';
 import { WgetCommand } from './commands/wget';
 import { Process } from '../process';
 import { COMMANDS as TEXT_UTILS } from './commands/textutils';
-import { COMMANDS as FILE_UTILS } from './commands/fileutils';
+import { COMMANDS as FILE_UTILS, readable } from './commands/fileutils';
 import { COMMANDS as ARCHIVES } from './commands/archives';
 import { COMMANDS as PROC_INFO } from './commands/procinfo';
 import {
@@ -579,6 +579,16 @@ export class Shell implements IShell {
     }
 
     /**
+     * The status a child process left, told to the engine so the rest of the line reads it: a child
+     * is spawned beside the engine, never through it, so `node -e 'process.exit(3)'; echo $?` would
+     * print 0 without this -- the engine's own `$?` is still the one the line before it left.
+     */
+    noteChildStatus(code: number): void {
+        this.lastStatus = code;
+        this.shellState.lastStatus = code;
+    }
+
+    /**
      * One command the script engine does not implement itself. The dispatch is the container's other
      * shell's, in the same order: this shell's own built-ins, then a command only a child can run,
      * then a name found on PATH or behind a shebang, then a utility the container cannot have, then
@@ -690,6 +700,10 @@ export class Shell implements IShell {
                     if (args.length === 0) return ok(input ?? '');
                     let joined = '';
                     for (const name of args) {
+                        /* The mode `chmod` set is honoured here: a file whose owner cannot read it
+                           is not read, with the message and status the host's `cat` gives, rather
+                           than printed as if the mode meant nothing. */
+                        if (!readable(this.moduleFs, at(name))) return fail(`cat: ${name}: Permission denied\n`);
                         const content = fs.readFile(at(name));
                         if (content === undefined) return fail(`File not found: ${name}`);
                         joined += content;
@@ -718,11 +732,40 @@ export class Shell implements IShell {
                 }
                 case 'rm': {
                     if (args.length === 0) return fail('No file specified');
-                    const recursive = args.includes('-r') || args.includes('-rf');
-                    for (const file of args.filter((arg) => !arg.startsWith('-'))) {
-                        fs.deleteFile(at(file), recursive);
+                    /* `-rf`, `-fr`, `-f -r` and the long forms are all the same two flags: the
+                       letters of one word are read one at a time, the way rm reads them. */
+                    let force = false;
+                    let recursive = false;
+                    for (const arg of args) {
+                        if (!arg.startsWith('-') || arg === '-') continue;
+                        for (const ch of arg.slice(1)) {
+                            if (ch === 'f') force = true;
+                            else if (ch === 'r' || ch === 'R') recursive = true;
+                        }
                     }
-                    return ok();
+                    const paths = args.filter((arg) => !arg.startsWith('-') || arg === '-');
+                    let stderr = '';
+                    let failed = false;
+                    for (const file of paths) {
+                        const target = at(file);
+                        /* `-f` is exactly what it promises: a path that is not there is not an error,
+                           and the operand behind it is reached with the status the line had -- `rm -f
+                           a b` with only `a` missing is 0, as it is on a host. Nothing else is
+                           forgiven: a directory without `-r`, and a missing path without `-f`. */
+                        if (!this.fileExistsSafe(target)) {
+                            if (force) continue;
+                            stderr += `rm: ${file}: No such file or directory\n`;
+                            failed = true;
+                            continue;
+                        }
+                        if (!recursive && this.isDirectorySafe(target)) {
+                            stderr += `rm: ${file}: is a directory\n`;
+                            failed = true;
+                            continue;
+                        }
+                        fs.deleteFile(target, recursive);
+                    }
+                    return failed ? { stdout: '', stderr, exitCode: 1 } : ok();
                 }
                 case 'rmdir':
                     if (args.length === 0) return fail('No directory specified');

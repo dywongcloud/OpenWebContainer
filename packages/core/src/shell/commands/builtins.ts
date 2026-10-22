@@ -2245,16 +2245,27 @@ function restoreState(state: ShellState, snapshot: Snapshot): void {
     state.lastStatus = snapshot.lastStatus;
 }
 
+/**
+ * The status the command substitution that ran last ended with. A substitution is a subshell, and
+ * one that ended on a failure under `set -e` inside it -- `x=$(false; echo hi)` -- leaves that
+ * status behind it for the command it stood in, which is why `set -e; x=$(false; echo hi); echo
+ * after` prints nothing and exits 1 on a host. Read by the assignment of `runSimple`, and only
+ * there: `echo $(false)` is 0, because it is `echo` whose status the line takes.
+ */
+let substitutionStatus = 0;
+
 /** Command substitution: runs a script in a copied state and returns its stdout minus newlines. */
 function runSubstitution(state: ShellState, script: string): string {
     const snapshot = snapshotState(state);
     const savedIo = state.io;
     state.io = { stdout: '', stderr: '' };
+    let status = 0;
     try {
         const nodes = new Parser(script, state).parse();
-        runCommandList(state, nodes, null);
+        status = runCommandList(state, nodes, null);
     } catch (error) {
-        if (!(error instanceof ExitSignal) && !(error instanceof ReturnSignal) && !(error instanceof BreakSignal) && !(error instanceof ContinueSignal)) {
+        if (error instanceof ExitSignal || error instanceof ReturnSignal) status = error.code;
+        else if (!(error instanceof BreakSignal) && !(error instanceof ContinueSignal)) {
             writeErr(state, errorMessage(error) + '\n');
         }
     }
@@ -2262,6 +2273,7 @@ function runSubstitution(state: ShellState, script: string): string {
     state.io = savedIo;
     writeErr(state, captured.stderr);
     restoreState(state, snapshot);
+    substitutionStatus = status;
     return captured.stdout.replace(/\n+$/, '');
 }
 
@@ -2396,17 +2408,23 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null):
         const node = nodes[i];
         if (node.op === '&&' && status !== 0) continue;
         if (node.op === '||' && status === 0) continue;
-        const operandProtected = node.op !== null || (i + 1 < nodes.length && nodes[i + 1].op !== null);
-        if (operandProtected) state.protectedDepth++;
+        /* What `set -e` must not end the shell on, the way this machine's /bin/sh has it: a command
+           of an AND-OR list that is not its last -- `set -e; false && true; echo after` prints
+           `after`, and `set -e; true && false; echo after` does not, because `false` is the last --
+           and one whose status `!` inverts, `set -e; ! true; echo after`. The test has to happen
+           while the depth is still raised: below the `finally` it is already back to 0, so every
+           failure ended the shell and no exemption ever held. */
+        const exempt = node.bang === true || (i + 1 < nodes.length && nodes[i + 1].op !== null);
+        if (exempt) state.protectedDepth++;
         try {
             status = runNode(state, node, input);
+            state.lastStatus = status;
+            if (status !== 0 && state.protectedDepth === 0) {
+                runTrap(state, 'ERR');
+                if (state.options.errexit) throw new ExitSignal(status);
+            }
         } finally {
-            if (operandProtected) state.protectedDepth--;
-        }
-        state.lastStatus = status;
-        if (status !== 0 && state.protectedDepth === 0) {
-            runTrap(state, 'ERR');
-            if (state.options.errexit) throw new ExitSignal(status);
+            if (exempt) state.protectedDepth--;
         }
     }
     return status;
@@ -2826,6 +2844,7 @@ function callFunction(state: ShellState, fn: FunctionDef, args: string[]): numbe
 
 /** A simple command: assignments, redirections, then the command word. */
 function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>, input: string | null): number {
+    substitutionStatus = 0;
     const pending: { name: string; value: string }[] = [];
     for (const assign of command.assigns) pending.push({ name: assign.name, value: expandAssignment(state, assign) });
 
@@ -2848,6 +2867,10 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     const stdin = commandInput ?? (shared === '' ? null : shared);
 
     if (words.length === 0) {
+        /* An assignment with no command behind it is the substitution it carries: `x=$(false)` is 1
+           and `x=$(exit 5)` is 5, the status the subshell ended with, and it is what makes `set -e`
+           end the line -- a substitution whose own `set -e` stopped it early leaves that status too. */
+        const status = substitutionStatus;
         for (const entry of pending) {
             if (!setVar(state, entry.name, entry.value)) {
                 return finish(state, plan, '', `${entry.name}: readonly variable\n`, 1);
@@ -2855,7 +2878,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
             if (state.options.allexport) markExported(state, entry.name);
         }
         syncPwd(state);
-        return finish(state, plan, '', '', 0);
+        return finish(state, plan, '', '', status);
     }
 
     let name = words[0];
