@@ -26,7 +26,7 @@ export interface IFileSystem {
     resolvePath(path: string, basePath?: string): string;
     fileExists(path: string): boolean;
     resolveModulePath(specifier: string, basePath?: string): string;
-    createDirectory(path: string): void;
+    createDirectory(path: string, mode?: number): void;
     deleteDirectory(path: string): void;
     listDirectory(path: string): string[];
     isDirectory(path: string): boolean;
@@ -34,7 +34,7 @@ export interface IFileSystem {
     statPath(path: string): PathStat | undefined;
     readdirNames(path: string): string[] | undefined;
     readBytes(path: string): Uint8Array | undefined;
-    writeBytes(path: string, data: Uint8Array): void;
+    writeBytes(path: string, data: Uint8Array, mode?: number): void;
     removePath(path: string, recursive?: boolean): void;
     renamePath(from: string, to: string): void;
     /**

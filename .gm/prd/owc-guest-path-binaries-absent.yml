@@ -1,0 +1,7 @@
+id: owc-guest-path-binaries-absent
+description: 'Measured 2026-10-22 (judge, shard guest-fs). `/bin` and `/usr/bin` are created at boot and `PATH` is `/bin:/usr/bin:/usr/local/bin`, but the only file on it is `/usr/local/bin/node`: `which ls`, `which cat`, `which env` and `command -v sh` all exit 1 in the container where a host answers /bin/ls, /bin/cat, /usr/bin/env and /bin/sh, and `command -v npm` exits 1 although the container ships an npm executor. `command -v node` does answer, but prints `node is /usr/local/bin/node` where POSIX prints the path alone. The shell''s own commands are built in and run with no file, and node is at /usr/local/bin, so this is the shape of a container with no coreutils; giving every builtin a real file is a larger decision than one edit. Recorded.'
+owner: judge-guest-fs
+session_id: adv-judge-guest-fs-5
+subject: 'PATH names /bin and /usr/bin but no program lives there, so which and command -v find nothing'
+witness_plan: Run `which ls; command -v sh; command -v npm` in the container and with /bin/sh; every one must answer a path, or the difference must be recorded.
+status: pending

@@ -1,0 +1,7 @@
+id: owc-fs-device-files-absent
+description: 'Measured 2026-10-22 (judge, shard guest-fs). `/dev` is now created at boot, but `/dev/null` and `/dev/urandom` are still ENOENT where a host has both as character devices: `fs.existsSync(''/dev/null'')` is false and only a write creates the name, as an ordinary file, so a read of it gives back what was written instead of end of file and `stat().isCharacterDevice()` is false. A device is a kernel object and this file system holds files and directories only, so it cannot be made honestly; shell redirection to `/dev/null` is already a sink that never touches the tree. Recorded.'
+owner: judge-guest-fs
+session_id: adv-judge-guest-fs-5
+subject: /dev/null and /dev/urandom are not there, so a guest that opens them gets ENOENT where a host gets a device
+witness_plan: Stat /dev/null in the container and on the host; both must exist, and a read of one must be empty on both.
+status: pending

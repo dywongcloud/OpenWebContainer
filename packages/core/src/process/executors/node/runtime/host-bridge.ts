@@ -131,14 +131,25 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         return stat ? JSON.stringify(stat) : undefined;
     })));
     define('readdirJSON', (path) => context.newString(JSON.stringify(deps.fileSystem.readdirNames(text(path)) ?? [])));
-    define('writeBase64', (path, data) => context.newString(guardFs(() => {
+    /*
+     * The mode a new name is created with, when the guest asked for one. Node masks a mode with the
+     * process umask and applies it only when the name is created, never to one already there, and
+     * the guest has already done the masking; a call that names no mode leaves the file system's
+     * own default alone.
+     */
+    const optionalMode = (handle: QuickJSHandle): number | undefined => {
+        if (handle === undefined) return undefined;
+        const value = context.dump(handle);
+        return typeof value === 'number' ? value : undefined;
+    };
+    define('writeBase64', (path, data, mode) => context.newString(guardFs(() => {
         const file = text(path);
         requireParentDirectory(file);
         if (deps.fileSystem.statPath(file)?.type === 'dir') throw new FsCodeError('EISDIR');
-        deps.fileSystem.writeBytes(file, base64ToBytes(text(data)));
+        deps.fileSystem.writeBytes(file, base64ToBytes(text(data)), optionalMode(mode));
     })));
-    define('mkdir', (path) => context.newString(guardFs(() => {
-        deps.fileSystem.createDirectory(text(path));
+    define('mkdir', (path, mode) => context.newString(guardFs(() => {
+        deps.fileSystem.createDirectory(text(path), optionalMode(mode));
     })));
     define('rm', (path, recursive) => context.newString(guardFs(() => {
         const file = text(path);

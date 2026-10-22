@@ -1,0 +1,7 @@
+id: owc-guest-requirestack-undefined
+description: 'Measured 2026-10-22 (judge, shard guest-fs). `require(''./definitely-missing'')` throws with code MODULE_NOT_FOUND on both sides and with the same message, but `e.requireStack` is `undefined` in the container and an array naming the requiring file under host Node 24.15. Packages that walk `requireStack` to print where a dependency came from get nothing. The message already carries the same `Require stack:` block, so the fix is one assignment where the error is built in the bootstrap; it is recorded until that is measured.'
+owner: judge-guest-fs
+session_id: adv-judge-guest-fs-5
+subject: 'e.requireStack on a MODULE_NOT_FOUND error is undefined, where host Node gives the array of requiring files'
+witness_plan: require a missing module in the container and under host Node 24.15 and compare `e.requireStack`; both must be an array naming the requiring file.
+status: pending

@@ -65,6 +65,25 @@ function createScratchDirectories(): void {
     }
 }
 
+/**
+ * The directories a Linux image carries that a guest reaches for by name and that were not there,
+ * the same shape of hole `/tmp` was: `os.homedir()` of a guest is `/home` and `/home` was missing,
+ * `fs.writeFileSync('/etc/...', ...)` failed with ENOENT, and `PATH` lists `/bin` and `/usr/bin`
+ * while neither existed. Device files are not among them -- `/dev/null` is a character device on a
+ * host and no file here is, so the directory is made and the devices are not.
+ */
+const SYSTEM_DIRS: ReadonlyArray<string> = ['/bin', '/dev', '/etc', '/home', '/opt', '/usr/bin', '/usr/lib'];
+
+function createSystemDirectories(): void {
+    for (const dir of SYSTEM_DIRS) {
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    }
+}
+
+function joinPath(dir: string, name: string): string {
+    return dir === '/' ? `/${name}` : `${dir}/${name}`;
+}
+
 export class ZenFSCore implements IFileSystem {
     private fs: typeof fs;
 
@@ -73,6 +92,7 @@ export class ZenFSCore implements IFileSystem {
         mountContainerRoot();
         writeNodeBinary();
         createScratchDirectories();
+        createSystemDirectories();
         this.fs = fs;
     }
     readBuffer(path: string): Buffer | undefined {
@@ -186,8 +206,14 @@ export class ZenFSCore implements IFileSystem {
         throw new Error(`Module not found: ${specifier} (resolved to ${resolvedPath})`);
     }
 
-    createDirectory(path: string): void {
-        this.fs.mkdirSync(path,{recursive:true});
+    /*
+     * A directory made with no mode asked for gets the one `mkdir` gives it: 0o777 masked with the
+     * umask, so 0o755, and not the bare 0o777 ZenFS leaves -- which made every directory in the
+     * container world writable, and `ls -ld` of one read `drwxrwxrwx` where a host reads
+     * `drwxr-xr-x`.
+     */
+    createDirectory(path: string, mode?: number): void {
+        this.fs.mkdirSync(path, { recursive: true, mode: (mode === undefined ? 0o777 : mode & 0o7777) & ~0o022 });
     }
 
     deleteDirectory(path: string): void {
@@ -225,8 +251,8 @@ export class ZenFSCore implements IFileSystem {
         return new Uint8Array(this.fs.readFileSync(path));
     }
 
-    writeBytes(path: string, data: Uint8Array): void {
-        this.fs.writeFileSync(path, data);
+    writeBytes(path: string, data: Uint8Array, mode?: number): void {
+        this.fs.writeFileSync(path, data, mode === undefined ? undefined : { mode: mode & 0o7777 });
     }
 
     removePath(path: string, recursive = false): void {
@@ -234,7 +260,22 @@ export class ZenFSCore implements IFileSystem {
     }
 
     renamePath(from: string, to: string): void {
+        /* ZenFS renames a file and refuses a directory, so a directory is moved one entry at a
+           time: the tree a host moves with a single rename(2). */
+        if (this.fs.statSync(from)?.isDirectory()) {
+            this.moveDirectory(from, to);
+            return;
+        }
         this.fs.renameSync(from, to);
+    }
+
+    private moveDirectory(from: string, to: string): void {
+        const stat = this.fs.statSync(from);
+        this.fs.mkdirSync(to, { recursive: true, mode: stat.mode & 0o7777 });
+        for (const name of this.fs.readdirSync(from)) {
+            this.renamePath(joinPath(from, name), joinPath(to, name));
+        }
+        this.fs.rmdirSync(from);
     }
 
     utimes(path: string, mtimeMs: number): void {

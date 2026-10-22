@@ -272,6 +272,28 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
 - **A trailing newline.** The container writes a command's stderr exactly as the command left it; the host
   adds one only where the text has none.
 
+### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
+
+Each of these was measured by running the same script under host Node 24.15 and in the container and
+diffing stdout, stderr and the exit code. Where the two cannot agree, the reason is here.
+
+- **`process.stdout.columns` is 80 and `isTTY` is false, where a piped host stream leaves both undefined.**
+  A package that sizes its output from `columns || 80` therefore never falls back, and `writableHighWaterMark`
+  is undefined where the host's is 65536. There is no terminal behind a guest stream to ask.
+- **A guest `err.stack` has no `Error: <message>` header line.** It begins at the first frame, so
+  `err.stack.split('\n')[0]` is `    at <anonymous> (/app/main.js:24:52)` where the host's is `Error: boom`.
+- **`e.requireStack` on a `MODULE_NOT_FOUND` error is undefined**, where host Node's is the array of files
+  that required the missing one. `e.message` still carries the same `Require stack:` block, and
+  `e.code` is `MODULE_NOT_FOUND` on both.
+- **`/dev/null` and `/dev/urandom` are not there.** `/dev` is created at boot, but a character device is a
+  kernel object and this file system has files and directories only: `fs.writeFileSync('/dev/null', '')`
+  makes an ordinary file, and a read of one gives back what was written rather than end of file. Shell
+  redirection to `/dev/null` is a sink and never touches the tree.
+- **Nothing in `/bin` or `/usr/bin` is a program.** Those directories are created at boot, and
+  `PATH` names them as a Linux image does, but the only file on it is `/usr/local/bin/node`, so
+  `which ls`, `which cat`, `which env` and `command -v sh` all fail where a host answers a path.
+  The shell's own commands are built in and run without a file.
+
 ### ⚠️ `node` with no arguments: the REPL, and where it differs from host node
 
 `node` with no arguments starts a REPL instead of throwing. It reads `process.stdin`, writes to

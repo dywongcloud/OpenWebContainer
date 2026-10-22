@@ -1,0 +1,7 @@
+id: owc-guest-error-stack-no-header
+description: 'Measured 2026-10-22 (judge, shard guest-fs). `try { throw new Error(''boom'') } catch (e) { e.stack.split(''\n'')[0] }` is `"    at <anonymous> (/app/main.js:24:52)"` in the container and `"Error: boom"` under host Node 24.15: a guest stack has no `Error: <message>` header line, and the whole dump is 7 lines where the host''s is 11. A `MODULE_NOT_FOUND` shows it the same way -- the first line is a frame in owc-bootstrap.js rather than `Error: Cannot find module ...`. Fixing it means the error machinery prepending the name and message the way V8 does, which is one change to the part of the bootstrap every throw goes through, so it is recorded first.'
+owner: judge-guest-fs
+session_id: adv-judge-guest-fs-5
+subject: a guest error's stack has no "Error: <message>" header line, so its first line is a frame
+witness_plan: Throw an Error in the container and under host Node 24.15 and compare `e.stack.split('\n')[0]`; both must be `Error: boom`.
+status: pending

@@ -767,6 +767,7 @@ BF.fs = function () {
 
   var DESCRIPTIONS = {
     ENOENT: 'no such file or directory',
+    EACCES: 'permission denied',
     EEXIST: 'file already exists',
     EISDIR: 'illegal operation on a directory',
     ENOTDIR: 'not a directory',
@@ -951,8 +952,22 @@ BF.fs = function () {
     return Buf.from(bytes);
   };
 
+  /*
+   * The mode a new name gets. Node applies the mode a call asks for once, when the name is created,
+   * and masks it with the process umask -- 0o022, the shell's default and this machine's -- so a
+   * bare mkdirSync lands 0o755 and a bare writeFileSync 0o644, while 0o600 or 0o750 asked for
+   * explicitly survive. Ignoring both, which this did, leaves every file world readable and every
+   * directory world writable: writeFileSync with mode 0o600 came back 0o644.
+   */
+  var UMASK = 0o022;
+  var newMode = function (opts, fallback) {
+    var asked = opts && typeof opts === 'object' && typeof opts.mode === 'number' ? opts.mode : fallback;
+    return asked & ~UMASK & 0o7777;
+  };
+
   fs.writeFileSync = function (p, data, opts) {
     var file = toPathString(p);
+    var mode = newMode(opts, 0o666);
     var flag = opts && typeof opts === 'object' && opts.flag ? opts.flag : 'w';
     var bytes;
     if (typeof data === 'string') bytes = encodeString(data, optionsEncoding(opts) || 'utf8');
@@ -966,7 +981,7 @@ BF.fs = function () {
       merged.set(bytes, existing.length);
       bytes = merged;
     }
-    check(host.writeBase64(file, encodeBase64(bytes)), 'open', file);
+    check(host.writeBase64(file, encodeBase64(bytes), mode), 'open', file);
   };
 
   fs.appendFileSync = function (p, data, opts) {
@@ -996,11 +1011,18 @@ BF.fs = function () {
   fs.lstatSync = function (p, opts) {
     var file = toPathString(p);
     var st = statOf(file);
+    var linked = SYMLINKS[file] !== undefined;
+    /* A link whose target is not there yet has no bytes of its own, and Node still reports the
+       link: its size is the length of the target it names. */
     if (!st) {
-      if (opts && opts.throwIfNoEntry === false) return undefined;
-      throw fsError('ENOENT', 'lstat', file);
+      if (!linked) {
+        if (opts && opts.throwIfNoEntry === false) return undefined;
+        throw fsError('ENOENT', 'lstat', file);
+      }
+      var named = LINKTARGETS[file] !== undefined ? LINKTARGETS[file] : SYMLINKS[file];
+      st = { type: 'file', size: String(named).length, mtimeMs: 0 };
     }
-    return makeStats(st, opts, SYMLINKS[file] !== undefined);
+    return makeStats(st, opts, linked);
   };
 
   // Node names both ends of a symlink in its error: 'symlink '<target>' -> '<link>''.
@@ -1016,9 +1038,14 @@ BF.fs = function () {
     // A relative target names a path beside the link, not one under the working directory: that is
     // where the system resolves it when the link is opened, and where Node leaves it for readlink.
     var from = P.isAbsolute(raw) ? toPathString(raw) : P.resolve(P.dirname(to), raw);
-    if (!statOf(from)) throw symlinkError('ENOENT', from, to);
     if (statOf(to)) throw symlinkError('EEXIST', from, to);
-    check(host.writeBase64(to, encodeBase64(readBytesOf(from))), 'symlink', to);
+    /* A link is a name, not a copy, and a host lets it name a target that is not there yet: that is
+       a dangling link, and it is what a link to a file another step creates looks like. Only a
+       target that is a file carries bytes across, since a directory has none. */
+    var targetStat = statOf(from);
+    if (targetStat && targetStat.type === 'file') {
+      check(host.writeBase64(to, encodeBase64(readBytesOf(from))), 'symlink', to);
+    }
     SYMLINKS[to] = from;
     LINKTARGETS[to] = raw;
   };
@@ -1077,17 +1104,31 @@ BF.fs = function () {
       if (recursive && existing.type === 'dir') return undefined;
       throw fsError('EEXIST', 'mkdir', file);
     }
-    check(host.mkdir(file, recursive), 'mkdir', file);
+    check(host.mkdir(file, newMode(opts, 0o777)), 'mkdir', file);
     return recursive ? file : undefined;
   };
 
+  /* Node refuses to rm a directory without the recursive option before it looks at what is inside
+     it: ERR_FS_EISDIR, where a removal that got as far as the entries reports ENOTEMPTY instead. */
+  function eisdirError(syscall, file) {
+    var err = new Error('Path is a directory: ' + syscall + ' returned EISDIR (is a directory) ' + file);
+    err.code = 'ERR_FS_EISDIR';
+    err.errno = -21;
+    err.syscall = syscall;
+    err.path = file;
+    return err;
+  }
+
   fs.rmSync = function (p, opts) {
     var file = toPathString(p);
-    if (!statOf(file)) {
+    var st = statOf(file);
+    if (!st) {
       if (opts && opts.force) return;
       throw fsError('ENOENT', 'rm', file);
     }
-    check(host.rm(file, !!(opts && opts.recursive)), 'rm', file);
+    var recursive = !!(opts && opts.recursive);
+    if (st.type === 'dir' && !recursive) throw eisdirError('rm', file);
+    check(host.rm(file, recursive), 'rm', file);
   };
 
   fs.rmdirSync = function (p, opts) {
@@ -1118,9 +1159,21 @@ BF.fs = function () {
     check(host.writeBase64(toPathString(to), encodeBase64(readBytesOf(src))), 'copyfile', src);
   };
 
-  fs.accessSync = function (p) {
+  /*
+   * access asks whether the mode bits allow what the caller asked for, which is what a host does
+   * against one user's own bits: there is no other uid here to be. F_OK is a plain existence test,
+   * and a mode of 0 is F_OK however it is spelled.
+   */
+  fs.accessSync = function (p, mode) {
     var file = toPathString(p);
-    if (!statOf(file)) throw fsError('ENOENT', 'access', file);
+    var st = statOf(file);
+    if (!st) throw fsError('ENOENT', 'access', file);
+    var want = mode === undefined || mode === null ? 0 : Number(mode);
+    if (want === 0) return;
+    var bits = (st.mode !== undefined ? st.mode : (st.type === 'dir' ? 0o755 : 0o644)) & 0o777;
+    if (want & 4) { if (!(bits & 0o400)) throw fsError('EACCES', 'access', file); }
+    if (want & 2) { if (!(bits & 0o200)) throw fsError('EACCES', 'access', file); }
+    if (want & 1) { if (!(bits & 0o100)) throw fsError('EACCES', 'access', file); }
   };
 
   fs.realpathSync = function (p) {
@@ -1129,9 +1182,27 @@ BF.fs = function () {
     return file;
   };
 
+  /*
+   * mkdtemp replaces the run of X's at the end of the prefix with random characters -- a template
+   * whose X's are still there in the name it hands back is a prefix it never substituted -- and
+   * makes the directory 0o700, because a temporary directory is private to the user who asked for
+   * it. It is retried while the name is taken, the way mkdtemp(3) is.
+   */
+  var TEMP_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  var TRAILING_XS = /X+$/;
+  function randomName(stem, width) {
+    var out = stem;
+    for (var i = 0; i < width; i++) out += TEMP_ALPHABET.charAt(Math.floor(Math.random() * TEMP_ALPHABET.length));
+    return out;
+  }
   fs.mkdtempSync = function (prefix) {
-    var name = String(prefix) + Math.random().toString(36).slice(2, 8);
-    fs.mkdirSync(name, { recursive: true });
+    var raw = String(prefix);
+    var run = TRAILING_XS.exec(raw);
+    var stem = run ? raw.slice(0, run.index) : raw;
+    var width = run ? run[0].length : 6;
+    var name;
+    do { name = randomName(stem, width); } while (statOf(name));
+    fs.mkdirSync(name, { mode: 0o700 });
     return name;
   };
 

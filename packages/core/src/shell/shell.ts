@@ -810,15 +810,9 @@ export class Shell implements IShell {
                     return ok();
                 }
                 case 'cp':
-                case 'mv': {
-                    if (args.length < 2) return fail('Source and destination required');
-                    const [src, dest] = args;
-                    const content = fs.readFile(at(src));
-                    if (content === undefined) return fail(`Source file not found: ${src}`);
-                    fs.writeFile(at(dest), content);
-                    if (command === 'mv') fs.deleteFile(at(src));
-                    return ok();
-                }
+                    return this.copyCommand(args);
+                case 'mv':
+                    return this.moveCommand(args);
                 default:
                     return fail(`Command not found: ${command}`);
             }
@@ -1057,38 +1051,94 @@ export class Shell implements IShell {
         return this.success(args.join(' ') + '\n');
     }
 
-    private async cp(args: string[]): Promise<ShellCommandResult> {
-        if (args.length < 2) {
-            return this.failure('Source and destination required');
-        }
-        try {
-            const [src, dest] = args;
-            const content = this.fileSystem.readFile(this.resolvePath(src));
-            if (content === undefined) {
-                return this.failure(`Source file not found: ${src}`);
+    /*
+     * Both take flags, and both work on directories, which the versions here did not: `cp -r src
+     * dst` read '-r' as the name of the source and failed with ENOENT on '/-r', and `mv` of a
+     * directory read the directory's bytes -- a directory has none -- and failed with a size
+     * mismatch, leaving the source where it was. A move is one rename when it can be; a copy walks
+     * the tree and carries each file's bytes, so a binary survives it.
+     */
+    private parseFileArgs(args: string[]): { operands: string[]; recursive: boolean } {
+        const operands: string[] = [];
+        let recursive = false;
+        for (const arg of args) {
+            if (arg !== '-' && arg.startsWith('-') && arg.length > 1) {
+                if (/^-[a-zA-Z]*[rR][a-zA-Z]*$/.test(arg) || arg === '--recursive') recursive = true;
+                continue;
             }
-            this.fileSystem.writeFile(this.resolvePath(dest), content);
-            return this.success();
-        } catch (error: any) {
-            return this.failure(error.message);
+            operands.push(arg);
+        }
+        return { operands, recursive };
+    }
+
+    private baseName(path: string): string {
+        const parts = path.split('/').filter((part) => part.length > 0);
+        return parts.length > 0 ? parts[parts.length - 1] : path;
+    }
+
+    /** Where a source lands when it is named against a destination: inside it, if it is a directory. */
+    private landingPath(src: string, dest: string): string {
+        return this.isDirectorySafe(dest) ? `${dest}/${this.baseName(src)}`.replace(/\/+/g, '/') : dest;
+    }
+
+    private copyTree(from: string, to: string): void {
+        this.fileSystem.createDirectory(to);
+        for (const name of this.fileSystem.listDirectory(from)) {
+            const source = `${from}/${name}`.replace(/\/+/g, '/');
+            const target = `${to}/${name}`.replace(/\/+/g, '/');
+            if (this.isDirectorySafe(source)) {
+                this.copyTree(source, target);
+                continue;
+            }
+            const bytes = this.fileSystem.readBytes(source);
+            if (bytes !== undefined) this.fileSystem.writeBytes(target, bytes);
         }
     }
 
-    private async mv(args: string[]): Promise<ShellCommandResult> {
-        if (args.length < 2) {
-            return this.failure('Source and destination required');
-        }
+    private copyCommand(args: string[]): CommandResult {
+        const { operands, recursive } = this.parseFileArgs(args);
+        const fail = (stderr: string): CommandResult => ({ stdout: '', stderr, exitCode: 1 });
+        if (operands.length < 2) return fail('cp: Source and destination required');
         try {
-            const [src, dest] = args;
-            const content = this.fileSystem.readFile(this.resolvePath(src));
-            if (content === undefined) {
-                return this.failure(`Source file not found: ${src}`);
+            const src = this.resolvePath(operands[0]);
+            const dest = this.resolvePath(operands[1]);
+            if (!this.fileExistsSafe(src)) return fail(`cp: ${operands[0]}: No such file or directory`);
+            const to = operands.length > 2 ? dest : this.landingPath(src, dest);
+            if (this.isDirectorySafe(src)) {
+                if (!recursive) return fail(`cp: -r not specified; omitting directory '${operands[0]}'`);
+                this.copyTree(src, to);
+                return { stdout: '', stderr: '', exitCode: 0 };
             }
-            this.fileSystem.writeFile(this.resolvePath(dest), content);
-            this.fileSystem.deleteFile(this.resolvePath(src));
-            return this.success();
+            const bytes = this.fileSystem.readBytes(src);
+            if (bytes === undefined) return fail(`cp: ${operands[0]}: No such file or directory`);
+            this.fileSystem.writeBytes(to, bytes);
+            return { stdout: '', stderr: '', exitCode: 0 };
         } catch (error: any) {
-            return this.failure(error.message);
+            return fail(error instanceof Error ? error.message : String(error));
         }
+    }
+
+    private moveCommand(args: string[]): CommandResult {
+        const operands = args.filter((arg) => arg === '-' || !arg.startsWith('-'));
+        const fail = (stderr: string): CommandResult => ({ stdout: '', stderr, exitCode: 1 });
+        if (operands.length < 2) return fail('mv: Source and destination required');
+        try {
+            const src = this.resolvePath(operands[0]);
+            const dest = this.resolvePath(operands[1]);
+            if (!this.fileExistsSafe(src)) return fail(`mv: ${operands[0]}: No such file or directory`);
+            const to = operands.length > 2 ? dest : this.landingPath(src, dest);
+            this.fileSystem.renamePath(src, to);
+            return { stdout: '', stderr: '', exitCode: 0 };
+        } catch (error: any) {
+            return fail(error instanceof Error ? error.message : String(error));
+        }
+    }
+
+    private async cp(args: string[]): Promise<ShellCommandResult> {
+        return this.copyCommand(args);
+    }
+
+    private async mv(args: string[]): Promise<ShellCommandResult> {
+        return this.moveCommand(args);
     }
 }

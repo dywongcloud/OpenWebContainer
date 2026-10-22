@@ -1,0 +1,7 @@
+id: owc-guest-stdout-columns-tty
+description: 'Measured 2026-10-22 (judge, shard guest-fs), container vs host Node 24.15 both with stdout piped. The container prints `process.stdout.columns` 80, `isTTY` false (and `stderr.isTTY`/`stdin.isTTY` false) and leaves `writableHighWaterMark` undefined and `constructor.name` EventEmitter; host Node on a pipe gives columns undefined, isTTY undefined, writableHighWaterMark 65536 and constructor SyncWriteStream. A package that sizes output with `columns || 80` therefore never takes its fallback in the container. Deciding this needs a stream the container can credibly call a pipe rather than a terminal; until then it is recorded.'
+owner: judge-guest-fs
+session_id: adv-judge-guest-fs-5
+subject: guest process.stdout reports a terminal (columns 80, isTTY false) where a piped host stream reports neither
+witness_plan: Run `console.log(process.stdout.columns, process.stdout.isTTY, process.stdout.writableHighWaterMark, process.stdout.constructor.name)` in the container and under host Node with stdout piped; all four must agree.
+status: pending

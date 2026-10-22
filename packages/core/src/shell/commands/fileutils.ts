@@ -148,6 +148,13 @@ function modeOf(fs: Fs, path: string, isDir: boolean): number {
     if (stored !== undefined) return stored;
     // a symlink reports 755 on the host, which is what `ln -s` leaves behind
     if (meta.links.has(key)) return 0o755;
+    /* The mode the file system itself carries, which is the one `fs.statSync` of a guest reports:
+       `/tmp` is mounted 0o1777 and `ls -ld /tmp` has to print `drwxrwxrwt`, not the 0o755 a
+       directory made by `mkdir` gets. A file system with no modes of its own keeps the default. */
+    try {
+        const reported = fs.statPath(path)?.mode;
+        if (reported !== undefined) return reported & 0o7777;
+    } catch { /* a path that is not there has no mode to report */ }
     return isDir ? DEFAULT_DIR_MODE : DEFAULT_FILE_MODE;
 }
 
