@@ -1,4 +1,4 @@
-import { fs, InMemoryStore, normalizePath, StoreFS } from '@zenfs/core';
+import { DeviceFS, fs, InMemoryStore, normalizePath, StoreFS, type DeviceDriver } from '@zenfs/core';
 import { IFileSystem, PathStat } from './types';
 import { installPrototypeNameFix } from './zenfs-listing';
 import { NODE_BINARY } from '../process/executors/default-env';
@@ -69,14 +69,100 @@ function createScratchDirectories(): void {
  * The directories a Linux image carries that a guest reaches for by name and that were not there,
  * the same shape of hole `/tmp` was: `os.homedir()` of a guest is `/home` and `/home` was missing,
  * `fs.writeFileSync('/etc/...', ...)` failed with ENOENT, and `PATH` lists `/bin` and `/usr/bin`
- * while neither existed. Device files are not among them -- `/dev/null` is a character device on a
- * host and no file here is, so the directory is made and the devices are not.
+ * while neither existed.
  */
 const SYSTEM_DIRS: ReadonlyArray<string> = ['/bin', '/dev', '/etc', '/home', '/opt', '/usr/bin', '/usr/lib', '/app'];
 
 function createSystemDirectories(): void {
     for (const dir of SYSTEM_DIRS) {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    }
+}
+
+/**
+ * The device files a Linux image carries under the `/dev` the directories above make, which a guest
+ * could not see at all while this file system held files and directories only: `existsSync` of
+ * `/dev/null` was false, and the one way to make the name was to write it, which made an ordinary
+ * file -- a read of it handed back what had been written, where a host reads end of file -- and a
+ * guest that opened `/dev/urandom` for bytes of entropy got ENOENT. A host has all four as
+ * character devices: `statSync('/dev/null').isCharacterDevice()` is true there, its mode is
+ * `0o20666`, its size is 0, and a read of it ends at once.
+ *
+ * They are not files and hold no bytes of their own: `/dev/null` reads end of file and discards
+ * what is written to it, `/dev/zero` reads zeroes, and `/dev/random` and `/dev/urandom` read random
+ * bytes, `crypto.getRandomValues` being the source the host bridge already uses for `randomBase64`.
+ * A read of a stream has no end, so a whole-file read of one -- which is what `readFileSync` asks
+ * for -- hands back one chunk, the `DEVICE_CHUNK` bytes a single read of a character device yields;
+ * a device that is at end of file hands back nothing.
+ */
+const DEVICE_DIR = '/dev';
+const DEVICE_CHUNK = 4096;
+
+interface DeviceSpec {
+    /** The bytes one read of the device yields; empty for a device that is at end of file. */
+    read(length: number): Uint8Array;
+    major: number;
+    minor: number;
+}
+
+function randomBytes(length: number): Uint8Array {
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    return bytes;
+}
+
+const DEVICES: Readonly<Record<string, DeviceSpec>> = {
+    '/dev/null': { major: 1, minor: 3, read: () => new Uint8Array(0) },
+    '/dev/zero': { major: 1, minor: 5, read: (length) => new Uint8Array(length) },
+    '/dev/random': { major: 1, minor: 8, read: randomBytes },
+    '/dev/urandom': { major: 1, minor: 9, read: randomBytes }
+};
+
+function driverFor(name: string, spec: DeviceSpec): DeviceDriver {
+    return {
+        name,
+        init: () => ({ major: spec.major, minor: spec.minor }),
+        read: (_file, buffer, offset = 0, length = buffer.byteLength) => {
+            const bytes = spec.read(length);
+            new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).set(bytes, offset);
+            return bytes.length;
+        },
+        /* Every one of these discards what is written; the position still advances, as on a host. */
+        write: (file, _buffer, _offset, length) => {
+            file.position += length;
+            return length;
+        }
+    };
+}
+
+let devicesMounted = false;
+
+/**
+ * Mounts the file system that holds the devices at `/dev`, the way a host has one mounted there.
+ * ZenFS keeps device files in a file system of their own, and `/dev` is already a directory of the
+ * root file system by the time this runs, so `readdir('/')` still lists it.
+ */
+function mountDeviceDirectory(): void {
+    if (devicesMounted) return;
+    devicesMounted = true;
+    const dev = new DeviceFS();
+    dev.checkRootSync();
+    for (const path of Object.keys(DEVICES)) {
+        dev.createDevice(path.slice(DEVICE_DIR.length), driverFor(path.slice(DEVICE_DIR.length + 1), DEVICES[path]));
+    }
+    try {
+        fs.mount(DEVICE_DIR, dev);
+    } catch {
+        /* A second container in this process finds the mount already there, and it is the same one. */
+    }
+}
+
+/** The device a path names, or `undefined` when it names a file or a directory. */
+function deviceAt(path: string): DeviceSpec | undefined {
+    try {
+        return DEVICES[normalizePath(path)];
+    } catch {
+        return undefined;
     }
 }
 
@@ -121,6 +207,7 @@ export class ZenFSCore implements IFileSystem {
         writePathCommands();
         createScratchDirectories();
         createSystemDirectories();
+        mountDeviceDirectory();
         this.fs = fs;
     }
     readBuffer(path: string): Buffer | undefined {
@@ -261,6 +348,8 @@ export class ZenFSCore implements IFileSystem {
     statPath(path: string): PathStat | undefined {
         if (!this.fs.existsSync(path)) return undefined;
         const stat = this.fs.statSync(path);
+        /* A character device is `file` here, the only other kind `PathStat` names; what makes it a
+           device is the `S_IFCHR` its mode carries, which is what a host's own stat of one reports. */
         return {
             type: stat.isDirectory() ? 'dir' : 'file',
             size: stat.size,
@@ -276,6 +365,9 @@ export class ZenFSCore implements IFileSystem {
 
     readBytes(path: string): Uint8Array | undefined {
         if (!this.fs.existsSync(path) || this.fs.statSync(path).isDirectory()) return undefined;
+        const device = deviceAt(path);
+        /* A device has no bytes of its own: one read of it is all a read of the path can be. */
+        if (device) return device.read(DEVICE_CHUNK);
         return new Uint8Array(this.fs.readFileSync(path));
     }
 

@@ -2,6 +2,10 @@
  * Result of stat-ing a path in the virtual file system
  */
 export interface PathStat {
+    /**
+     * A character device under `/dev` reports `file`, the only other kind this interface names, and
+     * is told apart by its `mode`: it carries `S_IFCHR`, the way a host's `/dev/null` carries it.
+     */
     type: 'file' | 'dir';
     size: number;
     mtimeMs: number;
@@ -26,7 +30,7 @@ export interface IFileSystem {
     resolvePath(path: string, basePath?: string): string;
     fileExists(path: string): boolean;
     resolveModulePath(specifier: string, basePath?: string): string;
-    createDirectory(path: string): void;
+    createDirectory(path: string, mode?: number): void;
     deleteDirectory(path: string): void;
     listDirectory(path: string): string[];
     isDirectory(path: string): boolean;
@@ -34,7 +38,7 @@ export interface IFileSystem {
     statPath(path: string): PathStat | undefined;
     readdirNames(path: string): string[] | undefined;
     readBytes(path: string): Uint8Array | undefined;
-    writeBytes(path: string, data: Uint8Array): void;
+    writeBytes(path: string, data: Uint8Array, mode?: number): void;
     removePath(path: string, recursive?: boolean): void;
     renamePath(from: string, to: string): void;
     /**
