@@ -59,19 +59,17 @@ function argError(Ctor: ErrorConstructor, code: string, message: string): Error 
     return Object.assign(new Ctor(message), { code });
 }
 
-/** Node's rendering of a received value in an error message: `"a"`, `5`, `an instance of X`. */
+/** Node's rendering of a received value in an error message: `type string ('a')`, `type number (5)`, `an instance of X`. */
 function describe(value: unknown): string {
-    if (typeof value === 'string') return JSON.stringify(value);
-    if (typeof value === 'object' && value !== null) {
-        const name = (value as { constructor?: { name?: string } }).constructor?.name;
-        return name !== undefined && name !== 'Object' ? `an instance of ${name}` : 'an object';
-    }
-    return String(value);
+    if (value === null || value === undefined) return String(value);
+    if (typeof value === 'object') return `an instance of ${((value as { constructor?: { name?: string } }).constructor?.name) ?? 'Object'}`;
+    if (typeof value === 'string') return `type string ('${value}')`;
+    return `type ${typeof value} (${String(value)})`;
 }
 
 function optionsObject(value: unknown, name: string): Record<string, unknown> {
     if (value === null || typeof value !== 'object') {
-        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type object. Received ${describe(value)}.`);
+        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type object. Received ${describe(value)}`);
     }
     return value as Record<string, unknown>;
 }
@@ -95,7 +93,7 @@ function portOf(value: unknown, allowZero: boolean, name: string): number {
 function stringOf(value: unknown, name: string): string | undefined {
     if (value === undefined || value === null) return undefined;
     if (typeof value !== 'string') {
-        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type string. Received ${describe(value)}.`);
+        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type string. Received ${describe(value)}`);
     }
     return value;
 }
@@ -105,7 +103,7 @@ function alpnOf(value: unknown): string[] | undefined {
     const list: readonly unknown[] = Array.isArray(value) ? value : [value];
     for (const item of list) {
         if (typeof item !== 'string') {
-            throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "options.alpn" argument must be an array of strings. Received ${describe(item)}.`);
+            throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "options.alpn" argument must be an array of strings. Received ${describe(item)}`);
         }
     }
     return list as string[];
@@ -114,7 +112,7 @@ function alpnOf(value: unknown): string[] | undefined {
 function callbackOf(value: unknown, name: string): (() => void) | undefined {
     if (value === undefined || value === null) return undefined;
     if (typeof value !== 'function') {
-        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type function. Received ${describe(value)}.`);
+        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type function. Received ${describe(value)}`);
     }
     return value as () => void;
 }
@@ -122,7 +120,7 @@ function callbackOf(value: unknown, name: string): (() => void) | undefined {
 function traceOf(value: unknown): ((event: Record<string, unknown>) => void) | undefined {
     if (value === undefined || value === null) return undefined;
     if (typeof value !== 'function') {
-        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "options.trace" argument must be of type function. Received ${describe(value)}.`);
+        throw argError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "options.trace" argument must be of type function. Received ${describe(value)}`);
     }
     return value as (event: Record<string, unknown>) => void;
 }
@@ -130,7 +128,7 @@ function traceOf(value: unknown): ((event: Record<string, unknown>) => void) | u
 function idleTimeoutOf(value: unknown): number | undefined {
     if (value === undefined || value === null) return undefined;
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-        throw argError(RangeError, 'ERR_OUT_OF_RANGE', `The value of "options.idleTimeout" is out of range. It must be >= 0. Received ${describe(value)}.`);
+        throw argError(RangeError, 'ERR_OUT_OF_RANGE', `The value of "options.idleTimeout" is out of range. It must be >= 0. Received ${describe(value)}`);
     }
     return value;
 }
@@ -258,8 +256,9 @@ class QuicServer extends Emitter {
         return this;
     }
 
-    address(): { address: string; port: number } {
-        return this.socket.address();
+    /** null before listen() and after close(), the way net.Server.address() reports it. */
+    address(): { address: string; port: number } | null {
+        return this.socket === null ? null : this.socket.address();
     }
 
     close(callback?: () => void): void {
