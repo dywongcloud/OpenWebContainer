@@ -361,11 +361,12 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   builtin is one the builtin sees and one the shell does not keep, which is what a host does. Brace
   expansion is the expansion a host does first, so `x=q; echo pre{a,b}$x` is `preaq prebq` and
   `echo a\{b,c\}d` stays the text `a{b,c}d`; `set +B` turns it off, as on a host. Each case was run one
-  per process on both sides; the 214-line differential (the row's own eleven, the arrays, the
-  conditional, the braces, `PIPESTATUS`, indirection, the options and a general shell regression set)
-  leaves 11 differences and none of them is this row's: `set -n` runs where a host stops, `set -v`
-  traces where a host does not, and `$HOME`, `ls /`, `[[ -f /etc/hosts ]]` and every `sh -c` of a
-  nested shell are the two trees and the container's own no-nested-`sh` boundary.
+  per process on both sides and three times byte-identical; the 226-line differential (the row's own
+  eleven, the arrays, the conditional, the braces, `PIPESTATUS`, indirection, the options and a
+  general shell regression set) leaves 14 differences and none of them is this row's: `set -n` runs
+  where a host stops and `set -v` traces where a host does not, three are the container's own
+  no-nested-`sh` boundary, six are the two trees (`$HOME`, `ls /`, `[[ -f /etc/hosts ]]`), and three
+  are the `$0` a host prints as `/bin/sh` where this shell prints `sh`.
 - **A mode `chmod` sets does not outlive the `sh -c` line that set it.** The metadata side table it writes is
   keyed by the file system object a line was handed, so `chmod 700 f` in one `sh -c` and `ls -l f` in the next
   prints `-rw-r--r--`, where a host prints `-rwx------`; within one line the mode is there. Separately, a
