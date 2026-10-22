@@ -1,0 +1,15 @@
+id: owc-url-file-scheme-host
+subject: 'URL: a file: URL keeps a host, so new URL("file://localhost/a").hostname is "localhost" and new URL("file:/a").href is "file://a/" where host Node 24.15 gives "" and "file:///a"'
+description: >-
+  Measured 2026-10-22 (judge lane, differential container vs host Node 24.15). WHATWG treats file:
+  as hostless: 'file://localhost/a' has hostname '' in the host and 'localhost' in the container,
+  and 'file:/a' -- one slash, so no authority -- serialises as 'file:///a' in the host and
+  'file://a/' in the container, which makes 'a' the host. Fix belongs in parseUrl in
+  guest/globals.ts (urlGlobalOf): a file: URL with no '//' takes no authority, and 'localhost' is
+  not a host it keeps.
+owner: lanmower
+session_id: adv-judge-fetch-url-esm-4
+witness_plan: >-
+  Differential hostname and href over 'file://localhost/a' and 'file:/a', host Node 24.15 vs
+  container; every line must match.
+status: pending

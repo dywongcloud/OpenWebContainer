@@ -1,0 +1,16 @@
+id: owc-esm-builtin-namespace-surface
+subject: 'ESM: the namespace of a builtin module is thinner than Node''s, so Object.keys(await import("node:path")).length is 16 where host Node 24.15 gives 18 and node:fs lacks cp, glob, statfs, lutimes and openAsBlob'
+description: >-
+  Measured 2026-10-22 (judge lane, differential container vs host Node 24.15). node:path is missing
+  matchesGlob and _makeLong; node:fs is missing cp, cpSync, glob, globSync, statfs, statfsSync,
+  lutimes, lutimesSync, openAsBlob, mkdtempDisposableSync, FileReadStream, FileWriteStream and
+  Utf8Stream, and instead exposes F_OK/R_OK/W_OK/X_OK at top level where the host keeps them under
+  fs.constants only (81 keys vs 105); node:os is missing getPriority, setPriority and machine (20
+  keys vs 24). Fix belongs in the guest builtin modules (guest/modules/*): add the missing exports
+  and drop the four constants from the top level of fs.
+owner: lanmower
+session_id: adv-judge-fetch-url-esm-4
+witness_plan: >-
+  Differential Object.keys(await import('node:path'|'node:fs'|'node:os')) sorted, plus the presence
+  of each named export, host Node 24.15 vs container; every line must match.
+status: pending
