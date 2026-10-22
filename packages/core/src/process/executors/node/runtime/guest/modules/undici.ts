@@ -346,13 +346,25 @@ function normalizeHeaderValue(value) {
   return String(value).replace(/^[\t\n\f\r ]+/, '').replace(/[\t\n\f\r ]+$/, '');
 }
 
+/* The list a Headers keeps, kept beside the instance rather than on it: Node's Headers carries no
+   own property at all -- not even one Object.getOwnPropertyNames would show -- so there is nowhere
+   visible a record of entries could live. */
+var HEADERS_LIST = new WeakMap();
+
+function headersList(headers) {
+  var list = HEADERS_LIST.get(headers);
+  if (list === undefined) {
+    list = [];
+    HEADERS_LIST.set(headers, list);
+  }
+  return list;
+}
+
 function Headers(init) {
   if (!(this instanceof Headers)) {
     throw new TypeError('Class constructor _Headers cannot be invoked without \'new\'');
   }
-  /* The list a Headers keeps is an own property here, but not one Node's shows: Object.keys,
-     JSON.stringify and for-in of a Headers are all empty. */
-  Object.defineProperty(this, '_list', { value: [], writable: true, configurable: true });
+  HEADERS_LIST.set(this, []);
   if (init === undefined || init === null) return;
   var self = this;
   /* A sequence of pairs: an array of arrays, another Headers, or anything else iterable. */
@@ -393,23 +405,26 @@ Headers.prototype.append = function (name, value) {
       throw new TypeError('Headers.append: "' + rawValue + '" is an invalid header value.');
     }
   }
-  this._list.push({ name: rawName.toLowerCase(), value: normalizeHeaderValue(rawValue) });
+  headersList(this).push({ name: rawName.toLowerCase(), value: normalizeHeaderValue(rawValue) });
 };
 Headers.prototype.delete = function (name) {
   var lower = String(name).toLowerCase();
   var kept = [];
-  for (var i = 0; i < this._list.length; i++) if (this._list[i].name !== lower) kept.push(this._list[i]);
-  this._list = kept;
+  var list = headersList(this);
+  for (var i = 0; i < list.length; i++) if (list[i].name !== lower) kept.push(list[i]);
+  HEADERS_LIST.set(this, kept);
 };
 Headers.prototype.get = function (name) {
   var lower = String(name).toLowerCase();
   var found = [];
-  for (var i = 0; i < this._list.length; i++) if (this._list[i].name === lower) found.push(this._list[i].value);
+  var list = headersList(this);
+  for (var i = 0; i < list.length; i++) if (list[i].name === lower) found.push(list[i].value);
   return found.length === 0 ? null : found.join(', ');
 };
 Headers.prototype.has = function (name) {
   var lower = String(name).toLowerCase();
-  for (var i = 0; i < this._list.length; i++) if (this._list[i].name === lower) return true;
+  var list = headersList(this);
+  for (var i = 0; i < list.length; i++) if (list[i].name === lower) return true;
   return false;
 };
 /* Node's Headers declares set after delete, so that is the order the prototype lists them in. */
@@ -419,7 +434,8 @@ Headers.prototype.set = function (name, value) {
 };
 Headers.prototype.getSetCookie = function () {
   var found = [];
-  for (var i = 0; i < this._list.length; i++) if (this._list[i].name === 'set-cookie') found.push(this._list[i].value);
+  var list = headersList(this);
+  for (var i = 0; i < list.length; i++) if (list[i].name === 'set-cookie') found.push(list[i].value);
   return found;
 };
 /* What Node iterates: one entry per name, the names sorted, the values of a name joined. */
@@ -457,7 +473,7 @@ function inspectBlock(name, pairs, inspect) {
 }
 
 function headersInspect(inspect) {
-  var entries = headerEntries(this._list);
+  var entries = headerEntries(headersList(this));
   var shown = '';
   for (var i = 0; i < entries.length; i++) {
     shown += (i === 0 ? '' : ', ') + keyTextOf(entries[i][0]) + ': ' + inspect(entries[i][1]);
@@ -466,13 +482,13 @@ function headersInspect(inspect) {
 }
 
 Headers.prototype.keys = function () {
-  return headerEntries(this._list).map(function (pair) { return pair[0]; })[Symbol.iterator]();
+  return headerEntries(headersList(this)).map(function (pair) { return pair[0]; })[Symbol.iterator]();
 };
 Headers.prototype.values = function () {
-  return headerEntries(this._list).map(function (pair) { return pair[1]; })[Symbol.iterator]();
+  return headerEntries(headersList(this)).map(function (pair) { return pair[1]; })[Symbol.iterator]();
 };
 Headers.prototype.entries = function () {
-  return headerEntries(this._list).map(function (pair) { return [pair[0], pair[1]]; })[Symbol.iterator]();
+  return headerEntries(headersList(this)).map(function (pair) { return [pair[0], pair[1]]; })[Symbol.iterator]();
 };
 if (INSPECT_CUSTOM !== undefined) {
   Object.defineProperty(Headers.prototype, INSPECT_CUSTOM, {
@@ -482,7 +498,7 @@ if (INSPECT_CUSTOM !== undefined) {
 }
 Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
 Headers.prototype.forEach = function (fn, thisArg) {
-  var entries = headerEntries(this._list);
+  var entries = headerEntries(headersList(this));
   var self = this;
   for (var i = 0; i < entries.length; i++) {
     fn.call(thisArg === undefined ? self : thisArg, entries[i][1], entries[i][0], self);

@@ -352,24 +352,6 @@ function rxHasTopYield(src, s, e) {
   }
   return false;
 }
-/* Where the statement that follows a control header runs out: at its ';', or at the '}' or ')'
-   that closes whatever it is standing in. Used only to brace a loop that needs a declaration of
-   its own and has nowhere to put one. */
-function rxStatementEnd(src, s) {
-  var n = src.length, d = 0, q = s;
-  while (q < n) {
-    q = rxSkip(src, q, { nl: false });
-    if (q >= n) break;
-    var c = src.charCodeAt(q);
-    if (c === 40 || c === 91 || c === 123) { d++; q++; continue; }
-    if (c === 41 || c === 93 || c === 125) { if (d === 0) return q; d--; q++; continue; }
-    if (c === 59 && d === 0) return q + 1;
-    if (c === 34 || c === 39) { q = rxSkipString(src, q, c); continue; }
-    if (c === 96) { q = rxWalkTemplate(src, q).next; continue; }
-    q++;
-  }
-  return n;
-}
 /* QuickJS 0.31 and 0.32 raise 'stack underflow' while compiling 'for (const x of (yield e))' and
    the same shape under 'for await', so the iterable is evaluated into a const of its own and the
    loop reads it from there. The iterable of a for-of is evaluated once, before the first step of
@@ -380,18 +362,9 @@ function rxForOfYields(src, fors) {
   var out = [], seq = 0;
   for (var f = 0; f < fors.length; f++) {
     var t = fors[f];
-    var insertAt = t.s, brace = false;
-    if (t.pk === 'p' && t.pv === ':') {
-      /* after a ':' a statement may start: a label keeps the loop labelled only if the const goes
-         before the label, and a 'case' or 'default' clause takes the const where the loop stood */
-      if (t.ls >= 0) insertAt = t.ls;
-    } else if (t.pk === null || (t.pk === 'p' && (t.pv === '{' || t.pv === '}' || t.pv === ';' || t.pv === 'obj}'))) {
-      /* a statement list: the const simply goes before the loop */
-    } else if (t.pv === 'hdr' || t.pk === 'kw') {
-      /* the bare body of if, while, for, with, do or else: no declaration can stand before the
-         loop there, so the loop and its declaration are braced together */
-      brace = true;
-    } else continue;
+    var insertAt = t.s;
+    if (t.pv === ':' && t.ls >= 0) insertAt = t.ls;
+    else if (!(t.pk === null || (t.pk === 'p' && (t.pv === '{' || t.pv === '}' || t.pv === ';' || t.pv === 'obj}')))) continue;
     var n = src.length;
     var p = rxSkip(src, t.s + 3, { nl: false });
     if (src.slice(p, p + 5) === 'await') {
@@ -434,16 +407,10 @@ function rxForOfYields(src, fors) {
     var iterE = closeAt;
     while (iterE > iterS && rxIsSpace(src.charCodeAt(iterE - 1))) iterE--;
     if (iterE <= iterS || !rxHasTopYield(src, iterS, iterE)) continue;
-    if (brace) {
-      var endAt = rxStatementEnd(src, closeAt + 1);
-      if (endAt <= closeAt + 1) continue;
-    }
     var name = '';
     do { seq++; name = '__owcOf' + seq; } while (src.indexOf(name) >= 0);
-    var declare = 'const ' + name + ' = ' + src.slice(iterS, iterE) + '; ';
-    out.push({ s: insertAt, e: insertAt, text: brace ? '{ ' + declare : declare });
+    out.push({ s: insertAt, e: insertAt, text: 'const ' + name + ' = ' + src.slice(iterS, iterE) + '; ' });
     out.push({ s: iterS, e: iterE, text: name });
-    if (brace) out.push({ s: endAt, e: endAt, text: ' }' });
   }
   return out;
 }

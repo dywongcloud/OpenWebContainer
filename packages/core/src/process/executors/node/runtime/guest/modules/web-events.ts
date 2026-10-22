@@ -11,6 +11,45 @@ export const SRC = String.raw`
   var PORTS = new WeakMap();
   var PORT_TOKEN = {};
 
+  /*
+   * Node declares an event's members ENUMERABLE and in one fixed order, so a for-in over an event
+   * lists every one of them; a class body declares them non-enumerable and in the order it was
+   * written. So each member is taken off the prototype -- a property keeps the place it was first
+   * defined at, and deleting is what lets the order change -- and put back in Node's own order,
+   * with the setter Node's has: cancelBubble and returnValue are attributes a program may still
+   * write, and every other read-only one gets the setter that reports the assignment the way the
+   * host engine does.
+   */
+  function declareEventMembers(proto, order, className, extra) {
+    var held = Object.create(null);
+    Object.getOwnPropertyNames(proto).forEach(function (name) {
+      if (name === 'constructor') return;
+      held[name] = Object.getOwnPropertyDescriptor(proto, name);
+      delete proto[name];
+    });
+    if (extra !== undefined) {
+      Object.keys(extra).forEach(function (name) { held[name] = extra[name]; });
+    }
+    order.forEach(function (name) {
+      var d = held[name];
+      if (d === undefined) return;
+      if (d.get !== undefined || d.set !== undefined) {
+        if (d.set === undefined) {
+          d.set = function () {
+            throw new TypeError('Cannot set property ' + name + ' of #<' + className + '> which has only a getter');
+          };
+        }
+        d.enumerable = true;
+        d.configurable = true;
+      } else {
+        d.writable = true;
+        d.enumerable = true;
+        d.configurable = true;
+      }
+      Object.defineProperty(proto, name, d);
+    });
+  }
+
   var LEGACY_CODES = {
     IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5,
     NoModificationAllowedError: 7, NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11,
@@ -72,6 +111,43 @@ export const SRC = String.raw`
       return st.currentTarget === null ? [] : [st.currentTarget];
     }
   }
+  declareEventMembers(Event.prototype, [
+    'initEvent', 'stopImmediatePropagation', 'preventDefault', 'target', 'currentTarget', 'srcElement',
+    'type', 'cancelable', 'defaultPrevented', 'timeStamp', 'composedPath', 'returnValue', 'bubbles',
+    'composed', 'eventPhase', 'cancelBubble', 'stopPropagation', 'isTrusted'
+  ], 'Event', {
+    /* The legacy initialiser: it rewrites the three attributes it is handed, and says what the
+       constructor says when it is given nothing. */
+    initEvent: { value: function (type) {
+      if (arguments.length === 0) throw new TypeError('The "type" argument must be specified');
+      var st = EVENT.get(this);
+      if (st === undefined) return;
+      st.type = String(type);
+      st.bubbles = !!arguments[1];
+      st.cancelable = !!arguments[2];
+    } },
+    /* The two attributes a program may still write: writing one is what stops propagation or
+       cancels the event, and the getter reads the flag that writing it set. */
+    returnValue: {
+      get: function () { return !EVENT.get(this).defaultPrevented; },
+      set: function (value) { if (!value) this.preventDefault(); }
+    },
+    cancelBubble: {
+      get: function () { return EVENT.get(this).stopped; },
+      set: function (value) { if (value) this.stopPropagation(); }
+    }
+  });
+  Object.defineProperty(Event.prototype, Symbol.toStringTag, { value: 'Event', configurable: true });
+  /*
+   * CloseEvent is installed by the bootstrap above this file, which runs before Event exists, so
+   * there it can only be joined to Event on first use. Joining it here as well is what makes the
+   * prototype itself read the way Node's does from the first moment a program can see it: a for-in
+   * over CloseEvent.prototype lists the attributes it adds and then every attribute of an Event.
+   */
+  if (typeof globalThis.CloseEvent === 'function' &&
+      Object.getPrototypeOf(globalThis.CloseEvent.prototype) !== Event.prototype) {
+    Object.setPrototypeOf(globalThis.CloseEvent.prototype, Event.prototype);
+  }
   Object.defineProperty(Event, 'NONE', { value: 0, enumerable: true });
   Object.defineProperty(Event, 'CAPTURING_PHASE', { value: 1, enumerable: true });
   Object.defineProperty(Event, 'AT_TARGET', { value: 2, enumerable: true });
@@ -85,6 +161,8 @@ export const SRC = String.raw`
     }
     get detail() { return EVENT.get(this).detail; }
   }
+  declareEventMembers(CustomEvent.prototype, ['detail'], 'CustomEvent');
+  Object.defineProperty(CustomEvent.prototype, Symbol.toStringTag, { value: 'CustomEvent', configurable: true });
 
   class MessageEvent extends Event {
     constructor(type, options) {
@@ -103,6 +181,15 @@ export const SRC = String.raw`
     get source() { return EVENT.get(this).source; }
     get ports() { return EVENT.get(this).ports; }
   }
+  /* The legacy initialiser Node still declares, which sets nothing: it answers only to say it was
+     given no argument at all. */
+  declareEventMembers(MessageEvent.prototype,
+    ['data', 'origin', 'lastEventId', 'source', 'ports', 'initMessageEvent'], '_MessageEvent', {
+      initMessageEvent: { value: function (type) {
+        if (arguments.length < 1) throw new TypeError('MessageEvent.initMessageEvent: 1 argument required, but 0 found.');
+      } }
+    });
+  Object.defineProperty(MessageEvent.prototype, Symbol.toStringTag, { value: 'MessageEvent', configurable: true });
 
   class EventTarget {
     constructor() {
