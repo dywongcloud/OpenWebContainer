@@ -959,6 +959,27 @@ re-run in isolation; the rows are open.
   still compiled as CommonJS -- `typeof import.meta` is a `SyntaxError` and `typeof require` is
   `function`, where the host has `object` and `undefined`, and `node --input-type=module -p 1` should
   fail with `ERR_EVAL_ESM_CANNOT_PRINT` rather than print `1`.
+- `owc-esm-global-surface`: the enumerable globals are not Node's -- `Object.keys(globalThis).length`
+  is 27 here against the host's 15, and the container makes `Blob`, `Buffer`, `URL`, `URLSearchParams`,
+  `console`, `process`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `File` and
+  `CloseEvent` enumerable where the host does not, leaks `__owcErrname` as an enumerable global, and
+  has no `navigator`; `Object.getOwnPropertyNames(globalThis)` is 122 against 135, missing `Atomics`,
+  `Crypto`/`CryptoKey`/`SubtleCrypto`, `navigator`/`Navigator`, the `Performance` family,
+  `BroadcastChannel`, `CompressionStream`/`DecompressionStream`, `URLPattern`,
+  `DisposableStack`/`AsyncDisposableStack` and `SuppressedError` (row owc-esm-global-surface)
+- `owc-esm-unknown-file-extension`: `import('./m.xyz')` holding `export const v = 1` -- the host
+  answers `TypeError ERR_UNKNOWN_FILE_EXTENSION "Unknown file extension \".xyz\" for /app/m.xyz"`,
+  the container parses it as CommonJS. The same call exposes four more: `.m` is
+  `ERR_UNKNOWN_FILE_EXTENSION` on the host, `.ts` and `.mts` LOAD (Node 24 strips types) where the
+  container raises `unsupported keyword: export`, `.node` is `ERR_UNKNOWN_FILE_EXTENSION` where the
+  container gives `ERR_DLOPEN_FAILED`, and `.wasm` is a wasm module on the host and CommonJS here
+  (row owc-esm-unknown-file-extension)
+- `owc-esm-main-syntax-error-frame`: a syntax error is printed without Node's frame, and its message
+  is the engine's and not V8's -- for `const = 1;` the host writes `SyntaxError: Unexpected token '='`
+  under a caret with internal frames and a `Node.js v24.15.0` trailer, the container writes
+  `SyntaxError: variable name expected`. Not only an ES module main: a `.cjs` main, a typeless `.js`
+  main and a syntax error inside an imported dependency all lose the frame the same way, and an
+  `import.meta` in a `.cjs` loses it too (row owc-esm-main-syntax-error-frame)
 - `owc-esm-cjs-dynamic-import-namespace`: `import('./m.mjs')` written in a CommonJS importer
   resolves to the engine's namespace and not to Node's view of one -- `ns.a = 99` throws
   `'a' is read-only` where the host throws `Cannot assign to read only property 'a' of object
