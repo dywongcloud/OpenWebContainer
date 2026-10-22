@@ -1,0 +1,34 @@
+owc-esm-detection-markers -- judge lane adv4-judge-esm-5
+host: node v24.15.0; container: packages/core via /tmp/owc-r4/probe2/run-owc-repo.mts
+commit: bc0f3d99c61d0da523db77d36023b1a7dd2f0238
+load=23.80 freeMB=2255
+
+a1-meta-only           MATCH host_exit=0 cont_exit=0 aborted=0
+a2-nospace-export      MATCH host_exit=0 cont_exit=0 aborted=0
+a3-nospace-import      MATCH host_exit=0 cont_exit=0 aborted=0
+a6-await-in-async      MATCH host_exit=0 cont_exit=0 aborted=0
+b4-req-unknown-ext-esm MATCH host_exit=0 cont_exit=0 aborted=0
+n1-dynamic-import      MATCH host_exit=0 cont_exit=0 aborted=0
+n2-import-space-paren  MATCH host_exit=0 cont_exit=0 aborted=0
+n3-object-keys         MATCH host_exit=0 cont_exit=0 aborted=0
+n4-exportable          MATCH host_exit=0 cont_exit=0 aborted=0
+n5-tla                 MATCH host_exit=0 cont_exit=0 aborted=0
+n6-comment-export      MATCH host_exit=0 cont_exit=0 aborted=0
+n7-string-export       MATCH host_exit=0 cont_exit=0 aborted=0
+n8-export-default      MATCH host_exit=0 cont_exit=0 aborted=0
+n9-import-braces       MATCH host_exit=0 cont_exit=0 aborted=0
+n10-hashbang-export    MATCH host_exit=0 cont_exit=0 aborted=0
+n11-bare-static-import MATCH host_exit=0 cont_exit=0 aborted=0
+n13-type-module        MATCH host_exit=0 cont_exit=0 aborted=0
+n14-meta-midline       MATCH host_exit=0 cont_exit=0 aborted=0
+n15-req-xyz-cjs        MATCH host_exit=0 cont_exit=0 aborted=0
+m1-class-import        MATCH host_exit=0 cont_exit=0 aborted=0
+m2-object-import       MATCH host_exit=0 cont_exit=0 aborted=0
+m3-static-import       MATCH host_exit=0 cont_exit=0 aborted=0
+m4-extless-esm         MATCH host_exit=0 cont_exit=0 aborted=0
+m5-req-extless         MATCH host_exit=0 cont_exit=0 aborted=0
+q5-req-mjs             MATCH host_exit=0 cont_exit=0 aborted=0
+x2-import-mjs          MATCH host_exit=0 cont_exit=0 aborted=0
+x3-import-js-esm       MATCH host_exit=0 cont_exit=0 aborted=0
+x4-import-js-cjs       MATCH host_exit=0 cont_exit=0 aborted=0
+c1-meta-shapes         MATCH host_exit=0 cont_exit=0 aborted=0

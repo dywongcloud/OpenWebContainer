@@ -904,7 +904,7 @@ Future plans:
 - [ ] `url.pathToFileURL` returns a duck-typed object and not a `URL` -- `url.pathToFileURL('/a') instanceof URL` is `false` where host Node answers `true`, and its prototype carries only `host`, `href`, `origin`, `toJSON` and `toString` (row owc-url-path-to-file-url-not-a-url)
 - [ ] the `url` module is missing exports -- `Object.keys(url)` has no `URLPattern`, no `fileURLToPathBuffer` and no `resolveObject`, where host Node lists all three beside the eleven this container has (row owc-url-module-missing-exports)
 - [ ] `url.parse` drops a `__proto__` key from a parsed query -- `url.parse('http://a/b?__proto__=1', true).query` is `{}` where host Node gives `{__proto__: '1'}` (row owc-url-parse-query-proto-key)
-- [ ] Builtin module namespace surface -- far wider than `node:fs`: against host Node the namespaces of 20 of 26 builtins are short (`node:constants` 56 against 231, `node:process` 36 against 83, `node:crypto` 30 against 70, `node:util` 22 against 35), `node:util` adds 5 names host Node lacks, and `node:stream/consumers` and `node:assert/strict` do not resolve at all (row owc-esm-builtin-namespace-surface)
+- [ ] Builtin module namespace surface -- far wider than `node:fs`: measured against host Node 24.15, 19 of 34 builtins differ (`node:fs` 90 against 105, `node:process` 46 against 83, `node:crypto` 30 against 70, `node:util` 22 against 35, `node:os` 22 against 24, `node:path` 16 against 18); `node:cluster` exposes `worker` where Node has `Worker`, `node:util` leaks `__isDeepEqual`/`isFunction`/`isNumber`/`isObject`/`isString`, `node:module` still exports `createRequireFromPath`/`wrap`/`wrapper` that Node 24 dropped, and `node:fs` carries `F_OK`/`R_OK`/`W_OK`/`X_OK` at top level (row owc-esm-builtin-namespace-surface)
 - [x] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
 - [x] A multi-byte character split across two `process.stdout.write` calls, and a lone surrogate written as text -- `write([e4,b8])` then `write([ad])` is U+4E2D as on a host, including across an intervening empty-string write, and `write('\ud83d')` then `write('\ude00')` is two U+FFFD as on a host (row owc-stdout-split-sequence-mangled)
 - [x] `cmd 3>f >&3` -- a descriptor the command itself opened is visible to its own later `>&n`, and one a compound command opened to the whole construct, as on a host (row owc-shell-fd-opened-by-command-visible-to-itself)
@@ -958,6 +958,27 @@ re-run in isolation; the rows are open.
   still compiled as CommonJS -- `typeof import.meta` is a `SyntaxError` and `typeof require` is
   `function`, where the host has `object` and `undefined`, and `node --input-type=module -p 1` should
   fail with `ERR_EVAL_ESM_CANNOT_PRINT` rather than print `1`.
+- `owc-esm-global-surface`: the enumerable globals are not Node's -- `Object.keys(globalThis).length`
+  is 27 here against the host's 15, and the container makes `Blob`, `Buffer`, `URL`, `URLSearchParams`,
+  `console`, `process`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `File` and
+  `CloseEvent` enumerable where the host does not, leaks `__owcErrname` as an enumerable global, and
+  has no `navigator`; `Object.getOwnPropertyNames(globalThis)` is 122 against 135, missing `Atomics`,
+  `Crypto`/`CryptoKey`/`SubtleCrypto`, `navigator`/`Navigator`, the `Performance` family,
+  `BroadcastChannel`, `CompressionStream`/`DecompressionStream`, `URLPattern`,
+  `DisposableStack`/`AsyncDisposableStack` and `SuppressedError` (row owc-esm-global-surface)
+- `owc-esm-unknown-file-extension`: `import('./m.xyz')` holding `export const v = 1` -- the host
+  answers `TypeError ERR_UNKNOWN_FILE_EXTENSION "Unknown file extension \".xyz\" for /app/m.xyz"`,
+  the container parses it as CommonJS. The same call exposes four more: `.m` is
+  `ERR_UNKNOWN_FILE_EXTENSION` on the host, `.ts` and `.mts` LOAD (Node 24 strips types) where the
+  container raises `unsupported keyword: export`, `.node` is `ERR_UNKNOWN_FILE_EXTENSION` where the
+  container gives `ERR_DLOPEN_FAILED`, and `.wasm` is a wasm module on the host and CommonJS here
+  (row owc-esm-unknown-file-extension)
+- `owc-esm-main-syntax-error-frame`: a syntax error is printed without Node's frame, and its message
+  is the engine's and not V8's -- for `const = 1;` the host writes `SyntaxError: Unexpected token '='`
+  under a caret with internal frames and a `Node.js v24.15.0` trailer, the container writes
+  `SyntaxError: variable name expected`. Not only an ES module main: a `.cjs` main, a typeless `.js`
+  main and a syntax error inside an imported dependency all lose the frame the same way, and an
+  `import.meta` in a `.cjs` loses it too (row owc-esm-main-syntax-error-frame)
 - `owc-esm-cjs-dynamic-import-namespace`: `import('./m.mjs')` written in a CommonJS importer
   resolves to the engine's namespace and not to Node's view of one -- `ns.a = 99` throws
   `'a' is read-only` where the host throws `Cannot assign to read only property 'a' of object
