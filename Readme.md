@@ -351,14 +351,22 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   Six that do answer print the bare name where a host prints a path (`mkdir`, `rm`, `cp`, `mv`, `touch`,
   `which`), and `npx --version` exits 1 with `npx: a command or package is required` where a host prints
   `11.12.1`.
-- **`owc-shell-bash32-extensions`: this machine's `/bin/sh` is bash 3.2, and the guest shell has none of the
-  syntax that makes it one.** `arr=(x y z); echo ${arr[1]}` is `y` on the host and a syntax error here,
-  `[[ abc == a* ]]` is `matched` against `sh: [[: command not found` with 127, `echo a{b,c}d` is `abd acd`
-  against the literal `a{b,c}d`, `true | false | true; echo ${PIPESTATUS[1]}` is `1` against nothing, and
-  `k=target; target=hit; echo ${!k}` is `hit` against nothing -- with `set -o` naming 27 options on the host
-  and 17 here, `$-` `hBc` against `h`, `declare -i n=1; n=n+1` `2` against `n+1`, `export -n` and `hash -d`
-  rejected, and `read` not splitting on IFS. Each case was run one per process on both sides and re-run three
-  times byte-identical. The whole measured list is the row's subject.
+- **`owc-shell-bash32-extensions` (closed): this machine's `/bin/sh` is bash 3.2, and the guest shell
+  now has the syntax that makes it one.** `arr=(x y z); echo ${arr[1]}` is `y`, `[[ abc == a* ]]` is
+  `matched` (it was `sh: [[: command not found` with 127), `echo a{b,c}d` is `abd acd`,
+  `true | false | true; echo ${PIPESTATUS[1]}` is `1`, `k=target; target=hit; echo ${!k}` is `hit`,
+  `set -o` names the same 27 options in the same order with the same `on`/`off` behind a tab (it named
+  17), `$-` is `hBc` (it was `h`), `declare -i n=1; n=n+1` is `2` (it was `n+1`), `export -n FOO` and
+  `hash -d ls` both leave 0, and `IFS=: read x y` splits on the colon -- an assignment in front of a
+  builtin is one the builtin sees and one the shell does not keep, which is what a host does. Brace
+  expansion is the expansion a host does first, so `x=q; echo pre{a,b}$x` is `preaq prebq` and
+  `echo a\{b,c\}d` stays the text `a{b,c}d`; `set +B` turns it off, as on a host. Each case was run one
+  per process on both sides and three times byte-identical; the 226-line differential (the row's own
+  eleven, the arrays, the conditional, the braces, `PIPESTATUS`, indirection, the options and a
+  general shell regression set) leaves 14 differences and none of them is this row's: `set -n` runs
+  where a host stops and `set -v` traces where a host does not, three are the container's own
+  no-nested-`sh` boundary, six are the two trees (`$HOME`, `ls /`, `[[ -f /etc/hosts ]]`), and three
+  are the `$0` a host prints as `/bin/sh` where this shell prints `sh`.
 - **A mode `chmod` sets does not outlive the `sh -c` line that set it.** The metadata side table it writes is
   keyed by the file system object a line was handed, so `chmod 700 f` in one `sh -c` and `ls -l f` in the next
   prints `-rw-r--r--`, where a host prints `-rwx------`; within one line the mode is there. Separately, a
@@ -951,6 +959,7 @@ Future plans:
 - [ ] Builtin module namespace surface -- far wider than `node:fs`: measured against host Node 24.15, 19 of 34 builtins differ (`node:fs` 90 against 105, `node:process` 46 against 83, `node:crypto` 30 against 70, `node:util` 22 against 35, `node:os` 22 against 24, `node:path` 16 against 18); `node:cluster` exposes `worker` where Node has `Worker`, `node:util` leaks `__isDeepEqual`/`isFunction`/`isNumber`/`isObject`/`isString`, `node:module` still exports `createRequireFromPath`/`wrap`/`wrapper` that Node 24 dropped, and `node:fs` carries `F_OK`/`R_OK`/`W_OK`/`X_OK` at top level (row owc-esm-builtin-namespace-surface)
 - [x] Namespace mutation error text -- `ns.default = 1` reports QuickJS's `'default' is read-only`, not Node's message (row owc-esm-namespace-mutation-error-text)
 - [x] A multi-byte character split across two `process.stdout.write` calls, and a lone surrogate written as text -- `write([e4,b8])` then `write([ad])` is U+4E2D as on a host, including across an intervening empty-string write, and `write('\ud83d')` then `write('\ude00')` is two U+FFFD as on a host (row owc-stdout-split-sequence-mangled)
+- [x] bash 3.2 syntax this machine's `/bin/sh` has -- arrays (`a=(x y z)`, `${a[1]}`, `${#a[@]}`), the conditional command `[[ a == a* ]]`, brace expansion (`a{b,c}d`, `{1..3}`, `set +B`), `PIPESTATUS`, indirection `${!k}`, the full 27-name `set -o` list and `$-` of `hBc`, `declare -i`, `export -n`, `hash -d`, and an assignment in front of a builtin (`IFS=: read x y`) (row owc-shell-bash32-extensions)
 - [x] `cmd 3>f >&3` -- a descriptor the command itself opened is visible to its own later `>&n`, and one a compound command opened to the whole construct, as on a host (row owc-shell-fd-opened-by-command-visible-to-itself)
 - [x] `exec >f`, `exec 2>f` and `exec 1>&2` persist, and what the commands behind them wrote stays in the file -- `exec >f; echo a; echo b` is both lines (row owc-shell-exec-standard-fd-dropped)
 - [x] `exec 3>&1`, `exec 3>&2` and `exec 3<&1` duplicate the standard descriptor a host duplicates, with no bad-descriptor diagnostic (row owc-shell-exec-duplicating-standard-fd)

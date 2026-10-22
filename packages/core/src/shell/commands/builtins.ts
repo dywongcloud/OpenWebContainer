@@ -113,6 +113,11 @@ export interface ShellVar {
     export?: boolean;
     /** Assignment is refused (`readonly`, `declare -r`). */
     readonly?: boolean;
+    /**
+     * The integer attribute `declare -i` sets: every assignment to the name is arithmetic.
+     * `declare -i n=1; n=n+1` leaves a `n` of 2, where a name without it holds the text `n+1`.
+     */
+    integer?: boolean;
 }
 
 export interface TrapSpec {
@@ -139,25 +144,45 @@ export interface FunctionDef {
     text?: string;
 }
 
-/** Every option `set -o` knows about. */
+/**
+ * Every option `set -o` knows about.
+ *
+ * The names are the ones this machine's `/bin/sh` prints -- bash 3.2 in POSIX mode, which lists
+ * twenty-seven of them -- and every one `set -o <name>` takes is here, so the list a caller sees
+ * and the list a caller can set are the same list. The eleven this file does not act on are kept
+ * as state anyway: `set -o keyword; set -o | grep keyword` answers `on`, and `$-` reads the ones
+ * a host's own `$-` spells (`B` for `braceexpand`, `H` for `histexpand`, `b` for `notify`).
+ */
 export interface ShellOptions {
     allexport: boolean;
+    braceexpand: boolean;
+    emacs: boolean;
     errexit: boolean;
-    noglob: boolean;
+    errtrace: boolean;
+    functrace: boolean;
     hashall: boolean;
-    monitor: boolean;
-    noexec: boolean;
-    nounset: boolean;
-    verbose: boolean;
-    xtrace: boolean;
+    histexpand: boolean;
+    history: boolean;
     ignoreeof: boolean;
+    interactiveComments: boolean;
+    keyword: boolean;
+    monitor: boolean;
     noclobber: boolean;
+    noexec: boolean;
+    noglob: boolean;
+    nolog: boolean;
+    notify: boolean;
+    nounset: boolean;
+    onecmd: boolean;
+    physical: boolean;
     pipefail: boolean;
     posix: boolean;
+    privileged: boolean;
+    verbose: boolean;
     vi: boolean;
-    emacs: boolean;
+    xtrace: boolean;
+    /** Not a name `set -o` prints: it is set from how the shell was started, not from a flag. */
     interactive: boolean;
-    history: boolean;
 }
 
 /**
@@ -661,8 +686,72 @@ function setVar(state: ShellState, name: string, value: string): boolean {
     const scope = lookupScope(state, name) ?? state.scopes[state.scopes.length - 1];
     const existing = scope.get(name);
     if (existing?.readonly) return false;
-    if (existing) existing.value = value;
-    else scope.set(name, { value });
+    /* The integer attribute `declare -i` set: the value assigned is arithmetic, so `n=n+1` behind
+       a `declare -i n=1` leaves 2 and not the text `n+1`. A name the attribute was not set on keeps
+       its text, and one whose value is not an expression keeps that too -- `declare -i n; n=x` is 0
+       on a host, which is what an expression of one unset name evaluates to. */
+    const stored = existing?.integer === true ? integerValue(state, value) : value;
+    if (existing) existing.value = stored;
+    else scope.set(name, { value: stored });
+    return true;
+}
+
+/**
+ * The value an assignment to a `declare -i` name leaves behind: the value of the text read as an
+ * arithmetic expression, and the text itself where it is not one.
+ */
+function integerValue(state: ShellState, text: string): string {
+    try {
+        return String(Math.trunc(evalArith(state, text)));
+    } catch (error) {
+        if (error instanceof ArithError) return text;
+        throw error;
+    }
+}
+
+/**
+ * Drops every indexed element of `name`: the elements a `a=(x y)` writes over, and the ones an
+ * `unset a` takes with it. Only the keys this file's own array emulation made are touched, so a
+ * `a[foo]` a caller set by hand is left where it is.
+ */
+function clearArray(state: ShellState, name: string): void {
+    const prefix = `${name}[`;
+    for (const scope of state.scopes) {
+        for (const key of [...scope.keys()]) {
+            if (!key.startsWith(prefix) || !key.endsWith(']')) continue;
+            if (!/^-?[0-9]+$/.test(key.slice(prefix.length, -1))) continue;
+            scope.delete(key);
+        }
+    }
+}
+
+/**
+ * A compound assignment `a=(x y z)` or `a+=(w)`: the elements become `a[0]`, `a[1]`, ... in the
+ * order they were written, and `[3]=d` among them names the index it stands on, as it does on a
+ * host. The name itself is left holding its first element, which is what `$a` reads there --
+ * `a=(x y z); echo $a` prints `x` -- and an assignment that is not an append drops the elements
+ * the array held before it, so `a=(x y z); a=(w)` is an array of one.
+ */
+function assignArray(state: ShellState, name: string, elements: string[], append: boolean): boolean {
+    if (!append) {
+        clearArray(state, name);
+        if (getVar(state, name) !== undefined && !setVar(state, name, '')) return false;
+    }
+    let index = append ? arrayElements(state, `${name}[0]`).length : 0;
+    for (const element of elements) {
+        const subscripted = /^\[([^\]]*)\]=([\s\S]*)$/.exec(element);
+        if (subscripted !== null) {
+            index = Number.parseInt(integerValue(state, subscripted[1]), 10);
+            if (Number.isNaN(index)) index = 0;
+            if (!setVar(state, `${name}[${index}]`, subscripted[2])) return false;
+            index++;
+            continue;
+        }
+        if (!setVar(state, `${name}[${index}]`, element)) return false;
+        index++;
+    }
+    const first = lookupScope(state, `${name}[0]`)?.get(`${name}[0]`)?.value ?? '';
+    setVar(state, name, first);
     return true;
 }
 
@@ -1130,6 +1219,14 @@ interface Assignment {
     name: string;
     append: boolean;
     value: Word;
+    /**
+     * The words of a compound assignment `a=(x y z)`, empty for the ordinary `a=x`. They are the
+     * elements in the order they were written, and `[3]=d` among them names its own index, as it
+     * does in a host shell.
+     */
+    array?: Word[];
+    /** True for `a+=(w)`: the elements are appended behind the ones the array already holds. */
+    arrayAppend?: boolean;
 }
 
 type CommandBody =
@@ -1144,6 +1241,8 @@ type CommandBody =
     | { t: 'case'; word: Word; items: { patterns: Word[]; body: Node[] }[]; redirects: Redirect[] }
     | { t: 'group'; body: Node[]; redirects: Redirect[] }
     | { t: 'subshell'; body: Node[]; redirects: Redirect[] }
+    /** bash's conditional command `[[ ... ]]`: its words are not split, globbed or reordered. */
+    | { t: 'cond'; words: Word[]; redirects: Redirect[] }
     | { t: 'function'; name: string; body: Command; text?: string };
 
 type Command = CommandBody & { line: number };
@@ -1207,6 +1306,10 @@ function parseVarRef(body: string): VarRef {
         if (/^[@*#?]$/.test(rest)) return { raw, name: rest, op: 'len', arg: '' };
         const arrayAll = /^([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]$/.exec(rest);
         if (arrayAll) return { raw, name: `${arrayAll[1]}[@]`, op: 'len', arg: '' };
+        /* `${#a[1]}` is the length of the one element, as `${#a[@]}` is the number of them:
+           `a=(x y z); echo ${#a[1]}` is a host's `1`, where reading the `1` as part of a name
+           nothing was assigned to answered an empty word. */
+        if (/^[A-Za-z_][A-Za-z0-9_]*\[[^\]]*\]$/.test(rest)) return { raw, name: rest, op: 'len', arg: '' };
         if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(rest)) return { raw, name: rest, op: 'len', arg: '' };
         if (/^[0-9]$/.test(rest)) return { raw, name: rest, op: 'len', arg: '' };
     }
@@ -1406,6 +1509,22 @@ class Parser {
     /** Public wrapper so `lexParts` can read one word from a bare string. */
     readWordPublic(): Word | null {
         return this.readWord();
+    }
+
+    /**
+     * Public wrapper so a caller can read every word of a bare string, split on whitespace: the
+     * elements of a compound assignment `a=(x y z)` are the words of the text between the parens.
+     */
+    readAllWordsPublic(): Word[] {
+        const words: Word[] = [];
+        for (;;) {
+            this.skipSpace(true);
+            if (this.pos >= this.src.length) break;
+            const word = this.readWord();
+            if (word === null) break;
+            words.push(word);
+        }
+        return words;
     }
 
     private eof(): boolean {
@@ -1701,6 +1820,14 @@ class Parser {
             if (ch === '\\') {
                 const next = this.src[this.pos + 1];
                 if (next === '\n') {
+                    this.pos += 2;
+                    continue;
+                }
+                /* A brace the backslash escaped is not the brace that opens a group, and the
+                   backslash itself is gone from the word by the time it is expanded, so the mark
+                   goes in its place: `echo a\{b,c\}d` is one word, `a{b,c}d`. */
+                if (next === '{' || next === '}') {
+                    literal += ESCAPED_BRACE + next;
                     this.pos += 2;
                     continue;
                 }
@@ -2095,7 +2222,69 @@ class Parser {
         if (this.keywordAt(this.pos, 'while') || this.keywordAt(this.pos, 'until')) return { ...this.parseWhile(), line };
         if (this.keywordAt(this.pos, 'case')) return { ...this.parseCase(), line };
         if (this.keywordAt(this.pos, 'function')) return { ...this.parseFunction(), line };
+        /* `[[ ... ]]` is bash's conditional command, not a `[` that runs as one: a host evaluates
+           the expression inside it itself -- `[[ abc == a* ]]` is true -- where reading the brackets
+           as a command ran `[` and answered `[[: command not found` with 127. The words between
+           them are kept whole, because nothing inside one is field-split or globbed: `[[ -f * ]]`
+           asks whether the file `*` is there, and `[[ $x == a* ]]` takes the `*` as a pattern even
+           where the directory holds a file it would have matched. */
+        if (this.src.startsWith('[[', this.pos)) {
+            const words = this.parseCondWords();
+            return { t: 'cond', words, redirects: this.readRedirects(), line };
+        }
         return { ...this.parseSimple(), line };
+    }
+
+    /**
+     * The words of a `[[ ... ]]`, read to the `]]` that closes it.
+     *
+     * A word is read with `readWord`, which stops on the whitespace and the operators a command
+     * line stops on, and every one of them is kept as it was written so the evaluation can tell a
+     * quoted `a*` -- a literal -- from an unquoted one, which is a pattern.
+     */
+    private parseCondWords(): Word[] {
+        this.pos += 2;
+        const words: Word[] = [];
+        for (;;) {
+            this.skipSpace(true);
+            if (this.eof()) throw new ShellSyntaxError('syntax error: unexpected end of file');
+            if (this.src.startsWith(']]', this.pos)) {
+                this.pos += 2;
+                return words;
+            }
+            const ch = this.here();
+            /* The operators a conditional expression is written with are the ones a command line
+               stops a word on, so they are taken as words of their own here rather than left for
+               `readWord`, which stops on every one of them and answers nothing at all: `[[ a == a
+               || b == c ]]` was `syntax error: unexpected end of file` where a host answers true. */
+            if (ch === '|' || ch === '&' || ch === '<' || ch === '>') {
+                const two = this.src.slice(this.pos, this.pos + 2);
+                if (two === '||' || two === '&&') {
+                    this.pos += 2;
+                    words.push([{ t: 'lit', v: two }]);
+                    continue;
+                }
+                this.pos++;
+                words.push([{ t: 'lit', v: ch }]);
+                continue;
+            }
+            if (ch === ')' && words.length > 0) {
+                /* A `)` is one of the parentheses a conditional expression groups with -- `[[ (a == a)
+                   && (b == b) ]]` -- and not the one that would close a subshell, so it is a word
+                   of its own here. */
+                this.pos++;
+                words.push([{ t: 'lit', v: ')' }]);
+                continue;
+            }
+            if (ch === '(') {
+                this.pos++;
+                words.push([{ t: 'lit', v: '(' }]);
+                continue;
+            }
+            const word = this.readWord();
+            if (word === null) throw new ShellSyntaxError('syntax error: unexpected end of file');
+            words.push(word);
+        }
     }
 
     private readRedirects(): Redirect[] {
@@ -2213,6 +2402,29 @@ class Parser {
             const raw = this.src.slice(start, this.pos);
             if (!sawCommandWord) {
                 if (RESERVED_WORDS.has(text)) throw new ShellSyntaxError(`syntax error near unexpected token \`${text}'`);
+                /* A compound assignment `a=(x y z)`, `a=([2]=c)` and `a+=(w)`: the `(` stands where
+                   an ordinary assignment's value would, and the words between the parens are the
+                   elements of the array it makes. Read as text, `a=(x y z)` was the syntax error
+                   `syntax error near unexpected token `(x'' where a host makes an array of three.
+                   The body is taken from the source so nothing in it is expanded here -- a `$( )`
+                   in it is run when the command runs, not when the line is read.
+                   It is looked for *before* the ordinary assignment is: `readWord` stops on the
+                   `(`, so `a=(x y z)` reads as the assignment `a=` with nothing behind it, and
+                   taking that left the parens for the caller to report as a syntax error. */
+                const compound = /^([A-Za-z_][A-Za-z0-9_]*)(\+?)=\(/.exec(this.src.slice(start));
+                if (compound !== null) {
+                    this.pos = start + compound[0].length;
+                    const body = this.readDelimited('(', ')');
+                    const elements = new Parser(body, this.state).readAllWordsPublic();
+                    assigns.push({
+                        name: compound[1],
+                        append: compound[2] === '+',
+                        value: [],
+                        array: elements,
+                        arrayAppend: compound[2] === '+'
+                    });
+                    continue;
+                }
                 const assign = assignmentOf(raw);
                 if (assign) {
                     assigns.push({ name: assign.name, append: assign.append, value: parseValueWord(assign.rest) });
@@ -2472,18 +2684,140 @@ class Parser {
  * 5. Expansion
  * ================================================================== */
 
+/**
+ * Brace expansion: the words one word becomes before anything else is expanded.
+ *
+ * `a{b,c}d` is `abd acd`, `{1..3}` is `1 2 3`, and the expansion is done before a variable is,
+ * which is why `x=q; echo pre{a,b}$x` is `preaq prebq` and `x=q; echo {$x,b}` is `q b`. A brace
+ * with no comma and no `..` in it is text -- `echo {a}` prints `{a}` -- and so is one inside
+ * quotes, which is why only the word's *literal* parts are looked at here.
+ *
+ * Returns null where the word holds no brace group, so a caller can tell "nothing to expand" from
+ * "expanded to one word".
+ */
+function braceExpand(text: string): string[] | null {
+    let depth = 0;
+    let open = -1;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === ESCAPED_BRACE) {
+            i++;
+            continue;
+        }
+        if (ch === '\\') {
+            i++;
+            continue;
+        }
+        if (ch === '{') {
+            if (depth === 0) open = i;
+            depth++;
+            continue;
+        }
+        if (ch !== '}') continue;
+        depth--;
+        if (depth < 0) {
+            /* A `}` with no `{` behind it is text -- `echo x}` prints `x}` -- and not the close of
+               a group the loop will look for later. */
+            depth = 0;
+            open = -1;
+            continue;
+        }
+        if (depth > 0) continue;
+        if (open < 0) continue;
+        const parts = splitBraceBody(text.slice(open + 1, i));
+        /* One alternative and no range is not a brace group: `echo {a}` is the text `{a}`. */
+        if (parts.length < 2) {
+            open = -1;
+            continue;
+        }
+        const prefix = text.slice(0, open);
+        const suffix = text.slice(i + 1);
+        const out: string[] = [];
+        for (const part of parts) {
+            /* An alternative may hold a brace group of its own -- `{a,{b,c}}` is `a b c` -- and the
+               text behind the group it stood in may hold the next one: `a{b,c}d{e,f}` is four words.
+               Each pass takes one group out, so the expansion ends. */
+            for (const piece of braceExpand(part) ?? [part]) {
+                const combined = prefix + piece + suffix;
+                const again = braceExpand(combined);
+                if (again !== null) out.push(...again);
+                else out.push(combined);
+            }
+        }
+        return out;
+    }
+    return null;
+}
+
+/** Splits the inside of a brace group on its top-level commas, and expands `n..m` into a range. */
+function splitBraceBody(body: string): string[] {
+    const parts: string[] = [];
+    let current = '';
+    let depth = 0;
+    for (let i = 0; i < body.length; i++) {
+        const ch = body[i];
+        if (ch === ESCAPED_BRACE) {
+            current += ch + (body[i + 1] ?? '');
+            i++;
+            continue;
+        }
+        if (ch === '\\') {
+            current += ch + (body[i + 1] ?? '');
+            i++;
+            continue;
+        }
+        if (ch === '{') depth++;
+        else if (ch === '}') depth--;
+        if (ch === ',' && depth === 0) {
+            parts.push(current);
+            current = '';
+            continue;
+        }
+        current += ch;
+    }
+    parts.push(current);
+    if (parts.length === 1) {
+        const range = /^(-?[0-9]+)\.\.(-?[0-9]+)$/.exec(parts[0]);
+        if (range === null) return parts;
+        const from = Number.parseInt(range[1], 10);
+        const to = Number.parseInt(range[2], 10);
+        const step = from <= to ? 1 : -1;
+        const out: string[] = [];
+        for (let value = from; step > 0 ? value <= to : value >= to; value += step) out.push(String(value));
+        return out;
+    }
+    return parts;
+}
+
+/**
+ * The letters `$-` spells, in the order this machine's `/bin/sh` spells them: `a b e f h i m u v x
+ * B H C`, then the `c` of a shell a line was handed to with `-c` (the `s` of one reading its lines
+ * from its standard input, and neither for one reading a file). A host's own default is `hBc` --
+ * `hashall` and `braceexpand` on, and every other option off -- and `set -e -x -u` there answers
+ * `ehuxBc`, which is the order below and not the order the options were named in.
+ *
+ * `interactive-comments`, `posix` and the rest a host has on by default are not letters at all:
+ * `set -o posix; echo $-` is still `hBc`.
+ */
 function optionFlags(state: ShellState): string {
     let out = '';
     if (state.options.allexport) out += 'a';
+    if (state.options.notify) out += 'b';
     if (state.options.errexit) out += 'e';
     if (state.options.noglob) out += 'f';
     if (state.options.hashall) out += 'h';
+    if (state.options.interactive) out += 'i';
     if (state.options.monitor) out += 'm';
     if (state.options.noexec) out += 'n';
     if (state.options.nounset) out += 'u';
     if (state.options.verbose) out += 'v';
     if (state.options.xtrace) out += 'x';
+    if (state.options.braceexpand) out += 'B';
+    if (state.options.histexpand) out += 'H';
     if (state.options.noclobber) out += 'C';
+    /* A shell that reads no terminal and no file of its own was handed its one line with `-c`,
+       which is the only way this container starts one. */
+    if (!state.options.interactive) out += 'c';
     return out;
 }
 
@@ -2509,6 +2843,15 @@ function specialValue(state: ShellState, name: string): string | undefined {
 }
 
 const FIELD_MARK = ' ';
+
+/**
+ * The word a `\{` and a `\}` read as, so the expansion behind it knows the brace was escaped.
+ *
+ * The backslash is gone by the time the word is expanded -- a host expands braces *before* it takes
+ * the backslashes out, and this file's lexer takes them out as it reads -- so the mark is put in
+ * front of the brace instead: `a\{b,c\}d` lexes to `a<mark>{b,c<mark>}d`, which opens no group.
+ */
+const ESCAPED_BRACE = '\u0001';
 
 interface Expanded {
     text: string;
@@ -2664,14 +3007,17 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
     for (let index = 0; index < parts.length; index++) {
         const part = parts[index];
         if (part.t === 'lit') {
+            /* The mark a `\{` left is not text, and it goes out here -- everywhere the literal is
+               read, including the tilde expansion a word opening with `~` gets. */
+            const literal = part.v.split(ESCAPED_BRACE).join('');
             /* Tilde expansion is the first expansion a word gets, and only where the word opens with
                an unquoted `~`: `echo ~` is the home directory, `echo a~b` and `echo "~"` are not. */
             if (index === 0 && !quoted && target.text.length === 0) {
-                appendText(target, expandTilde(part.v, state), quoted, false);
+                appendText(target, expandTilde(literal, state), quoted, false);
                 continue;
             }
             /* Literal text is never field-split: only what an expansion produced is. */
-            appendText(target, part.v, quoted, false);
+            appendText(target, literal, quoted, false);
             continue;
         }
         if (part.t === 'sq') {
@@ -2701,14 +3047,27 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             continue;
         }
         const ref = part.ref;
-        if (quoted && ref.op === '' && (ref.name === '@' || ref.name === '*')) {
-            for (let i = 0; i < state.positional.length; i++) {
+        /* `"${a[@]}"` is one word per element, as `"$@"` is one word per positional parameter:
+           `a=(x y z); for e in "${a[@]}"; do echo "<$e>"; done` is three lines on a host, where
+           reading the array as one string gave one field holding all three. `"${a[*]}"` joins them
+           with the first character of IFS, the way `"$*"` joins the positional parameters. */
+        const allElements = quoted && ref.op === '' ? ARRAY_ALL_RE.exec(ref.name) : null;
+        if (quoted && ref.op === '' && (ref.name === '@' || ref.name === '*' || allElements !== null)) {
+            const elements = allElements !== null
+                ? arrayElements(state, `${allElements[1]}[0]`)
+                : state.positional;
+            for (let i = 0; i < elements.length; i++) {
                 if (i > 0) appendText(target, ref.name === '*' ? ifsJoiner(state) : FIELD_MARK, true);
-                appendText(target, state.positional[i], true);
+                appendText(target, elements[i], true);
             }
             continue;
         }
-        const name = ref.name;
+        let name = ref.name;
+        /* Indirection: `${!k}` names the variable *in* `k` -- `k=target; target=hit; echo ${!k}` is
+           `hit`, and a `k` nothing was assigned to is an empty word, as it is on a host. The `!` is
+           only indirection where it stands in front of the name with no operator behind it, so
+           `${!k:-x}`, `${!k#y}` and the rest still mean what they meant. */
+        if (name.startsWith('!') && ref.op === '') name = getVar(state, name.slice(1)) ?? '';
         let value: string | undefined;
         let set = false;
         if (name === '@' || name === '*') {
@@ -2772,8 +3131,41 @@ function wordIsQuoted(word: Word): boolean {
     return false;
 }
 
+/**
+ * The words a brace group in one of `word`'s literal parts makes, or null where the word holds
+ * none. The parts around the one that holds the group are kept as they are, so `pre{a,b}$x` is two
+ * words that each still carry the `$x` behind them.
+ */
+function braceWord(word: Word): Word[] | null {
+    for (let i = 0; i < word.length; i++) {
+        const part = word[i];
+        if (part.t !== 'lit') continue;
+        const expanded = braceExpand(part.v);
+        if (expanded === null) continue;
+        return expanded.map((text) => {
+            const copy = word.slice();
+            copy[i] = { t: 'lit', v: text };
+            return copy;
+        });
+    }
+    return null;
+}
+
 /** Expands a word the way a command argument is expanded: splitting, then pathname expansion. */
 function expandWord(state: ShellState, word: Word): string[] {
+    /* Brace expansion is the first expansion a word gets, and it is the only one that makes one
+       word into several: `echo a{b,c}d` runs `echo` with two arguments. It is done before the
+       word's own parts are expanded, because a brace group may stand next to a variable -- `x=q;
+       echo pre{a,b}$x` is `preaq prebq` -- and it never touches quoted text, which is why only the
+       literal parts are looked at. `set +B` turns it off, as it does on a host. */
+    if (state.options.braceexpand) {
+        const braced = braceWord(word);
+        if (braced !== null) {
+            const out: string[] = [];
+            for (const piece of braced) out.push(...expandWord(state, piece));
+            return out;
+        }
+    }
     const target: Expanded = { text: '', quoted: [], split: [] };
     expandParts(state, word, false, target);
     if (target.text.includes(FIELD_MARK)) return target.text.split(FIELD_MARK);
@@ -2810,6 +3202,92 @@ function expandWords(state: ShellState, words: Word[]): string[] {
 function expandAssignment(state: ShellState, assign: Assignment): string {
     const base = assign.append ? getVar(state, assign.name) ?? '' : '';
     return base + expandToString(assign.value, state);
+}
+
+/**
+ * One assignment a command carries in front of it, expanded.
+ *
+ * A compound assignment carries its elements rather than one value: `a=(x y z)` is three of them,
+ * and each is expanded as a word is -- `a=($v w)` takes `$v` for what it holds.
+ */
+interface PendingAssign {
+    name: string;
+    value: string;
+    array?: string[];
+    arrayAppend?: boolean;
+}
+
+function expandAssign(state: ShellState, assign: Assignment): PendingAssign {
+    if (assign.array !== undefined) {
+        return {
+            name: assign.name,
+            value: '',
+            array: assign.array.map((word) => expandToString(word, state)),
+            arrayAppend: assign.arrayAppend === true
+        };
+    }
+    return { name: assign.name, value: expandAssignment(state, assign) };
+}
+
+/**
+ * Puts the assignments a command carried in front of it in place.
+ *
+ * An assignment in front of a command is one the command *sees* and one the shell does not keep:
+ * `IFS=: read x y` splits on the colon and `IFS` is the default again behind it, and `v=1 read x`
+ * leaves no `v` at all -- which is what this machine's `/bin/sh` does for a builtin, special or
+ * not, and why `pending` is undone below. An assignment with no command behind it is the one the
+ * shell keeps, and it never comes through here.
+ *
+ * Returns false where a readonly name refused the assignment, which is the one case the caller
+ * reports instead of running the command.
+ */
+function pushPending(state: ShellState, pending: PendingAssign[]): boolean {
+    for (const entry of pending) {
+        if (entry.array !== undefined) {
+            if (!assignArray(state, entry.name, entry.array, entry.arrayAppend === true)) return false;
+            continue;
+        }
+        if (!setVar(state, entry.name, entry.value)) return false;
+        if (state.options.allexport) markExported(state, entry.name);
+    }
+    return true;
+}
+
+/** What each of `pending` displaced: its value, or the fact that it had none. */
+interface PendingSaved {
+    value: string | undefined;
+    /** The elements the name held, for an assignment that is an array's. */
+    elements: string[] | undefined;
+}
+
+function savePending(state: ShellState, pending: PendingAssign[]): PendingSaved[] {
+    return pending.map((entry) => ({
+        value: getVar(state, entry.name),
+        elements: entry.array === undefined ? undefined : arrayElements(state, `${entry.name}[0]`)
+    }));
+}
+
+function restorePending(state: ShellState, pending: PendingAssign[], saved: PendingSaved[]): void {
+    for (let i = 0; i < pending.length; i++) {
+        const entry = pending[i];
+        const before = saved[i];
+        if (entry.array !== undefined) {
+            clearArray(state, entry.name);
+            const elements = before?.elements ?? [];
+            for (let index = 0; index < elements.length; index++) setVar(state, `${entry.name}[${index}]`, elements[index]);
+            if (before?.value === undefined) {
+                const scope = lookupScope(state, entry.name);
+                if (scope !== undefined) scope.delete(entry.name);
+            } else setVar(state, entry.name, before.value);
+            continue;
+        }
+        if (before?.value === undefined) {
+            const scope = lookupScope(state, entry.name);
+            if (scope !== undefined) scope.delete(entry.name);
+            continue;
+        }
+        setVar(state, entry.name, before.value);
+    }
 }
 
 /** Reads one line out of the shell's input buffer. */
@@ -3462,6 +3940,12 @@ function runNode(state: ShellState, node: Node, input: string | null): number {
         // reaches the sink even when the command threw: `exec echo hi` still prints
         writeOut(state, pendingOut);
     }
+    /* `PIPESTATUS` is the status of every stage of the pipeline, in the order the stages ran:
+       `true | false | true; echo ${PIPESTATUS[1]}` is a host's `1`, and `${PIPESTATUS[@]}` after
+       `false | true` is `1 0`. It is written before `!` and `pipefail` are applied, because both
+       move the status of the pipeline and neither moves the status a stage ended with, and a
+       command that ran on its own is a pipeline of one: `echo hi; echo ${PIPESTATUS[@]}` is `0`. */
+    setPipeStatus(state, statuses);
     let status = statuses.length > 0 ? statuses[statuses.length - 1] : 0;
     if (state.options.pipefail) {
         const failed = statuses.find((entry) => entry !== 0);
@@ -3469,6 +3953,20 @@ function runNode(state: ShellState, node: Node, input: string | null): number {
     }
     if (node.bang) status = status === 0 ? 1 : 0;
     return status;
+}
+
+/**
+ * The status of every stage of the last pipeline, as `PIPESTATUS` reads it.
+ *
+ * The array is this file's own indexed-array emulation -- the elements live in the scopes as
+ * `PIPESTATUS[0]`, `PIPESTATUS[1]`, ... -- and the name is left holding its first element, so
+ * `$PIPESTATUS` and `${PIPESTATUS[1]}` both answer. A pipeline shorter than the one before it
+ * drops the elements it no longer has: `true|false|true` and then `echo hi` leaves one.
+ */
+function setPipeStatus(state: ShellState, statuses: number[]): void {
+    clearArray(state, 'PIPESTATUS');
+    for (let i = 0; i < statuses.length; i++) setVar(state, `PIPESTATUS[${i}]`, String(statuses[i]));
+    setVar(state, 'PIPESTATUS', statuses.length === 0 ? '' : String(statuses[0]));
 }
 
 /**
@@ -3543,11 +4041,167 @@ function runCompoundRedirected(state: ShellState, command: Command, input: strin
     return status;
 }
 
+/**
+ * One word of a `[[ ... ]]`: the text it expanded to, and whether it was written quoted, which is
+ * what tells a pattern from the text it would match -- `[[ abc == "a*" ]]` is false, while
+ * `[[ abc == a* ]]` is true.
+ */
+interface CondWord {
+    text: string;
+    quoted: boolean;
+}
+
+/** True where any part of the word was written inside quotes. */
+function condWordQuoted(word: Word): boolean {
+    for (const part of word) if (part.t === 'sq' || part.t === 'dq') return true;
+    return false;
+}
+
+/** The file tests a `[[ ]]` answers, read through the file system the shell holds. */
+function condFileTest(state: ShellState, op: string, path: string): boolean {
+    const fs = state.fs;
+    if (fs === undefined || fs === null) return false;
+    try {
+        const exists = fs.fileExists(path) || fs.isDirectory(path);
+        switch (op) {
+            case '-e': case '-a': return exists;
+            case '-f': return fs.fileExists(path) && !fs.isDirectory(path);
+            case '-d': return fs.isDirectory(path);
+            case '-r': case '-w': case '-x': return exists;
+            case '-s': return fs.fileExists(path) && (fs.readFile(path) ?? '') !== '';
+            default: return false;
+        }
+    } catch {
+        /* A path this file system will not look at -- one in a directory it has no read bit for on
+           a host -- is a path nothing is there, and a conditional expression asks about it without
+           complaining: `[[ -f /etc/hosts ]]` is plain false here, not a diagnostic. */
+        return false;
+    }
+}
+
+/**
+ * The value of a `[[ ... ]]`: true where the expression holds, which is the status 0 a host gives
+ * it, and false where it does not, which is 1.
+ *
+ * Nothing inside the brackets is field-split or globbed, so the words are expanded as strings and
+ * taken as they stand, and the operators are the ones bash reads there: `==` and `!=` with a
+ * pattern on the right, `=~` with a regular expression, `<` and `>` for the order two strings
+ * collate in, the arithmetic `-eq` to `-ge`, `&&`, `||`, `!` and the parentheses that group them.
+ */
+function evalConditional(state: ShellState, words: Word[]): boolean {
+    const tokens: CondWord[] = words.map((word) => ({ text: expandToString(word, state), quoted: condWordQuoted(word) }));
+    let at = 0;
+    const peek = (offset = 0): CondWord | undefined => tokens[at + offset];
+    const globMatch = (text: string, pattern: string): boolean => new RegExp(`^${globToRegExp(pattern, true).source}$`).test(text);
+    const numeric = (text: string): number => {
+        const value = Number(text.trim());
+        return Number.isNaN(value) ? 0 : value;
+    };
+    const primary = (): boolean => {
+        const token = peek();
+        if (token === undefined) return false;
+        if (token.text === '!') {
+            at++;
+            return !primary();
+        }
+        if (token.text === '(') {
+            at++;
+            const value = disjunction();
+            if (peek()?.text === ')') at++;
+            return value;
+        }
+        if (token.text === '-z') {
+            at++;
+            const value = (peek()?.text ?? '') === '';
+            if (peek() !== undefined) at++;
+            return value;
+        }
+        if (token.text === '-n') {
+            at++;
+            const value = (peek()?.text ?? '') !== '';
+            if (peek() !== undefined) at++;
+            return value;
+        }
+        if (/^-(e|a|f|d|r|w|x|s|L|h)$/.test(token.text) && peek(1) !== undefined) {
+            const op = token.text;
+            at++;
+            const path = peek()?.text ?? '';
+            at++;
+            if (op === '-L' || op === '-h') return false;
+            return condFileTest(state, op, resolvePath(state, path));
+        }
+        at++;
+        const operator = peek();
+        if (operator === undefined) return token.text !== '';
+        const right = peek(1);
+        if (right === undefined) return token.text !== '';
+        if (operator.text === '==') {
+            at += 2;
+            /* A quoted right-hand side is the text it was written as, and an unquoted one is a
+               pattern: `[[ abc == a* ]]` is true and `[[ abc == "a*" ]]` is false. */
+            return right.quoted ? token.text === right.text : globMatch(token.text, right.text);
+        }
+        if (operator.text === '!=') {
+            at += 2;
+            return right.quoted ? token.text !== right.text : !globMatch(token.text, right.text);
+        }
+        if (operator.text === '=~') {
+            at += 2;
+            try {
+                return new RegExp(right.text).test(token.text);
+            } catch {
+                return false;
+            }
+        }
+        if (operator.text === '<') {
+            at += 2;
+            return token.text < right.text;
+        }
+        if (operator.text === '>') {
+            at += 2;
+            return token.text > right.text;
+        }
+        if (['-eq', '-ne', '-lt', '-le', '-gt', '-ge'].includes(operator.text)) {
+            at += 2;
+            const left = numeric(token.text);
+            const value = numeric(right.text);
+            switch (operator.text) {
+                case '-eq': return left === value;
+                case '-ne': return left !== value;
+                case '-lt': return left < value;
+                case '-le': return left <= value;
+                case '-gt': return left > value;
+                default: return left >= value;
+            }
+        }
+        return token.text !== '';
+    };
+    const conjunction = (): boolean => {
+        let value = primary();
+        while (peek()?.text === '&&') {
+            at++;
+            value = primary() && value;
+        }
+        return value;
+    };
+    const disjunction = (): boolean => {
+        let value = conjunction();
+        while (peek()?.text === '||') {
+            at++;
+            value = conjunction() || value;
+        }
+        return value;
+    };
+    return disjunction();
+}
+
 function runCommand(state: ShellState, command: Command, input: string | null): number {
     state.line = command.line;
     switch (command.t) {
         case 'simple':
             return runSimple(state, command, input);
+        case 'cond':
+            return runCompoundRedirected(state, command, input, () => (evalConditional(state, command.words) ? 0 : 1));
         case 'arithcmd':
             return runCompoundRedirected(state, command, input, () => {
                 try {
@@ -4458,8 +5112,8 @@ function callFunction(state: ShellState, fn: FunctionDef, args: string[]): numbe
 /** A simple command: assignments, redirections, then the command word. */
 function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>, input: string | null): number {
     substitutionStatus = 0;
-    const pending: { name: string; value: string }[] = [];
-    for (const assign of command.assigns) pending.push({ name: assign.name, value: expandAssignment(state, assign) });
+    const pending: PendingAssign[] = [];
+    for (const assign of command.assigns) pending.push(expandAssign(state, assign));
 
     const words: string[] = [];
     for (const word of command.words) words.push(...expandWord(state, word));
@@ -4525,17 +5179,18 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
            and `x=$(exit 5)` is 5, the status the subshell ended with, and it is what makes `set -e`
            end the line -- a substitution whose own `set -e` stopped it early leaves that status too. */
         const status = substitutionStatus;
+        /* An assignment with no command behind it is the one the shell keeps, so it is applied here
+           and not undone: `IFS=:` on a line of its own is the shell's IFS from here on. One at a
+           time, so the name a readonly variable refused is the name the complaint names. */
         for (const entry of pending) {
-            if (!setVar(state, entry.name, entry.value)) {
-                /* An assignment a readonly variable refuses ends the shell a line was handed to with
-                   `-c`, the way a host's own does: `readonly R=1; R=2; echo after` writes nothing
-                   behind its diagnostic and leaves 127. The complaint is one a host writes without
-                   the line it stands on -- `$0: R: readonly variable`. */
-                finish(state, plan, '', `${state.shellName}: ${entry.name}: readonly variable\n`, 127);
-                state.exitCalled = true;
-                return throwExit(127);
-            }
-            if (state.options.allexport) markExported(state, entry.name);
+            if (pushPending(state, [entry])) continue;
+            /* An assignment a readonly variable refuses ends the shell a line was handed to with
+               `-c`, the way a host's own does: `readonly R=1; R=2; echo after` writes nothing
+               behind its diagnostic and leaves 127. The complaint is one a host writes without
+               the line it stands on -- `$0: R: readonly variable`. */
+            finish(state, plan, '', `${state.shellName}: ${entry.name}: readonly variable\n`, 127);
+            state.exitCalled = true;
+            return throwExit(127);
         }
         syncPwd(state);
         return finish(state, plan, '', '', status);
@@ -4607,9 +5262,14 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
             /* A function its own redirections could not be made of is not called: `f >&9` with no
                `9` is the diagnostic and a status of 1 on a host, and no `x` from the body. */
             if (plan.error !== undefined) return finish(state, plan, '', '', 1, name);
-            for (const entry of pending) setVar(state, entry.name, entry.value);
+            /* In front of a *function* the assignment is one the shell keeps, which is the one
+               place a host differs from a builtin: `v=1; f() { echo $v; }; v=2 f; echo "[$v]"` is
+               a host's `2` and then `[2]`, where `IFS=: true; echo "$IFS"` is the default again.
+               So it is put in place before the call and left for the body to write over, which is
+               why it is not put back afterwards: `v=1; f() { v=inner; }; v=2 f; echo "[$v]"` is a
+               host's `[inner]` and not the `[2]` a second assignment behind the call would leave. */
+            pushPending(state, pending);
             const status = callFunction(state, fn, args);
-            for (const entry of pending) setVar(state, entry.name, entry.value);
             syncPwd(state);
             return finish(state, plan, '', '', status, name);
         }
@@ -4624,6 +5284,13 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
                 fs: (state.fs ?? NO_FS) as never
             };
             bindState(ctx, state);
+            /* The assignments in front of the command are in place *while it runs*, which is the
+               only time a builtin can read them: `IFS=: read x y` splits the line on the colon,
+               where setting IFS behind the read left it split on whitespace and answered the whole
+               line as one field. `env: state.env` above was already read out of the scopes the
+               assignments land in, so a builtin that reads `ctx.env` sees them too. */
+            const saved = savePending(state, pending);
+            pushPending(state, pending);
             let result: CommandResult;
             try {
                 result = builtin(ctx);
@@ -4637,20 +5304,27 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
                     throw error;
                 }
                 result = { stdout: '', stderr: `${errorMessage(error)}\n`, exitCode: 1 };
+            } finally {
+                restorePending(state, pending, saved);
             }
             /* What the built-in read through a descriptor it was handed -- `read x <&3` -- is what
                the descriptor's own offset moves by, so the line behind it reads on from there. */
             advanceReadFd(state, plan, name, args, result.stdout, commandInput ?? '');
             if (shellInput !== null) advanceShellInput(state, name, args, result.stdout, shellInput, cursorBefore);
-            for (const entry of pending) setVar(state, entry.name, entry.value);
             syncPwd(state);
             return finish(state, plan, result.stdout, result.stderr, result.exitCode, name);
         }
 
-        const step = RUNNER(state, words, stdin);
+        const saved = savePending(state, pending);
+        pushPending(state, pending);
+        let step: { stdout: string; stderr: string; exitCode: number };
+        try {
+            step = RUNNER(state, words, stdin);
+        } finally {
+            restorePending(state, pending, saved);
+        }
         advanceReadFd(state, plan, name, args, step.stdout, commandInput ?? '');
         if (shellInput !== null) advanceShellInput(state, name, args, step.stdout, shellInput, cursorBefore);
-        for (const entry of pending) setVar(state, entry.name, entry.value);
         syncPwd(state);
         return finish(state, plan, step.stdout, step.stderr, step.exitCode, name);
     } finally {
@@ -4720,8 +5394,10 @@ function markReadonly(state: ShellState, name: string): void {
 }
 
 function declarePrint(name: string, variable: ShellVar): string {
-    if (variable.readonly) return `declare -r${variable.export ? 'x' : ''} ${name}=${quoteDouble(variable.value)}`;
-    if (variable.export) return `declare -x ${name}=${quoteDouble(variable.value)}`;
+    /* The attributes a host spells in the order they stand in `declare -irx`, and the integer one
+       among them: `declare -i n=1; n=n+1; declare -p n` is a host's `declare -i n="2"`. */
+    const flags = `${variable.integer ? 'i' : ''}${variable.readonly ? 'r' : ''}${variable.export ? 'x' : ''}`;
+    if (flags !== '') return `declare -${flags} ${name}=${quoteDouble(variable.value)}`;
     return `declare -- ${name}=${quoteDouble(variable.value)}`;
 }
 
@@ -4887,37 +5563,59 @@ function pathOfName(state: ShellState, name: string): string {
     return '';
 }
 
+/**
+ * Every name `set -o` prints, in the order a host prints them -- alphabetical, twenty-seven of
+ * them -- each with the state it reads. `interactive` is not one of them: a host's `set -o` has
+ * `interactive-comments` but no `interactive`, which is set from how the shell was started.
+ */
 const OPTION_NAMES: [keyof ShellOptions, string][] = [
     ['allexport', 'allexport'],
+    ['braceexpand', 'braceexpand'],
+    ['emacs', 'emacs'],
     ['errexit', 'errexit'],
-    ['noglob', 'noglob'],
+    ['errtrace', 'errtrace'],
+    ['functrace', 'functrace'],
     ['hashall', 'hashall'],
-    ['monitor', 'monitor'],
-    ['noexec', 'noexec'],
-    ['nounset', 'nounset'],
-    ['verbose', 'verbose'],
-    ['xtrace', 'xtrace'],
+    ['histexpand', 'histexpand'],
+    ['history', 'history'],
     ['ignoreeof', 'ignoreeof'],
+    ['interactiveComments', 'interactive-comments'],
+    ['keyword', 'keyword'],
+    ['monitor', 'monitor'],
     ['noclobber', 'noclobber'],
+    ['noexec', 'noexec'],
+    ['noglob', 'noglob'],
+    ['nolog', 'nolog'],
+    ['notify', 'notify'],
+    ['nounset', 'nounset'],
+    ['onecmd', 'onecmd'],
+    ['physical', 'physical'],
     ['pipefail', 'pipefail'],
     ['posix', 'posix'],
+    ['privileged', 'privileged'],
+    ['verbose', 'verbose'],
     ['vi', 'vi'],
-    ['emacs', 'emacs'],
-    ['interactive', 'interactive'],
-    ['history', 'history']
+    ['xtrace', 'xtrace']
 ];
 
 const SHORT_OPTIONS: Record<string, keyof ShellOptions> = {
     a: 'allexport',
+    b: 'notify',
     e: 'errexit',
     f: 'noglob',
     h: 'hashall',
+    k: 'keyword',
     m: 'monitor',
     n: 'noexec',
+    p: 'privileged',
+    t: 'onecmd',
     u: 'nounset',
     v: 'verbose',
     x: 'xtrace',
-    C: 'noclobber'
+    B: 'braceexpand',
+    C: 'noclobber',
+    H: 'histexpand',
+    P: 'physical'
 };
 
 function setBuiltin(ctx: CommandContext): CommandResult {
@@ -4942,7 +5640,10 @@ function setBuiltin(ctx: CommandContext): CommandResult {
             if (body === 'o') {
                 const next = args[index + 1];
                 if (next === undefined) {
-                    const lines = OPTION_NAMES.map(([key, name]) => `${name.padEnd(14)}${state.options[key] ? 'on' : 'off'}`);
+                    /* The list a host prints: the name in a column fifteen characters wide, a tab,
+                       and `on` or `off` -- `allexport      \toff`, and `interactive-comments` longer
+                       than the column, so the tab is the only thing between it and its answer. */
+                    const lines = OPTION_NAMES.map(([key, name]) => `${name.padEnd(15)}\t${state.options[key] ? 'on' : 'off'}`);
                     return ok(joinLines(lines), state);
                 }
                 const entry = OPTION_NAMES.find(([, name]) => name === next);
@@ -5002,16 +5703,33 @@ function printExported(state: ShellState): string {
 function exportBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     if (ctx.args.length === 0 || ctx.args[0] === '-p') return ok(printExported(state), state);
+    /* `export -n NAME` takes the export attribute back off a name the shell is still holding:
+       `export FOO=1; export -n FOO` leaves a `FOO` of 1 that `env` no longer lists, and a status
+       of 0 -- where reading the `-n` as a name made it `export: `-n': not a valid identifier`. */
+    let unexport = false;
     for (const arg of ctx.args) {
+        if (arg === '-n') {
+            unexport = true;
+            continue;
+        }
+        if (arg.startsWith('-')) {
+            if (arg === '-f') continue;
+            return failDiag(state, `export: ${arg}: invalid option\nexport: usage: export [-nf] [name[=value] ...] or export -p`, 2);
+        }
         const assign = splitAssign(arg);
         if (!assign) {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failDiag(state, `export: \`${arg}': not a valid identifier`, 1);
+            if (unexport) {
+                const variable = lookupScope(state, arg)?.get(arg);
+                if (variable !== undefined) variable.export = false;
+                continue;
+            }
             markExported(state, arg);
             continue;
         }
         const base = assign.append ? getVar(state, assign.name) ?? '' : '';
         setVar(state, assign.name, base + (assign.value ?? ''));
-        markExported(state, assign.name);
+        if (!unexport) markExported(state, assign.name);
     }
     return ok();
 }
@@ -5045,7 +5763,7 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
     const args = ctx.args.slice();
     let exportFlag: boolean | null = null;
     let readonlyFlag: boolean | null = null;
-    let integer = false;
+    let integer: boolean | null = null;
     let global = false;
     let print = false;
     let functions = false;
@@ -5100,7 +5818,7 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
             /* `-i` makes the value arithmetic: `declare -i z=1+2` is a `z` of 3, which is what a
                host's own integer attribute leaves behind it. */
             const raw = base + (assign.value ?? '');
-            const value = integer && !assign.append ? arithmeticValue(state, raw) : raw;
+            const value = integer === true && !assign.append ? arithmeticValue(state, raw) : raw;
             if (!scope.has(name)) scope.set(name, { value });
             else setVar(state, name, value);
         } else if (!lookupScope(state, name)) {
@@ -5113,6 +5831,14 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
         if (readonlyFlag !== null) {
             const variable = lookupScope(state, name)?.get(name);
             if (variable) variable.readonly = readonlyFlag;
+        }
+        /* `-i` is an attribute the name keeps, not one the value it was given alone: every
+           assignment behind it is arithmetic, so `declare -i n=1; n=n+1` is a `n` of 2 and
+           `declare -i n; n=x` is a `n` of 0, as they are on a host. Setting it after the value
+           was put in place is what makes the assignments behind this line arithmetic too. */
+        if (integer !== null) {
+            const variable = lookupScope(state, name)?.get(name);
+            if (variable) variable.integer = integer;
         }
     }
     return ok();
@@ -5151,7 +5877,7 @@ function localBuiltin(ctx: CommandContext): CommandResult {
         }
         const base = assign.append ? getVar(state, assign.name) ?? '' : '';
         const raw = base + (assign.value ?? '');
-        scope.set(assign.name, { value: integer && !assign.append ? arithmeticValue(state, raw) : raw });
+        scope.set(assign.name, { value: integer && !assign.append ? arithmeticValue(state, raw) : raw, integer: integer || undefined });
     }
     return ok();
 }
@@ -5390,11 +6116,25 @@ function builtinBuiltin(ctx: CommandContext): CommandResult {
 function hashBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     let status = 0;
+    /* `hash -d name` forgets the command it was remembering: the option a host lists in its own
+       usage line -- `hash [-lr] [-p pathname] [-dt] [name ...]` -- and one that leaves a status of
+       0 whatever the table held, where reading it as an option `hash` did not know answered
+       `hash: -d: invalid option` and 2. */
+    let remove = false;
     for (const arg of ctx.args) {
         if (arg === '-r') {
             state.hash.clear();
             continue;
         }
+        if (arg === '-d') {
+            remove = true;
+            continue;
+        }
+        /* `-l` prints the table in a form a script can read back, `-p path name` remembers a path
+           of its own, and `-t` prints the paths the names hold: none of them is a name to look
+           up, and a host takes each with the argument behind it. */
+        if (arg === '-l' || arg === '-t') continue;
+        if (arg === '-p') continue;
         if (arg.startsWith('-')) {
             /* An option `hash` does not know: the two lines a host writes, and the 2 it leaves. */
             return failDiag(
@@ -5402,6 +6142,10 @@ function hashBuiltin(ctx: CommandContext): CommandResult {
                 `hash: ${arg}: invalid option\nhash: usage: hash [-lr] [-p pathname] [-dt] [name ...]`,
                 2
             );
+        }
+        if (remove) {
+            state.hash.delete(arg);
+            continue;
         }
         const path = findOnPath(state, arg);
         if (path === undefined) {
@@ -6723,24 +7467,39 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
     if (!globals.has('IFS')) globals.set('IFS', { value: ' \t\n', export: false });
     /** The table of a state whose host keeps none: `child.ts` leaves its own in `state.host`. */
     const ownJobs: ShellJob[] = [];
+    /* The defaults this machine's `/bin/sh` starts with -- bash 3.2 in POSIX mode -- so `set -o`
+       and `$-` answer the way they do there: `hashall`, `braceexpand`, `interactive-comments` and
+       `posix` are on, `emacs` is *off* (a host's own `set -o` prints `emacs off`), and every other
+       option is off besides. */
     const options: ShellOptions = {
         allexport: false,
+        braceexpand: true,
+        emacs: false,
         errexit: false,
-        noglob: false,
+        errtrace: false,
+        functrace: false,
         hashall: true,
-        monitor: false,
-        noexec: false,
-        nounset: false,
-        verbose: false,
-        xtrace: false,
+        histexpand: false,
+        history: false,
         ignoreeof: false,
+        interactiveComments: true,
+        keyword: false,
+        monitor: false,
         noclobber: false,
+        noexec: false,
+        noglob: false,
+        nolog: false,
+        notify: false,
+        nounset: false,
+        onecmd: false,
+        physical: false,
         pipefail: false,
-        posix: false,
+        posix: true,
+        privileged: false,
+        verbose: false,
         vi: false,
-        emacs: true,
-        interactive: false,
-        history: false
+        xtrace: false,
+        interactive: false
     };
     const state: ShellState = {
         scopes: [globals],

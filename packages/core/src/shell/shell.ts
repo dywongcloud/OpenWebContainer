@@ -174,6 +174,10 @@ export class Shell implements IShell {
         this.interactive = options.interactive === true;
         this.shellState.options.interactive = this.interactive;
         this.shellState.options.monitor = this.interactive;
+        /* `histexpand` is on in a shell that reads a terminal and off in one a line was handed to
+           with `-c`, which is what puts the `H` in a host's `$-` there: `sh -i -c 'echo $-'` is
+           `hiBHc` where `sh -c 'echo $-'` is `hBc`. */
+        this.shellState.options.histexpand = this.interactive;
         this.shellState.startJob = this.startBackgroundJob;
         this.registerAllBuiltInCommands()
         this.registerAllExternalCommands();
