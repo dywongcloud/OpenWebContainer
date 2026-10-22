@@ -637,7 +637,12 @@ function makeCallSite(text) {
 if (!Error.captureStackTrace) {
   Error.captureStackTrace = function (target) {
     if (!target || typeof target !== 'object') return;
-    var frames = String(new Error('').stack || '').split('\n').slice(1);
+    var lines = String(new Error('').stack || '').split('\n');
+    /* What the engine hands back opens with the line naming the error once the constructors below
+       are in place, and with a frame when it is not; either way the line that follows is this call,
+       which is not a frame of the caller's and is dropped with it. */
+    if (lines.length > 0 && lines[0].indexOf('    at ') !== 0) lines = lines.slice(1);
+    var frames = lines.slice(1);
     if (typeof Error.prepareStackTrace === 'function') {
       target.stack = Error.prepareStackTrace(target, frames.map(makeCallSite));
       return;
@@ -647,6 +652,118 @@ if (!Error.captureStackTrace) {
   };
 }
 if (Error.stackTraceLimit === undefined) Error.stackTraceLimit = 10;
+
+/*
+ * The header a V8 stack starts with: the error's own name and message, then the frames. This engine
+ * writes the frames alone, as a plain data property with nothing in front of them, so the first
+ * line of a guest err.stack is a frame where the host's is "Error: boom". The frames are moved
+ * behind an accessor -- the shape the host has -- and the stack is built the first time it is read
+ * and kept from then on, which is what makes a name or a message written before that first read the
+ * one the stack shows and one written after it nothing at all.
+ */
+var STACK_HEADER_CTORS = [
+  'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'AggregateError'
+];
+var CONSTRUCT_FRAME = '    at construct (native)';
+
+function stackHeaderOf(err) {
+  var name = 'Error';
+  var message = '';
+  try {
+    name = String(err.name || 'Error');
+    message = String(err.message === undefined || err.message === null ? '' : err.message);
+  } catch (ignored) {
+    /* A message that throws when it is read: the host read it once, before it threw. */
+  }
+  return message === '' ? name : name + ': ' + message;
+}
+
+/*
+ * The frames of a stack the engine built, less the two the wrapper puts there of its own -- the
+ * Reflect.construct call and the wrapper itself, neither of which was on the stack the caller asked
+ * about -- and less the empty line the engine ends every stack with. The count is the limit the
+ * host keeps on Error.stackTraceLimit.
+ */
+function framesOfEngineStack(stack, ownFrame) {
+  var lines = typeof stack === 'string' && stack !== '' ? stack.split('\n') : [];
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  var at = 0;
+  while (at < lines.length && (lines[at] === CONSTRUCT_FRAME || lines[at] === ownFrame)) at++;
+  lines = lines.slice(at);
+  var limit = Error.stackTraceLimit;
+  if (typeof limit === 'number' && limit >= 0 && lines.length > limit) lines = lines.slice(0, limit);
+  return lines.join('\n');
+}
+
+/*
+ * err.stack as the host has it: an accessor that builds the stack once and keeps it, that a
+ * prepareStackTrace is asked for, and that an assignment turns into the plain data property the
+ * host's own assignment turns it into -- a value written back is the value read, with no header
+ * put in front of it.
+ */
+function installErrorStack(err, frames) {
+  var kept = null;
+  Object.defineProperty(err, 'stack', {
+    get: function () {
+      if (kept !== null) return kept;
+      if (typeof Error.prepareStackTrace === 'function') {
+        kept = String(Error.prepareStackTrace(err, frames === '' ? [] : frames.split('\n').map(makeCallSite)));
+        return kept;
+      }
+      var header = stackHeaderOf(err);
+      kept = frames === '' ? header : (frames.indexOf(header) === 0 ? frames : header + '\n' + frames);
+      return kept;
+    },
+    set: function (value) {
+      /* V8's own assignment: the accessor is replaced by the value, so what is written is what is
+         read and nothing that follows changes it. */
+      Object.defineProperty(err, 'stack', { value: value, writable: true, enumerable: false, configurable: true });
+    },
+    enumerable: false,
+    configurable: true
+  });
+}
+
+function installStackHeader(name) {
+  var Native = globalThis[name];
+  if (typeof Native !== 'function') return;
+  if (typeof Reflect === 'undefined' || typeof Reflect.construct !== 'function') return;
+  var ownFrame = null;
+  function Shim() {
+    var err = Reflect.construct(Native, arguments, new.target === undefined ? Shim : new.target);
+    var raw = err.stack;
+    /* The first error built names the frame the wrapper itself contributes; every later one is
+       asked to drop it. */
+    if (ownFrame === null) {
+      var built = typeof raw === 'string' && raw !== '' ? raw.split('\n') : [];
+      ownFrame = built.length > 1 ? built[1] : '';
+    }
+    installErrorStack(err, framesOfEngineStack(raw, ownFrame));
+    return err;
+  }
+  Shim.prototype = Native.prototype;
+  Object.defineProperty(Shim, 'name', { value: name, configurable: true });
+  Object.defineProperty(Shim, 'length', { value: Native.length, configurable: true });
+  /* A wrapper is not the engine's own function and String(Error) is asked of it: the host reads
+     "function Error() { [native code] }" there, and a package that tests for native code tests
+     this very string. */
+  Object.defineProperty(Shim, 'toString', {
+    value: function () { return 'function ' + name + '() { [native code] }'; },
+    writable: true,
+    enumerable: false,
+    configurable: true
+  });
+  var statics = Object.getOwnPropertyNames(Native);
+  for (var s = 0; s < statics.length; s++) {
+    if (statics[s] === 'length' || statics[s] === 'name' || statics[s] === 'prototype') continue;
+    Object.defineProperty(Shim, statics[s], Object.getOwnPropertyDescriptor(Native, statics[s]));
+  }
+  /* err.constructor === Error is asked as often as err instanceof Error is, and the prototype the
+     instances keep is still the engine's own, so it is its constructor that names the wrapper. */
+  Object.defineProperty(Native.prototype, 'constructor', { value: Shim, writable: true, enumerable: false, configurable: true });
+  globalThis[name] = Shim;
+}
+for (var headerAt = 0; headerAt < STACK_HEADER_CTORS.length; headerAt++) installStackHeader(STACK_HEADER_CTORS[headerAt]);
 
 var groupIndent = '';
 var counters = Object.create(null);
@@ -1370,7 +1487,13 @@ function urlGlobalOf(nodeUrl) {
   field('origin', function () {
     var state = STATE.get(this);
     if (state.protocol === 'blob:') {
-      try { return new URL(state.pathname).origin; } catch (notAUrl) { return 'null'; }
+      /* One level only, and only into a scheme that carries a host of its own: the origin of
+         'blob:blob:http://h/x' is 'null', not the 'http://h' a second step would reach. */
+      try {
+        var inner = new URL(state.pathname);
+        if (DEFAULT_PORTS.hasOwnProperty(inner.protocol)) return inner.origin;
+      } catch (notAUrl) { /* an unparseable path is the opaque origin */ }
+      return 'null';
     }
     if (state.protocol === 'file:' || !DEFAULT_PORTS.hasOwnProperty(state.protocol) || !state.hasHost) return 'null';
     return state.protocol + '//' + state.hostname + (state.port ? ':' + state.port : '');
@@ -1774,6 +1897,122 @@ globalThis.crypto = nodeCrypto.webcrypto;
   define('$' + String.fromCharCode(96), before);
   define('rightContext', after);
   define("$'", after);
+})();
+
+/*
+ * A cycle in a value handed to JSON.stringify: the engine says "circular reference" where V8 names
+ * the constructor the circle starts at, each property walked to get there and the property that
+ * closes it. Only the words are asked of a value the engine has already refused, so the walk that
+ * finds the circle runs after the refusal and never before it, and a value that is accepted costs
+ * nothing at all.
+ */
+function cycleConstructorName(value) {
+  var proto = Object.getPrototypeOf(value);
+  if (proto === null || proto === undefined) return 'Object';
+  var ctor = proto.constructor;
+  if (ctor !== null && ctor !== undefined && typeof ctor.name === 'string' && ctor.name !== '') return ctor.name;
+  return 'Object';
+}
+
+/* How one step of the path is named: an index of an array, and otherwise a property. */
+function cycleStepText(key, parentIsArray) {
+  return parentIsArray ? 'index ' + key : "property '" + key + "'";
+}
+
+/*
+ * The circle in a value, as the place on the path it starts at and the key that closes it, or null
+ * when a walk of the value finds none -- a cycle a replacer or a toJSON built is one this walk does
+ * not see, and for that one the engine's own words are left alone.
+ */
+function findCycleIn(value) {
+  var path = [];
+  var reached = [];
+  var found = null;
+
+  function walk(node, key, parentIsArray) {
+    if (found !== null) return true;
+    if (node === null || typeof node !== 'object') return false;
+    /* V8 asks a value for its own JSON form before it walks into it, and a Date answers with a
+       string that has nothing behind it. */
+    if (typeof node.toJSON === 'function') {
+      var form;
+      try { form = node.toJSON(key); } catch (ignored) { return false; }
+      if (form === null || typeof form !== 'object') return false;
+      node = form;
+    }
+    var at = path.indexOf(node);
+    if (at >= 0) {
+      found = { start: at, key: key, parentIsArray: parentIsArray, path: path.slice(), reached: reached.slice() };
+      return true;
+    }
+    path.push(node);
+    reached.push({ key: key, parentIsArray: parentIsArray });
+    var isArray = Array.isArray(node);
+    var names = isArray ? null : Object.keys(node);
+    var count = isArray ? node.length : names.length;
+    for (var i = 0; i < count; i++) {
+      var childKey = isArray ? i : names[i];
+      var child;
+      try { child = node[childKey]; } catch (ignored) { continue; }
+      if (walk(child, childKey, isArray)) return true;
+    }
+    path.pop();
+    reached.pop();
+    return false;
+  }
+
+  walk(value, undefined, false);
+  return found;
+}
+
+/*
+ * The path V8 prints: every step of it when the circle closes within three, and otherwise the first
+ * two, a line of dots, and the step that closed it -- a chain a hundred long is four lines and not
+ * a hundred.
+ */
+function circularStructureText(value) {
+  var cycle = findCycleIn(value);
+  if (cycle === null) return null;
+  var lines = ['Converting circular structure to JSON'];
+  lines.push("    --> starting at object with constructor '" + cycleConstructorName(cycle.path[cycle.start]) + "'");
+  var steps = [];
+  for (var i = cycle.start + 1; i < cycle.path.length; i++) {
+    steps.push('    |     ' + cycleStepText(cycle.reached[i].key, cycle.reached[i].parentIsArray) +
+      " -> object with constructor '" + cycleConstructorName(cycle.path[i]) + "'");
+  }
+  if (steps.length > 3) steps = steps.slice(0, 2).concat(['    |     ...', steps[steps.length - 1]]);
+  for (var s = 0; s < steps.length; s++) lines.push(steps[s]);
+  lines.push('    --- ' + cycleStepText(cycle.key, cycle.parentIsArray) + ' closes the circle');
+  return lines.join('\n');
+}
+
+(function installCircularStructureMessage() {
+  var nativeStringify = JSON.stringify;
+  if (typeof nativeStringify !== 'function') return;
+  function stringify() {
+    try {
+      return nativeStringify.apply(JSON, arguments);
+    } catch (err) {
+      if (!(err instanceof TypeError) || String(err.message) !== 'circular reference') throw err;
+      var text = circularStructureText(arguments[0]);
+      if (text === null) throw err;
+      /* The error the engine threw carries the stack of the call that asked for the string, so it
+         is the one thrown back, with its words replaced; where a message cannot be written, a fresh
+         error of the same kind carries them instead. */
+      var rewritten = false;
+      try {
+        err.message = text;
+        rewritten = String(err.message) === text;
+      } catch (ignored) {
+        rewritten = false;
+      }
+      throw rewritten ? err : new TypeError(text);
+    }
+  }
+  /* The host's own JSON.stringify: three parameters, and the name a package reads off it. */
+  Object.defineProperty(stringify, 'name', { value: 'stringify', configurable: true });
+  Object.defineProperty(stringify, 'length', { value: 3, configurable: true });
+  JSON.stringify = stringify;
 })();
 
 api.finalExitCode = function () {

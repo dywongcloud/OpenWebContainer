@@ -1,0 +1,7 @@
+id: owc-guest-error-engine-stack-no-header
+owner: judge-guest-errors-1
+session_id: adv3-judge-guest-errors-1
+status: pending
+subject: An error the engine raises itself has no header line in its stack
+description: 'Measured 2026-10-23 (judge shard guest-errors, session adv3-judge-guest-errors-1), host Node 24.15.0 against the container at HEAD with the guest error constructors wrapped. A stack of an error the guest constructs now opens with its header -- new Error(''boom'') gives ''Error: boom'' -- but a stack of an error the engine raises itself still opens with a frame: null.x gives ''    at <anonymous> (/app/main.js:12:11)'' where the host gives "TypeError: Cannot read properties of null (reading ''x'')", and JSON.parse(''{'') gives ''    at <input>:1:2'' where the host gives "SyntaxError: Expected property name or ''}'' in JSON at position 1 (line 1 column 2)". The same holds for a not-a-function call, an undefined read and a RangeError the engine raises. The wrapper is on the constructors, and these are raised at throw sites inside the engine that no guest-side definition reaches.'
+witness_plan: 'Differential of null.x, JSON.parse(''{''), a not-a-function call and an undefined read against host Node 24.15: the first line of err.stack must name the error and its message on both sides.'

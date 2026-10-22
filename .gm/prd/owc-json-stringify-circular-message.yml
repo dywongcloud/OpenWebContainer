@@ -1,7 +1,0 @@
-id: owc-json-stringify-circular-message
-subject: JSON.stringify of a cyclic structure says "circular reference" where host Node 24.15 prints the path that closed the circle
-description: 'Measured 2026-10-23 (judge shard fetch-web, session adv2-judge-fetch-web-8), host Node 24.15.0 against the container. var o={}; o.o=o; JSON.stringify(o) throws TypeError "Converting circular structure to JSON" on the host, followed by two lines naming the constructor the circle starts at and the property that closes it, and TypeError "circular reference" in the container. The same pair comes out of Response.json(o), which stringifies through the same call, and it is not a property of that constructor: a bare JSON.stringify of the same object inside the container reports the same two-word text, so the string is the engine. No open row names it. Left unfixed: reproducing the host text means walking the value before stringifying it to find the cycle and to name the constructor and the property, which is a second implementation of the check rather than a wording change.'
-witness_plan: 'Differential of JSON.stringify(o) where o.o === o, and of Response.json(o) with the same object, against host Node 24.15: both messages must agree.'
-owner: drain-corpus
-session_id: adv2-judge-fetch-web-8
-status: pending

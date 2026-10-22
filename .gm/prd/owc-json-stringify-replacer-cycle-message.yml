@@ -1,0 +1,7 @@
+id: owc-json-stringify-replacer-cycle-message
+description: 'Measured 2026-10-23 (judge shard guest-errors, session adv3-judge-guest-errors-1), host Node 24.15.0 against the container at HEAD. JSON.stringify({x:1}, function(k,v){ return k === ''x'' ? cyc : v; }) where cyc.a === cyc throws TypeError ''circular reference'' in the container where the host throws "Converting circular structure to JSON" followed by "    --> starting at object with constructor ''Object''" and "    --- property ''a'' closes the circle". A cycle in the value handed to JSON.stringify, and one a toJSON returns, are now both named by the walk that runs after the engine''s refusal; only one the replacer substitutes is not, because that walk sees the value as it was handed over and not the graph the replacer built in its place.'
+owner: judge-guest-errors-1
+session_id: adv3-judge-guest-errors-1
+status: pending
+subject: A cycle a replacer introduces keeps the engine's two-word circular message
+witness_plan: 'Differential of JSON.stringify({x:1}, function(k,v){ return k === ''x'' ? cyc : v; }) where cyc.a === cyc, against host Node 24.15: both messages must agree. The cycle in the value itself and the one a toJSON returns must stay agreeing.'
