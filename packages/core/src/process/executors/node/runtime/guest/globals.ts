@@ -762,22 +762,39 @@ globalThis.crypto = nodeCrypto.webcrypto;
    * CloseEvent, which Node delivers to a WebSocket's close handler: code, reason and wasClean, and
    * the socket it happened to. The engine has no such class, so a close would otherwise arrive as a
    * plain object, so an "event instanceof CloseEvent" check -- the one a program makes to tell a
-   * real close from a hand-built one -- would be false.
+   * real close from a hand-built one -- would be false. The attributes sit on a prototype backed by
+   * the values of the one event, the way Node's own events keep theirs on a prototype backed by
+   * internal slots: that also makes it an Event, and leaves no attribute an own property.
    */
   globalThis.CloseEvent = (function () {
     function CloseEvent(type, init) {
       init = init || {};
-      this.type = String(type === undefined ? 'close' : type);
-      this.code = init.code === undefined ? 0 : Number(init.code);
-      this.reason = init.reason === undefined ? '' : String(init.reason);
-      this.wasClean = init.wasClean === undefined ? false : !!init.wasClean;
-      this.target = init.target === undefined ? null : init.target;
-      this.currentTarget = null;
-      this.bubbles = false;
-      this.cancelable = false;
-      this.defaultPrevented = false;
-      this.timeStamp = 0;
+      var values = {
+        type: String(type === undefined ? 'close' : type),
+        code: init.code === undefined ? 0 : Number(init.code),
+        reason: init.reason === undefined ? '' : String(init.reason),
+        wasClean: init.wasClean === undefined ? false : !!init.wasClean,
+        target: init.target === undefined ? null : init.target,
+        currentTarget: null,
+        bubbles: false,
+        cancelable: false,
+        defaultPrevented: false,
+        timeStamp: 0
+      };
+      /*
+       * Node's own Event is installed further down the bootstrap than this file runs, so the
+       * parent is joined on first use rather than here, or a close event would not be an Event.
+       */
+      var Base = typeof globalThis.Event === 'function' ? globalThis.Event.prototype : Object.prototype;
+      if (Object.getPrototypeOf(CloseEvent.prototype) !== Base) Object.setPrototypeOf(CloseEvent.prototype, Base);
+      var proto = Object.create(CloseEvent.prototype);
+      Object.keys(values).forEach(function (key) {
+        Object.defineProperty(proto, key, { get: function () { return values[key]; }, configurable: true });
+      });
+      return Object.create(proto);
     }
+    CloseEvent.prototype = Object.create(Object.prototype);
+    Object.defineProperty(CloseEvent.prototype, 'constructor', { value: CloseEvent, writable: true, configurable: true });
     CloseEvent.prototype.preventDefault = function () {};
     CloseEvent.prototype.stopPropagation = function () {};
     Object.defineProperty(CloseEvent.prototype, Symbol.toStringTag, { value: 'CloseEvent', configurable: true });

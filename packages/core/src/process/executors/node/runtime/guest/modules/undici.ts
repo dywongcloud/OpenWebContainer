@@ -884,6 +884,17 @@ function wsCloseBody(code, reason) {
   return body;
 }
 
+/*
+ * The codes a peer may close with: 1000, the 1001-1014 the protocol defines, or any 3000-4999 an
+ * application registers for itself. 1004, 1005 and 1006 name no real close, 1015 up to 2999 are
+ * reserved, and anything under 1000 or over 4999 is out of range -- each of them fails the
+ * connection rather than settling it.
+ */
+function wsCloseCodeOk(code) {
+  if (code >= 1000 && code <= 1014) return code !== 1004 && code !== 1005 && code !== 1006;
+  return code >= 3000 && code <= 4999;
+}
+
 function wsDeliverMessage(ws, opcode, bytes) {
   var data;
   if (opcode === 0x1) {
@@ -900,6 +911,17 @@ function wsDeliverMessage(ws, opcode, bytes) {
 
 function wsHandleFrame(ws, fin, opcode, payload) {
   if (opcode === 0x8) {
+    /*
+     * A close frame the protocol does not allow: one byte of payload, which is half a code, or a
+     * code a peer may not send. Node fails the connection then and there -- an error event and the
+     * abnormal 1006, without waiting for the socket to end -- rather than settling on it. A frame
+     * carrying no payload at all is the exception: it names no code, which is the 1005 Node
+     * settles on cleanly.
+     */
+    if (payload.length === 1 || (payload.length >= 2 && !wsCloseCodeOk(payload.readUInt16BE(0)))) {
+      wsFail(ws);
+      return;
+    }
     var code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
     var reason = payload.length > 2 ? payload.slice(2).toString('utf8') : '';
     /*
@@ -987,18 +1009,62 @@ function wsSocketGone(ws) {
     wsSettle(ws, ws._closeReceived, ws._closeReceivedReason, true);
     return;
   }
-  if (ws.listenerCount('error') > 0) {
-    ws.emit('error', new Error('The WebSocket connection was closed before a close frame was received.'));
-  }
+  if (ws.listenerCount('error') > 0) ws.emit('error', wsErrorEvent(ws));
   wsSettle(ws, 1006, '', false);
 }
 
-function wsFail(ws, err) {
+function wsFail(ws) {
   if (ws._settled) return;
   /* a listener sees the socket as Node does: already CLOSED, not still connecting */
   ws.readyState = WS_CLOSED;
-  if (ws.listenerCount('error') > 0) ws.emit('error', err);
+  if (ws.listenerCount('error') > 0) ws.emit('error', wsErrorEvent(ws));
   wsSettle(ws, 1006, '', false);
+}
+
+/*
+ * The error event Node delivers to a WebSocket's error handler. Its attributes sit on a prototype
+ * backed by the values below, the way Node's own events keep theirs on a prototype backed by
+ * internal slots, so an "event instanceof Event" check passes and none of them shows up as an own
+ * property. The failure it carries is a TypeError Node builds for the occasion, with no message of
+ * its own: the real cause -- a refused connection, a bad Sec-WebSocket-Accept -- never reaches the
+ * handler, so a handler that reads event.error.message sees '' whatever went wrong.
+ */
+function wsBuildEvent(Ctor, values) {
+  var proto = Object.create(Ctor.prototype);
+  for (var name in values) {
+    (function (key) {
+      Object.defineProperty(proto, key, { get: function () { return values[key]; }, configurable: true });
+    })(name);
+  }
+  return Object.create(proto);
+}
+
+var WSErrorEvent = (function () {
+  function ErrorEvent() {}
+  var Base = typeof globalThis.Event === 'function' ? globalThis.Event.prototype : Object.prototype;
+  ErrorEvent.prototype = Object.create(Base);
+  Object.defineProperty(ErrorEvent.prototype, 'constructor', { value: ErrorEvent, writable: true, configurable: true });
+  Object.defineProperty(ErrorEvent.prototype, Symbol.toStringTag, { value: 'ErrorEvent', configurable: true });
+  ErrorEvent.prototype.preventDefault = function () {};
+  ErrorEvent.prototype.stopPropagation = function () {};
+  return ErrorEvent;
+})();
+
+function wsErrorEvent(target) {
+  return wsBuildEvent(WSErrorEvent, {
+    type: 'error',
+    message: '',
+    filename: '',
+    lineno: 0,
+    colno: 0,
+    error: new TypeError(),
+    target: target,
+    currentTarget: null,
+    bubbles: false,
+    cancelable: false,
+    defaultPrevented: false,
+    timeStamp: 0
+  });
 }
 
 function wsCloseEvent(code, reason, clean, target) {
@@ -1113,7 +1179,7 @@ function WebSocket(url, protocols) {
   req.on('upgrade', function (res, socket, head) {
     var accept = res && res.headers ? res.headers['sec-websocket-accept'] : undefined;
     if (accept !== wsAcceptOf(key)) {
-      wsFail(self, new Error('Server sent an invalid Sec-WebSocket-Accept header'));
+      wsFail(self);
       return;
     }
     self._socket = socket;
@@ -1133,9 +1199,9 @@ function WebSocket(url, protocols) {
   });
   req.on('response', function (res) {
     if (res && typeof res.resume === 'function') res.resume();
-    wsFail(self, new Error('Unexpected server response: ' + (res ? res.statusCode : 'unknown')));
+    wsFail(self);
   });
-  req.on('error', function (err) { wsFail(self, err); });
+  req.on('error', function () { wsFail(self); });
   req.end();
 }
 WebSocket.prototype = Object.create(requireBuiltin('events').prototype);
