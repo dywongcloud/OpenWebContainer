@@ -1,6 +1,5 @@
 import { Process } from '../../../base';
 import { VirtualNetwork, VirtualSink } from '../../../../network/virtual/hub';
-import type { QuickJSAsyncWASMModule } from 'quickjs-emscripten';
 
 /** Container-level services a guest process may use through capabilities. */
 export interface StartProcessRequest {
@@ -28,15 +27,4 @@ export interface RuntimeServices {
      * runaway; 0 leaves it unstoppable. Absent means the default.
      */
     guestBudgetMs?: number;
-    /**
-     * The QuickJS module the last boot loaded: a WebAssembly instance of about 30 MB of host
-     * external memory plus the bytes of its binary.
-     *
-     * Only a synchronous child needs it. Such a child runs to completion inside the capability call
-     * that spawned it, so it cannot await a load of its own and boots on the module already loaded.
-     * A process that is not one of those loads its own and drops it when the process ends, which is
-     * what keeps a module from being held for every process the container has ever run. The container
-     * drops this one when it is disposed, so nothing holds a module past the container's own life.
-     */
-    quickJsModule?: QuickJSAsyncWASMModule;
 }

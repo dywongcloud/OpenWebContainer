@@ -73,8 +73,6 @@ function httpOptions(options) {
  * text/plain;charset=UTF-8, a URLSearchParams as form-urlencoded and a FormData as multipart with a
  * boundary it picks. A Content-Type the caller set on the request wins over the derived one.
  */
-var MULTIPART_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-
 function isBlobLike(value) {
   return globalThis.Blob !== undefined && value instanceof globalThis.Blob;
 }
@@ -83,10 +81,11 @@ function multipartQuote(value) {
   return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
 }
 
+/* A boundary in the shape undici writes one: the fixed prefix, then twelve digits. */
 function multipartBoundary() {
-  var bytes = requireBuiltin('crypto').randomBytes(24);
-  var boundary = '----formdata-owc-';
-  for (var i = 0; i < bytes.length; i++) boundary += MULTIPART_CHARS[bytes[i] % MULTIPART_CHARS.length];
+  var bytes = requireBuiltin('crypto').randomBytes(12);
+  var boundary = '----formdata-undici-';
+  for (var i = 0; i < bytes.length; i++) boundary += String(bytes[i] % 10);
   return boundary;
 }
 
@@ -139,6 +138,30 @@ function multipartAsync(form, boundary) {
   return step();
 }
 
+/* The characters the form-urlencoded serializer leaves alone; every other byte of the UTF-8 form
+   of the value is escaped, and a space becomes '+'. */
+var FORM_SAFE = /[0-9A-Za-z*\-._]/;
+
+function formEncode(text) {
+  var bytes = Buffer.from(String(text), 'utf8');
+  var out = '';
+  for (var i = 0; i < bytes.length; i++) {
+    var byte = bytes[i];
+    if (byte === 0x20) out += '+';
+    else if (FORM_SAFE.test(String.fromCharCode(byte))) out += String.fromCharCode(byte);
+    else out += '%' + (byte < 16 ? '0' : '') + byte.toString(16).toUpperCase();
+  }
+  return out;
+}
+
+/* A URLSearchParams read through its own entries rather than through String(): the pairs are what
+   the caller appended, whatever the container's own URLSearchParams makes of its constructor. */
+function formUrlencode(params) {
+  var out = [];
+  params.forEach(function (value, name) { out.push(formEncode(name) + '=' + formEncode(value)); });
+  return out.join('&');
+}
+
 /* ---- a body, as Request and Response both hold one ----
  *
  * Node keeps a body as a stream of bytes and derives a Content-Type from the kind of value it was
@@ -160,7 +183,7 @@ function makeBody(value) {
     return { bytes: Buffer.from(new Uint8Array(value)), stream: null, pending: null, contentType: null, has: true };
   }
   if (globalThis.URLSearchParams !== undefined && value instanceof globalThis.URLSearchParams) {
-    return { bytes: Buffer.from(String(value), 'utf8'), stream: null, pending: null, contentType: 'application/x-www-form-urlencoded;charset=UTF-8', has: true };
+    return { bytes: Buffer.from(formUrlencode(value), 'utf8'), stream: null, pending: null, contentType: 'application/x-www-form-urlencoded;charset=UTF-8', has: true };
   }
   if (value instanceof FormData) {
     var boundary = multipartBoundary();
@@ -322,7 +345,7 @@ function normalizeHeaderValue(value) {
 
 function Headers(init) {
   if (!(this instanceof Headers)) {
-    throw new TypeError("Failed to construct 'Headers': Please use the 'new' operator.");
+    throw new TypeError('Class constructor _Headers cannot be invoked without \'new\'');
   }
   this._list = [];
   if (init === undefined || init === null) return;
@@ -349,15 +372,10 @@ function Headers(init) {
     }
     return;
   }
-  /* A record: one value per key, or several for a key the server sent more than once. */
-  for (var key in init) {
-    var value = init[key];
-    if (Array.isArray(value)) {
-      for (var j = 0; j < value.length; j++) self.append(key, String(value[j]));
-    } else {
-      self.append(key, String(value));
-    }
-  }
+  /* A record: one string value per key. The value is converted once, so an array of values arrives
+     as the comma-joined string String() makes of it -- '1,2' rather than two entries -- which is
+     what a record of ByteStrings holds. */
+  for (var key in init) self.append(String(key), String(init[key]));
 }
 Headers.prototype.append = function (name, value) {
   var rawName = String(name);
@@ -444,7 +462,7 @@ Object.defineProperty(Headers.prototype, Symbol.toStringTag, { value: 'Headers',
  */
 function FormData() {
   if (!(this instanceof FormData)) {
-    throw new TypeError('Failed to construct \'FormData\': Please use the \'new\' operator.');
+    throw new TypeError('Class constructor _FormData cannot be invoked without \'new\'');
   }
   this._entries = [];
 }
@@ -491,6 +509,11 @@ FormData.prototype.values = function () {
 };
 FormData.prototype[Symbol.iterator] = FormData.prototype.entries;
 Object.defineProperty(FormData.prototype, Symbol.toStringTag, { value: 'FormData', configurable: true });
+
+/* Node's message for a body that has already been read, whichever way it is read again. */
+function unusableBody() {
+  return new TypeError('Body is unusable: Body has already been read');
+}
 
 /* The bytes a body holds, whichever of the three kinds it is: what is in hand is returned as it is,
    what has to be read is read once and kept, and a body the caller owns is drained. */
@@ -539,12 +562,13 @@ function bodyStream(body) {
 
 function Response(body, init) {
   if (!(this instanceof Response)) {
-    throw new TypeError("Failed to construct 'Response': Please use the 'new' operator.");
+    throw new TypeError('Class constructor _Response cannot be invoked without \'new\'');
   }
   init = init || {};
   var raw = init.status === undefined ? 200 : Number(init.status);
   var status = raw < 0 ? Math.ceil(raw) : Math.floor(raw);
-  if (status < 200 || status > 599) {
+  /* a status that is not a number at all is no more in range than one that is out of it */
+  if (!(status >= 200 && status <= 599)) {
     throw new RangeError('init["status"] must be in the range of 200 to 599, inclusive.');
   }
   var statusText = init.statusText === undefined ? '' : String(init.statusText);
@@ -577,40 +601,98 @@ Object.defineProperty(Response.prototype, 'bodyUsed', {
 });
 Object.defineProperty(Response.prototype, Symbol.toStringTag, { value: 'Response', configurable: true });
 Response.prototype.bytes = function () {
-  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  if (this._used) return Promise.reject(unusableBody());
   this._used = true;
   return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
 };
 Response.prototype.text = function () {
-  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  if (this._used) return Promise.reject(unusableBody());
   this._used = true;
   return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
 };
 Response.prototype.json = function () {
-  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  if (this._used) return Promise.reject(unusableBody());
   this._used = true;
   return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
 };
 Response.prototype.arrayBuffer = function () {
-  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  if (this._used) return Promise.reject(unusableBody());
   this._used = true;
   return bodyBuffer(this).then(function (buffer) {
     return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
   });
 };
 Response.prototype.clone = function () {
-  if (this._used) throw new TypeError('Response.clone: body has already been used.');
-  var copy = new Response(null, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
+  if (this._used) throw new TypeError('Response.clone: Body has already been consumed.');
+  /* built beside the constructor rather than through it: a clone keeps the status it was made
+     with, and status 0 -- the one Response.error() carries -- is not a status the constructor
+     would accept again */
+  var copy = Object.create(Response.prototype);
+  copy.status = this.status;
+  copy.statusText = this.statusText;
+  copy.ok = this.ok;
+  copy.type = this.type;
+  copy.redirected = this.redirected;
+  copy.url = this.url;
+  copy.headers = new Headers(this.headers);
+  copy._used = false;
   if (this._stream !== null && this._stream !== undefined) {
     var both = this._stream.tee();
     this._stream = both[0];
     copy._stream = both[1];
+    copy._bytes = null;
+    copy._pending = null;
     this._bytes = null;
   } else {
     copy._bytes = this._bytes;
     copy._pending = this._pending;
+    copy._stream = null;
   }
   return copy;
+};
+
+/* init with one content-type added to whatever headers the caller passed, for the two static
+   constructors that set one. The caller's own object is never touched. */
+function initWithContentType(init, contentType) {
+  var out = {};
+  if (init !== undefined && init !== null) for (var key in init) out[key] = init[key];
+  var headers = new Headers(init === undefined || init === null ? undefined : init.headers);
+  if (!headers.has('content-type')) headers.set('content-type', contentType);
+  out.headers = headers;
+  return out;
+}
+
+/* The three constructors Node hangs off Response itself, beside the one a program calls with new.
+   Response.error is the one the class cannot express: its status is 0 and its type is 'error'. */
+Response.json = function (data, init) {
+  if (arguments.length < 1) throw new TypeError('Response.json: 1 argument required, but 0 found.');
+  var text = JSON.stringify(data);
+  if (text === undefined) throw new TypeError('Value is not JSON serializable');
+  return new Response(text, initWithContentType(init, 'application/json'));
+};
+var REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+Response.redirect = function (url, status) {
+  if (arguments.length < 1) throw new TypeError('Response.redirect: 1 argument required, but 0 found.');
+  var code = status === undefined ? 302 : Number(status);
+  if (REDIRECT_STATUSES.indexOf(code) < 0) throw new RangeError('Invalid status code ' + String(status));
+  var parsed = requestableUrl(url);
+  if (parsed === null) throw unparseableUrl(url);
+  return new Response(null, { status: code, headers: { location: parsed.href } });
+};
+Response.error = function () {
+  var res = Object.create(Response.prototype);
+  res.status = 0;
+  res.statusText = '';
+  res.ok = false;
+  res.type = 'error';
+  res.redirected = false;
+  res.url = '';
+  res.headers = new Headers();
+  res._bytes = null;
+  res._stream = null;
+  res._pending = null;
+  res._used = false;
+  return res;
 };
 
 var FORBIDDEN_METHODS = ['CONNECT', 'TRACE', 'TRACK'];
@@ -626,9 +708,33 @@ function normalizeMethod(raw) {
   return upper;
 }
 
+/*
+ * A URL a request can be sent to, or null for one Node would refuse to parse. Node's URL rejects
+ * 'http://' and 'http:' outright -- they name no host -- while this runtime's parses them to a
+ * hostless href, so a scheme that needs a host is checked here too.
+ */
+function requestableUrl(raw) {
+  var text = String(raw);
+  var parsed = null;
+  try { parsed = new globalThis.URL(text); } catch (badUrl) { return null; }
+  var scheme = parsed.protocol;
+  if ((scheme === 'http:' || scheme === 'https:' || scheme === 'ws:' || scheme === 'wss:') && parsed.hostname === '') return null;
+  return parsed;
+}
+
+/* The TypeError both the Request constructor and fetch give for a URL that will not parse: the
+   message Node writes, carrying the platform's ERR_INVALID_URL as its cause. */
+function unparseableUrl(raw) {
+  var failed = new TypeError('Failed to parse URL from ' + raw);
+  var cause = new TypeError('Invalid URL');
+  cause.code = 'ERR_INVALID_URL';
+  failed.cause = cause;
+  return failed;
+}
+
 function Request(target, options) {
   if (!(this instanceof Request)) {
-    throw new TypeError("Failed to construct 'Request': Please use the 'new' operator.");
+    throw new TypeError('Class constructor _Request cannot be invoked without \'new\'');
   }
   if (arguments.length < 1) throw new TypeError('Request constructor: 1 argument required, but 0 found.');
   options = options === undefined || options === null ? {} : options;
@@ -652,14 +758,15 @@ function Request(target, options) {
   if (options.method !== undefined && options.method !== null) rawMethod = String(options.method);
   if (options.headers !== undefined && options.headers !== null) headersInit = options.headers;
   if (options.body !== undefined && options.body !== null) bodyIn = options.body;
+  /* the URL is read first: a URL that will not parse is reported before the method or the body
+     is looked at, which is the order Node reports them in */
+  var parsed = requestableUrl(url);
+  if (parsed === null) throw unparseableUrl(url);
   var method = normalizeMethod(rawMethod);
   var made = makeBody(bodyIn);
   if (made.has && (method === 'GET' || method === 'HEAD')) {
     throw new TypeError('Request with GET/HEAD method cannot have body.');
   }
-  var parsed = null;
-  try { parsed = new globalThis.URL(url); } catch (badUrl) { parsed = null; }
-  if (parsed === null) throw new TypeError('Failed to parse URL from ' + url);
   this.url = parsed.href;
   this.method = method;
   this.headers = new Headers(headersInit);
@@ -701,29 +808,29 @@ Object.defineProperty(Request.prototype, 'signal', {
 });
 Object.defineProperty(Request.prototype, Symbol.toStringTag, { value: 'Request', configurable: true });
 Request.prototype.bytes = function () {
-  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  if (this._used) return Promise.reject(unusableBody());
   this._used = true;
   return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
 };
 Request.prototype.text = function () {
-  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  if (this._used) return Promise.reject(unusableBody());
   this._used = true;
   return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
 };
 Request.prototype.json = function () {
-  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  if (this._used) return Promise.reject(unusableBody());
   this._used = true;
   return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
 };
 Request.prototype.arrayBuffer = function () {
-  if (this._used) return Promise.reject(new TypeError('Body has already been used.'));
+  if (this._used) return Promise.reject(unusableBody());
   this._used = true;
   return bodyBuffer(this).then(function (buffer) {
     return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
   });
 };
 Request.prototype.clone = function () {
-  if (this._used) throw new TypeError('Request.clone: body has already been used.');
+  if (this._used) throw new TypeError('unusable');
   var copy = new Request(this.url, { method: this.method, headers: this.headers });
   if (this._stream !== null && this._stream !== undefined) {
     var both = this._stream.tee();
@@ -738,6 +845,32 @@ Request.prototype.clone = function () {
   return copy;
 };
 
+/* An error that is the caller's, not the network's: fetch rejects with it as it is, and it is never
+   wrapped in 'fetch failed'. */
+function notTransport(error) {
+  Object.defineProperty(error, 'owcNotTransport', { value: true });
+  return error;
+}
+
+/*
+ * A data: URL, which Node answers without a socket: the media type before the first comma is the
+ * content type -- text/plain;charset=US-ASCII when the URL gives none -- and what follows is the
+ * body, percent-decoded, or base64 when the type says so.
+ */
+function dataResponse(url) {
+  var at = url.indexOf(',');
+  var meta = at < 0 ? '' : url.slice(5, at);
+  var payload = at < 0 ? '' : url.slice(at + 1);
+  var base64 = /(^|;)base64$/i.test(meta);
+  var bytes;
+  try {
+    bytes = base64 ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'utf8');
+  } catch (undecodable) {
+    bytes = Buffer.from(payload, 'utf8');
+  }
+  return new Response(bytes, { status: 200, headers: { 'content-type': base64 ? meta.slice(0, meta.length - 7) : (meta === '' ? 'text/plain;charset=US-ASCII' : meta) } });
+}
+
 /* fetch(target, options): target is a URL string, a URL, or a Request -- a Request carries its own
    method, headers and body, and an option given beside it overrides the one the Request holds. */
 function fetch(target, options) {
@@ -745,8 +878,7 @@ function fetch(target, options) {
   if (target instanceof Request) {
     if (target._used) {
       /* not a transport failure, so it travels out of fetch exactly as Node reports it */
-      var used = new TypeError('Cannot construct a Request with a Request object that has already been used.');
-      Object.defineProperty(used, 'owcNotTransport', { value: true });
+      var used = notTransport(new TypeError('Cannot construct a Request with a Request object that has already been used.'));
       return Promise.reject(used);
     }
     var carried = target._bytes !== null && target._bytes !== undefined
@@ -760,6 +892,27 @@ function fetch(target, options) {
     target = target.url;
   }
   var url = String(target && target.href !== undefined ? target.href : target);
+  /*
+   * What a Request would have refused, in the order a Request refuses it: a URL that does not
+   * parse, a method that is not a token or is one of the three a request may never carry, and a
+   * body beside GET or HEAD. None of them is a transport failure, and none of them dials: an
+   * 'http://' that names no host fails to parse here as it does in Node, instead of being
+   * connected to port 80.
+   */
+  var parsed = requestableUrl(url);
+  if (parsed === null) return Promise.reject(notTransport(unparseableUrl(url)));
+  var method;
+  try {
+    method = normalizeMethod(init.method === undefined || init.method === null ? 'GET' : String(init.method));
+  } catch (badMethod) {
+    return Promise.reject(notTransport(badMethod));
+  }
+  if (init.body !== undefined && init.body !== null && (method === 'GET' || method === 'HEAD')) {
+    return Promise.reject(notTransport(new TypeError('Request with GET/HEAD method cannot have body.')));
+  }
+  if (parsed.protocol === 'data:') return Promise.resolve(dataResponse(url));
+  /* a scheme the container has no client for is a failed fetch, not a parse error */
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return Promise.reject(new Error('unknown scheme'));
   return request(url, init).then(function (res) {
     /* a status that carries no body gets none, so a 204 is not built with an empty one */
     var payload = (res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304) ? null : res.body.buffer;

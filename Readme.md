@@ -381,6 +381,21 @@ is still byte-identical to host Node 24.15 after these changes.
 - `process.kill` matches host Node 24.15 on the same script: `process.kill(process.pid, 0)` is `true`, a pid that is not there throws `ESRCH` (`kill ESRCH`), a live child answers `0` with `true` and `SIGTERM` with `true` and then exits with `null SIGTERM`, and `process.kill(process.pid)` ends this process with status 143
 - QuickJS 0.31 printed `Assertion failed: list_empty(&rt->gc_obj_list)` at teardown after correct output (`mathjs`, `prettier`, `typescript`, `uglify-js`, `xlsx`, `jsdom`); the pinned 0.32 engine passes all six in the corpus. `prettier` 3.9.10 was re-measured here: its formatted output is byte-identical to host Node's
 - `sass` compiles: dart-sass 1.106.0 `compileString` returns CSS byte-identical to host Node's, for a flat rule and for one that goes through `@use "sass:math"`. The hang this entry used to describe does not reproduce
+- `liquidjs` 10.30.0 does not load: `require('liquidjs')` raises `stack underflow (op=110, pc=301)` where host Node 24.15 imports it and prints `OUT 1;2;`. This is a QuickJS bug and not this container's. It reduces to one line —
+
+      function* inner(a) { for (const x of (yield a)) { } }
+
+  — a `yield` in the iterable of a `for...of` head, which QuickJS cannot compile: the failure is at
+  compile time, so no statement of the file has run when it lands, and it is not a regression the
+  0.31 to 0.32 upgrade brought or undid. Measured on every variant this project can load: 0.32
+  singlefile-asyncify (the one the container uses) and 0.32 wasmfile-debug both say
+  `stack underflow (op=110, pc=8)`, and 0.31 singlefile-asyncify, 0.31 wasmfile-release-sync and
+  0.31 asmjs all say `stack underflow (op=112, pc=8)`; the same source under bare QuickJS with no
+  container in the way fails identically, so nothing here rewrites or mis-handles it. Host Node 24.15
+  runs it: `inner([1, 2, 3]).next()` yields `{"value":[1,2,3],"done":false}` and the next `next()`
+  finishes. There is no guest-side way past it — rewriting `yield` out of a `for...of` head is a
+  source transform over every module the container loads, and QuickJS exposes no hook to fix the
+  code it generates
 - `AsyncLocalStorage` context is not carried across `await` (timers, ticks and `.then` callbacks do carry it): the store is present before the first `await` and `undefined` after it. An async function's suspension unwinds the JS stack before the engine calls `then`, and its resumption runs in a job enqueued after the reaction returns, so no reaction wrapper can hand the frame across; it needs the host hook V8's `SetPromiseHook` gives Node's `async_hooks` — a hook on job enqueue — and `quickjs-emscripten` 0.32 exposes none
 - Shell: `;` separators and `|` pipes work — measured against this machine's `/bin/sh`, they agree on stdout, stderr and exit code — and so does globbing. What does not agree: `chmod` and `fs.chmodSync` succeed and change nothing, so `chmod 755 f; stat -c %a f` prints `644` where the host prints `755`; `touch a b c` creates only `a`, where the host creates all three; `ls -l`, `ls -a` and `ls -la` are accepted and ignored, so no long format and no dotfiles are ever printed
 - `node` and `npm` run only on a line of their own: joined to another command with `;`, `&&` or `||`, or put in a pipeline, they write `<name>: cannot run here: it can only be run on a line of its own, where the shell can wait for it` (exit 127 for the command). `npm run` does work, including `pre`/`post` lifecycle scripts, `npm install` writes `package-lock.json` at lockfileVersion 3, and global installs are refused (`Global installs are not supported by this runtime`, exit 1)

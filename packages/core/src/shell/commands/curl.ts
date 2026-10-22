@@ -1,5 +1,6 @@
 import { ShellCommandResult } from "../types";
 import { CommandHelp, ShellCommand } from "./base";
+import { curlCommand } from "./unsupported";
 
 export class CurlCommand extends ShellCommand {
     get help(): CommandHelp {
@@ -10,7 +11,12 @@ export class CurlCommand extends ShellCommand {
                 'Options:\n' +
                 '  -X <method>  HTTP method\n' +
                 '  -H <header>  Custom header\n' +
-                '  -o <file>    Output to file',
+                '  -d <data>    Request body\n' +
+                '  -o <file>    Output to file ("-" for stdout)\n' +
+                '  -i           Include the response head\n' +
+                '  -I           Head only\n' +
+                '  -s -S        Silent / show errors\n' +
+                '  --version    Print the version',
             examples: [
                 'curl https://api.example.com',
                 'curl -X POST -H "Content-Type: application/json" https://api.com',
@@ -19,93 +25,16 @@ export class CurlCommand extends ShellCommand {
         };
     }
 
+    /**
+     * The request, its options and every status it reports are `curlCommand` in ./unsupported: this
+     * class is the asynchronous command the shell's registry reaches, and all it adds is the two
+     * things that utility needs of the container -- a path resolved against the working directory,
+     * and a file written as bytes.
+     */
     async execute(args: string[]): Promise<ShellCommandResult> {
-        try {
-            // Basic argument parsing
-            const urlIndex = args.findIndex(arg => !arg.startsWith('-'));
-            if (urlIndex === -1) {
-                return {
-                    stdout: '',
-                    stderr: 'curl: URL required',
-                    exitCode: 1
-                };
-            }
-
-            const url = args[urlIndex];
-            const options = args.slice(0, urlIndex);
-
-            // Parse options
-            const method = options.includes('-X') ?
-                args[args.indexOf('-X') + 1] : 'GET';
-            const headers: Record<string, string> = {};
-            const outputFile = options.includes('-o') ?
-                args[args.indexOf('-o') + 1] : undefined;
-
-            const followRedirects = !options.includes('--no-follow');
-            const insecure = options.includes('-k') || options.includes('--insecure');
-
-            // Parse headers
-            for (let i = 0; i < args.length; i++) {
-                if (args[i] === '-H' && args[i + 1]) {
-                    const headerStr = args[i + 1];
-                    const [key, ...valueParts] = headerStr.split(':');
-                    const value = valueParts.join(':').trim();
-                    headers[key.trim()] = value;
-                    i++; // Skip next argument since we processed it
-                }
-            }
-
-
-            try {
-                const response = await fetch(url, {
-                    method,
-                    headers: {
-                        ...headers,
-                        'Accept': '*/*',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                    },
-                    redirect: followRedirects ? 'follow' : 'manual',
-                    // Ignore SSL certificate errors if -k flag is used
-                    mode: 'cors',
-                });
-
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                }
-
-                const responseText = await response.text();
-
-                // Handle output to file if -o option is used
-                if (outputFile) {
-                    this.fileSystem.writeFile(this.resolvePath(outputFile), responseText);
-                    return {
-                        stdout: `  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n` +
-                            `                                   Dload  Upload   Total   Spent    Left  Speed\n` +
-                            `100  ${responseText.length}  100  ${responseText.length}    0     0   ${Math.floor(responseText.length / 0.1)}      0  0:00:01 --:--:--  0:00:01 ${Math.floor(responseText.length / 0.1)}\n`,
-                        stderr: '',
-                        exitCode: 0
-                    };
-                }
-
-                return {
-                    stdout: responseText + '\n',
-                    stderr: '',
-                    exitCode: 0
-                };
-
-            } catch (error: any) {
-                return {
-                    stdout: '',
-                    stderr: `curl: (6) Could not resolve host: ${error.message}\n`,
-                    exitCode: 6
-                };
-            }
-        } catch (error: any) {
-            return {
-                stdout: '',
-                stderr: `curl: ${error.message}\n`,
-                exitCode: 1
-            };
-        }
+        return await curlCommand(args, {
+            resolve: (path: string) => this.resolvePath(path),
+            writeBytes: (path: string, bytes: Uint8Array) => this.fileSystem.writeBytes(path, bytes)
+        });
     }
 }
