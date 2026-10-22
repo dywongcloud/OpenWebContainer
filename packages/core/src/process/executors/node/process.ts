@@ -228,14 +228,19 @@ function nodeColumn(text: string, column: number): number {
     if (end < 0 || text[end] === ')') return column;
     /* The callee: a name, or names read off one another -- `a.b.c()` -- walked backwards. */
     let start = end;
+    let lastDot = -1;
     for (;;) {
         while (start >= 0 && /[A-Za-z0-9_$]/.test(text[start] ?? '')) start--;
         let dot = start;
         while (dot >= 0 && /\s/.test(text[dot] ?? '')) dot--;
         if (dot < 0 || text[dot] !== '.') break;
+        lastDot = dot;
         start = dot - 1;
     }
-    let head = start + 1;
+    /* V8 names the property the call is read off, not the receiver in front of it: it reports
+       `"abc".toUpperCase().nope()` at the `nope`, so where the walk crossed a dot the head is one
+       past the last of them. A callee with no dot in it -- `f()` -- starts where the walk stopped. */
+    let head = lastDot >= 0 ? lastDot + 1 : start + 1;
     /* `new` in front of the callee is part of the expression V8 names: `new Error()` is reported at
        the `new`, not at the parenthesis. */
     let word = head - 1;
@@ -248,6 +253,30 @@ function nodeColumn(text: string, column: number): number {
 }
 
 /**
+ * The spans of `text` a string or template literal covers, as `[first, last]` index pairs.
+ *
+ * A `throw` the caret scan finds is only a statement when the engine is not inside one of these:
+ * `const s = "throw", t = s()` holds no `throw` at all, and a scan that does not know a literal
+ * from code marks the word inside the string.
+ */
+function literalSpans(text: string): [number, number][] {
+    const spans: [number, number][] = [];
+    let quote = '';
+    let from = -1;
+    for (let at = 0; at < text.length; at++) {
+        const ch = text[at] ?? '';
+        if (quote !== '') {
+            if (ch === '\\') { at++; continue; }
+            if (ch === quote) { spans.push([from, at]); quote = ''; }
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === '`') { quote = ch; from = at; }
+    }
+    if (quote !== '') spans.push([from, text.length - 1]);
+    return spans;
+}
+
+/**
  * The column node points the caret at, which is not always the column of the frame: a `throw` is
  * marked at the `throw` and reported at the expression it throws, so `throw new Error('x')` is a
  * caret under `throw` and a frame at `new`. The `throw` that raised the error is the last one behind
@@ -255,11 +284,13 @@ function nodeColumn(text: string, column: number): number {
  * stops there. A failure no `throw` raised keeps the column the frame has.
  */
 function caretColumn(text: string, column: number): number {
+    const quoted = literalSpans(text);
+    const inside = (at: number): boolean => quoted.some(([from, to]) => at >= from && at <= to);
     for (let at = column - 1; at >= 0; at--) {
         const ch = text[at];
         if (ch === ';' || ch === '{' || ch === '}') break;
         if (ch === 'w' && at >= 4 && text.slice(at - 4, at + 1) === 'throw'
-            && !/[A-Za-z0-9_$]/.test(text[at - 5] ?? '')) {
+            && !/[A-Za-z0-9_$]/.test(text[at - 5] ?? '') && !inside(at)) {
             return at - 3;
         }
     }
