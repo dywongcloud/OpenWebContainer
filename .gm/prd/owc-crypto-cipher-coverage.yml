@@ -1,0 +1,6 @@
+id: owc-crypto-cipher-coverage
+session_id: adv5-exec-crypto
+owner: adv5-exec-crypto
+classification: GUEST
+status: pending
+subject: 'crypto.getCiphers() answers 16 names where host Node 24.15 answers 130, so a cipher the host knows and this runtime does not raises ERR_CRYPTO_UNKNOWN_CIPHER here where the host names the real fault: ERR_CRYPTO_INVALID_KEYLEN for camellia-128-cbc/sm4-cbc/aria-128-cbc/aes-128-cfb1/aes-128-cfb8/aes-128-ofb, ERR_CRYPTO_INVALID_IV for des-ede/des-ede3/aes-128-ccm/aes-128-ocb/aes-128-wrap, ERR_OSSL_XTS_DUPLICATED_KEYS for aes-128-xts, and bare chacha20 works on the host and is unknown here. Only the AES ecb/cbc/ctr/cfb/gcm family and chacha20-poly1305 are implemented (CIPHER_SPECS in packages/core/src/process/executors/node/runtime/capabilities/crypto.ts). Missing and needing block ciphers @noble/ciphers does not carry: camellia-*, aria-*, sm4-*, des-*/des-ede/des-ede3/des3-*. Missing but derivable from the AES block already present: aes-*-ofb, aes-*-cfb1, aes-*-cfb8, aes-*-xts, aes-*-ccm, aes-*-ocb; aes-*-wrap/aes-*-wrap-pad are available as @noble/ciphers aeskw/aeskwp, and bare chacha20 as @noble/ciphers chacha. Node also answers its aliases (aes128, aes192, aes256, des3, id-aes128-wrap, ...).'
