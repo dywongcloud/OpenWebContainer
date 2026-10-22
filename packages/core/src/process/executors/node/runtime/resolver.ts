@@ -16,12 +16,29 @@ export type ResolveFailure =
     | { kind: 'import-not-defined'; packageDir: string; specifier: string }
     | { kind: 'dir-target'; dir: string }
     | { kind: 'bad-file-url'; ctor: 'TypeError' | 'URIError'; code: string; message: string }
+    | { kind: 'unknown-extension'; file: string; ext: string }
     | { kind: 'missing'; target: 'package' | 'module'; name?: string; file?: string };
 
 export type ResolveResult = { kind: 'file'; file: string } | ResolveFailure;
 
 const FILE_EXTENSIONS = ['.js', '.json', '.cjs', '.mjs'];
 const INDEX_FILES = ['index.js', 'index.json', 'index.cjs', 'index.mjs'];
+
+/**
+ * The extensions the default ES module loader knows: a name carrying one of them Node loads as a
+ * module, as CommonJS, as JSON or as TypeScript with its types stripped, and one carrying no
+ * extension is decided the way a `.js` file is. Any other extension is
+ * ERR_UNKNOWN_FILE_EXTENSION -- `.xyz`, and `.node`, which only require() can load -- and Node
+ * names it before it reads a line of the file, which is why no module-syntax detection reaches
+ * it. `.wasm` is not among them because this loader has no wasm module format: a name Node loads
+ * as a wasm module is reported here as an extension no loader knows.
+ */
+const ESM_EXTENSIONS = ['', '.js', '.mjs', '.cjs', '.json', '.ts', '.mts', '.cts'];
+
+/** Whether the ES module loader has a format for a file's name: the extension, the dot included. */
+function isEsmExtension(file: string): boolean {
+    return ESM_EXTENSIONS.includes(extensionOf(file));
+}
 
 /** A `/` begins a regular expression only where no expression can end just before it. */
 const REGEX_PRECEDERS = '(,=:[!&|?{};+-*%~^<>';
@@ -202,7 +219,16 @@ export class NodeResolver {
     resolveDetailed(specifier: string, fromDir: string, mode: ResolveMode): ResolveResult {
         this.lastFailure = undefined;
         const file = this.resolve(specifier, fromDir, mode);
-        if (file !== undefined) return { kind: 'file', file };
+        if (file !== undefined) {
+            /* An extension the ES module loader does not know is one Node names before it reads the
+               file: 'Unknown file extension ".xyz" for /app/m.xyz', not a module that failed to
+               parse. A `data:` URL carries no extension to reject -- its text is the module. */
+            if (mode === 'import' && file.startsWith('/') && !isEsmExtension(file)) {
+                this.lastFailure = { kind: 'unknown-extension', file, ext: extensionOf(file) };
+                return this.lastFailure;
+            }
+            return { kind: 'file', file };
+        }
         return this.lastFailure ?? { kind: 'missing', target: 'module' };
     }
 
@@ -275,12 +301,15 @@ export class NodeResolver {
      * ERR_UNKNOWN_FILE_EXTENSION before any detection runs, so it never detects one.
      */
     isESM(file: string, forRequire = false): boolean {
-        if (file.endsWith('.mjs')) return true;
-        if (file.endsWith('.cjs') || file.endsWith('.json')) return false;
-        /* A .js file and a file no extension follows are the two Node decides by the package "type"
-           first and by the module syntax in it second -- its detection, on by default since 22.7,
-           reads 'export' or a top-level 'await' in either and loads it as a module. */
-        if (forRequire || file.endsWith('.js') || extensionOf(file) === '') {
+        /* TypeScript's own extensions are the ESM ones with a letter in front: Node strips the types
+           and what is left is decided by the name, so `.mts` is a module the way `.mjs` is and
+           `.cts` is CommonJS the way `.cjs` is, whatever the nearest package.json says. */
+        if (file.endsWith('.mjs') || file.endsWith('.mts')) return true;
+        if (file.endsWith('.cjs') || file.endsWith('.cts') || file.endsWith('.json')) return false;
+        /* A .js file, a .ts file and a file no extension follows are the three Node decides by the
+           package "type" first and by the module syntax in it second -- its detection, on by default
+           since 22.7, reads 'export' or a top-level 'await' in either and loads it as a module. */
+        if (forRequire || file.endsWith('.js') || file.endsWith('.ts') || extensionOf(file) === '') {
             const packageType = this.nearestPackageType(dirnameOf(file));
             if (packageType === 'module') return true;
             if (packageType === 'commonjs') return false;

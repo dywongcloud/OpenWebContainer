@@ -2690,8 +2690,25 @@ export class NodeProcess extends Process {
                 : ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify(failure));
         }
         const baseDir = baseName && baseName.startsWith('/') ? dirnameOf(baseName) : this.currentCwd;
-        const detail = this.resolver.resolveDetailed(spec, baseDir, 'import');
+        const resolved = this.resolver.resolveDetailed(spec, baseDir, 'import');
+        /* A require() reaching a name whose extension the ES module loader does not know still
+           loads it: require has no handler for such an extension either, but it falls back to the
+           handler for `.js`, which detects -- `require('./m.xyz')` holding `export const v = 1`
+           loads as a module, as in Node. Only an `import` of that name is
+           ERR_UNKNOWN_FILE_EXTENSION, and Node names the extension before it reads a line of the
+           file, so the source is never compiled: the same name fails whether it holds `export` or
+           `module.exports`. */
+        const detail = resolved.kind === 'unknown-extension' && resolved.file === this.requireFile
+            ? { kind: 'file' as const, file: resolved.file }
+            : resolved;
         if (detail.kind !== 'file') {
+            if (detail.kind === 'unknown-extension') {
+                return ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
+                    code: 'ERR_UNKNOWN_FILE_EXTENSION',
+                    ctor: 'TypeError',
+                    message: `Unknown file extension "${detail.ext}" for ${detail.file}`,
+                }));
+            }
             /* A subpath no "exports" map defines is its own failure in Node, not a missing module:
                ERR_PACKAGE_PATH_NOT_EXPORTED, which user code branches on. */
             if (detail.kind === 'not-exported') {
