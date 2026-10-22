@@ -1,0 +1,103 @@
+row: owc-shell-syntax-error-token-named, owc-shell-arith-operand-error-status, owc-shell-command-not-found-wording
+measured: 2026-10-23T01:19:00+08:00
+load: 1:19  up 3 days,  9:44, 7 users, load averages: 22.78 19.61 20.71
+free: Pages free: 16682 (273 MB) at the witness run, 55110 (903 MB) at the sweep
+claim: repair for the three shell-diag rows the judge confirmed and left unfixed
+verdict: FIXED -- each row's own shape now agrees with this machine's /bin/sh (bash 3.2)
+
+Every case below is `sh -c <line>` on both sides: the host's own /bin/sh, and the container's
+shell through `container.spawn('sh', ['-c', line])` (packages/core/src/process/executors/shell/
+process.ts -> Shell.executeLine -> runScript). Two runs of the container batch are byte-identical.
+What still differs on a syntax error is the `/bin/sh` the host calls itself against the `sh` the
+container calls itself, and the line a host echoes after the message -- both are
+owc-shell-syntax-error-source-line, which is filed and out of reach.
+
+Row: owc-shell-syntax-error-token-named
+Witness: .gm/witness-out/repair-shell-diag-4.txt
+Status: resolved
+
+case: "if; then"                                  (host names `;')
+  host  stderr="/bin/sh: -c: line 0: syntax error near unexpected token `;'"              exit=2
+  cont  stderr="syntax error near unexpected token `newline'"                 <-- before
+  cont  stderr="syntax error near unexpected token `;'"                       <-- after
+case: "while; do echo; done"                      (host names `;')
+  cont  before "`newline'"                        after "`;'"
+case: "{ cat <<EOF\na\nEOF\n; } & wait"           (host names `;')
+  cont  before "`newline'"                        after "`;'"
+case: "echo |"                                    (host: unexpected end of file)
+  host  stderr="/bin/sh: -c: line 1: syntax error: unexpected end of file"                exit=2
+  cont  before "syntax error near unexpected token `|'"
+  cont  after  "syntax error: unexpected end of file"
+case: "for x in a; echo hi; done"                 (host names `echo')
+  host  stderr="/bin/sh: -c: line 0: syntax error near unexpected token `echo'"           exit=2
+  cont  before "syntax error: `do' expected"
+  cont  after  "syntax error near unexpected token `echo'"
+
+Cause, and the same fix for the shapes beside them: a command that was expected and is not there
+named `newline' whatever stood in its place, and a word a construct needs named the word it wanted
+rather than the token standing there. `Parser.tokenHere` names what stands there -- `;`, `&`, `|`,
+`||`, `;;`, `)`, or the whole word -- and `Parser.expectedKeyword` names it for `then`, `do` and
+`in`, saying the input ended only when no token is left. A `|` at the very end of the input is the
+operator it is and not a leftover: the command behind it is what is missing.
+
+Measured beside them, all now naming the token the host names: ";" "`&'" "`|'" "`||'" "`;)'" ->
+`;`, `&`, `|`, `||`, `)`; "for x", "while true", "if true" -> `syntax error: unexpected end of
+file`; "for x in a; done" -> `done'; "for x in a; ; do echo hi; done" -> `;'; "case x; esac" ->
+`;'. "for" alone still names `newline', as the host does.
+
+Row: owc-shell-arith-operand-error-status
+Witness: .gm/witness-out/repair-shell-diag-4.txt
+Status: resolved
+
+case: "x=$((1+))"
+  host  stderr="/bin/sh: 1+: syntax error: operand expected (error token is \"+\")\n"     exit=127
+  cont  stderr="syntax error: operand expected\n"                              exit=1     <-- before
+  cont  stderr="sh: 1+: syntax error: operand expected (error token is \"+\")\n" exit=127 <-- after
+case: "echo $((1 2))"
+  host  "/bin/sh: 1 2: syntax error in expression (error token is \"2\")\n"   exit=127
+  cont  "syntax error in arithmetic expression\n"                             exit=1      <-- before
+  cont  "sh: 1 2: syntax error in expression (error token is \"2\")\n"        exit=127    <-- after
+case: "echo $((1/0))"
+  host  "/bin/sh: 1/0: division by 0 (error token is \"0\")\n"                exit=127
+  cont  "division by 0\n" exit=1 -> "sh: 1/0: division by 0 (error token is \"0\")\n" exit=127
+case: "echo $((1 @ 2))"     cont before `syntax error: invalid arithmetic operator (error token is
+  "@ 2")' exit 1 -> "sh: 1 @ 2: ... (error token is \"@ 2\")" exit=127
+case: "echo $((1+*2))"      cont before `(error token is "*")' exit 1 -> "sh: 1+*2: ... (error
+  token is \"*2\")" exit=127, as the host has it
+case: "echo $(( 1 + ))"     host `1 + : ... operand expected (error token is " ")'; cont now the
+  same, where it was `syntax error: operand expected' and exit 1
+case: "echo $((++))"        host `++: ... operand expected (error token is "+")'; cont now the same
+case: "let 'x=1+'"          host `/bin/sh: let: x=1+: syntax error: operand expected (error token
+  is "+")' exit 1; cont before `let: syntax error: operand expected' exit 1, after the host's own
+  words and status
+
+Cause: the message was the reason alone, the status was the 1 a caught error gets, and neither the
+shell's name nor the expression nor the text a host points at was in it. `ArithError` carries the
+error token now, taken from the offset every token of the expression keeps, `arithDiagnostic`
+writes the whole line the way a host writes it, and an expression that will not evaluate fails the
+line with 127 (`let` keeping its own 1), which is what `x=$((1+)); echo after` does on a host: no
+`after`. A number is nothing `++` or `--` can stand behind -- `$((1 ++ ))` is the host's own
+`operand expected (error token is " ")' and not a leftover behind the value.
+
+Row: owc-shell-command-not-found-wording
+Witness: .gm/witness-out/repair-shell-diag-4.txt
+Status: resolved
+
+case: "nosuchcmd-j4"
+  host  stderr="/bin/sh: nosuchcmd-j4: command not found\n"                              exit=127
+  cont  stderr="Command not found: nosuchcmd-j4\n"                            exit=127    <-- before
+  cont  stderr="sh: nosuchcmd-j4: command not found\n"                        exit=127    <-- after
+case: "nosuchcmd-j4; echo after"   stdout="after\n" on both, exit 0, same wording
+
+The name now sits where a host puts it: the shell's name, then the command, then `command not
+found`. The closed row beside it still holds -- owc-shell-command-not-found-newline is about the
+newline every diagnostic ends in, and `echo $( echo a\nb )` is still `sh: b: command not found\n`
+with it.
+
+Measured beside the three rows, unchanged and matching: the heredoc and background-job cases the
+earlier commits closed (`(cat <<EOF\nb\nEOF\n) & wait`, `if true; then cat <<EOF ... fi & wait`,
+`for i in 1; do cat <<EOF ... done & wait`, `cat <<EOF\n\na\n\nEOF`, `cat <<EOF |\na\nEOF\ncat &
+wait`), `echo "abc` and `echo ${x` at exit 2, `/tmp` and a file without its execute bit at 126,
+and a 58-case sweep of general shell features 52/58 -- the six are ones no commit here touched:
+`$((1--2))` (a host reads it as `1 - -2`), `$((1?2:3))` (`:` is not lexed), `$(( ))`, `$[1+2]`,
+`${x:1:2}`, and `echo a |` on the echoed line alone.

@@ -678,10 +678,12 @@ export class Shell implements IShell {
         }
 
         /* The message a host writes for a name no built-in, no utility and no file on PATH answers
-           to, and it ends in the newline every diagnostic of a host's ends in -- which is what the
-           one the script engine fell back on was missing, so the text a line wrote after it ran on
-           into it. */
-        return { stdout: '', stderr: `Command not found: ${command}\n`, exitCode: 127 };
+           to: the shell's name, then the command, then `command not found`, in the order a host
+           puts them -- `Command not found: nosuchcmd` had the name in front of the sentence it
+           belongs in the middle of. It ends in the newline every diagnostic of a host's ends in,
+           which is what the one the script engine fell back on was missing, so the text a line
+           wrote after it ran on into it. */
+        return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: command not found\n`, exitCode: 127 };
     };
 
     /** The status and message of a command this shell cannot run inside the script engine. */
