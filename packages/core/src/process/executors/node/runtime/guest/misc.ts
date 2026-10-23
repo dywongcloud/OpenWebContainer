@@ -2765,6 +2765,24 @@ BF.crypto = function () {
     return new DiffieHellman(cryptoCap('crypto.dh.create', args).id);
   }
 
+  /* The width of the secret key generateKey and generateKeySync are asked for, in bytes. */
+  function secretKeyLengthOf(type, options) {
+    if (typeof type !== 'string') throw invalidArgType('type', 'of type string', type);
+    if (type !== 'hmac' && type !== 'aes') throw invalidArgValue('type', type);
+    if (options === null || typeof options !== 'object') {
+      throw invalidArgType('options', 'of type object', options);
+    }
+    var length = options.length;
+    if (typeof length !== 'number') throw invalidArgType('options.length', 'of type number', length);
+    if (!(length >= 1 && length <= 4294967295)) {
+      throw outOfRange('options.length', '>= 1 && <= 4294967295', length);
+    }
+    if (type === 'aes' && length !== 128 && length !== 192 && length !== 256) {
+      throw invalidArgValue('options.length', length, 'must be one of: 128, 192, 256');
+    }
+    return Math.ceil(length / 8);
+  }
+
   function createDiffieHellmanGroup(name) {
     /* Node reads the group name as a string before it looks it up, so a number is a type error and
        not the ERR_CRYPTO_UNKNOWN_DH_GROUP an unresolvable name answers. */
@@ -3540,6 +3558,69 @@ BF.crypto = function () {
     diffieHellman: diffieHellman,
     subtle: subtle,
     webcrypto: webcrypto,
+    /* The classes behind the four factories, which node exports in their own right: 'new
+       crypto.Hash('sha256')' is the same object createHash gives, and so are the other three. */
+    Hash: Hash,
+    Hmac: function Hmac(algorithm, key, options) {
+      return new Hash(algorithm, keyBytesOf(key), outputLengthOf(options));
+    },
+    Sign: Sign,
+    Verify: Verify,
+    Cipheriv: function Cipheriv(algorithm, key, iv, options) {
+      return createCipher('encrypt')(algorithm, key, iv, options);
+    },
+    Decipheriv: function Decipheriv(algorithm, key, iv, options) {
+      return createCipher('decrypt')(algorithm, key, iv, options);
+    },
+    /* The two classes behind createDiffieHellman and createDiffieHellmanGroup: one holds the prime
+       and generator it was given, the other a MODP group it names, and they carry the same methods.
+       Both are the factories themselves, because node's constructors take the same arguments --
+       a width or a prime, then a generator -- and hand back the object the factory hands back. */
+    DiffieHellman: function DiffieHellmanClass(prime, generator, generatorEncoding) {
+      return createDiffieHellman(prime, generator, generatorEncoding);
+    },
+    DiffieHellmanGroup: function DiffieHellmanGroup(name) {
+      return createDiffieHellmanGroup(name);
+    },
+    /* FIPS: this container is not built against a FIPS-capable provider, so it answers the way node
+       does on such a build -- getFips is 0, and setFips accepts the flag and does nothing. */
+    getFips: function getFips() { return 0; },
+    setFips: function setFips(enabled) {
+      if (typeof enabled !== 'boolean') {
+        var badFips = new TypeError('The "enabled" argument must be of type boolean. Received '
+          + receivedTypeOf(enabled));
+        badFips.code = 'ERR_INVALID_ARG_TYPE';
+        throw badFips;
+      }
+      return undefined;
+    },
+    /* No secure heap is ever allocated here, so the usage is node's own empty one: a utilization of
+       NaN, which is what zero out of zero is. */
+    secureHeapUsed: function secureHeapUsed() {
+      return { total: 0, used: 0, utilization: NaN, min: 2 };
+    },
+    /* An OpenSSL engine this build carries no provider for: node names the one it was asked for. */
+    setEngine: function setEngine(id) {
+      var noEngine = new Error('Engine "' + String(id) + '" was not found');
+      noEngine.code = 'ERR_CRYPTO_ENGINE_UNKNOWN';
+      /* OpenSSL's own number for the error, which node carries on the error as it does on every
+         one it raises out of a provider. */
+      noEngine.opensslErrorStack = ['error:25078067:UI routines:UI_get_lib_method:unsupported'];
+      throw noEngine;
+    },
+    /* generateKey is the secret-key counterpart of generateKeyPair: a width in bits, and the bytes
+       are random. Only 'hmac' and 'aes' are secret keys -- a pair belongs to generateKeyPair -- and
+       aes takes the three widths the cipher has. */
+    generateKeySync: function generateKeySync(type, options) {
+      return createSecretKey(randomBytes(secretKeyLengthOf(type, options)));
+    },
+    generateKey: function generateKey(type, options, callback) {
+      var done = callback;
+      if (typeof done !== 'function') throw invalidArgType('callback', 'of type function', done);
+      var size = secretKeyLengthOf(type, options);
+      queueMicrotask(function () { done(null, createSecretKey(randomBytes(size))); });
+      return undefined;
+    },
     constants: {
       RSA_PKCS1_PADDING: 1,
       RSA_NO_PADDING: 3,
