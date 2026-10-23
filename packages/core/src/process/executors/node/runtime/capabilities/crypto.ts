@@ -920,6 +920,21 @@ function cipherFinal(state: CipherState): { data: Uint8Array; tag?: Uint8Array }
             };
         }
         if (state.tag === undefined) throw authFailure();
+        /*
+         * A caller who asked for a tag shorter than the sixteen the AEAD computes is checking the
+         * leading bytes of it, and the library will only ever compare all sixteen. Both of these
+         * AEADs seal by XOR, so the keystream does not depend on the plaintext: sealing as many
+         * zero bytes unseals the bytes in hand, and sealing those back answers the whole tag.
+         */
+        if (state.tagLength !== TAG_LENGTH) {
+            const sealed = aeadCipher(state).encrypt(new Uint8Array(rest.length));
+            const plain = new Uint8Array(rest.length);
+            for (let i = 0; i < rest.length; i++) plain[i] = rest[i] ^ sealed[i];
+            const full = aeadCipher(state).encrypt(plain);
+            const tag = full.subarray(full.length - TAG_LENGTH);
+            for (let i = 0; i < state.tagLength; i++) if (tag[i] !== state.tag[i]) throw authFailure();
+            return { data: plain };
+        }
         try {
             return { data: aeadCipher(state).decrypt(concatBytes(rest, state.tag)) };
         } catch {
@@ -2536,11 +2551,16 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         state.aad = bytesArg(args?.aad);
         return true;
     },
-    /** Args {id, tag}: the authentication tag a decrypting AEAD cipher checks its input against. */
+    /** Args {id, tag}: the authentication tag a decrypting AEAD cipher checks its input against.
+     *  Node takes only a tag of the length the cipher was opened with and names the one it got. */
     'crypto.cipher.setAuthTag': (args) => {
         const state = stateFor(args?.id, 'setAuthTag');
         if (!state.spec.aead) invalidState('setAuthTag');
-        state.tag = bytesArg(args?.tag);
+        const tag = bytesArg(args?.tag);
+        if (tag.length !== state.tagLength) {
+            throw cipherFail('ERR_CRYPTO_INVALID_AUTH_TAG', `Invalid authentication tag length: ${tag.length}`, 'TypeError');
+        }
+        state.tag = tag;
         return true;
     },
     /** Args {id, on}: whether ECB and CBC add and remove PKCS#7 padding. */

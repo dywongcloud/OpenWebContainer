@@ -202,7 +202,6 @@ BF['zlib'] = function () {
   /* Options only brotli and zstd read: 'params' is a map of BROTLI_PARAM_* or ZSTD_c_* / ZSTD_d_*
      keys to numbers. Node checks the key before the value, and names the key as it was written. */
   var BROTLI_PARAM_MAX = 8;
-  var ZSTD_COMPRESSION_LEVEL = 100;
   var CODEC = { brotli: 1, zstd: 1 };
 
   function isCodecFormat(format) {
@@ -233,14 +232,7 @@ BF['zlib'] = function () {
      Node ignores 'level' for zstd -- it is only ever a deflate-family option there -- and a level
      asked for here is applied, as ZSTD_c_compressionLevel, before any 'params'. */
   function codecParamsOption(format, compress, options) {
-    var pairs = paramsOption(format, options);
-    if (format === 'zstd' && compress) {
-      var level = options && typeof options === 'object' ? options.level : undefined;
-      if (typeof level === 'number') {
-        pairs = pairs ? [[ZSTD_COMPRESSION_LEVEL, level]].concat(pairs) : [[ZSTD_COMPRESSION_LEVEL, level]];
-      }
-    }
-    return pairs;
+    return paramsOption(format, options);
   }
 
   function dictionaryOption(options) {
@@ -301,12 +293,34 @@ BF['zlib'] = function () {
     return compress && !isCodecFormat(format) ? levelOption(options) : -1;
   }
 
+  /* Node caps the output buffer of every zlib format: a result that will not fit raises a RangeError
+     naming the cap, and a cap that is not a positive number is refused before anything runs. */
+  function maxOutputOption(options) {
+    if (options === null || typeof options !== 'object') return undefined;
+    var max = options.maxOutputLength;
+    if (max === undefined) return undefined;
+    if (typeof max !== 'number') throw argTypeError('options.maxOutputLength', 'of type number', max);
+    if (!(max >= 1 && max <= 9007199254740991)) {
+      throw failure(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "options.maxOutputLength" is out of range. It must be >= 1 and <= 9007199254740991. Received ' + max);
+    }
+    return max;
+  }
+
+  function cappedOutput(max, bytes) {
+    if (max !== undefined && bytes.length > max) {
+      throw failure(RangeError, 'ERR_BUFFER_TOO_LARGE', 'Cannot create a Buffer larger than ' + max + ' bytes');
+    }
+    return bytes;
+  }
+
   function syncOp(format, compress) {
     return function (buffer, options) {
       var bytes = inputBytes(buffer, 'buffer', SYNC_INPUT, true);
       flushOptions(format, options);
-      return runZlib(format, compress, bytes, levelOf(format, compress, options), dictionaryOption(options),
-        codecParamsOption(format, compress, options), chunkOption(format, options), false);
+      var max = maxOutputOption(options);
+      return cappedOutput(max, runZlib(format, compress, bytes, levelOf(format, compress, options), dictionaryOption(options),
+        codecParamsOption(format, compress, options), chunkOption(format, options), false));
     };
   }
 
@@ -325,10 +339,11 @@ BF['zlib'] = function () {
       var dictionary = dictionaryOption(options);
       var params = codecParamsOption(format, compress, options);
       var chunkSize = chunkOption(format, options);
+      var max = maxOutputOption(options);
       var result = null;
       var error = null;
       try {
-        result = runZlib(format, compress, bytes, level, dictionary, params, chunkSize, true);
+        result = cappedOutput(max, runZlib(format, compress, bytes, level, dictionary, params, chunkSize, true));
       } catch (err) {
         error = err;
       }
