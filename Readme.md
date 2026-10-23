@@ -269,6 +269,23 @@ bridge costs and the same 16 MiB takes 2.1-2.8 s in the container against 0.09-0
 ~9 MiB/s is the price of a JavaScript HTTP/2 on this engine and not of the transport: the identical
 bytes over this container's own HTTP/1.1, on the identical bridge, are 372 MiB/s.
 
+**Re-measured at HEAD, and the two claims in that paragraph that do not hold.** The gap and its cause
+both survive, but "no change to the bridge can move" is too strong for the wall clock, and "this
+engine" is the wrong subject. Three 16 MiB runs, one process each, at machine load 23-45 (never idle,
+so a floor again): HTTP/2 took 2092-3055 ms here against the host's 68-108 ms, and HTTP/1.1 took
+443-715 ms against the host's 31-42 ms. Counting macrotask hops in that same process and pricing them
+with a `setImmediate` chain measured there -- 1.41-1.92 ms per turn here against 0.043-0.077 ms on
+host, a 20-40x penalty -- turns account for 1103 of the 2092 ms of HTTP/2 (53%) and 365 of the 443 ms
+of HTTP/1.1 (82%), and that term moves with the machine: it fell from 1.92 to 1.41 ms per turn as the
+load fell from 45 to 23. What is left is 59-93 ns per byte for HTTP/2 and 4.6-13 for HTTP/1.1, against
+the host's 4.1-5.4 and 1.9-2.0 -- so HTTP/2 is ~15x the host's per-byte work where HTTP/1.1 is ~2.5x,
+and HTTP/2 costs 6-13x this container's own HTTP/1.1 where the host's HTTP/2 costs 2.2-2.6x its own.
+The outlier is still HTTP/2 and the transport is still not the cause; but the largest single term in
+the wall clock is a bridge turn, and it is movable. It is not the engine's byte throughput either: the
+guest copies 16 MiB in 64 KiB blocks at 0.20 ns/byte against the host's 0.046, and concats 16 MiB at
+0.083 against 0.053 -- 1.6-4.5x, not the ~15x the HTTP/2 path shows.
+
+
 ### 🚧 In Progress
 
 - **Network Simulation hardening**
