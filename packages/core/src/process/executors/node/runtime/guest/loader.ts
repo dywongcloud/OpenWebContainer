@@ -1048,11 +1048,44 @@ function fireTimer(id) {
     if (t.refed) host.ref(-1);
   }
   runInAsyncContext(t.ctx, function () {
+    /*
+     * An immediate runs one domain deeper than a timer or a tick does when a domain is entered
+     * while it fires: host node 24.15's processImmediate invokes the callback through MakeCallback,
+     * which enters process.domain itself -- the deprecated path the DEP0097 warning names -- on top
+     * of the enter the bound callback does. Measured on host node 24.15 against this container:
+     * one d.enter() and an immediate, domain._stack is 3 there and was 2 here (s1), two nested
+     * enters 4 against 3 (s2), enter/enter/exit 3 against 2 (s6), an immediate inside an immediate
+     * 3 against 2 (s8) -- while a timer and a tick scheduled the same way agree at 2 (s9), and an
+     * immediate that fires with no domain entered agrees at 1 (i1, i7). It is an enter the driver
+     * undoes on the way out, not a leak: a later timer reads the same depth on both sides (j1).
+     */
+    var dom = t.immediate && proc ? proc.domain : null;
+    if (!(dom && typeof dom.enter === 'function' && typeof dom.exit === 'function')) {
+      try {
+        t.fn.apply(undefined, t.args);
+      } catch (err) {
+        uncaughtFromCallback(err);
+      }
+      return;
+    }
+    dom.enter();
     try {
       t.fn.apply(undefined, t.args);
     } catch (err) {
+      dom.exit();
       uncaughtFromCallback(err);
+      /*
+       * An immediate that throws leaves the process on undefined at the next timer, not on the null
+       * the route wrote -- measured on host node 24.15 (k1 with an 'uncaughtException' listener, k3
+       * without, k5 with a tick and a 0 ms timer before it): the leave host node owes the immediate
+       * lands after the route has already cleared, and a leave with nothing on the stack writes the
+       * undefined an ordinary leave writes. Same flag the nested route in uncaughtInDomain leaves,
+       * spent the same way, at the next timer.
+       */
+      if (proc && proc.domain === null) proc._owcIdleUndefined = true;
+      return;
     }
+    dom.exit();
   });
 }
 
@@ -1072,7 +1105,11 @@ function setIntervalImpl(fn, ms) {
 }
 
 function setImmediateImpl(fn) {
-  return scheduleTimer(bindToActiveDomain(fn), 0, Array.prototype.slice.call(arguments, 1), false);
+  var handle = scheduleTimer(bindToActiveDomain(fn), 0, Array.prototype.slice.call(arguments, 1), false);
+  /* the one timer kind host node 24.15 runs a domain deeper: see the note in fireTimer */
+  var entry = timers[handle._owcTimerId];
+  if (entry) entry.immediate = true;
+  return handle;
 }
 
 /* process.nextTick queue: drained by the host before each promise job, as Node does */

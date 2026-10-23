@@ -1362,6 +1362,8 @@ export const SRC = String.raw`
         var dom = chain[i];
         if (dom.listenerCount('error') === 0) continue;
         leaveDomainsAbove(dom);
+        /* what is left below every entry of dom: the domains the route leaves entered */
+        var outerLeft = stack.length;
         if (isObjectLike(err)) {
           Object.defineProperty(err, 'domain', { value: dom, writable: true, configurable: true });
           err.domainThrown = true;
@@ -1370,17 +1372,22 @@ export const SRC = String.raw`
         clearDomains();
         /*
          * The idle value host node 24.15 settles on is null -- that is what
-         * domainUncaughtExceptionClear writes -- with one shape excepted: when the domain that
-         * handled the error was the innermost of two or more that were entered, a later timer reads
-         * process.domain and domain.active as undefined, not null. Measured on host node 24.15:
-         * one domain entered, a later timer reads null (and so does a nextTick); two entered and the
-         * inner one handling it, the same timer reads undefined and so does every one after it;
-         * two entered with the *outer* one handling it -- the inner one has no 'error' listener --
-         * it reads null again. The undefined arrives after the ticks of the tick that ran the route
-         * -- a nextTick scheduled before the throw still reads null -- so the flag is left for the
-         * driver to spend when the next timer is due, which is where host node 24.15 has it.
+         * domainUncaughtExceptionClear writes -- with one shape excepted: when a domain was still
+         * entered *below* the one that handled the error, a later timer reads process.domain and
+         * domain.active as undefined, not null. Measured on host node 24.15: one domain entered, a
+         * later timer reads null (and so does a nextTick); two entered and the inner one handling
+         * it, the same timer reads undefined and so does every one after it; two entered with the
+         * *outer* one handling it -- the inner one has no 'error' listener -- it reads null again.
+         * The undefined arrives after the ticks of the tick that ran the route -- a nextTick
+         * scheduled before the throw still reads null -- so the flag is left for the driver to
+         * spend when the next timer is due, which is where host node 24.15 has it.
+         *
+         * "Below" is a second domain, not a second entry of the same one: a timer the domain owns
+         * calling d.bind(...) puts that domain on the stack twice -- the driver's bind plus the
+         * one bind's runInDomain does -- and host node 24.15 pops every duplicate and settles on
+         * null, not undefined (measured: b06, t05, t07, v1, v3).
          */
-        if (i === 0 && index > 0 && typeof process === 'object' && process !== null) {
+        if (i === 0 && index > 0 && outerLeft > 0 && typeof process === 'object' && process !== null) {
           Object.defineProperty(process, '_owcIdleUndefined', { value: true, writable: true, configurable: true });
         }
         return true;
