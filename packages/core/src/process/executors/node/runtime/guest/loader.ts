@@ -920,9 +920,25 @@ function reportUncaught(err) {
  * node lets that one end the process too. The listener is counted when the error is in hand and not
  * when the callback was scheduled, because a program registers it at the top and throws at the
  * bottom. False when there is none, which leaves the caller the fatal path.
+ *
+ * A domain comes before the process: node hands an error no caller is going to receive to the
+ * domain the domain module has entered, not to 'uncaughtException', so d.run(() => { throw })
+ * prints the domain's 'error' handler on host node 24.15 whether or not an 'uncaughtException'
+ * listener is registered at all. A domain with no 'error' listener answers false, and then the
+ * process gets the error exactly as it did before.
  */
 function emitUncaught(err) {
   var proc = globalThis.process;
+  var dom = proc ? proc.domain : null;
+  if (dom && typeof dom._owcUncaught === 'function') {
+    try {
+      if (dom._owcUncaught(err)) return true;
+    } catch (again) {
+      /* a handler that ends the process throws the exit signal, as an uncaughtException one may */
+      if (again !== EXIT_SIGNAL) throw again;
+      return true;
+    }
+  }
   if (!(proc && typeof proc.emit === 'function' && proc.listenerCount('uncaughtException') > 0)) return false;
   try {
     proc.emit('uncaughtException', err);
@@ -950,17 +966,52 @@ function drainTicks() {
   }
 }
 
+/*
+ * queueMicrotask is not a promise reaction a domain binds, so the callback is not bound when it is
+ * queued and the reaction that runs it is queued with the engine's own then, taken before the
+ * domain module patches it. The job is not what enters the domain, though: it runs with the domain
+ * that was active when it was queued as its async context, which is what host node 24.15 measures
+ * -- queued inside d.run(), whose exit has run by the time the job does, process.domain is still d
+ * and process.hasUncaughtExceptionCaptureCallback() is still true inside it.
+ *
+ * Routing is the other half and follows the enter/exit stack, not that context: a throw out of a
+ * microtask queued inside d.run() reaches 'uncaughtException' (and ends the process when there is
+ * none), while one queued while a domain is still entered reaches that domain.
+ */
+var ENGINE_THEN = Promise.prototype.then;
+
+/* the domain a job runs with as its context: set without entering it, so no stack is touched */
+function setDomainContext(dom) {
+  var proc = globalThis.process;
+  if (!proc || typeof proc._owcSetDomainContext !== 'function') return undefined;
+  return proc._owcSetDomainContext(dom);
+}
+
 function queueMicrotaskImpl(fn) {
   if (typeof fn !== 'function') throw new TypeError('The "callback" argument must be of type function');
-  fn = bindToActiveDomain(fn);
+  var proc = globalThis.process;
+  var dom = proc ? proc.domain : null;
   var ctx = captureAsyncContext();
-  Promise.resolve().then(function () {
+  ENGINE_THEN.call(Promise.resolve(), function () {
+    var prior = dom ? setDomainContext(dom) : undefined;
     try {
       runInAsyncContext(ctx, function () {
         fn();
       });
     } catch (err) {
-      reportUncaught(err);
+      if (dom && dom._owcEntered !== true) {
+        /* the domain is only this job's context: the fatal path asks the process, not the domain */
+        setDomainContext(null);
+        try {
+          uncaughtFromCallback(err);
+        } finally {
+          setDomainContext(dom);
+        }
+      } else {
+        uncaughtFromCallback(err);
+      }
+    } finally {
+      if (dom) setDomainContext(prior);
     }
   });
 }
@@ -1151,21 +1202,16 @@ var api = {
      * 'uncaughtException' listener has been given it, and a listener that has been given it *keeps*
      * the process alive: node does not exit once one has run, so what happens next is the handler's
      * to decide (it may well call process.exit, and then that code is the status). With no listener
-     * the error goes exactly where it has always gone, out of the main module and off the end of
-     * the process, which is the fatal path that ends it with status 1.
+     * and no domain entered the error goes exactly where it has always gone, out of the main module
+     * and off the end of the process, which is the fatal path that ends it with status 1.
      */
-    var proc = globalThis.process;
     try {
       loadCJS(filename, null, true);
     } catch (err) {
       /* The listener is counted when the error is in hand, not when the module starts: a program
-         registers it at the top and throws at the bottom, so at the start there is none. */
-      if (!(proc && typeof proc.emit === 'function' && proc.listenerCount('uncaughtException') > 0)) throw err;
-      try {
-        proc.emit('uncaughtException', err);
-      } catch (again) {
-        if (again !== EXIT_SIGNAL) throw again;
-      }
+         registers it at the top and throws at the bottom, so at the start there is none. The
+         domain is asked first, as it is everywhere else an error has no caller to receive it. */
+      if (!emitUncaught(err)) throw err;
     }
   },
   fire: fireTimer,
