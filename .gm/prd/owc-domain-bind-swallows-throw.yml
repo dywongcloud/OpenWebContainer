@@ -1,0 +1,35 @@
+id: owc-domain-bind-swallows-throw
+title: 'RESOLVED: a throw out of a domain-bound callback reaches the fatal path, as on host node 24.15'
+classification: GUEST
+subject: 'Measured against host node 24.15 while closing owc-domain-uncaught-not-routed. `const f = d.bind(() => { throw new Error(''bound''); }); f(); P(''after'',''yes'');` with a domain ''error'' listener and a process ''uncaughtException'' listener: the host prints only DOMAIN.ERROR=bound and exits 0 -- the throw is not caught by bind, it reaches the fatal path, the uncaught-exception capture callback hands it to the entered domain, and execution does not resume, so ''after=yes'' never prints -- while this container prints DOMAIN.ERROR=bound and then after=yes and exits 0, because invokeInDomain (packages/core/src/process/executors/node/runtime/guest/modules/pure-b.ts) catches the throw in-line, emits ''error'' and returns undefined. Site: invokeInDomain in modules/pure-b.ts. Not fixed in the domain shard because the naive fix (stop catching) breaks the timer, nextTick and promise-reaction cases measured in owc-domain-uncaught-not-routed (cases c10-c12, /tmp/owc-r4/adv6-domain/cases): an uncaught throw out of a .then reaction would become an unhandled rejection instead of reaching the domain, so the change needs a model that distinguishes a bound callback with a caller from one without, which is wider than the row that found it.'
+acceptance_criteria:
+- '`const f = d.bind(() => { throw new Error(''bound''); }); f(); P(''after'',''yes'');` prints DOMAIN.ERROR=bound and not after=yes, and exits 0, as host node 24.15 does'
+- A throw out of a timer, a nextTick and a promise reaction registered inside d.run() still reaches the domain's 'error' listener, as it does now
+witness_plan: Run /tmp/owc-r4/adv6-domain/r/r8/main.js under host node and in the container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core and diff stdout, stderr and exit code; host prints DOMAIN.ERROR=bound only, the container prints DOMAIN.ERROR=bound then after=yes. Re-run /tmp/owc-r4/adv6-domain/cases/c10, c11 and c12 to prove the promise-reaction case still matches.
+session_id: adv6-exec-domain
+owner: adv6-exec-domain
+status: 'completed'
+witness_request:
+  ts_ms: 1792734356182
+  requested_by: verify-owc-domain
+  note: 'Container vs host node 24.15, /tmp/owc-r4/adv7-domain: d-r8 (d.bind throw, no caller) now prints DOMAIN.ERROR=bound with no after=yes and exit 0 on both sides; p2 (caller try/catch) prints CALLER.CAUGHT=bound-caught then after=yes; p4 prints DOMAIN.ERROR=bound-both. c10 timer, c11 nextTick and c12 promise reaction still print DOMAIN.ERROR on both. Published as cb1a433c9a43ec6c69491e972557d4d68f9446f1 (blob 6cf54c4d53bc768021fa401c4d105b01a7972245).'
+resolved_by: 'adv7-judge-domain-10'
+resolved_at: 'HEAD + the domain fix in pure-b.ts (adv7-judge-domain-10)'
+body: |-
+  VERIFIED AND FIXED (adv7-judge-domain-10). Every case below was re-run in isolation on
+  both sides -- host /Users/dylanwong/.nvm/versions/node/v24.15.0/bin/node and the container through
+  /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core -- comparing stdout, stderr and exit code, and
+  the five load-bearing ones were run twice and came back byte-identical. Machine load 1-min average
+  9.6-50.4 (most runs 15-30), free memory 52 MB - 2.8 GB; another lane was running in /tmp/owc-r9-advgoal
+  and adv7-napi-adv throughout and the playground vite on 5173 was left alone.
+  
+  Both acceptance criteria hold at HEAD. (1) d-r8 (a d.bind throw with no caller, a domain 'error'
+  listener and a process 'uncaughtException' listener) prints DOMAIN.ERROR=bound and nothing after it
+  and exits 0 on both sides, and p4 agrees. (2) A throw out of a timer (b06, t02, t05), a nextTick
+  (t03, t07), a setImmediate (t06) and a promise reaction registered inside d.run() (r01) still
+  reaches the domain's 'error' listener on both sides.
+  
+  What the row's own text could not see is the asynchronous half of the same surface, which is a
+  different symptom and is filed and fixed as owc-domain-bound-async-throw-leaves-domain-entered: a
+  d.bind(...) callback driven by a timer or a nextTick used to leave the domain entered for the rest
+  of the process, so later timers ran inside it where host node 24.15 runs them outside.

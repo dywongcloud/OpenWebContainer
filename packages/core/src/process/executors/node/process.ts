@@ -750,9 +750,9 @@ const REJECTION_TRACKER_SRC = String.raw`
     return 0;
   }
 
-  /* A rejection nothing handled goes to the domain that owns the promise first, then to an
-     unhandledRejection listener on process, and only then ends the process: the formatted reason
-     of the first one that reaches that point, or '' when none does. */
+  /* A rejection nothing handled goes to the domain that owns the promise, and only when no domain
+     owns it to an unhandledRejection listener on process, and only then ends the process: the
+     formatted reason of the first one that reaches that point, or '' when none does. */
   api.takeUnhandledRejection = function () {
     var found = [];
     for (var i = 0; i < WATCHED.length; i++) {
@@ -763,14 +763,20 @@ const REJECTION_TRACKER_SRC = String.raw`
     var proc = globalThis.process;
     for (var j = 0; j < found.length; j++) {
       var cell = found[j];
+      /*
+       * Node's emitUnhandledRejection (lib/internal/process/promises.js) is one line -- the
+       * domain that owns the promise gets the reason as an 'error' event, and only a rejection no
+       * domain owns goes to process as 'unhandledRejection' -- so a domain is not asked whether it
+       * listens: emitting 'error' on one that does not is the fatal "Unhandled 'error' event on
+       * Domain instance", exit 1 with nothing on stdout, and a process 'unhandledRejection'
+       * listener never hears the rejection at all. Measured on host node 24.15 (r03, r10):
+       * preferring the process listener instead printed UNHANDLED and kept running, exit 0.
+       * Nothing here annotates the reason either -- host node 24.15 reads err.domain undefined and
+       * err.domainThrown undefined in the handler a rejection reaches, which is the one route that
+       * does not go through Domain.prototype._errorHandler.
+       */
       var dom = cell.domain;
-      if (listenerCountOf(dom, 'error') > 0) {
-        if (cell.reason !== null && typeof cell.reason === 'object') {
-          try {
-            Object.defineProperty(cell.reason, 'domain', { value: dom, writable: true, configurable: true });
-            cell.reason.domainThrown = false;
-          } catch (e) { /* a frozen reason keeps the properties it already has */ }
-        }
+      if (dom !== null && dom !== undefined) {
         dom.emit('error', cell.reason);
         continue;
       }

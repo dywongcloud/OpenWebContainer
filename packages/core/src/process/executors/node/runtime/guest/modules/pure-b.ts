@@ -905,7 +905,33 @@ export const SRC = String.raw`
      * then, leaving the domain first, so a domain entered with no listener of its own -- and no
      * enclosing one that has one -- prints the 'uncaughtException' handler outside the domain
      * instead, and one with no handler at all ends the process.
+     *
+     * Either way the route ends the way every uncaught exception does in lib/domain.js: the stack
+     * is emptied and domain.active and process.domain go back to null -- not to the undefined an
+     * ordinary exit() leaves behind, which is what a later timer used to read here.
      */
+    /*
+     * The leave a domain's own 'error' handler sees: lib/domain.js reaches _errorHandler with that
+     * domain as the active one -- it pops the inner domains first and sets process.domain to the
+     * next one out before it recurses -- and then pops *every* adjacent duplicate of it, in a
+     * while-active-is-this loop of exit() calls. A timer the domain owns calling d.bind(...) is
+     * what puts the same domain on the stack twice: the driver's own enter for the callback plus
+     * the one bind's runInDomain does. Splicing a single entry left the second one behind, so the
+     * process ran the rest of its life -- later timers included -- inside a domain host node 24.15
+     * had already left (measured: b06, t04, t05, t07, t09).
+     */
+    function leaveDomainsAbove(dom) {
+      var at = stack.lastIndexOf(dom);
+      if (at === -1) return;
+      stack.splice(at + 1);
+      setActive(dom);
+      while (exp.active === dom && stack.lastIndexOf(dom) !== -1) dom.exit();
+    }
+    /* domainUncaughtExceptionClear: how lib/domain.js ends every uncaught route. */
+    function clearDomains() {
+      stack.length = 0;
+      setActive(null);
+    }
     function uncaughtInDomain(self, err) {
       /*
        * Walk outward for a domain that listens: host node 24.15 does not stop at the innermost
@@ -919,16 +945,13 @@ export const SRC = String.raw`
       for (var i = 0; i < chain.length; i++) {
         var dom = chain[i];
         if (dom.listenerCount('error') === 0) continue;
-        var at = stack.lastIndexOf(dom);
-        if (at !== -1) {
-          stack.splice(at);
-          setActive(at === 0 ? undefined : stack[at - 1]);
-        }
+        leaveDomainsAbove(dom);
         if (isObjectLike(err)) {
           Object.defineProperty(err, 'domain', { value: dom, writable: true, configurable: true });
           err.domainThrown = true;
         }
         dom.emit('error', err);
+        clearDomains();
         return true;
       }
       /*
@@ -939,10 +962,7 @@ export const SRC = String.raw`
        * hasUncaughtExceptionCaptureCallback() false, and a timer that fires afterwards runs outside
        * the domain. Node leaves the domain before it falls through, so this does too.
        */
-      if (index !== -1) {
-        stack.splice(index);
-        setActive(index === 0 ? undefined : stack[index - 1]);
-      }
+      clearDomains();
       return false;
     }
     /* the loader asks for this on process.domain: the one place an uncaught error is routed */
