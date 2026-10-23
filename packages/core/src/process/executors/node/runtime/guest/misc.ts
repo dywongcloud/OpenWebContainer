@@ -3094,9 +3094,23 @@ BF.crypto = function () {
     return err;
   }
 
+  /* Node bounds N, r and p as unsigned 32-bit integers and maxmem as a safe integer before it
+     reads a zero as 'not handed over': a value that is not an integer is an out-of-range error
+     naming the integer, and one outside the range names the range -- so -1 and 4294967296 are
+     refused where 0 still reaches the default and 16384 derives. */
+  function scryptBound(name, value, top) {
+    if (value === undefined) return;
+    if (value !== Math.floor(value)) throw outOfRange(name, 'an integer', value);
+    if (!(value >= 0 && value <= top)) throw outOfRange(name, '>= 0 && <= ' + top, value);
+  }
+
   function scryptSync(password, salt, keylen, options) {
     var opts = options === undefined || options === null ? {} : options;
-    var len = Number(keylen);
+    /* keylen is a number first, then an integer, then inside 0..2147483647: Node names each fault
+       in that order, so '8' is a type error, 1.5 an integer error and -1 a range error. */
+    if (typeof keylen !== 'number') throw invalidArgType('keylen', 'of type number', keylen);
+    var len = keylen;
+    if (len !== Math.floor(len)) throw outOfRange('keylen', 'an integer', keylen);
     if (!(len >= 0 && len <= 2147483647)) throw outOfRange('keylen', '>= 0 && <= 2147483647', keylen);
     /* Node reaches its default for a parameter handed over as zero, and rejects a set it cannot
        derive with before it derives anything: N a power of two above one, r and p positive, and
@@ -3104,11 +3118,16 @@ BF.crypto = function () {
     var cost = scryptParam(opts, 'N', 'cost');
     var block = scryptParam(opts, 'r', 'blockSize');
     var par = scryptParam(opts, 'p', 'parallelization');
+    scryptBound('N', cost, 4294967295);
+    scryptBound('r', block, 4294967295);
+    scryptBound('p', par, 4294967295);
     var maxmem = opts.maxmem;
-    if (maxmem !== undefined && maxmem !== null && typeof maxmem !== 'number') {
+    /* A null was handed over, so it offends the type check the way undefined does not. */
+    if (maxmem !== undefined && (maxmem === null || typeof maxmem !== 'number')) {
       throw invalidArgType('maxmem', 'of type number', maxmem);
     }
-    var want = maxmem === undefined || maxmem === null ? undefined : Number(maxmem);
+    var want = maxmem;
+    scryptBound('maxmem', want, 9007199254740991);
     var n = cost === undefined || cost === 0 ? 16384 : cost;
     var r = block === undefined || block === 0 ? 8 : block;
     var p = par === undefined || par === 0 ? 1 : par;
