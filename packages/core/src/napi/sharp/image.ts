@@ -755,6 +755,16 @@ export function premultiplyImage(image: Image): Image {
  * the same truncation -- a colour of 128 on an alpha of 200 comes back as 127, so `floor` and not
  * a round-to-nearest that would send the exact 127.5 up to 128.
  *
+ * The scale is a single-precision float, and that is the whole of what separates this from exact
+ * arithmetic: libvips divides 255 by the alpha once, in a float, and multiplies by it, so a band
+ * that divides out exactly can land one ulp below its own quotient and truncate to one less --
+ * colour 255 on an alpha of 7 is 254 and not the 255 a double gives. Measured against sharp 0.33.5
+ * over the whole 65536-entry (colour, alpha) grid with a NEAREST zoom, which leaves every pixel
+ * the round trip of its own (colour, alpha): `floor(fround(band * fround(255 / alpha)))` reproduces
+ * every cell, and the same floor without the two fround()s misses 36, all of them a band that
+ * divides out exactly. Bare QuickJS 0.32 agrees: fround(255 / 7) is 36.42856979370117 there and
+ * floor(fround(7 * scale)) is 254.
+ *
  * The value can come out above 255 once a kernel with negative lobes has run, since the bands and
  * the alpha are resampled independently and the two no longer agree; the extra is clipped away,
  * which is what writing it into an 8-bit band does.
@@ -766,8 +776,9 @@ export function unpremultiplyImage(image: Image): Image {
     const data = image.data;
     for (let i = 0; i < out.data.length; i += ch) {
         const a = data[i + ch - 1];
+        const scale = a === 0 ? 0 : Math.fround(255 / a);
         for (let c = 0; c < ch - 1; c++) {
-            const v = a === 0 ? 0 : Math.floor((data[i + c] * 255) / a);
+            const v = a === 0 ? 0 : Math.floor(Math.fround(data[i + c] * scale));
             out.data[i + c] = v > 255 ? 255 : v;
         }
     }

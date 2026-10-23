@@ -146,7 +146,18 @@ function imageFromRaw(input: Record<string, unknown>, bytes: Uint8Array): Image 
     if (bytes.length < want) {
         throw corruptImage('Input buffer has corrupt header');
     }
-    return { width, height, channels, data: bytesOf(bytes.slice(0, want)) };
+    /*
+     * The pixels are copied out of the caller's buffer, never aliased: a Buffer's slice() is a view
+     * onto its own memory, so handing the caller's bytes straight to an Image lets the pipeline
+     * write back into them -- resizing a raw input whose alpha is not 255 premultiplies it, and
+     * three resizes over one buffer leave it premultiplied three times over. libvips reads the
+     * input and never writes to it, so the caller's buffer comes back untouched there: measured
+     * against sharp 0.33.5, 8x8 RGBA of [200,237,145,17] resized with cubic leaves the buffer at
+     * c8ed9111 on host and rewrote it to 0d0f0911 here before this copy.
+     */
+    const data = new Uint8Array(want);
+    data.set(bytesOf(bytes).subarray(0, want));
+    return { width, height, channels, data };
 }
 
 function decodeBytes(bytes: Uint8Array): Decoded {
