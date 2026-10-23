@@ -2066,6 +2066,16 @@ BF.crypto = function () {
     return err;
   }
 
+  /*
+   * The same refusal about a property of an options object rather than an argument of a call: Node
+   * says "property" where it is reading one out of options, and "argument" where it is not.
+   */
+  function invalidPropertyType(name, expected, value) {
+    var err = new TypeError('The "' + name + '" property must be of type ' + expected + '. Received ' + receivedAs(value));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+  }
+
   function outOfRange(name, range, value) {
     var err = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + value);
     err.code = 'ERR_OUT_OF_RANGE';
@@ -2165,7 +2175,12 @@ BF.crypto = function () {
     return bytes;
   }
 
-  function randomUUID() {
+  function randomUUID(options) {
+    /* Node reads its options even though it has none to read yet, so a value that is not an object
+       -- and not absent -- is refused before a UUID is drawn. */
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
+      throw invalidArgType('options', 'of type object', options);
+    }
     var b = randomBytes(16);
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
@@ -2293,12 +2308,27 @@ BF.crypto = function () {
   }
 
   /*
+   * The one encoding whose length tells you it cannot fit: 'hex' takes two characters per byte, so
+   * a string of an odd length is not data in it at all. Node refuses it rather than decoding what
+   * it can -- which is what every other encoding does with a character it cannot read -- and names
+   * the encoding it was handed, so an upper-case 'HEX' stays 'HEX' in the message.
+   */
+  function refuseOddHex(data, encoding) {
+    if (typeof data !== 'string' || typeof encoding !== 'string') return;
+    if (encoding.toLowerCase() !== 'hex' || data.length % 2 === 0) return;
+    var err = new TypeError("The argument 'encoding' is invalid for data of length " + data.length + ". Received '" + encoding + "'");
+    err.code = 'ERR_INVALID_ARG_VALUE';
+    throw err;
+  }
+
+  /*
    * The data a hash, a sign or a verify is fed. Node reads an encoding it does not know as utf8
    * rather than refusing it, and that covers an encoding that is not text at all: a number, an
    * object, a Symbol or null all hash the string, so update('a', 1) is update('a') and only a value
    * that is not data reaches the type check above.
    */
   function toDataBytes(data, encoding, name, list) {
+    refuseOddHex(data, encoding);
     var enc = encoding === undefined || encoding === null || typeof encoding === 'string' ? encoding : 'utf8';
     try {
       return toBytes(data, enc, name, list);
@@ -2355,6 +2385,26 @@ BF.crypto = function () {
     var name = typeof encoding === 'string' ? encoding : String(encoding);
     var as = OUTPUT_ENCODINGS[name.toLowerCase()];
     return as === undefined || as === 'buffer' ? bytes : bytes.toString(as);
+  }
+
+  /*
+   * The output encoding of a Sign and of a DiffieHellman's getters, which is strict where a
+   * digest's is not: the value goes to Buffer.prototype.toString, so an encoding that is not one
+   * is ERR_UNKNOWN_ENCODING -- "Unknown encoding: nope", and "Unknown encoding: 32" for a number,
+   * which is the text it gets as a string. Nothing, an empty string and 'buffer' all mean the
+   * Buffer itself, because Node tests the encoding for being there before it decodes with it.
+   */
+  function outputStrict(bytes, encoding) {
+    if (typeof encoding === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+    if (encoding === undefined || encoding === null || encoding === false || encoding === '' || encoding === 0) return bytes;
+    var name = typeof encoding === 'string' ? encoding : String(encoding);
+    var as = OUTPUT_ENCODINGS[name.toLowerCase()];
+    if (as === undefined) {
+      var err = new TypeError('Unknown encoding: ' + name);
+      err.code = 'ERR_UNKNOWN_ENCODING';
+      throw err;
+    }
+    return as === 'buffer' ? bytes : bytes.toString(as);
   }
 
   /*
@@ -2496,7 +2546,12 @@ BF.crypto = function () {
   function importKey(want, keyObjectNamed) {
     var named = keyObjectNamed === undefined ? want === 'public' : keyObjectNamed === true;
     return function (key) {
-      if (key === undefined || key === null) throw invalidArgType('key', 'a string, Buffer, TypedArray, DataView or JsonWebKey', key);
+      if (key === undefined || key === null) {
+        var list = named
+          ? 'string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey'
+          : 'string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView';
+        throw invalidArgType('key', 'of type ' + list, key);
+      }
       /* A {key, format, type, passphrase} wrapper: Node's own callers pass the material inside it. */
       var given = key;
       var type = undefined;
@@ -2614,7 +2669,20 @@ BF.crypto = function () {
    * too, because each of them reads a size out of it.
    */
   function generateKeyPairSync(type, options) {
-    if (options !== undefined && (options === null || typeof options !== 'object')) {
+    /*
+     * Node reads the key type as text before it looks it up, so a value that is not text is a type
+     * error and not the 'supported key type' refusal a name it does not know answers.
+     */
+    if (typeof type !== 'string') throw invalidArgType('type', 'of type string', type);
+    /*
+     * A null options object is Node's own failure: it destructures the encodings out of options
+     * before it has established that there is an options object, so the message names the property
+     * it reached for and not the argument it was handed.
+     */
+    if (options === null) {
+      throw new TypeError("Cannot destructure property 'publicKeyEncoding' of 'options' as it is null.");
+    }
+    if (options !== undefined && typeof options !== 'object') {
       throw invalidArgType('options', 'of type object', options);
     }
     return keyPairOf(cryptoCap('crypto.key.generate', { type: String(type), options: options === undefined ? undefined : wrapOptions(options) }), options);
@@ -2633,16 +2701,32 @@ BF.crypto = function () {
   }
 
   /* Only the fields the host reads travel; a callback or an encoding it does not use stays here. */
+  /*
+   * A width has to be checked on this side of the call and not by the capability that receives it:
+   * NaN, Infinity and a BigInt are values the JSON between the two cannot carry, and they would
+   * arrive as null or refuse to be serialised at all. Node names the value it was handed, so the
+   * type check and the whole-number check both happen here, before anything is sent.
+   */
+  function widthOption(options, name) {
+    var value = options[name];
+    if (typeof value !== 'number') throw invalidPropertyType('options.' + name, 'number', value);
+    if (!Number.isInteger(value)) throw outOfRange('options.' + name, 'an integer', String(value));
+    return value;
+  }
+
   function wrapOptions(options) {
     if (options === null || typeof options !== 'object') return undefined;
     var out = {};
     if (options.namedCurve !== undefined) out.namedCurve = options.namedCurve;
-    if (options.modulusLength !== undefined) out.modulusLength = options.modulusLength;
+    if (options.modulusLength !== undefined) out.modulusLength = widthOption(options, 'modulusLength');
+    if (options.publicExponent !== undefined && typeof options.publicExponent !== 'number') {
+      throw invalidPropertyType('options.publicExponent', 'number', options.publicExponent);
+    }
     if (options.publicExponent !== undefined) out.publicExponent = options.publicExponent;
     if (options.paramType !== undefined) out.paramType = options.paramType;
     /* DSA names the width of its subprime, and DH the width of its prime, each in its own option. */
-    if (options.divisorLength !== undefined) out.divisorLength = options.divisorLength;
-    if (options.primeLength !== undefined) out.primeLength = options.primeLength;
+    if (options.divisorLength !== undefined) out.divisorLength = widthOption(options, 'divisorLength');
+    if (options.primeLength !== undefined) out.primeLength = widthOption(options, 'primeLength');
     if (options.generator !== undefined) out.generator = options.generator;
     return out;
   }
@@ -2657,13 +2741,21 @@ BF.crypto = function () {
     if (!digestKnown(algorithm)) throw invalidDigest(undefined);
     this._algorithm = String(algorithm);
     this._chunks = [];
+    /*
+     * A Sign is consumed by its own answer: Node's object is uninitialised again the moment it
+     * signs, and not even a fresh update() re-arms it, so a second sign() on it answers
+     * 'Not initialised'. Signing nothing at all is allowed -- the message is simply empty.
+     */
+    this._used = false;
   }
   Sign.prototype.update = function (data, encoding) {
     this._chunks.push(toDataBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView'));
     return this;
   };
   Sign.prototype.sign = function (privateKey, encoding) {
+    if (this._used) throw cipherStateError('Not initialised');
     if (privateKey === undefined || privateKey === null) throw noKeyToSign();
+    this._used = true;
     var signature = cryptoCap('crypto.key.sign', {
       id: keyIdOf(privateKey, 'private'),
       algorithm: this._algorithm,
@@ -2675,7 +2767,7 @@ BF.crypto = function () {
          "Unsupported crypto operation" where the one-shot crypto.sign names OpenSSL's digest. */
       fromSign: true
     });
-    return outputOf(Buf.from(signature, 'base64'), encoding);
+    return outputStrict(Buf.from(signature, 'base64'), encoding);
   };
   Sign.prototype.end = function () { return this; };
 
@@ -2693,16 +2785,23 @@ BF.crypto = function () {
   Verify.prototype.verify = function (publicKey, signature, encoding) {
     /* A verify consumes what it was fed for good: Node's own object is uninitialised again the
        moment it answers, and not even a second update() re-arms it, so any later verify() on the
-       same object throws 'Not initialised'. */
-    if (this._used || this._chunks.length === 0) throw cipherStateError('Not initialised');
+       same object throws 'Not initialised'. A verify that was fed nothing does not throw: it has
+       nothing to check a signature against and answers false. */
+    if (this._used) throw cipherStateError('Not initialised');
     this._used = true;
+    if (this._chunks.length === 0) return false;
     var data = Buf.concat(this._chunks);
     this._chunks = [];
     return cryptoCap('crypto.key.verify', {
       id: keyIdOf(publicKey, 'public'),
       algorithm: this._algorithm,
       data: data.toString('base64'),
-      signature: toBytes(signature, encoding, 'signature').toString('base64'),
+      /*
+       * The encoding of the signature is read only when it is text: a number, a Symbol or null in
+       * that slot leaves Node decoding the signature as a string, which is why verify(key, sig, 1)
+       * answers false where verify(key, sig, 'nope') refuses the encoding outright.
+       */
+      signature: toBytes(signature, typeof encoding === 'string' ? encoding : 'utf8', 'signature').toString('base64'),
       dsaEncoding: publicKey !== null && typeof publicKey === 'object' ? publicKey.dsaEncoding : undefined,
       padding: publicKey !== null && typeof publicKey === 'object' ? publicKey.padding : undefined,
       saltLength: publicKey !== null && typeof publicKey === 'object' ? publicKey.saltLength : undefined,
@@ -2746,8 +2845,15 @@ BF.crypto = function () {
    * the property read, the way Node's own code does -- rather than on a type check of its own.
    */
   function keyOptionsOf(key) {
-    /* The reads happen before the data and the signature are looked at, so a key that is missing
-       fails on the read -- Node's own code reads padding first, and its message names padding. */
+    /*
+     * Node reads the key's own options before it looks at the data or the signature, and it reads
+     * padding first, so a key that is not there fails on that read and not on a type check. This
+     * runtime's engine words the read its own way, and the host's wording is what a caller sees,
+     * so the read is guarded and the message is the one V8 gives for it.
+     */
+    if (key === undefined || key === null) {
+      throw new TypeError("Cannot read properties of " + String(key) + " (reading 'padding')");
+    }
     var padding = key.padding;
     var dsaEncoding = key.dsaEncoding;
     var saltLength = key.saltLength;
@@ -2756,10 +2862,13 @@ BF.crypto = function () {
 
   function verifyOne(algorithm, data, key, signature, callback) {
     var algo = algorithmOf(algorithm);
-    /* Node reads the key's own options before it looks at the data or the signature, so a key
-       that is not there fails on that read and not on a type check of its own. */
-    var opts = keyOptionsOf(key);
     var bytes = verifyDataBytes(data).toString('base64');
+    /*
+     * The key's own options are read next, after the data and before the signature: a key that is
+     * not there fails on that read -- Node's own code reads padding first, and its message names
+     * padding -- while data that is not data is refused as data before the key is looked at.
+     */
+    var opts = keyOptionsOf(key);
     var sig = signatureBytes(signature).toString('base64');
     var answer = cryptoCap('crypto.key.verify', {
       id: keyIdOf(key, 'public'),
@@ -2803,17 +2912,28 @@ BF.crypto = function () {
       }
     });
   }
+  /*
+   * Node's DiffieHellman hands back the number it computed and nothing else: a public key of 4 in
+   * a 128-byte group is the one byte 0x04 and not 128 bytes with 127 zeroes in front of it. The
+   * prime and the generator are the group's, and those are padded to the width of the prime.
+   */
+  function withoutLeadingZeros(bytes) {
+    var at = 0;
+    while (at < bytes.length && bytes[at] === 0) at++;
+    return at === 0 ? bytes : bytes.slice(at);
+  }
+
   DiffieHellman.prototype.generateKeys = function (encoding) {
     var keys = cryptoCap('crypto.dh.keys', { id: this._id });
-    this._public = Buf.from(keys.public, 'base64');
-    this._private = Buf.from(keys.private, 'base64');
-    return outputOf(this._public, encoding);
+    this._public = withoutLeadingZeros(Buf.from(keys.public, 'base64'));
+    this._private = withoutLeadingZeros(Buf.from(keys.private, 'base64'));
+    return outputStrict(this._public, encoding);
   };
   DiffieHellman.prototype.getPrime = function (encoding) {
-    return outputOf(Buf.from(cryptoCap('crypto.dh.info', { id: this._id }).prime, 'base64'), encoding);
+    return outputStrict(Buf.from(cryptoCap('crypto.dh.info', { id: this._id }).prime, 'base64'), encoding);
   };
   DiffieHellman.prototype.getGenerator = function (encoding) {
-    return outputOf(Buf.from(cryptoCap('crypto.dh.info', { id: this._id }).generator, 'base64'), encoding);
+    return outputStrict(Buf.from(cryptoCap('crypto.dh.info', { id: this._id }).generator, 'base64'), encoding);
   };
   /*
    * A public key is made from a private one by generateKeys(), not by setPrivateKey(): Node keeps
@@ -2821,11 +2941,11 @@ BF.crypto = function () {
    */
   DiffieHellman.prototype.getPublicKey = function (encoding) {
     if (this._public === undefined) throw cipherStateError('No public key - did you forget to generate one?');
-    return outputOf(this._public, encoding);
+    return outputStrict(this._public, encoding);
   };
   DiffieHellman.prototype.getPrivateKey = function (encoding) {
     if (this._private === undefined) throw cipherStateError('No private key - did you forget to generate one?');
-    return outputOf(this._private, encoding);
+    return outputStrict(this._private, encoding);
   };
   DiffieHellman.prototype.setPublicKey = function (key, encoding) {
     this._public = toBytes(key, encoding, 'publicKey');
@@ -2839,9 +2959,22 @@ BF.crypto = function () {
     return this;
   };
   DiffieHellman.prototype.computeSecret = function (otherPublicKey, inputEncoding, outputEncoding) {
+    var other = toBytes(otherPublicKey, inputEncoding, 'otherPublicKey');
+    /*
+     * A key with no bytes in it is refused before anything is computed, and an object that has no
+     * private key of its own yet -- which is where a fresh createDiffieHellman starts, until
+     * generateKeys() or setPrivateKey() gives it one -- answers nothing at all rather than
+     * throwing: Node's computeSecret returns an empty buffer in that state, not an error.
+     */
+    if (other.length === 0) {
+      var small = new RangeError('Supplied key is too small');
+      small.code = 'ERR_CRYPTO_INVALID_KEYLEN';
+      throw small;
+    }
+    if (this._private === undefined) return outputOf(Buf.alloc(0), outputEncoding);
     var secret = Buf.from(cryptoCap('crypto.dh.secret', {
       id: this._id,
-      public: toBytes(otherPublicKey, inputEncoding, 'otherPublicKey').toString('base64')
+      public: other.toString('base64')
     }), 'base64');
     return outputOf(secret, outputEncoding);
   };
@@ -3502,6 +3635,7 @@ BF.crypto = function () {
   }
 
   function cipherBytes(data, encoding, name, list) {
+    refuseOddHex(data, encoding);
     return typeof data === 'string' ? Buf.from(data, encoding || 'utf8') : toBytes(data, undefined, name, list);
   }
 

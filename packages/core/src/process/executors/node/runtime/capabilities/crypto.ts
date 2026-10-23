@@ -1711,7 +1711,10 @@ function generateRsa(bits: number, exponent: bigint): IntKey {
      * 2^(h-1) can multiply to less than 2^(2h-1) and lose a bit, but two above 2^(h-0.5) never do.
      */
     const half = bits >> 1;
-    const p = searchPrime(half, { topBits: 2, coprimeTo: exponent });
+    /* An odd width needs one prime a bit wider than the other: 513 bits is a 257-bit prime times a
+       256-bit one, and two equal halves could never reach past 512. */
+    const wide = half + (bits & 1);
+    const p = searchPrime(wide, { topBits: 2, coprimeTo: exponent });
     let q = searchPrime(half, { topBits: 2, coprimeTo: exponent });
     while (q === p) q = searchPrime(half, { topBits: 2, coprimeTo: exponent });
     const n = p * q;
@@ -1903,6 +1906,16 @@ function pssSaltLength(saltLength: unknown, hLen: number): number {
 }
 
 /** Signs or verifies with an RSA key: the exponentiation is one BigInt modPow either way. */
+/**
+ * The bytes a signature is taken over. A named digest is hashed; no algorithm at all -- the form
+ * crypto.sign(null, ...) asks for -- reaches Node's default, SHA-256, for an RSA, a DSA and an EC
+ * key. An Edwards key never gets here: it is pure, and refuses a digest of any kind.
+ */
+const DEFAULT_DIGEST = 'sha256';
+function noDigestBytes(data: Uint8Array, algorithm: unknown): Uint8Array {
+    return digestFor(algorithm === undefined || algorithm === null ? DEFAULT_DIGEST : algorithm).fn(data, 0);
+}
+
 function rsaSignWith(ints: IntKey, digest: Uint8Array, name: string, padding: number, saltLength: number): Uint8Array {
     const n = ints.n as bigint;
     const size = modulusSize(n);
@@ -2143,13 +2156,18 @@ function dsaVerifyWith(ints: IntKey, digest: Uint8Array, signature: Uint8Array, 
 }
 
 function generatePair(type: unknown, options: any): { public: number; private: number } {
+    /* Node reads the key type as text before it looks it up, so a number is a type error and not
+       the 'supported key type' refusal a name it does not know answers. */
+    if (typeof type !== 'string') {
+        throw keyFail('ERR_INVALID_ARG_TYPE', 'The "type" argument must be of type string. Received ' + receivedLike(type), 'TypeError');
+    }
     const kind = String(type ?? '').toLowerCase();
     /*
-     * Node insists on an options object for the three kinds that take a size -- an RSA modulus, a
-     * DSA modulus and a DH prime all need a width, and there is no default to fall back on -- so
-     * a call with none is an argument error here too, the way it is on the host.
+     * Node insists on an options object for the kinds that take a size -- an RSA modulus, a DSA
+     * modulus, a DH prime and an EC curve all need something named -- so a call with none is an
+     * argument error here too, the way it is on the host.
      */
-    if (kind === 'rsa' || kind === 'rsa-pss' || kind === 'dsa' || kind === 'dh') {
+    if (kind === 'rsa' || kind === 'rsa-pss' || kind === 'dsa' || kind === 'dh' || kind === 'ec') {
         if (options === undefined || options === null || typeof options !== 'object') {
             throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options" argument must be of type object. Received ' + receivedLike(options), 'TypeError');
         }
@@ -2162,13 +2180,27 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         if (!Number.isInteger(modulusLength)) {
             throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.modulusLength" is out of range. It must be an integer. Received ' + String(modulusLength), 'RangeError');
         }
+        /* Node bounds a modulus by what an uint32 can hold before it reaches OpenSSL's own floor:
+           -1 is out of range where 256 is merely too small a key. */
+        if (modulusLength < 0 || modulusLength > 4294967295) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.modulusLength" is out of range. It must be >= 0 && <= 4294967295. Received ' + String(modulusLength), 'RangeError');
+        }
         /* OpenSSL's own floor for an RSA modulus, and the uncoded error it answers below it. */
         if (modulusLength < 512) {
             throw keyFail(null, 'error:1C8000AB:Provider routines::key size too small');
         }
-        const exponent = options?.publicExponent === undefined || options?.publicExponent === null ? 65537n : BigInt(String(options?.publicExponent));
+        /*
+         * A public exponent is a number or nothing: Node takes its word for the value and lets
+         * OpenSSL refuse one it will not use, which is an even exponent, one below 3, or a string
+         * handed in where a number was asked for.
+         */
+        const givenExponent = options?.publicExponent;
+        if (givenExponent !== undefined && givenExponent !== null && typeof givenExponent !== 'number') {
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.publicExponent" property must be of type number. Received ' + receivedLike(givenExponent), 'TypeError');
+        }
+        const exponent = givenExponent === undefined || givenExponent === null ? 65537n : BigInt(String(givenExponent));
         if (exponent < 3n || (exponent & 1n) === 0n) {
-            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.publicExponent" is out of range. It must be an odd integer >= 3. Received ' + exponent.toString(), 'RangeError');
+            throw keyFail(null, 'error:020000B2:rsa routines::pub exponent out of range');
         }
         const ints = generateRsa(modulusLength, exponent);
         const size = modulusSize(ints.n as bigint);
@@ -2189,8 +2221,19 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         if (modulusLength < 512) {
             throw keyFail(null, 'error:030000E9:digital envelope routines::provider keymgmt failure');
         }
-        const divisorLength = options?.divisorLength === undefined || options?.divisorLength === null ? 224 : Number(options?.divisorLength);
-        const ints = generateDsa(modulusLength, divisorLength);
+        const divisorLength = options?.divisorLength === undefined || options?.divisorLength === null ? 224 : options?.divisorLength;
+        if (typeof divisorLength !== 'number') {
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.divisorLength" property must be of type number. Received ' + receivedLike(divisorLength), 'TypeError');
+        }
+        /* OpenSSL's own floor for a DSA modulus: below 1024 it has no FFC parameters to offer, and
+           below 512 its provider will not even start. */
+        if (modulusLength < 512) {
+            throw keyFail(null, 'error:030000E9:digital envelope routines::provider keymgmt failure');
+        }
+        if (modulusLength < 1024) {
+            throw keyFail(null, 'error:05000072:dsa routines::bad ffc parameters');
+        }
+        const ints = generateDsa(modulusLength, Number(divisorLength));
         const size = modulusSize(ints.p as bigint);
         return {
             public: storeKey({ type: 'public', kind, ints, publicBytes: bytesOf(ints.y as bigint, size) }),
@@ -2202,9 +2245,13 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         if (options?.primeLength === undefined || options?.primeLength === null) {
             throw Object.assign(new Error('At least one of the group, prime, or primeLength options is required'), { code: 'ERR_MISSING_OPTION' });
         }
-        const primeLength = Number(options.primeLength);
+        const primeLength = options.primeLength;
+        if (typeof primeLength !== 'number') {
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.primeLength" property must be of type number. Received ' + receivedLike(primeLength), 'TypeError');
+        }
+        /* OpenSSL's own floor for a DH modulus, and the uncoded error it answers below it. */
         if (!Number.isInteger(primeLength) || primeLength < 16) {
-            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.primeLength" is out of range. It must be >= 16. Received ' + String(options?.primeLength), 'RangeError');
+            throw keyFail(null, 'error:0280007E:Diffie-Hellman routines::modulus too small');
         }
         const ints = generateDh(primeLength, options?.generator === undefined || options?.generator === null ? 2n : BigInt(String(options?.generator)));
         const size = modulusSize(ints.p as bigint);
@@ -2223,10 +2270,11 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         };
     }
     if (kind === 'ec') {
-        /* Node carries no default curve: an 'ec' pair has to name one, and it is a type error
-           naming 'options.namedCurve' when it does not. */
-        if (options?.namedCurve === undefined || options?.namedCurve === null) {
-            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.namedCurve" property must be of type string. Received ' + String(options?.namedCurve), 'TypeError');
+        /* Node carries no default curve: an 'ec' pair has to name one, and a value that is not
+           even text is a type error naming 'options.namedCurve', not an unusable curve name. */
+        const namedCurve = options?.namedCurve === undefined || options?.namedCurve === null ? options?.curve : options?.namedCurve;
+        if (typeof namedCurve !== 'string') {
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.namedCurve" property must be of type string. Received ' + receivedLike(namedCurve), 'TypeError');
         }
         const curve = curveFor(options?.namedCurve ?? options?.curve ?? 'prime256v1');
         const priv = curve.curve.utils.randomPrivateKey();
@@ -2303,6 +2351,41 @@ function curveForOid(oid: string): EcCurve {
         if (EC_CURVES[name].oid === oid) return EC_CURVES[name];
     }
     throw keyFail('ERR_CRYPTO_INVALID_CURVE', 'Unsupported EC curve');
+}
+
+/** What OpenSSL's own decoder answers for key material it can find no decoder for. */
+const decodeFail = () => keyFail('ERR_OSSL_UNSUPPORTED', 'error:1E08010C:DECODER routines::unsupported');
+
+function importKeyMaterial(args: any): { id: number } {
+    const want = String(args?.want ?? 'public');
+    if (args?.jwk !== undefined && args?.jwk !== null) {
+        return { id: storeKey(importJwk(args?.jwk, want === 'private' ? 'private' : 'public')) };
+    }
+    const bytes = bytesArg(args?.bytes);
+    const text = new TextDecoder().decode(bytes);
+    const pem = text.includes('-----BEGIN');
+    /* Node reads the label when the caller names no format, so an EC PRIVATE KEY imports as sec1. */
+    const kind = String(args?.type ?? (pem ? pemKindOf(text) : (want === 'private' ? 'pkcs8' : 'spki'))).toLowerCase();
+    const sealed = pem && /-----BEGIN ENCRYPTED PRIVATE KEY-----/.test(text);
+    /*
+     * A caller that asked for a private key and handed over a public one gets no key at all: Node's
+     * decoder is asked for a private key and finds nothing it can decode, which is the same failure
+     * as handing it garbage rather than a usable-key-of-the-wrong-kind error.
+     */
+    if (want === 'private' && kind === 'spki') throw decodeFail();
+    if (kind === 'spki') return { id: storeKey(importSpki(pem ? pemDecode(text, 'PUBLIC KEY') : bytes)) };
+    if (kind === 'pkcs8') {
+        const plain = sealed ? decryptPkcs8(pemDecode(text, 'ENCRYPTED PRIVATE KEY'), args?.passphrase) : pem ? pemDecode(text, 'PRIVATE KEY') : bytes;
+        return { id: storeKey(importPkcs8(plain)) };
+    }
+    if (kind === 'sec1') {
+        const der = text.includes('-----BEGIN') ? pemDecode(text, 'EC PRIVATE KEY') : bytes;
+        const root = derRead(der);
+        const oidNode = root.children.find((child) => child.tag === 0xa0 && child.children.length === 1 && child.children[0].tag === DER_OID);
+        if (oidNode === undefined) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid SEC1 key: no curve');
+        return { id: storeKey(importEcPrivateKey(der, curveForOid(oidOf(oidNode.children[0])))) };
+    }
+    throw keyFail('ERR_CRYPTO_INVALID_KEY_TYPE', 'Unsupported key format: ' + kind);
 }
 
 /** SPKI: SEQUENCE { AlgorithmIdentifier, BIT STRING publicKey }. */
@@ -2468,14 +2551,19 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncod
     const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type ' + key.type + ', expected private.', 'TypeError');
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
-        const name = digestNameFor(algorithm);
-        const spec = digestFor(name);
         const mode = rsaModeFor(padding, key.kind);
+        /*
+         * A null algorithm names no digest at all: Node hands the data straight to the padding, so
+         * what is signed is the PKCS#1 v1.5 block of the bytes themselves, with no DigestInfo
+         * wrapped around them. crypto.sign(null, ...) is how a caller asks for that raw signature.
+         */
+        const name = digestNameFor(algorithm === undefined || algorithm === null ? DEFAULT_DIGEST : algorithm);
+        const spec = digestFor(name);
         return rsaSignWith(key.ints as IntKey, spec.fn(data, 0), name, mode, pssSaltLength(saltLength, spec.out));
     }
     if (key.kind === 'dsa') {
-        const name = digestNameFor(algorithm);
-        return dsaSignWith(key.ints as IntKey, digestFor(name).fn(data, 0), encoding);
+        /* A null algorithm signs the data as it stands, which is the digest it would have fed in. */
+        return dsaSignWith(key.ints as IntKey, noDigestBytes(data, algorithm), encoding);
     }
     if (key.kind === 'dh') {
         throw keyFail('ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE', 'error:03000096:digital envelope routines::operation not supported for this keytype');
@@ -2507,8 +2595,15 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncod
      * The nonce is salted with fresh entropy because OpenSSL draws a random one: a caller that
      * signs the same bytes twice sees two different signatures on the host, and here too.
      */
-    const digest = digestFor(algorithm).fn(data, 0);
-    const signed = curve.curve.sign(digest, key.privateBytes as Uint8Array, { lowS: true, prehash: false, extraEntropy: randomOf(32) });
+    const digest = noDigestBytes(data, algorithm);
+        /*
+         * Node's own ECDSA signature is not normalised to a low S: OpenSSL draws a nonce and takes
+         * the S it gets, so about half of a host's signatures carry a high one, which is what makes
+         * the DER length it emits 70, 71 or 72 bytes in the 1:2:1 the arithmetic predicts. Forcing
+         * a low S here would pin it to 70 or 71 and never 72, which is a distribution a caller can
+         * tell apart from the host's over a handful of signatures. Verification accepts either.
+         */
+        const signed = curve.curve.sign(digest, key.privateBytes as Uint8Array, { lowS: false, prehash: false, extraEntropy: randomOf(32) });
     /* 'ieee-p1363' is r||s; Node's default is the DER SEQUENCE of the two. */
     return signed.toBytes(encoding === 'ieee-p1363' ? 'compact' : 'der');
 }
@@ -2517,17 +2612,16 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
     const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'public' && key.type !== 'private') return false;
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
-        const name = digestNameFor(algorithm);
+        const mode = rsaModeFor(padding, key.kind);
+        const name = digestNameFor(algorithm === undefined || algorithm === null ? DEFAULT_DIGEST : algorithm);
         const spec = DIGEST_SPECS[name];
         if (spec === undefined) return false;
-        const mode = rsaModeFor(padding, key.kind);
         /* A PSS check the caller named no salt length for is AUTO, which accepts any salt. */
         return rsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), name, signature, mode, saltLength === undefined || saltLength === null ? -2 : pssSaltLength(saltLength, spec.out));
     }
     if (key.kind === 'dsa') {
-        const spec = DIGEST_SPECS[digestNameFor(algorithm)];
-        if (spec === undefined) return false;
-        return dsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), signature, encoding);
+        if (algorithm !== undefined && algorithm !== null && DIGEST_SPECS[digestNameFor(algorithm)] === undefined) return false;
+        return dsaVerifyWith(key.ints as IntKey, noDigestBytes(data, algorithm), signature, encoding);
     }
     if (key.kind === 'dh') return false;
     const spec = EDWARDS[key.kind];
@@ -2552,7 +2646,7 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
     }
     const curve = key.curve as EcCurve;
     try {
-        const digest = digestFor(algorithm).fn(data, 0);
+        const digest = noDigestBytes(data, algorithm);
         /*
          * Node parses the signature in the encoding it was asked for, and @noble would accept
          * either: a 64-byte r||s pair is not a DER SEQUENCE and a DER SEQUENCE is not 64 bytes,
@@ -2946,33 +3040,24 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         }
         return format === 'der' ? { bytes: bytesToBase64(der) } : { bytes: bytesToBase64(new TextEncoder().encode(pemEncode(label, der))) };
     },
-    /** Args {format, type, bytes, jwk}: imports a key and returns its handle. */
+    /** Args {bytes, format, type, passphrase, want}: imports a key and returns its handle. */
     'crypto.key.import': (args) => {
-        const want = String(args?.want ?? 'public');
-        if (args?.jwk !== undefined && args?.jwk !== null) {
-            return { id: storeKey(importJwk(args?.jwk, want === 'private' ? 'private' : 'public')) };
+        /*
+         * Material Node cannot decode is one error, whatever went wrong inside the parse: its
+         * OpenSSL decoder finds no decoder for it at all and answers 'DECODER routines::unsupported',
+         * so the particular reason this runtime's own parser reached is folded into that answer.
+         * A key that is decoded but is the wrong kind -- an encrypted one with no passphrase, say --
+         * keeps its own error, because that one the host does name.
+         */
+        try {
+            return importKeyMaterial(args);
+        } catch (error) {
+            const code = (error as { code?: unknown } | null)?.code;
+            if (code === undefined || code === 'ERR_CRYPTO_INVALID_KEYPAIR' || code === 'ERR_CRYPTO_INVALID_KEY_TYPE') throw decodeFail();
+            throw error;
         }
-        const bytes = bytesArg(args?.bytes);
-        const text = new TextDecoder().decode(bytes);
-        const pem = text.includes('-----BEGIN');
-        /* Node reads the label when the caller names no format, so an EC PRIVATE KEY imports as sec1. */
-        const kind = String(args?.type ?? (pem ? pemKindOf(text) : (want === 'private' ? 'pkcs8' : 'spki'))).toLowerCase();
-        const sealed = pem && /-----BEGIN ENCRYPTED PRIVATE KEY-----/.test(text);
-        if (kind === 'spki') return { id: storeKey(importSpki(pem ? pemDecode(text, 'PUBLIC KEY') : bytes)) };
-        if (kind === 'pkcs8') {
-            const plain = sealed ? decryptPkcs8(pemDecode(text, 'ENCRYPTED PRIVATE KEY'), args?.passphrase) : pem ? pemDecode(text, 'PRIVATE KEY') : bytes;
-            return { id: storeKey(importPkcs8(plain)) };
-        }
-        if (kind === 'sec1') {
-            const der = text.includes('-----BEGIN') ? pemDecode(text, 'EC PRIVATE KEY') : bytes;
-            const root = derRead(der);
-            const oidNode = root.children.find((child) => child.tag === 0xa0 && child.children.length === 1 && child.children[0].tag === DER_OID);
-            if (oidNode === undefined) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid SEC1 key: no curve');
-            return { id: storeKey(importEcPrivateKey(der, curveForOid(oidOf(oidNode.children[0])))) };
-        }
-        throw keyFail('ERR_CRYPTO_INVALID_KEY_TYPE', 'Unsupported key format: ' + kind);
     },
-    /** Args {a, b}: whether two handles name the same key material. */
+/** Args {a, b}: whether two handles name the same key material. */
     'crypto.key.equal': (args) => {
         const a = keyFor(args?.a, 'key.equal');
         const b = keyFor(args?.b, 'key.equal');
@@ -3064,10 +3149,11 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         if (dhVerifyError(state.prime, state.generator) !== 0) {
             throw dhFail('ERR_CRYPTO_OPERATION_FAILED', 'Key generation failed');
         }
-        if (state.privateKey === undefined) {
-            state.privateKey = randomExponent(state.prime);
-            state.publicKey = modPow(state.generator, state.privateKey, state.prime);
-        }
+        /* The public half is always derived from the private one: Node's generateKeys() computes
+           g^private mod p even when a public key was set by hand beforehand, so a caller who set
+           one and then asked for a pair gets the one that belongs to the private key it chose. */
+        if (state.privateKey === undefined) state.privateKey = randomExponent(state.prime);
+        state.publicKey = modPow(state.generator, state.privateKey, state.prime);
         return {
             /* Node pads a prime and a public key to the prime's width but leaves a private
                exponent bare, so a 2048-bit group reports a 29-byte private key. */
