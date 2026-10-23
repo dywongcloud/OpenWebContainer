@@ -274,6 +274,157 @@ const REALM_REJECTION_SRC = '(function (note, record) {' +
     '})';
 
 /**
+ * The stack a `vm` context's own realm gives the errors it builds: the header host Node 24.15 opens
+ * one with, and the frames of the caller's own realm behind it.
+ *
+ * This engine writes the frames alone and nothing in front of them, so `vm.runInNewContext('new
+ * Error("x")').stack.split('\n')[0]` was a frame -- `    at <eval> (evalmachine.<anonymous>:1:10)` --
+ * where host Node 24.15 answers `Error: x`. The guest realm has never had that problem: it wraps
+ * each of the eight error constructors in one that puts the header on and takes this container's own
+ * frames out, and a second realm is made without any of it, so the moment errors stopped being
+ * copied on their way out of a context and began crossing as the context's own objects, every error
+ * a context handed back carried the engine's stack and not the host's. This is that same wrapper in
+ * a realm's own terms -- `guestFramesOf` of `guest/globals.ts`, which a second realm cannot reach
+ * because it is a closure of a source this one never runs.
+ *
+ * The frames it takes out are the ones this container's bootstrap leaves on a stack that spans the
+ * two realms -- `callCap`, `vmEval`, `runInRecord`, `vmGuarded`, `runScript`, `runInNewContext` --
+ * and what it puts in their place is what host Node names there: the compile of a CommonJS body, the
+ * load behind it and the entry that started the run. The frame of the code a context ran is named
+ * after the eval that ran it by this engine and after the file alone by the host, so `<eval>` comes
+ * off it too.
+ */
+const REALM_STACK_SRC = '(function () {' +
+    'var NAMES = ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError",' +
+    ' "URIError", "AggregateError"];' +
+    'var BOOT = "owc-bootstrap.js:";' +
+    'var CJS_MODULE_FRAMES = [' +
+    '"    at Module._compile (node:internal/modules/cjs/loader:1830:14)",' +
+    '"    at Object..js (node:internal/modules/cjs/loader:1961:10)",' +
+    '"    at Module.load (node:internal/modules/cjs/loader:1553:32)",' +
+    '"    at Module._load (node:internal/modules/cjs/loader:1355:12)",' +
+    '"    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)"];' +
+    'var CJS_MAIN_TAIL = [' +
+    '"    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)",' +
+    '"    at node:internal/main/run_main_module:33:47"];' +
+    'var CJS_REQUIRE_TAIL = [' +
+    '"    at Module.require (node:internal/modules/cjs/loader:1576:12)",' +
+    '"    at require (node:internal/modules/helpers:153:16)"];' +
+    'var CJS_CALL_FRAME = "    at call (native)";' +
+    'var CONSTRUCT_FRAME = "    at construct (native)";' +
+    'function isBootstrapFrame(text) {' +
+    'return typeof text === "string" && text.indexOf(BOOT) >= 0; }' +
+    'function anonymousFrameName(text) {' +
+    'var parsed = /^(\\s*)at <anonymous> \\(([^)]+)\\)\\s*$/.exec(text);' +
+    'if (parsed === null) return text;' +
+    'if (parsed[2].charAt(0) !== "/") return text;' +
+    'return parsed[1] + "at " + parsed[2]; }' +
+    /* The frame of the code a context ran: this engine names it after the eval that ran it, and host
+       node names it after the location alone. */
+    'function evalFrameName(text) {' +
+    'var parsed = /^(\\s*)at <eval> \\(([^)]+)\\)\\s*$/.exec(text);' +
+    'return parsed === null ? text : parsed[1] + "at " + parsed[2]; }' +
+    'function moduleFrameName(text) {' +
+    'var parsed = /^(\\s*)at <anonymous> \\((.*)\\)\\s*$/.exec(text);' +
+    'return parsed === null ? text : parsed[1] + "at Object.<anonymous> (" + parsed[2] + ")"; }' +
+    'function framesOf(lines) {' +
+    'var out = [];' +
+    'var at = 0;' +
+    'while (at < lines.length) {' +
+    'var line = lines[at];' +
+    'if (isBootstrapFrame(line)) { at++; continue; }' +
+    'if (line === CJS_CALL_FRAME && at + 1 < lines.length && isBootstrapFrame(lines[at + 1])) {' +
+    'var end = at + 1;' +
+    'while (end < lines.length && isBootstrapFrame(lines[end])) end++;' +
+    'var run = lines.slice(at + 1, end);' +
+    'var main = false;' +
+    'var asked = false;' +
+    'for (var r = 0; r < run.length; r++) {' +
+    'if (run[r].indexOf("    at runMain (") === 0) main = true;' +
+    'if (run[r].indexOf("    at require (") === 0 || run[r].indexOf("    at requireFrom (") === 0) asked = true;' +
+    '}' +
+    'if (main || asked) {' +
+    'if (out.length > 0) out[out.length - 1] = moduleFrameName(out[out.length - 1]);' +
+    'var tail = main ? CJS_MAIN_TAIL : CJS_REQUIRE_TAIL;' +
+    'for (var m = 0; m < CJS_MODULE_FRAMES.length; m++) out.push(CJS_MODULE_FRAMES[m]);' +
+    'for (var t = 0; t < tail.length; t++) out.push(tail[t]);' +
+    '}' +
+    'at = end;' +
+    'continue;' +
+    '}' +
+    'out.push(line);' +
+    'at++;' +
+    '}' +
+    'for (var n = 0; n < out.length; n++) out[n] = evalFrameName(anonymousFrameName(out[n]));' +
+    'return out; }' +
+    'function headerOf(err) {' +
+    'var name = "Error";' +
+    'var message = "";' +
+    'try {' +
+    'name = String(err.name || "Error");' +
+    'message = String(err.message === undefined || err.message === null ? "" : err.message);' +
+    '} catch (ignored) { }' +
+    'return message === "" ? name : name + ": " + message; }' +
+    'function engineFrames(stack, ownFrame) {' +
+    'var lines = typeof stack === "string" && stack !== "" ? stack.split("\\n") : [];' +
+    'while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();' +
+    'var at = 0;' +
+    'while (at < lines.length && (lines[at] === CONSTRUCT_FRAME || lines[at] === ownFrame)) at++;' +
+    'var out = framesOf(lines.slice(at));' +
+    'var limit = Error.stackTraceLimit;' +
+    'if (typeof limit !== "number") limit = 10;' +
+    'if (limit >= 0 && out.length > limit) out = out.slice(0, limit);' +
+    'return out.join("\\n"); }' +
+    /* An assignment to `stack` is what the host's own is: the accessor is replaced by the value, so
+       what is written is what is read and nothing put in front of it. */
+    'function installStack(err, frames) {' +
+    'var kept = null;' +
+    'Object.defineProperty(err, "stack", {' +
+    'get: function () {' +
+    'if (kept !== null) return kept;' +
+    'var header = headerOf(err);' +
+    'kept = frames === "" ? header : (frames.indexOf(header) === 0 ? frames : header + "\\n" + frames);' +
+    'return kept; },' +
+    'set: function (value) {' +
+    'Object.defineProperty(err, "stack", { value: value, writable: true, enumerable: false, configurable: true }); },' +
+    'enumerable: false,' +
+    'configurable: true' +
+    '}); }' +
+    'function install(name) {' +
+    'var Native = globalThis[name];' +
+    'if (typeof Native !== "function") return;' +
+    'if (typeof Reflect === "undefined" || typeof Reflect.construct !== "function") return;' +
+    'var ownFrame = null;' +
+    'function Shim() {' +
+    'var err = Reflect.construct(Native, arguments, new.target === undefined ? Shim : new.target);' +
+    'var raw = err.stack;' +
+    'if (ownFrame === null) {' +
+    'var built = typeof raw === "string" && raw !== "" ? raw.split("\\n") : [];' +
+    'ownFrame = built.length > 1 ? built[1] : "";' +
+    '}' +
+    'installStack(err, engineFrames(raw, ownFrame));' +
+    'return err; }' +
+    'Shim.prototype = Native.prototype;' +
+    'Object.defineProperty(Shim, "name", { value: name, configurable: true });' +
+    'Object.defineProperty(Shim, "length", { value: Native.length, configurable: true });' +
+    'Object.defineProperty(Shim, "toString", {' +
+    'value: function () { return "function " + name + "() { [native code] }"; },' +
+    'writable: true, enumerable: false, configurable: true });' +
+    'var statics = Object.getOwnPropertyNames(Native);' +
+    'for (var s = 0; s < statics.length; s++) {' +
+    'if (statics[s] === "length" || statics[s] === "name" || statics[s] === "prototype") continue;' +
+    'Object.defineProperty(Shim, statics[s], Object.getOwnPropertyDescriptor(Native, statics[s]));' +
+    '}' +
+    /* err.constructor === Error is asked as often as err instanceof Error is, and the prototype the
+       instances keep is still the engine's own, so it is its constructor that names the wrapper. */
+    'Object.defineProperty(Native.prototype, "constructor",' +
+    ' { value: Shim, writable: true, enumerable: false, configurable: true });' +
+    'try { globalThis[name] = Shim; } catch (x) { }' +
+    '}' +
+    'for (var i = 0; i < NAMES.length; i++) install(NAMES[i]);' +
+    '})';
+
+/**
  * The standard globals a second realm is given the guest realm's own object for, outright, rather
  * than its own namesake with the guest's statics copied onto it.
  *
@@ -524,6 +675,7 @@ function realmFor(host: VmHost, id: number): VmRealm | undefined {
         const realm: VmRealm = { ctx, base: new Set<string>(), held: new Set<string>(), injected: new Set<string>() };
         host.realms.set(id, realm);
         bridgeGlobals(host, realm);
+        installStacks(realm);
         installRejections(host, realm);
         /* The intrinsics of the realm as it stands -- the bridged names with them -- are what a run
            may add to and is never asked to hand back to the sandbox. */
@@ -671,6 +823,31 @@ function defineHidden(realm: VmRealm, key: string, value: QuickJSHandle): void {
         else result.value.dispose();
     } catch {
         // a global the realm will not take still leaves the run intact
+    }
+}
+
+/**
+ * Gives a freshly made second realm the wrapper its errors need: see {@link REALM_STACK_SRC}.
+ *
+ * It runs after {@link bridgeGlobals}, which is what hands the realm the statics the guest's own
+ * error constructors carry -- `captureStackTrace` and `stackTraceLimit` among them -- so that the
+ * wrapper built here is given those to hand on and the errors a context makes answer for them as
+ * the guest's own do.
+ */
+function installStacks(realm: VmRealm): void {
+    try {
+        const built = realm.ctx.evalCode(REALM_STACK_SRC);
+        if (built.error) {
+            built.error.dispose();
+            return;
+        }
+        const installer = realm.ctx.unwrapResult(built);
+        const result = realm.ctx.callFunction(installer, realm.ctx.global, []);
+        installer.dispose();
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // an error that keeps the engine's own stack still carries its name, message and frames
     }
 }
 

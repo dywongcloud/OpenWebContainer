@@ -35,15 +35,27 @@ function formatErrorStack(err) {
   var nameText = err.name === undefined || err.name === null ? 'Error' : String(err.name);
   var header = nameText;
   var ctorText = constructorNameOf(err);
+  var subbed = false;
   if (ctorText && ctorText !== nameText && ctorText !== 'Object' &&
       !Object.prototype.hasOwnProperty.call(err, 'name')) {
     header = ctorText + ' [' + nameText + ']';
+    subbed = true;
   }
   if (err.message) header += header === '' ? String(err.message) : ': ' + err.message;
   var stack = err.stack ? String(err.stack) : '';
   var lines = stack === '' ? [] : guestFramesOf(stack.split('\n'));
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   var body = lines.join('\n');
+  /* The header the error's own stack carries is the one node prints for a plain error and the one
+     it drops when it prints 'Z [Error]: s' instead: the stack of a subclass opens with 'Error: s',
+     the name it inherited and not the name the constructor answers, and node's report opens with
+     the constructor's and then goes on with the frames -- 'Error: s' is not a line it prints twice.
+     The stack of an error out of a 'vm' context carries that header too now, so the same dropping
+     is what keeps 'Z [Error]: s' from being followed by it there. */
+  if (subbed) {
+    var ownHeader = nameText + (err.message ? ': ' + String(err.message) : '');
+    if (body === ownHeader || body.indexOf(ownHeader + '\n') === 0) body = body.slice(ownHeader.length + 1);
+  }
   if (body === '') return header;
   /* A stack that is no stack at all -- one the error was given by hand, 'L1\nL2', with no frame in
      it -- is what node prints in brackets, '[L1\nL2]': not a report with a header in front of it
