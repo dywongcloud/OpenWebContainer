@@ -410,17 +410,23 @@ export function encodeJPEG(
 
   /* libjpeg's quality-to-scale rule, on the 0..1 scale (libjpeg takes 0..100):
    *   quality >= 50 ? 200 - 2*quality : 5000/quality
-   * so a quality of 0.5 gives 100 either way. The q === 0 branch is degenerate;
-   * any huge finite factor drives every table entry to 255, which is the limit. */
-  const scale = q >= 0.5 ? 200 - 200 * q : q > 0 ? 50 / q : 1e12;
+   * so a quality of 0.5 gives 100 either way. libjpeg clamps a quality of 0 to 1 before it
+   * divides, so the 0 the JS API allows is a scale of 5000 and not an unbounded one: measured on
+   * canvas 3.2.3, a 64x64 gradient written at quality 0.0 carries 0320 0226 0258 at the head of
+   * its quant table -- 800, 550 and 600, which are the standard table's 16, 11 and 12 times 50 --
+   * where an unbounded scale drives every entry to the clamp. */
+  const scale = q >= 0.5 ? 200 - 200 * q : 5000 / Math.max(q * 100, 1);
 
   const quantLuma = new Int32Array(64);
   const quantChroma = new Int32Array(64);
   for (let i = 0; i < 64; i++) {
+    /* The values are not clamped to 255 the way an 8-bit table would force them to be: libjpeg
+     * widens the table to 16 bits instead, and it is the widened values that quantize the
+     * coefficients. 65535 is the most a 16-bit table can carry. */
     const lv = Math.round((STD_LUMA_QT[i] * scale) / 100);
     const cv = Math.round((STD_CHROMA_QT[i] * scale) / 100);
-    quantLuma[i] = lv < 1 ? 1 : lv > 255 ? 255 : lv;
-    quantChroma[i] = cv < 1 ? 1 : cv > 255 ? 255 : cv;
+    quantLuma[i] = lv < 1 ? 1 : lv > 65535 ? 65535 : lv;
+    quantChroma[i] = cv < 1 ? 1 : cv > 65535 ? 65535 : cv;
   }
 
   /* RGB -> YCbCr (JFIF full range). Fully transparent pixels composite onto
@@ -505,12 +511,22 @@ export function encodeJPEG(
     0x00, 0x00, /* no thumbnail */
   ]);
 
-  /* DQT, two 8-bit tables, values in zig-zag order */
-  const dqtLuma: number[] = [0x00];
-  const dqtChroma: number[] = [0x01];
+  /* DQT, values in zig-zag order. A table any of whose entries will not fit in a byte is written
+   * as 16-bit: Pq is 1 and every entry takes two bytes. Measured on canvas 3.2.3, a 64x64
+   * gradient at quality 0.1 begins ffdb 0083 10 0050 0037 003c -- a 131-byte segment carrying
+   * 80, 55 and 60, the standard table's 16, 11 and 12 at libjpeg's scale of 500 -- where the
+   * same tables clamped to 8 bits begin ffdb 0043 00 50 37 3c. */
+  const wideLuma = quantLuma.some((value) => value > 255);
+  const wideChroma = quantChroma.some((value) => value > 255);
+  const dqtLuma: number[] = [wideLuma ? 0x10 : 0x00];
+  const dqtChroma: number[] = [wideChroma ? 0x11 : 0x01];
   for (let k = 0; k < 64; k++) {
-    dqtLuma.push(quantLuma[ZIGZAG[k]]);
-    dqtChroma.push(quantChroma[ZIGZAG[k]]);
+    const lv = quantLuma[ZIGZAG[k]];
+    const cv = quantChroma[ZIGZAG[k]];
+    if (wideLuma) dqtLuma.push((lv >>> 8) & 0xff, lv & 0xff);
+    else dqtLuma.push(lv);
+    if (wideChroma) dqtChroma.push((cv >>> 8) & 0xff, cv & 0xff);
+    else dqtChroma.push(cv);
   }
   writeSegment(bw, 0xdb, dqtLuma);
   writeSegment(bw, 0xdb, dqtChroma);

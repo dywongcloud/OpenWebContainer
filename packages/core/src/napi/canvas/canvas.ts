@@ -19,7 +19,7 @@ import { clone as cloneMat, identity, invert, mat, matFrom, multiply, scaleOf } 
 import { PathBuilder, transformPath } from './path';
 import type { DevicePath, SubPath } from './path';
 import type { FillRule } from './raster';
-import { Surface, gaussianBlur, compositePixel, rasterize, sampleSurface } from './raster';
+import { Surface, gaussianBlur, compositePixel, rasterize, sampleArea, sampleSurface } from './raster';
 import type { Paint, Repetition } from './paint';
 import { LinearGradient, Pattern as PatternPaint, RadialGradient, SolidPaint } from './paint';
 import { strokeOutline } from './stroke';
@@ -257,11 +257,18 @@ export class Canvas {
     private encode(type: string, config: EncodeConfig | undefined): Uint8Array | undefined {
         if (this.width === 0 || this.height === 0) this.empty();
         const t = (type || 'image/png').toLowerCase();
+        /* A non-image surface is written in its own format and the mime is ignored: measured on
+         * canvas 3.2.3, a 10x10 pdf canvas asked for 'image/png' answers 951 bytes beginning
+         * %PDF-1.7 and a 4x4 svg one asked for the same answers 169 bytes of <?xml, which is what
+         * each answers when no mime is named at all. The shim has neither writer, so both are
+         * refused here, whatever mime they are handed. */
+        if (this.type === 'pdf') throw unsupported('PDF output -- the shim has no PDF surface');
+        if (this.type === 'svg') throw unsupported('SVG output -- the shim has no SVG surface');
         if (t === 'image/png') {
             if (config && config.palette) {
                 throw unsupported('PNG palette (indexed) output -- the shim always writes 8-bit RGBA');
             }
-            return encodePNG(this.pixels().data, this.width, this.height, config && config.resolution);
+            return encodePNG(this.pixels().data, this.width, this.height, config && config.resolution, config && config.compressionLevel);
         }
         if (t === 'image/jpeg') {
             const quality = config && typeof config.quality === 'number' ? config.quality : 0.75;
@@ -282,10 +289,10 @@ export class Canvas {
             }
             return out;
         }
-        // A PDF canvas has no PDF surface to write: the add-on recognises both PDF mime types and
-        // returns undefined for an image canvas, where the shim refuses with a named error.
-        if (t === 'application/pdf' || t === 'image/pdf') throw unsupported('PDF output -- the shim has no PDF surface');
-        // Anything else, as the add-on does: no image, and no error either.
+        // An image canvas asked for a mime it cannot write answers undefined, as the add-on does
+        // for application/pdf, image/pdf, image/svg+xml and anything unrecognised alike --
+        // measured on canvas 3.2.3, where a pdf mime is undefined on an image canvas and a real
+        // PDF only on a pdf one. No image, and no error either.
         return undefined;
     }
 
@@ -296,7 +303,7 @@ export class Canvas {
             if (this.width === 0 || this.height === 0) this.empty();
             const cfg = config as EncodeConfig;
             if (cfg && cfg.palette) throw unsupported('PNG palette (indexed) output -- the shim always writes 8-bit RGBA');
-            bytes = encodePNG(this.pixels().data, this.width, this.height, cfg && cfg.resolution);
+            bytes = encodePNG(this.pixels().data, this.width, this.height, cfg && cfg.resolution, cfg && cfg.compressionLevel);
         } catch (error) {
             cb(error instanceof Error ? error : new Error(String(error)));
             return;
@@ -1098,6 +1105,10 @@ export class CanvasRenderingContext2d {
     }
 
     getImageData(sx: number, sy: number, sw: number, sh: number): ImageData {
+        /* cairo reads pixels out of an image surface only: a pdf or svg canvas has none to hand
+         * back and the add-on refuses with "Not an image canvas" (measured on canvas 3.2.3), so
+         * a surface this shim draws as an image but cannot encode is refused here too. */
+        if (this.canvas.type !== 'image') throw new Error('Not an image canvas');
         const w = Math.floor(Number(sw));
         const h = Math.floor(Number(sh));
         if (!isFinite(w) || !isFinite(h)) throw new RangeError('IndexSizeError');
@@ -1186,12 +1197,20 @@ export class CanvasRenderingContext2d {
         if (sw === 0 || sh === 0 || dw === 0 || dh === 0) return;
         const device = transformPath([subRect(dx, dy, dw, dh)], this.state.ctm);
         const smooth = this.state.imageSmoothingEnabled;
+        /* A destination pixel at least as wide as a source pixel is averaged over the source pixels
+         * it covers, which is what cairo's own filter does on a downscale; anything narrower is one
+         * bilinear read of the source, which is what it does on an upscale. */
+        const averaging = smooth && sw >= dw && sh >= dh;
+        const stepU = sw / dw;
+        const stepV = sh / dh;
         const paint: Paint = {
             uniform: false,
             colorAt: (ux: number, uy: number): RGBA => {
                 const u = sx + ((ux - dx) / dw) * sw;
                 const v = sy + ((uy - dy) / dh) * sh;
-                const c = sampleSurface(source, u, v, smooth, 'pad');
+                const c = averaging
+                    ? sampleArea(source, u - stepU / 2, v - stepV / 2, u + stepU / 2, v + stepV / 2)
+                    : sampleSurface(source, u, v, smooth, 'pad');
                 return rgba(c[0], c[1], c[2], c[3] * 255);
             }
         };

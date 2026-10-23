@@ -403,12 +403,54 @@ function clampIndex(i: number, n: number): number {
     return i < 0 ? 0 : i >= n ? n - 1 : i;
 }
 
+/**
+ * The average of the source pixels a destination pixel covers, weighted by how much of each it
+ * covers. cairo reads a downscale that way -- its filter is an average over the source footprint
+ * and not one bilinear tap of it -- measured on canvas 3.2.3: a 32x32 canvas drawn into 8x8 with
+ * smoothing on agrees with the unweighted mean of each 4x4 block of source pixels to a maximum of
+ * 1 of 255 over all 256 values, against a maximum of 90 for a single tap.
+ *
+ * `u0`, `v0` are the near edges of the footprint and `u1`, `v1` the far ones, in the same
+ * continuous coordinates sampleSurface takes; a pixel past an edge is padded, as it is there.
+ */
+export function sampleArea(
+    s: Surface, u0: number, v0: number, u1: number, v1: number
+): [number, number, number, number] {
+    let r = 0, g = 0, b = 0, a = 0, total = 0;
+    for (let ky = Math.floor(v0); ky < Math.ceil(v1); ky++) {
+        const wy = Math.min(ky + 1, v1) - Math.max(ky, v0);
+        if (wy <= 0) continue;
+        const cy = clampIndex(ky, s.height);
+        for (let kx = Math.floor(u0); kx < Math.ceil(u1); kx++) {
+            const wx = Math.min(kx + 1, u1) - Math.max(kx, u0);
+            if (wx <= 0) continue;
+            const cx = clampIndex(kx, s.width);
+            const w = wx * wy;
+            const at = (cy * s.width + cx) * 4;
+            const pa = s.data[at + 3] / 255;
+            r += s.data[at] * pa * w;
+            g += s.data[at + 1] * pa * w;
+            b += s.data[at + 2] * pa * w;
+            a += pa * w;
+            total += w;
+        }
+    }
+    if (total <= 0 || a <= 0) return [0, 0, 0, 0];
+    return [r / a, g / a, b / a, a / total];
+}
+
 /** Bilinear sample of an RGBA byte surface at a real-valued position; outside is transparent. */
 export function sampleSurface(
     s: Surface, x: number, y: number, smooth: boolean, extend?: 'pad'
 ): [number, number, number, number] {
     if (!smooth) {
-        const ix = Math.floor(x), iy = Math.floor(y);
+        /* The same pixel the bilinear branch starts from: `x` is a continuous position, so the pixel
+         * whose centre x+0.5 is nearest begins at floor(x - 0.5). Reading floor(x) instead put every
+         * nearest sample half a pixel late, which cairo does not do -- measured on canvas 3.2.3, a
+         * 32x32 source drawn into 8x8 with imageSmoothingEnabled false reads source pixels (1,1),
+         * (5,1) and (9,1) for the first three destination pixels, where floor(x) reads (2,2), (6,2)
+         * and (10,2). */
+        const ix = Math.floor(x - 0.5), iy = Math.floor(y - 0.5);
         if (ix < 0 || iy < 0 || ix >= s.width || iy >= s.height) return [0, 0, 0, 0];
         const at = (iy * s.width + ix) * 4;
         return [s.data[at], s.data[at + 1], s.data[at + 2], s.data[at + 3] / 255];

@@ -2,10 +2,11 @@
  * The PNG encoder. The IDAT stream is a zlib wrapper around a real deflate -- fflate's, at level 6,
  * which is what the guest has and the only deflate a shim with no WebAssembly can run -- so a canvas
  * this shim writes is a compressed PNG of about the add-on's size rather than a stored one twice it.
- * The zlib stream is not libpng's byte for byte, because no JavaScript deflate is zlib's, and libpng's
- * adaptive row filtering is not reproduced either: every scanline is written with filter type 0
- * (None), so a `filters` option in PngConfig is accepted and ignored, and `palette` is refused
- * outright.
+ * The zlib stream is not libpng's byte for byte, because no JavaScript deflate is zlib's: only
+ * the two header bytes are made libpng's (see zlibHeader), and libpng's adaptive row filtering is
+ * reproduced in filteredRows below rather than left at filter type 0. A `filters` option in
+ * PngConfig is accepted and ignored, because the add-on's own does not reach libpng either, and
+ * `palette` is refused outright.
  *
  * The chunks are the add-on's own: IHDR, then a bKGD of opaque white, then IDAT, then IEND. cairo
  * writes that bKGD -- 00ff 00ff 00ff, six bytes, the RGB of colour type 6 as three 16-bit values --
@@ -119,10 +120,42 @@ function filteredRows(rgba: Uint8Array, width: number, height: number): Uint8Arr
 }
 
 /**
- * Encodes straight RGBA bytes, row 0 first, as an 8-bit RGBA PNG (colour type 6, no interlace).
- * `resolution`, when given, becomes a pHYs chunk in pixels per metre.
+ * libpng's zlib header: CMF's CINFO names the window it deflates into, and libpng picks the
+ * smallest power of two -- from 256 up, capped at 32768 -- that holds the whole filtered image,
+ * so the two bytes change with the size of the picture. Measured on canvas 3.2.3: 1x1, 2x2, 4x4
+ * and 7x5 answer 0899, 8x8 answers 1895, 20x10 answers 2891, 16x16, 100x3 and 3x100 answer 388d,
+ * 32x32 answers 5885 and 64x64 and 120x80 answer 789c -- every one of them the smallest window
+ * that holds height * (width * 4 + 1) bytes, which is the filtered image and its filter bytes.
+ *
+ * The deflate payload a JavaScript deflate writes is unaffected by the window it declares, so
+ * naming libpng's own is honest: no match in the stream can reach further back than the image is
+ * long, and the window is never smaller than that.
  */
-export function encodePNG(rgba: Uint8Array, width: number, height: number, resolution?: number): Uint8Array {
+function zlibHeader(rawLength: number, level: number): number[] {
+    let bits = 8;
+    while (bits < 15 && (1 << bits) < rawLength) bits++;
+    const cmf = 0x08 | ((bits - 8) << 4);
+    /* zlib's own FLEVEL, the two bits above FCHECK: 0 for level 0 and 1, 1 for 2 to 5, 2 for 6
+     * and 3 for 7 to 9. FCHECK is what makes CMF * 256 + FLG a multiple of 31. */
+    const flevel = level < 2 ? 0 : level < 6 ? 1 : level === 6 ? 2 : 3;
+    const flg = flevel << 6;
+    return [cmf, flg | ((31 - ((cmf * 256 + flg) % 31)) % 31)];
+}
+
+/**
+ * Encodes straight RGBA bytes, row 0 first, as an 8-bit RGBA PNG (colour type 6, no interlace).
+ * `resolution`, when given, becomes a pHYs chunk in pixels per metre. `compressionLevel` is
+ * libpng's own 0 to 9, and it reaches the deflate: the add-on answers 16558 bytes at level 0,
+ * 250 at 3, 198 at 6 and 195 at 9 for a 64x64 gradient, where a level the encoder never sees
+ * gives 198 for all four.
+ */
+export function encodePNG(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+    resolution?: number,
+    compressionLevel?: number,
+): Uint8Array {
     const stride = width * 4;
     const raw = filteredRows(rgba, width, height);
     const ihdr = new Uint8Array(13);
@@ -156,7 +189,15 @@ export function encodePNG(rgba: Uint8Array, width: number, height: number, resol
         phys[8] = 1;
         pushChunk(out, 'pHYs', phys);
     }
-    pushChunk(out, 'IDAT', zlibSync(raw, { level: 6 }));
+    /* fflate names its levels 0 to 9, which is libpng's own range. */
+    const level = (typeof compressionLevel === 'number' && compressionLevel >= 0 && compressionLevel <= 9
+        ? Math.round(compressionLevel)
+        : 6) as 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+    const stream = zlibSync(raw, { level });
+    const header = zlibHeader(raw.length, level);
+    stream[0] = header[0];
+    stream[1] = header[1];
+    pushChunk(out, 'IDAT', stream);
     pushChunk(out, 'IEND', new Uint8Array(0));
     return new Uint8Array(out);
 }
