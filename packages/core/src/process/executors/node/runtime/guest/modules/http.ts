@@ -153,7 +153,12 @@ function routesToGuest(hostname) {
     mapped = null;
   }
   if (mapped !== null) return true;
-  return /^127\./.test(hostname);
+  if (/^127\./.test(hostname)) return true;
+  /* The IPv6 loopback and the IPv4-mapped loopback are this host too, and an IPv6 literal is dialled
+     as it stands rather than resolved, so the name table has nothing to say about either: a request
+     to '::1' or to '::ffff:127.0.0.1' belongs to a guest listener, not to the outside. A bracketed
+     form stays external -- Node cannot resolve '[::1]' and answers ENOTFOUND for it. */
+  return hostname === '::1' || /^::ffff:127\./i.test(hostname);
 }
 
 function urlOptions(u) {
@@ -1135,12 +1140,15 @@ BF['http'] = function () {
     if (protocol !== defaultProtocol) {
       throw httpError(Error, 'ERR_INVALID_PROTOCOL', 'Protocol "' + protocol + '" not supported. Expected "' + defaultProtocol + '"');
     }
-    var rawHost = options.hostname || (typeof options.host === 'string' ? options.host.replace(/:\d+$/, '') : '') || 'localhost';
-    var hostname = rawHost.charAt(0) === '[' ? rawHost.slice(1, -1) : rawHost;
+    /* Node takes the host as it was given: it strips no trailing port from it and no brackets around
+       an IPv6 literal, so a host of "::1" is the loopback a dial reaches while "[::1]" and
+       "localhost:0" are names getaddrinfo cannot answer (ENOTFOUND). Brackets are unwrapped only
+       upstream, by urlOptions, which reads them off a parsed URL as Node's own urlToOptions does. */
+    var hostname = options.hostname || (typeof options.host === 'string' ? options.host : '') || 'localhost';
     var defaultPort = defaultProtocol === 'https:' ? 443 : 80;
     var port = options.port !== undefined && options.port !== null && options.port !== '' ? Number(options.port) : defaultPort;
     var path = options.path ? String(options.path) : '/';
-    var hostHeader = (hostname.indexOf(':') >= 0 ? '[' + hostname + ']' : hostname) + (port === defaultPort ? '' : ':' + port);
+    var hostHeader = (hostname.indexOf(':') >= 0 && hostname.charAt(0) !== '[' ? '[' + hostname + ']' : hostname) + (port === defaultPort ? '' : ':' + port);
     return new ClientRequest({
       method: String(options.method || 'GET').toUpperCase(),
       path: path,

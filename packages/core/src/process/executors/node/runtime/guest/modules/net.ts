@@ -943,6 +943,15 @@ BF['net'] = function () {
         deleteTarget(this._targetId);
         this._targetId = undefined;
       }
+      /* Node reads a socket's four addresses and both families off its handle, so once the handle is
+         gone every one of them is undefined: a destroyed socket names no address at either of its
+         ends, and address() is the empty object rather than the pair the connection was made on. */
+      this.localAddress = undefined;
+      this.localPort = undefined;
+      this.localFamily = undefined;
+      this.remoteAddress = undefined;
+      this.remotePort = undefined;
+      this.remoteFamily = undefined;
       netRefresh(this);
     }
 
@@ -977,7 +986,7 @@ BF['net'] = function () {
     }
 
     address() {
-      if (this._hubId === undefined) return {};
+      if (this._hubId === undefined || this._hubClosed) return {};
       return { address: this.localAddress, family: this.localFamily, port: this.localPort };
     }
 

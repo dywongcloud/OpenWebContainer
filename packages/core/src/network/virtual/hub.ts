@@ -313,10 +313,12 @@ export class VirtualNetwork {
             /* The mapped spelling is what the client's own socket reports for itself, and for the peer
                it reached: Node's remoteAddress is the address that was dialled, so a socket that
                dialled '::ffff:127.0.0.1' reports it at both of its ends -- its own local address and
-               the remote one -- not the plain IPv4 address the hub routed the dial to. */
-            localAddress: mapped === null ? localAddress : request.address,
+               the remote one -- not the plain IPv4 address the hub routed the dial to. It is reported
+               in the canonical dotted spelling, so a dial of the short '::ffff:7f00:1' names
+               '::ffff:127.0.0.1', which is what a host's own getpeername renders for it. */
+            localAddress: mapped === null ? localAddress : '::ffff:' + mapped,
             localPort,
-            remoteAddress: mapped === null ? displayAddress(destination) : request.address,
+            remoteAddress: mapped === null ? displayAddress(destination) : '::ffff:' + mapped,
             remotePort: request.port,
         };
     }
@@ -661,9 +663,16 @@ export class VirtualNetwork {
  */
 function v4MappedOf(address: string | undefined): string | null {
     if (typeof address !== 'string') return null;
-    const match = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(address);
-    if (match === null) return null;
-    return match[1].split('.').every((part) => Number(part) <= 255) ? match[1] : null;
+    const dotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(address);
+    if (dotted !== null) return dotted[1].split('.').every((part) => Number(part) <= 255) ? dotted[1] : null;
+    /* The same address spelled as its last two hex groups -- '::ffff:7f00:1' is 127.0.0.1 -- is a
+       literal a host kernel parses just as readily, and one it reports back in the dotted spelling:
+       a socket that dialled the short form names '::ffff:127.0.0.1' at both of its own ends. */
+    const groups = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(address);
+    if (groups === null) return null;
+    const high = parseInt(groups[1], 16);
+    const low = parseInt(groups[2], 16);
+    return `${(high >> 8) & 255}.${high & 255}.${(low >> 8) & 255}.${low & 255}`;
 }
 
 /**
