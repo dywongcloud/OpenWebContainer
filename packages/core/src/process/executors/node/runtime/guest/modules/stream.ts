@@ -1543,7 +1543,13 @@ function owcBuildStreamCore() {
 
   // Node names the reducer 'reducer' and the signal property 'options.signal' in every operator.
   function checkOperatorOptions(options) {
-    if (options !== undefined && typeof options !== 'object') throw argTypeError('options', 'of type object', options);
+    /* Node's isObject is "not null, typeof object, and not an Array": an array where options go is
+       refused with the very words a string or a number gets, while a Date, a RegExp, a Map, a
+       Buffer, an Error, an arguments object and an object with no prototype are each accepted. A
+       function is refused too, but by the typeof test alone. */
+    if (options !== undefined && (typeof options !== 'object' || Array.isArray(options))) {
+      throw argTypeError('options', 'of type object', options);
+    }
     var signal = options === undefined || options === null ? undefined : options.signal;
     checkSignalProp(signal);
     return signal;
