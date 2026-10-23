@@ -1,4 +1,34 @@
 id: owc-crypto-ciphers-brotli
 subject: 'Ciphers and compression gaps (witness dispatch 1792020269182-7-9453f953e0e0f15b): crypto.createCipheriv with aes-128-cbc throws ERR_FEATURE_UNAVAILABLE (createHash sha256 and createHmac are equal to Node and are not in this row); brotliCompressSync and brotliDecompressSync and zstd round trips throw ERR_NOT_SUPPORTED. Implement createCipheriv and createDecipheriv on top of @noble/ciphers (AES-CBC, AES-CTR, AES-GCM, ChaCha20-Poly1305 as available there) with Node''s error codes for bad keys and IVs, witnessed against Node''s crypto. Brotli and zstd are a separate decision (a pure-JS brotli decoder and encoder are large): record that decision here before implementing.'
 session_id: owc-r4
-status: pending
+status: completed
+resolved_by: adv7-exec-crypto
+resolved_at: 8f36844 (local main, HEAD at verification)
+title: 'RESOLVED: createCipheriv/createDecipheriv are byte-identical to Node with its own error codes, and brotli and zstd are implemented, not deferred'
+body: |-
+  VERIFIED CLOSED (adv7-exec-crypto) at local main HEAD 8f36844, no source change needed -- this row
+  was a reappearance. Host node v24.15.0 against the container, /tmp/owc-adv7-crypto/app/main.js run
+  on both sides: 121 probes, 112 identical, container run repeated twice byte-identically.
+
+  Ciphers: ciphertext byte-identical for aes-128-cbc, aes-256-cbc, aes-128-ctr, aes-256-ctr,
+  aes-128-ecb, aes-128-gcm, aes-256-gcm and chacha20-poly1305; AEAD round trips through
+  getAuthTag/setAuthTag and setAAD are true on both; { authTagLength: 12 } gives the same 12-byte tag
+  1ba85d3478620ffe6191d35d; and the error surface matches -- ERR_CRYPTO_INVALID_KEYLEN,
+  ERR_CRYPTO_INVALID_IV, ERR_CRYPTO_UNKNOWN_CIPHER, ERR_OSSL_BAD_DECRYPT and the uncoded
+  'Unsupported state or unable to authenticate data'.
+
+  Brotli and zstd are implemented rather than deferred: the WASM codec bridge carries them.
+  brotliCompressSync('abcabcabcabcabc') is the same 13 bytes 1b0e00f825c3c4c6229b208006 on both, and
+  the callback form, createBrotliCompress and the decompress stream give the same bytes; quality 11
+  and an out-of-range parameter agree; garbage fails with ERR__ERROR_FORMAT_PADDING_2 on both.
+  zstdCompressSync is the same 18 bytes 28b52ffd200f4d0000186162630100726e08 (the callback form
+  28b52ffd00584d0000186162630100726e08, which differs from the sync frame on the host too), round
+  trips are true and garbage fails with ZSTD_error_prefix_unknown on both. The 2026-10-16 decision
+  that sent them to the WASM bridge rather than multi-megabyte inlined JS stands recorded in
+  .gm/receipts/owc-crypto-ciphers-brotli/01-run.md.
+
+  Residual, already recorded under row owc-crypto-cipher-coverage and out of this row's text:
+  getCiphers() answers 55 names where the host answers 130; aes-128-ccm and aes-128-ocb are listed
+  but refused with ERR_CRYPTO_INVALID_AUTH_TAG where the host takes an authTagLength and answers
+  ciphertext and a tag of the length asked for; camellia-128-cbc and sm4-cbc are
+  ERR_CRYPTO_UNKNOWN_CIPHER here where the host encrypts.
