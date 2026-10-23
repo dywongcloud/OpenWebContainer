@@ -170,7 +170,9 @@ function netListenHub(host) {
 /** A Node-shaped system error: 'listen EADDRINUSE: address already in use 127.0.0.1:80', 'connect ECONNREFUSED ...'. */
 function netSystemError(cause, syscall, address, port) {
   var code = cause && typeof cause.code === 'string' ? cause.code : 'ERR_NET_FAILURE';
-  var where = port === undefined ? address : address + ':' + port;
+  /* Port -1 is what host Node reports on a unix bind that failed: it names no port, so none is
+     printed in the message, but err.port still carries it. */
+  var where = port === undefined || port < 0 ? address : address + ':' + port;
   /* Port 0 is not a destination, so the kernel's EADDRNOTAVAIL names no peer port: Node reports
      'connect EADDRNOTAVAIL 127.0.0.1' and leaves err.port unset. (Node appends the local address
      its socket had already bound, '- Local (0.0.0.0:53326)', whose port is the host's own
@@ -553,6 +555,13 @@ BF['net'] = function () {
     _doConnectPath(path) {
       var res;
       try {
+        /* A path the hub does not carry -- one with no separator in it -- has nothing bound at it
+           either, so the answer is the ENOENT host Node reports (connect('x.sock'),
+           connect('localhost')), not a dial that reads the name as an address and refuses it
+           ENETUNREACH or EADDRNOTAVAIL. */
+        if (netIsPath(path) === undefined) {
+          throw Object.assign(new Error('connect ENOENT ' + path), { code: 'ENOENT', errno: -2 });
+        }
         res = callCap('net.connect', { address: path, port: 0, targetId: this._targetId });
       } catch (cause) {
         var refused = netSystemError(cause, 'connect', path);
@@ -1270,11 +1279,15 @@ BF['net'] = function () {
          path is the hub's own name for the binding, not an entry in the filesystem. */
       var named = args.path !== undefined && args.path !== null ? String(args.path) : undefined;
       var path = netIsPath(named);
-      /* A path with no separator in it is not one the hub carries, so it is read as a port and
-         refused there, which is what this runtime answered before a path was carried at all. */
-      var port = path !== undefined
+      /* A port named alongside a path wins, as it does on host Node 24.15: a listen of
+         {path:'/tmp/x', port:8080} binds the TCP port and ignores the path, where a path named
+         alone binds the socket. A path with no separator in it is not one the hub carries, so it
+         is read as a port and refused there, which is what this runtime answered before a path
+         was carried at all. */
+      var usePath = path !== undefined && args.port === undefined;
+      var port = usePath
         ? 0
-        : netPortOf(named !== undefined ? named : (args.port === undefined ? 0 : args.port));
+        : netPortOf(args.port !== undefined ? args.port : (named !== undefined ? named : 0));
       if (this._targetId === undefined) {
         var target = this;
         this._targetId = createTarget(function (name, payload) {
@@ -1284,16 +1297,16 @@ BF['net'] = function () {
       /* A server told to bind 'localhost' binds the address this host's own lookup gives the name,
          which is ::1 (Node 24.15, verified). dgram keeps the IPv4 answer its family asks for, so the
          name is resolved here and not in netListenDisplay, which both bind paths share. */
-      var shown = path !== undefined
+      var shown = usePath
         ? path
         : (typeof args.host === 'string' && args.host.toLowerCase() === 'localhost'
           ? '::1'
           : netListenDisplay(args.host));
       var res;
       try {
-        res = callCap('net.listen', { address: path !== undefined ? path : netListenHub(shown), port: port, targetId: this._targetId });
+        res = callCap('net.listen', { address: usePath ? path : netListenHub(shown), port: port, targetId: this._targetId });
       } catch (cause) {
-        var failed = netSystemError(cause, 'listen', shown, path !== undefined ? undefined : port);
+        var failed = netSystemError(cause, 'listen', shown, usePath ? -1 : port);
         var failedServer = this;
         netDefer(function () { failedServer.emit('error', failed); });
         return this;
@@ -1301,7 +1314,7 @@ BF['net'] = function () {
       this._handleId = res.id;
       this._listening = true;
       /* A unix listener's address() is the path itself, a plain string, as Node reports it. */
-      this._address = path !== undefined ? res.address : { address: shown, family: netFamilyName(shown), port: res.port };
+      this._address = usePath ? res.address : { address: shown, family: netFamilyName(shown), port: res.port };
       netRefresh(this);
       if (typeof args.cb === 'function') this.once('listening', args.cb);
       var listeningServer = this;
@@ -1327,7 +1340,9 @@ BF['net'] = function () {
         }
         this._listening = false;
         this._handleId = undefined;
-        this._address = null;
+        /* A closed TCP listener answers address() with null, but a unix listener keeps answering
+           with the path it was bound at, as host Node 24.15 does after a close. */
+        if (typeof this._address !== 'string') this._address = null;
         netRefresh(this);
       }
       this._emitCloseIfDrained();
@@ -1335,10 +1350,11 @@ BF['net'] = function () {
     }
 
     address() {
-      if (!this._listening || !this._address) return null;
       /* A unix listener's address is the path it is bound at: Node answers with the path itself, a
-         plain string, and not with the address/family/port triple a TCP listener gives. */
+         plain string, and not with the address/family/port triple a TCP listener gives -- and it
+         keeps answering with it after a close, where a closed TCP listener answers null. */
       if (typeof this._address === 'string') return this._address;
+      if (!this._listening || !this._address) return null;
       return { address: this._address.address, family: this._address.family, port: this._address.port };
     }
 
@@ -1693,7 +1709,11 @@ BF['dgram'] = function () {
       var args = netBindArgs(arguments);
       if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
       if (this._bound) throw netError(Error, 'ERR_SOCKET_ALREADY_BOUND', 'Socket is already bound');
-      var port = args.port === undefined ? 0 : netPortOf(args.port);
+      /* A dgram bind coerces what it cannot read as a port to 0 rather than refusing it, as host
+         Node 24.15 does: bind('/tmp/x.sock') and bind('abc') bind an ephemeral UDP port
+         (0.0.0.0:55602 there), where a path meant as a unix socket is not a thing dgram opens. */
+      var port = args.port === undefined ? 0
+        : netPortOf(typeof args.port === 'string' && !/^\d+$/.test(args.port) ? 0 : args.port);
       var shown = args.address
         ? netListenDisplay(args.address)
         : (this._family === 'IPv6' ? '::' : '0.0.0.0');

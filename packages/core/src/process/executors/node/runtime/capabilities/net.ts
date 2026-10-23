@@ -9,6 +9,10 @@ const ERRNO: Record<string, number> = {
     ECONNREFUSED: -61,
     ENETUNREACH: -51,
     EBADF: -9,
+    /* The unix bind and dial the hub answers: a path nothing is bound at, and a path too long for a
+       `sockaddr_un`. Both carry the errno host Node reports, so `err.errno` is set for them too. */
+    ENOENT: -2,
+    EINVAL: -22,
 };
 
 /** Converts a hub failure into an error that the guest turns back into an Error with code, errno and syscall. */

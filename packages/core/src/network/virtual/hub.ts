@@ -36,8 +36,9 @@ export const HOST_PID = 0;
 
 const WILDCARD_ADDRESSES = new Set(['', '0.0.0.0', '::']);
 const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '::1']);
-/** Longest path a `sockaddr_un` holds on this platform (macOS): a longer bind is EINVAL. */
-const UNIX_PATH_MAX = 103;
+/** Longest path a `sockaddr_un` holds on this platform (macOS): a longer bind is EINVAL. Measured
+    against host Node 24.15, which binds a 104-byte path and refuses 105 with EINVAL. */
+const UNIX_PATH_MAX = 104;
 
 interface Endpoint {
     ownerPid: number;
