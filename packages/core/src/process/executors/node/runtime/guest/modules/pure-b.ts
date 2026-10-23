@@ -364,7 +364,17 @@ export const SRC = String.raw`
     }
     var decl = declaredNames(src);
     var scope = new Proxy(rec.sb, withHandler(rec, fnSet, decl));
-    return outOfRecord(rec, runWrapped.call(rec.G, scope, rewriteTypeof(src), fns, rec.sb));
+    var out;
+    try {
+      out = runWrapped.call(rec.G, scope, rewriteTypeof(src), fns, rec.sb);
+    } catch (thrown) {
+      /* A value the context throws out of itself crosses the way one it hands back does: an error of
+         another realm, so e instanceof Error is false in the catch of
+         vm.runInNewContext('throw new Error("x")'), as on host Node 24.15, with name and message and
+         the properties its constructor put on it still reading as they did inside the context. */
+      throw outOfRecord(rec, thrown);
+    }
+    return outOfRecord(rec, out);
   }
 
   /* A source this module compiles for a context gets the loader's compatibility rewrite, as a
@@ -506,9 +516,12 @@ export const SRC = String.raw`
       return timeout;
     }
 
-    function vmGuarded(options, run) {
+    /* rec is the context the run belongs to, and undefined for runInThisContext, whose code runs in
+       the caller's own realm: an error out of that one is the caller's, as on host Node 24.15. */
+    function vmGuarded(options, run, rec) {
       var timeout = vmTimeoutOf(options);
       if (timeout === undefined) return run();
+      function out(err) { return rec === undefined ? err : outOfRecord(rec, err); }
       var slot = null;
       api.vmThunk = function () {
         try { slot = { ok: true, value: run() }; } catch (err) { slot = { ok: false, error: err }; }
@@ -521,9 +534,11 @@ export const SRC = String.raw`
       }
       if (outcome.unbound) return run();
       if (outcome.interrupted) {
-        throw nodeError(Error, 'ERR_SCRIPT_EXECUTION_TIMEOUT', 'Script execution timed out after ' + timeout + 'ms');
+        /* Raised here rather than by the code that overran it, but host Node raises it in the
+           context's realm, so the caller reads e instanceof Error as false there too. */
+        throw out(nodeError(Error, 'ERR_SCRIPT_EXECUTION_TIMEOUT', 'Script execution timed out after ' + timeout + 'ms'));
       }
-      if (outcome.error !== undefined) throw new Error(outcome.error);
+      if (outcome.error !== undefined) throw out(new Error(outcome.error));
       if (slot.ok) return slot.value;
       throw slot.error;
     }
@@ -535,12 +550,12 @@ export const SRC = String.raw`
     Script.prototype.runInContext = function (contextifiedObject, options) {
       var rec = recordOf(contextifiedObject);
       var code = this._owcCode;
-      return vmGuarded(options, function () { return runInRecord(rec, code); });
+      return vmGuarded(options, function () { return runInRecord(rec, code); }, rec);
     };
     Script.prototype.runInNewContext = function (contextObject, options) {
       var rec = recordOf(createContextObject(contextObject));
       var code = this._owcCode;
-      return vmGuarded(options, function () { return runInRecord(rec, code); });
+      return vmGuarded(options, function () { return runInRecord(rec, code); }, rec);
     };
     Script.prototype.createCachedData = function () {
       return typeof Buffer !== 'undefined' ? Buffer.alloc(0) : new Uint8Array(0);
@@ -640,6 +655,24 @@ export const SRC = String.raw`
       }
     }
 
+    /*
+     * Set the domain a callback runs with as its context without entering it: no push onto the
+     * stack, so exit() is not what undoes this and _owcEntered stays false. A microtask queued
+     * inside d.run() is the case -- host node 24.15 reads process.domain as d inside it and
+     * hasUncaughtExceptionCaptureCallback() as true, with the domain long exited. Returns the
+     * domain that was there before, which is what a caller restores.
+     */
+    function setDomainContext(d) {
+      var proc = typeof process === 'object' && process !== null ? process : null;
+      if (!proc) return undefined;
+      var prior = proc.domain;
+      setActive(d);
+      return prior;
+    }
+    if (typeof process === 'object' && process !== null && typeof process._owcSetDomainContext !== 'function') {
+      Object.defineProperty(process, '_owcSetDomainContext', { value: setDomainContext, writable: true, configurable: true });
+    }
+
     /* what the capture callback above would do with an error no caller is going to receive */
     function captureUncaught(err) {
       var dom = exp.active;
@@ -716,24 +749,47 @@ export const SRC = String.raw`
      * the outer one, and a timer that fires afterwards runs outside the domain. err.domain is the
      * domain and domainThrown true, as on a host.
      *
-     * False when this domain has no 'error' listener: node falls through to the process then, so a
-     * domain entered with no listener of its own prints the 'uncaughtException' handler instead,
-     * and one with no handler at all ends the process.
+     * False when no domain in the chain has an 'error' listener: node falls through to the process
+     * then, so a domain entered with no listener of its own -- and no enclosing one that has one --
+     * prints the 'uncaughtException' handler instead, and one with no handler at all ends the
+     * process.
      */
     function uncaughtInDomain(self, err) {
-      if (self.listenerCount('error') === 0) return false;
-      self.exit();
-      if (isObjectLike(err)) {
-        Object.defineProperty(err, 'domain', { value: self, writable: true, configurable: true });
-        err.domainThrown = true;
+      /*
+       * Walk outward for a domain that listens: host node 24.15 does not stop at the innermost
+       * one. An inner domain with no 'error' listener run inside an outer one that has one prints
+       * the outer handler, not 'uncaughtException' -- measured. A domain that is only the async
+       * context, not on the stack, is its own one-entry chain, which is the unhandled-rejection
+       * path: it still handles the error.
+       */
+      var index = stack.lastIndexOf(self);
+      var chain = index === -1 ? [self] : stack.slice(0, index + 1).reverse();
+      for (var i = 0; i < chain.length; i++) {
+        var dom = chain[i];
+        if (dom.listenerCount('error') === 0) continue;
+        var at = stack.lastIndexOf(dom);
+        if (at !== -1) {
+          stack.splice(at);
+          setActive(at === 0 ? undefined : stack[at - 1]);
+        }
+        if (isObjectLike(err)) {
+          Object.defineProperty(err, 'domain', { value: dom, writable: true, configurable: true });
+          err.domainThrown = true;
+        }
+        dom.emit('error', err);
+        return true;
       }
-      self.emit('error', err);
-      return true;
+      return false;
     }
     /* the loader asks for this on process.domain: the one place an uncaught error is routed */
     Object.defineProperty(Domain.prototype, '_owcUncaught', {
       value: function (err) { return uncaughtInDomain(this, err); },
       writable: true,
+      configurable: true
+    });
+    /* whether this domain is on the enter/exit stack, which is what routes a fatal throw */
+    Object.defineProperty(Domain.prototype, '_owcEntered', {
+      get: function () { return stack.lastIndexOf(this) !== -1; },
       configurable: true
     });
 

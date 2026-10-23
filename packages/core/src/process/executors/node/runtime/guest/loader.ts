@@ -969,24 +969,49 @@ function drainTicks() {
 /*
  * queueMicrotask is not a promise reaction a domain binds, so the callback is not bound when it is
  * queued and the reaction that runs it is queued with the engine's own then, taken before the
- * domain module patches it: an error it throws is routed by the domain that is active when it is
- * thrown, not by one that was active when it was queued. Measured on host node 24.15 -- queued
- * inside d.run(), whose exit has run by the time the job does, a throw reaches 'uncaughtException'
- * (and ends the process when there is none); queued while a domain is still entered, it reaches
- * that domain.
+ * domain module patches it. The job is not what enters the domain, though: it runs with the domain
+ * that was active when it was queued as its async context, which is what host node 24.15 measures
+ * -- queued inside d.run(), whose exit has run by the time the job does, process.domain is still d
+ * and process.hasUncaughtExceptionCaptureCallback() is still true inside it.
+ *
+ * Routing is the other half and follows the enter/exit stack, not that context: a throw out of a
+ * microtask queued inside d.run() reaches 'uncaughtException' (and ends the process when there is
+ * none), while one queued while a domain is still entered reaches that domain.
  */
 var ENGINE_THEN = Promise.prototype.then;
 
+/* the domain a job runs with as its context: set without entering it, so no stack is touched */
+function setDomainContext(dom) {
+  var proc = globalThis.process;
+  if (!proc || typeof proc._owcSetDomainContext !== 'function') return undefined;
+  return proc._owcSetDomainContext(dom);
+}
+
 function queueMicrotaskImpl(fn) {
   if (typeof fn !== 'function') throw new TypeError('The "callback" argument must be of type function');
+  var proc = globalThis.process;
+  var dom = proc ? proc.domain : null;
   var ctx = captureAsyncContext();
   ENGINE_THEN.call(Promise.resolve(), function () {
+    var prior = dom ? setDomainContext(dom) : undefined;
     try {
       runInAsyncContext(ctx, function () {
         fn();
       });
     } catch (err) {
-      uncaughtFromCallback(err);
+      if (dom && dom._owcEntered !== true) {
+        /* the domain is only this job's context: the fatal path asks the process, not the domain */
+        setDomainContext(null);
+        try {
+          uncaughtFromCallback(err);
+        } finally {
+          setDomainContext(dom);
+        }
+      } else {
+        uncaughtFromCallback(err);
+      }
+    } finally {
+      if (dom) setDomainContext(prior);
     }
   });
 }
