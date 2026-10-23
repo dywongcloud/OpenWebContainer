@@ -1029,6 +1029,16 @@ function clearTimer(t) {
 }
 
 function fireTimer(id) {
+  /*
+   * The idle domain value a nested uncaught route leaves behind: see the note in uncaughtInDomain
+   * in pure-b.ts. It is spent here and not at the route, because a nextTick queued before the throw
+   * runs first and reads the null the route itself wrote.
+   */
+  var proc = globalThis.process;
+  if (proc && proc._owcIdleUndefined === true) {
+    proc._owcIdleUndefined = false;
+    if (typeof proc._owcSetDomainContext === 'function') proc._owcSetDomainContext(undefined);
+  }
   var t = timers[id];
   if (!t) return;
   if (t.repeat) {
@@ -1093,6 +1103,13 @@ function reportUncaught(err) {
 }
 
 /*
+ * The two hooks the domain module puts on every instance it builds, under symbol keys so that a
+ * domain's own names stay host node 24.15's: see the note at BF.domain in pure-b.ts.
+ */
+var DOMAIN_UNCAUGHT = Symbol.for('owc.domain.uncaught');
+var DOMAIN_ENTERED = Symbol.for('owc.domain.entered');
+
+/*
  * An 'uncaughtException' listener, given an error no caller is going to receive: true once one has
  * run, and true as well when the listener itself throws something other than the exit signal, since
  * node lets that one end the process too. The listener is counted when the error is in hand and not
@@ -1108,9 +1125,9 @@ function reportUncaught(err) {
 function emitUncaught(err) {
   var proc = globalThis.process;
   var dom = proc ? proc.domain : null;
-  if (dom && typeof dom._owcUncaught === 'function') {
+  if (dom && typeof dom[DOMAIN_UNCAUGHT] === 'function') {
     try {
-      if (dom._owcUncaught(err)) return true;
+      if (dom[DOMAIN_UNCAUGHT](err)) return true;
     } catch (again) {
       /* a handler that ends the process throws the exit signal, as an uncaughtException one may */
       if (again !== EXIT_SIGNAL) throw again;
@@ -1177,7 +1194,7 @@ function queueMicrotaskImpl(fn) {
         fn();
       });
     } catch (err) {
-      if (dom && dom._owcEntered !== true) {
+      if (dom && dom[DOMAIN_ENTERED] !== true) {
         /* the domain is only this job's context: the fatal path asks the process, not the domain */
         setDomainContext(null);
         try {

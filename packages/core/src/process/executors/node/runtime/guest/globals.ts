@@ -487,6 +487,29 @@ function pidOf(pid) {
   }
   throw badPidFor(pid);
 }
+/* The names a listener has been registered for at some point, whether or not one is registered for
+   them now. Registering one is what changes the signal's disposition on a host, and taking the last
+   listener away does not put node's own disposition back but the host's -- see
+   DEFAULT_IGNORED_SIGNALS -- so a kill has to know the difference. The emitter itself forgets the
+   name as soon as the last listener goes, so registration is recorded here, on the one object a
+   program registers signal listeners on. */
+var SIGNALS_LISTENED_FOR = Object.create(null);
+(function () {
+  var methods = ['on', 'addListener', 'once', 'prependListener', 'prependOnceListener'];
+  for (var i = 0; i < methods.length; i++) {
+    (function (method) {
+      var inner = proc[method];
+      Object.defineProperty(proc, method, {
+        value: function (name) {
+          var named = nameOfSignal(name);
+          if (named !== undefined) SIGNALS_LISTENED_FOR[named] = 1;
+          return inner.apply(this, arguments);
+        },
+        writable: true, configurable: true, enumerable: false
+      });
+    })(methods[i]);
+  }
+})();
 function einvalFor(signal) {
   var bad = new Error('kill EINVAL');
   bad.code = 'EINVAL';
@@ -496,11 +519,12 @@ function einvalFor(signal) {
 }
 proc.kill = function (pid, signal) {
   var num = pidOf(pid);
-  /* undefined is the one signal a caller leaves out, and it means SIGTERM. Every other falsy one
-     -- '', null, false, NaN and 0 -- is the null signal on a host: it asks only whether the
-     process is there and answers true, which is what process.kill(pid, '') measures. */
-  var spec = signal === undefined ? 'SIGTERM' : signal;
-  if (spec !== undefined && !spec) spec = 0;
+  /* undefined is the one signal a caller leaves out, and it means SIGTERM -- and so does every
+     other value a host reads as "no signal was named": '', null, false and NaN all end the process
+     with SIGTERM, measured against node 24.15 (exit 143 for each). The number 0 is not an absence
+     but the null signal: it asks only whether the process is there and answers true. -0 is that
+     same number, so it is the null signal too. */
+  var spec = signal === undefined || (!signal && signal !== 0) ? 'SIGTERM' : signal;
   /* Signal 0 is the null signal: it only asks whether the process is there, and never ends it.
      Node takes it as the number 0 -- the string '0' is not a name and is refused as unknown.
      Pid 0 is the process group, which is always there as far as a null signal is concerned. */
@@ -533,9 +557,16 @@ proc.kill = function (pid, signal) {
       return true;
     }
     /* Two defaults of Node's own: SIGUSR1 opens the inspector and leaves the process running, and
-       a name a host ignores is ignored here too. */
-    if (name === 'SIGUSR1') return true;
-    if (IGNORED_SIGNALS[name] !== undefined) return true;
+       a name a host ignores is ignored here too. Neither survives a listener having been registered
+       for the name and taken away again, which is the state SIGNALS_LISTENED_FOR records: the host
+       puts its own disposition back, so SIGUSR1 ends the process and SIGPIPE and SIGXFSZ, two names
+       node ignores at startup, end it as well. */
+    if (SIGNALS_LISTENED_FOR[name] === undefined) {
+      if (name === 'SIGUSR1') return true;
+      if (IGNORED_SIGNALS[name] !== undefined) return true;
+    } else if (DEFAULT_IGNORED_SIGNALS[name] !== undefined) {
+      return true;
+    }
     proc.exit(128 + SIGNAL_NUMBERS[name]);
     return true;
   }

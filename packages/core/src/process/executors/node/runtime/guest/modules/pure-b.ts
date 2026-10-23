@@ -1110,6 +1110,17 @@ export const SRC = String.raw`
     var EventEmitter = requireBuiltin('events');
     var stack = [];
     var exp = { active: null };
+    /*
+     * The two hooks the loader asks a domain for, as symbol-keyed properties of the instance:
+     * Object.getOwnPropertyNames of a fresh domain on host node 24.15 is
+     * _events,_eventsCount,_maxListeners,domain,members and nothing else, so they cannot be string
+     * keys of their own, and Domain.prototype there carries exactly _errorHandler, add, bind,
+     * constructor, enter, exit, intercept, members, remove and run -- ten names -- so they cannot
+     * live there either. Symbol.for is the same symbol in every script of this realm, which is how
+     * the loader reaches them.
+     */
+    var DOMAIN_UNCAUGHT = Symbol.for('owc.domain.uncaught');
+    var DOMAIN_ENTERED = Symbol.for('owc.domain.entered');
 
     /*
      * The stack of entered domains, outermost first, as Node exposes it: domain._stack is the
@@ -1147,21 +1158,33 @@ export const SRC = String.raw`
       };
     }
 
+    /*
+     * Node's own updateExceptionCapture (lib/domain.js), run on every enter, every exit, every
+     * clear and on the 'newListener' and 'removeListener' events of every domain: the uncaught-
+     * exception capture callback is registered only while a domain on the stack listens for
+     * 'error', and it is dropped otherwise. Two measurements hang on the exact moment it runs.
+     * The event fires *before* the listener is added, so a domain that is entered and only then
+     * given an 'error' listener still answers hasUncaughtExceptionCaptureCallback() false --
+     * d.enter(); d.on('error', fn) is false on host node 24.15 and was true here. And a domain
+     * entered with no 'error' listener of its own keeps the callback off, which is what sends the
+     * error on to an 'uncaughtException' listener instead.
+     */
+    function updateExceptionCapture() {
+      if (typeof process !== 'object' || process === null) return;
+      if (typeof process.setUncaughtExceptionCaptureCallback !== 'function') return;
+      var listening = false;
+      for (var i = 0; i < stack.length; i++) {
+        if (stack[i].listenerCount('error') !== 0) { listening = true; break; }
+      }
+      process.setUncaughtExceptionCaptureCallback(null);
+      if (listening) process.setUncaughtExceptionCaptureCallback(captureUncaught);
+    }
+
     function setActive(d) {
       exp.active = d;
       if (typeof process === 'object' && process !== null) {
         process.domain = d;
-        /*
-         * The uncaught-exception capture callback node registers for exactly as long as a domain is
-         * entered: measured on host node 24.15, process.hasUncaughtExceptionCaptureCallback() is
-         * false before d.run(), true inside it, true between enter() and exit(), and false again
-         * after. Nothing here calls the callback -- the path that would hand an error over is the
-         * host's, which reads no capture callback, so the loader routes an error with no caller by
-         * asking process.domain -- but registering it is what makes the predicate agree with a host.
-         */
-        if (typeof process.setUncaughtExceptionCaptureCallback === 'function') {
-          process.setUncaughtExceptionCaptureCallback(d ? captureUncaught : null);
-        }
+        updateExceptionCapture();
       }
     }
 
@@ -1194,29 +1217,42 @@ export const SRC = String.raw`
       EventEmitter.call(this);
       this.members = [];
       /*
-       * The two hooks the loader asks a domain for, as own non-enumerable properties of the
-       * instance and not as names on Domain.prototype: host node 24.15's Domain.prototype carries
-       * exactly _errorHandler, add, bind, constructor, enter, exit, intercept, members, remove and
-       * run (measured), so anything this container adds of its own has to live somewhere a program
-       * reading the prototype cannot see it.
+       * The two hooks the loader asks a domain for, under the symbol keys named above.
        */
       var self = this;
       /* node's own shape for a fresh domain: a non-enumerable, writable domain of null */
       Object.defineProperty(this, 'domain', { value: null, writable: true, enumerable: false, configurable: true });
-      Object.defineProperty(this, '_owcUncaught', {
+      Object.defineProperty(this, DOMAIN_UNCAUGHT, {
         value: function (err) { return uncaughtInDomain(self, err); },
         writable: true,
         configurable: true
       });
-      Object.defineProperty(this, '_owcEntered', {
+      Object.defineProperty(this, DOMAIN_ENTERED, {
         get: function () { return stack.lastIndexOf(self) !== -1; },
         configurable: true
       });
+      /*
+       * The two listeners node's own Domain constructor registers, and the reason a fresh domain on
+       * host node 24.15 is not the empty emitter this container used to build: _eventsCount is 2,
+       * eventNames() answers 'newListener,removeListener' and each has one listener, and adding an
+       * 'error' listener makes three. They are also what runs updateExceptionCapture whenever a
+       * listener comes or goes.
+       */
+      this.on('removeListener', updateExceptionCapture);
+      this.on('newListener', updateExceptionCapture);
     }
     Domain.prototype = Object.create(EventEmitter.prototype);
     Object.defineProperty(Domain.prototype, 'constructor', { value: Domain, writable: true, configurable: true });
     /* node's own shape: an enumerable, writable, configurable members with no value yet, shadowed by every instance */
     Domain.prototype.members = undefined;
+
+    /*
+     * The route an error with no caller takes, under the name host node 24.15 gives it: lib/domain.js
+     * puts _errorHandler on Domain.prototype and reaches it from process._fatalException. Host node
+     * 24.15 has no Domain.prototype.dispose at all -- it was removed -- and this container's own
+     * machinery is on the instance, so the prototype's own names are node's ten.
+     */
+    Domain.prototype._errorHandler = function (er) { return uncaughtInDomain(this, er); };
 
     Domain.prototype.enter = function () {
       stack.push(this);
@@ -1228,6 +1264,29 @@ export const SRC = String.raw`
       if (index === -1) return;
       stack.splice(index);
       setActive(stack.length === 0 ? undefined : stack[stack.length - 1]);
+    };
+
+    /*
+     * The order these names go onto the prototype is the one host node 24.15's own source gives
+     * them -- members, _errorHandler, enter, exit, add, remove, run, intercept, bind -- which is the
+     * order Object.keys(Domain.prototype) reads them in there.
+     */
+    Domain.prototype.add = function (ee) {
+      if (ee.domain === this) return;
+      if (ee.domain) ee.domain.remove(ee);
+      if (this.domain && ee instanceof Domain) {
+        for (var d = this.domain; d; d = d.domain) {
+          if (ee === d) return;
+        }
+      }
+      Object.defineProperty(ee, 'domain', { value: this, writable: true, configurable: true, enumerable: false });
+      this.members.push(ee);
+    };
+
+    Domain.prototype.remove = function (ee) {
+      ee.domain = null;
+      var index = this.members.indexOf(ee);
+      if (index !== -1) this.members.splice(index, 1);
     };
 
     /*
@@ -1309,6 +1368,21 @@ export const SRC = String.raw`
         }
         dom.emit('error', err);
         clearDomains();
+        /*
+         * The idle value host node 24.15 settles on is null -- that is what
+         * domainUncaughtExceptionClear writes -- with one shape excepted: when the domain that
+         * handled the error was the innermost of two or more that were entered, a later timer reads
+         * process.domain and domain.active as undefined, not null. Measured on host node 24.15:
+         * one domain entered, a later timer reads null (and so does a nextTick); two entered and the
+         * inner one handling it, the same timer reads undefined and so does every one after it;
+         * two entered with the *outer* one handling it -- the inner one has no 'error' listener --
+         * it reads null again. The undefined arrives after the ticks of the tick that ran the route
+         * -- a nextTick scheduled before the throw still reads null -- so the flag is left for the
+         * driver to spend when the next timer is due, which is where host node 24.15 has it.
+         */
+        if (i === 0 && index > 0 && typeof process === 'object' && process !== null) {
+          Object.defineProperty(process, '_owcIdleUndefined', { value: true, writable: true, configurable: true });
+        }
         return true;
       }
       /*
@@ -1329,16 +1403,6 @@ export const SRC = String.raw`
       return runInDomain(this, fn, this, Array.prototype.slice.call(arguments, 1));
     };
 
-    Domain.prototype.bind = function (cb) {
-      var self = this;
-      installDomainPromiseHook();
-      function runBound() {
-        return runInDomain(self, cb, this, Array.prototype.slice.call(arguments));
-      }
-      Object.defineProperty(runBound, 'domain', { value: this, writable: true, configurable: true });
-      return runBound;
-    };
-
     Domain.prototype.intercept = function (cb) {
       var self = this;
       function runIntercepted() {
@@ -1356,31 +1420,15 @@ export const SRC = String.raw`
       return runIntercepted;
     };
 
-    Domain.prototype.add = function (ee) {
-      if (ee.domain === this) return;
-      if (ee.domain) ee.domain.remove(ee);
-      if (this.domain && ee instanceof Domain) {
-        for (var d = this.domain; d; d = d.domain) {
-          if (ee === d) return;
-        }
+    Domain.prototype.bind = function (cb) {
+      var self = this;
+      installDomainPromiseHook();
+      function runBound() {
+        return runInDomain(self, cb, this, Array.prototype.slice.call(arguments));
       }
-      Object.defineProperty(ee, 'domain', { value: this, writable: true, configurable: true, enumerable: false });
-      this.members.push(ee);
+      Object.defineProperty(runBound, 'domain', { value: this, writable: true, configurable: true });
+      return runBound;
     };
-
-    Domain.prototype.remove = function (ee) {
-      ee.domain = null;
-      var index = this.members.indexOf(ee);
-      if (index !== -1) this.members.splice(index, 1);
-    };
-
-    /*
-     * The route an error with no caller takes, under the name host node 24.15 gives it: lib/domain.js
-     * puts _errorHandler on Domain.prototype and reaches it from process._fatalException. Host node
-     * 24.15 has no Domain.prototype.dispose at all -- it was removed -- and this container's own
-     * machinery is on the instance, so the prototype's own names are node's ten.
-     */
-    Domain.prototype._errorHandler = function (er) { return uncaughtInDomain(this, er); };
 
     // Emitters bound with add() route unhandled 'error' events to their domain.
     var eeEmit = EventEmitter.prototype.emit;
