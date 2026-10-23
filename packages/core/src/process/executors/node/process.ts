@@ -2805,7 +2805,20 @@ export class NodeProcess extends Process {
                 text = stripTsTypes(source);
             } catch (error) {
                 if (!(error instanceof TsUnsupported)) throw error;
-                throw new GuestFailure(tsUnsupportedText(source, file, error), true);
+                /* Node hands the importer of such a file the error itself -- a SyntaxError carrying
+                   ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX -- and prints the report only where nothing
+                   catches it. A file reached as a dependency therefore evaluates to a module that
+                   throws that error and carries the report beside it, which is what an uncaught one
+                   is written as; the entry, which has no importer to catch anything, is the report. */
+                const info = {
+                    ctor: 'SyntaxError',
+                    code: 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX',
+                    message: `TypeScript ${error.what} is not supported in strip-only mode`,
+                    whole: tsUnsupportedText(source, file, error),
+                    stack: tsUnsupportedFrame(source, file, error),
+                };
+                if (isMain) throw new GuestFailure(info.whole, true);
+                return errorModuleSource(ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify(info)));
             }
         }
         const duplicate = duplicateModuleBinding(text);
@@ -4334,12 +4347,7 @@ function stripTsTypes(source: string): string {
     return out;
 }
 
-/**
- * The report Node gives for a TypeScript construct its stripper will not rewrite: the internal
- * frame it throws through, the file and the line with the offending source underlined, and a
- * SyntaxError carrying ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX.
- */
-function tsUnsupportedText(source: string, file: string, info: TsUnsupported): string {
+function tsUnsupportedFrame(source: string, file: string, info: TsUnsupported): string {
     const lines = source.split('\n');
     const start = lineColumnOf(source, info.start);
     const end = lineColumnOf(source, Math.max(info.end - 1, info.start));
@@ -4350,11 +4358,18 @@ function tsUnsupportedText(source: string, file: string, info: TsUnsupported): s
         frame += ' '.repeat(Math.max(start.column - 1, 0))
             + '^'.repeat(Math.max(end.column - start.column + 1, 1)) + '\n';
     }
+    return `${toFileUrl(file)}:${start.line}\n` + frame;
+}
+/**
+ * The report Node gives for a TypeScript construct its stripper will not rewrite: the internal
+ * frame it throws through, the file and the line with the offending source underlined, and a
+ * SyntaxError carrying ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX.
+ */
+function tsUnsupportedText(source: string, file: string, info: TsUnsupported): string {
     return 'node:internal/modules/run_main:107\n'
         + '    triggerUncaughtException(\n'
         + '    ^\n\n'
-        + `${toFileUrl(file)}:${start.line}\n`
-        + frame
+        + tsUnsupportedFrame(source, file, info)
         + `\nSyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript ${info.what} is not supported`
         + ' in strip-only mode\n'
         + '    at parseTypeScript (node:internal/modules/typescript:68:40)\n'
@@ -4565,12 +4580,12 @@ function namedErrorSource(ctorName: string, message: string): string {
 }
 
 function errorModuleSource(name: string): string {
-    const info = JSON.parse(decodeURIComponent(name.slice(ERROR_MODULE_PREFIX.length))) as { code: string; message: string; ctor?: string; exports?: string[] };
+    const info = JSON.parse(decodeURIComponent(name.slice(ERROR_MODULE_PREFIX.length))) as { code: string; message: string; ctor?: string; exports?: string[]; whole?: string; stack?: string };
     /* The constructor Node builds the error with, which user code reads as `err.name`: most loader
        errors are TypeErrors, but an unknown module format is a RangeError and a path a URL cannot
        decode is a URIError, and neither is recoverable from a plain Error. */
     const ctorName = info.ctor === 'TypeError' || info.ctor === 'RangeError' || info.ctor === 'URIError'
-        || info.ctor === 'CompileError' ? info.ctor : 'Error';
+        || info.ctor === 'CompileError' || info.ctor === 'SyntaxError' ? info.ctor : 'Error';
     // the default export, and every name the importing declaration binds, exist so that a static
     // import links; evaluation of the module then throws, which is where Node raises these errors
     let source = 'export default undefined;\n';
@@ -4583,9 +4598,18 @@ function errorModuleSource(name: string): string {
        something a caller reads as one: an Error carrying the name, which is what `err.name` is
        read from here. */
     const built = ctorName === 'Error' || ctorName === 'TypeError' || ctorName === 'RangeError' || ctorName === 'URIError'
+        || ctorName === 'SyntaxError'
         ? `new ${ctorName}(${JSON.stringify(info.message)})`
         : namedErrorSource(ctorName, info.message);
-    return source + `throw Object.assign(${built}, { code: ${JSON.stringify(info.code)} });\n`;
+    /* The report Node writes when nothing catches the error, and the stack Node gives it, both of
+       which a module that is only loaded still has to carry: an importer that catches reads the
+       error, and one that does not is written as the report, not as a header and a stack. */
+    const marked = `Object.assign(${built}, { code: ${JSON.stringify(info.code)}`
+        + (info.whole === undefined ? ' }' : `, __owcWhole: ${JSON.stringify(info.whole)} }`) + ')';
+    const stacked = info.stack === undefined ? marked
+        : `(function (e) { try { Object.defineProperty(e, 'stack',`
+            + ` { value: ${JSON.stringify(info.stack)}, configurable: true }); } catch (x) {} return e; }(${marked}))`;
+    return source + `throw ${stacked};\n`;
 }
 
 /** Whether a specifier is a `data:` URL: the scheme is read case-insensitively, as a URL's is. */

@@ -26,7 +26,7 @@ export const BOOTSTRAP_SRC = [
     WASM_SRC,
     GLOBALS_SRC,
     ...MODULE_SRCS,
-    'Object.defineProperty(globalThis, "__owc_api", { value: api, enumerable: false });',
+    'OWC_BRIDGE.__owc_api = api;',
     'return api;',
     '})'
 ].join('\n');

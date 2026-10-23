@@ -22,6 +22,11 @@ function quoteStringLiteral(s) {
  * nothing. The empty line the engine ends every stack with is not one node writes.
  */
 function formatErrorStack(err) {
+  /* An error the host raised as the whole of what Node writes -- a module Node's stripper refuses
+     to rewrite, whose report is the internal frame, the source and the error, and not a header and
+     a stack -- carries that report with it, and it goes out as it stands: no name and colon go
+     in front of a report that already holds the line Node opens with. */
+  if (err && typeof err.__owcWhole === 'string') return err.__owcWhole;
   var header = String(err.name || 'Error') + (err.message ? ': ' + err.message : '');
   var stack = err.stack ? String(err.stack) : '';
   var lines = stack === '' ? [] : guestFramesOf(stack.split('\n'));
