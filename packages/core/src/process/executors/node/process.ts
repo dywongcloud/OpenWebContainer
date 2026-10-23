@@ -2416,6 +2416,9 @@ export class NodeProcess extends Process {
             this.drainJobs();
             const state = this.context!.getPromiseState(promise);
             if (state.type === 'rejected') throw this.guestFailure(state.error);
+            /* The same handle runEsmEntry frees, and for the same reason: a fulfilled state the
+               host still holds keeps the evaluated module's objects on the runtime's list. */
+            if (state.type === 'fulfilled' && state.notAPromise !== true && state.value.alive) state.value.dispose();
         } catch (error) {
             if (error instanceof GuestFailure) throw error;
         } finally {
@@ -2452,11 +2455,15 @@ export class NodeProcess extends Process {
         /* The drain can end the process -- an unhandled rejection, a fatal error -- and it throws
            when it does. The module's evaluation promise is a handle the host owns, and one it still
            holds when the runtime is freed keeps its object live, which is what QuickJS asserts on
-           at teardown (`list_empty(&rt->gc_obj_list)`): it is freed on the way out either way. */
+           at teardown (`list_empty(&rt->gc_obj_list)`): it is freed on the way out either way.
+           The state's own value is a second handle the host owns, and the one that keeps an entry
+           with a top-level await live: an exported object the module's namespace reads through is
+           what the fulfilled value holds, so it is freed here too. */
         try {
             this.drainJobs();
             const state = context.getPromiseState(promise);
             if (state.type === 'rejected') throw this.guestFailure(state.error);
+            if (state.type === 'fulfilled' && state.notAPromise !== true && state.value.alive) state.value.dispose();
         } catch (error) {
             if (error instanceof GuestFailure) throw error;
         } finally {
