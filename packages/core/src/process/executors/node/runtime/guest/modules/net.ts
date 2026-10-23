@@ -15,13 +15,16 @@
  *   required; otherwise it is a self-contained EventEmitter with the same surface.
  * - dgram accepts multicast, broadcast and reuse options but implements none of them. Two
  *   sockets cannot share a UDP port.
- * - Unix domain sockets are not supported.
+ * - Unix domain sockets are carried by path in the hub: `listen('/tmp/x')` and `connect('/tmp/x')`
+ *   meet there and a unix connection reports no address at either end, as Node's does. No inode is
+ *   created at the path, so the container's filesystem shows nothing there and a bind under a
+ *   directory that does not exist is not the host's EACCES.
  *
  * Plain JavaScript inside a String.raw snippet. Each family registers BF.net, BF.dgram.
  */
 export const SRC = String.raw`
 (function () {
-var NET_REASON_TEXT = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'address not available' };
+var NET_REASON_TEXT = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'address not available', EINVAL: 'invalid argument' };
 
 /** What a loopback socket absorbs before a write is still in flight when it is destroyed: Node's SO_SNDBUF. */
 var NET_SNDBUF = 262144;
@@ -293,6 +296,16 @@ function netConnectArgs(args) {
   return { port: first, host: typeof list[1] === 'string' ? list[1] : undefined, cb: cb };
 }
 
+/**
+ * The unix domain socket path an argument names, or undefined for a port or a host. Node reads a
+ * string that is not a number as a pipe path, so a listen of "/tmp/x" binds one; this runtime binds
+ * only a path that holds a separator, and leaves any other string to be read as a port, which is
+ * what it answered before a path was carried at all.
+ */
+function netIsPath(value) {
+  return typeof value === 'string' && value.indexOf('/') !== -1 ? value : undefined;
+}
+
 function netListenArgs(args) {
   var list = Array.prototype.slice.call(args);
   var cb = typeof list[list.length - 1] === 'function' ? list.pop() : undefined;
@@ -300,6 +313,8 @@ function netListenArgs(args) {
   if (first !== null && typeof first === 'object') {
     return { port: first.port, host: first.host, path: first.path, ipv6Only: first.ipv6Only, cb: cb };
   }
+  var asPath = netIsPath(first);
+  if (asPath !== undefined) return { path: asPath, cb: cb };
   return { port: first, host: typeof list[1] === 'string' ? list[1] : undefined, cb: cb };
 }
 
@@ -471,10 +486,12 @@ BF['net'] = function () {
       this.connecting = true;
       this._ensureTarget();
       netRefresh(this);
-      /* A pipe path names an IPC socket, which this runtime has none of: the way Node reports one it
-         could not open is an asynchronous 'error' carrying ENOENT, never a throw out of connect(). */
+      /* A pipe path names a unix domain socket the virtual hub carries by path. */
       if (args.path !== undefined) {
-        this.destroy(netSystemError({ code: 'ENOENT', errno: -2 }, 'connect', String(args.path)));
+        var dialled = String(args.path);
+        var dialler = this;
+        /* Node's connect is never synchronous, not even the answer it refuses with. */
+        netDefer(function () { dialler._doConnectPath(dialled); });
         return this;
       }
       var port = netPortOf(args.port);
@@ -529,6 +546,29 @@ BF['net'] = function () {
       var self = this;
       netDefer(function () { self.destroy(refused); });
       return;
+    }
+
+    /* Dials a unix domain socket by path. A path nothing is bound at is the kernel's ENOENT, which
+       is the error Node reports for it, and a connection it accepted has no addresses at all. */
+    _doConnectPath(path) {
+      var res;
+      try {
+        res = callCap('net.connect', { address: path, port: 0, targetId: this._targetId });
+      } catch (cause) {
+        var refused = netSystemError(cause, 'connect', path);
+        var self = this;
+        netDefer(function () { self.destroy(refused); });
+        return;
+      }
+      this._hubId = res.id;
+      this.localAddress = res.localAddress;
+      this.localPort = res.localPort;
+      this.localFamily = res.localAddress === undefined ? undefined : netFamilyName(res.localAddress);
+      this.remoteAddress = res.remoteAddress;
+      this.remotePort = res.remotePort;
+      this.remoteFamily = res.remoteAddress === undefined ? undefined : netFamilyName(res.remoteAddress);
+      netRefresh(this);
+      this._flushPending();
     }
 
     /* The third argument is the payload on the binary channel, an ArrayBuffer the host read out of
@@ -858,10 +898,11 @@ BF['net'] = function () {
       this._hubId = payload.connectionId;
       this.localAddress = payload.localAddress;
       this.localPort = payload.localPort;
-      this.localFamily = netFamilyName(payload.localAddress);
+      /* A unix connection carries no address, so it has no family to name either. */
+      this.localFamily = payload.localAddress === undefined ? undefined : netFamilyName(payload.localAddress);
       this.remoteAddress = payload.remoteAddress;
       this.remotePort = payload.remotePort;
-      this.remoteFamily = netFamilyName(payload.remoteAddress);
+      this.remoteFamily = payload.remoteAddress === undefined ? undefined : netFamilyName(payload.remoteAddress);
       netRefresh(this);
     }
 
@@ -1222,13 +1263,18 @@ BF['net'] = function () {
       if (this._listening) {
         throw netError(Error, 'ERR_SERVER_ALREADY_LISTEN', 'Listen method has been called more than once without closing.');
       }
-      /* A 'path' option names an IPC socket, and this runtime has none: it is refused exactly as the
-         string form is, rather than being dropped -- dropping it left the port at its default 0 and
-         bound a fabricated TCP wildcard ({"address":"::","family":"IPv6","port":49152}), so a listen
-         that had no address at all reported success. */
-      var port = args.path !== undefined
-        ? netPortOf(args.path)
-        : (args.port === undefined ? 0 : netPortOf(args.port));
+      /* A 'path' option names a unix domain socket, which the virtual hub carries by path: the
+         socket binds, accepts and connects as the host's does, and reports no address, because a
+         unix connection has none. What the hub does not do is put a file at the path -- no inode is
+         created there, and a bind under a directory that does not exist is not refused -- so the
+         path is the hub's own name for the binding, not an entry in the filesystem. */
+      var named = args.path !== undefined && args.path !== null ? String(args.path) : undefined;
+      var path = netIsPath(named);
+      /* A path with no separator in it is not one the hub carries, so it is read as a port and
+         refused there, which is what this runtime answered before a path was carried at all. */
+      var port = path !== undefined
+        ? 0
+        : netPortOf(named !== undefined ? named : (args.port === undefined ? 0 : args.port));
       if (this._targetId === undefined) {
         var target = this;
         this._targetId = createTarget(function (name, payload) {
@@ -1238,21 +1284,24 @@ BF['net'] = function () {
       /* A server told to bind 'localhost' binds the address this host's own lookup gives the name,
          which is ::1 (Node 24.15, verified). dgram keeps the IPv4 answer its family asks for, so the
          name is resolved here and not in netListenDisplay, which both bind paths share. */
-      var shown = typeof args.host === 'string' && args.host.toLowerCase() === 'localhost'
-        ? '::1'
-        : netListenDisplay(args.host);
+      var shown = path !== undefined
+        ? path
+        : (typeof args.host === 'string' && args.host.toLowerCase() === 'localhost'
+          ? '::1'
+          : netListenDisplay(args.host));
       var res;
       try {
-        res = callCap('net.listen', { address: netListenHub(shown), port: port, targetId: this._targetId });
+        res = callCap('net.listen', { address: path !== undefined ? path : netListenHub(shown), port: port, targetId: this._targetId });
       } catch (cause) {
-        var failed = netSystemError(cause, 'listen', shown, port);
+        var failed = netSystemError(cause, 'listen', shown, path !== undefined ? undefined : port);
         var failedServer = this;
         netDefer(function () { failedServer.emit('error', failed); });
         return this;
       }
       this._handleId = res.id;
       this._listening = true;
-      this._address = { address: shown, family: netFamilyName(shown), port: res.port };
+      /* A unix listener's address() is the path itself, a plain string, as Node reports it. */
+      this._address = path !== undefined ? res.address : { address: shown, family: netFamilyName(shown), port: res.port };
       netRefresh(this);
       if (typeof args.cb === 'function') this.once('listening', args.cb);
       var listeningServer = this;
@@ -1287,6 +1336,9 @@ BF['net'] = function () {
 
     address() {
       if (!this._listening || !this._address) return null;
+      /* A unix listener's address is the path it is bound at: Node answers with the path itself, a
+         plain string, and not with the address/family/port triple a TCP listener gives. */
+      if (typeof this._address === 'string') return this._address;
       return { address: this._address.address, family: this._address.family, port: this._address.port };
     }
 
@@ -1329,10 +1381,10 @@ BF['net'] = function () {
         this.emit('drop', {
           localAddress: payload.localAddress,
           localPort: payload.localPort,
-          localFamily: netFamilyName(payload.localAddress),
+          localFamily: payload.localAddress === undefined ? undefined : netFamilyName(payload.localAddress),
           remoteAddress: payload.remoteAddress,
           remotePort: payload.remotePort,
-          remoteFamily: netFamilyName(payload.remoteAddress),
+          remoteFamily: payload.remoteAddress === undefined ? undefined : netFamilyName(payload.remoteAddress),
         });
         return;
       }

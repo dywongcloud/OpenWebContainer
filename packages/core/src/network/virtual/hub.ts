@@ -36,6 +36,8 @@ export const HOST_PID = 0;
 
 const WILDCARD_ADDRESSES = new Set(['', '0.0.0.0', '::']);
 const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '::1']);
+/** Longest path a `sockaddr_un` holds on this platform (macOS): a longer bind is EINVAL. */
+const UNIX_PATH_MAX = 103;
 
 interface Endpoint {
     ownerPid: number;
@@ -53,6 +55,8 @@ interface Listener {
     address: string;
     port: number;
     targetId: number;
+    /** Set for a unix domain socket: the path it is bound at, which is also its `address`. */
+    path?: string;
 }
 
 interface Connection {
@@ -62,6 +66,8 @@ interface Connection {
     closed: boolean;
     /** This side has sent its end-of-stream (half-close). */
     writeEnded: boolean;
+    /** Set for a unix domain socket: the path the connection was made over. */
+    path?: string;
     /** Server side: the listener that accepted it. */
     listenerId?: number;
     /** Server side: its 'connection' event is not delivered yet, so its owner may still attach it. */
@@ -100,10 +106,11 @@ export interface ConnectRequest {
 
 export interface ConnectResult {
     id: number;
-    localAddress: string;
-    localPort: number;
-    remoteAddress: string;
-    remotePort: number;
+    /* A unix connection has no addresses: both of its ends report none, as Node's do. */
+    localAddress?: string;
+    localPort?: number;
+    remoteAddress?: string;
+    remotePort?: number;
 }
 
 export class VirtualNetworkError extends Error {
@@ -134,6 +141,8 @@ export class VirtualNetwork {
     private listeners = new Map<number, Listener>();
     private udpSockets = new Map<number, Listener>();
     private connections = new Map<number, Connection>();
+    /** Unix domain socket bindings, by the path they are bound at. */
+    private unixSockets = new Map<string, Listener>();
     private hosts = new Map<string, string>();
     private hostSink?: VirtualSink;
     private nextId = 1;
@@ -165,6 +174,8 @@ export class VirtualNetwork {
      */
     listen(request: ListenRequest): ListenResult {
         const protocol = request.protocol;
+        const path = unixPathOf(request.address);
+        if (path !== undefined) return this.listenUnix(request, path);
         const address = this.hubAddress(request.address);
         /* A caller that names no family is binding by address, so the family follows the address:
            '::1' is an IPv6 bind. Both wildcards fold to '', so the family is read from the address
@@ -185,10 +196,41 @@ export class VirtualNetwork {
     }
 
     /**
+     * Binds a unix domain socket at a path, the loopback's IPC form. A path already bound is
+     * EADDRINUSE, and one longer than the platform's `sockaddr_un.sun_path` is EINVAL, both as the
+     * kernel answers them. The binding lives in the hub alone: whether a file appears at the path is
+     * the filesystem's business, and this hub holds no inode of its own.
+     */
+    private listenUnix(request: ListenRequest, path: string): ListenResult {
+        if (path.length > UNIX_PATH_MAX) {
+            throw new VirtualNetworkError('EINVAL', `invalid argument ${path}`);
+        }
+        if (this.unixSockets.has(path)) {
+            throw new VirtualNetworkError('EADDRINUSE', `address already in use ${path}`);
+        }
+        const id = this.nextId++;
+        const listener: Listener = {
+            id,
+            ownerPid: request.ownerPid,
+            protocol: request.protocol,
+            family: 'IPv4',
+            address: path,
+            port: 0,
+            targetId: request.targetId,
+            path,
+        };
+        this.listeners.set(id, listener);
+        this.unixSockets.set(path, listener);
+        return { id, address: path, port: 0 };
+    }
+
+    /**
      * Closes a listener. The connections it accepted that are not attached yet are destroyed, so their
      * peers get end and close (Node resets a closing listener's backlog instead).
      */
     closeListener(id: number): void {
+        const listener = this.listeners.get(id);
+        if (listener?.path !== undefined) this.unixSockets.delete(listener.path);
         this.listeners.delete(id);
         for (const connection of [...this.connections.values()]) {
             if (connection.listenerId === id && connection.local.targetId === undefined) this.destroy(connection.id);
@@ -201,6 +243,8 @@ export class VirtualNetwork {
 
     /** Opens a loopback TCP connection to a listener; both ends receive their events asynchronously. */
     connect(request: ConnectRequest): ConnectResult {
+        const path = unixPathOf(request.address);
+        if (path !== undefined) return this.connectUnix(request, path);
         /* An IPv4-mapped IPv6 literal ('::ffff:127.0.0.1') is the loopback under its IPv6 spelling:
            the kernel connects to the IPv4 address it embeds, so that is the peer the hub routes to --
            and isLocal must see it as local, or the dial is refused ENETUNREACH before a listener is
@@ -271,6 +315,44 @@ export class VirtualNetwork {
             remoteAddress: displayAddress(destination),
             remotePort: request.port,
         };
+    }
+
+    /**
+     * Opens a connection to a unix domain socket. A path nothing is bound at is ENOENT -- the kernel's
+     * own answer for a connect to a path that is not there, which is how Node reports it -- and the
+     * connection carries no addresses at either of its ends, since a unix socket has none.
+     */
+    private connectUnix(request: ConnectRequest, path: string): ConnectResult {
+        const listener = this.unixSockets.get(path);
+        if (!listener) {
+            throw new VirtualNetworkError('ENOENT', `connect ENOENT ${path}`);
+        }
+        const client: Connection = {
+            id: this.nextId++,
+            local: { ownerPid: request.ownerPid, address: '', port: 0, targetId: request.targetId, pending: [] },
+            closed: false,
+            writeEnded: false,
+            connectPending: true,
+            path,
+        };
+        const server: Connection = {
+            id: this.nextId++,
+            local: { ownerPid: listener.ownerPid, address: '', port: 0, pending: [] },
+            closed: false,
+            writeEnded: false,
+            listenerId: listener.id,
+            offerPending: true,
+            path,
+        };
+        client.remote = server;
+        server.remote = client;
+        this.connections.set(client.id, client);
+        this.connections.set(server.id, server);
+        this.schedule(request.ownerPid, request.targetId, 'connect', { connectionId: client.id }, undefined, () => {
+            if (this.connections.get(client.id) === client) client.connectPending = false;
+        });
+        this.offer(server, listener, { connectionId: server.id, path });
+        return { id: client.id };
     }
 
     /**
@@ -379,7 +461,9 @@ export class VirtualNetwork {
     /** Tears down everything a process owns (call when it exits): listeners, UDP sockets and connections. */
     releaseOwner(pid: number): void {
         for (const listener of [...this.listeners.values()]) {
-            if (listener.ownerPid === pid) this.listeners.delete(listener.id);
+            if (listener.ownerPid !== pid) continue;
+            if (listener.path !== undefined) this.unixSockets.delete(listener.path);
+            this.listeners.delete(listener.id);
         }
         for (const socket of [...this.udpSockets.values()]) {
             if (socket.ownerPid === pid) this.udpSockets.delete(socket.id);
@@ -408,6 +492,8 @@ export class VirtualNetwork {
             .sort((a, b) => a.id - b.id)
             .map((connection) => {
                 const peer = connection.remote as Connection;
+                /* A unix connection is named by its path at both ends: it has no addresses to print. */
+                if (connection.path !== undefined) return { local: connection.path, remote: connection.path };
                 addresses.add(displayAddress(connection.local.address));
                 addresses.add(displayAddress(peer.local.address));
                 return { local: endpointText(connection.local), remote: endpointText(peer.local) };
@@ -489,6 +575,8 @@ export class VirtualNetwork {
         let wildcard: Listener | undefined;
         for (const candidate of table.values()) {
             if (candidate.port !== port) continue;
+            /* A unix binding is not an internet endpoint: it is reached by path, never by port. */
+            if (candidate.path !== undefined) continue;
             if (protocol === 'udp') {
                 if (candidate.family !== family) continue;
             } else if (candidate.address === '' && !wildcardTakes(candidate, family)) {
@@ -505,6 +593,7 @@ export class VirtualNetwork {
         const table = protocol === 'tcp' ? this.listeners : this.udpSockets;
         for (const other of table.values()) {
             if (other.port !== port) continue;
+            if (other.path !== undefined) continue;
             if (protocol === 'udp') {
                 if (other.family !== family) continue;
                 if (other.address === address || other.address === '' || address === '') return true;
@@ -571,6 +660,16 @@ function v4MappedOf(address: string | undefined): string | null {
     const match = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(address);
     if (match === null) return null;
     return match[1].split('.').every((part) => Number(part) <= 255) ? match[1] : null;
+}
+
+/**
+ * The unix domain socket path an address names, or undefined for an internet address. Node takes a
+ * non-numeric string as a pipe path, so any bind or dial address holding a separator is a path; it is
+ * read before the address is folded or lower-cased, because a path is case-sensitive where an address
+ * is not.
+ */
+function unixPathOf(address: string | undefined): string | undefined {
+    return typeof address === 'string' && address.includes('/') ? address : undefined;
 }
 
 function displayAddress(address: string): string {
