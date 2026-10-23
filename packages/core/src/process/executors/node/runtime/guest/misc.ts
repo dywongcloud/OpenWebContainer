@@ -5180,8 +5180,15 @@ BF.module = function () {
      points answer the way node's do when its own cache is off -- DISABLED, no directory, nothing
      to flush -- and the status is read off the frozen table above rather than written twice. */
   /* The directory a caller names is one no cache can be written into, so the status stays DISABLED
-     whichever it is; the parameter is node's own arity, which is 1. */
+     whichever it is; the parameter is node's own arity, which is 1. The argument itself is still
+     checked the way node checks it -- node raises ERR_INVALID_ARG_TYPE, a TypeError, for anything
+     that is neither a string nor absent, and its message names the parameter alone. */
   Module.enableCompileCache = function enableCompileCache(cacheDir) {
+    if (cacheDir !== undefined && typeof cacheDir !== 'string') {
+      var badCacheDir = new TypeError('cacheDir should be a string');
+      badCacheDir.code = 'ERR_INVALID_ARG_TYPE';
+      throw badCacheDir;
+    }
     return { status: Module.constants.compileCacheStatus.DISABLED, directory: undefined };
   };
   Module.flushCompileCache = function flushCompileCache() { return undefined; };
@@ -5270,9 +5277,13 @@ BF.module = function () {
    * owc-module-export-table-incomplete.
    */
   var moduleParents = typeof WeakMap === 'function' ? new WeakMap() : null;
+  /* 'parent' is a getter/setter over a weak map, so a module the loader builds carries the one it
+     was given without owning a key for it; the class require('module') hands out stores it under
+     the symbol node's own constructor writes instead, so the getter reads that too. */
   Object.defineProperty(Module.prototype, 'parent', {
     get: function getParent() {
-      return moduleParents === null ? undefined : moduleParents.get(this);
+      if (moduleParents !== null && moduleParents.has(this)) return moduleParents.get(this);
+      return this[kFirstModuleParent];
     },
     set: function setParent(value) {
       if (moduleParents !== null) moduleParents.set(this, value);
@@ -5298,7 +5309,7 @@ BF.module = function () {
     /* resolve.paths: the folders a bare request is looked for in, which is the module's own
        node_modules chain followed by the global folders -- the list _resolveLookupPaths builds,
        and null for a built-in, which has no folders to be looked for in. */
-    req.resolve.paths = function pathsOf(request) {
+    req.resolve.paths = function paths(request) {
       if (typeof request !== 'string') {
         var badRequest = new TypeError('The "request" argument must be of type string. Received '
           + receivedTypeOf(request));
@@ -5392,7 +5403,7 @@ BF.module = function () {
       id: base, filename: base, path: dirnameOf(base),
       paths: Module._nodeModulePaths(dirnameOf(base))
     };
-    req.resolve.paths = function pathsOf(request) {
+    req.resolve.paths = function paths(request) {
       if (typeof request !== 'string') {
         var badRequest = new TypeError('The "request" argument must be of type string. Received '
           + receivedTypeOf(request));
@@ -5423,30 +5434,40 @@ BF.module = function () {
    * constructor does: a module names its file and builds its paths in load(), so one that has only
    * been constructed answers null for the first and has no key at all for the second. The keys it
    * does own are node's own six, in node's own order.
+   *
+   * String() of that class is its source text, and QuickJS hands back the text it parsed, so the
+   * constructor is spelled the way node spells it -- the name node gives it, the defaulted first
+   * parameter that makes its arity 0, the two-space body -- and the three helpers the body names
+   * are node's own. That is the only reason the body sits inside an IIFE: Module is the loader's
+   * class out here, so the name node's text carries has to be taken in a scope of its own, and
+   * path is read when a module is built rather than when this class is, because the built-in that
+   * answers it is not what the loader is filling yet.
    */
-  function ModuleOf(filename, parent) {
-    var built = new Module(
-      arguments.length > 0 && filename !== undefined ? String(filename) : '', parent);
-    var idOf = built.id;
-    var pathOf = built.path;
-    var exportsOf = built.exports;
-    var loadedOf = built.loaded;
-    var childrenOf = built.children;
-    delete built.id;
-    delete built.path;
-    delete built.exports;
-    delete built.filename;
-    delete built.loaded;
-    delete built.children;
-    delete built.paths;
-    built.id = idOf;
-    built.path = pathOf;
-    built.exports = exportsOf;
-    built.filename = null;
-    built.loaded = loadedOf;
-    built.children = childrenOf;
-    return built;
+  var kFirstModuleParent = Symbol('kFirstModuleParent');
+  var kLastModuleParent = Symbol('kLastModuleParent');
+  function setOwnProperty(obj, prop, value) {
+    Object.defineProperty(obj, prop,
+      { value: value, writable: true, enumerable: true, configurable: true });
+    return value;
   }
+  function updateChildren(parent, child, scan) {
+    var children = parent === null || parent === undefined ? undefined : parent.children;
+    if (children && !(scan && children.indexOf(child) !== -1)) children.push(child);
+  }
+  var ModuleOf = (function () {
+    var path = { dirname: function dirnameOf(p) { return requireBuiltin('path').dirname(p); } };
+    return function Module(id = '', parent) {
+  this.id = id;
+  this.path = path.dirname(id);
+  setOwnProperty(this, 'exports', {});
+  this[kFirstModuleParent] = parent;
+  this[kLastModuleParent] = parent;
+  updateChildren(parent, this, false);
+  this.filename = null;
+  this.loaded = false;
+  this.children = [];
+};
+  })();
   var moduleStatics = Object.getOwnPropertyNames(Module);
   for (var msAt = 0; msAt < moduleStatics.length; msAt++) {
     var staticName = moduleStatics[msAt];
