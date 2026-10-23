@@ -43,6 +43,11 @@ function owcBuildStreamCore() {
   var kPipelineValue = Symbol('owcPipelineValue');
   /* A destination function's duplex is not a pipe target: the function reads the link before it. */
   var kDestFunc = Symbol('owcDestinationFunc');
+  var kAnswered = Symbol('owcDestinationAnswered');
+  /* A body in a place past the first is not pumped into: Node hands it to Duplex.from and leaves the
+     duplex that answers there unread, so a string, an array or a Buffer where a destination goes
+     settles nothing and the pipeline never ends. */
+  var kUnpumped = Symbol('owcUnpumpedBody');
 
   function owcErr(Ctor, code, message) {
     var err = new Ctor(message);
@@ -1626,9 +1631,18 @@ function owcBuildStreamCore() {
     var concurrency = 1;
     var highWaterMark = 0;
     if (options !== undefined && options !== null) {
-      if (options.concurrency !== undefined && options.concurrency !== null) concurrency = Math.floor(options.concurrency);
-      if (options.highWaterMark !== undefined && options.highWaterMark !== null) highWaterMark = Math.floor(options.highWaterMark);
-      else highWaterMark = concurrency - 1;
+      /* Node floors both with Math.floor, and Math.floor of a BigInt is the engine's own type
+         error -- V8 words it 'Cannot convert a BigInt value to a number', which is what the host
+         answers here, and this engine words differently. The conversion is refused in the host's
+         words before the floor can make its own. */
+      if (options.concurrency !== undefined && options.concurrency !== null) {
+        if (typeof options.concurrency === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
+        concurrency = Math.floor(options.concurrency);
+      }
+      if (options.highWaterMark !== undefined && options.highWaterMark !== null) {
+        if (typeof options.highWaterMark === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
+        highWaterMark = Math.floor(options.highWaterMark);
+      } else highWaterMark = concurrency - 1;
     }
     validateOperatorInt(concurrency, 'options.concurrency', 1);
     validateOperatorInt(highWaterMark, 'options.highWaterMark', 0);
@@ -1650,6 +1664,16 @@ function owcBuildStreamCore() {
     var started = false;
     var resume = null;
     var waiting = null;
+    /* Whether the pump came to this value out of a pull or out of the wait it was put into by a
+       full watermark: a host's pump that has not been made to wait is a value behind its own
+       failure flag, and takes the value it pulled before the flag was set all the same. */
+    var suspended = false;
+    var held = false;
+    /* Whether the call that failed failed by throwing, which the pump sees within the tick that
+       started it, or by rejecting a promise, which it does not see until a tick or more later: a
+       host's pump is a value further along by then, and takes the value it pulled before the
+       rejection was delivered. */
+    var threwAtOnce = false;
 
     function settled() {
       inFlight--;
@@ -1661,6 +1685,25 @@ function owcBuildStreamCore() {
       var wake = resume;
       resume = null;
       wake();
+    }
+
+    /* Node's consumer wakes the pump in its own finally, and wakes it whatever the flags say:
+       'if (resume) resume()' and not a visit to maybeResume, which a stopped pump would refuse. */
+    function wakePump() {
+      if (resume === null) return;
+      var wake = resume;
+      resume = null;
+      wake();
+    }
+
+    /* The source is closed by the pump, when it stops pulling, and not by the consumer's own return:
+       a for-await that returns is what calls iterator.return() on the source, and it returns only
+       after the pull the wake cost it. */
+    var closed = false;
+    function closeSource() {
+      if (closed) return;
+      closed = true;
+      if (inner && typeof inner.return === 'function') inner.return();
     }
 
     function maybeAnswer() {
@@ -1686,21 +1729,41 @@ function owcBuildStreamCore() {
       maybeAnswer();
     }
 
+    /* Node starts a call and hands the promise straight to its two handlers -- it does not await it
+       inside another async frame first -- so a call that fails is seen by the pump after exactly the
+       hops Node's own sees it, and not one hop earlier. */
+    function enqueueCall(value) {
+      var promise;
+      try {
+        promise = Promise.resolve(apply(value)).then(function (answer) {
+          return answer.skip ? { skip: true } : { value: answer.value };
+        });
+      } catch (error) {
+        promise = Promise.reject(error);
+        threwAtOnce = true;
+      }
+      enqueue(promise);
+    }
+
     function pump() {
       var running = (async function () {
         for (;;) {
-          if (done || failed) break;
           var aborted = abortStep(signal);
           var step = await (aborted !== null ? aborted : inner.next());
           if (step.done) break;
-          var value = step.value;
-          enqueue((async function () {
-            var answer = await apply(value);
-            return answer.skip ? { skip: true } : { value: answer.value };
-          })());
+          /* Node asks whether the pump has been stopped only once the next value is in hand: its
+             check stands at the head of the body, behind the pull the for-await over the source has
+             already made. A call that has failed, or a consumer that has stopped asking, therefore
+             costs the source one pull more than a check made before the pull would. */
+          if (done || failed) {
+            if (failed && !suspended && !threwAtOnce && !held) held = true;
+            else { closeSource(); break; }
+          }
+          enqueueCall(step.value);
           if (!failed && (queue.length >= limits.highWaterMark || inFlight >= limits.concurrency)) {
             await new Promise(function (resolve) { resume = resolve; });
-          }
+            suspended = true;
+          } else suspended = false;
         }
         done = true;
         queue.push(Promise.resolve(eof));
@@ -1739,7 +1802,13 @@ function owcBuildStreamCore() {
         }
       })();
     }, function (value) {
-      return inner.return(value);
+      /* The consumer has stopped asking: Node's generator wakes the pump in its own finally and
+         leaves the source alone -- the pull the wake costs is the one that closes it, a pull later.
+         A pump woken into a source that is already destroyed pulls nothing at all, which is the pull
+         this operator used to answer short of the host's in every shape. */
+      done = true;
+      wakePump();
+      return Promise.resolve({ value: value, done: true });
     });
   }
 
@@ -2762,6 +2831,7 @@ function owcBuildStreamCore() {
     var error = null;
     var pending = streams.length;
     var destroyers = [];
+    var releases = [];
     var completed = false;
     var signal = opts && opts.signal ? opts.signal : null;
     var onAbort = null;
@@ -2776,6 +2846,11 @@ function owcBuildStreamCore() {
       if (pending === 0) {
         completed = true;
         if (signal !== null) signal.removeEventListener('abort', onAbort);
+        /* Node destroys every link it still holds once the chain is done, and not only when it
+           failed: a link that never settled -- the proxy a destination function was given when the
+           pipeline was asked not to end it -- is destroyed with ERR_STREAM_DESTROYED there, and the
+           'error' it emits has no listener, so the process dies, as it does on the host. */
+        while (destroyers.length > 0) destroyers.shift()(error);
         process.nextTick(callback, error === null ? undefined : error,
           streams.length > 0 ? streams[streams.length - 1][kPipelineValue] : undefined);
       }
@@ -2801,10 +2876,21 @@ function owcBuildStreamCore() {
       var endLink = i < last || !(opts && opts.end === false);
       (function (stream, reading, writing, nowait) {
         var settled = false;
+        var watching = null;
+        /* A destination function's proxy the pipeline was asked not to end is never ended, so it
+           never settles: it counts towards the chain all the same -- once the answer is known, as
+           Node's own finishCount counts it -- and is left open for the destruction that ends the
+           pipeline, which is what makes the host's own crash here. */
+        var leaveOpen = nowait && stream[kDestFunc] === true;
+        var answered = stream ? stream[kAnswered] : undefined;
         if (nowait) {
-          process.nextTick(function () { settled = true; finishStep(); });
+          if (leaveOpen && answered !== undefined && answered !== null) {
+            answered.then(function () { finishStep(); }, function () { finishStep(); });
+          } else {
+            process.nextTick(function () { settled = true; finishStep(); });
+          }
         } else {
-          finishedImpl(stream, { readable: reading, writable: writing }, function (err) {
+          watching = finishedImpl(stream, { readable: reading, writable: writing }, function (err) {
             settled = !err;
             finishStep(err);
           });
@@ -2814,8 +2900,28 @@ function owcBuildStreamCore() {
           settled = true;
           stream.destroy(err || errDestroyed('pipe'));
         });
+        if (i < last) {
+          /* A destination function is under no obligation to read the link before it, and Node does
+             not wait for that link to end: once the answer is known the link is dropped -- destroyed
+             and not drained, so a source a destination never read is destroyed with its pulls at
+             zero and its 'end' never emitted. The watch is taken off before the destroy, or the
+             'close' it brings would be read as a premature close. */
+          releases.push(function () {
+            if (settled) return;
+            settled = true;
+            if (watching !== null) watching();
+            finishStep();
+            stream.destroy();
+          });
+        }
       })(streams[i], i < last, i > 0, !endLink);
-      if (i > 0 && !(streams[i] && streams[i][kDestFunc])) linkPipe(streams[i - 1], streams[i], endLink);
+      if (i > 0 && !(streams[i] && (streams[i][kDestFunc] || streams[i][kUnpumped]))) linkPipe(streams[i - 1], streams[i], endLink);
+    }
+    var answered = streams[last] ? streams[last][kAnswered] : undefined;
+    if (answered !== undefined && answered !== null && typeof answered.then === 'function') {
+      answered.then(function () {
+        for (var r = 0; r < releases.length; r++) releases[r]();
+      });
     }
     return streams[last];
   }
@@ -2898,6 +3004,10 @@ function owcBuildStreamCore() {
     /* A web stream is a link of its own: Node's pipeline takes a WritableStream as a destination and
        a ReadableStream as a source, bridging each with fromWeb. */
     if (isWebWritable(value)) return Writable.fromWeb(value);
+    /* A web transform is a link of its own -- a TransformStream, and a TextDecoderStream is one --
+       and Node pumps the link before it into its writable side and reads its readable side as the
+       next link, which is what lets a decoder stand in the middle of a pipeline. */
+    if (isWebTransformValue(value)) return webTransformToDuplex(value);
     /* The three places a function can stand are not the same body: at the head it is the source, in
        the middle the transform between its neighbours, and at the end the destination whose answer
        is the value the pipeline reports. */
@@ -2912,9 +3022,49 @@ function owcBuildStreamCore() {
     if (isBlobValue(value)) return promiseToDuplex(value.arrayBuffer());
     if (value && (readableTrait(value.readable) || writableTrait(value.writable))) return pairToDuplex(value);
     if (value && (typeof value[Symbol.asyncIterator] === 'function' || typeof value[Symbol.iterator] === 'function')) {
-      return Readable.from(value);
+      var body = Readable.from(value);
+      if (index > 0) body[kUnpumped] = true;
+      return body;
     }
     throw argBodyError(value);
+  }
+
+  /* A web transform's two halves become the two sides of one Duplex, bridged the way fromWeb
+     bridges each: what the chain writes reaches the transform's writable, and what the transform
+     answers is what the chain reads next. */
+  function webTransformToDuplex(transform) {
+    var out = Readable.fromWeb(transform.readable);
+    var into = Writable.fromWeb(transform.writable);
+    var duplex = new Duplexify({ objectMode: true, readable: true, writable: true });
+    out.on('end', function () {
+      duplex.push(null);
+    });
+    out.on('readable', function () {
+      duplex._read();
+    });
+    out.on('error', function (err) {
+      duplex.destroy(err);
+    });
+    /* What the transform refuses -- a byte a fatal decoder will not have -- reaches the chain as the
+       link's own error and not as an 'error' event nobody is listening for. */
+    into.on('error', function (err) {
+      duplex.destroy(err);
+    });
+    duplex._read = function () {
+      for (;;) {
+        var chunk = out.read();
+        if (chunk === null) return;
+        if (!duplex.push(chunk)) return;
+      }
+    };
+    duplex._write = function (chunk, encoding, callback) {
+      if (into.write(chunk)) callback();
+      else into.once('drain', callback);
+    };
+    duplex._final = function (callback) {
+      into.end(callback);
+    };
+    return duplex;
   }
 
   /* A { readable, writable } pair is a body of its own: the two halves become the two sides of one
@@ -3113,6 +3263,9 @@ function owcBuildStreamCore() {
       },
       read: function () { /* the answer is pushed, never pulled: nothing reads the destination */ }
     });
+    /* The moment the answer is known is the moment the chain may drop the links before it: Node
+       destroys them then, and drains nothing. */
+    duplex[kAnswered] = finished;
     /* Nothing is ever piped into a destination function's duplex -- the function drains the link
        before it itself -- so the writable side is ended at once and the chain's bookkeeping settles. */
     duplex[kDestFunc] = true;
@@ -3120,18 +3273,13 @@ function owcBuildStreamCore() {
 
     /* A destination function is not obliged to read the link it is handed -- one that answers
        without touching the link before it is a case Node runs -- and Node does not wait for that
-       link to end, so it is drained and discarded once the answer is known, which is what lets the
-       chain settle. */
-    function releasePrevious() {
-      if (previous && typeof previous.resume === 'function'
-        && !(previous._readableState && previous._readableState.endEmitted)) previous.resume();
-    }
+       link to end: it destroys it once the answer is known, and drains nothing out of it, so a
+       source a destination never read is destroyed with its pulls still at zero. */
 
     function endReadable(value) {
       if (value !== null && value !== undefined) duplex.push(value);
       duplex.push(null);
       finishStep();
-      releasePrevious();
     }
 
     if (answered && typeof answered.then === 'function') {
@@ -3140,7 +3288,6 @@ function owcBuildStreamCore() {
         endReadable(val);
       }, function (err) {
         finishStep();
-        releasePrevious();
         duplex.destroy(err);
       });
       return duplex;
@@ -3161,7 +3308,6 @@ function owcBuildStreamCore() {
           pumping = false;
           ended = true;
           finishStep();
-          releasePrevious();
           duplex.destroy(err);
         });
       }

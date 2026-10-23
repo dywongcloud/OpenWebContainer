@@ -5911,14 +5911,130 @@ function textDecoderInputTypeError(input, encoding, stream, carrying) {
  * was made from, an options argument that is not one, and an input that is bytes or no input at
  * all are left to the method it had: only the refusal is answered over.
  */
+/*
+ * What a decoder does with the bytes it is handed, for the two answers the decoder beside it does
+ * not give. The first is the byte order mark: a utf-16le stream that begins ff fe and a utf-16be
+ * one that begins fe ff lose those bytes as a utf-8 one loses ef bb bf, and each only at the head
+ * of the stream -- the mark is never taken out of the middle of it, and a decoder told to ignore it
+ * keeps it as text. The second is the flush: a sequence the input ends in the middle of is one
+ * replacement character, but the bytes behind it are then read as text of their own, so a 'f0 9f'
+ * a stream left behind and a '!' the flush is handed come out as a replacement character followed
+ * by '!' and not as the replacement character alone.
+ */
+function textDecoderUtf8(values, fatal, stream) {
+  var out = '';
+  var i = 0;
+  var n = values.length;
+  while (i < n) {
+    var b = values[i];
+    var need, cp, lower, upper, k, c, ok;
+    if (b <= 0x7f) { out += String.fromCharCode(b); i += 1; continue; }
+    if (b >= 0xc2 && b <= 0xdf) { need = 1; cp = b & 0x1f; lower = 0x80; upper = 0xbf; }
+    else if (b >= 0xe0 && b <= 0xef) {
+      need = 2; cp = b & 0x0f;
+      lower = b === 0xe0 ? 0xa0 : 0x80;
+      upper = b === 0xed ? 0x9f : 0xbf;
+    } else if (b >= 0xf0 && b <= 0xf4) {
+      need = 3; cp = b & 0x07;
+      lower = b === 0xf0 ? 0x90 : 0x80;
+      upper = b === 0xf4 ? 0x8f : 0xbf;
+    } else {
+      if (fatal) throw textDecoderError(TypeError, 'ERR_ENCODING_INVALID_ENCODED_DATA', 'The encoded data was not valid for encoding utf-8');
+      out += '\ufffd'; i += 1; continue;
+    }
+    ok = true;
+    for (k = 1; k <= need; k++) {
+      if (i + k >= n) {
+        /* The input ends inside the sequence: on a stream the bytes behind the lead wait for the
+           chunk that completes them, and off it they are one replacement character and no more --
+           the bytes are part of the sequence that failed and are not read again. */
+        if (stream) return { out: out, rest: values.slice(i) };
+        if (fatal) throw textDecoderError(TypeError, 'ERR_ENCODING_INVALID_ENCODED_DATA', 'The encoded data was not valid for encoding utf-8');
+        return { out: out + '\ufffd', rest: [] };
+      }
+      c = values[i + k];
+      if (c < (k === 1 ? lower : 0x80) || c > (k === 1 ? upper : 0xbf)) {
+        /* The byte that broke the sequence is read again as the start of the next one, which is what
+           makes 'c3 28' a replacement character followed by '(' and not two of them. */
+        if (fatal) throw textDecoderError(TypeError, 'ERR_ENCODING_INVALID_ENCODED_DATA', 'The encoded data was not valid for encoding utf-8');
+        out += '\ufffd'; i += k; ok = false; break;
+      }
+      cp = (cp << 6) | (c & 0x3f);
+    }
+    if (!ok) continue;
+    if (cp > 0xffff) {
+      cp -= 0x10000;
+      out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    } else out += String.fromCharCode(cp);
+    i += need + 1;
+  }
+  return { out: out, rest: [] };
+}
+
+function textDecoderUtf16(values, little, stream) {
+  var out = '';
+  var i = 0;
+  var n = values.length - (values.length % 2);
+  for (; i < n; i += 2) {
+    out += String.fromCharCode(little ? (values[i] | (values[i + 1] << 8)) : ((values[i] << 8) | values[i + 1]));
+  }
+  /* One byte left over: off a stream it is dropped, as the standard drops it; on a stream it waits
+     for its pair. Either way a lone trailing byte is not an error the standard reports. */
+  var rest = stream && values.length % 2 === 1 ? values.slice(values.length - 1) : [];
+  return { out: out, rest: rest };
+}
+
+function textDecoderSingleByte(values) {
+  var out = '';
+  for (var j = 0; j < values.length; j++) {
+    var b = values[j];
+    out += String.fromCharCode(b < 0x80 || b > 0x9f ? b : WINDOWS_1252_HIGH[b]);
+  }
+  return { out: out, rest: [] };
+}
+
+function textDecoderBomOf(encoding) {
+  if (encoding === 'utf-8') return [0xef, 0xbb, 0xbf];
+  if (encoding === 'utf-16le') return [0xff, 0xfe];
+  if (encoding === 'utf-16be') return [0xfe, 0xff];
+  return null;
+}
+
+function textDecoderDecode(state, bytes, stream) {
+  var values = state.rest.slice();
+  for (var i = 0; i < bytes.length; i++) values.push(bytes[i]);
+  var bom = textDecoderBomOf(state.encoding);
+  if (bom !== null && !state.bom && !state.ignoreBOM) {
+    var isBom = true;
+    for (var j = 0; j < bom.length; j++) { if (values[j] !== bom[j]) { isBom = false; break; } }
+    if (values.length >= bom.length) {
+      state.bom = true;
+      if (isBom) values = values.slice(bom.length);
+    } else if (stream && values.length > 0 && values[0] === bom[0]) {
+      /* Too early to say: the bytes could still turn out to be a mark. */
+      state.rest = values;
+      return '';
+    } else if (!stream) state.bom = true;
+  }
+  var run;
+  if (state.encoding === 'utf-8') run = textDecoderUtf8(values, state.fatal, stream);
+  else if (state.encoding === 'utf-16le' || state.encoding === 'utf-16be') run = textDecoderUtf16(values, state.encoding === 'utf-16le', stream);
+  else run = textDecoderSingleByte(values);
+  state.rest = stream ? run.rest : [];
+  return run.out;
+}
+
 var textDecoderDecodeBytes = TextDecoderImpl.prototype.decode;
 TextDecoderImpl.prototype.decode = function (input, options) {
   var state = TEXT_DECODER_STATE.get(this);
   if (state === undefined || input === undefined) return textDecoderDecodeBytes.call(this, input, options);
   if (textDecoderOptionsError(options) !== undefined) return textDecoderDecodeBytes.call(this, input, options);
-  if (decodeInputBytes(input) !== undefined) return textDecoderDecodeBytes.call(this, input, options);
-  throw textDecoderInputTypeError(input, state.encoding,
-    options !== undefined && options !== null && Boolean(options.stream), state.rest.length > 0);
+  var bytes = decodeInputBytes(input);
+  if (bytes === undefined) {
+    throw textDecoderInputTypeError(input, state.encoding,
+      options !== undefined && options !== null && Boolean(options.stream), state.rest.length > 0);
+  }
+  return textDecoderDecode(state, bytes, options !== undefined && options !== null && Boolean(options.stream));
 };
 /* The two arguments are optional in Node's own signature, so the arity a program reads off the
    method it was handed stays 0 here too -- and its name stays the name of the property it was
