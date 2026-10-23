@@ -2041,6 +2041,9 @@ BF.crypto = function () {
     if (value === null) return 'null';
     if (value === undefined) return 'undefined';
     var kind = typeof value;
+    /* Node renders a string the way util.inspect does, with its quotes on: "Received type string
+       ('1')" for an offset handed in as text, which is not how a number is rendered. */
+    if (kind === 'string') return "type string ('" + value + "')";
     if (kind !== 'object' && kind !== 'function') return 'type ' + kind + ' (' + String(value) + ')';
     var made = value.constructor;
     var named = made !== undefined && made !== null && typeof made.name === 'string' ? made.name : null;
@@ -2084,7 +2087,7 @@ BF.crypto = function () {
   }
 
   /* Node's ERR_INVALID_ARG_VALUE: "The property 'a.b' is invalid. Received x", with an optional
-     reason. Node raises it as a TypeError, so `crypto.diffieHellman({...})` and a key's export
+     reason. Node raises it as a TypeError, so 'crypto.diffieHellman({...})' and a key's export
      format answer the constructor host Node 24.15 answers and not the RangeError they did here. */
   function invalidArgValue(name, value, reason) {
     var err = new TypeError("The property '" + name + "' " + (reason === undefined ? 'is invalid' : reason) + '. Received ' + shownOf(value));
@@ -2148,9 +2151,18 @@ BF.crypto = function () {
   function getRandomValues(typed) {
     var tag = Object.prototype.toString.call(typed).slice(8, -1);
     if (INTEGER_TYPED_ARRAYS.indexOf(tag) < 0) {
-      var mismatched = new TypeError('The data argument must be an integer-type TypedArray');
-      mismatched.code = 17;
-      mismatched.name = 'TypeMismatchError';
+      /* A webcrypto error is a DOMException: its name is the error's own and its class is the
+         DOM's, which is what a caller reads off constructor.name and what util.inspect prints. */
+      var mismatched = typeof DOMException === 'function'
+        ? new DOMException('The data argument must be an integer-type TypedArray', 'TypeMismatchError')
+        : new TypeError('The data argument must be an integer-type TypedArray');
+      if (mismatched.code === undefined) mismatched.code = 17;
+      if (mismatched.name !== 'TypeMismatchError') mismatched.name = 'TypeMismatchError';
+      /* The tag is the last thing a host DOMException carries that a plain Error does not: it is
+         what makes util.inspect print [object DOMException] and not [object Error]. */
+      if (Object.prototype.toString.call(mismatched) !== '[object DOMException]' && typeof Symbol === 'function' && Symbol.toStringTag !== undefined) {
+        Object.defineProperty(mismatched, Symbol.toStringTag, { value: 'DOMException', configurable: true });
+      }
       throw mismatched;
     }
     var bytes = decodeBase64(host.randomBase64(typed.byteLength));
@@ -2166,14 +2178,19 @@ BF.crypto = function () {
     }
     var elementSize = isView && buf.BYTES_PER_ELEMENT ? buf.BYTES_PER_ELEMENT : 1;
     var elements = buf.byteLength / elementSize;
-    var start = offset === undefined ? 0 : offset;
-    if (typeof start !== 'number' || !(start >= 0 && start <= elements) || Math.floor(start) !== start) {
-      throw outOfRange('offset', '>= 0 && <= ' + elements, start);
-    }
-    var count = size === undefined ? elements - start : size;
-    if (typeof count !== 'number' || !(count >= 0 && start + count <= elements) || Math.floor(count) !== count) {
-      throw outOfRange('size', '>= 0 && <= ' + (elements - start), count);
-    }
+    /*
+     * Node reads an offset and a size as numbers it truncates rather than as integers it insists
+     * on: a fill of 1.5 bytes fills one, and an offset of 1.5 starts one in. What it does bound
+     * is the sum -- "The value of "size + offset" is out of range. It must be <= 4. Received 5" --
+     * the offset on its own against the buffer, and a size against 2^31.
+     */
+    if (offset !== undefined && typeof offset !== 'number') throw invalidArgType('offset', 'of type number', offset);
+    if (size !== undefined && typeof size !== 'number') throw invalidArgType('size', 'of type number', size);
+    var start = offset === undefined ? 0 : Math.trunc(offset);
+    if (!(start >= 0 && start <= elements)) throw outOfRange('offset', '>= 0 && <= ' + elements, offset);
+    var count = size === undefined ? elements - start : Math.trunc(size);
+    if (!(count >= 0 && count <= 2147483647)) throw outOfRange('size', '>= 0 && <= 2147483647', size);
+    if (start + count > elements) throw outOfRange('size + offset', '<= ' + elements, start + count);
     var base = isView ? buf.byteOffset : 0;
     var backing = isView ? buf.buffer : buf;
     return new Uint8Array(backing, base + start * elementSize, count * elementSize);
@@ -2359,19 +2376,40 @@ BF.crypto = function () {
     return state.type === 'public' ? 'an instance of PublicKeyObject' : 'an instance of PrivateKeyObject';
   }
 
-  function importKey(want) {
+  /* The shapes a {key, ...} wrapper may carry inside it: a string, a Buffer, a TypedArray, a
+     DataView or an ArrayBuffer. Anything else is not key material, and Node says so by name. */
+  function isKeyMaterial(value) {
+    return typeof value === 'string' || Buf.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer;
+  }
+
+  /* Node names the property inside a {key, ...} wrapper when what is in it is not key material.
+     A public import names KeyObject and CryptoKey in the list, a private one does not. */
+  function keyWrapperError(inner, withKeyObject) {
+    var list = withKeyObject
+      ? 'string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey'
+      : 'string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView';
+    var err = new TypeError('The "key.key" property must be of type ' + list + '. Received ' + receivedAs(inner));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+  }
+
+  function importKey(want, keyObjectNamed) {
+    var named = keyObjectNamed === undefined ? want === 'public' : keyObjectNamed === true;
     return function (key) {
       if (key === undefined || key === null) throw invalidArgType('key', 'a string, Buffer, TypedArray, DataView or JsonWebKey', key);
       /* A {key, format, type, passphrase} wrapper: Node's own callers pass the material inside it. */
       var given = key;
       var type = undefined;
       var passphrase = undefined;
+      var wrapped = false;
       if (typeof key === 'object' && key !== null && Object.prototype.hasOwnProperty.call(key, 'key')) {
         given = key.key;
         type = key.type;
         passphrase = key.passphrase;
+        wrapped = true;
       } else if (typeof key === 'object' && key !== null && key.format === 'jwk' && key.key !== undefined) {
         given = key.key;
+        wrapped = true;
       }
       /* A KeyObject is accepted only as the source of a public key: Node derives the public half. */
       if (isKeyObject(given)) {
@@ -2390,8 +2428,16 @@ BF.crypto = function () {
       }
       var jwk = undefined;
       var bytes = undefined;
+      if (wrapped && !isKeyMaterial(given) && !(given !== null && typeof given === 'object' && typeof given.kty === 'string')) {
+        throw keyWrapperError(given, named);
+      }
       if (given !== null && typeof given === 'object' && !(given instanceof Buf) && !ArrayBuffer.isView(given) && !(given instanceof ArrayBuffer)) {
-        if (typeof given.kty !== 'string') throw invalidArgType('key', 'a string, Buffer, TypedArray, DataView or JsonWebKey', key);
+        /* A plain object with no key material in it is the wrapper Node reads it as, and the
+           property it names in the message is the one inside: "The "key.key" property must be of
+           type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received
+           undefined" for createPrivateKey({}), where createPublicKey names KeyObject and CryptoKey
+           too and a sign or a verify names them as a public key does. */
+        if (typeof given.kty !== 'string') throw keyWrapperError(key.key, named);
         jwk = given;
       } else {
         bytes = toBytes(given, undefined, 'key').toString('base64');
@@ -2418,7 +2464,8 @@ BF.crypto = function () {
       if (want === 'public' && state.type === 'private') return cryptoCap('crypto.key.public', { id: state.id }).id;
       return state.id;
     }
-    return keyStateOf(importKey(want)(key), 'key').id;
+    /* A sign or a verify names KeyObject and CryptoKey in the list, as a public import does. */
+    return keyStateOf(importKey(want, true)(key), 'key').id;
   }
 
   var createPublicKey = importKey('public');
@@ -2445,9 +2492,9 @@ BF.crypto = function () {
   }
 
   /* A key half Node hands back as text instead of as a KeyObject, when its encoding asks for it.
-     A `{format: 'jwk'}` encoding is the one shape that is not bytes at all: Node answers the JWK
-     object itself, so `generateKeyPairSync('ec', {publicKeyEncoding: {format: 'jwk'}})` gives a
-     caller `{"kty": "EC", "crv": "P-256", ...}` and not a Buffer it never made. */
+     A '{format: 'jwk'}' encoding is the one shape that is not bytes at all: Node answers the JWK
+     object itself, so 'generateKeyPairSync('ec', {publicKeyEncoding: {format: 'jwk'}})' gives a
+     caller '{"kty": "EC", "crv": "P-256", ...}' and not a Buffer it never made. */
   function exportedKey(key, encoding, defaultType) {
     var result = cryptoCap('crypto.key.export', {
       id: keyStateOf(key, 'key').id,
@@ -2512,7 +2559,10 @@ BF.crypto = function () {
       data: Buf.concat(this._chunks).toString('base64'),
       dsaEncoding: privateKey !== null && typeof privateKey === 'object' ? privateKey.dsaEncoding : undefined,
       padding: privateKey !== null && typeof privateKey === 'object' ? privateKey.padding : undefined,
-      saltLength: privateKey !== null && typeof privateKey === 'object' ? privateKey.saltLength : undefined
+      saltLength: privateKey !== null && typeof privateKey === 'object' ? privateKey.saltLength : undefined,
+      /* A Sign object always names a digest, and a pure key that is handed one answers
+         "Unsupported crypto operation" where the one-shot crypto.sign names OpenSSL's digest. */
+      fromSign: true
     });
     return outputOf(Buf.from(signature, 'base64'), encoding);
   };
@@ -2535,7 +2585,8 @@ BF.crypto = function () {
       signature: toBytes(signature, encoding, 'signature').toString('base64'),
       dsaEncoding: publicKey !== null && typeof publicKey === 'object' ? publicKey.dsaEncoding : undefined,
       padding: publicKey !== null && typeof publicKey === 'object' ? publicKey.padding : undefined,
-      saltLength: publicKey !== null && typeof publicKey === 'object' ? publicKey.saltLength : undefined
+      saltLength: publicKey !== null && typeof publicKey === 'object' ? publicKey.saltLength : undefined,
+      fromVerify: true
     }) === true;
   };
   Verify.prototype.end = function () { return this; };
@@ -2587,8 +2638,21 @@ BF.crypto = function () {
    * the surface Node's callers use, and every one of its calls is one capability round trip.
    */
   function DiffieHellman(id) {
-    this._id = id;
-    this.verifyError = 0;
+    var self = this;
+    self._id = id;
+    /*
+     * Node's DH_check bits, kept as the own enumerable property a DiffieHellman has them on. They
+     * are read the first time a caller asks: deciding whether a 1024-bit modulus is prime is two
+     * Miller-Rabin searches, and a DiffieHellman nobody asks about is made in the time those take.
+     */
+    Object.defineProperty(self, 'verifyError', {
+      enumerable: true,
+      configurable: true,
+      get: function () {
+        if (self._verifyError === undefined) self._verifyError = cryptoCap('crypto.dh.verify', { id: self._id }).code;
+        return self._verifyError;
+      }
+    });
   }
   DiffieHellman.prototype.generateKeys = function (encoding) {
     var keys = cryptoCap('crypto.dh.keys', { id: this._id });
@@ -2687,6 +2751,52 @@ BF.crypto = function () {
       public: keyIdOf(opts.publicKey, 'public')
     }), 'base64');
   }
+
+  /*
+   * privateEncrypt, publicDecrypt, publicEncrypt and privateDecrypt: the raw RSA operation with no
+   * digest in the way. 'op' names which one, and 'want' the half of the key pair it runs with --
+   * a private encrypt and a private decrypt need the private half, and the two public ones take
+   * either, because a public exponent is what both of them raise with.
+   */
+  function rsaCipher(op, want) {
+    return function (key, buffer) {
+      var given = key;
+      var padding = undefined;
+      var oaepHash = undefined;
+      var oaepLabel = undefined;
+      /* A {key, padding, oaepHash, oaepLabel} wrapper, which is how a caller names the padding. */
+      if (given !== null && typeof given === 'object' && !isKeyObject(given) &&
+        Object.prototype.hasOwnProperty.call(given, 'key')) {
+        padding = given.padding;
+        oaepHash = given.oaepHash;
+        oaepLabel = given.oaepLabel;
+        given = given.key;
+      }
+      var state = keyStateOf(given, 'key');
+      if (state !== undefined && want === 'private' && state.type !== 'private') {
+        var wrong = new TypeError('Invalid key object type ' + state.type + ', expected private.');
+        wrong.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
+        throw wrong;
+      }
+      var id = keyIdOf(given, want);
+      var data = toBytes(buffer, undefined, 'buffer');
+      var label = oaepLabel === undefined || oaepLabel === null
+        ? undefined : toBytes(oaepLabel, undefined, 'oaepLabel').toString('base64');
+      return Buf.from(cryptoCap('crypto.rsa.raw', {
+        id: id,
+        op: op,
+        data: data.toString('base64'),
+        padding: padding === undefined || padding === null ? undefined : Number(padding),
+        oaepHash: oaepHash === undefined || oaepHash === null ? undefined : String(oaepHash),
+        oaepLabel: label
+      }), 'base64');
+    };
+  }
+
+  var privateEncrypt = rsaCipher('private-encrypt', 'private');
+  var publicDecrypt = rsaCipher('public-decrypt', 'public');
+  var publicEncrypt = rsaCipher('public-encrypt', 'public');
+  var privateDecrypt = rsaCipher('private-decrypt', 'private');
 
   function keyBytesOf(key) {
     var state = keyStateOf(key, 'key');
@@ -3124,10 +3234,10 @@ BF.crypto = function () {
   /*
    * A failing capability reaches the guest as a plain Error: the envelope carries a code and a
    * message but not a constructor, and the spine that rebuilds it has no class to rebuild. The
-   * capability names the class it threw with in `owcErrorClass`, so every crypto call rebuilds
-   * here -- `crypto.sign` with a bad `dsaEncoding` and `createDiffieHellman(8)` are TypeErrors on
-   * host Node 24.15 and were plain Errors here, and `createDiffieHellman(1.5)` a RangeError.
-   * The asynchronous path rejects the same way, so `scrypt` and `pbkdf2` with a callback agree.
+   * capability names the class it threw with in 'owcErrorClass', so every crypto call rebuilds
+   * here -- 'crypto.sign' with a bad 'dsaEncoding' and 'createDiffieHellman(8)' are TypeErrors on
+   * host Node 24.15 and were plain Errors here, and 'createDiffieHellman(1.5)' a RangeError.
+   * The asynchronous path rejects the same way, so 'scrypt' and 'pbkdf2' with a callback agree.
    */
   function capabilityError(err) {
     var Ctor = err && err.owcErrorClass === 'RangeError' ? RangeError : err && err.owcErrorClass === 'TypeError' ? TypeError : Error;
@@ -3373,10 +3483,10 @@ BF.crypto = function () {
     verify: verifyOne,
     createCipheriv: createCipher('encrypt'),
     createDecipheriv: createCipher('decrypt'),
-    privateDecrypt: unavailable('privateDecrypt'),
-    publicEncrypt: unavailable('publicEncrypt'),
-    privateEncrypt: unavailable('privateEncrypt'),
-    publicDecrypt: unavailable('publicDecrypt'),
+    privateDecrypt: privateDecrypt,
+    publicEncrypt: publicEncrypt,
+    privateEncrypt: privateEncrypt,
+    publicDecrypt: publicDecrypt,
     checkPrime: checkPrime,
     checkPrimeSync: checkPrimeSync,
     generatePrime: generatePrime,

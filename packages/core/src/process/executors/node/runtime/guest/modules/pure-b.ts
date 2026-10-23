@@ -1570,12 +1570,40 @@ export const SRC = String.raw`
     exp.Session = Session;
     exp.open = function () {};
     exp.close = function () {};
-    exp.wait = function () {};
     exp.url = function () { return undefined; };
     exp.waitForDebugger = function () {
       throw nodeError(Error, 'ERR_INSPECTOR_NOT_ACTIVE', 'Inspector is not active');
     };
     exp.console = globalThis.console;
+    /*
+     * The Network domain: nine events a host exposes as callable notifiers, each of which hands
+     * its params to whatever frontend is attached. There is no frontend here and no network the
+     * protocol is watching, so each takes the params a host's takes and reports nothing, which is
+     * what a host does when nothing has subscribed.
+     */
+    var NETWORK_EVENTS = ['requestWillBeSent', 'responseReceived', 'loadingFinished', 'loadingFailed',
+      'dataSent', 'dataReceived', 'webSocketCreated', 'webSocketClosed',
+      'webSocketHandshakeResponseReceived'];
+    exp.Network = {};
+    for (var ne = 0; ne < NETWORK_EVENTS.length; ne++) {
+      exp.Network[NETWORK_EVENTS[ne]] = function () { return undefined; };
+    }
+    /*
+     * NetworkResources.put hands a resource to the frontend. It is behind a command-line flag a
+     * host is not started with by default, and with the flag off a host warns and does nothing
+     * before it validates its arguments -- so the warning, not the validation, is what a caller
+     * sees, and it is what this emits.
+     */
+    exp.NetworkResources = {
+      put: function () {
+        var proc = globalThis.process;
+        if (proc !== undefined && proc !== null && typeof proc.emitWarning === 'function') {
+          proc.emitWarning('The --experimental-inspector-network-resource option is not enabled. ' +
+            'Please enable it to use the putNetworkResource function');
+        }
+        return undefined;
+      }
+    };
     return exp;
   };
 
@@ -1632,6 +1660,19 @@ export const SRC = String.raw`
     var EventEmitter = requireBuiltin('events');
     var vm = requireBuiltin('vm');
     var exp = {};
+
+    /*
+     * vm.Script compiles a line without running it, which is exactly the question isValidSyntax
+     * asks: a throw out of the constructor is a line that is not syntax, and anything else is.
+     */
+    function scriptParses(code) {
+      try {
+        new vm.Script(code);
+        return true;
+      } catch (parseErr) {
+        return false;
+      }
+    }
 
     function replConsole(repl) {
       var c = {};
@@ -1992,6 +2033,22 @@ export const SRC = String.raw`
     exp.REPL_MODE_STRICT = Symbol('repl-strict');
     exp.writer = replWriter;
     exp.Recoverable = Recoverable;
+    /*
+     * repl.isValidSyntax answers whether a line is complete syntax, which a host decides by
+     * parsing it twice -- once as it stands and once wrapped in an assignment, so that both an
+     * expression and a declaration pass. The parser here is the one behind vm.Script, which is the
+     * script grammar a host's parser is given for the same question: a module-only form -- an
+     * 'export', a bare 'import' declaration, a 'return' with no function around it -- is no more
+     * a script here than there, so those are the two answers a host gives. A top-level 'await'
+     * is the one shape the script grammar refuses and a host's REPL prompt accepts, so a line
+     * holding one is parsed a third time, in the position it sits in at that prompt.
+     */
+    exp.isValidSyntax = function (input) {
+      var code = String(input);
+      if (scriptParses(code)) return true;
+      if (scriptParses('_=' + code)) return true;
+      return /\bawait\b/.test(code) === true && scriptParses('(async()=>{\n' + code + '\n})');
+    };
     return exp;
   };
 
