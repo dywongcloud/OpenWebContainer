@@ -175,7 +175,9 @@ export class VirtualNetwork {
      */
     listen(request: ListenRequest): ListenResult {
         const protocol = request.protocol;
-        const path = unixPathOf(request.address);
+        /* Only TCP carries unix sockets: a UDP bind of a name is an internet bind of that name, and
+           reading it as a path bound a datagram socket to a file the guest never asked for. */
+        const path = protocol === 'tcp' ? unixPathOf(request.address) : undefined;
         if (path !== undefined) return this.listenUnix(request, path);
         const address = this.hubAddress(request.address);
         /* A caller that names no family is binding by address, so the family follows the address:
@@ -748,13 +750,21 @@ function udpPeerAddress(receiver: Listener, source: string): string {
 }
 
 /**
- * The unix domain socket path an address names, or undefined for an internet address. Node takes a
- * non-numeric string as a pipe path, so any bind or dial address holding a separator is a path; it is
- * read before the address is folded or lower-cased, because a path is case-sensitive where an address
- * is not.
+ * The unix domain socket path an address names, or undefined for an internet address. Node's rule is
+ * isPipeName: a string that is not a number it can read as a port is a pipe path, separator or not,
+ * so 'x.sock', 'localhost' and 'abc' each name a socket in the working directory, which is what host
+ * Node 24.15 binds for them -- demanding a '/' here left them to be read as ports and refused
+ * ERR_SOCKET_BAD_PORT. An internet address is the one exception this hub has to make, and it is
+ * because a path and a name arrive in the same field: '::1' or '127.0.0.1' has to stay the address a
+ * bind of that name asks for, rather than a file called '::1'. It is read before the address is
+ * folded or lower-cased, because a path is case-sensitive where an address is not.
  */
 function unixPathOf(address: string | undefined): string | undefined {
-    return typeof address === 'string' && address.includes('/') ? address : undefined;
+    if (typeof address !== 'string' || address === '') return undefined;
+    if (address.includes(':') || /^\d{1,3}(\.\d{1,3}){3}$/.test(address)) return undefined;
+    const asNumber = Number(address);
+    if (!Number.isNaN(asNumber) && asNumber >= 0) return undefined;
+    return address;
 }
 
 function displayAddress(address: string): string {

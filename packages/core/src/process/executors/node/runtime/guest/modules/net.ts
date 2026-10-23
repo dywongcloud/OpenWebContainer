@@ -37,6 +37,13 @@ var DGRAM_RECV_BUFFER_SIZE = 786896;
 var DGRAM_SEND_BUFFER_SIZE = 9216;
 
 /**
+ * The most a buffer size this platform's kernel will hold: a setter is free to ask for more and the
+ * kernel accepts it, but the socket then reports this figure, so setRecvBufferSize(2147483647)
+ * followed by getRecvBufferSize() answers 8388608 on host Node 24.15 for either direction.
+ */
+var DGRAM_MAX_BUFFER_SIZE = 8388608;
+
+/**
  * One piece of a socket write, and the most a socket delivers in one read.
  *
  * Measured over 4 KiB to 4 MiB per write, 16 MiB end to end: a write goes fastest in pieces of
@@ -148,10 +155,15 @@ function netFamilyName(address) {
   return netIsIPv6(address) ? 'IPv6' : 'IPv4';
 }
 
-function netPortOf(value) {
+function netPortOf(value, listen) {
   var port = typeof value === 'string' && value !== '' ? Number(value) : value;
   if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535) {
-    throw netError(RangeError, 'ERR_SOCKET_BAD_PORT', 'Port should be >= 0 and < 65536. Received ' + netDescribe(value) + '.');
+    /* A server's own refusal names the option it was given, where every other caller -- a connect,
+       a dgram bind -- names the port itself: 'options.port should be >= 0 and < 65536. Received
+       type string ('')' against 'Port should be >= 0 and < 65536. Received type number (70000).' */
+    throw netError(RangeError, 'ERR_SOCKET_BAD_PORT',
+      (listen ? 'options.port' : 'Port') + ' should be >= 0 and < 65536. Received '
+      + netDescribe(value) + '.');
   }
   return port;
 }
@@ -184,24 +196,50 @@ function netUtf8Cut(buf) {
  * one has had its handle nulled and Node dereferences it, throwing a TypeError with V8's own text
  * rather than the error it throws for an unbound socket.
  */
+/**
+ * The class host Node 24.15 reports as the constructor of every error it raises itself: V8 calls it
+ * NodeError, whatever the error's own 'name', and a guest error has to carry the same one for
+ * 'err.constructor.name' to read the way a host's does.
+ */
+var NET_NODE_ERROR = function NodeError() {};
+
+/**
+ * The error host Node 24.15 throws when the buffer-size operation itself fails: a 'SystemError'
+ * carrying the libuv call that failed and the errno it answered with -- EBADF (-9) for a socket with
+ * no descriptor behind it, EINVAL (-22) for a size the kernel refuses to hold.
+ */
+function netBufferError(syscall, name, errno) {
+  var err = netError(Error, 'ERR_SOCKET_BUFFER_SIZE',
+    'Could not get or set buffer size: ' + syscall + ' returned ' + name + ' (' + NET_BUFFER_REASON[name] + ')');
+  err.name = 'SystemError';
+  err.constructor = NET_NODE_ERROR;
+  err.errno = errno;
+  err.syscall = syscall;
+  return err;
+}
+
+/** The reason text Node prints for the errno a buffer-size call answered with. */
+var NET_BUFFER_REASON = { EBADF: 'bad file descriptor', EINVAL: 'invalid argument' };
+
 function netBufferState(socket, syscall) {
   if (socket._dead) throw new TypeError("Cannot read properties of null (reading 'bufferSize')");
-  if (!socket._bound) {
-    throw Object.assign(
-      netError(Error, 'ERR_SOCKET_BUFFER_SIZE', 'Could not get or set buffer size: ' + syscall + ' returned EBADF (bad file descriptor)'),
-      { syscall: syscall });
-  }
+  if (!socket._bound) throw netBufferError(syscall, 'EBADF', -9);
 }
 
 /**
- * Validates a buffer size the way Node 24.15 validates one: any integer from 0 up, with a message
- * that names a positive integer even though 0 passes, which is the text Node itself prints for it.
+ * Validates a buffer size the way Node 24.15 validates one. Three bands, each with its own answer:
+ * a size that is not an integer, is negative, or will not fit in a 32-bit word is refused before the
+ * kernel ever sees it ('ERR_SOCKET_BAD_BUFFER_SIZE', a TypeError, whose text names a positive integer
+ * even though 0 passes it); one from 2^31 to 2^32-1 reaches libuv and comes back EINVAL, because the
+ * size is handed to the kernel as a signed 32-bit int and overflows it; and everything from 0 to
+ * 2^31-1 is accepted, the kernel clamping what it holds to 8388608.
  */
 function netBufferSize(socket, size, syscall) {
   netBufferState(socket, syscall);
-  if (typeof size !== 'number' || !Number.isInteger(size) || size < 0) {
-    throw netError(RangeError, 'ERR_SOCKET_BAD_BUFFER_SIZE', 'Buffer size must be a positive integer');
+  if (typeof size !== 'number' || !Number.isInteger(size) || size < 0 || size > 4294967295) {
+    throw netError(TypeError, 'ERR_SOCKET_BAD_BUFFER_SIZE', 'Buffer size must be a positive integer');
   }
+  if (size > 2147483647) throw netBufferError(syscall, 'EINVAL', -22);
 }
 
 /** Address shown for a listener: no host means the IPv6 wildcard, as Node does on a dual-stack host. */
@@ -310,6 +348,25 @@ function netConnectList(host, family) {
   return ['::1', '127.0.0.1'];
 }
 
+/**
+ * The error host Node 24.15 reports for a name getaddrinfo cannot answer: ENOTFOUND, and carrying
+ * libuv's own errno for it, UV_EAI_NONAME (-3008), which is the figure a host's 'err.errno' reads
+ * on a connect to a name that does not resolve.
+ */
+function netNotFound(name) {
+  return netSystemError({ code: 'ENOTFOUND', errno: -3008 }, 'getaddrinfo', name);
+}
+
+/**
+ * Whether an address is one this host's own loopback answers to, and so one a socket may be bound
+ * to: the loopback and the wildcard of either family. Anything else is EADDRNOTAVAIL, which is what
+ * a host's bind answers for an address no interface of its holds ('bind EADDRNOTAVAIL 8.8.8.8').
+ */
+function netOwnAddress(address) {
+  if (netIsIP(address) === 6) return address === '::' || address === '::1';
+  return address === '0.0.0.0' || address.indexOf('127.') === 0;
+}
+
 /** Resolves a host to an address: IP literals and the name table synchronously, other names via dns.lookup. */
 function netResolve(host, family, done, lookup) {
   var name = host === undefined || host === null || host === '' ? 'localhost' : String(host);
@@ -329,7 +386,11 @@ function netResolve(host, family, done, lookup) {
       }
       var entry = Array.isArray(found) ? found[0] : undefined;
       if (entry && typeof entry.address === 'string' && netIsIP(entry.address)) done(null, entry.address);
-      else done(netError(Error, 'ERR_INVALID_IP_ADDRESS', 'Invalid IP address: ' + String(Array.isArray(found) ? undefined : found)));
+      /* Node asked for a list, so anything that is not one has no address to report and names the
+         one it read -- undefined -- which is the text host Node 24.15 prints for a lookup that
+         answered a bare string. It is a TypeError, as every ERR_INVALID_IP_ADDRESS of Node's is. */
+      else done(netError(TypeError, 'ERR_INVALID_IP_ADDRESS',
+        'Invalid IP address: ' + String(entry && entry.address)));
     };
     try {
       lookup(name, { family: family || 0, hints: 0, all: true }, answer);
@@ -353,9 +414,9 @@ function netResolve(host, family, done, lookup) {
   }
   callOp('dns.lookup', { hostname: name, family: family || 0 }).then(function (found) {
     if (found && typeof found.address === 'string') done(null, found.address);
-    else done(netSystemError({ code: 'ENOTFOUND' }, 'getaddrinfo', name));
+    else done(netNotFound(name));
   }, function () {
-    done(netSystemError({ code: 'ENOTFOUND' }, 'getaddrinfo', name));
+    done(netNotFound(name));
   });
 }
 
@@ -364,7 +425,8 @@ function netConnectArgs(args) {
   var cb = typeof list[list.length - 1] === 'function' ? list.pop() : undefined;
   var first = list[0];
   if (first !== null && typeof first === 'object') {
-    return { port: first.port, host: first.host, family: first.family, localPort: first.localPort, lookup: first.lookup, path: first.path, cb: cb };
+    return { port: first.port, host: first.host, family: first.family, localPort: first.localPort,
+      localAddress: first.localAddress, lookup: first.lookup, path: first.path, cb: cb };
   }
   if (typeof first === 'string' && !/^\d+$/.test(first)) {
     /* A pipe path is a destination this runtime cannot open. Node does not throw it either: the
@@ -375,13 +437,20 @@ function netConnectArgs(args) {
 }
 
 /**
- * The unix domain socket path an argument names, or undefined for a port or a host. Node reads a
- * string that is not a number as a pipe path, so a listen of "/tmp/x" binds one; this runtime binds
- * only a path that holds a separator, and leaves any other string to be read as a port, which is
- * what it answered before a path was carried at all.
+ * The unix domain socket path an argument names, or undefined for a port or a host. Node's rule is
+ * isPipeName: a string that is neither a number it can read as a port nor an internet address is a
+ * pipe path, separator or not, so a listen of 'x.sock', 'localhost' or 'abc' binds a socket of that
+ * name in the working directory, which is what host Node 24.15 reports -- where demanding a '/'
+ * read them as a port and refused them ERR_SOCKET_BAD_PORT. An IP literal is the one exception this
+ * runtime has to make: a name and a path reach the hub as the same field, so '::1' has to stay the
+ * address a bind of that name asks for rather than becoming a file called '::1'.
  */
 function netIsPath(value) {
-  return typeof value === 'string' && value.indexOf('/') !== -1 ? value : undefined;
+  if (typeof value !== 'string' || value === '') return undefined;
+  if (netIsIP(value) !== 0) return undefined;
+  var asNumber = Number(value);
+  if (!Number.isNaN(asNumber) && asNumber >= 0) return undefined;
+  return value;
 }
 
 function netListenArgs(args) {
@@ -539,7 +608,11 @@ BF['net'] = function () {
          has not delivered yet, plus what a write before 'connect' is still holding. */
       var queued = 0;
       for (var i = 0; i < this._pendingWrites.length; i++) queued += this._pendingWrites[i].length;
-      return this._unsentBytes + queued;
+      /* Plus what the stream itself is still holding: a corked socket has handed the hub nothing at
+         all, and host Node 24.15 counts those bytes -- 131072 for two 64 KiB writes under a cork,
+         falling to 0 on the uncork that hands them on. */
+      var held = this._writableState ? this._writableState.length : 0;
+      return this._unsentBytes + queued + held;
     }
 
     /**
@@ -560,23 +633,94 @@ BF['net'] = function () {
     connect() {
       var args = netConnectArgs(arguments);
       if (typeof args.cb === 'function') this.once('connect', args.cb);
+      /* A connect that names no destination at all is one Node refuses before it looks at the
+         socket: 'The "options" or "port" or "path" argument must be specified', a TypeError thrown
+         synchronously, whether the socket is fresh or already connected. */
+      if (args.port === undefined && args.path === undefined) {
+        throw netError(TypeError, 'ERR_MISSING_ARGS',
+          'The "options" or "port" or "path" argument must be specified');
+      }
+      /* A local address has to be an address at all: Node reads it before it dials, and a name there
+         is ERR_INVALID_IP_ADDRESS, a TypeError thrown synchronously. */
+      if (args.localAddress !== undefined && args.localAddress !== null && args.localAddress !== ''
+        && netIsIP(args.localAddress) === 0) {
+        throw netError(TypeError, 'ERR_INVALID_IP_ADDRESS', 'Invalid IP address: ' + String(args.localAddress));
+      }
+      /* A socket already destroyed is not one Node refuses: connect() nulls the handle its destroy
+         closed, clears the addresses the dead connection reported and the destroyed flag itself,
+         and dials again -- host Node 24.15 emits a second 'connect' and carries bytes both ways on
+         the new connection. Reopening it here means undoing the destroy: the stream's own flags
+         and the socket's, since it is one socket that connects twice, not two. */
+      if (this._dead) {
+        if (typeof this._undestroy === 'function') this._undestroy();
+        this._dead = false;
+        this._hubId = undefined;
+        this._hubClosed = false;
+        this._closePending = false;
+        this._rEnded = false;
+        this._wEnded = false;
+        this._wFinished = false;
+        this._finEnded = false;
+        this._endRequested = false;
+        this._hadError = false;
+        this._pendingWrites = [];
+        this._writeCbs = [];
+        this._readQueue = [];
+        this._unsentBytes = 0;
+        this._flowing = undefined;
+        this._carry = null;
+        this.localAddress = undefined;
+        this.localPort = undefined;
+        this.localFamily = undefined;
+        this.remoteAddress = undefined;
+        this.remotePort = undefined;
+        this.remoteFamily = undefined;
+      }
       /* A second connect is one Node refuses: a connection this socket has already made is EISCONN,
          one still in flight is EALREADY, and both are reported the way every connect failure is --
          asynchronously, and by destroying the socket, which then emits 'close' too -- while connect()
-         itself still answers with the socket. The answer is read before 'connecting' is set, so a
-         connect asked for while one is in flight is the one that answers EALREADY. Two cases are not
-         refused, and both are host Node 24.15's own: a connect that names no destination dials again
-         in silence, and one on a socket already destroyed is a no-op that reports nothing. */
+         itself still answers with the socket. Which of the two it is has to be read before
+         'connecting' is set, since setting it is what makes the next one EALREADY. Node sets the
+         flag first, so a socket whose second connect was refused still reads connecting until the
+         destroy that reports the refusal clears it.
+         The refusal is not the first thing that happens either: Node resolves the name first, so a
+         name getaddrinfo cannot answer is ENOTFOUND even on a socket that is already connected, and
+         the refusal comes per address -- one address is one EISCONN, and the two a bare port asks
+         for ('localhost' is dual-stack) are the AggregateError Node reports for a name it tried
+         twice. A connect on a socket already destroyed is not refused at all. */
+      var flying = this.connecting;
+      this.connecting = true;
       var again = this._dead ? null
-        : (this.connecting ? 'EALREADY' : (this._hubId !== undefined ? 'EISCONN' : null));
-      if (again !== null && (args.path !== undefined || typeof args.host === 'string')) {
-        var refused = netConnectAgainError(this, again, args);
-        var failing = this;
-        netDefer(function () { failing.destroy(refused); });
+        : (flying ? 'EALREADY' : (this._hubId !== undefined ? 'EISCONN' : null));
+      if (again !== null) {
+        var refused = this;
+        var retry = args.path !== undefined ? [args.path] : netConnectList(args.host, args.family);
+        var refuse = function (addresses) {
+          var each = [];
+          for (var i = 0; i < addresses.length; i++) {
+            each.push(netConnectAgainError(refused, again, { path: args.path, host: addresses[i], port: args.port }));
+          }
+          netDefer(function () {
+            refused.destroy(each.length === 1 ? each[0] : netAggregate(each));
+          });
+        };
+        /* A path is one destination, so it is one EISCONN; the host's own process aborts on that
+           case (a native assertion in TCPWrap::Connect), so there is no answer of its to match. */
+        if (retry !== null) {
+          refuse(retry);
+          return this;
+        }
+        var refusing = this;
+        netResolve(args.host, args.family, function (failure, address) {
+          if (failure) {
+            netDefer(function () { refusing.destroy(failure); });
+            return;
+          }
+          refuse([address]);
+        }, args.lookup);
         return this;
       }
       this._connectStarted = true;
-      this.connecting = true;
       this._ensureTarget();
       netRefresh(this);
       /* A pipe path names a unix domain socket the virtual hub carries by path. */
@@ -596,6 +740,19 @@ BF['net'] = function () {
         if (failure) {
           self.destroy(failure);
           return;
+        }
+        /* Binding the local end to an address is the kernel's own call, and it answers the way a
+           host's bind does: EINVAL (-22) for an address of the other family than the peer, and
+           EADDRNOTAVAIL (-49) for one no interface of this host holds. */
+        if (args.localAddress !== undefined && args.localAddress !== null && args.localAddress !== '') {
+          if ((netIsIP(args.localAddress) === 6) !== (netIsIP(address) === 6)) {
+            self.destroy(netSystemError({ code: 'EINVAL', errno: -22 }, 'bind', args.localAddress));
+            return;
+          }
+          if (!netOwnAddress(args.localAddress)) {
+            self.destroy(netSystemError({ code: 'EADDRNOTAVAIL', errno: -49 }, 'bind', args.localAddress));
+            return;
+          }
         }
         self._doConnect(listed || [address], port, args.localPort);
       };
@@ -1431,7 +1588,7 @@ BF['net'] = function () {
       var usePath = path !== undefined && args.port === undefined;
       var port = usePath
         ? 0
-        : netPortOf(args.port !== undefined ? args.port : (named !== undefined ? named : 0));
+        : netPortOf(args.port !== undefined ? args.port : (named !== undefined ? named : 0), true);
       if (this._targetId === undefined) {
         var target = this;
         this._targetId = createTarget(function (name, payload) {
@@ -1506,7 +1663,14 @@ BF['net'] = function () {
       return { address: this._address.address, family: this._address.family, port: this._address.port };
     }
 
+    /* Node refuses a call with no callback before it answers anything: ERR_INVALID_ARG_TYPE, a
+       TypeError naming the argument, thrown synchronously -- where answering later raised the
+       callback as 'not a function' from a tick the caller never saw coming. */
     getConnections(callback) {
+      if (typeof callback !== 'function') {
+        throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+          'The "callback" argument must be of type function. Received ' + netDescribe(callback));
+      }
       var count = this._connections;
       netDefer(function () { callback(null, count); });
       return this;
@@ -1826,6 +1990,7 @@ BF['dgram'] = function () {
       this._hubId = undefined;
       this._targetId = undefined;
       this._bound = false;
+      this._binding = false;
       this._dead = false;
       this._address = null;
       this._refed = true;
@@ -1836,7 +2001,7 @@ BF['dgram'] = function () {
     }
 
     _holdable() {
-      return this._bound && !this._dead;
+      return (this._bound || this._binding) && !this._dead;
     }
 
     /** 'udp4' or 'udp6', as Node names the kind of socket this is. */
@@ -1861,7 +2026,7 @@ BF['dgram'] = function () {
     bind() {
       var args = netBindArgs(arguments);
       if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
-      if (this._bound) throw netError(Error, 'ERR_SOCKET_ALREADY_BOUND', 'Socket is already bound');
+      if (this._bound || this._binding) throw netError(Error, 'ERR_SOCKET_ALREADY_BOUND', 'Socket is already bound');
       /* A dgram bind coerces what it cannot read as a port to 0 rather than refusing it, as host
          Node 24.15 does: bind('/tmp/x.sock') and bind('abc') bind an ephemeral UDP port
          (0.0.0.0:55602 there), where a path meant as a unix socket is not a thing dgram opens. */
@@ -1891,12 +2056,21 @@ BF['dgram'] = function () {
         return this;
       }
       this._hubId = res.id;
-      this._bound = true;
       this._address = { address: shown, family: this._family, port: res.port };
+      this._binding = true;
       netRefresh(this);
       if (typeof args.cb === 'function') this.once('listening', args.cb);
+      /* A dgram bind is asynchronous, as a host's is: the descriptor the buffer-size getters and
+         setters read exists only once the socket is listening, so in the window between bind()
+         and 'listening' host Node 24.15 answers them EBADF. The hub id is assigned here, so a
+         datagram sent in that window still has somewhere to go. */
       var listeningSocket = this;
-      netDefer(function () { listeningSocket.emit('listening'); });
+      netDefer(function () {
+        if (listeningSocket._dead || !listeningSocket._binding) return;
+        listeningSocket._binding = false;
+        listeningSocket._bound = true;
+        listeningSocket.emit('listening');
+      });
       return this;
     }
 
@@ -1927,7 +2101,7 @@ BF['dgram'] = function () {
       }
       port = netPortOf(port);
       var target = address === undefined || address === null || address === '' ? 'localhost' : String(address);
-      if (!this._bound) this.bind(0);
+      if (!this._bound && !this._binding) this.bind(0);
       var self = this;
       netResolve(target, this._family === 'IPv6' ? 6 : 4, function (failure, resolved) {
         if (failure) {
@@ -2002,7 +2176,7 @@ BF['dgram'] = function () {
       if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
       if (this._remote !== null) throw netError(Error, 'ERR_SOCKET_DGRAM_IS_CONNECTED', 'Already connected');
       var port = netPortOf(args.port);
-      if (!this._bound) this.bind(0);
+      if (!this._bound && !this._binding) this.bind(0);
       if (typeof args.cb === 'function') this.once('connect', args.cb);
       var self = this;
       netResolve(args.address, this._family === 'IPv6' ? 6 : 4, function (failure, resolved) {
@@ -2060,12 +2234,12 @@ BF['dgram'] = function () {
        does with it -- host Node 24.15 still reports 786896 after setRecvBufferSize(0). */
     setRecvBufferSize(size) {
       netBufferSize(this, size, 'uv_recv_buffer_size');
-      if (size > 0) this._recvBufferSize = size;
+      if (size > 0) this._recvBufferSize = Math.min(size, DGRAM_MAX_BUFFER_SIZE);
     }
 
     setSendBufferSize(size) {
       netBufferSize(this, size, 'uv_send_buffer_size');
-      if (size > 0) this._sendBufferSize = size;
+      if (size > 0) this._sendBufferSize = Math.min(size, DGRAM_MAX_BUFFER_SIZE);
     }
 
     /* The size a bound dgram socket reports: whatever a setter gave it, or the size host Node 24.15
@@ -2083,6 +2257,12 @@ BF['dgram'] = function () {
     addMembership() {}
 
     dropMembership() {}
+
+    /* Source-specific multicast, the two calls of the multicast surface that were missing: host
+       Node 24.15 has them as functions on every dgram socket. */
+    addSourceSpecificMembership() {}
+
+    dropSourceSpecificMembership() {}
   }
 
   function dgramCreateSocket(type, listener) {
@@ -2091,6 +2271,16 @@ BF['dgram'] = function () {
       throw netError(TypeError, 'ERR_SOCKET_BAD_TYPE', 'Bad socket type specified. Valid types are: udp4, udp6');
     }
     var socket = new DgramSocket(kind);
+    /* The two sizes a socket can be opened with: Node passes them to the same setters, so a socket
+       created with them reports them from the moment it is bound. */
+    if (type !== null && typeof type === 'object') {
+      if (typeof type.recvBufferSize === 'number' && type.recvBufferSize > 0) {
+        socket._recvBufferSize = Math.min(type.recvBufferSize, DGRAM_MAX_BUFFER_SIZE);
+      }
+      if (typeof type.sendBufferSize === 'number' && type.sendBufferSize > 0) {
+        socket._sendBufferSize = Math.min(type.sendBufferSize, DGRAM_MAX_BUFFER_SIZE);
+      }
+    }
     if (typeof listener === 'function') socket.on('message', listener);
     return socket;
   }
