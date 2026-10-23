@@ -4,7 +4,7 @@ import { ShellProcess } from './process';
 import { ChildProcessPayload, Process } from '../../base';
 import type { NetworkHandle } from '../../../shell/commands/types';
 import { containerEnv } from '../default-env';
-import { SHELL_DIRECTORIES } from '../node/runtime/capabilities/child';
+import { isContainerShell } from '../node/runtime/capabilities/child';
 
 export class ShellProcessExecutor implements ProcessExecutor {
     constructor(private fileSystem: IFileSystem, private network?: NetworkHandle) { }
@@ -16,7 +16,7 @@ export class ShellProcessExecutor implements ProcessExecutor {
      * with, so the path is kept and recognised here rather than rewritten to the bare name.
      */
     canExecute(executable: string): boolean {
-        return executable === 'sh' || SHELL_DIRECTORIES.some((directory) => executable === `${directory}/sh`);
+        return isContainerShell(executable);
     }
 
     async execute(payload: ChildProcessPayload, pid: number, parantPid?: number): Promise<Process> {

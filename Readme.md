@@ -1338,8 +1338,14 @@ bare QuickJS 0.32, on both builds, as it does here; `JSON.parse('')` is the one 
   { timeout: 400, killSignal: 'SIGTERM' })` -- host 2010 ms, code 0, `A\nTRAPPED\nB\n`; here 2010 ms,
   SIGTERM, `A\nB\n`, no trap; the control `sh -c 'trap "echo TRAPPED-EXIT" EXIT; echo X'` answers
   `X\nTRAPPED-EXIT\n` on both sides, so the trap machinery itself is there and only the timeout path
-  bypasses it. This is an engine limit, proved live: bare QuickJS 0.32 (quickjs-emscripten, no
-  container in the way) has no timer of its own at all -- `typeof os`, `typeof setTimeout` and
+  bypasses it. Not a QuickJS limit but a host-thread block of this container's own: `sleep` waits in
+  `blockFor` (`shell/commands/fileutils.ts:2482`), an `Atomics.wait` on the host thread that no timer
+  can interrupt, so the bound is missed by the whole sleep -- measured at HEAD with one fresh
+  container per case, `spawn('sh', ['-c', 'sleep 5'], { timeout: 400, killSignal: 'SIGKILL' })`
+  exits at 5015 ms here against 410 ms on host Node 24.15, `spawnSync('sh', ['-c', 'sleep 5'],
+  { timeout: 400 })` answers status 0 with no error at 5009 ms against 402 ms with ETIMEDOUT, and
+  the same bound on `sh -c 'node busy3.js'` fires at 417 ms here against 413 ms. Proved live: bare
+  QuickJS 0.32 (quickjs-emscripten, no container in the way) has no timer of its own at all -- `typeof os`, `typeof setTimeout` and
   `typeof setInterval` are all `undefined` -- so every deadline here is a host timer, and a host
   `setTimeout(..., 400)` armed before a synchronous 3 s wait inside the engine fires at 3001 ms and
   not at 400 ms. The same thing measured in the container: a 100 ms interval in the process that runs

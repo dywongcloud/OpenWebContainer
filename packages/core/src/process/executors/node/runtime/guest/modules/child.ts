@@ -862,9 +862,21 @@ function cpExec(command, rest) {
   var cmd = String(command);
   /* /bin/sh, the path a host's node runs an exec through: $0 inside the command reads that path, as
      it does on a host. execSync was given the same path; the asynchronous exec had been left on the
-     bare name, which is what made exec('echo $0') print sh where a host prints /bin/sh. */
-  var child = cpSpawnCore(new (cpChildClass())(), '/bin/sh', ['-c', cmd], call.opts, { kind: 'child' });
-  cpCollect(child, call.opts, cmd, call.cb);
+     bare name, which is what made exec('echo $0') print sh where a host prints /bin/sh.
+
+     A shell option names the shell instead, and the line is handed to it once. It used to be handed
+     twice: this call spawned '/bin/sh -c <line>' and the option then wrapped that whole command in
+     the shell again, so sh -c '/bin/sh -c <line>' ran -- and since the inner path was not one the
+     shell recognised, every exec with a shell option printed nothing and 'exit 4' came back 0. */
+  var shell = typeof call.opts.shell === 'string' && call.opts.shell !== '' ? call.opts.shell : '/bin/sh';
+  var opts = call.opts;
+  if (opts.shell !== undefined) {
+    opts = {};
+    Object.keys(call.opts).forEach(function (key) { opts[key] = call.opts[key]; });
+    delete opts.shell;
+  }
+  var child = cpSpawnCore(new (cpChildClass())(), shell, ['-c', cmd], opts, { kind: 'child' });
+  cpCollect(child, opts, cmd, call.cb);
   return child;
 }
 

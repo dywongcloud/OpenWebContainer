@@ -4,6 +4,7 @@ import { ProcessEvent, ProcessState, ProcessType } from '../../base';
 import { IFileSystem } from '../../../filesystem';
 import type { NetworkHandle } from '../../../shell/commands/types';
 import { ShellCommandResult } from '../../../shell';
+import { isContainerShell } from '../node/runtime/capabilities/child';
 
 interface CommandHistoryEntry {
     command: string;
@@ -214,6 +215,22 @@ export class ShellProcess extends Process {
     /** The command of this line was a child process: its output reached the terminal as it ran, so the
      *  result's own copy of that output is not written again. */
     private liveChildOutput = false;
+    /**
+     * The `timeout` of the spawn that started this shell, in milliseconds; 0 when the caller named
+     * none. The bound belongs to the whole command line, not to one command of it, so it is kept as
+     * the moment it runs out -- see `armKillDeadline`.
+     */
+    private killDeadlineMs = 0;
+    /** The wall-clock moment that bound runs out: one moment for every command of the line. */
+    private killDeadlineAt = 0;
+    /** The signal the caller's `killSignal` named, which is the one the line is ended with. */
+    private killSignalName = 'SIGTERM';
+    /** What the caller is told when the bound ends the line, so it reports the kill it asked for. */
+    private onKillDeadline?: () => void;
+    /** True once the bound has been reported; it is reported once. */
+    private killDeadlineFired = false;
+    /** The host timer behind the bound, cleared when this shell ends. */
+    private killDeadlineTimer?: ReturnType<typeof setTimeout>;
 
     constructor(
         pid: number,
@@ -246,6 +263,68 @@ export class ShellProcess extends Process {
         this.prompt = oscMode ? '\x1b[1;32m$\x1b[0m ' : '$ ';
     }
 
+    /**
+     * Puts the `timeout` of the spawn that started this shell on the line it runs.
+     *
+     * A command of that line can hold the host thread -- a `node` script busy-looping does, and so
+     * does a line of this shell's own that never ends -- and while it does, no host timer runs, so
+     * neither this shell nor its caller can end it from outside. The line keeps one wall-clock
+     * moment for all of its commands, and what is left of it travels to each child this shell
+     * starts, which is the only thing that can interrupt the guest actually holding the thread: see
+     * `killDeadlineLeft` and what `NodeProcess` does with it. A line that keeps to its bound never
+     * reaches the moment, and the caller's own timer ends it as it always did.
+     */
+    armKillDeadline(ms: number, signal: string, onFire?: () => void): void {
+        if (!(ms > 0)) return;
+        this.killDeadlineMs = ms;
+        this.killDeadlineAt = Date.now() + ms;
+        this.killSignalName = signal;
+        this.onKillDeadline = onFire;
+        /* A backstop for a line this shell can step itself: a shell in a loop of its own, or one
+           whose child has already gone. The child's own bound is what ends a line that blocks. */
+        this.killDeadlineTimer = setTimeout(() => this.fireKillDeadline(), ms);
+    }
+
+    /**
+     * What is left of this shell's bound, for a child of it to run under: the shell's own line is
+     * what the caller timed out, and the child is the thing that runs it.
+     */
+    killDeadlineLeft(): { ms: number; signal: string } | undefined {
+        if (this.killDeadlineAt === 0) return undefined;
+        const left = this.killDeadlineAt - Date.now();
+        return { ms: left > 0 ? left : 1, signal: this.killSignalName };
+    }
+
+    /** True once the moment this shell's line was bounded by has come, and not reported yet. */
+    private deadlinePassed(): boolean {
+        return this.killDeadlineAt > 0 && !this.killDeadlineFired && Date.now() >= this.killDeadlineAt;
+    }
+
+    /**
+     * Ends this shell as a child its caller killed: the caller is told, which is what makes the
+     * spawn report the signal it named and `killed` true, and the line stops where it stands -- a
+     * host's `sh` is dead at that moment and runs no command after it.
+     */
+    private fireKillDeadline(): void {
+        if (this.killDeadlineFired) return;
+        this.killDeadlineFired = true;
+        if (this.killDeadlineTimer !== undefined) {
+            clearTimeout(this.killDeadlineTimer);
+            this.killDeadlineTimer = undefined;
+        }
+        const notify = this.onKillDeadline;
+        this.onKillDeadline = undefined;
+        notify?.();
+    }
+
+    /** The bound is over when this shell is: its timer is not left behind. */
+    private disarmKillDeadline(): void {
+        if (this.killDeadlineTimer !== undefined) {
+            clearTimeout(this.killDeadlineTimer);
+            this.killDeadlineTimer = undefined;
+        }
+    }
+
     protected async execute(): Promise<void> {
         try {
             // Handle initial command if provided in args
@@ -254,6 +333,12 @@ export class ShellProcess extends Process {
                     ? (this.filteredArgs[1] ?? '')
                     : this.filteredArgs.join(' ');
                 const result = await this.executeCommand(commandLine);
+                /* The line outran the bound the caller put on it: the caller is told now, before the
+                   exit this shell is about to emit, so the exit is the one a killed child gives --
+                   the caller's signal and no status -- and not the status the line happened to end
+                   with. A host's `sh` is killed by the same moment, which is why it reports none. */
+                if (this.deadlinePassed()) this.fireKillDeadline();
+                this.disarmKillDeadline();
                 /* A child process wrote its output to this shell as it ran and the shell's terminal
                    saw it there; writing what the result collected as well would print it twice. */
                 const live = this.liveChildOutput;
@@ -278,15 +363,19 @@ export class ShellProcess extends Process {
             while (this.running && this.state === ProcessState.RUNNING) {
                 const input = await this.readInput();
                 await this.handleInput(input);
+                if (this.deadlinePassed()) this.fireKillDeadline();
             }
         } catch (error: any) {
             this.emitError(`Shell error: ${error.message}\n`);
             throw error;
+        } finally {
+            this.disarmKillDeadline();
         }
     }
 
     protected async onTerminate(): Promise<void> {
         this.running = false;
+        this.disarmKillDeadline();
         this.emitOutput('\nShell terminated.\n');
     }
 
@@ -595,6 +684,10 @@ export class ShellProcess extends Process {
                 piped = '';
             }
             if (this.shell.stopped) break;
+            /* The bound ran out while that step held the thread: no step after it runs, the way no
+               command of a host's `sh` runs once the shell has been killed -- `sh -c 'echo a; node
+               busy.js; echo b'` prints no `b` when its timeout ends inside the busy one. */
+            if (this.deadlinePassed()) break;
         }
         return { stdout, stderr, exitCode };
     }
@@ -634,6 +727,17 @@ export class ShellProcess extends Process {
     }
 
     /**
+     * The file a command naming one stands at. A name written with a `/` in it is a path already;
+     * any other is a file in the directory this shell stands in -- `./node_modules/.bin/cowsay`,
+     * which a host's `sh` executes from there and which the file system answers only once the
+     * directory is put in front of it.
+     */
+    private commandFile(command: string): string {
+        if (command.startsWith('/')) return command;
+        return joinOnPath(this.fileSystem, this.shell.getWorkingDirectory(), command);
+    }
+
+    /**
      * Runs a command that only a child process can run, or returns undefined when the command is not
      * one of those and the line belongs to the script engine.
      */
@@ -650,10 +754,12 @@ export class ShellProcess extends Process {
                     this.shell.getWorkingDirectory()
                 );
             }
-            /* `sh -c <line>` is a shell of its own, and it runs that line the way this shell runs one:
-               a command only a child can run -- `sh -c 'node x.js'` -- reaches a child through it,
-               where the engine's own `sh`, which cannot spawn, would refuse it with 127. */
-            if (command === 'sh' && cmdArgs[0] === '-c') {
+            /* `sh -c <line>` is a shell of its own, and so is any spelling of the path it stands at:
+               it runs that line the way this shell runs one, so a command only a child can run --
+               `sh -c 'node x.js'` -- reaches a child through it, where the engine's own `sh`, which
+               cannot spawn, would refuse it with 127. Only the bare name was recognised, so
+               `/bin/sh -c 'echo hi'` fell through to a file lookup and closed 0 having run nothing. */
+            if (isContainerShell(command) && cmdArgs[0] === '-c') {
                 this.liveChildOutput = true;
                 return await this.spawnChild(
                     command,
@@ -689,7 +795,7 @@ export class ShellProcess extends Process {
             // check for shebang: a name that is not a file to read is not one, and says so by throwing
             let content: string | undefined;
             try {
-                content = this.fileSystem.readFile(command);
+                content = this.fileSystem.readFile(this.commandFile(command));
             } catch {
                 content = undefined;
             }
@@ -703,7 +809,15 @@ export class ShellProcess extends Process {
                         if (tokens.length == 1)
                             throw "executor not specified"
                         let newCommand = tokens[1]
-                        return await this.spawnChild(newCommand, [command, ...cmdArgs]);
+                        /* The script is run where this shell stands and with this shell's variables,
+                           the way a host's `sh` hands it to its interpreter: a relative name means
+                           the file beside the shell and nothing at all from the file system root,
+                           which is where a child with no directory of its own looks for it. As in
+                           every other path here, the child writes to this shell as it runs, so the
+                           result's own copy of that output is not written again. */
+                        this.liveChildOutput = true;
+                        return await this.spawnChild(newCommand, [command, ...cmdArgs],
+                            Object.fromEntries(this.env), this.shell.getWorkingDirectory());
                     }
                 }
             }
