@@ -998,6 +998,25 @@ function moduleFrameName(text) {
 }
 
 /*
+ * The wrapper the host puts a CommonJS body in: the parameter list of the function it is compiled
+ * as, and the body follows it on the same line, so line 1 of a module is line 1 of a script that
+ * starts 61 columns earlier and every frame the engine names there is 61 wide of the one node
+ * names for the same code. The body of a module is the only code compiled that way, so it is the
+ * file and not the frame that says which ones they are, and only line 1 is affected: a later line
+ * keeps the column it has.
+ */
+var CJS_WRAPPER_WIDTH = '(function (exports, require, module, __filename, __dirname) {'.length;
+var FRAME_AT_COLUMN = /^(\s*at )((?:[^\n]*? \()?)([^\s()]+):(\d+):(\d+)(\))?\s*$/;
+
+function frameColumnUnwrapped(text) {
+  var parsed = FRAME_AT_COLUMN.exec(text);
+  if (parsed === null || parsed[4] !== '1' || WRAPPED_FILES[parsed[3]] !== true) return text;
+  var column = parseInt(parsed[5], 10) - CJS_WRAPPER_WIDTH;
+  if (column < 1) return text;
+  return parsed[1] + parsed[2] + parsed[3] + ':1:' + column + (parsed[6] === undefined ? '' : parsed[6]);
+}
+
+/*
  * A guest's frames with this container's own taken out and node's put in their place: the call into
  * a compiled CommonJS body, the loader that made it and the require or the entry behind it are one
  * run of frames of ours, and a host node names the frames of its own loader there and nothing of
@@ -1032,7 +1051,7 @@ function guestFramesOf(lines) {
     out.push(line);
     at++;
   }
-  for (var n = 0; n < out.length; n++) out[n] = anonymousFrameName(out[n]);
+  for (var n = 0; n < out.length; n++) out[n] = anonymousFrameName(frameColumnUnwrapped(out[n]));
   return out;
 }
 

@@ -13,11 +13,22 @@ function quoteStringLiteral(s) {
   return "'" + escaped.replace(/'/g, "\\'") + "'";
 }
 
+/*
+ * The stack the container prints for an error: the header, then the frames. An error the engine
+ * raised itself carries the frames alone and no header, and they are the frames of the bootstrap
+ * that loaded the module, so they are put through the same rewriting a guest's own error gets --
+ * the frames of this container's own become the frames of node's CommonJS loader -- and the header
+ * goes in front. An error the guest constructed already went through it, and once more changes
+ * nothing. The empty line the engine ends every stack with is not one node writes.
+ */
 function formatErrorStack(err) {
   var header = String(err.name || 'Error') + (err.message ? ': ' + err.message : '');
   var stack = err.stack ? String(err.stack) : '';
-  if (stack.indexOf(header) === 0) return stack;
-  return stack ? header + '\n' + stack : header;
+  var lines = stack === '' ? [] : guestFramesOf(stack.split('\n'));
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  var body = lines.join('\n');
+  if (body === '') return header;
+  return body.indexOf(header) === 0 ? body : header + '\n' + body;
 }
 
 function hexByte(b) {
