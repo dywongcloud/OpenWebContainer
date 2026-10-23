@@ -43,7 +43,9 @@ function owcBuildStreamCore() {
 
   function describeReceived(value) {
     if (value === null || value === undefined) return ' Received ' + value;
-    if (typeof value === 'function') return ' Received function ' + (value.name || '<anonymous>');
+    /* Node names a function by its own name and prints nothing for one that has none, so an
+       anonymous function is "Received function " with the name left empty and not "<anonymous>". */
+    if (typeof value === 'function') return ' Received function ' + (value.name || '');
     if (typeof value === 'object') {
       if (value.constructor && value.constructor.name) return ' Received an instance of ' + value.constructor.name;
       return ' Received ' + Object.prototype.toString.call(value);
@@ -98,9 +100,9 @@ function owcBuildStreamCore() {
   }
 
   function normalizeEncoding(enc) {
-    /* Node's internal normalise treats a missing encoding as utf8: setEncoding(null) and
-       setEncoding(undefined) both end up decoding utf8 rather than throwing. */
-    if (enc === null || enc === undefined) return 'utf8';
+    /* Node's internal normalise treats a missing encoding as utf8: setEncoding(null),
+       setEncoding(undefined) and setEncoding('') all end up decoding utf8 rather than throwing. */
+    if (enc === null || enc === undefined || enc === '') return 'utf8';
     var e = String(enc).toLowerCase();
     if (e === 'utf-8') return 'utf8';
     if (e === 'ucs2' || e === 'ucs-2' || e === 'utf-16le') return 'utf16le';
@@ -1993,6 +1995,13 @@ function owcBuildStreamCore() {
     Object.defineProperty(Duplex.prototype, method, Object.getOwnPropertyDescriptor(Writable.prototype, method));
   });
   defineWritableGetters(Duplex.prototype);
+  /* Duplex.from: the same bodies Readable.from does not take -- a function, a promise and a
+     { readable, writable } pair -- over the same converter compose uses, so a generator function,
+     Duplex.from(Promise.resolve('pz')) and Duplex.from({ readable, writable }) all work as on a
+     host. Inherited from Readable it answered Readable.from and rejected all three as iterables. */
+  Duplex.from = function (body) {
+    return duplexFrom(body);
+  };
 
   // ---------------------------------------------------------------- Transform
 
@@ -2276,10 +2285,104 @@ function owcBuildStreamCore() {
   function pipelineBody(value) {
     if (isStreamLike(value)) return value;
     if (typeof value === 'function') return funcToDuplex(value);
+    if (value && typeof value.then === 'function') return promiseToDuplex(value);
+    if (value && (readableTrait(value.readable) || writableTrait(value.writable))) return pairToDuplex(value);
     if (value && (typeof value[Symbol.asyncIterator] === 'function' || typeof value[Symbol.iterator] === 'function')) {
       return Readable.from(value);
     }
     throw argBodyError(value);
+  }
+
+  /* A { readable, writable } pair is a body of its own: the two halves become the two sides of one
+     Duplex, which is what Duplex.from answers for that shape. */
+  function pairToDuplex(pair) {
+    var r = pair.readable;
+    var w = pair.writable;
+    var readable = readableTrait(r);
+    var writable = writableTrait(w);
+    var d = new Duplex({
+      objectMode: !!(r && r.readableObjectMode) || !!(w && w.writableObjectMode),
+      readable: readable,
+      writable: writable
+    });
+    if (readable) {
+      r.on('end', function () {
+        d.push(null);
+      });
+      r.on('readable', function () {
+        d._read();
+      });
+      d._read = function () {
+        for (;;) {
+          var chunk = r.read();
+          if (chunk === null) return;
+          if (!d.push(chunk)) return;
+        }
+      };
+    }
+    if (writable) {
+      d._write = function (chunk, encoding, callback) {
+        if (w.write(chunk, encoding)) callback();
+        else w.once('drain', callback);
+      };
+      d._final = function (callback) {
+        w.end(callback);
+      };
+    }
+    return d;
+  }
+
+  // A promise body settles into one chunk: whatever it resolves to is pushed once, as it is.
+  function promiseToDuplex(value) {
+    var out = new Duplex({
+      objectMode: true,
+      read: function () {},
+      /* What is written to it goes nowhere: a promise is a source, so a promise body in the middle
+         of a composed chain takes the link before it and answers with its own value instead. */
+      write: function (chunk, encoding, callback) {
+        callback();
+      },
+      final: function (callback) {
+        callback();
+      }
+    });
+    Promise.resolve(value).then(function (settled) {
+      if (!isStreamLike(settled)) {
+        out.push(settled);
+        out.push(null);
+        return;
+      }
+      out._read = function () {
+        settled.resume();
+      };
+      settled.on('data', function (chunk) {
+        if (!out.push(chunk)) settled.pause();
+      });
+      settled.on('end', function () {
+        out.push(null);
+      });
+      settled.on('error', function (err) {
+        out.destroy(err);
+      });
+    }, function (err) {
+      out.destroy(err);
+    });
+    return out;
+  }
+
+  /* What a body function answered with is a body in its own right, and Node reads it the same way it
+     reads one handed to compose: a string or a Buffer is one chunk, an iterable is its values, a
+     stream is the next link, and anything else is not a body at all. */
+  function bodyValue(value) {
+    if (isStreamLike(value)) return value;
+    if (typeof value === 'string' || Buf.isBuffer(value)) return Readable.from(value);
+    if (value && typeof value.then === 'function') return promiseToDuplex(value);
+    if (value && (readableTrait(value.readable) || writableTrait(value.writable))) return pairToDuplex(value);
+    if (value && typeof value[Symbol.asyncIterator] === 'function') return Readable.from(value);
+    if (value && typeof value[Symbol.iterator] === 'function') return Readable.from(value);
+    throw owcErr(TypeError, 'ERR_INVALID_RETURN_VALUE',
+      'Expected Iterable, AsyncIterable or AsyncFunction to be returned from the "body" function but got '
+      + describeReceived(value).replace(/^ Received /, '') + '.');
   }
 
   function readableTrait(value) {
@@ -2339,17 +2442,20 @@ function owcBuildStreamCore() {
     if (typeof fn !== 'function') return fn;
     if (fn.length === 0) {
       var made = fn();
-      if (made === null || typeof made !== 'object') throw argBodyError(fn);
+      if (made === null || typeof made !== 'object') return bodyValue(made);
       if (typeof made.next === 'function') return iteratorToDuplex(made, new PassThrough({ objectMode: true }));
-      return made;
+      return bodyValue(made);
     }
     var source = new PassThrough({ objectMode: true });
     var iterator = fn(source);
-    if (iterator === null || typeof iterator !== 'object') throw argBodyError(fn);
+    if (iterator === null || typeof iterator !== 'object') return bodyValue(iterator);
     if (typeof iterator.next !== 'function') {
+      /* A string or a Buffer answered by a body of one argument is one chunk, as Node reads it, and
+         not an iterable of characters or of bytes. */
+      if (typeof iterator === 'string' || Buf.isBuffer(iterator)) return bodyValue(iterator);
       if (typeof iterator[Symbol.asyncIterator] === 'function') iterator = iterator[Symbol.asyncIterator]();
       else if (typeof iterator[Symbol.iterator] === 'function') iterator = iterator[Symbol.iterator]();
-      else throw argBodyError(fn);
+      else return bodyValue(iterator);
     }
     return iteratorToDuplex(iterator, source);
   }
@@ -2404,6 +2510,8 @@ function owcBuildStreamCore() {
     // the transform between the two streams around it.
     for (var m = 0; m < streams.length; m++) {
       if (typeof streams[m] === 'function') streams[m] = funcToDuplex(streams[m]);
+      /* A promise is a body wherever it stands too, and what it settles to is the link. */
+      else if (streams[m] && typeof streams[m].then === 'function') streams[m] = promiseToDuplex(streams[m]);
     }
     for (var n = 0; n < streams.length; n++) {
       var item = streams[n];
@@ -2762,25 +2870,25 @@ function owcBuildStreamCore() {
     return new Duplex(opts);
   };
 
-  Stream.Stream = Stream;
+  /*
+   * The order these are assigned in is the order Object.keys(require('node:stream')) reads them
+   * back in, and a host's order is not alphabetical: its five predicates come first, then the
+   * constructors and helpers, then 'promises', 'Stream', and the three underscore helpers last.
+   */
+  Stream.isDestroyed = streamIsDestroyed;
+  Stream.isDisturbed = streamIsDisturbed;
+  Stream.isErrored = streamIsErrored;
+  Stream.isReadable = streamIsReadable;
+  Stream.isWritable = streamIsWritable;
   Stream.Readable = Readable;
   Stream.Writable = Writable;
   Stream.Duplex = Duplex;
   Stream.Transform = Transform;
   Stream.PassThrough = PassThrough;
-  Stream.pipeline = pipeline;
-  Stream.finished = finished;
-  Stream.promises = streamPromises;
-  Stream.getDefaultHighWaterMark = getDefaultHighWaterMark;
-  Stream.setDefaultHighWaterMark = setDefaultHighWaterMark;
-  Stream.addAbortSignal = addAbortSignal;
-  Stream.compose = compose;
-  Stream.isReadable = streamIsReadable;
-  Stream.isWritable = streamIsWritable;
-  Stream.isErrored = streamIsErrored;
-  Stream.isDisturbed = streamIsDisturbed;
-  Stream.isDestroyed = streamIsDestroyed;
   Stream.duplexPair = duplexPair;
+  Stream.pipeline = pipeline;
+  Stream.addAbortSignal = addAbortSignal;
+  Stream.finished = finished;
   /*
    * The four a host's stream module exports beside these and this one did not: 'destroy' is the
    * destroy a caller hands a stream -- an aborted signal's handler gives it one -- and the three
@@ -2793,8 +2901,13 @@ function owcBuildStreamCore() {
     if (typeof stream.destroy !== 'function') return;
     stream.destroy(err);
   };
-  Stream._isUint8Array = function (value) { return value instanceof Uint8Array; };
+  Stream.compose = compose;
+  Stream.setDefaultHighWaterMark = setDefaultHighWaterMark;
+  Stream.getDefaultHighWaterMark = getDefaultHighWaterMark;
+  Stream.promises = streamPromises;
+  Stream.Stream = Stream;
   Stream._isArrayBufferView = function (value) { return ArrayBuffer.isView(value); };
+  Stream._isUint8Array = function (value) { return value instanceof Uint8Array; };
   Stream._uint8ArrayToBuffer = function (chunk) {
     return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
   };
@@ -3095,7 +3208,9 @@ function owcBuildStreamCore() {
         lineIterator: null,
         onData: null,
         onEnd: null,
-        history: []
+        /* A history handed in with the options seeds the array the interface reads, as Node's does:
+           createInterface({ history: ['x', 'y'] }) leaves rl.history holding those two lines. */
+        history: Array.isArray(opts.history) ? opts.history.slice() : []
       },
       enumerable: false,
       writable: true,
@@ -3182,6 +3297,11 @@ function owcBuildStreamCore() {
   Interface.prototype.question = function (query, options, cb) {
     var callback = typeof options === 'function' ? options : cb;
     if (this.closed) throw errUseAfterClose();
+    /* Node validates options.signal before it writes the query: a signal that is not an AbortSignal
+       is refused, and nothing is prompted. */
+    if (options !== null && typeof options === 'object' && options.signal !== undefined) {
+      checkSignalProp(options.signal);
+    }
     var st = this[kState];
     if (st.questionCallback !== null) {
       this.prompt();
