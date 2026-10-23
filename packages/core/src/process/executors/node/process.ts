@@ -3251,13 +3251,18 @@ export class NodeProcess extends Process {
                flag -- is told that file and data are supported, with no mention of node, while
                every other scheme is told about file, data and node. */
             const network = scheme === 'http:' || scheme === 'https:';
+            /* The url Node puts on a module it could not find: the file URL of the absolute path the
+               specifier named. A bare specifier has no path behind it and so no url -- `Cannot find
+               package 'lodash'` carries a code and a message and nothing else. */
+            const url = code === 'ERR_MODULE_NOT_FOUND' && scheme === undefined && directory === undefined
+                && target.startsWith('/') ? toFileUrl(target) : undefined;
             const message = directory !== undefined
                 ? `Directory import '${directory}' is not supported resolving ES modules imported from ${baseName}`
                 : scheme === undefined
                     ? `${named}${baseName ? ` imported from ${baseName}` : ''}`
                     : `Only URLs with a scheme in: ${network ? 'file and data' : 'file, data, and node'} are supported by the default ESM loader. Received protocol '${scheme}'`;
-            this.setImportFailureCode(code);
-            return { error: this.resolveErrorHandle(message, code) };
+            this.setImportFailureCode(code, url);
+            return { error: this.resolveErrorHandle(message, code, url) };
         }
         const found = detail.file;
         if (missingAttribute) {
@@ -3361,13 +3366,19 @@ export class NodeProcess extends Process {
      * instead: the wrapper the ES module source puts around every dynamic import reads it back and
      * sets it on the rejection.
      */
-    private setImportFailureCode(code: string): void {
+    private setImportFailureCode(code: string, url?: string): void {
         const context = this.context;
         if (context === undefined) return;
         try {
             const value = context.newString(code);
             context.setProp(context.global, "__owc_import_failure", value);
             value.dispose();
+            /* The url travels the same road as the code, and is cleared the same way: a failure with
+               no url behind it -- a bare package name that resolves to nothing -- must not leave the
+               last one's on the next error that comes through. */
+            const urlValue = url === undefined ? context.undefined : context.newString(url);
+            context.setProp(context.global, "__owc_import_failure_url", urlValue);
+            urlValue.dispose();
         } catch {
             // a guest that is already gone cannot carry the code; the message still reports it
         }
@@ -3384,8 +3395,10 @@ export class NodeProcess extends Process {
      * a CommonJS module's is plain compiled code with no wrapper in it, so the code has to ride on
      * the error itself.
      */
-    private resolveErrorHandle(message: string, code: string): QuickJSHandle | Error {
-        this.lastResolveError = Object.assign(new Error(message), { code });
+    private resolveErrorHandle(message: string, code: string, url?: string): QuickJSHandle | Error {
+        this.lastResolveError = url === undefined
+            ? Object.assign(new Error(message), { code })
+            : Object.assign(new Error(message), { code, url });
         const context = this.context;
         if (context === undefined) return this.lastResolveError;
         try {
@@ -3395,6 +3408,18 @@ export class NodeProcess extends Process {
                 context.setProp(error, 'code', codeHandle);
             } finally {
                 codeHandle.dispose();
+            }
+            /* The url rides on the error beside the code, and for the same reason: a program that
+               reads err.url after a failed import is reading the one thing a rebuilt host Error
+               loses. A specifier with no file behind it -- a bare package name that resolves to
+               nothing -- has no url on the host either, so none is written. */
+            if (url !== undefined) {
+                const urlHandle = context.newString(url);
+                try {
+                    context.setProp(error, 'url', urlHandle);
+                } finally {
+                    urlHandle.dispose();
+                }
             }
             return error;
         } catch {

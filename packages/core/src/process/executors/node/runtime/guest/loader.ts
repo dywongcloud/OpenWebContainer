@@ -1341,9 +1341,19 @@ function importWrap(promise, strict) {
     return moduleViewOf(value, strict);
   }, function (err) {
     var code = globalThis.__owc_import_failure;
+    var url = globalThis.__owc_import_failure_url;
     globalThis.__owc_import_failure = undefined;
-    if (typeof code === 'string' && err !== null && typeof err === 'object' && err.code === undefined) {
-      try { err.code = code; } catch (e) { /* a frozen error keeps the message it already has */ }
+    globalThis.__owc_import_failure_url = undefined;
+    if (err !== null && typeof err === 'object') {
+      if (typeof code === 'string' && err.code === undefined) {
+        try { err.code = code; } catch (e) { /* a frozen error keeps the message it already has */ }
+      }
+      /* The url is dropped the way the code is, and is put back the same way: it names the file the
+         specifier pointed at, and a bare name that resolves to no package has none -- so it is
+         written only when there is one, and never as undefined. */
+      if (typeof url === 'string' && err.url === undefined) {
+        try { err.url = url; } catch (e) { /* a frozen error keeps the message it already has */ }
+      }
     }
     throw err;
   });

@@ -413,12 +413,92 @@ function deepEqualValues(a, b, strict) {
   return true;
 }
 
+/*
+ * TextEncoder, as the encoding standard and Node 24.15 have it: what an encoder knows of itself it
+ * knows off the prototype and not off the instance, so Object.keys of one is empty and 'encoding'
+ * is an accessor beside 'encode' and 'encodeInto'; and encodeInto writes into the Uint8Array it is
+ * handed, stopping at the code point that would not fit, and answers how much of the string it
+ * read and how many bytes it wrote -- a whole code point at a time, never half of one.
+ */
+var TEXT_ENCODER_STATE = new WeakMap();
 function TextEncoderImpl() {
-  this.encoding = 'utf-8';
+  TEXT_ENCODER_STATE.set(this, true);
 }
+/* 'Received <what>' as Node's own argument errors spell it: null and undefined bare, a primitive as
+   its type and its value, and anything else as an instance of the constructor it came from. */
+function encodeArgReceived(v) {
+  if (v === null) return 'null';
+  if (v === undefined) return 'undefined';
+  if (typeof v !== 'object') {
+    if (typeof v === 'symbol') return 'type symbol (' + String(v) + ')';
+    if (typeof v === 'string') return 'type string (\'' + v + '\')';
+    return 'type ' + typeof v + ' (' + String(v) + ')';
+  }
+  var n = v.constructor && v.constructor.name;
+  return 'an instance of ' + (typeof n === 'string' && n !== '' ? n : 'Object');
+}
+/* 'Value of "this" must be of type TextEncoder': the brand no probe of the value itself gives,
+   since an encoder carries nothing of its own -- only the record beside it says this object was
+   ever built by this constructor. */
+function textEncoderThis(state) {
+  if (state !== true) {
+    throw textDecoderError(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type TextEncoder');
+  }
+}
+Object.defineProperty(TextEncoderImpl.prototype, 'encoding', {
+  get: function () { textEncoderThis(TEXT_ENCODER_STATE.get(this)); return 'utf-8'; },
+  enumerable: true, configurable: true
+});
 TextEncoderImpl.prototype.encode = function (input) {
+  textEncoderThis(TEXT_ENCODER_STATE.get(this));
   return encodeUtf8(input === undefined ? '' : String(input));
 };
+TextEncoderImpl.prototype.encodeInto = function (input, dest) {
+  textEncoderThis(TEXT_ENCODER_STATE.get(this));
+  if (typeof input !== 'string') {
+    throw textDecoderError(TypeError, 'ERR_INVALID_ARG_TYPE',
+      'The "src" argument must be of type string. Received ' + encodeArgReceived(input));
+  }
+  if (!(dest instanceof Uint8Array)) {
+    throw textDecoderError(TypeError, 'ERR_INVALID_ARG_TYPE',
+      'The "dest" argument must be an instance of Uint8Array. Received ' + encodeArgReceived(dest));
+  }
+  var read = 0;
+  var written = 0;
+  var i = 0;
+  while (i < input.length) {
+    var unit = input.charCodeAt(i);
+    var next = 1;
+    var cp = unit;
+    if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < input.length) {
+      var low = input.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        cp = 0x10000 + ((unit - 0xd800) << 10) + (low - 0xdc00);
+        next = 2;
+      }
+    }
+    /* A half of a pair whose other half is not there is not a code point at all, and the standard
+       answers it with the replacement character rather than with the bytes of a surrogate. */
+    var seq = (unit >= 0xd800 && unit <= 0xdfff && next === 1) ? [0xef, 0xbf, 0xbd]
+      : cp < 0x80 ? [cp]
+      : cp < 0x800 ? [0xc0 | (cp >> 6), 0x80 | (cp & 0x3f)]
+      : cp < 0x10000 ? [0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f)]
+      : [0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f)];
+    if (written + seq.length > dest.length) break;
+    for (var k = 0; k < seq.length; k++) dest[written + k] = seq[k];
+    written += seq.length;
+    i += next;
+    read += next;
+  }
+  return { read: read, written: written };
+};
+/* Its name, which a program reads off the constructor, is 'TextEncoder' and not the name it was
+   built under here. */
+Object.defineProperty(TextEncoderImpl, 'name', { value: 'TextEncoder', configurable: true });
+Object.defineProperty(TextEncoderImpl.prototype, Symbol.toStringTag, { value: 'TextEncoder', configurable: true });
+/* The one argument encode takes is optional in Node's own signature and so is absent from its
+   length: the arity a program reads is 0, and the method reads its argument all the same. */
+Object.defineProperty(TextEncoderImpl.prototype.encode, 'length', { value: 0, configurable: true });
 
 /*
  * TextDecoder, as the encoding standard and Node 24.15 have it: a label names one of the
@@ -581,15 +661,25 @@ function TextDecoderImpl(label, options) {
 /* The four the host's own prototype carries, and as the host carries them: a method and three
    accessors, all of them writable and enumerable, which is what makes Object.keys of the
    prototype answer their names. 'constructor' is the one name that is not. */
+/* Which decoder a getter was asked about: the record beside it, or the brand error when there is
+   no such record -- 'Value of "this" must be of type TextDecoder', which a getter reached with a
+   foreign 'this' throws exactly as decode does. */
+function textDecoderThis(target) {
+  var state = TEXT_DECODER_STATE.get(target);
+  if (state === undefined) {
+    throw textDecoderError(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type TextDecoder');
+  }
+  return state;
+}
 Object.defineProperty(TextDecoderImpl.prototype, 'decode', { writable: true, enumerable: true, configurable: true });
 Object.defineProperty(TextDecoderImpl.prototype, 'encoding', {
-  get: function () { return TEXT_DECODER_STATE.get(this).encoding; }, enumerable: true, configurable: true
+  get: function () { return textDecoderThis(this).encoding; }, enumerable: true, configurable: true
 });
 Object.defineProperty(TextDecoderImpl.prototype, 'fatal', {
-  get: function () { return TEXT_DECODER_STATE.get(this).fatal; }, enumerable: true, configurable: true
+  get: function () { return textDecoderThis(this).fatal; }, enumerable: true, configurable: true
 });
 Object.defineProperty(TextDecoderImpl.prototype, 'ignoreBOM', {
-  get: function () { return TEXT_DECODER_STATE.get(this).ignoreBOM; }, enumerable: true, configurable: true
+  get: function () { return textDecoderThis(this).ignoreBOM; }, enumerable: true, configurable: true
 });
 TextDecoderImpl.prototype.decode = function (input, options) {
   var state = TEXT_DECODER_STATE.get(this);
