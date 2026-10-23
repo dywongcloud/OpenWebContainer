@@ -3341,6 +3341,13 @@ BF.crypto = function () {
     return err;
   }
 
+  /* Node reads the refusal's reason off OpenSSL's error queue, and that queue is sticky: once a
+     working set has failed its budget the reason stays on the queue, so a later bare 'invalid
+     params' refusal -- N:1, say -- carries it too, until a scrypt call that succeeds clears it.
+     A process that has never overrun its budget has an empty queue and answers bare. */
+  var SCRYPT_MEM_REASON = 'error:030000AC:digital envelope routines::memory limit exceeded';
+  var scryptReason = null;
+
   /* Node bounds N, r and p as unsigned 32-bit integers and maxmem as a safe integer before it
      reads a zero as 'not handed over': a value that is not an integer is an out-of-range error
      naming the integer, and one outside the range names the range -- so -1 and 4294967296 are
@@ -3379,9 +3386,12 @@ BF.crypto = function () {
     var r = block === undefined || block === 0 ? 8 : block;
     var p = par === undefined || par === 0 ? 1 : par;
     var budget = want === undefined || want === 0 ? 32 * 1024 * 1024 : want;
-    if (!(n > 1) || (n & (n - 1)) !== 0 || !(r > 0) || !(p > 0)) throw scryptParams();
+    if (!(n > 1) || (n & (n - 1)) !== 0 || !(r > 0) || !(p > 0)) {
+      throw scryptParams(scryptReason === null ? undefined : 'Invalid scrypt params: ' + scryptReason);
+    }
     if (128 * n * r > budget) {
-      throw scryptParams('Invalid scrypt params: error:030000AC:digital envelope routines::memory limit exceeded');
+      scryptReason = SCRYPT_MEM_REASON;
+      throw scryptParams('Invalid scrypt params: ' + SCRYPT_MEM_REASON);
     }
     var out = cryptoCap('crypto.scrypt', {
       password: toBytes(password, undefined, 'password').toString('base64'),
@@ -3392,6 +3402,8 @@ BF.crypto = function () {
       p: par,
       maxmem: want
     });
+    /* A derivation that reached the end empties the queue, so the next refusal is bare again. */
+    scryptReason = null;
     return Buf.from(out, 'base64');
   }
 

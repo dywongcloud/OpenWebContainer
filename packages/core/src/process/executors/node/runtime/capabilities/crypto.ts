@@ -2263,9 +2263,17 @@ function ocbLValues(state: CipherState, count: number): { star: Uint8Array; doll
 function ocbOffset(state: CipherState, tagLength: number): Uint8Array {
     const p = primitiveOf(state.spec);
     const nonce = new Uint8Array(BLOCK);
+    /*
+     * Nonce = num2str(TAGLEN mod 128, 7) || zeros(120 - bitlen(N)) || 1 || N, so the seven tag
+     * bits sit at the head, the marker bit sits at bit 127 - bitlen(N) and N itself is flush
+     * against the tail -- a 12-byte nonce is the case that puts the marker at byte 3 and N at
+     * byte 4, but the layout moves with the nonce's own length, from 1 byte to 15.
+     */
+    const bits = state.iv.length * 8;
     nonce[0] = ((tagLength * 8) % 128) << 1;
-    nonce[3] = 0x01;
-    nonce.set(state.iv, 4);
+    const marker = 127 - bits;
+    nonce[marker >> 3] |= 1 << (7 - (marker & 7));
+    nonce.set(state.iv, BLOCK - state.iv.length);
     const bottom = state.iv[state.iv.length - 1] & 0x3f;
     const ktopInput = Uint8Array.from(nonce);
     ktopInput[BLOCK - 1] &= 0xc0;
