@@ -1,0 +1,13 @@
+id: owc-sharp-jpeg-decode-pixels
+session_id: adv6-judge-sharp-8
+owner: adv6-judge-sharp-8
+status: pending
+classification: GUEST
+measured_at: de4f90d (local main)
+title: A jpeg decodes a count off, and every jpeg resize inherits it
+subject: 'A jpeg decode with no operation already differs: sharp(fig.jpg).raw() on a 64x64 RGB jpeg is 12288 bytes on both sides but hashes 3242831015 under host sharp 0.33.5 and 3218269188 here, 474 of the 12288 bytes apart and every one of them by 1 or 2. A png decode with no operation agrees (hash 2016360389), so it is the inverse DCT: this shim inverts it in floating point with a separable A-transposed transform, where libjpeg uses its fixed-point jpeg_idct_islow. Every jpeg resize inherits it -- 1:1, 64x48, 128x128, w16 and w8, with and without fastShrinkOnLoad, all 12 jpeg cases differ. Confirmed by adv6-judge-sharp-8 in isolation (load 11, 8.5 GB free), two container boots byte-identical.'
+acceptance_criteria:
+- sharp(64x64 RGB jpeg).raw().toBuffer() hashes 3242831015, as under host sharp 0.33.5
+- sharp(that jpeg).resize(16).raw().toBuffer() hashes 2888504620
+- a png decode with no operation still hashes 2016360389
+witness_plan: One container boot per side, `npm install --no-audit --no-fund sharp@0.33.5` on its own `sh -c` line followed by `node /app/main.js`, against host node v24.15.0 with sharp 0.33.5 at /tmp/owc-r5-napivm/oracle. Witnessed in the R8.* keys of /tmp/owc-judge-sharp-8/case/main.js, and byte-for-byte in /tmp/owc-judge-sharp-8/jpeg-host.json against /tmp/owc-judge-sharp-8/jpeg-shim.json.

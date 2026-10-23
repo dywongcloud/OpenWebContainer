@@ -32,11 +32,20 @@ export function cloneImage(image: Image): Image {
 
 /** Copy `src` into `dst` at (left, top); the parts of `src` outside `dst` are dropped. */
 export function blit(dst: Image, src: Image, left: number, top: number): void {
-    const w = Math.min(src.width, dst.width - left);
-    const h = Math.min(src.height, dst.height - top);
+    /*
+     * A negative offset -- which is what an embed onto a canvas smaller than the image asks for --
+     * pushes the top-left corner of the source off the destination, so both the source read and the
+     * destination write have to start inside their own image.
+     */
+    const sx = left < 0 ? -left : 0;
+    const sy = top < 0 ? -top : 0;
+    const dx = left < 0 ? 0 : left;
+    const dy = top < 0 ? 0 : top;
+    const w = Math.min(src.width - sx, dst.width - dx);
+    const h = Math.min(src.height - sy, dst.height - dy);
     for (let y = 0; y < h; y++) {
-        const from = (y * src.width) * src.channels;
-        const to = ((y + top) * dst.width + left) * dst.channels;
+        const from = ((y + sy) * src.width + sx) * src.channels;
+        const to = ((y + dy) * dst.width + dx) * dst.channels;
         dst.data.set(src.data.subarray(from, from + w * src.channels), to);
     }
 }
@@ -499,6 +508,8 @@ export function resample(image: Image, hshrink: number, vshrink: number, kernel:
     let work = image;
     if (vshrink > 1) work = resampleAxis(work, vshrink, false, kernel);
     if (hshrink > 1) work = resampleAxis(work, hshrink, true, kernel);
+    /* Whether either axis actually ran a reduce: see the zoom branch below. */
+    const reduced = work !== image;
     const hscale = 1 / hshrink;
     const vscale = 1 / vshrink;
     if (hscale <= 1 && vscale <= 1) return work;
@@ -511,8 +522,15 @@ export function resample(image: Image, hshrink: number, vshrink: number, kernel:
      */
     const ah = hscale > 1 ? hscale : 1;
     const av = vscale > 1 ? vscale : 1;
-    /* A whole-number NEAREST enlargement is vips_zoom, not an affine at all. */
-    if (kernel === 'nearest' && ah === Math.floor(ah) && av === Math.floor(av)) {
+    /*
+     * A whole-number NEAREST enlargement of an image no reduce has touched is vips_zoom, not an
+     * affine at all. It is not taken once a reduce has run on the other axis: measured against
+     * sharp 0.33.5, 40x30 -> 200x5 fill nearest -- a 6x vertical reduce plus a 5x horizontal
+     * enlargement -- comes out of the affine, and vips_zoom's `floor(x / 5)` is one column early
+     * at every fifth column (host samples source column 0 at output columns 0-5, zoom at 0-4).
+     * Powers of two hide it because 1/2, 1/4 and 1/8 accumulate exactly; 1/5 does not.
+     */
+    if (kernel === 'nearest' && !reduced && ah === Math.floor(ah) && av === Math.floor(av)) {
         return zoomImage(work, Math.round(ah), Math.round(av));
     }
     return affineImage(work, ah, av, kernel);
@@ -544,9 +562,15 @@ export interface ResizeSpec {
  * 40x30: a crop centres on Math.round of the spare room (5 -> 3, 7 -> 4, 3 -> 2 all minimise the
  * difference from libvips), an embed on Math.floor (room 1/3/5/7 -> 0/1/2/3, read off the padding
  * columns of a contain resize with withoutEnlargement).
+ *
+ * An embed's room can be NEGATIVE -- a canvas smaller than the image, which is what withoutReduction
+ * leaves behind, since the shrink is clamped to 1 -- and sharp's CalculateEmbedPosition (src/common.cc)
+ * divides it with C's integer division, which truncates toward zero: a 40x30 image on a 10x5 canvas
+ * sits at (-15, -12), not (-15, -13). libvips then places the image there and clips, so the output is
+ * the image shifted, with the part pushed off the edge gone and background in its place.
  */
 function offsetOf(position: number, outer: number, inner: number, crop: boolean): number {
-    if (outer <= inner) return 0;
+    if (crop && outer <= inner) return 0;
     const room = outer - inner;
     switch (position) {
         case 1:
@@ -558,17 +582,17 @@ function offsetOf(position: number, outer: number, inner: number, crop: boolean)
         case 7:
             return room; // south
         default:
-            return crop ? Math.round(room / 2) : Math.floor(room / 2);
+            return crop ? Math.round(room / 2) : Math.trunc(room / 2);
     }
 }
 
 /** The horizontal half of `offsetOf`: 4/7/8 west, 2/5/6 east, else centred. */
 function offsetXOf(position: number, outer: number, inner: number, crop: boolean): number {
-    if (outer <= inner) return 0;
+    if (crop && outer <= inner) return 0;
     const room = outer - inner;
     if (position === 4 || position === 7 || position === 8) return 0;
     if (position === 2 || position === 5 || position === 6) return room;
-    return crop ? Math.round(room / 2) : Math.floor(room / 2);
+    return crop ? Math.round(room / 2) : Math.trunc(room / 2);
 }
 
 /**
@@ -620,14 +644,16 @@ function resolveShrink(
 }
 
 /**
- * The dimensions and the crop or pad that sharp's resize produces, measured against sharp 0.33.5 at
- * 40x30: cover/contain/inside/outside/fill over (20,10), (20,-1), (-1,10), (60,40), (60,-1), (-1,60), (40,30)
- * and (10,10), with and without withoutEnlargement.
+ * The resample alone, with whether it changed anything. The crop or embed that finishes a resize is
+ * `canvasImage`, and sharp runs it later than this: after the flip, flop and rotation, not before.
+ *
+ * `resized` is sharp's own `shouldResize` -- the resolved shrink moved off 1 on either axis -- which
+ * is also what makes libvips premultiply an alpha channel, so the caller needs it.
  */
-export function resizeImage(image: Image, spec: ResizeSpec): Image {
+export function resizeImage(image: Image, spec: ResizeSpec): { image: Image; resized: boolean } {
     const W = image.width;
     const H = image.height;
-    if (spec.width < 0 && spec.height < 0) return image;
+    if (spec.width < 0 && spec.height < 0) return { image, resized: false };
     const { hshrink, vshrink } = resolveShrink(
         W,
         H,
@@ -639,33 +665,54 @@ export function resizeImage(image: Image, spec: ResizeSpec): Image {
     );
     const sw = roundU(W / hshrink);
     const sh = roundU(H / vshrink);
-    const scaled = sw === W && sh === H ? image : resample(image, hshrink, vshrink, spec.kernel);
+    return {
+        image: sw === W && sh === H ? image : resample(image, hshrink, vshrink, spec.kernel),
+        resized: hshrink !== 1 || vshrink !== 1
+    };
+}
+
+/**
+ * The crop or embed sharp applies after the resample and after the flip, flop and rotation
+ * (src/pipeline.cc: the mirror and `rot` block, then `inputWidth`/`inputHeight` are re-read and the
+ * crop/embed runs against those). Measured against sharp 0.33.5 at 40x30:
+ *
+ * - `.resize(20,10).rotate(90)` is 15x10, not 10x20: the resize gives 20x15, rotate(90) turns that
+ *   into 15x20, and only then is it cropped to 20x10 -- which the 15-pixel width clamps to 15.
+ * - `.resize({width:20,height:10,fit:'contain'}).rotate(90)` is 20x13: the resize gives 13x10,
+ *   rotate(90) turns it into 10x13, and the embed then pads to 20x13.
+ *
+ * An embed takes the MAXIMUM of the canvas and the image, never the canvas alone: `vips_embed` is
+ * handed `std::max(inputWidth, baton->width)`, so a contain resize whose canvas is smaller than the
+ * image -- which is what withoutReduction leaves behind, since the shrink is clamped to 1 -- does
+ * not crop. 40x30 -> 20x10 contain withoutReduction is 40x30 on host, not 20x10.
+ */
+export function canvasImage(image: Image, spec: ResizeSpec): Image {
+    const w = spec.width > 0 ? spec.width : image.width;
+    const h = spec.height > 0 ? spec.height : image.height;
     if (spec.canvas === 'crop') {
-        const w = spec.width > 0 ? Math.min(spec.width, scaled.width) : scaled.width;
-        const h = spec.height > 0 ? Math.min(spec.height, scaled.height) : scaled.height;
-        if (w === scaled.width && h === scaled.height) return scaled;
+        const cw = Math.min(w, image.width);
+        const ch = Math.min(h, image.height);
+        if (cw === image.width && ch === image.height) return image;
         return extractImage(
-            scaled,
-            offsetXOf(spec.position, scaled.width, w, true),
-            offsetOf(spec.position, scaled.height, h, true),
-            w,
-            h
+            image,
+            offsetXOf(spec.position, image.width, cw, true),
+            offsetOf(spec.position, image.height, ch, true),
+            cw,
+            ch
         );
     }
     if (spec.canvas === 'embed') {
-        const w = spec.width > 0 ? spec.width : scaled.width;
-        const h = spec.height > 0 ? spec.height : scaled.height;
-        if (w === scaled.width && h === scaled.height) return scaled;
-        return embedImage(
-            scaled,
-            w,
-            h,
-            offsetXOf(spec.position, w, scaled.width, false),
-            offsetOf(spec.position, h, scaled.height, false),
-            spec.background
-        );
+        const ew = Math.max(w, image.width);
+        const eh = Math.max(h, image.height);
+        /* The offsets come off the canvas the caller asked for, not off the max: a canvas smaller
+           than the image gives a negative offset, and the image is shifted and clipped rather than
+           padded (see offsetOf). */
+        const left = offsetXOf(spec.position, w, image.width, false);
+        const top = offsetOf(spec.position, h, image.height, false);
+        if (ew === image.width && eh === image.height && left === 0 && top === 0) return image;
+        return embedImage(image, ew, eh, left, top, spec.background);
     }
-    return scaled;
+    return image;
 }
 
 /* ------------------------------------------------------- geometry operations */

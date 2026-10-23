@@ -26,12 +26,14 @@ import {
 import {
     ChannelCount,
     Image,
+    ResizeSpec,
     createImage,
     embedImage,
     extractImage,
     flipImage,
     flopImage,
     padBackground,
+    canvasImage,
     resizeImage,
     rotateQuarters,
     spaceOf,
@@ -70,6 +72,7 @@ interface Decoded {
     hasProfile: boolean;
     hasAlpha: boolean;
     orientation?: number;
+    exif?: Uint8Array;
     background?: { r: number; g: number; b: number };
     comments?: Array<[string, string]>;
 }
@@ -157,7 +160,7 @@ function decodedFromPng(image: Image, info: PngInfo, size: number): Decoded {
         image,
         format: 'png',
         size,
-        density: densityOf(info.density),
+        density: info.density,
         resolutionUnit: info.resolutionUnit,
         isProgressive: info.isProgressive,
         paletteBitDepth: info.paletteBitDepth,
@@ -169,13 +172,16 @@ function decodedFromPng(image: Image, info: PngInfo, size: number): Decoded {
 }
 
 /**
- * libvips gives every image it has loaded a resolution, defaulting to 72 dpi when the file carries
- * none, so sharp's metadata() always has a density for a PNG or JPEG input and never for one it
- * built itself (create, raw). Measured against sharp 0.33.5: a PNG and a JPEG with no pHYs and a
- * JFIF with units 0 both report 72, while sharp({create:...}) and a raw buffer report none.
+ * A JPEG always leaves the decoder with a resolution: libvips defaults one to 72 dpi when the JFIF
+ * carries none (units 0), so sharp's metadata() always has a density for a JPEG and a PNG reports
+ * one only when its pHYs says so. Measured against host sharp 0.33.5: a jpeg whose JFIF is 72 dpi
+ * reports 72, while a png with no pHYs -- and one whose pHYs is libvips' own 1000 px/m default,
+ * which is what sharp writes when no density is asked for -- reports no density at all.
+ *
+ * Below one pixel per millimetre (25.4 dpi) libvips keeps no resolution, so neither does this.
  */
-function densityOf(density: number | undefined): number {
-    return typeof density === 'number' && isFinite(density) && density > 0 ? density : 72;
+function densityOf(density: number | undefined): number | undefined {
+    return typeof density === 'number' && isFinite(density) && density > 25.4 ? density : 72;
 }
 
 function decodedFromJpeg(image: Image, info: JpegInfo, size: number): Decoded {
@@ -184,11 +190,13 @@ function decodedFromJpeg(image: Image, info: JpegInfo, size: number): Decoded {
         format: 'jpeg',
         size,
         density: densityOf(info.density),
+        resolutionUnit: info.resolutionUnit,
         chromaSubsampling: info.chromaSubsampling,
         isProgressive: info.isProgressive,
         hasProfile: info.hasProfile,
         hasAlpha: false,
-        orientation: info.orientation
+        orientation: info.orientation,
+        exif: info.exif
     };
 }
 
@@ -240,12 +248,19 @@ function decodeInput(options: Record<string, unknown>, host: SharpAddonHost | un
 
 /* ------------------------------------------------------------------ pipeline */
 
-/** Pre-extract, resize, post-extract, then flip, flop and rotate - unless the rotation comes first. */
-function applyOperations(image: Image, options: Record<string, unknown>): { image: Image; cropLeft: number; cropTop: number } {
+/**
+ * Pre-extract, resize, then flip, flop and rotate, then the crop or embed that finishes the resize,
+ * then the post-extract - unless the rotation comes first.
+ *
+ * The order is src/pipeline.cc's, and the crop/embed coming after the rotation is not cosmetic:
+ * sharp re-reads `inputWidth`/`inputHeight` after `rot` and crops against those, so
+ * `.resize(20,10).rotate(90)` on a 40x30 input is 15x10 on host (20x15 resized, 15x20 rotated, then
+ * cropped to 20x10, which the 15-pixel width clamps) and not the 10x20 a crop-first order gives.
+ */
+function applyOperations(image: Image, options: Record<string, unknown>): { image: Image; resized: boolean } {
     let out = image;
     const rotationFirst = options.rotateBeforePreExtract === true;
-    let cropLeft = 0;
-    let cropTop = 0;
+    let resized = false;
     const orient = (): void => {
         if (options.flip === true) out = flipImage(out);
         if (options.flop === true) out = flopImage(out);
@@ -254,6 +269,17 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
             const quarters = ((Math.round(angle / 90) % 4) + 4) % 4;
             out = rotateQuarters(out, quarters, arrayOption(options, 'rotationBackground', [0, 0, 0, 255]));
         }
+    };
+    const spec: ResizeSpec = {
+        width: numberOption(options, 'width', -1),
+        height: numberOption(options, 'height', -1),
+        canvas: String(options.canvas ?? 'crop'),
+        withoutEnlargement: options.withoutEnlargement === true,
+        withoutReduction: options.withoutReduction === true,
+        fastShrinkOnLoad: options.fastShrinkOnLoad !== false,
+        kernel: String(options.kernel ?? 'lanczos3'),
+        position: numberOption(options, 'position', 0),
+        background: arrayOption(options, 'resizeBackground', [0, 0, 0, 255])
     };
     if (rotationFirst) orient();
     if (numberOption(options, 'widthPre', -1) >= 0 || numberOption(options, 'heightPre', -1) >= 0) {
@@ -265,23 +291,14 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
             numberOption(options, 'heightPre', out.height)
         );
     }
-    if (numberOption(options, 'width', -1) >= 0 || numberOption(options, 'height', -1) >= 0) {
-        const before = out;
-        out = resizeImage(out, {
-            width: numberOption(options, 'width', -1),
-            height: numberOption(options, 'height', -1),
-            canvas: String(options.canvas ?? 'crop'),
-            withoutEnlargement: options.withoutEnlargement === true,
-            withoutReduction: options.withoutReduction === true,
-            fastShrinkOnLoad: options.fastShrinkOnLoad !== false,
-            kernel: String(options.kernel ?? 'lanczos3'),
-            position: numberOption(options, 'position', 0),
-            background: arrayOption(options, 'resizeBackground', [0, 0, 0, 255])
-        });
-        if (String(options.canvas ?? 'crop') === 'crop' && (out.width !== before.width || out.height !== before.height)) {
-            cropLeft = Math.round((before.width - out.width) / 2);
-            cropTop = Math.round((before.height - out.height) / 2);
-        }
+    if (spec.width >= 0 || spec.height >= 0) {
+        const step = resizeImage(out, spec);
+        out = step.image;
+        resized = step.resized;
+    }
+    if (!rotationFirst) orient();
+    if (spec.width >= 0 || spec.height >= 0) {
+        out = canvasImage(out, spec);
     }
     if (numberOption(options, 'widthPost', -1) >= 0 || numberOption(options, 'heightPost', -1) >= 0) {
         out = extractImage(
@@ -292,8 +309,7 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
             numberOption(options, 'heightPost', out.height)
         );
     }
-    if (!rotationFirst) orient();
-    return { image: out, cropLeft, cropTop };
+    return { image: out, resized };
 }
 
 function encodeOutput(image: Image, options: Record<string, unknown>, inputFormat: string): { format: string; data: Uint8Array } {
@@ -320,58 +336,92 @@ function encodeOutput(image: Image, options: Record<string, unknown>, inputForma
 
 /* ------------------------------------------------------------------ metadata */
 
-/** sharp reports `size` for Buffer and Stream input only, never for a file it opened itself. */
+/**
+ * sharp reports `size` for Buffer and Stream input only, never for a file it opened itself.
+ *
+ * The keys come out in src/metadata.cc's order -- format, size, width, height, space, channels,
+ * depth, density, chromaSubsampling, isProgressive, paletteBitDepth, resolutionUnit, background,
+ * hasProfile, hasAlpha, orientation, exif, icc, comments -- because `Object.keys(metadata())` is
+ * observable and sharp 0.33.5 answers in that order.
+ */
 function metadataOf(decoded: Decoded, fromBuffer: boolean): Record<string, unknown> {
     const meta: Record<string, unknown> = {
-        format: decoded.format,
-        width: decoded.image.width,
-        height: decoded.image.height,
-        space: spaceOf(decoded.image.channels),
-        channels: decoded.image.channels,
-        depth: 'uchar',
-        hasProfile: decoded.hasProfile,
-        hasAlpha: decoded.hasAlpha
+        format: decoded.format
     };
     if (fromBuffer) meta.size = decoded.size;
+    meta.width = decoded.image.width;
+    meta.height = decoded.image.height;
+    meta.space = spaceOf(decoded.image.channels);
+    meta.channels = decoded.image.channels;
+    meta.depth = 'uchar';
     if (decoded.density !== undefined) meta.density = decoded.density;
-    if (decoded.resolutionUnit !== undefined) meta.resolutionUnit = decoded.resolutionUnit;
     if (decoded.chromaSubsampling !== undefined) meta.chromaSubsampling = decoded.chromaSubsampling;
     if (decoded.isProgressive !== undefined) meta.isProgressive = decoded.isProgressive;
     if (decoded.paletteBitDepth !== undefined) meta.paletteBitDepth = decoded.paletteBitDepth;
-    if (decoded.orientation !== undefined) meta.orientation = decoded.orientation;
+    if (decoded.resolutionUnit !== undefined) meta.resolutionUnit = decoded.resolutionUnit;
     if (decoded.background !== undefined) meta.background = decoded.background;
+    meta.hasProfile = decoded.hasProfile;
+    meta.hasAlpha = decoded.hasAlpha;
+    if (decoded.orientation !== undefined) meta.orientation = decoded.orientation;
+    if (decoded.exif !== undefined) meta.exif = decoded.exif;
     if (decoded.comments !== undefined) meta.comments = decoded.comments;
     return meta;
 }
 
 /* ------------------------------------------------------------------- exports */
 
-/** The formats lib/utility.js hangs aliases off, with what this shim can actually do. */
+/**
+ * `sharp.format`: what the libvips build behind a sharp install can read and write, in the order
+ * lib/utility.js's own table lists them. It is a property of the build, not of this shim's codecs,
+ * so it answers what sharp 0.33.5 against libvips 8.15.3 answers -- webp and heif readable and
+ * writable, svg read-only, dz write-only, vips file-only, jpeg carrying its four suffixes and its
+ * two aliases -- while a format this shim cannot actually encode is still refused where it counts,
+ * by `formatOut` in options.ts. Measured against host sharp 0.33.5, key for key.
+ */
+interface FormatFlags {
+    input: { file: boolean; buffer: boolean; stream: boolean; fileSuffix?: string[] };
+    output: { file: boolean; buffer: boolean; stream: boolean; alias?: string[] };
+}
+
+const FORMAT_TABLE: Array<[string, FormatFlags]> = [
+    ['jpeg', { input: { file: true, buffer: true, stream: true, fileSuffix: ['.jpg', '.jpeg', '.jpe', '.jfif'] },
+               output: { file: true, buffer: true, stream: true, alias: ['jpe', 'jpg'] } }],
+    ['png', { input: { file: true, buffer: true, stream: true, fileSuffix: ['.png'] },
+              output: { file: true, buffer: true, stream: true } }],
+    ['webp', { input: { file: true, buffer: true, stream: true, fileSuffix: ['.webp'] },
+               output: { file: true, buffer: true, stream: true } }],
+    ['tiff', { input: { file: true, buffer: true, stream: true, fileSuffix: ['.tif', '.tiff'] },
+               output: { file: true, buffer: true, stream: true, alias: ['tif'] } }],
+    ['magick', { input: { file: false, buffer: false, stream: false }, output: { file: false, buffer: false, stream: false } }],
+    ['openslide', { input: { file: false, buffer: false, stream: false }, output: { file: false, buffer: false, stream: false } }],
+    ['dz', { input: { file: false, buffer: false, stream: false }, output: { file: true, buffer: true, stream: true } }],
+    ['ppm', { input: { file: false, buffer: false, stream: false }, output: { file: false, buffer: false, stream: false } }],
+    ['fits', { input: { file: false, buffer: false, stream: false }, output: { file: false, buffer: false, stream: false } }],
+    ['gif', { input: { file: true, buffer: true, stream: true, fileSuffix: ['.gif'] },
+              output: { file: true, buffer: true, stream: true } }],
+    ['svg', { input: { file: true, buffer: true, stream: true, fileSuffix: ['.svg', '.svgz', '.svg.gz'] },
+              output: { file: false, buffer: false, stream: false } }],
+    ['heif', { input: { file: true, buffer: true, stream: true, fileSuffix: ['.avif'] },
+               output: { file: true, buffer: true, stream: true, alias: ['avif'] } }],
+    ['pdf', { input: { file: false, buffer: false, stream: false }, output: { file: false, buffer: false, stream: false } }],
+    ['vips', { input: { file: true, buffer: false, stream: false, fileSuffix: ['.v', '.vips'] },
+               output: { file: true, buffer: false, stream: false } }],
+    ['jp2k', { input: { file: false, buffer: false, stream: false },
+               output: { file: false, buffer: false, stream: false, alias: ['j2c', 'j2k', 'jp2', 'jpx'] } }],
+    ['jxl', { input: { file: false, buffer: false, stream: false }, output: { file: false, buffer: false, stream: false } }],
+    ['raw', { input: { file: false, buffer: true, stream: true }, output: { file: false, buffer: true, stream: true } }]
+];
+
 function formatTable(): Record<string, unknown> {
-    const entry = (id: string, input: boolean, output: boolean, file: boolean): Record<string, unknown> => ({
-        id,
-        input: { file: input && file, buffer: input, stream: input },
-        output: { file: output && file, buffer: output, stream: output }
-    });
-    return {
-        jpeg: entry('jpeg', true, true, true),
-        png: entry('png', true, true, true),
-        raw: { id: 'raw', input: { file: false, buffer: true, stream: true }, output: { file: false, buffer: true, stream: true } },
-        webp: entry('webp', false, false, true),
-        tiff: entry('tiff', false, false, true),
-        gif: entry('gif', false, false, true),
-        heif: entry('heif', false, false, true),
-        svg: entry('svg', false, false, true),
-        jp2k: entry('jp2k', false, false, true),
-        jxl: entry('jxl', false, false, true),
-        dz: entry('dz', false, false, true),
-        vips: entry('vips', false, false, true),
-        magick: entry('magick', false, false, true),
-        openslide: entry('openslide', false, false, true),
-        ppm: entry('ppm', false, false, true),
-        fits: entry('fits', false, false, true),
-        pdf: entry('pdf', false, false, true)
-    };
+    const table: Record<string, unknown> = {};
+    for (const [id, flags] of FORMAT_TABLE) {
+        const input: Record<string, unknown> = { file: flags.input.file, buffer: flags.input.buffer, stream: flags.input.stream };
+        if (flags.input.fileSuffix !== undefined) input.fileSuffix = flags.input.fileSuffix;
+        const output: Record<string, unknown> = { file: flags.output.file, buffer: flags.output.buffer, stream: flags.output.stream };
+        if (flags.output.alias !== undefined) output.alias = flags.output.alias;
+        table[id] = { id, input, output };
+    }
+    return table;
 }
 
 /**
@@ -455,25 +505,36 @@ export function createAddon(host: SharpAddonHost = {}): object {
             if (limit > 0 && decoded.image.width * decoded.image.height > limit) {
                 throw pixelLimit(decoded.image.width, decoded.image.height, limit);
             }
-            const { image: worked, cropLeft, cropTop } = applyOperations(decoded.image, opts);
+            const { image: worked, resized } = applyOperations(decoded.image, opts);
             // The pipeline ends in sRGB, so one band comes out as three and two as four: this is
             // what makes an 8x8x1 raw input 48 bytes of 4x4 raw output and not 16.
             const image = toSrgb(worked);
             const encoded = encodeOutput(image, opts, decoded.format);
             bytes = encoded.data;
             fileOut = String(opts.fileOut ?? '');
+            /*
+             * No cropOffsetLeft / cropOffsetTop: sharp sets `hasCropOffset` only inside the
+             * attention/entropy branch of its crop (src/pipeline.cc), off the `xoffset`/`yoffset`
+             * vips_smartcrop hands back. A gravity crop -- which is the only crop this shim has --
+             * reports neither field on sharp 0.33.5, including a 64x64 jpeg -> 16 downsize that
+             * never crops and an enlargement that reports nothing to crop.
+             */
             info = {
                 format: encoded.format,
                 size: bytes.length,
                 width: image.width,
                 height: image.height,
                 channels: image.channels,
-                premultiplied: false
+                /*
+                 * sharp's `shouldPremultiplyAlpha` (src/pipeline.cc): an image with an alpha band
+                 * that a resize actually ran on. libvips premultiplies before the resample and
+                 * unpremultiplies after it, and the flag says which of the two the pixels came out
+                 * of -- true for a 16x16x4 -> 8x8 reduction, a 48x32 RGBA png -> 24, and every
+                 * cover/contain/inside/outside resize of an image with alpha; false for a
+                 * 3-channel resize, for no operation at all, and for a rotate(90) with no resize.
+                 */
+                premultiplied: (decoded.image.channels === 2 || decoded.image.channels === 4) && resized
             };
-            if (String(opts.canvas ?? 'crop') === 'crop' && (cropLeft !== 0 || cropTop !== 0)) {
-                info.cropOffsetLeft = cropLeft;
-                info.cropOffsetTop = cropTop;
-            }
             if (fileOut !== '') {
                 // A raw file is not a format sharp can write to disk: the extension names the format,
                 // and .raw names none, so the add-on is never reached and sharp itself refuses with

@@ -27,6 +27,7 @@ export interface JpegInfo {
   chromaSubsampling: string;
   isProgressive: boolean;
   density?: number;
+  resolutionUnit?: string;
   hasProfile: boolean;
   orientation?: number;
   exif?: Uint8Array;
@@ -353,7 +354,6 @@ function asciiAt(b: Uint8Array, o: number, s: string): boolean {
 
 /* EXIF Orientation (tag 0x0112) out of a raw TIFF block */
 function exifOrientation(tiff: Uint8Array): number | undefined {
-  if (tiff.length < 8) return undefined;
   let le = false;
   if (tiff[0] === 0x49 && tiff[1] === 0x49) le = true;
   else if (tiff[0] === 0x4d && tiff[1] === 0x4d) le = false;
@@ -384,6 +384,53 @@ function exifOrientation(tiff: Uint8Array): number | undefined {
     if (u16(e) === 0x0112 && u16(e + 2) === 3) return u16(e + 8);
   }
   return undefined;
+}
+
+/**
+ * EXIF XResolution (0x011a, a RATIONAL) and ResolutionUnit (0x0128, a SHORT) out of a raw TIFF
+ * block, as a density in dpi. libvips reads the resolution off the EXIF rather than off the JFIF
+ * when the file carries both -- which is what sharp writes: `.withMetadata({density:150})` on a
+ * jpeg leaves the JFIF at 72 dpi and puts 150 in the EXIF, and host sharp 0.33.5 reports 150.
+ * Unit 2 is inches, unit 3 centimetres; sharp reports the string libvips stores, 'in' as 'inch'.
+ */
+function exifResolution(tiff: Uint8Array): { dpi: number; unit?: string } | undefined {
+  if (tiff.length < 8) return undefined;
+  let le = false;
+  if (tiff[0] === 0x49 && tiff[1] === 0x49) le = true;
+  else if (tiff[0] === 0x4d && tiff[1] === 0x4d) le = false;
+  else return undefined;
+
+  const u16 = (o: number): number =>
+    le ? tiff[o] | (tiff[o + 1] << 8) : (tiff[o] << 8) | tiff[o + 1];
+  const u32 = (o: number): number =>
+    le
+      ? ((tiff[o] | (tiff[o + 1] << 8) | (tiff[o + 2] << 16) | (tiff[o + 3] << 24)) >>> 0)
+      : (((tiff[o] << 24) | (tiff[o + 1] << 16) | (tiff[o + 2] << 8) | tiff[o + 3]) >>> 0);
+
+  if (u16(2) !== 0x002a) return undefined;
+  const ifd = u32(4);
+  if (ifd < 8 || ifd + 2 > tiff.length) return undefined;
+  const n = u16(ifd);
+  let xres: number | undefined;
+  let unit: number | undefined;
+  for (let i = 0; i < n; i++) {
+    const e = ifd + 2 + i * 12;
+    if (e + 12 > tiff.length) break;
+    const tag = u16(e);
+    const type = u16(e + 2);
+    if (tag === 0x011a && type === 5) {
+      const off = u32(e + 8);
+      if (off + 8 <= tiff.length) {
+        const den = u32(off + 4);
+        if (den !== 0) xres = u32(off) / den;
+      }
+    } else if (tag === 0x0128 && type === 3) {
+      unit = u16(e + 8);
+    }
+  }
+  if (xres === undefined || !(xres > 0)) return undefined;
+  const unitName = unit === 3 ? 'cm' : 'inch';
+  return { dpi: unit === 3 ? Math.round(xres * 2.54) : xres, unit: unitName };
 }
 
 /* sharp/libvips style chroma subsampling label */
@@ -558,6 +605,9 @@ export function decodeJpeg(
   const comps: DecodeComp[] = [];
 
   let density: number | undefined;
+  let resolutionUnit: string | undefined;
+  let exifDensity: number | undefined;
+  let exifUnit: string | undefined;
   let orientation: number | undefined;
   let exif: Uint8Array | undefined;
   let iccChunks: Uint8Array[] | undefined;
@@ -605,6 +655,11 @@ export function decodeJpeg(
           exif = bytes.slice(s + 6, e);
           const o = exifOrientation(exif);
           if (o !== undefined) orientation = o;
+          const r = exifResolution(exif);
+          if (r !== undefined) {
+            exifDensity = r.dpi;
+            exifUnit = r.unit;
+          }
         } else if (asciiAt(bytes, s, 'http://ns.adobe.com/xap/1.0/\0')) {
           xmp = bytes.slice(s + 29, e);
         }
@@ -952,7 +1007,21 @@ export function decodeJpeg(
     isProgressive: false,
     hasProfile: icc !== undefined,
   };
+  /*
+   * The EXIF resolution wins over the JFIF one when the file carries both, and libvips keeps a
+   * resolution of one pixel per millimetre or better and no other -- 25.4 dpi -- so a jpeg written
+   * with a density of 25 reports no density at all on host sharp 0.33.5.
+   */
+  if (exifDensity !== undefined) {
+    density = exifDensity;
+    resolutionUnit = exifUnit;
+  }
+  if (density !== undefined && density <= 25.4) {
+    density = undefined;
+    resolutionUnit = undefined;
+  }
   if (density !== undefined) info.density = density;
+  if (resolutionUnit !== undefined) info.resolutionUnit = resolutionUnit;
   if (orientation !== undefined) info.orientation = orientation;
   if (exif !== undefined) info.exif = exif;
   if (icc !== undefined) info.icc = icc;

@@ -182,11 +182,19 @@ export function decodePng(bytes: Uint8Array): { image: Image; info: PngInfo } {
         if (len >= 9) {
           const px = readU32(data, 0);
           if (data[8] === 1) {
-            // pHYs unit 1 is pixels per metre; report pixels per inch (dpi),
-            // the unit sharp's own metadata uses, so density and
-            // resolutionUnit stay mutually consistent.
-            density = Math.round(px * 0.0254);
-            resolutionUnit = 'inch';
+            // pHYs unit 1 is pixels per metre, and libvips keeps a resolution of one pixel per
+            // millimetre or better and no other: below 1000 px/m it loads the image with no
+            // resolution at all, so sharp's metadata() reports neither density nor resolutionUnit.
+            // Measured against host sharp 0.33.5 -- a png whose pHYs is 1000 px/m (libvips' own
+            // default, which is what sharp writes when no density is asked for) reports no
+            // density, and one whose pHYs is 1004 reports 26 dpi.
+            if (px > 1000) {
+              // pHYs unit 1 is pixels per metre; report pixels per inch (dpi),
+              // the unit sharp's own metadata uses, so density and
+              // resolutionUnit stay mutually consistent.
+              density = Math.round(px * 0.0254);
+              resolutionUnit = 'inch';
+            }
           } else {
             density = px;
           }
