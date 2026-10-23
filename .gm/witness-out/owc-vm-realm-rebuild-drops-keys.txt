@@ -1,0 +1,72 @@
+row: owc-vm-realm-rebuild-drops-keys
+measured_at: 1fe0710 (local main, working tree dirty with other lanes' edits)
+probe: /tmp/owc-r4/adv5-fix-als-3/w.sh  (host node 24.15 vs container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core)
+host node: v24.15.0
+
+===== case v1 =====
+--- host stdout ---
+o_o={"o":{"x":1},"p":{"y":2}}
+o_n={"o":{"x":1},"n":5}
+n_o={"n":5,"o":{"x":1}}
+o_n_m={"o":{"x":1},"n":5,"m":6}
+n_o_m={"n":5,"o":{"x":1},"m":6}
+a_n={"a":[1],"n":5}
+a_a={"a":[1],"b":[2]}
+a_o={"a":[1],"o":{"x":1}}
+o_o_o={"o":{"x":1},"p":{"y":2},"q":{"z":3}}
+arr2=len=2 [{"q":1},{"r":2}]
+arr3=len=3 [1,2,3]
+o_arr={"o":{"x":1},"a":[1],"n":5}
+END=ok
+--- host stderr ---
+--- container (driver transcript) ---
+---- program output ----
+o_o={"o":{"x":1}}
+o_n={"o":{"x":1},"n":5}
+n_o={"n":5,"o":{"x":1}}
+o_n_m={"o":{"x":1},"n":5,"m":6}
+n_o_m={"n":5,"o":{"x":1},"m":6}
+a_n={"a":[1],"n":5}
+a_a={"a":[1]}
+a_o={"a":[1]}
+o_o_o={"o":{"x":1}}
+arr2=len=1 [{"q":1}]
+arr3=len=3 [1,2,3]
+o_arr={"o":{"x":1}}
+END=ok
+---- program stderr ----
+[owc exit 0]
+
+===== case v2 =====
+--- host stdout ---
+twoDates={"d":"1970-01-01T00:00:00.000Z","e":"1970-01-01T00:00:00.001Z"}
+twoRe={"re":{},"re2":{}}
+twoEmpty={"o":{},"p":{}}
+scalarThenObj={"o":1,"p":{"y":2}}
+objThenObj={"o":{"x":1},"p":{"y":2}}
+deepOne={"o":{"x":{"z":1}}}
+arr3obj=len=3 [{"q":1},{"r":2},{"s":3}]
+objThenMap={"o":{"x":1},"p":{}}
+objThenFn={"o":{"x":1}}
+mapThenObj={"o":{},"p":{"y":2}}
+objObjScalar={"o":{"x":1},"p":{"y":2},"n":7}
+objScalarObj={"o":{"x":1},"n":7,"p":{"y":2}}
+END=ok
+--- host stderr ---
+--- container (driver transcript) ---
+---- program output ----
+twoDates={"d":"1970-01-01T00:00:00.000Z","e":"1970-01-01T00:00:00.001Z"}
+twoRe={"re":{},"re2":{}}
+twoEmpty={"o":{}}
+scalarThenObj={"o":1,"p":{"y":2}}
+objThenObj={"o":{"x":1}}
+deepOne={"o":{"x":{"z":1}}}
+arr3obj=len=1 [{"q":1}]
+objThenMap={"o":{"x":1}}
+objThenFn={"o":{"x":1}}
+mapThenObj={"o":{},"p":{"y":2}}
+objObjScalar={"o":{"x":1}}
+objScalarObj={"o":{"x":1},"n":7}
+END=ok
+---- program stderr ----
+[owc exit 0]

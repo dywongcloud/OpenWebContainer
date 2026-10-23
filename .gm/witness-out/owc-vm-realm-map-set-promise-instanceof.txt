@@ -1,0 +1,54 @@
+row: owc-vm-realm-map-set-promise-instanceof
+measured_at: 1fe0710 (local main, working tree dirty with other lanes' edits)
+probe: /tmp/owc-r4/adv5-fix-als-3/w.sh  (host node 24.15 vs container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core)
+host node: v24.15.0
+
+===== case v3 =====
+--- host stdout ---
+map.instanceofMap=false
+set.instanceofSet=false
+promise.instanceofPromise=false
+error.instanceofError=false
+error.name=Error
+error.msg=E
+agg.instanceofAggregateError=false
+date.instanceofDate=false
+re.instanceofRegExp=false
+arr.instanceofArray=false
+arr.isArray=true
+arr.len=2
+obj.instanceofObject=false
+obj.keys=x
+thrown.instanceofError=false
+thrown.name=Error
+thrown.msg=vm-error
+thrown.stackHas=true
+typeerr.name=TypeError
+typeerr.instanceofTypeError=false
+END=ok
+--- host stderr ---
+--- container (driver transcript) ---
+---- program output ----
+map.instanceofMap=true
+set.instanceofSet=true
+promise.instanceofPromise=true
+error.instanceofError=false
+error.name=Error
+error.msg=E
+agg.instanceofAggregateError=false
+date.instanceofDate=false
+re.instanceofRegExp=false
+arr.instanceofArray=false
+arr.isArray=true
+arr.len=2
+obj.instanceofObject=false
+obj.keys=x
+thrown.instanceofError=true
+thrown.name=Error
+thrown.msg=vm-error
+thrown.stackHas=true
+typeerr.name=TypeError
+typeerr.instanceofTypeError=true
+END=ok
+---- program stderr ----
+[owc exit 0]
