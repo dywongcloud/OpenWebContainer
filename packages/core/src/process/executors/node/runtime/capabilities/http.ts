@@ -37,8 +37,12 @@ function headerObject(headers: Headers): Record<string, string | string[]> {
 }
 
 /**
- * Runs one request through the host's fetch. Redirects are followed by fetch: a browser hides the
- * status of a redirect under redirect 'manual', so the guest sees the final response.
+ * Runs one request through the host's fetch. The host is asked not to follow: a redirect belongs to
+ * the caller, which here is the guest's own fetch -- 'manual' and 'error' are its to answer, and a
+ * 'follow' is a hop it takes itself -- so a 3xx and its Location have to reach it intact. A browser
+ * cannot show a 3xx at all: it answers 'manual' with an opaque redirect, a status of 0 and no header,
+ * so a host that hands one back is asked again, this time following, which is the only answer it has
+ * for a redirect anyway.
  */
 async function fetchExternal(args: FetchArgs): Promise<unknown> {
     let target: URL;
@@ -69,7 +73,12 @@ async function fetchExternal(args: FetchArgs): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
-        const response = await fetch(target.href, { method, headers, body, redirect: 'follow', signal: controller.signal });
+        const init: RequestInit = { method, headers, body, redirect: 'manual', signal: controller.signal };
+        let response = await fetch(target.href, init);
+        /* nothing of the 3xx survived the host: take the answer it can give, the followed one */
+        if (response.type === 'opaqueredirect' || response.status === 0) {
+            response = await fetch(target.href, { ...init, redirect: 'follow' });
+        }
         const bytes = new Uint8Array(await response.arrayBuffer());
         return {
             status: response.status,
