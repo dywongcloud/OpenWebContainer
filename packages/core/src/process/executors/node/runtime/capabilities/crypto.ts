@@ -238,7 +238,7 @@ function hkdfDigestFor(name: unknown): DigestSpec {
     const key = String(name ?? '').toLowerCase();
     const spec = DIGEST_SPECS[DIGEST_ALIASES[key] ?? key];
     if (spec === undefined) {
-        throw Object.assign(new TypeError('Invalid digest: ' + String(name ?? '')), { code: 'ERR_CRYPTO_INVALID_DIGEST' });
+        throw keyFail('ERR_CRYPTO_INVALID_DIGEST', 'Invalid digest: ' + String(name ?? ''), 'TypeError');
     }
     return spec;
 }
@@ -1928,6 +1928,147 @@ function rsaVerifyWith(ints: IntKey, digest: Uint8Array, name: string, signature
     return true;
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * The raw RSA surface: privateEncrypt, publicDecrypt, publicEncrypt and privateDecrypt. There is
+ * no digest in the way -- the caller's own bytes are padded, exponentiated and unpadded, which is
+ * what makes privateEncrypt the width of the modulus and publicDecrypt the bytes it was given.
+ * Node's defaults differ by direction and not by name: a private encrypt and a public decrypt are
+ * PKCS#1 v1.5 (block type 1, the signing padding), while a public encrypt and a private decrypt
+ * are OAEP with SHA-1 and no label, which is why the same 2048-bit key takes 245 bytes one way
+ * and 214 the other.
+ * ------------------------------------------------------------------------------------------ */
+
+/** RSA_NO_PADDING is 3 and RSA_PKCS1_OAEP_PADDING is 4, as crypto.constants names them. */
+const RSA_NO_PADDING = 3;
+const RSA_PKCS1_OAEP_PADDING = 4;
+
+const rsaDataTooLarge = () => keyFail('ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE', 'error:0200006E:rsa routines::data too large for key size');
+const rsaDataTooSmall = () => keyFail('ERR_OSSL_RSA_DATA_TOO_SMALL_FOR_KEY_SIZE', 'error:0200007A:rsa routines::data too small for key size');
+const rsaInvalidPadding = () => keyFail('ERR_OSSL_RSA_INVALID_PADDING', 'error:0200008A:rsa routines::invalid padding');
+const rsaOaepDecoding = () => keyFail('ERR_OSSL_RSA_OAEP_DECODING_ERROR', 'error:02000079:rsa routines::oaep decoding error');
+
+function rsaDigestFor(name: unknown): DigestSpec {
+    /* An OAEP block is built with a digest the caller names, SHA-1 when it names none. */
+    const spec = DIGEST_SPECS[digestNameFor(name === undefined || name === null ? 'sha1' : name)];
+    if (spec === undefined) throw keyFail('ERR_OSSL_EVP_UNSUPPORTED', 'Digest method not supported');
+    return spec;
+}
+
+/** PKCS#1 v1.5 encryption padding (RFC 8017 7.2): 0x00, the block type, a filler, 0x00, the data. */
+function rsaPadV15(data: Uint8Array, size: number, type: number): Uint8Array {
+    if (data.length + 11 > size) throw rsaDataTooLarge();
+    const out = new Uint8Array(size);
+    out[0] = 0x00;
+    out[1] = type;
+    if (type === 1) {
+        out.fill(0xff, 2, size - data.length - 1);
+    } else {
+        /* A type 2 filler is random and never zero, so the scan that reads it back stops where
+           the padding ends: a zero byte is the delimiter and not part of the filler. */
+        const filler = randomOf(size - data.length - 3);
+        for (let i = 0; i < filler.length; i++) out[2 + i] = filler[i] === 0 ? 1 : filler[i];
+    }
+    out[size - data.length - 1] = 0x00;
+    out.set(data, size - data.length);
+    return out;
+}
+
+function rsaUnpadV15(em: Uint8Array, size: number, type: number): Uint8Array {
+    if (size < 11 || em[0] !== 0x00 || em[1] !== type) throw rsaInvalidPadding();
+    let at = 2;
+    /* Eight bytes of filler at the least, which is what OpenSSL's own scan of the block insists
+       on. A type 1 filler is a run of 0xff up to the delimiter; a type 2 one is every byte up to
+       it, because a type 2 filler is random and only the delimiter is known to be zero. */
+    if (type === 1) {
+        while (at < size && em[at] === 0xff) at++;
+    } else {
+        while (at < size && em[at] !== 0x00) at++;
+    }
+    if (at < 10 || em[at] !== 0x00) throw rsaInvalidPadding();
+    return em.subarray(at + 1);
+}
+
+/** RSAES-OAEP (RFC 8017 7.1): a masked seed over a masked data block, each under MGF1. */
+function rsaPadOaep(data: Uint8Array, size: number, spec: DigestSpec, label: Uint8Array): Uint8Array {
+    const hLen = spec.out;
+    /* An OAEP block is always the digest's own length, so no XOF length is asked for here. */
+    const hash = (message: Uint8Array): Uint8Array => spec.fn(message, 0);
+    if (data.length > size - 2 * hLen - 2) throw rsaDataTooLarge();
+    const lHash = hash(label);
+    const filler = new Uint8Array(size - data.length - 2 * hLen - 2);
+    const db = concatBytes(concatBytes(lHash, filler), concatBytes(new Uint8Array([0x01]), data));
+    const seed = randomOf(hLen);
+    const maskedDb = xorBytes(db, mgf1(seed, size - hLen - 1, hash));
+    const maskedSeed = xorBytes(seed, mgf1(maskedDb, hLen, hash));
+    return concatBytes(new Uint8Array([0x00]), concatBytes(maskedSeed, maskedDb));
+}
+
+function rsaUnpadOaep(em: Uint8Array, size: number, spec: DigestSpec, label: Uint8Array): Uint8Array {
+    const hLen = spec.out;
+    const hash = (message: Uint8Array): Uint8Array => spec.fn(message, 0);
+    if (size < 2 * hLen + 2 || em[0] !== 0x00) throw rsaOaepDecoding();
+    const maskedSeed = em.subarray(1, 1 + hLen);
+    const maskedDb = em.subarray(1 + hLen);
+    const seed = xorBytes(maskedSeed, mgf1(maskedDb, hLen, hash));
+    const db = xorBytes(maskedDb, mgf1(seed, size - hLen - 1, hash));
+    const lHash = hash(label);
+    for (let i = 0; i < hLen; i++) if (db[i] !== lHash[i]) throw rsaOaepDecoding();
+    let at = hLen;
+    while (at < db.length && db[at] === 0x00) at++;
+    if (at >= db.length || db[at] !== 0x01) throw rsaOaepDecoding();
+    return db.subarray(at + 1);
+}
+
+/**
+ * Args {id, op, data, padding, oaepHash, oaepLabel}: one raw RSA operation. `op` is one of
+ * private-encrypt, public-decrypt, public-encrypt and private-decrypt.
+ */
+function rsaRawWith(key: KeyRecord, op: string, data: Uint8Array, padding: unknown, oaepHash: unknown, oaepLabel: Uint8Array): Uint8Array {
+    if (key.kind !== 'rsa' && key.kind !== 'rsa-pss') {
+        throw keyFail('ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE', 'error:03000096:digital envelope routines::operation not supported for this keytype');
+    }
+    const sealing = op === 'private-encrypt' || op === 'private-decrypt';
+    if (sealing && key.type !== 'private') {
+        throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type ' + key.type + ', expected private.', 'TypeError');
+    }
+    const ints = key.ints as IntKey;
+    const n = ints.n as bigint;
+    const size = modulusSize(n);
+    const oaepByDefault = op === 'public-encrypt' || op === 'private-decrypt';
+    const mode = padding === undefined || padding === null
+        ? (oaepByDefault ? RSA_PKCS1_OAEP_PADDING : RSA_PKCS1_PADDING)
+        : Number(padding);
+    const exponent = (sealing ? ints.d : ints.e) as bigint;
+    if (mode !== RSA_PKCS1_PADDING && mode !== RSA_PKCS1_OAEP_PADDING && mode !== RSA_NO_PADDING) {
+        throw keyFail('ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE', 'error:030000A6:digital envelope routines::illegal or unsupported padding mode');
+    }
+    if (op === 'private-encrypt' || op === 'public-encrypt') {
+        let em: Uint8Array;
+        if (mode === RSA_NO_PADDING) {
+            /* A raw block is the modulus' own width, no wider and no narrower. */
+            if (data.length < size) throw rsaDataTooSmall();
+            if (data.length > size) throw rsaDataTooLarge();
+            em = data;
+        } else if (mode === RSA_PKCS1_OAEP_PADDING) {
+            em = rsaPadOaep(data, size, rsaDigestFor(oaepHash), oaepLabel);
+        } else {
+            em = rsaPadV15(data, size, sealing ? 1 : 2);
+        }
+        const m = bigOf(em);
+        if (m >= n) throw rsaDataTooLarge();
+        return bytesOf(modPow(m, exponent, n), size);
+    }
+    if (data.length !== size) throw rsaDataTooSmall();
+    const c = bigOf(data);
+    if (c >= n) throw rsaDataTooLarge();
+    const em = bytesOf(modPow(c, exponent, n), size);
+    if (mode === RSA_NO_PADDING) return em;
+    if (mode === RSA_PKCS1_OAEP_PADDING) return rsaUnpadOaep(em, size, rsaDigestFor(oaepHash), oaepLabel);
+    /* A private decrypt reads the block type a public encrypt wrote, and a public one the type a
+       private encrypt wrote: 2 one way and 1 the other, as OpenSSL's own two padding calls pair. */
+    return rsaUnpadV15(em, size, op === 'private-decrypt' ? 2 : 1);
+}
+
 /** FIPS 186-4 4.6: the leftmost `bits` of a digest, as an integer, so a short q still signs. */
 const bits2int = (digest: Uint8Array, bits: number): bigint => {
     const excess = digest.length * 8 - bits;
@@ -2264,7 +2405,7 @@ function dsaEncodingFor(value: unknown): 'der' | 'ieee-p1363' {
     return name;
 }
 
-function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown): Uint8Array {
+function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown, fromSign = false): Uint8Array {
     const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type ' + key.type + ', expected private.', 'TypeError');
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
@@ -2289,7 +2430,14 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncod
         if (spec.sign === undefined) {
             throw keyFail('ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE', 'error:03000096:digital envelope routines::operation not supported for this keytype');
         }
+        /*
+         * A digest named for a pure key is refused either way, but the two callers name it
+         * differently: crypto.sign() reaches OpenSSL's own digest check, while a Sign object --
+         * which cannot be built without naming an algorithm -- never gets that far and answers
+         * the plainer "Unsupported crypto operation" host Node 24.15 gives it.
+         */
         if (algorithm !== undefined && algorithm !== null) {
+            if (fromSign) throw keyFail('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Unsupported crypto operation');
             throw keyFail('ERR_OSSL_INVALID_DIGEST', 'error:1C80007A:Provider routines::invalid digest');
         }
         return spec.sign(data, key.privateBytes as Uint8Array);
@@ -2306,7 +2454,7 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncod
     return signed.toBytes(encoding === 'ieee-p1363' ? 'compact' : 'der');
 }
 
-function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signature: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown): boolean {
+function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signature: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown, fromVerify = false): boolean {
     const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'public' && key.type !== 'private') return false;
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
@@ -2329,9 +2477,12 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
         /*
          * An Edwards key is pure: it hashes and signs in one step and names no digest, so a
          * signature that asks for one is refused rather than answered false. The one-shot
-         * crypto.verify reaches the digest check and names it; the record is Node's own.
+         * crypto.verify reaches the digest check and names it; a Verify object, which cannot be
+         * built without naming an algorithm, answers "Unsupported crypto operation" instead,
+         * which is the record host Node 24.15 gives a createVerify() over an Edwards key.
          */
         if (algorithm !== undefined && algorithm !== null) {
+            if (fromVerify) throw keyFail('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Unsupported crypto operation');
             throw keyFail('ERR_OSSL_INVALID_DIGEST', 'error:1C80007A:Provider routines::invalid digest');
         }
         try {
@@ -2401,6 +2552,34 @@ function dhFor(id: unknown, op: string) {
     const state = DH_STATE.get(Number(id));
     if (state === undefined) dhFail('ERR_CRYPTO_INVALID_STATE', `Invalid state for operation ${op}`);
     return state as NonNullable<typeof state>;
+}
+
+/**
+ * The bits OpenSSL's DH_check answers, which Node reports as a DiffieHellman's `verifyError`:
+ * P_NOT_PRIME for a modulus that is not one, P_NOT_SAFE_PRIME for a prime whose (p-1)/2 is not
+ * one, NOT_SUITABLE_GENERATOR for a generator that squares to 1 -- or that is out of the range
+ * a generator has to sit in -- and the 128 Node adds for every modulus under OpenSSL's own
+ * 512-bit floor. Measured against host Node 24.15 over the primes below 100 and the MODP groups.
+ */
+function dhVerifyError(prime: bigint, generator: bigint): number {
+    const bits = prime.toString(2).length;
+    let code = bits < 512 ? 128 : 0;
+    /* Trial division first: it is what catches a composite modulus without a single exponentiation. */
+    let composite = prime < 2n;
+    if (!composite) {
+        for (const small of SIEVE_PRIMES) {
+            if (prime === BigInt(small)) break;
+            if (prime % BigInt(small) === 0n) {
+                composite = true;
+                break;
+            }
+        }
+    }
+    if (composite || !isProbablePrime(prime, bits >= 4096 ? 1 : bits >= 1024 ? 4 : 8)) return code | 1;
+    const sub = (prime - 1n) >> 1n;
+    if (sub < 2n || !isProbablePrime(sub, bits >= 4096 ? 1 : bits >= 1024 ? 4 : 8)) code |= 2;
+    if (generator <= 1n || generator >= prime || modPow(generator, 2n, prime) === 1n) code |= 8;
+    return code;
 }
 
 function storeDh(state: { prime: bigint; generator: bigint; size: number }): number {
@@ -2593,10 +2772,8 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         const spec = hkdfDigestFor(args?.algorithm);
         const keylen = Number(args?.keylen);
         if (!Number.isInteger(keylen) || keylen <= 0 || keylen > 255 * spec.out) {
-            throw Object.assign(
-                new Error('The value of "keylen" is out of range. It must be > 0 && <= ' + 255 * spec.out + '. Received ' + String(args?.keylen)),
-                { code: 'ERR_OUT_OF_RANGE' }
-            );
+            /* Node bounds the length with a RangeError and names the value it was handed. */
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "keylen" is out of range. It must be > 0 && <= ' + 255 * spec.out + '. Received ' + String(args?.keylen), 'RangeError');
         }
         return bytesToBase64(hkdfBytes(
             spec,
@@ -2746,7 +2923,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         return { id: storeKey({ type: 'public', kind: key.kind, curve: key.curve, ints: key.ints, publicBytes: Uint8Array.from(key.publicBytes) }) };
     },
     /** Args {id, algorithm, data, dsaEncoding, padding, saltLength}: the signature; returns base64. */
-    'crypto.key.sign': (args) => bytesToBase64(signWith(keyFor(args?.id, 'key.sign'), args?.algorithm, bytesArg(args?.data), args?.dsaEncoding, args?.padding, args?.saltLength)),
+    'crypto.key.sign': (args) => bytesToBase64(signWith(keyFor(args?.id, 'key.sign'), args?.algorithm, bytesArg(args?.data), args?.dsaEncoding, args?.padding, args?.saltLength, args?.fromSign === true)),
     /*
      * Primality. Node answers checkPrime from a Miller-Rabin search with `checks` witnesses, and
      * generatePrime by drawing odd candidates of the width asked for until one passes; a safe prime
@@ -2774,7 +2951,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         }
         throw keyFail('ERR_CRYPTO_INVALID_STATE', 'Could not find a prime of ' + bits + ' bits');
     },    /** Args {id, algorithm, data, signature, dsaEncoding, padding, saltLength}: whether it checks out. */
-    'crypto.key.verify': (args) => verifyWith(keyFor(args?.id, 'key.verify'), args?.algorithm, bytesArg(args?.data), bytesArg(args?.signature), args?.dsaEncoding, args?.padding, args?.saltLength),
+    'crypto.key.verify': (args) => verifyWith(keyFor(args?.id, 'key.verify'), args?.algorithm, bytesArg(args?.data), bytesArg(args?.signature), args?.dsaEncoding, args?.padding, args?.saltLength, args?.fromVerify === true),
 
     /* -----------------------------------------------------------------------------------------
      * Diffie-Hellman.
@@ -2840,6 +3017,20 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             throw dhFail('ERR_CRYPTO_INVALID_PUBLIC_KEY', 'Invalid public key');
         }
         return bytesToBase64(bytesOf(modPow(other, state.privateKey, state.prime), state.size));
+    },
+    /** Args {id, op, data, padding, oaepHash, oaepLabel}: one raw RSA operation; base64 bytes. */
+    'crypto.rsa.raw': (args) => bytesToBase64(rsaRawWith(
+        keyFor(args?.id, 'rsa.raw'),
+        String(args?.op ?? ''),
+        bytesArg(args?.data),
+        args?.padding,
+        args?.oaepHash,
+        typeof args?.oaepLabel === 'string' ? bytesArg(args?.oaepLabel) : new Uint8Array(0)
+    )),
+    /** Args {id}: the DH_check bits; read when a caller asks a DiffieHellman for `verifyError`. */
+    'crypto.dh.verify': (args) => {
+        const state = dhFor(args?.id, 'dh.verify');
+        return { code: dhVerifyError(state.prime, state.generator) };
     },
     /** Args {prime, private, public}: the low-level shared secret Node's diffieHellman() answers. */
     /*
