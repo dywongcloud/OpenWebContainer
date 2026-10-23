@@ -849,7 +849,8 @@ if (procEnv.OWC_STDIN === 'pipe') {
   delete procEnv.OWC_STDIN;
   stdinOpen = true;
 }
-globalThis.process = proc;
+/* Node's own process is an accessor and not a data property, and its descriptor says so. */
+Object.defineProperty(globalThis, 'process', { get: function () { return proc; }, configurable: true, enumerable: true });
 BF.process = function () {
   return proc;
 };
@@ -2017,14 +2018,18 @@ globalThis.atob = function (input) {
 globalThis.btoa = function (input) {
   return encodeBase64(encodeString(String(input), 'latin1'));
 };
-globalThis.performance = {
-  timeOrigin: Date.now() - (host.now() - startedAt),
-  now: function () { return host.now() - startedAt; }
-};
+Object.defineProperty(globalThis, 'performance', {
+  get: function () {
+    return {
+      timeOrigin: Date.now() - (host.now() - startedAt),
+      now: function () { return host.now() - startedAt; }
+    };
+  }, configurable: true, enumerable: true
+});
 globalThis.structuredClone = function (value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 };
-globalThis.crypto = nodeCrypto.webcrypto;
+Object.defineProperty(globalThis, 'crypto', { get: function () { return nodeCrypto.webcrypto; }, configurable: true, enumerable: true });
 /*
  * fetch, with the three classes Node also defines beside it (Headers, Request, Response). The
  * request goes out on the container's own http and https client, so a URL on the virtual network
@@ -2478,10 +2483,18 @@ function circularStructureText(value, replacer) {
   navProp('languages', function () { return Object.freeze(['en-US']); });
   navProp('platform', function () { return NAV_PLATFORM; });
   navProp('userAgent', function () { return 'Node.js/' + String(proc.versions.node).split('.')[0]; });
+  /* node 24 gives navigator.locks a LockManager, whose two methods this container has no
+     locks behind: it is the object a guest that asks is answered with. */
+  navProp('locks', function () { return navLocks; });
   Object.defineProperty(Navigator.prototype, Symbol.toStringTag, { value: 'Navigator', configurable: true });
   Object.defineProperty(Navigator.prototype, 'constructor', { value: Navigator, writable: true, configurable: true });
   globalThis.Navigator = Navigator;
-  Object.defineProperty(globalThis, 'navigator', { value: Object.create(Navigator.prototype), writable: true, configurable: true, enumerable: true });
+  var navInstance = Object.create(Navigator.prototype);
+  var navLocks = {
+    request: function () { return Promise.reject(new TypeError('The "locks" are not supported')); },
+    query: function () { return Promise.resolve({ held: [], pending: [] }); }
+  };
+  Object.defineProperty(globalThis, 'navigator', { get: function () { return navInstance; }, configurable: true, enumerable: true });
 
   /*
    * The 'Performance' family, on the clock the rest of this file already keeps: 'performance' is a
@@ -2569,8 +2582,10 @@ function circularStructureText(value, replacer) {
     return fn;
   };
   Performance.prototype.toJSON = function () {
-    return { timeOrigin: this.timeOrigin, nodeTiming: this.nodeTiming };
+    return { timeOrigin: this.timeOrigin, nodeTiming: this.nodeTiming, eventLoopUtilization: this.eventLoopUtilization() };
   };
+  /* The callback node leaves null until a listener is set. */
+  Object.defineProperty(Performance.prototype, 'onresourcetimingbufferfull', { get: function () { return null; }, configurable: true, enumerable: true });
   Object.defineProperty(Performance.prototype, 'nodeTiming', {
     get: function () {
       return { name: 'node', entryType: 'node', startTime: 0, duration: 0, nodeStart: 0, bootstrapComplete: 0 };
@@ -2601,7 +2616,9 @@ function circularStructureText(value, replacer) {
   PerformanceObserver.prototype.disconnect = function () { /* nothing was ever observed */ };
   PerformanceObserver.prototype.takeRecords = function () { return []; };
   Object.defineProperty(PerformanceObserver.prototype, Symbol.toStringTag, { value: 'PerformanceObserver', configurable: true });
-  Object.defineProperty(globalThis, 'performance', { value: performance, writable: true, configurable: true, enumerable: true });
+  /* An accessor, as node's is: a guest that reads the descriptor and not the value is answered
+     with a getter there, and with a writable data property here no longer. */
+  Object.defineProperty(globalThis, 'performance', { get: function () { return performance; }, configurable: true, enumerable: true });
   globalThis.Performance = Performance;
   globalThis.PerformanceEntry = PerformanceEntry;
   globalThis.PerformanceMark = entryMark;
@@ -2626,6 +2643,10 @@ function circularStructureText(value, replacer) {
   if (webcrypto !== undefined && webcrypto !== null) {
     if (Object.getPrototypeOf(webcrypto) === Object.prototype) Object.setPrototypeOf(webcrypto, Crypto.prototype);
     Object.defineProperty(Crypto.prototype, 'subtle', { get: function () { return webcrypto.subtle; }, configurable: true, enumerable: true });
+    /* The two methods of the instance are on the prototype in node too, so Crypto.prototype
+       lists them even where every one of them is read off the webcrypto behind it. */
+    Object.defineProperty(Crypto.prototype, 'getRandomValues', { get: function () { return webcrypto.getRandomValues; }, configurable: true, enumerable: true });
+    Object.defineProperty(Crypto.prototype, 'randomUUID', { get: function () { return webcrypto.randomUUID; }, configurable: true, enumerable: true });
     if (typeof webcrypto.CryptoKey === 'function') globalThis.CryptoKey = webcrypto.CryptoKey;
     if (webcrypto.subtle !== undefined && webcrypto.subtle !== null
         && Object.getPrototypeOf(webcrypto.subtle) === Object.prototype) {
@@ -2666,8 +2687,11 @@ function circularStructureText(value, replacer) {
     return err;
   }
   SuppressedError.prototype = Object.create(Error.prototype);
-  SuppressedError.prototype.name = 'SuppressedError';
+  /* In the order Object.getOwnPropertyNames reads them in on a host: constructor, then name, then
+     the message every error carries. */
   Object.defineProperty(SuppressedError.prototype, 'constructor', { value: SuppressedError, writable: true, configurable: true });
+  SuppressedError.prototype.name = 'SuppressedError';
+  Object.defineProperty(SuppressedError.prototype, 'message', { value: '', writable: true, configurable: true });
 
   function disposeValue(value) {
     if (value === null || value === undefined) return;
@@ -2703,7 +2727,9 @@ function circularStructureText(value, replacer) {
     Stack.prototype.defer = function (onDispose) {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       if (typeof onDispose !== 'function') throw new TypeError('The "onDispose" argument must be of type function');
-      this._held.push({ kind: 'use', value: { dispose: onDispose } });
+      /* A deferred callback is a function and not a disposable: node calls it as it stands, and
+         never looks for a Symbol.dispose on it. */
+      this._held.push({ kind: 'defer', value: onDispose });
     };
     Stack.prototype.move = function () {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
@@ -2730,7 +2756,8 @@ function circularStructureText(value, replacer) {
     var first = null;
     for (var i = held.length - 1; i >= 0; i--) {
       try {
-        disposeValue(held[i].value);
+        if (held[i].kind === 'defer') held[i].value();
+        else disposeValue(held[i].value);
       } catch (error) {
         if (first === null) first = { error: error, suppressed: null };
         else first = { error: first.error, suppressed: first.suppressed === null ? error : new SuppressedError(first.suppressed, error) };
@@ -2759,8 +2786,10 @@ function circularStructureText(value, replacer) {
         return Promise.reject(first.suppressed === null ? first.error
           : new SuppressedError(first.error, first.suppressed, 'An error was suppressed during disposal'));
       }
-      var value = held[at--].value;
-      return asyncDisposeValue(value).then(null, function (error) {
+      var entry = held[at--];
+      var value = entry.value;
+      return (entry.kind === 'defer' ? Promise.resolve(value()) : asyncDisposeValue(value))
+        .then(null, function (error) {
         if (first === null) first = { error: error, suppressed: null };
         else first = { error: first.error, suppressed: first.suppressed === null ? error : new SuppressedError(first.suppressed, error) };
       }).then(step);

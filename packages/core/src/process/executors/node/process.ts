@@ -2749,13 +2749,22 @@ export class NodeProcess extends Process {
      */
     private esmSource(source: string, file: string, isMain: boolean, urlSuffix = ''): string {
         /* Node 24 strips the types out of a `.ts`, `.mts` or `.cts` file before it compiles what
-           is left, and so does this: see stripTsTypes. */
-        const text = TS_EXTENSION.test(file) ? stripTsTypes(source) : source;
+           is left, and so does this: see stripTsTypes. What Node refuses to strip -- an `enum`, a
+           `namespace`, a parameter property -- is refused here too, in its own words. */
+        let text = source;
+        if (TS_EXTENSION.test(file)) {
+            try {
+                text = stripTsTypes(source);
+            } catch (error) {
+                if (!(error instanceof TsUnsupported)) throw error;
+                throw new GuestFailure(tsUnsupportedText(source, file, error), true);
+            }
+        }
         const duplicate = duplicateModuleBinding(text);
         if (duplicate !== undefined) {
             throw new GuestFailure(esmCompileFailureText(
                 text, file, duplicate.line, duplicate.column,
-                `Identifier '${duplicate.name}' has already been declared`, isMain
+                `Identifier '${duplicate.name}' has already been declared`, isMain, duplicate.span
             ), true);
         }
         const prepared = prepareEsmSource(text, file, isMain, urlSuffix, (spec) => {
@@ -2927,6 +2936,11 @@ export class NodeProcess extends Process {
         );
         const bytes = this.fileSystem.readBytes(file);
         if (bytes === undefined) return { value: compileError(`${file}: could not be read`) };
+        /* Node names an empty buffer for what it is before it looks for a magic word in it, so a
+           zero-byte file is not the `found ` a short one is. */
+        if (bytes.length === 0) {
+            return { value: compileError(`${file}: WebAssembly.Module(): BufferSource argument is empty`) };
+        }
         const found = Array.from(bytes.slice(0, 4)).map((b) => b.toString(16).padStart(2, '0')).join(' ');
         if (bytes.length < 4 || found !== '00 61 73 6d') {
             return { value: compileError(`${file}: WebAssembly.Module(): expected magic word 00 61 73 6d, found ${found} @+0`) };
@@ -2940,8 +2954,10 @@ export class NodeProcess extends Process {
         /* The bytes reach the guest as base64, which is what a bundle of guest source can carry;
            an export whose name is not an identifier is still reachable, off the instance. */
         const body = Buffer.from(bytes).toString('base64');
+        /* Every export the module declares is a named export and node adds no `default` beside
+           them: `import('./add.wasm')` is `{ add, mem }`, and a module that exports nothing is
+           an empty namespace, not one holding `default`. */
         let source = `const __owc_wasm = new WebAssembly.Instance(new WebAssembly.Module(Buffer.from(${JSON.stringify(body)}, 'base64'))).exports;\n`;
-        source += `export default __owc_wasm;\n`;
         for (const name of names) {
             if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) && !RESERVED_WORDS.has(name)) {
                 source += `export const ${name} = __owc_wasm[${JSON.stringify(name)}];\n`;
@@ -3720,10 +3736,16 @@ function lineColumnOf(source: string, index: number): { line: number; column: nu
  * Captured from the build NODE_VERSION names, as the usage block is -- a frame names a file this
  * container does not have, at a line only that build knows.
  */
-function esmCompileFrames(isMain: boolean): string {
+function esmCompileFrames(isMain: boolean, isTs = false): string {
     const shared = [
         '    at compileSourceTextModule (node:internal/modules/esm/utils:318:16)',
-        '    at ModuleLoader.moduleStrategy (node:internal/modules/esm/translators:90:18)',
+        '    at ModuleLoader.moduleStrategy (node:internal/modules/esm/translators:90:18)'
+    ];
+    /* A `.ts` entry is stripped by the translator before it is compiled, and the frame of the
+       stripper -- in the place TracingChannel.tracePromise has for any other entry -- is part of
+       what node prints for it. */
+    const stripped = isTs ? ['    at ModuleLoader.<anonymous> (node:internal/modules/esm/translators:642:10)'] : [];
+    const after = [
         '    at #translate (node:internal/modules/esm/loader:451:20)',
         '    at afterLoad (node:internal/modules/esm/loader:507:29)',
         '    at ModuleLoader.loadAndTranslate (node:internal/modules/esm/loader:512:12)',
@@ -3733,10 +3755,10 @@ function esmCompileFrames(isMain: boolean): string {
     ];
     const last = isMain
         ? ['    at node:internal/modules/esm/loader:628:32',
-            '    at TracingChannel.tracePromise (node:diagnostics_channel:362:14)']
+            ...(isTs ? [] : ['    at TracingChannel.tracePromise (node:diagnostics_channel:362:14)'])]
         : ['    at ModuleJob.syncLink (node:internal/modules/esm/module_job:162:33)',
             '    at ModuleJob.link (node:internal/modules/esm/module_job:252:17)'];
-    return shared.concat(last).join('\n');
+    return shared.concat(stripped, after, last).join('\n');
 }
 
 /**
@@ -3746,17 +3768,53 @@ function esmCompileFrames(isMain: boolean): string {
  * loader contributes, which differ between the entry a run started and a dependency it linked.
  */
 function esmCompileFailureText(
-    source: string, file: string, line: number, column: number, message: string, isMain: boolean
+    source: string, file: string, line: number, column: number, message: string, isMain: boolean,
+    span = 1
 ): string {
     const lines = source.split('\n');
     const shown = lines[Math.min(Math.max(line, 1), lines.length) - 1] ?? '';
-    const caret = ' '.repeat(Math.max(column - 1, 0)) + '^';
+    /* Node underlines from the start of the line to the token, and a tab in that run stays a tab --
+       the caret under a tab-indented line is indented with it, and not with spaces alone. */
+    const caret = shown.slice(0, Math.max(column - 1, 0)).replace(/[^\t]/g, ' ') + '^'.repeat(span);
     return `${toFileUrl(file)}:${line}\n${shown}\n${caret}\n\nSyntaxError: ${message}\n` +
-        `${esmCompileFrames(isMain)}\n\nNode.js ${NODE_VERSION}`;
+        `${esmCompileFrames(isMain, TS_EXTENSION.test(file))}\n\nNode.js ${NODE_VERSION}`;
 }
 
 /** The three extensions Node strips types out of before it compiles the file. */
 const TS_EXTENSION = /\.[cm]?ts$/;
+
+/**
+ * A TypeScript construct Node's stripper refuses to rewrite rather than erasing: an `enum`, a
+ * `namespace` and a parameter property, each the subject of its own ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX.
+ */
+class TsUnsupported {
+    constructor(
+        /** What Node names it in the message: `enum`, `namespace declaration`, `parameter property`. */
+        readonly what: string,
+        /** The first character of the span Node underlines, and the one behind its last. */
+        readonly start: number,
+        readonly end: number
+    ) { }
+}
+
+/** The words that stand in front of a class member and are no part of the member itself. */
+const CLASS_MEMBER_MODIFIERS = new Set([
+    'static', 'abstract', 'readonly', 'private', 'protected', 'public', 'override', 'declare',
+    'async', 'get', 'set'
+]);
+
+/** An identifier a `<` behind it cannot open the type arguments of: one that ends an expression. */
+const NO_TYPE_ARGS_AFTER_ID = new Set([
+    'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do',
+    'else', 'yield', 'await', 'if', 'for', 'while', 'switch', 'const', 'let', 'var', 'function',
+    'class', 'import', 'export', 'extends', 'implements', 'interface', 'type', 'enum', 'namespace'
+]);
+
+/** A punctuation a `<` behind it can open type arguments at: the start of an expression. */
+const TYPE_ARGS_AFTER_PUNC = new Set([
+    '=', '(', ',', '[', ':', '?', ';', '=>', '&&', '||', '??', '!', '+', '-', '*', '/', '%', '~',
+    '^', '&', '|', '{', '}', ')', ']'
+]);
 
 /**
  * The types of a TypeScript file, erased the way Node's own stripping erases them: an annotation
@@ -3781,8 +3839,10 @@ function stripTsTypes(source: string): string {
        name -- and not the one that follows a block or an object -- is the one marked. */
     let classAhead = false;
 
-    /** The first token of the code behind a type that starts at `k`. */
-    function typeEnd(k: number): number {
+    /** The first token of the code behind a type that starts at `k`. A cast -- `as { a: number }`
+        -- may carry an object type of its own, so the `{` a body would open is only one there; the
+        one behind a return type is the body of the function the type belongs to. */
+    function typeEnd(k: number, inCast: boolean): number {
         let depth = 0;
         /* A type that opened a bracket of its own -- a function type, a tuple, an object type --
            owns the `=>` and the `>` behind it, so those do not end it; the bracket that closes
@@ -3791,7 +3851,11 @@ function stripTsTypes(source: string): string {
         for (let j = k; j < tokens.length; j++) {
             const tok = tokens[j]!;
             if (tok.t === 'punc') {
-                if (tok.v === '<' || tok.v === '(' || tok.v === '[' || tok.v === '{') { depth++; opened = true; }
+                /* Only a `(` or a `<` can be the head of a function type, so only one of those
+                   is followed by an `=>` that belongs to the type; the `=>` behind a tuple or an
+                   object type is the arrow of the function the annotation stands on. */
+                if (tok.v === '<' || tok.v === '(') { depth++; opened = true; }
+                else if (tok.v === '[' || tok.v === '{') depth++;
                 else if (tok.v === '>' || tok.v === ')' || tok.v === ']' || tok.v === '}') {
                     if (depth === 0) return j;
                     depth--;
@@ -3799,7 +3863,7 @@ function stripTsTypes(source: string): string {
                     || (tok.v === '=>' && !opened))) return j;
                 /* A `{` that is not the type's own first token is the body of the function whose
                    return type this is, and so no part of the type. */
-                if (depth === 1 && tok.v === '{' && j > k) return j;
+                if (!inCast && depth === 1 && tok.v === '{' && j > k) return j;
             }
             if (depth === 0 && tok.nl) return j;
         }
@@ -3849,12 +3913,100 @@ function stripTsTypes(source: string): string {
         return tok.nl ? tok.s : tok.s;
     }
 
+    /**
+     * The `>` that closes the type arguments a `<` at `open` opens, or -1 when the `<` is a
+     * comparison. A type argument list is what TypeScript reads there whenever one parses and a
+     * `(` follows it -- which is why `a < b > (c)` is a call and not two comparisons -- so the
+     * token behind the `<` must be able to end an expression and the one behind its `>` must be
+     * the `(` of the argument list.
+     */
+    function typeArgumentClose(open: number): number {
+        const prev = tokens[open - 1];
+        if (prev !== undefined) {
+            if (prev.t === 'id') {
+                if (NO_TYPE_ARGS_AFTER_ID.has(prev.v)) return -1;
+            } else if (prev.t === 'punc') {
+                if (!TYPE_ARGS_AFTER_PUNC.has(prev.v)) return -1;
+            } else return -1;
+        }
+        let depth = 0;
+        for (let j = open; j < tokens.length; j++) {
+            const tok = tokens[j]!;
+            if (tok.t !== 'punc') continue;
+            if (tok.v === '<') depth++;
+            else if (tok.v === '>') {
+                depth--;
+                if (depth === 0) return isPunc(tokens[j + 1], '(') ? j : -1;
+            } else if (tok.v === '>>') {
+                /* `A<B<C>>` carries two closes in one token. */
+                depth -= 2;
+                if (depth <= 0) return depth === 0 && isPunc(tokens[j + 1], '(') ? j : -1;
+            } else if (tok.v === ';' || tok.v === '{' || tok.v === '}' || tok.v === '=>') return -1;
+        }
+        return -1;
+    }
+
+    /** The first token of the class member whose name stands at `k`: the modifiers in front of
+        the name are no part of the member, but they go with it when it is cut. */
+    function memberStart(k: number): number {
+        let j = k;
+        while (j > 0) {
+            const before = tokens[j - 1]!;
+            if (before.t === 'id' && CLASS_MEMBER_MODIFIERS.has(before.v)) { j--; continue; }
+            if (isPunc(before, '*')) { j--; continue; }
+            break;
+        }
+        return j;
+    }
+
+    /**
+     * The character behind the last of a declaration that opens a body of its own: the `}` that
+     * closes it, or the `;` that ends a declaration with no body. Only this much is underlined,
+     * and never the statement that follows on the next line.
+     */
+    function declarationEnd(at: number): number {
+        for (let j = at + 1; j < tokens.length; j++) {
+            if (isPunc(tokens[j], '{')) {
+                const close = matchingClose(tokens, j);
+                return (close > 0 ? tokens[close]! : tokens[j]!).e;
+            }
+            if (isPunc(tokens[j], ';')) return tokens[j]!.e;
+            if (tokens[j]!.nl) return tokens[j - 1]!.e;
+        }
+        return tokens[tokens.length - 1]!.e;
+    }
+
+    /** The `;` that ends a `function` declaration with no body -- an overload signature, which
+        TypeScript drops whole -- or -1 for one that has a body and so declares something. */
+    function bodylessFunctionEnd(at: number): number {
+        let k = at + 1;
+        if (isPunc(tokens[k], '*')) k++;
+        if (tokens[k] !== undefined && tokens[k]!.t === 'id') k++;
+        if (!isPunc(tokens[k], '(')) return -1;
+        const close = matchingClose(tokens, k);
+        if (close < 0) return -1;
+        let m = close + 1;
+        if (isPunc(tokens[m], ':')) m = typeEnd(m + 1, false);
+        return isPunc(tokens[m], ';') ? m : -1;
+    }
+
     for (let i = 0; i < tokens.length; i++) {
         const tok = tokens[i]!;
         const prev = tokens[i - 1];
         const next = tokens[i + 1];
         const top = stack[stack.length - 1];
         if (tok.t === 'punc') {
+            /* The type arguments of a call, of a `new` and of an arrow: `f<number>(1)`,
+               `new Map<string, number>()`, `<T,>(x: T) => x`. They are erased with the `<` and
+               the `>` that close them, which is what makes `f<number>(1)` run. */
+            if (tok.v === '<') {
+                const close = typeArgumentClose(i);
+                if (close > 0) {
+                    edits.push({ start: tok.s, end: tokens[close]!.e, text: '' });
+                    i = close;
+                    continue;
+                }
+            }
             if (tok.v === '(' || tok.v === '[' || tok.v === '{') {
                 let params = false;
                 const openingClass = classAhead;
@@ -3867,6 +4019,33 @@ function stripTsTypes(source: string): string {
                     params = close > 0 && (isPunc(after, '{') || isPunc(after, ':') || isPunc(after, '=>')
                         || (isPunc(after, '=') && isPunc(tokens[close + 2], '>'))
                         || isId(tokens[i - 1], 'function') || isId(tokens[i - 2], 'function'));
+                    /* A member with a parameter list and no body -- an overload signature, an
+                       `abstract m(): void;` -- declares nothing at run time, so it goes whole. */
+                    if (close > 0 && top !== undefined && top.classBody && prev !== undefined && prev.t === 'id') {
+                        let m = close + 1;
+                        if (isPunc(tokens[m], ':')) m = typeEnd(m + 1, false);
+                        if (isPunc(tokens[m], ';')) {
+                            edits.push({ start: tokens[memberStart(i - 1)]!.s, end: tokens[m]!.e, text: '' });
+                            i = m;
+                            continue;
+                        }
+                    }
+                }
+                /* An index signature -- `[key: string]: unknown;` -- declares nothing either. */
+                if (tok.v === '[' && top !== undefined && top.classBody && (prev === undefined
+                    || isPunc(prev, '{') || isPunc(prev, ';') || isPunc(prev, '}')
+                    || (prev.t === 'id' && CLASS_MEMBER_MODIFIERS.has(prev.v)))) {
+                    const close = matchingClose(tokens, i);
+                    if (close > 0 && isPunc(tokens[close + 1], ':')) {
+                        const end = statementEnd(i);
+                        edits.push({
+                            start: tok.s,
+                            end: tokens[end] !== undefined && !tokens[end]!.nl ? tokens[end]!.e : stopAt(end),
+                            text: ''
+                        });
+                        i = end;
+                        continue;
+                    }
                 }
                 stack.push({
                     open: tok.v,
@@ -3882,17 +4061,41 @@ function stripTsTypes(source: string): string {
                 lastParams = gone !== undefined && gone.params;
                 continue;
             }
+            /* `r?: number`, `m?(x)` and `d!: number` -- the `?` of an optional member or parameter
+               and the `!` of a definite assignment are no part of what is left. A `?` or a `!`
+               standing anywhere else is: the ternary and the assertion of an expression keep theirs. */
+            if (tok.v === '?' || tok.v === '!') {
+                const inMember = top !== undefined && (top.params || top.classBody);
+                /* `x!: number` stands at the top level of a module too, where no group encloses it. */
+                if (tok.v === '?' ? inMember : inMember || tok.v === '!') {
+                    const behind = prev !== undefined
+                        && (prev.t === 'id' || isPunc(prev, ']') || isPunc(prev, '}'));
+                    const ahead = next !== undefined
+                        && (isPunc(next, ':') || isPunc(next, '=') || isPunc(next, ',')
+                            || isPunc(next, ')') || isPunc(next, ';'));
+                    if (behind && ahead) {
+                        edits.push({ start: tok.s, end: tok.e, text: '' });
+                        continue;
+                    }
+                }
+            }
             if (tok.v !== ':' || top === undefined && prev === undefined) continue;
             if (top !== undefined && top.specifier) continue;
             if (prev === undefined) continue;
-            const behind = prev.t === 'id' || isPunc(prev, ')') || isPunc(prev, ']') || isPunc(prev, '}') || prev.v === '...';
+            /* An erased `?` or `!` still stands in front of the `:` in the token stream, so the
+               binding behind the annotation is the one in front of that. */
+            let inFront = i - 1;
+            while (inFront >= 0 && (tokens[inFront]!.v === '?' || tokens[inFront]!.v === '!')) inFront--;
+            const named = tokens[inFront];
+            const behind = prev.t === 'id' || isPunc(prev, ')') || isPunc(prev, ']') || isPunc(prev, '}')
+                || prev.v === '...' || (named !== undefined && named.t === 'id');
             if (!behind) continue;
             const inParams = (top !== undefined && top.open === '(' && top.params)
                 || (isPunc(prev, ')') && lastParams)
                 || (top !== undefined && top.classBody)
                 || i < declLimit;
             if (!inParams) continue;
-            const end = typeEnd(i + 1);
+            const end = typeEnd(i + 1, false);
             edits.push({ start: tok.s, end: stopAt(end), text: '' });
             i = end - 1;
             continue;
@@ -3902,6 +4105,35 @@ function stripTsTypes(source: string): string {
         /* `export interface` and `export type` declare nothing at run time either, so the
            `export` they stand behind goes with them. */
         const from = isId(prev, 'export') ? prev.s : tok.s;
+        /* What Node refuses to rewrite rather than erasing, and says so in its own error: an
+           `enum` and a `namespace`, wherever one stands, and not the `enum` of an object key. */
+        if ((tok.v === 'enum' || tok.v === 'namespace') && next !== undefined && next.t === 'id'
+            && (atStatement || isPunc(prev, '{') || isId(prev, 'const') || isId(prev, 'declare'))) {
+            throw new TsUnsupported(
+                tok.v === 'enum' ? 'enum' : 'namespace declaration', from, declarationEnd(i)
+            );
+        }
+        /* A `declare` at the top level of a module declares nothing at all -- not the binding
+           behind it, which is why `declare const D1: number;` leaves no `D1` to read. */
+        if (tok.v === 'declare' && atStatement) {
+            const end = statementEnd(i + 1);
+            edits.push({
+                start: from,
+                end: tokens[end] !== undefined && !tokens[end]!.nl ? tokens[end]!.e : stopAt(end),
+                text: ''
+            });
+            i = end;
+            continue;
+        }
+        /* An overload signature: a `function` with no body, which TypeScript drops whole. */
+        if (tok.v === 'function' && atStatement) {
+            const end = bodylessFunctionEnd(i);
+            if (end > 0) {
+                edits.push({ start: from, end: tokens[end]!.e, text: '' });
+                i = end;
+                continue;
+            }
+        }
         if (tok.v === 'interface' && atStatement) {
             let brace = -1;
             for (let j = i + 1; j < tokens.length; j++) {
@@ -3938,7 +4170,7 @@ function stripTsTypes(source: string): string {
             continue;
         }
         if ((tok.v === 'as' || tok.v === 'satisfies') && prev !== undefined) {
-            const end = typeEnd(i + 1);
+            const end = typeEnd(i + 1, true);
             edits.push({ start: prev.e, end: stopAt(end), text: '' });
             i = end - 1;
             continue;
@@ -3949,6 +4181,23 @@ function stripTsTypes(source: string): string {
         if ((tok.v === 'private' || tok.v === 'protected' || tok.v === 'public' || tok.v === 'readonly'
             || tok.v === 'abstract' || tok.v === 'declare' || tok.v === 'override')
             && next !== undefined && (next.t === 'id' || isPunc(next, '['))) {
+            /* One of those words inside a parameter list is a parameter property, which Node
+               refuses outright; the span it underlines is the parameter behind the word. */
+            if (top !== undefined && top.open === '(' && top.params) {
+                let last = i + 1;
+                let depth = 0;
+                for (let j = i + 1; j < tokens.length; j++) {
+                    const t = tokens[j]!;
+                    if (t.t !== 'punc') { last = j; continue; }
+                    if (t.v === '(' || t.v === '[' || t.v === '{') depth++;
+                    else if (t.v === ')' || t.v === ']' || t.v === '}') {
+                        if (depth === 0) break;
+                        depth--;
+                    } else if (depth === 0 && t.v === ',') break;
+                    last = j;
+                }
+                throw new TsUnsupported('parameter property', next.s, tokens[last]!.e);
+            }
             edits.push({ start: tok.s, end: next.s, text: '' });
             continue;
         }
@@ -3979,10 +4228,21 @@ function stripTsTypes(source: string): string {
         }
     }
 
+    /* Two cuts that meet -- the modifier of a member the member's own cut takes whole -- are one
+       cut of the wider span, and not a wider one dropped for standing behind a narrower. */
     edits.sort((a, b) => a.start - b.start || a.end - b.end);
+    const merged: SourceEdit[] = [];
+    for (const edit of edits) {
+        const last = merged[merged.length - 1];
+        if (last !== undefined && edit.start <= last.end) {
+            last.end = Math.max(last.end, edit.end);
+            continue;
+        }
+        merged.push({ start: edit.start, end: edit.end, text: edit.text });
+    }
     let out = '';
     let cursor = 0;
-    for (const edit of edits) {
+    for (const edit of merged) {
         if (edit.start < cursor) continue;
         out += source.slice(cursor, edit.start) + edit.text;
         cursor = edit.end;
@@ -3992,13 +4252,101 @@ function stripTsTypes(source: string): string {
 }
 
 /**
+ * The report Node gives for a TypeScript construct its stripper will not rewrite: the internal
+ * frame it throws through, the file and the line with the offending source underlined, and a
+ * SyntaxError carrying ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX.
+ */
+function tsUnsupportedText(source: string, file: string, info: TsUnsupported): string {
+    const lines = source.split('\n');
+    const start = lineColumnOf(source, info.start);
+    const end = lineColumnOf(source, Math.max(info.end - 1, info.start));
+    let frame = '';
+    for (let line = Math.max(start.line - 1, 1); line <= Math.min(start.line + 1, lines.length); line++) {
+        frame += `${lines[line - 1] ?? ''}\n`;
+        if (line !== start.line) continue;
+        frame += ' '.repeat(Math.max(start.column - 1, 0))
+            + '^'.repeat(Math.max(end.column - start.column + 1, 1)) + '\n';
+    }
+    return 'node:internal/modules/run_main:107\n'
+        + '    triggerUncaughtException(\n'
+        + '    ^\n\n'
+        + `${toFileUrl(file)}:${start.line}\n`
+        + frame
+        + `\nSyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript ${info.what} is not supported`
+        + ' in strip-only mode\n'
+        + '    at parseTypeScript (node:internal/modules/typescript:68:40)\n'
+        + '    at processTypeScriptCode (node:internal/modules/typescript:146:42)\n'
+        + '    at stripTypeScriptModuleTypes (node:internal/modules/typescript:209:22)\n'
+        + '    at ModuleLoader.<anonymous> (node:internal/modules/esm/translators:641:29)\n'
+        + '    at #translate (node:internal/modules/esm/loader:451:20)\n'
+        + '    at afterLoad (node:internal/modules/esm/loader:507:29)\n'
+        + '    at ModuleLoader.loadAndTranslate (node:internal/modules/esm/loader:512:12)\n'
+        + '    at #getOrCreateModuleJobAfterResolve (node:internal/modules/esm/loader:555:36)\n'
+        + '    at afterResolve (node:internal/modules/esm/loader:603:52)\n'
+        + "    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:609:12) {\n"
+        + "  code: 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX'\n"
+        + '}\n\n'
+        + `Node.js ${NODE_VERSION}`;
+}
+
+/**
  * The SyntaxError Node gives for a module that binds one name twice at its top level, as the name
  * it binds again and where in the source that name stands; undefined when no name is bound twice.
  * QuickJS accepts a name brought in by an import and declared again by the module itself, and
  * accepts a redeclaration inside a block, so only names bound at module scope are counted.
- * `var` and `function` redeclaration stays legal, as it is in Node.
+ * `var` redeclaration stays legal, as it is in Node; a `function` declaration is a lexical binding
+ * at module scope, as it is there, so a `var` or another `function` of the same name is not.
  */
-function duplicateModuleBinding(source: string): { name: string; line: number; column: number } | undefined {
+/**
+ * Where node underlines a name bound twice: the start of the declaration that binds it a second
+ * time, and how much of that declaration it covers. A `function` or a `class` is underlined from
+ * its keyword -- and a class the whole way to the `}` that closes it -- where a `const`, a `let`
+ * and a `var` are underlined at the binding alone, which in a pattern is the one that repeats.
+ */
+function duplicateSite(tokens: JsToken[], i: number, name: string): { at: number; span: number } {
+    const tok = tokens[i]!;
+    if (tok.v === 'function' || tok.v === 'class') {
+        let span = 1;
+        if (tok.v === 'class') {
+            for (let j = i + 1; j < tokens.length; j++) {
+                if (isPunc(tokens[j], '{')) {
+                    const close = matchingClose(tokens, j);
+                    span = (close > 0 ? tokens[close]! : tokens[j]!).e - tok.s;
+                    break;
+                }
+                if (isPunc(tokens[j], ';')) break;
+            }
+        }
+        return { at: tok.s, span };
+    }
+    let at = tok.s;
+    let depth = 0;
+    for (let j = i + 1; j < tokens.length; j++) {
+        const t = tokens[j]!;
+        if (t.t === 'id') {
+            if (t.v === name) at = t.s;
+            continue;
+        }
+        if (t.t !== 'punc') continue;
+        if (t.v === '(' || t.v === '[' || t.v === '{') depth++;
+        else if (t.v === ')' || t.v === ']' || t.v === '}') {
+            if (depth === 0) break;
+            depth--;
+        } else if (depth === 0) {
+            if (t.v === ';') break;
+            /* The initializer of a declarator is no binding, so the names it holds are not the
+               ones being bound: `const [a, a] = [1, 2]` underlines the second `a` of the pattern. */
+            if (t.v === '=') {
+                const after = skipExpression(tokens, j + 1);
+                if (after > j + 1) j = after - 1;
+            }
+        }
+    }
+    return { at, span: 1 };
+}
+
+function duplicateModuleBinding(source: string)
+    : { name: string; line: number; column: number; span: number } | undefined {
     const tokens = tokenizeJs(source);
     const lexical = new Set<string>();
     const hoisted = new Set<string>();
@@ -4024,7 +4372,7 @@ function duplicateModuleBinding(source: string): { name: string; line: number; c
             const name = tokens[i + 1];
             if (name === undefined || name.t !== 'id') continue;
             names.push(name.v);
-            lexicalBinding = tok.v === 'class';
+            lexicalBinding = true;
         } else if (tok.v === 'const' || tok.v === 'let' || tok.v === 'var') {
             lexicalBinding = tok.v !== 'var';
             let k = i + 1;
@@ -4045,17 +4393,9 @@ function duplicateModuleBinding(source: string): { name: string; line: number; c
         for (const name of names) {
             // a lexical name is never rebound; a var or function name is, by another var or function
             if (lexical.has(name) || (lexicalBinding && hoisted.has(name))) {
-                /* Node points at the name bound a second time, not at the declaration that binds
-                   it: the `a` of `const a = 1`, the `a` of `import { a } from './y.mjs'`. */
-                let at = tok.s;
-                for (let k = i + 1; k < tokens.length; k++) {
-                    if (tokens[k]!.t === 'id' && tokens[k]!.v === name) {
-                        at = tokens[k]!.s;
-                        break;
-                    }
-                }
-                const where = lineColumnOf(source, at);
-                return { name, line: where.line, column: where.column };
+                const site = duplicateSite(tokens, i, name);
+                const where = lineColumnOf(source, site.at);
+                return { name, line: where.line, column: where.column, span: site.span };
             }
             if (lexicalBinding) lexical.add(name);
             else hoisted.add(name);
