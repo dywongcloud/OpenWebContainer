@@ -18,36 +18,51 @@ import { CapabilityContext, CapabilityHandler } from './types';
  * timeout interrupts a script.
  */
 
+interface VmRealm {
+    /** The QuickJS context that is this `vm` context's own realm. */
+    ctx: QuickJSContext;
+    /** Hands a cell the realm's tracker built to `api.noteRejection`, once per realm. */
+    noteFn?: QuickJSHandle;
+    /** Rebuilds the value a promise settles with, once per realm: see {@link promiseOf}. */
+    rehomeFn?: QuickJSHandle;
+    /** The standard globals of the guest realm beside their namesakes in this realm, once. */
+    builtins?: { from: QuickJSHandle[]; to: QuickJSHandle[] };
+    /** `Object.getOwnPropertyNames` of this realm, once: what {@link syncOut} reads. */
+    namesFn?: QuickJSHandle;
+    /** The own names of this realm's global object as it was made: its intrinsics, not its sandbox. */
+    base: Set<string>;
+    /** The names on the global object that are the sandbox's: what {@link syncOut} writes back. */
+    held: Set<string>;
+    /** Names this container put on the global object itself: never written back to the sandbox. */
+    injected: Set<string>;
+}
+
 interface VmHost {
     runtime: QuickJSRuntime;
     context: QuickJSContext;
     /** The guest bootstrap API object; vm.run reads the thunk from its `vmThunk` slot. */
     api: QuickJSHandle;
     /**
-     * A second realm: a second QuickJS context on the same runtime, made the first time a `vm`
-     * context runs code -- or the first time a value of this realm has to cross out of one. The
-     * code of a context runs here, and its intrinsics are its own -- `Array` here is not the
-     * guest's `Array` -- because QuickJS gives each context its own set, while objects of one
-     * context are usable from another of the same runtime. That is the whole of what Node's
-     * cross-realm behaviour needs: a value the context made answers `false` to `instanceof Array`
-     * while `Array.isArray` still answers `true`, and one the caller put into the context is the
-     * caller's own object still.
+     * One second realm per `vm` context, each a QuickJS context of its own on the same runtime,
+     * made the first time that context runs code. Its intrinsics are its own -- `Array` here is
+     * not the guest's `Array`, and not the `Array` of any other context -- because QuickJS gives
+     * each context its own set, while objects of one context are usable from another of the same
+     * runtime. That is the whole of what Node's cross-realm behaviour needs: a value the context
+     * made answers `false` to `instanceof Array` while `Array.isArray` still answers `true`, and
+     * one the caller put into the context is the caller's own object still. A context is a realm
+     * of its own on host Node 24.15 too, so `vm.createContext({})` twice is two: `Object` out of
+     * one is not the `Object` out of the other, and `[1]` out of one is not `instanceof` the
+     * `Array` of the other.
      */
-    realm?: QuickJSContext;
+    realms: Map<number, VmRealm>;
     /** `Object.prototype.toString` and `Array.isArray` of the guest realm, once: see {@link VmProbes}. */
     probes?: VmProbes;
     /** `(v) => boolean`: whether `v` is a proxy the guest realm made, built once in that realm. */
     proxyTest?: QuickJSHandle;
     /** `Proxy` of the guest realm, once: what a rebuild wraps a proxy it hands back in. */
     proxyCtor?: QuickJSHandle;
-    /** Values built in {@link VmHost.realm} and handed to the guest, freed with the binding. */
+    /** Values built in a second realm and handed to the guest, freed with the binding. */
     realmValues: QuickJSHandle[];
-    /** Rebuilds the value a promise settles with, once per binding: see {@link promiseOf}. */
-    rehomeFn?: QuickJSHandle;
-    /** The wrapper {@link REALM_EXEC_SRC} compiles to in {@link VmHost.realm}, once. */
-    execFn?: QuickJSHandle;
-    /** Hands a cell the realm's tracker built to `api.noteRejection`, once per binding. */
-    noteFn?: QuickJSHandle;
     /**
      * A `WeakMap` of the guest realm: the value a `vm` context handed back -> the twin it was
      * rebuilt as, so that what the context hands back twice comes back as one object.
@@ -55,8 +70,6 @@ interface VmHost {
     twins?: QuickJSHandle;
     /** The pairs behind {@link VmHost.twins}, oldest first: the source, and the twin beside it. */
     memo: { src: QuickJSHandle; twin: QuickJSHandle }[];
-    /** The standard globals of the guest realm beside their namesakes in the second realm, once. */
-    builtins?: { from: QuickJSHandle[]; to: QuickJSHandle[] };
     /** Armed deadline in epoch milliseconds; 0 while nothing is armed. */
     deadline: number;
     /** Set by the interrupt handler when it interrupts; read by vm.run. */
@@ -125,51 +138,56 @@ const REALM_TYPED_ARRAYS = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int
     'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array'];
 
 /**
- * The standard globals whose namesake in the second realm replaces the guest realm's when one of
+ * The standard globals of the guest realm whose namesake in a second realm replaces it when one of
  * them is what crosses out of a `vm` context: `runInContext('Array')` is the context's own `Array`,
  * not the caller's, which is why host Node reports `false` for `runInContext('Array') === Array`.
+ *
+ * The names a second realm is *given* are these and the ones below: a context made here starts as a
+ * bare realm of this engine's, and the standard globals host Node 24.15 hands a fresh context --
+ * `Float16Array`, `Iterator`, `SuppressedError`, `WebAssembly`, the two disposable stacks -- are
+ * its own polyfills' to supply, so each one the realm lacks is taken from the guest realm, and so
+ * is every static the guest's copy carries that the realm's does not (`Array.fromAsync`,
+ * `Error.captureStackTrace`, `Symbol.dispose`, `Math.sumPrecise`): a context here answers
+ * `typeof WebAssembly` and `typeof Array.fromAsync` the way the guest realm does, as on the host.
  */
-const REALM_BUILTINS = ['AggregateError', 'Array', 'ArrayBuffer', 'Atomics', 'BigInt', 'BigInt64Array',
-    'BigUint64Array', 'Boolean', 'DataView', 'Date', 'Error', 'EvalError', 'FinalizationRegistry',
-    'Float32Array', 'Float64Array', 'Function', 'Int16Array', 'Int32Array', 'Int8Array', 'Intl',
-    'JSON', 'Map', 'Math', 'Number', 'Object', 'Promise', 'Proxy', 'RangeError', 'ReferenceError',
-    'Reflect', 'RegExp', 'Set', 'SharedArrayBuffer', 'String', 'Symbol', 'SyntaxError', 'TypeError',
+const REALM_BUILTINS = ['AggregateError', 'Array', 'ArrayBuffer', 'AsyncDisposableStack', 'Atomics',
+    'BigInt', 'BigInt64Array', 'BigUint64Array', 'Boolean', 'DataView', 'Date', 'DisposableStack',
+    'Error', 'EvalError', 'FinalizationRegistry', 'Float16Array', 'Float32Array', 'Float64Array',
+    'Function', 'Int16Array', 'Int32Array', 'Int8Array', 'Intl', 'Iterator', 'JSON', 'Map', 'Math',
+    'Number', 'Object', 'Promise', 'Proxy', 'RangeError', 'ReferenceError', 'Reflect', 'RegExp',
+    'Set', 'SharedArrayBuffer', 'String', 'SuppressedError', 'Symbol', 'SyntaxError', 'TypeError',
     'Uint16Array', 'Uint32Array', 'Uint8Array', 'Uint8ClampedArray', 'URIError', 'WeakMap',
-    'WeakRef', 'WeakSet'];
+    'WeakRef', 'WeakSet', 'WebAssembly'];
 
-/** The ES globals of the second realm whose names the guest's `with` scope answers for. */
+/** The ES globals of a second realm whose names the guest's `with` scope answers for. */
 const REALM_ES_NAMES = ['Infinity', 'NaN', 'undefined', 'eval', 'isFinite', 'isNaN', 'parseFloat',
     'parseInt', 'encodeURI', 'encodeURIComponent', 'decodeURI', 'decodeURIComponent', 'escape',
     'unescape'].concat(REALM_BUILTINS);
 
 /**
- * The body a `vm` context's code runs under, compiled *inside* the second realm.
- *
- * A context used to run its code in the caller's own realm, with a `with` scope that handed the ES
- * globals of that realm to it. No change to what the scope hands out can match host Node 24.15
- * then: an array the caller puts into a context and an array the code of the context makes are the
- * same kind of object there, so `e instanceof Array` and `[] instanceof Array` cannot come apart,
- * and on the host they do (`false` and `true`). What separates them is the realm the code runs in,
- * so the `with` scope is handed to a wrapper compiled in the second realm and the code is `eval`ed
- * there: a value the context makes is of the second realm as it is made, one the caller put in is
- * still the caller's, and both are handed back as they are.
- *
- * The names are the ones the scope's proxy leaves alone -- every other free name is the scope's to
- * answer, so a parameter called `sb` would read as a sandbox property and not as the argument.
+ * The one global this engine gives every context that host Node 24.15 does not give a fresh one:
+ * `typeof InternalError` reads `undefined` inside a `vm` context there, so it is taken off.
  */
-const REALM_EXEC_SRC = '(function (__owcVmWith, __owcVmCode, __owcVmFns, __owcVmSb) {' +
-    'var __owcVmOut;' +
-    'try {' +
-    'with (__owcVmWith) { __owcVmOut = eval(__owcVmCode); }' +
-    '} finally {' +
-    'for (var __owcVmI = 0; __owcVmI < __owcVmFns.length; __owcVmI++) {' +
-    'try { __owcVmSb[__owcVmFns[__owcVmI]] = eval(__owcVmFns[__owcVmI]); }' +
-    'catch (__owcVmErr) {' +
-    'if (__owcVmSb[__owcVmFns[__owcVmI]] === undefined) delete __owcVmSb[__owcVmFns[__owcVmI]];' +
-    '}' +
-    '}' +
-    '}' +
-    'return __owcVmOut; })';
+const REALM_ENGINE_ONLY = ['InternalError'];
+
+/**
+ * How the code of a `vm` context runs: as global code of the context's own realm.
+ *
+ * The sandbox is synced onto that realm's global object before the run and back onto the sandbox
+ * after it, which is what host Node 24.15's own contextifying does: the sandbox is the context's
+ * global object there, so a name the caller put in is a global of the context, and a global the code
+ * makes -- a `var`, a `function`, an undeclared assignment -- is a property of the sandbox when the
+ * run is over. A name neither of them knows is a ReferenceError of the context's realm, as it is on
+ * the host.
+ *
+ * Global code is what makes the rest of it fall out rather than be emulated: a top-level `let`,
+ * `const` or `class` binds in the realm's global lexical scope, so it is still there for the next
+ * run of the same context (`vm.runInContext('let a = 1', c)` then `vm.runInContext('a', c)`), and a
+ * second declaration of it is the SyntaxError the host reports, where an `eval` of the same code
+ * would bind it for one run only. The compile is the realm's own, so the `filename` and the
+ * `lineOffset` of a `Script` are what the frames of the error it throws name, and the interruption
+ * of a `timeout` still reaches the guest as the uncatchable error this engine raises.
+ */
 
 /**
  * The rejection tracker the second realm gets, so a promise a `vm` context leaves unhandled is
@@ -237,6 +255,7 @@ export function bindVmRuntime(owner: CapabilityContext, runtime: QuickJSRuntime,
         runtime,
         context,
         api,
+        realms: new Map(),
         realmValues: [],
         memo: [],
         deadline: 0,
@@ -328,40 +347,8 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
         }
         host.twins = undefined;
     }
-    if (host.builtins !== undefined) {
-        for (const handle of [...host.builtins.from, ...host.builtins.to]) {
-            try {
-                handle.dispose();
-            } catch {
-                // as above
-            }
-        }
-        host.builtins = undefined;
-    }
-    if (host.rehomeFn !== undefined) {
-        try {
-            host.rehomeFn.dispose();
-        } catch {
-            // a handle already gone is nothing to report
-        }
-        host.rehomeFn = undefined;
-    }
-    if (host.execFn !== undefined) {
-        try {
-            host.execFn.dispose();
-        } catch {
-            // as above
-        }
-        host.execFn = undefined;
-    }
-    if (host.noteFn !== undefined) {
-        try {
-            host.noteFn.dispose();
-        } catch {
-            // as above
-        }
-        host.noteFn = undefined;
-    }
+    for (const realm of host.realms.values()) disposeRealm(realm);
+    host.realms.clear();
     if (host.proxyTest !== undefined) {
         try {
             host.proxyTest.dispose();
@@ -389,13 +376,27 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
         }
         host.probes = undefined;
     }
-    if (host.realm !== undefined) {
+}
+
+/** Frees one second realm and every handle of the binding that was built inside it. */
+function disposeRealm(realm: VmRealm): void {
+    for (const handle of [realm.noteFn, realm.rehomeFn, realm.namesFn,
+        ...(realm.builtins === undefined ? [] : [...realm.builtins.from, ...realm.builtins.to])]) {
+        if (handle === undefined) continue;
         try {
-            host.realm.dispose();
+            handle.dispose();
         } catch {
-            // as above
+            // a handle already gone is nothing to report
         }
-        host.realm = undefined;
+    }
+    realm.noteFn = undefined;
+    realm.rehomeFn = undefined;
+    realm.namesFn = undefined;
+    realm.builtins = undefined;
+    try {
+        realm.ctx.dispose();
+    } catch {
+        // as above
     }
 }
 
@@ -426,6 +427,12 @@ export function takeVmInterruption(owner: CapabilityContext): VmInterruption | u
     return reason;
 }
 
+/** The `vm` context a capability was called for: the guest numbers them, one number per context. */
+function realmIdOf(args: Record<string, unknown>): number {
+    const id = Number(args.id);
+    return Number.isFinite(id) ? id : 0;
+}
+
 function describeError(error: unknown): string {
     if (error !== null && typeof error === 'object' && 'message' in error) {
         return String((error as { message: unknown }).message);
@@ -434,19 +441,26 @@ function describeError(error: unknown): string {
 }
 
 /**
- * The second realm, made on the first value that has to cross -- or on the first `vm` context that
- * has to run -- or undefined when it cannot be made.
+ * The realm of one `vm` context, made the first time that context runs code or hands a value out,
+ * or undefined when it cannot be made. `id` is the context's own, which the guest numbers.
  *
  * A `vm` context's code runs here, so the realm is given the process's rejection tracker before
  * anything runs in it: a promise the context leaves unhandled is otherwise one this process never
- * hears about, where host Node 24.15 reports it.
+ * hears about, where host Node 24.15 reports it. It is given the standard globals the guest realm
+ * has and it does not, so that a context here answers for the same names the guest's own code does.
  */
-function realmOf(host: VmHost): QuickJSContext | undefined {
-    if (host.realm !== undefined) return host.realm;
+function realmFor(host: VmHost, id: number): VmRealm | undefined {
+    const found = host.realms.get(id);
+    if (found !== undefined) return found;
     try {
-        const realm = host.runtime.newContext();
-        host.realm = realm;
+        const ctx = host.runtime.newContext();
+        const realm: VmRealm = { ctx, base: new Set<string>(), held: new Set<string>(), injected: new Set<string>() };
+        host.realms.set(id, realm);
+        bridgeGlobals(host, realm);
         installRejections(host, realm);
+        /* The intrinsics of the realm as it stands -- the bridged names with them -- are what a run
+           may add to and is never asked to hand back to the sandbox. */
+        for (const name of realmNames(host, realm)) realm.base.add(name);
         return realm;
     } catch {
         return undefined;
@@ -454,17 +468,190 @@ function realmOf(host: VmHost): QuickJSContext | undefined {
 }
 
 /**
- * Gives a freshly made second realm the process's rejection tracker, whose cells are handed to the
- * guest's `api.noteRejection`.
+ * Gives a freshly made realm the standard globals the guest realm carries that it does not, and the
+ * statics the guest's copies carry that its own do not: see {@link REALM_BUILTINS}.
+ *
+ * A context here starts as a bare realm of this engine's, which is short of host Node 24.15's own
+ * surface in the places the guest realm has already been brought up to it -- `WebAssembly`,
+ * `SuppressedError`, `Array.fromAsync`, `Error.captureStackTrace`, `Symbol.dispose` -- and short of
+ * nothing else, so only what it lacks is taken. A static is copied by value where the guest's is a
+ * plain one (`Error.stackTraceLimit`, `RegExp.input`) and by reference where it is a function, which
+ * is then a function of the guest realm called on objects of this one, as a polyfill of Node's is.
  */
-function installRejections(host: VmHost, realm: QuickJSContext): void {
+function bridgeGlobals(host: VmHost, realm: VmRealm): void {
+    const { context } = host;
     try {
-        const built = realm.evalCode(REALM_REJECTION_SRC);
+        const built = realm.ctx.evalCode(
+            '(function (src, both) {' +
+            'var names = both[0];' +
+            'var gone = both[1];' +
+            'for (var j = 0; j < gone.length; j++) {' +
+            'try { delete globalThis[gone[j]]; } catch (x) { }' +
+            '}' +
+            'for (var i = 0; i < names.length; i++) {' +
+            'var n = names[i];' +
+            'var s = src[n];' +
+            'if (s === undefined) continue;' +
+            'if (!Object.prototype.hasOwnProperty.call(globalThis, n)) {' +
+            'try { globalThis[n] = s; } catch (x) { }' +
+            'continue;' +
+            '}' +
+            'var d = globalThis[n];' +
+            'if (d === null || (typeof d !== "object" && typeof d !== "function")) continue;' +
+            'if (s === null || (typeof s !== "object" && typeof s !== "function")) continue;' +
+            'var keys = Object.getOwnPropertyNames(s);' +
+            'for (var k = 0; k < keys.length; k++) {' +
+            'var key = keys[k];' +
+            'if (key === "name" || key === "length" || key === "prototype") continue;' +
+            'if (Object.prototype.hasOwnProperty.call(d, key)) continue;' +
+            'try { d[key] = s[key]; } catch (x) { }' +
+            '}' +
+            '}' +
+            '})'
+        );
         if (built.error) {
             built.error.dispose();
             return;
         }
-        const installer = realm.unwrapResult(built);
+        const bridge = realm.ctx.unwrapResult(built);
+        const names = realm.ctx.unwrapResult(
+            realm.ctx.evalCode(JSON.stringify([REALM_ES_NAMES.concat(REALM_ENGINE_ONLY), REALM_ENGINE_ONLY]))
+        );
+        const result = realm.ctx.callFunction(bridge, realm.ctx.undefined, [context.global, names]);
+        names.dispose();
+        bridge.dispose();
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // a realm short of a global still runs the code of a context
+    }
+}
+
+/**
+ * `delete target[key]`, in whichever context `target` belongs to: this engine's context API has no
+ * delete of its own, and a name the sandbox no longer carries has to come off the realm's global
+ * object with it -- on host Node 24.15 the sandbox *is* that global object, so there is nothing to
+ * take off anywhere else.
+ */
+function deleteKey(ctx: QuickJSContext, target: QuickJSHandle, key: string): void {
+    try {
+        const built = ctx.evalCode('(function (o, k) { try { delete o[k]; } catch (x) { } })');
+        if (built.error) {
+            built.error.dispose();
+            return;
+        }
+        const fn = ctx.unwrapResult(built);
+        const name = ctx.newString(key);
+        const result = ctx.callFunction(fn, ctx.undefined, [target, name]);
+        name.dispose();
+        fn.dispose();
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // a name that will not come off still leaves the rest of the sync intact
+    }
+}
+
+/** The own string names of a realm's global object, read inside it. */
+function realmNames(host: VmHost, realm: VmRealm): string[] {
+    try {
+        if (realm.namesFn === undefined) {
+            const built = realm.ctx.evalCode('(function () { return Object.getOwnPropertyNames(globalThis); })');
+            if (built.error) {
+                built.error.dispose();
+                return [];
+            }
+            realm.namesFn = realm.ctx.unwrapResult(built);
+        }
+        const result = realm.ctx.callFunction(realm.namesFn, realm.ctx.global, []);
+        if (result.error) {
+            result.error.dispose();
+            return [];
+        }
+        const names = host.context.dump(result.value);
+        result.value.dispose();
+        return Array.isArray(names) ? names.map((name) => String(name)) : [];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Puts the sandbox of a `vm` context onto its realm's global object before a run: the context's
+ * globals are the sandbox's, as they are on host Node 24.15, where the sandbox *is* the global
+ * object of the context and not a scope around it.
+ *
+ * A name the sandbox no longer carries is taken off the global object with it, so a property the
+ * caller drops between two runs is gone inside the context too.
+ */
+function syncIn(host: VmHost, realm: VmRealm, sandbox: QuickJSHandle): void {
+    const { context } = host;
+    const seen = new Set<string>();
+    try {
+        for (const key of ownKeysOf(host, sandbox)) {
+            const value = context.getProp(sandbox, key);
+            realm.ctx.setProp(realm.ctx.global, key, value);
+            value.dispose();
+            if (typeof key === 'string') {
+                seen.add(key);
+                realm.held.add(key);
+            }
+        }
+        for (const held of [...realm.held]) {
+            if (seen.has(held)) continue;
+            realm.held.delete(held);
+            deleteKey(realm.ctx, realm.ctx.global, held);
+        }
+    } catch {
+        // a sandbox that cannot be read leaves the realm's globals as the last run left them
+    }
+}
+
+/**
+ * Puts a realm's global object back onto the sandbox after a run: everything the code made a global
+ * of -- a `var`, a `function`, an undeclared assignment -- is a property of the sandbox on host Node
+ * 24.15, and a name the code deleted is off it.
+ *
+ * The intrinsics of the realm and the names this container put there itself stay out of it, which is
+ * the difference between a global the context made and one it was born with: `Object.keys` of a
+ * sandbox reads the assignment a script made on host Node 24.15 and not `Array`.
+ */
+function syncOut(host: VmHost, realm: VmRealm, sandbox: QuickJSHandle): void {
+    const { context } = host;
+    const names = realmNames(host, realm);
+    const present = new Set<string>();
+    try {
+        for (const name of names) {
+            if (realm.base.has(name) || realm.injected.has(name)) continue;
+            const value = realm.ctx.getProp(realm.ctx.global, name);
+            context.setProp(sandbox, name, value);
+            value.dispose();
+            present.add(name);
+            realm.held.add(name);
+        }
+        for (const held of [...realm.held]) {
+            if (present.has(held)) continue;
+            realm.held.delete(held);
+            deleteKey(context, sandbox, held);
+        }
+    } catch {
+        // a realm whose globals cannot be read leaves the sandbox as the run found it
+    }
+}
+
+/**
+ * Gives a freshly made second realm the process's rejection tracker, whose cells are handed to the
+ * guest's `api.noteRejection`.
+ */
+function installRejections(host: VmHost, realm: VmRealm): void {
+    const ctx = realm.ctx;
+    try {
+        const built = ctx.evalCode(REALM_REJECTION_SRC);
+        if (built.error) {
+            built.error.dispose();
+            return;
+        }
+        const installer = ctx.unwrapResult(built);
         const note = host.context.newFunction('noteRejection', (cell) => {
             try {
                 const fn = host.context.getProp(host.api, 'noteRejection');
@@ -481,8 +668,8 @@ function installRejections(host: VmHost, realm: QuickJSContext): void {
             }
             return host.context.undefined;
         });
-        host.noteFn = note;
-        const result = realm.callFunction(installer, realm.undefined, [note]);
+        realm.noteFn = note;
+        const result = ctx.callFunction(installer, ctx.undefined, [note]);
         installer.dispose();
         if (result.error) result.error.dispose();
         else result.value.dispose();
@@ -602,20 +789,21 @@ function callFor(host: VmHost, fn: QuickJSHandle, thisArg: QuickJSHandle, args: 
  * The namesake of `value` in the second realm, when `value` is one of the guest realm's own standard
  * globals: the context's `Array` is its own, so that is the one a program gets back from it.
  */
-function builtinOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle | undefined {
-    if (host.builtins === undefined) {
+function builtinOf(host: VmHost, realm: VmRealm, value: QuickJSHandle): QuickJSHandle | undefined {
+    const ctx = realm.ctx;
+    if (realm.builtins === undefined) {
         const from: QuickJSHandle[] = [];
         const to: QuickJSHandle[] = [];
         const { context } = host;
         for (const name of REALM_BUILTINS) {
             const ofGuest = context.getProp(context.global, name);
-            const ofRealm = realm.getProp(realm.global, name);
+            const ofRealm = ctx.getProp(ctx.global, name);
             from.push(ofGuest);
             to.push(ofRealm);
         }
-        host.builtins = { from, to };
+        realm.builtins = { from, to };
     }
-    const { from, to } = host.builtins;
+    const { from, to } = realm.builtins;
     for (let i = 0; i < from.length; i++) {
         if (host.context.eq(from[i], value)) return to[i];
     }
@@ -656,13 +844,14 @@ function isProxyValue(host: VmHost, value: QuickJSHandle): boolean {
  * `value` wrapped in a proxy of the second realm, built through the guest realm's own `Proxy` so
  * that the record that realm keeps -- and `util.types.isProxy` with it -- names it too.
  */
-function proxyOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle | undefined {
+function proxyOf(host: VmHost, realm: VmRealm, value: QuickJSHandle): QuickJSHandle | undefined {
+    const ctx = realm.ctx;
     const { context } = host;
     try {
         if (host.proxyCtor === undefined) host.proxyCtor = context.getProp(context.global, 'Proxy');
-        const object = realm.getProp(realm.global, 'Object');
-        const objectProto = realm.getProp(object, 'prototype');
-        const built = realm.evalCode(
+        const object = ctx.getProp(ctx.global, 'Object');
+        const objectProto = ctx.getProp(object, 'prototype');
+        const built = ctx.evalCode(
             '(function (orig, proto, P) {' +
             'return new P(orig, { getPrototypeOf: function () { return proto; } });' +
             '})'
@@ -674,7 +863,7 @@ function proxyOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): Qui
             return undefined;
         }
         const bridge = context.unwrapResult(built);
-        const result = realm.callFunction(bridge, realm.undefined, [value, objectProto, host.proxyCtor]);
+        const result = ctx.callFunction(bridge, ctx.undefined, [value, objectProto, host.proxyCtor]);
         bridge.dispose();
         objectProto.dispose();
         if (result.error) {
@@ -712,7 +901,7 @@ function methodDump(host: VmHost, value: QuickJSHandle, name: string): unknown {
  */
 function rehomeInto(
     host: VmHost,
-    realm: QuickJSContext,
+    realm: VmRealm,
     value: QuickJSHandle,
     depth: number,
     seen: QuickJSHandle[],
@@ -720,6 +909,7 @@ function rehomeInto(
     kept: QuickJSHandle[]
 ): QuickJSHandle {
     const { context } = host;
+    const ctx = realm.ctx;
     if (host.realmValues.length >= REALM_MAX_VALUES) return value;
     const builtin = builtinOf(host, realm, value);
     if (builtin !== undefined) return builtin;
@@ -749,7 +939,7 @@ function rehomeInto(
     let made: QuickJSHandle;
     try {
         if (isArray) {
-            made = realm.newArray();
+            made = ctx.newArray();
             /* An instance of a class that extends a host's own `Array` is an array to every probe --
                `Array.isArray` and the `[object Array]` tag both say so -- but it still answers the
                name of its class, not `Array`, to `o.constructor.name` on host Node 24.15. */
@@ -758,7 +948,7 @@ function rehomeInto(
                 nameAfter(host, realm, made, arrayCtor);
             }
         } else if (tag === '[object Object]') {
-            made = realm.newObject();
+            made = ctx.newObject();
             /* A class instance: `class C {}` out of a context still answers `C` to
                `o.constructor.name` on host Node 24.15, which a bare object of the second realm would
                answer `Object` to. The class itself is the one thing that cannot cross -- its body was
@@ -768,11 +958,11 @@ function rehomeInto(
             if (ctor !== undefined && ctor !== 'Object') nameAfter(host, realm, made, ctor);
         } else if (tag === '[object Date]') {
             const ms = Number(methodDump(host, value, 'getTime'));
-            return pin(host, context.unwrapResult(realm.evalCode(`new Date(${Number.isFinite(ms) ? ms : 0})`)));
+            return pin(host, context.unwrapResult(ctx.evalCode(`new Date(${Number.isFinite(ms) ? ms : 0})`)));
         } else if (tag === '[object RegExp]') {
             const source = String(propDump(host, value, 'source') ?? '');
             const flags = String(propDump(host, value, 'flags') ?? '');
-            return pin(host, context.unwrapResult(realm.evalCode(`new RegExp(${JSON.stringify(source)}, ${JSON.stringify(flags)})`)));
+            return pin(host, context.unwrapResult(ctx.evalCode(`new RegExp(${JSON.stringify(source)}, ${JSON.stringify(flags)})`)));
         } else if (tag === '[object Error]') {
             /* An error is the one ordinary object a context shares with the caller in host Node --
                it is of the context's realm, so `instanceof Error` is false outside it -- and the
@@ -809,7 +999,7 @@ function rehomeInto(
         } else if (tag === '[object ArrayBuffer]') {
             const bytes = bytesOf(host, value);
             if (bytes === undefined) return value;
-            return pin(host, realm.newArrayBuffer(bytes.buffer as ArrayBuffer));
+            return pin(host, ctx.newArrayBuffer(bytes.buffer as ArrayBuffer));
         } else if (tag === '[object DataView]') {
             /* A `DataView` is a window on a buffer, and the buffer is the only part of it the caller
                could not otherwise reach, so the rebuild is a copy of those bytes under a view of the
@@ -817,14 +1007,14 @@ function rehomeInto(
                `instanceof DataView`, as it does on host Node 24.15. */
             const bytes = bytesOf(host, value);
             if (bytes === undefined) return value;
-            const built = realm.evalCode('(function (ab) { return new DataView(ab, 0); })');
+            const built = ctx.evalCode('(function (ab) { return new DataView(ab, 0); })');
             if (built.error) {
                 built.error.dispose();
                 return value;
             }
             const bridge = context.unwrapResult(built);
-            const buffer = realm.newArrayBuffer(bytes.buffer as ArrayBuffer);
-            const result = realm.callFunction(bridge, realm.undefined, [buffer]);
+            const buffer = ctx.newArrayBuffer(bytes.buffer as ArrayBuffer);
+            const result = ctx.callFunction(bridge, ctx.undefined, [buffer]);
             bridge.dispose();
             buffer.dispose();
             if (result.error) {
@@ -845,14 +1035,14 @@ function rehomeInto(
                 if (empty === undefined) return value;
                 return pin(host, empty);
             }
-            const built = realm.evalCode(`(function (ab) { return new ${name}(ab); })`);
+            const built = ctx.evalCode(`(function (ab) { return new ${name}(ab); })`);
             if (built.error) {
                 built.error.dispose();
                 return value;
             }
             const bridge = context.unwrapResult(built);
-            const buffer = realm.newArrayBuffer(bytes.buffer as ArrayBuffer);
-            const result = realm.callFunction(bridge, realm.undefined, [buffer]);
+            const buffer = ctx.newArrayBuffer(bytes.buffer as ArrayBuffer);
+            const result = ctx.callFunction(bridge, ctx.undefined, [buffer]);
             bridge.dispose();
             buffer.dispose();
             if (result.error) {
@@ -894,7 +1084,7 @@ function rehomeInto(
              * its second element). `kept` frees them once the whole rebuild is done instead.
              */
             kept.push(own);
-            realm.setProp(made, key, rehomeInto(host, realm, own, depth + 1, seen, twins, kept));
+            ctx.setProp(made, key, rehomeInto(host, realm, own, depth + 1, seen, twins, kept));
         }
     } catch {
         // a value whose own names cannot be read crosses as the empty shell it is so far
@@ -964,22 +1154,23 @@ const REALM_FUNCTION_WRAPPERS: Record<string, string> = {
     '[object AsyncGeneratorFunction]': '(function (f) { return async function* () { return yield* f.apply(this, arguments); }; })'
 };
 
-function fnOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle, tag: string): QuickJSHandle | undefined {
+function fnOf(host: VmHost, realm: VmRealm, value: QuickJSHandle, tag: string): QuickJSHandle | undefined {
+    const ctx = realm.ctx;
     const source = REALM_FUNCTION_WRAPPERS[tag] ?? REALM_FUNCTION_WRAPPERS['[object Function]'];
     try {
-        let built = realm.evalCode(source);
+        let built = ctx.evalCode(source);
         if (built.error) {
             /* An engine whose parser will not take the kind's own syntax still gets the plain
                wrapper rather than losing the function: a call reaches the body either way. */
             built.error.dispose();
-            built = realm.evalCode(REALM_FUNCTION_WRAPPERS['[object Function]']);
+            built = ctx.evalCode(REALM_FUNCTION_WRAPPERS['[object Function]']);
             if (built.error) {
                 built.error.dispose();
                 return undefined;
             }
         }
         const bridge = host.context.unwrapResult(built);
-        const result = realm.callFunction(bridge, realm.undefined, [value]);
+        const result = ctx.callFunction(bridge, ctx.undefined, [value]);
         bridge.dispose();
         if (result.error) {
             result.error.dispose();
@@ -996,9 +1187,10 @@ function fnOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle, tag: st
 }
 
 /** Gives the function `made` of the second realm the `name` and `length` of the function it wraps. */
-function dressAs(realm: QuickJSContext, made: QuickJSHandle, name: string, length: number): void {
+function dressAs(realm: VmRealm, made: QuickJSHandle, name: string, length: number): void {
+    const ctx = realm.ctx;
     try {
-        const built = realm.evalCode(
+        const built = ctx.evalCode(
             '(function (f, n, l) {' +
             'try { Object.defineProperty(f, "name", { value: n, configurable: true }); } catch (x) {}' +
             'try { Object.defineProperty(f, "length", { value: l, configurable: true }); } catch (x) {}' +
@@ -1008,10 +1200,10 @@ function dressAs(realm: QuickJSContext, made: QuickJSHandle, name: string, lengt
             built.error.dispose();
             return;
         }
-        const bridge = realm.unwrapResult(built);
-        const named = realm.newString(name);
-        const counted = realm.newNumber(length);
-        const result = realm.callFunction(bridge, realm.undefined, [made, named, counted]);
+        const bridge = ctx.unwrapResult(built);
+        const named = ctx.newString(name);
+        const counted = ctx.newNumber(length);
+        const result = ctx.callFunction(bridge, ctx.undefined, [made, named, counted]);
         named.dispose();
         counted.dispose();
         bridge.dispose();
@@ -1026,9 +1218,10 @@ function dressAs(realm: QuickJSContext, made: QuickJSHandle, name: string, lengt
  * Gives `made` a constructor named `name`, so a class instance out of a context keeps the name of its
  * class: an object of the second realm set under a fresh prototype whose constructor wears it.
  */
-function nameAfter(host: VmHost, realm: QuickJSContext, made: QuickJSHandle, name: string): void {
+function nameAfter(host: VmHost, realm: VmRealm, made: QuickJSHandle, name: string): void {
+    const ctx = realm.ctx;
     try {
-        const built = realm.evalCode(
+        const built = ctx.evalCode(
             '(function (o, n) {' +
             'var S = function () {};' +
             'try { Object.defineProperty(S, "name", { value: n, configurable: true }); } catch (x) {}' +
@@ -1041,8 +1234,8 @@ function nameAfter(host: VmHost, realm: QuickJSContext, made: QuickJSHandle, nam
             return;
         }
         const bridge = host.context.unwrapResult(built);
-        const named = realm.newString(name);
-        const result = realm.callFunction(bridge, realm.undefined, [made, named]);
+        const named = ctx.newString(name);
+        const result = ctx.callFunction(bridge, ctx.undefined, [made, named]);
         named.dispose();
         bridge.dispose();
         if (result.error) result.error.dispose();
@@ -1053,9 +1246,10 @@ function nameAfter(host: VmHost, realm: QuickJSContext, made: QuickJSHandle, nam
 }
 
 /** `new Map()` or `new Set()` of the second realm, or undefined when it cannot be built. */
-function emptyOf(host: VmHost, realm: QuickJSContext, name: string): QuickJSHandle | undefined {
+function emptyOf(host: VmHost, realm: VmRealm, name: string): QuickJSHandle | undefined {
+    const ctx = realm.ctx;
     try {
-        const built = realm.evalCode(`new ${name}()`);
+        const built = ctx.evalCode(`new ${name}()`);
         if (built.error) {
             built.error.dispose();
             return undefined;
@@ -1085,7 +1279,7 @@ function emptyOf(host: VmHost, realm: QuickJSContext, name: string): QuickJSHand
  */
 function fillEntries(
     host: VmHost,
-    realm: QuickJSContext,
+    realm: VmRealm,
     value: QuickJSHandle,
     made: QuickJSHandle,
     isMap: boolean,
@@ -1094,6 +1288,7 @@ function fillEntries(
     twins: QuickJSHandle[],
     kept: QuickJSHandle[]
 ): void {
+    const ctx = realm.ctx;
     const entries: QuickJSHandle[][] = [];
     let collect: QuickJSHandle | undefined;
     try {
@@ -1116,7 +1311,7 @@ function fillEntries(
             /* The entries are dups this walk owns and frees below, so they outlive the rebuild of
                the value each one names -- which is what lets `seen` keep them for a twin to come. */
             const into = entry.map((one) => rehomeInto(host, realm, one, depth + 1, seen, twins, kept));
-            const result = realm.callMethod(made, isMap ? 'set' : 'add', into);
+            const result = ctx.callMethod(made, isMap ? 'set' : 'add', into);
             if (result.error) result.error.dispose();
             else result.value.dispose();
         } catch {
@@ -1143,10 +1338,11 @@ function fillEntries(
  * reaction and carries a walk of its own: a `seen` kept from the earlier one would be compared
  * against handles this binding has already freed.
  */
-function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle {
+function promiseOf(host: VmHost, realm: VmRealm, value: QuickJSHandle): QuickJSHandle {
+    const ctx = realm.ctx;
     try {
-        if (host.rehomeFn === undefined) {
-            host.rehomeFn = host.context.newFunction('rehome', (settled) => {
+        if (realm.rehomeFn === undefined) {
+            realm.rehomeFn = host.context.newFunction('rehome', (settled) => {
                 const kept: QuickJSHandle[] = [];
                 try {
                     return rehomeInto(host, realm, settled, 1, [], [], kept);
@@ -1159,7 +1355,7 @@ function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): Q
                 }
             });
         }
-        const built = realm.evalCode(
+        const built = ctx.evalCode(
             /* A promise the context built with a subclass of `Promise` keeps the name of that
                subclass: `class P extends Promise {}` out of a context still answers `P` to
                `constructor.name` on host Node 24.15, and `false` to `instanceof Promise`. The second
@@ -1189,7 +1385,7 @@ function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): Q
         }
         const bridge = host.context.unwrapResult(built);
         const guestPromise = host.context.getProp(host.context.global, 'Promise');
-        const result = realm.callFunction(bridge, realm.undefined, [value, host.rehomeFn, guestPromise]);
+        const result = ctx.callFunction(bridge, ctx.undefined, [value, realm.rehomeFn!, guestPromise]);
         guestPromise.dispose();
         bridge.dispose();
         if (result.error) {
@@ -1213,7 +1409,8 @@ function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): Q
  */
 function ownKeysOf(host: VmHost, value: QuickJSHandle): (string | QuickJSHandle)[] {
     const keys: (string | QuickJSHandle)[] = [];
-    const result = host.context.callFunction(host.probes!.names, host.probes!.object, [value]);
+    const probes = probesOf(host);
+    const result = host.context.callFunction(probes.names, probes.object, [value]);
     if (result.error) {
         result.error.dispose();
     } else {
@@ -1235,7 +1432,8 @@ function symbolKeysOf(host: VmHost, value: QuickJSHandle): QuickJSHandle[] {
     const out: QuickJSHandle[] = [];
     const { context } = host;
     try {
-        const result = context.callFunction(host.probes!.symbols, host.probes!.object, [value]);
+        const probes = probesOf(host);
+        const result = context.callFunction(probes.symbols, probes.object, [value]);
         if (result.error) {
             result.error.dispose();
             return out;
@@ -1304,14 +1502,15 @@ const REALM_ERRORS = ['AggregateError', 'Error', 'EvalError', 'RangeError', 'Ref
  * the second realm's, which is the honest answer: the frames of the guest's own realm are the
  * container's, and no realm boundary makes them the host's.
  */
-function errorOf(host: VmHost, realm: QuickJSContext, name: string, ctor: string, message: string): QuickJSHandle | undefined {
+function errorOf(host: VmHost, realm: VmRealm, name: string, ctor: string, message: string): QuickJSHandle | undefined {
+    const ctx = realm.ctx;
     try {
         const kind = REALM_ERRORS.indexOf(name) >= 0 ? name : 'Error';
         /* `AggregateError` takes its errors first and its message second, so a message alone would
            be read as the iterable of errors: `new AggregateError('m')` came out with one error --
            the string's one character -- and an empty message. Its `errors` are copied by the walk. */
         const args = kind === 'AggregateError' ? `[], ${JSON.stringify(message)}` : JSON.stringify(message);
-        const built = realm.evalCode(
+        const built = ctx.evalCode(
             `(function () {` +
             `var n = ${JSON.stringify(name)};` +
             `var k = ${JSON.stringify(ctor)};` +
@@ -1407,54 +1606,72 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
     },
 
     /**
-     * Runs the code of a `vm` context inside the second realm, with the `with` scope the guest built
-     * around its sandbox, and leaves what it answered at `api.vmOut` -- or what it threw at
-     * `api.vmThrow` with `{ ok: false }`.
+     * Runs the code of a `vm` context as global code of that context's own realm, and leaves what
+     * it answered at `api.vmOut` -- or what it threw at `api.vmThrow` with `{ ok: false }`.
      *
-     * The code has to run there and not in the guest's own realm: see {@link REALM_EXEC_SRC}. The
-     * value comes back as it is, which is the whole point -- a value the context made is already of
-     * another realm, so `instanceof` reads false for it outside, and it is the very object the
-     * context made, so a value it hands back twice is one object.
+     * The sandbox goes onto the realm's global object before the run and back onto the sandbox
+     * after it, which is what makes the globals the code makes the sandbox's: see {@link syncIn}.
+     * The value comes back as it is, which is the whole point -- a value the context made is
+     * already of another realm, so `instanceof` reads false for it outside, and it is the very
+     * object the context made, so a value it hands back twice is one object.
+     *
+     * `filename` and `lineOffset` are the ones the `Script` or the options named, and the code is
+     * compiled under them: the frames of the error a script throws name the file and the line the
+     * host would, and QuickJS is given no line number of its own, so the offset is the newlines in
+     * front of the code instead.
      */
-    'vm.exec': (_args, ctx) => {
+    'vm.exec': (args, ctx) => {
         const host = hosts.get(ctx);
         if (!host) return { unbound: true };
         const { context } = host;
-        const realm = realmOf(host);
+        const realm = realmFor(host, realmIdOf(args));
         if (realm === undefined) return { unbound: true };
-        if (host.execFn === undefined) {
-            const built = realm.evalCode(REALM_EXEC_SRC);
-            if (built.error) {
-                built.error.dispose();
-                return { unbound: true };
-            }
-            host.execFn = realm.unwrapResult(built);
-        }
         const code = context.getProp(host.api, 'vmCode');
-        const scope = context.getProp(host.api, 'vmScope');
-        const fns = context.getProp(host.api, 'vmFns');
-        const sb = context.getProp(host.api, 'vmSb');
-        const self = context.getProp(host.api, 'vmSelf');
+        const sandbox = context.getProp(host.api, 'vmSb');
+        const view = context.getProp(host.api, 'vmG');
+        const cons = context.getProp(host.api, 'vmConsole');
         try {
-            const result = realm.callFunction(host.execFn, self, [scope, code, fns, sb]);
-            if (result.error) {
+            syncIn(host, realm, sandbox);
+            if (context.typeof(cons) === 'object') {
+                realm.ctx.setProp(realm.ctx.global, 'console', cons);
+                realm.injected.add('console');
+            }
+            const source = context.dump(code);
+            const offset = Number(args.lineOffset);
+            const pad = Number.isInteger(offset) && offset > 0 && offset < 65536 ? '\n'.repeat(offset) : '';
+            const file = typeof args.filename === 'string' && args.filename !== ''
+                ? args.filename : 'evalmachine.<anonymous>';
+            const built = realm.ctx.evalCode(pad + (typeof source === 'string' ? source : ''), file);
+            if (built.error) {
                 /* Whether the run was interrupted, which the guest cannot tell from the error alone:
                    QuickJS raises an interruption as an uncatchable InternalError, but this call is a
                    host boundary -- the throw the guest makes of what is handed back here is an
                    ordinary one its own catch blocks do see, so a vm.run deadline that stopped a
                    context would otherwise surface as that raw InternalError and not as the
                    ERR_SCRIPT_EXECUTION_TIMEOUT host Node 24.15 raises in the context's realm. */
-                context.setProp(host.api, 'vmThrow', result.error);
-                result.error.dispose();
-                return { ok: false, fired: host.fired };
+                const fired = host.fired;
+                context.setProp(host.api, 'vmThrow', built.error);
+                built.error.dispose();
+                syncOut(host, realm, sandbox);
+                return { ok: false, fired };
             }
-            context.setProp(host.api, 'vmOut', result.value);
-            result.value.dispose();
+            const out = built.value;
+            /* `globalThis` of a context is the sandbox's own view of it to the caller and not the
+               realm's global object: host Node 24.15 hands back the contextified global, and that
+               is one object however many runs hand it back. */
+            if (realm.ctx.eq(out, realm.ctx.global)) {
+                out.dispose();
+                context.setProp(host.api, 'vmOut', view.dup());
+            } else {
+                context.setProp(host.api, 'vmOut', out);
+                out.dispose();
+            }
+            syncOut(host, realm, sandbox);
             return { ok: true };
         } catch {
             return { unbound: true };
         } finally {
-            for (const handle of [code, scope, fns, sb, self]) {
+            for (const handle of [code, sandbox, view, cons]) {
                 try { handle.dispose(); } catch { /* already gone with its context */ }
             }
         }
@@ -1465,13 +1682,13 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
      * scope answers for: the code of a `vm` context runs in that realm, so the `Array` its `[]` is
      * an instance of has to be the realm's and not the caller's.
      */
-    'vm.es': (_args, ctx) => {
+    'vm.es': (args, ctx) => {
         const host = hosts.get(ctx);
         if (!host) return { unbound: true };
-        const realm = realmOf(host);
+        const realm = realmFor(host, realmIdOf(args));
         if (realm === undefined) return { unbound: true };
         try {
-            const built = realm.evalCode(
+            const built = realm.ctx.evalCode(
                 '(function (names) {' +
                 'var o = {};' +
                 'for (var i = 0; i < names.length; i++) {' +
@@ -1483,9 +1700,9 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
                 built.error.dispose();
                 return { unbound: true };
             }
-            const reader = realm.unwrapResult(built);
-            const names = realm.unwrapResult(realm.evalCode(JSON.stringify(REALM_ES_NAMES)));
-            const result = realm.callFunction(reader, realm.undefined, [names]);
+            const reader = realm.ctx.unwrapResult(built);
+            const names = realm.ctx.unwrapResult(realm.ctx.evalCode(JSON.stringify(REALM_ES_NAMES)));
+            const result = realm.ctx.callFunction(reader, realm.ctx.undefined, [names]);
             names.dispose();
             reader.dispose();
             if (result.error) {
@@ -1508,7 +1725,7 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
      * a live object. Nothing is written to `api.vmBack` when there is no binding, no second realm or
      * nothing to rebuild, and the guest keeps the value it had.
      */
-    'vm.realm': (_args, ctx) => {
+    'vm.realm': (args, ctx) => {
         const host = hosts.get(ctx);
         if (!host) return { unbound: true };
         const { context } = host;
@@ -1519,7 +1736,7 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
         let rebuilt: QuickJSHandle | undefined;
         try {
             if (context.typeof(value) !== 'object' && context.typeof(value) !== 'function') return { rebuilt: false };
-            const realm = realmOf(host);
+            const realm = realmFor(host, realmIdOf(args));
             if (realm === undefined) return { rebuilt: false };
             /* The whole value a run handed back: recognized before it is rebuilt, so a value the
                context has handed back before comes back as the one object it came back as then, the

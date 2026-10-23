@@ -1113,6 +1113,11 @@ re-run in isolation; the rows are open.
   and the url that was asked for, where a browser's own followed answer carries
   `url="https://httpbin.org/get" redirected=true type="cors"`. No guest code can read a 3xx out of a
   browser `fetch`, so this half is not reachable from here.
+- `owc-vm-script-cachedata`: `new vm.Script('1+1', { produceCachedData: true })` leaves both
+  `cachedDataProduced` and `cachedData` undefined, where host Node 24.15 answers `true` and a 336-byte
+  `Buffer`. Recorded rather than fixed: that cache is V8's own bytecode, and quickjs-emscripten 0.32
+  exposes no bytecode entry point on its module or on a context, so there is no cache to hand back --
+  bare QuickJS 0.32 with no container in the way carries neither property.
 - `owc-node-require-preload-dropped`: `node -r ./pre.js main.js` (and `--require ./pre.js`) reads the
   option, so `process.execArgv` and `process.argv` agree with the host, but the preload module is
   never run -- the host prints `preloaded` before `main`, the container prints `main` only.

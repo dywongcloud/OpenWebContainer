@@ -17,15 +17,16 @@
 export const SRC = String.raw`
 (function () {
   var ES_NAMES = Object.create(null);
-  var ES_LIST = ['AggregateError', 'Array', 'ArrayBuffer', 'Atomics', 'BigInt', 'BigInt64Array',
-    'BigUint64Array', 'Boolean', 'DataView', 'Date', 'Error', 'EvalError', 'FinalizationRegistry',
-    'Float32Array', 'Float64Array', 'Function', 'Infinity', 'Int8Array', 'Int16Array', 'Int32Array',
-    'Intl', 'JSON', 'Map', 'Math', 'NaN', 'Number', 'Object', 'Promise', 'Proxy', 'RangeError',
-    'ReferenceError', 'Reflect', 'RegExp', 'Set', 'SharedArrayBuffer', 'String', 'Symbol',
+  var ES_LIST = ['AggregateError', 'Array', 'ArrayBuffer', 'AsyncDisposableStack', 'Atomics',
+    'BigInt', 'BigInt64Array', 'BigUint64Array', 'Boolean', 'DataView', 'Date', 'DisposableStack',
+    'Error', 'EvalError', 'FinalizationRegistry', 'Float16Array', 'Float32Array', 'Float64Array',
+    'Function', 'Infinity', 'Int8Array', 'Int16Array', 'Int32Array', 'Intl', 'Iterator', 'JSON',
+    'Map', 'Math', 'NaN', 'Number', 'Object', 'Promise', 'Proxy', 'RangeError', 'ReferenceError',
+    'Reflect', 'RegExp', 'Set', 'SharedArrayBuffer', 'String', 'SuppressedError', 'Symbol',
     'SyntaxError', 'TypeError', 'Uint8Array', 'Uint8ClampedArray', 'Uint16Array', 'Uint32Array',
-    'URIError', 'WeakMap', 'WeakRef', 'WeakSet', 'decodeURI', 'decodeURIComponent', 'encodeURI',
-    'encodeURIComponent', 'escape', 'eval', 'isFinite', 'isNaN', 'parseFloat', 'parseInt',
-    'undefined', 'unescape'];
+    'URIError', 'WeakMap', 'WeakRef', 'WeakSet', 'WebAssembly', 'decodeURI', 'decodeURIComponent',
+    'encodeURI', 'encodeURIComponent', 'escape', 'eval', 'isFinite', 'isNaN', 'parseFloat',
+    'parseInt', 'undefined', 'unescape'];
   for (var esi = 0; esi < ES_LIST.length; esi++) ES_NAMES[ES_LIST[esi]] = true;
 
   var vmRecords = new WeakMap();
@@ -353,27 +354,23 @@ export const SRC = String.raw`
     return c;
   }
 
-  /* The ES globals the code of a vm context sees: the second realm's, not this one's.
-     The code runs there -- see vmEval -- so a name it reads and the object a literal of the same
-     name makes have to be one realm's: [] instanceof Array is true inside a context on host node
-     24.15, as it is here, while e instanceof Array for an array the caller put in is false there,
-     which only a second realm can give. The names are read out of that realm once. */
-  var esRealm = null;
-
-  function realmEs(key) {
-    if (esRealm === null) {
-      esRealm = false;
+  /* The ES globals the code of a vm context sees: that context's own realm's, not this one's, and
+     not another context's: every context is a realm of its own, so the names are read out of the
+     realm of the one asking, once each. */
+  function realmEs(rec, key) {
+    if (rec.es === null) {
+      rec.es = false;
       try {
-        callCap('vm.es', {});
-        if (api.vmEs !== undefined && api.vmEs !== null) esRealm = api.vmEs;
+        callCap('vm.es', { id: rec.id });
+        if (api.vmEs !== undefined && api.vmEs !== null) rec.es = api.vmEs;
         api.vmEs = undefined;
       } catch (esErr) {
-        esRealm = false;
+        rec.es = false;
       }
     }
-    if (esRealm === false) return undefined;
+    if (rec.es === false) return undefined;
     try {
-      return esRealm[key];
+      return rec.es[key];
     } catch (esErr) {
       return undefined;
     }
@@ -383,14 +380,16 @@ export const SRC = String.raw`
     if (key === 'globalThis') return rec.G;
     if (key === 'console') return rec.console;
     if (ES_NAMES[key] === true) {
-      var es = realmEs(key);
+      var es = realmEs(rec, key);
       return es === undefined ? globalThis[key] : es;
     }
     return undefined;
   }
 
+  var vmSeq = 0;
+
   function makeRecord(sb) {
-    var rec = { sb: sb, console: silentConsole(), G: null };
+    var rec = { sb: sb, console: silentConsole(), G: null, id: ++vmSeq, es: null };
     rec.G = new Proxy(sb, {
       get: function (target, key) {
         if (typeof key !== 'string' || (key in target)) return target[key];
@@ -419,7 +418,7 @@ export const SRC = String.raw`
         /* The ReferenceError a context raises for a name it does not know is one of the context's
            own realm, as every error host Node 24.15 raises inside one is: outside it, an error out
            of a context answers false to instanceof ReferenceError and to instanceof Error both. */
-        var Ref = realmEs('ReferenceError');
+        var Ref = realmEs(rec, 'ReferenceError');
         throw new (typeof Ref === 'function' ? Ref : ReferenceError)(key + ' is not defined');
       },
       set: function (target, key, value) {
@@ -437,27 +436,26 @@ export const SRC = String.raw`
      the realm reaches the guest as an ordinary throw and not as the uncatchable error it is. */
   var vmFired = false;
 
-  /* The code of a context, run in the second realm through its own copy of this wrapper's body --
-     the host's, compiled there. Everything a context makes is then of that realm as it is made, and
-     comes back as it is, which is what a rebuild of it could only approximate. NO_REALM means no
-     second realm could be made, and the run falls back to this one. */
-  function vmEval(code, scope, fns, sb, self) {
+  /* The code of a context, compiled and run as global code of that context's own realm: the host
+     syncs the sandbox onto the realm's global object first and back onto the sandbox afterwards, so
+     everything the code makes is of that realm as it is made and comes back as it is, which is what
+     a rebuild of it could only approximate. NO_REALM means no realm could be made for the context,
+     and the run falls back to this one, under a with scope instead. */
+  function vmEval(rec, code, file, offset, frames) {
     api.vmCode = code;
-    api.vmScope = scope;
-    api.vmFns = fns;
-    api.vmSb = sb;
-    api.vmSelf = self;
+    api.vmSb = rec.sb;
+    api.vmG = rec.G;
+    api.vmConsole = rec.console;
     api.vmOut = undefined;
     api.vmThrow = undefined;
     var res;
     try {
-      res = callCap('vm.exec', {});
+      res = callCap('vm.exec', { id: rec.id, filename: file, lineOffset: offset });
     } finally {
       api.vmCode = undefined;
-      api.vmScope = undefined;
-      api.vmFns = undefined;
       api.vmSb = undefined;
-      api.vmSelf = undefined;
+      api.vmG = undefined;
+      api.vmConsole = undefined;
     }
     if (res.unbound) return NO_REALM;
     var out = api.vmOut;
@@ -466,13 +464,52 @@ export const SRC = String.raw`
     api.vmOut = undefined;
     api.vmThrow = undefined;
     if (res.ok) return out;
-    throw thrown;
+    throw vmDress(thrown, code, file, offset === undefined ? 0 : offset, frames);
+  }
+
+  /* The frames host Node 24.15 puts under the frame of a script a context ran: its own vm entry
+     point, and nothing of the caller's, which no context can know. */
+  var VM_FRAMES = {
+    runInContext: ['    at Script.runInContext (node:vm:149:12)',
+      '    at Object.runInContext (node:vm:301:6)'],
+    runInNewContext: ['    at Script.runInContext (node:vm:149:12)',
+      '    at Script.runInNewContext (node:vm:154:17)',
+      '    at Object.runInNewContext (node:vm:310:38)'],
+    script: ['    at Script.runInContext (node:vm:149:12)'],
+    scriptNew: ['    at Script.runInContext (node:vm:149:12)',
+      '    at Script.runInNewContext (node:vm:154:17)']
+  };
+
+  /* The stack a script of a context carries out with it, as host Node 24.15 writes one: the file
+     and the line, the line of the source, a caret, and the error under it. A script is compiled
+     under the filename it was given, so the line is the one the host would name -- and this engine
+     names an identifier it does not know with quotes round it, where node does not. */
+  function vmDress(err, code, file, offset, frames) {
+    if (!isObjectLike(err)) return err;
+    try {
+      if (err.name === 'ReferenceError' && typeof err.message === 'string') {
+        var quoted = /^'([^']*)' is not defined$/.exec(err.message);
+        if (quoted !== null) err.message = quoted[1] + ' is not defined';
+      }
+    } catch (dressErr) { /* an error that will not be dressed still crosses as itself */ }
+    try {
+      var at = /:(\d+):(\d+)/.exec(String(err.stack === undefined || err.stack === null ? '' : err.stack));
+      var line = at === null ? 1 : Number(at[1]);
+      var col = at === null ? 1 : Number(at[2]);
+      var shown = String(code).split('\n')[line - 1 - offset];
+      if (shown === undefined) shown = '';
+      var name = err.name === undefined || err.name === null ? 'Error' : String(err.name);
+      var stack = file + ':' + line + '\n' + shown + '\n^\n\n' + name
+        + (err.message ? ': ' + err.message : '')
+        + '\n    at ' + file + ':' + line + ':' + col
+        + (frames === null || frames === undefined ? '' : '\n' + frames.join('\n'));
+      Object.defineProperty(err, 'stack', { value: stack, writable: true, configurable: true });
+    } catch (dressErr) { /* as above */ }
+    return err;
   }
 
   function runWrapped(__owcVmWith, __owcVmCode, __owcVmFns, __owcVmSb) {
     var __owcVmOut;
-    var __owcVmIn = vmEval(__owcVmCode, __owcVmWith, __owcVmFns, __owcVmSb, this);
-    if (__owcVmIn !== NO_REALM) return __owcVmIn;
     try {
       with (__owcVmWith) {
         __owcVmOut = eval(__owcVmCode);
@@ -490,8 +527,16 @@ export const SRC = String.raw`
     return __owcVmOut;
   }
 
-  function runInRecord(rec, code) {
+  function runInRecord(rec, code, file, offset, frames) {
     var src = vmCode(code);
+    /* The code runs in the context's own realm, so what it answers -- and what it throws -- is
+       already of another realm: an error out of one is no more an Error of the caller than an array
+       is. The one error a context has no hand in is the ERR_SCRIPT_EXECUTION_TIMEOUT of a timeout,
+       which is raised here and rehomed on its way out like any other value this realm built. */
+    var out = vmEval(rec, src, file === undefined ? 'evalmachine.<anonymous>' : file, offset, frames);
+    if (out !== NO_REALM) return out;
+    /* No realm for this context: the code runs in this one, under a with scope over the sandbox,
+       and loses the top-level bindings a realm would keep for it. */
     var fns = topLevelFunctionNames(src);
     var fnSet = Object.create(null);
     for (var i = 0; i < fns.length; i++) {
@@ -500,10 +545,6 @@ export const SRC = String.raw`
     }
     var decl = declaredNames(src);
     var scope = new Proxy(rec.sb, withHandler(rec, fnSet, decl));
-    /* The code runs in the second realm, so what it answers -- and what it throws -- is already of
-       another realm: an error out of one is no more an Error of the caller than an array is. The
-       one error a context has no hand in is the ERR_SCRIPT_EXECUTION_TIMEOUT of a timeout, which is
-       raised here and rehomed on its way out like any other value this realm built. */
     return runWrapped.call(rec.G, scope, rewriteTypeof(src), fns, rec.sb);
   }
 
@@ -540,7 +581,7 @@ export const SRC = String.raw`
     api.vmValue = out;
     var back;
     try {
-      callCap('vm.realm', {});
+      callCap('vm.realm', { id: rec.id });
       back = api.vmBack;
     } catch (e) {
       back = undefined;
@@ -878,6 +919,16 @@ export const SRC = String.raw`
       if (typeof code !== 'string') throw argError('code', 'of type string', code);
       new Function(code);
       Object.defineProperty(this, '_owcCode', { value: code });
+      /* The filename and the line offset a script is compiled under: host Node 24.15 compiles it
+         with them, so the frames of the error it throws name them, and a run of the script answers
+         to them unless the options of that run name their own. */
+      var held = options === null || typeof options !== 'object' ? {} : options;
+      Object.defineProperty(this, '_owcFile', {
+        value: typeof held.filename === 'string' ? held.filename : undefined
+      });
+      Object.defineProperty(this, '_owcOffset', {
+        value: typeof held.lineOffset === 'number' && held.lineOffset >= 0 ? held.lineOffset : 0
+      });
     }
     // A timeout option hands the evaluation to the host as a thunk (vm.run), which arms the deadline
     // around the call. QuickJS raises the interruption as an uncatchable error, so the host catches
@@ -934,15 +985,22 @@ export const SRC = String.raw`
       return vmGuarded(options, function () { return (0, eval)(code); });
     };
     Script.prototype.runInContext = function (contextifiedObject, options) {
-      var rec = recordOf(contextifiedObject);
-      var code = this._owcCode;
-      return vmGuarded(options, function () { return runInRecord(rec, code); }, rec);
+      return runScript(this, recordOf(contextifiedObject), options, VM_FRAMES.script);
     };
     Script.prototype.runInNewContext = function (contextObject, options) {
-      var rec = recordOf(createContextObject(contextObject));
-      var code = this._owcCode;
-      return vmGuarded(options, function () { return runInRecord(rec, code); }, rec);
+      return runScript(this, recordOf(createContextObject(contextObject)), options, VM_FRAMES.scriptNew);
     };
+
+    /* One run of a script in a context: the file and the offset the options name win over the ones
+       the script was compiled with, as they do on host Node 24.15. */
+    function runScript(script, rec, options, frames) {
+      var code = script._owcCode;
+      var file = options !== null && typeof options === 'object' && typeof options.filename === 'string'
+        ? options.filename : script._owcFile;
+      var offset = options !== null && typeof options === 'object' && typeof options.lineOffset === 'number'
+        ? options.lineOffset : script._owcOffset;
+      return vmGuarded(options, function () { return runInRecord(rec, code, file, offset, frames); }, rec);
+    }
     Script.prototype.createCachedData = function () {
       return typeof Buffer !== 'undefined' ? Buffer.alloc(0) : new Uint8Array(0);
     };
@@ -956,7 +1014,7 @@ export const SRC = String.raw`
       }
       if (options && options.parsingContext !== undefined) {
         return runInRecord(recordOf(options.parsingContext),
-          '(function (' + list.join(', ') + ') {\n' + code + '\n})');
+          '(function (' + list.join(', ') + ') {\n' + code + '\n})', undefined, 0, null);
       }
       return Function.apply(null, list.concat([code]));
     }
@@ -990,13 +1048,25 @@ export const SRC = String.raw`
          context object is an ERR_INVALID_ARG_TYPE there even when the code is bad syntax too. */
       runInContext: function (code, contextifiedObject, options) {
         var rec = recordOf(contextifiedObject);
-        return scriptFor(rec, code).runInContext(contextifiedObject, options);
+        return runScript(scriptFor(rec, code), rec, options, VM_FRAMES.runInContext);
       },
       runInNewContext: function (code, sandbox, options) {
         var rec = recordOf(createContextObject(sandbox));
-        return scriptFor(rec, code).runInContext(rec.sb, options);
+        return runScript(scriptFor(rec, code), rec, options, VM_FRAMES.runInNewContext);
       },
       compileFunction: compileFunction,
+      measureMemory: function () {
+        /* An experimental host API: what node answers is the heap of the isolate it measured, and
+           this container has no isolate of its own to measure, so the numbers are the ones the
+           process reports for itself and the shape is node's. */
+        var used = 0;
+        try {
+          var mu = typeof process === 'object' && process !== null && typeof process.memoryUsage === 'function'
+            ? process.memoryUsage() : null;
+          if (mu !== null && typeof mu.heapUsed === 'number') used = mu.heapUsed;
+        } catch (memErr) { used = 0; }
+        return Promise.resolve({ total: { jsHeapSizeUsed: used, jsHeapSizeTotal: used, physicalSize: used } });
+      },
       constants: {
         USE_MAIN_CONTEXT_DEFAULT_LOADER: Symbol('vm_dynamic_import_main_context_default'),
         DONT_CONTEXTIFY: Symbol('vm_context_no_contextify')
