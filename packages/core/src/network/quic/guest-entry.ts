@@ -316,6 +316,10 @@ function connect(options: ClientOptions): QuicConnection & { endpoint: QuicEndpo
     connection.endpoint = endpoint;
     Object.defineProperty(connection, 'localPort', { get: () => socket.address().port, enumerable: true });
     endpoint.on('connectionClosed', () => endpoint.close());
+    /* A send that fails after the arguments are accepted (a name the socket's family cannot reach,
+       for one) arrives here as a socket 'error'; listen() forwards the same event, and without a
+       listener of its own it would be an uncaught exception and would take the process down. */
+    socket.on('error', (error: unknown) => connection.emit('error', error));
     return connection;
 }
 
