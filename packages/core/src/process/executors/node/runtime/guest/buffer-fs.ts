@@ -749,12 +749,67 @@ BF.buffer = function () {
     return true;
   }
 
+  /* Node's atob and btoa: the web pair, over the base64 a Buffer already reads and writes. btoa
+     takes a string of single bytes and atob hands one back, so a character above U+00FF is refused
+     here as it is there, and so is a text that is not base64 at all. */
+  function b64Error() {
+    var err = new Error('Invalid character');
+    err.name = 'InvalidCharacterError';
+    err.code = 5;
+    return err;
+  }
+
+  function atobOf(input) {
+    /* Node drops ASCII whitespace from the text before it reads it, as the web pair does. */
+    var text = String(input).replace(/[\t\n\f\r ]/g, '');
+    var body = text.replace(/=+$/, '');
+    if (text.length % 4 !== 0 || text.length - body.length > 2 || /[^A-Za-z0-9+/]/.test(body)) throw b64Error();
+    return Buffer.from(text, 'base64').toString('latin1');
+  }
+
+  function btoaOf(input) {
+    var text = String(input);
+    for (var i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) > 0xff) throw b64Error();
+    }
+    return Buffer.from(text, 'latin1').toString('base64');
+  }
+
+  /* Node's File: a Blob with the two fields that make one the value of a form field. */
+  var kFileName = Symbol('owcFileName');
+  var kFileModified = Symbol('owcFileLastModified');
+
+  class File extends Blob {
+    constructor(sources, fileName, options) {
+      super(sources, options);
+      this[kFileName] = String(fileName);
+      var at = options === undefined || options === null ? undefined : options.lastModified;
+      this[kFileModified] = typeof at === 'number' && isFinite(at) ? Math.trunc(at) : Date.now();
+    }
+    get name() {
+      return this[kFileName];
+    }
+    get lastModified() {
+      return this[kFileModified];
+    }
+  }
+  Object.defineProperty(File.prototype, Symbol.toStringTag, { value: 'File', configurable: true });
+
   return {
     Buffer: Buffer,
     kMaxLength: MAX_BUFFER_LENGTH,
     kStringMaxLength: MAX_STRING_LENGTH,
     constants: { MAX_LENGTH: MAX_BUFFER_LENGTH, MAX_STRING_LENGTH: MAX_STRING_LENGTH },
     Blob: Blob,
+    File: File,
+    /* How much of a Buffer inspect shows before it writes an ellipsis, as on the host. */
+    INSPECT_MAX_BYTES: 50,
+    atob: atobOf,
+    btoa: btoaOf,
+    /* The one half of the blob URL store Node keeps: a URL this container never registers, so
+       there is nothing for it to resolve, which is what Node answers for one of those too. */
+    resolveObjectURL: function () { return undefined; },
+    SlowBuffer: function (length) { return Buffer.alloc(Number(length) || 0); },
     transcode: transcode,
     isUtf8: isUtf8,
     isAscii: isAscii
@@ -906,9 +961,31 @@ BF.fs = function () {
   }
 
   /* Node exports fs.Stats, and packages test a stat with instanceof fs.Stats, so a stat is an
-     instance of it; every field still sits on the instance, exactly as it did before. */
+     instance of it. Its own properties are the fourteen numeric fields alone, as on host Node
+     24.15: the four dates are getters on fs.Stats.prototype above it, and the seven kind tests on
+     a prototype above that, so Object.getOwnPropertyNames(fs.statSync(p)) names no date and no
+     test. The type the store recorded travels as a symbol, which no own-name list carries, because
+     a mode with no format in it still has to fall back to it. */
+  var kStatsType = Symbol('owcStatsType');
+  var kStatsLink = Symbol('owcStatsLink');
+
   function Stats() {}
   Object.defineProperty(Stats.prototype, Symbol.toStringTag, { value: 'Stats', configurable: true });
+
+  var STATS_DATES = ['atime', 'mtime', 'ctime', 'birthtime'];
+  for (var sd = 0; sd < STATS_DATES.length; sd++) {
+    Object.defineProperty(Stats.prototype, STATS_DATES[sd], {
+      configurable: true,
+      enumerable: true,
+      get: (function (name) {
+        return function () { return new Date(Number(this[name + 'Ms'])); };
+      })(STATS_DATES[sd])
+    });
+  }
+  /* Node's own helper, which is on fs.Stats.prototype on the host too. */
+  Stats.prototype._checkModeProperty = function (property) {
+    return (Number(this.mode) & S_IFMT) === property;
+  };
 
   /* The bits of st_mode that say what a path is, and the value each kind leaves in them. A mode the
      file system already carries is the authority -- it is what makes a character device a device and
@@ -922,15 +999,37 @@ BF.fs = function () {
   var S_IFIFO = 4096;
   var S_IFSOCK = 49152;
 
+  /* The seven kind tests, on the prototype above fs.Stats.prototype as they are on the host: a mode
+     with a format in it is the authority, and one without falls back to the type the store carries.
+     A link is the exception Node makes too -- lstat of one answers isFile() and isDirectory() false
+     and isSymbolicLink() true however many bits its mode carries, so the flag lstat was made with
+     travels with the stat as a symbol. */
+  function statsKind(bit, type, falseForLink) {
+    return function () {
+      if (falseForLink === true && this[kStatsLink] === true) return false;
+      var format = Number(this.mode) & S_IFMT;
+      return format === 0 ? this[kStatsType] === type : format === bit;
+    };
+  }
+
+  var statsKinds = {
+    isDirectory: statsKind(S_IFDIR, 'dir', true),
+    isFile: statsKind(S_IFREG, 'file', true),
+    isBlockDevice: statsKind(S_IFBLK, 'blk', false),
+    isCharacterDevice: statsKind(S_IFCHR, 'chr', false),
+    isSymbolicLink: function () {
+      return this[kStatsLink] === true || (Number(this.mode) & S_IFMT) === S_IFLNK;
+    },
+    isFIFO: statsKind(S_IFIFO, 'fifo', false),
+    isSocket: statsKind(S_IFSOCK, 'sock', false)
+  };
+  Object.setPrototypeOf(Stats.prototype, statsKinds);
+
   function makeStats(st, opts, isLink) {
     var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
     // With bigint every numeric field is a BigInt; the four date fields stay Date objects.
     var num = bigint ? function (value) { return BigInt(value); } : function (value) { return value; };
-    var mtime = new Date(st.mtimeMs);
     var mode = st.mode !== undefined ? st.mode : (st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188));
-    var format = Number(mode) & S_IFMT;
-    /* The kind a mode says, or -- with no format in it -- the one the store recorded. */
-    var kindOf = function (bit, type) { return format === 0 ? st.type === type : format === bit; };
     var out = {
       dev: num(0),
       mode: num(mode),
@@ -945,19 +1044,10 @@ BF.fs = function () {
       atimeMs: num(st.mtimeMs),
       mtimeMs: num(st.mtimeMs),
       ctimeMs: num(st.mtimeMs),
-      birthtimeMs: num(st.mtimeMs),
-      atime: mtime,
-      mtime: mtime,
-      ctime: mtime,
-      birthtime: mtime,
-      isFile: function () { return !isLink && kindOf(S_IFREG, 'file'); },
-      isDirectory: function () { return !isLink && kindOf(S_IFDIR, 'dir'); },
-      isSymbolicLink: function () { return !!isLink; },
-      isBlockDevice: function () { return format === S_IFBLK; },
-      isCharacterDevice: function () { return format === S_IFCHR; },
-      isFIFO: function () { return format === S_IFIFO; },
-      isSocket: function () { return format === S_IFSOCK; }
+      birthtimeMs: num(st.mtimeMs)
     };
+    out[kStatsType] = st.type;
+    out[kStatsLink] = isLink === true;
     Object.setPrototypeOf(out, Stats.prototype);
     return out;
   }
@@ -967,7 +1057,6 @@ BF.fs = function () {
   function Dirent(name, parentPath, type) {
     this.name = name;
     this.parentPath = parentPath;
-    this.path = parentPath;
     this[kDirentType] = type;
   }
   Dirent.prototype.isFile = function () { return this[kDirentType] === 'file'; };
@@ -1726,7 +1815,61 @@ BF.fs = function () {
     if (!statOf(file)) throw fsError('ENOENT', 'chown', file);
   };
 
+  /* The five calls Node has beside utimes, chown and chmod for the two targets those do not reach:
+     a link instead of what it points at, and a descriptor instead of a path. This file system keeps
+     no owner of its own, so a chown is the existence check Node makes, and a mode there is no host
+     to write through to is kept as chmodSync keeps it. The sweep below gives each its callback and
+     promise form, as it does for every other name here that ends in Sync. */
+  fs.lutimesSync = function (p, atime, mtime) {
+    var file = toPathString(p);
+    if (!statOf(file)) throw fsError('ENOENT', 'lutime', file);
+    MTIMES[file] = timeToMs(mtime);
+  };
+
+  fs.futimesSync = function (fd, atime, mtime) {
+    var rec = descriptorOf(fd, 'futime');
+    if (!statOf(rec.path)) throw fsError('ENOENT', 'futime', rec.path);
+    MTIMES[rec.path] = timeToMs(mtime);
+  };
+
+  fs.fchownSync = function (fd, uid, gid) {
+    var rec = descriptorOf(fd, 'fchown');
+    if (!statOf(rec.path)) throw fsError('ENOENT', 'fchown', rec.path);
+  };
+
+  fs.lchownSync = function (p, uid, gid) {
+    var file = toPathString(p);
+    if (!statOf(file)) throw fsError('ENOENT', 'lchown', file);
+  };
+
+  fs.lchmodSync = function (p, mode) {
+    var file = toPathString(p);
+    if (!setModeOf(file, mode, 'lchmod')) throw fsError('ENOENT', 'open', file);
+  };
+
   /* read streams read the file once and push it in highWaterMark-sized chunks; write streams append each chunk */
+
+  /* Node exports the classes createReadStream and createWriteStream answer with, and the two names
+     they carried before, so a stream is an instance of all four. The prototype waits for the first
+     stream, because the stream built-in is not loaded when this module is. */
+  function ReadStream() {}
+  function WriteStream() {}
+  var readStreamProto = false;
+  var writeStreamProto = false;
+
+  function streamProtoOf(Ctor, Base, ready) {
+    if (ready !== true) {
+      Ctor.prototype = Object.create(Base.prototype);
+      Ctor.prototype.constructor = Ctor;
+    }
+    return Ctor.prototype;
+  }
+
+  fs.ReadStream = ReadStream;
+  fs.FileReadStream = ReadStream;
+  fs.WriteStream = WriteStream;
+  fs.FileWriteStream = WriteStream;
+
   fs.createReadStream = function (p, opts) {
     var Readable = requireBuiltin('stream').Readable;
     var Buf = requireBuiltin('buffer').Buffer;
@@ -1786,6 +1929,8 @@ BF.fs = function () {
       stream.emit('open', 3);
       stream.emit('ready');
     });
+    Object.setPrototypeOf(stream, streamProtoOf(ReadStream, Readable, readStreamProto));
+    readStreamProto = true;
     return stream;
   };
 
@@ -1814,6 +1959,8 @@ BF.fs = function () {
     });
     stream.path = file;
     stream.bytesWritten = 0;
+    Object.setPrototypeOf(stream, streamProtoOf(WriteStream, Writable, writeStreamProto));
+    writeStreamProto = true;
     return stream;
   };
 
@@ -1942,10 +2089,12 @@ BF.fs = function () {
 
   // Node's fs.constants on the reference platform, so flag and mode values match exactly.
   fs.constants = {"UV_FS_SYMLINK_DIR":1,"UV_FS_SYMLINK_JUNCTION":2,"O_RDONLY":0,"O_WRONLY":1,"O_RDWR":2,"UV_DIRENT_UNKNOWN":0,"UV_DIRENT_FILE":1,"UV_DIRENT_DIR":2,"UV_DIRENT_LINK":3,"UV_DIRENT_FIFO":4,"UV_DIRENT_SOCKET":5,"UV_DIRENT_CHAR":6,"UV_DIRENT_BLOCK":7,"S_IFMT":61440,"S_IFREG":32768,"S_IFDIR":16384,"S_IFCHR":8192,"S_IFBLK":24576,"S_IFIFO":4096,"S_IFLNK":40960,"S_IFSOCK":49152,"O_CREAT":512,"O_EXCL":2048,"UV_FS_O_FILEMAP":0,"O_NOCTTY":131072,"O_TRUNC":1024,"O_APPEND":8,"O_DIRECTORY":1048576,"O_NOFOLLOW":256,"O_SYNC":128,"O_DSYNC":4194304,"O_SYMLINK":2097152,"O_NONBLOCK":4,"S_IRWXU":448,"S_IRUSR":256,"S_IWUSR":128,"S_IXUSR":64,"S_IRWXG":56,"S_IRGRP":32,"S_IWGRP":16,"S_IXGRP":8,"S_IRWXO":7,"S_IROTH":4,"S_IWOTH":2,"S_IXOTH":1,"F_OK":0,"R_OK":4,"W_OK":2,"X_OK":1,"UV_FS_COPYFILE_EXCL":1,"COPYFILE_EXCL":1,"UV_FS_COPYFILE_FICLONE":2,"COPYFILE_FICLONE":2,"UV_FS_COPYFILE_FICLONE_FORCE":4,"COPYFILE_FICLONE_FORCE":4};
-  fs.F_OK = 0;
-  fs.R_OK = 4;
-  fs.W_OK = 2;
-  fs.X_OK = 1;
+  /* The four access-mode constants Node keeps on fs itself as well as in fs.constants: readable
+     there, but not among the names Object.keys(fs) answers, which they are not on the host either. */
+  Object.defineProperty(fs, 'F_OK', { value: 0, enumerable: false, configurable: false });
+  Object.defineProperty(fs, 'R_OK', { value: 4, enumerable: false, configurable: false });
+  Object.defineProperty(fs, 'W_OK', { value: 2, enumerable: false, configurable: false });
+  Object.defineProperty(fs, 'X_OK', { value: 1, enumerable: false, configurable: false });
 
   /*
    * What statfs reports about the file system a path sits on, in the seven numbers Node's own give:
@@ -2186,6 +2335,29 @@ BF.fs = function () {
   fs.exists = function (p, cb) {
     var found = fs.existsSync(p);
     queueMicrotask(function () { cb(found); });
+  };
+
+  /* Node's mkdtempDisposableSync: the same directory mkdtempSync makes, in an object a caller can
+     leave a using declaration to close, so the block's end removes it and everything under it. Added after the
+     sweep so no callback or promise form is generated for it -- Node has none. */
+  fs.mkdtempDisposableSync = function (prefix, options) {
+    var dir = fs.mkdtempSync(prefix, options);
+    var disposable = {
+      path: dir,
+      remove: function () { fs.rmSync(dir, { recursive: true, force: true }); }
+    };
+    disposable[Symbol.dispose] = function () { disposable.remove(); };
+    return disposable;
+  };
+
+  /* Node's own time conversion, which it exports beside the calls it feeds: a Date or a number of
+     seconds to a Unix timestamp, and a type error for anything else. */
+  fs._toUnixTimestamp = function (time, name) {
+    if (!(time instanceof Date) && typeof time !== 'number') {
+      throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "time" argument must be an instance of Date or an Time in seconds. Received ' + describeFsArg(time));
+    }
+    return Math.floor(timeToMs(time) / 1000);
   };
   /*
    * fs.write by descriptor. The file system here is path based and has no descriptors, except for

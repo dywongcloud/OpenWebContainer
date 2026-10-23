@@ -387,6 +387,99 @@ for (const bits of [128, 192, 256]) {
 addCipher('chacha20', { mode: 'cc20', keyLength: 32, blockSize: 1, ivLength: 16, aead: false });
 addCipher('chacha20-poly1305', { mode: 'cc20p', keyLength: 32, blockSize: 1, ivLength: 12, aead: true });
 
+/** What Node 24.15's getCipherInfo answers for each name here: nid, mode, the name OpenSSL spells,
+ *  blockSize and ivLength, with 0 where the answer carries none. keyLength is the spec's own. */
+const CIPHER_INFO: Record<string, [number, string, string, number, number]> = {
+    'aes-128-ecb': [418, 'ecb', 'aes-128-ecb', 16, 0],
+    'aes-128-cbc': [419, 'cbc', 'aes-128-cbc', 16, 16],
+    'aes-128-ctr': [904, 'ctr', 'aes-128-ctr', 1, 16],
+    'aes-128-cfb': [421, 'cfb', 'aes-128-cfb', 1, 16],
+    'aes-128-cfb8': [653, 'cfb', 'aes-128-cfb8', 1, 16],
+    'aes-128-cfb1': [650, 'cfb', 'aes-128-cfb1', 1, 16],
+    'aes-128-ofb': [420, 'ofb', 'aes-128-ofb', 1, 16],
+    'aes-128-gcm': [895, 'gcm', 'id-aes128-gcm', 1, 12],
+    'aes-128-ccm': [896, 'ccm', 'id-aes128-ccm', 1, 12],
+    'aes-128-ocb': [958, 'ocb', 'aes-128-ocb', 16, 12],
+    'aes-128-xts': [913, 'xts', 'aes-128-xts', 1, 16],
+    'aes128': [419, 'cbc', 'aes-128-cbc', 16, 16],
+    'id-aes128-gcm': [895, 'gcm', 'id-aes128-gcm', 1, 12],
+    'id-aes128-ccm': [896, 'ccm', 'id-aes128-ccm', 1, 12],
+    'aes128-wrap': [788, 'wrap', 'id-aes128-wrap', 8, 8],
+    'aes128-wrap-pad': [897, 'wrap', 'id-aes128-wrap-pad', 8, 4],
+    'id-aes128-wrap': [788, 'wrap', 'id-aes128-wrap', 8, 8],
+    'id-aes128-wrap-pad': [897, 'wrap', 'id-aes128-wrap-pad', 8, 4],
+    'aes-192-ecb': [422, 'ecb', 'aes-192-ecb', 16, 0],
+    'aes-192-cbc': [423, 'cbc', 'aes-192-cbc', 16, 16],
+    'aes-192-ctr': [905, 'ctr', 'aes-192-ctr', 1, 16],
+    'aes-192-cfb': [425, 'cfb', 'aes-192-cfb', 1, 16],
+    'aes-192-cfb8': [654, 'cfb', 'aes-192-cfb8', 1, 16],
+    'aes-192-cfb1': [651, 'cfb', 'aes-192-cfb1', 1, 16],
+    'aes-192-ofb': [424, 'ofb', 'aes-192-ofb', 1, 16],
+    'aes-192-gcm': [898, 'gcm', 'id-aes192-gcm', 1, 12],
+    'aes-192-ccm': [899, 'ccm', 'id-aes192-ccm', 1, 12],
+    'aes-192-ocb': [959, 'ocb', 'aes-192-ocb', 16, 12],
+    'aes192': [423, 'cbc', 'aes-192-cbc', 16, 16],
+    'id-aes192-gcm': [898, 'gcm', 'id-aes192-gcm', 1, 12],
+    'id-aes192-ccm': [899, 'ccm', 'id-aes192-ccm', 1, 12],
+    'aes192-wrap': [789, 'wrap', 'id-aes192-wrap', 8, 8],
+    'aes192-wrap-pad': [900, 'wrap', 'id-aes192-wrap-pad', 8, 4],
+    'id-aes192-wrap': [789, 'wrap', 'id-aes192-wrap', 8, 8],
+    'id-aes192-wrap-pad': [900, 'wrap', 'id-aes192-wrap-pad', 8, 4],
+    'aes-256-ecb': [426, 'ecb', 'aes-256-ecb', 16, 0],
+    'aes-256-cbc': [427, 'cbc', 'aes-256-cbc', 16, 16],
+    'aes-256-ctr': [906, 'ctr', 'aes-256-ctr', 1, 16],
+    'aes-256-cfb': [429, 'cfb', 'aes-256-cfb', 1, 16],
+    'aes-256-cfb8': [655, 'cfb', 'aes-256-cfb8', 1, 16],
+    'aes-256-cfb1': [652, 'cfb', 'aes-256-cfb1', 1, 16],
+    'aes-256-ofb': [428, 'ofb', 'aes-256-ofb', 1, 16],
+    'aes-256-gcm': [901, 'gcm', 'id-aes256-gcm', 1, 12],
+    'aes-256-ccm': [902, 'ccm', 'id-aes256-ccm', 1, 12],
+    'aes-256-ocb': [960, 'ocb', 'aes-256-ocb', 16, 12],
+    'aes-256-xts': [914, 'xts', 'aes-256-xts', 1, 16],
+    'aes256': [427, 'cbc', 'aes-256-cbc', 16, 16],
+    'id-aes256-gcm': [901, 'gcm', 'id-aes256-gcm', 1, 12],
+    'id-aes256-ccm': [902, 'ccm', 'id-aes256-ccm', 1, 12],
+    'aes256-wrap': [790, 'wrap', 'id-aes256-wrap', 8, 8],
+    'aes256-wrap-pad': [903, 'wrap', 'id-aes256-wrap-pad', 8, 4],
+    'id-aes256-wrap': [790, 'wrap', 'id-aes256-wrap', 8, 8],
+    'id-aes256-wrap-pad': [903, 'wrap', 'id-aes256-wrap-pad', 8, 4],
+    /* The spelled-out wrap names OpenSSL answers but does not list: getCipherInfo knows them. */
+    'aes-128-wrap': [788, 'wrap', 'id-aes128-wrap', 8, 8],
+    'aes-128-wrap-pad': [897, 'wrap', 'id-aes128-wrap-pad', 8, 4],
+    'aes-192-wrap': [789, 'wrap', 'id-aes192-wrap', 8, 8],
+    'aes-192-wrap-pad': [900, 'wrap', 'id-aes192-wrap-pad', 8, 4],
+    'aes-256-wrap': [790, 'wrap', 'id-aes256-wrap', 8, 8],
+    'aes-256-wrap-pad': [903, 'wrap', 'id-aes256-wrap-pad', 8, 4],
+    'chacha20': [1019, 'stream', 'chacha20', 0, 16],
+    'chacha20-poly1305': [1018, 'stream', 'chacha20-poly1305', 0, 12]
+};
+
+/**
+ * Node's getCipherInfo: undefined for a name no cipher here carries, and for one whose keyLength or
+ * ivLength a caller asked for is not the cipher's own. A nid names the cipher as a name does.
+ */
+function cipherInfo(nameOrNid: unknown, options: any): Record<string, unknown> | undefined {
+    const key = typeof nameOrNid === 'number'
+        ? Object.keys(CIPHER_INFO).find((name) => CIPHER_INFO[name][0] === nameOrNid)
+        : typeof nameOrNid === 'string' ? nameOrNid.toLowerCase() : undefined;
+    if (key === undefined) return undefined;
+    const entry = CIPHER_INFO[key];
+    const spec = CIPHER_SPECS[key];
+    if (spec === undefined) return undefined;
+    const keyLength = spec.keyLength;
+    const ivLength = entry[4];
+    if (options !== undefined && options !== null) {
+        if (options.keyLength !== undefined && options.keyLength !== null && Number(options.keyLength) !== keyLength) return undefined;
+        if (options.ivLength !== undefined && options.ivLength !== null && Number(options.ivLength) !== ivLength) return undefined;
+    }
+    /* The field order is the one host Node 24.15's JSON answers with. */
+    const info: Record<string, unknown> = { mode: entry[1], name: entry[2], nid: entry[0] };
+    if (entry[3] !== 0) info.blockSize = entry[3];
+    if (ivLength !== 0) info.ivLength = ivLength;
+    info.keyLength = keyLength;
+    return info;
+}
+
 /** GCM accepts a nonce of almost any length in Node; @noble draws the line at 8 bytes. */
 const GCM_MIN_IV = 8;
 const TAG_LENGTH = 16;
@@ -413,6 +506,9 @@ interface CipherState {
     emitted: boolean;
     aad: Uint8Array;
     tag?: Uint8Array;
+    /** 16 unless createCipheriv was given an authTagLength, which Node honours for GCM and for
+     *  chacha20-poly1305: the tag a caller reads is the first that many bytes of the full one. */
+    tagLength: number;
 }
 
 const CIPHER_STATE = new Map<number, CipherState>();
@@ -713,15 +809,27 @@ function aesWrapPad(key: Uint8Array, aiv: Uint8Array, data: Uint8Array): Uint8Ar
     return aesWrap(key, a, padded);
 }
 
-function aesUnwrapPad(key: Uint8Array, data: Uint8Array): Uint8Array {
+/** A wrap whose integrity check fails: the words OpenSSL uses for a wrap it cannot unwrap. */
+function wrapIntegrity(): never {
+    return cipherFail(null, 'Trying to add data in unsupported state');
+}
+
+function aesUnwrapPad(key: Uint8Array, aiv: Uint8Array, data: Uint8Array): Uint8Array {
+    /* RFC 5649 keeps the AIV's first half for the IV it was wrapped with and puts the plaintext's
+       own length in the second, so both come back: a length the padded data cannot hold, or an IV
+       that is not the one given, is a wrap this key and IV never produced. */
     if (data.length === 16) {
         const b = ecb(key, { disablePadding: true }).decrypt(data);
-        return b.subarray(8, 8 + readWrapLength(b, 4));
+        const len = readWrapLength(b, 4);
+        if (len > 8) throw wrapIntegrity();
+        for (let i = 0; i < 4; i++) if (b[i] !== aiv[i]) throw wrapIntegrity();
+        return b.subarray(8, 8 + len);
     }
-    /* The alternative IV OpenSSL was given comes back as the first half of the starting value, with
-       the plaintext's own length in the second half. */
     const { a, plain } = aesUnwrap(key, data);
-    return plain.subarray(0, readWrapLength(a, 4));
+    const len = readWrapLength(a, 4);
+    if (len > plain.length) throw wrapIntegrity();
+    for (let i = 0; i < 4; i++) if (a[i] !== aiv[i]) throw wrapIntegrity();
+    return plain.subarray(0, len);
 }
 
 /** The four bytes of a wrap's starting value at `at`, most significant first. */
@@ -746,21 +854,42 @@ function unpad(bytes: Uint8Array): Uint8Array {
 
 function cipherUpdate(state: CipherState, input: Uint8Array): Uint8Array {
     state.updated = true;
-    /* XTS and the two key wraps answer in one shot: everything comes back from the first update. */
-    if (state.spec.mode === 'xts' || state.spec.mode === 'wrap' || state.spec.mode === 'wrappad') {
+    /* XTS answers in one shot: everything comes back from the first update. */
+    if (state.spec.mode === 'xts') {
         if (state.emitted) throw cipherFail(null, 'Trying to add data in unsupported state');
         const all = concatBytes(state.pending, input);
         state.pending = new Uint8Array(0);
         state.emitted = true;
-        if (state.spec.mode === 'xts') {
-            if (all.length < BLOCK) throw cipherFail(null, 'Trying to add data in unsupported state');
-            return xtsTransform(state, all);
-        }
+        if (all.length < BLOCK) throw cipherFail(null, 'Trying to add data in unsupported state');
+        return xtsTransform(state, all);
+    }
+    /* A key wrap answers every update on its own, as OpenSSL's does: two updates of sixteen bytes
+       are two wraps, not one of thirty-two. RFC 3394 wraps two blocks or more and nothing between,
+       so a length that is not a whole number of blocks, or is shorter than two, is refused rather
+       than wrapped as far as it goes; empty input wraps nothing and leaves the cipher open. */
+    if (state.spec.mode === 'wrap' || state.spec.mode === 'wrappad') {
         const encrypt = state.direction === 'encrypt';
+        if (input.length === 0) return new Uint8Array(0);
         if (state.spec.mode === 'wrap') {
-            return encrypt ? aesWrap(state.key, state.iv, all) : aesUnwrap(state.key, all).plain;
+            if (input.length < (encrypt ? 16 : 24) || input.length % 8 !== 0) {
+                throw cipherFail(null, 'Trying to add data in unsupported state');
+            }
+        } else if (!encrypt && (input.length < 16 || input.length % 8 !== 0)) {
+            throw cipherFail(null, 'Trying to add data in unsupported state');
         }
-        return encrypt ? aesWrapPad(state.key, state.iv, all) : aesUnwrapPad(state.key, all);
+        if (state.spec.mode === 'wrap') {
+            if (!encrypt) {
+                const unwrapped = aesUnwrap(state.key, input);
+                /* RFC 3394's integrity check: the alternative IV the wrap was made with comes back,
+                   and one that does not is a wrap this key and IV never produced. */
+                for (let i = 0; i < state.iv.length; i++) {
+                    if (unwrapped.a[i] !== state.iv[i]) throw wrapIntegrity();
+                }
+                return unwrapped.plain;
+            }
+            return aesWrap(state.key, state.iv, input);
+        }
+        return encrypt ? aesWrapPad(state.key, state.iv, input) : aesUnwrapPad(state.key, state.iv, input);
     }
     if (state.spec.aead) {
         state.pending = concatBytes(state.pending, input);
@@ -784,7 +913,11 @@ function cipherFinal(state: CipherState): { data: Uint8Array; tag?: Uint8Array }
     if (state.spec.aead) {
         if (state.direction === 'encrypt') {
             const sealed = aeadCipher(state).encrypt(rest);
-            return { data: sealed.subarray(0, sealed.length - TAG_LENGTH), tag: sealed.subarray(sealed.length - TAG_LENGTH) };
+            const at = sealed.length - TAG_LENGTH;
+            return {
+                data: sealed.subarray(0, at),
+                tag: sealed.subarray(at, at + state.tagLength)
+            };
         }
         if (state.tag === undefined) throw authFailure();
         try {
@@ -833,9 +966,19 @@ function openCipher(args: any): { id: number; aead: boolean } {
         throw invalidIv();
     }
     /* CCM and OCB answer no tag length of their own, so Node refuses them outright and names the
-       cipher it refused; the guest passes no options, so the refusal is unconditional here. */
+       cipher it refused. The guest passes no options, so the refusal is unconditional here. */
     if (spec.needsAuthTagLength === true) {
         throw cipherFail('ERR_CRYPTO_INVALID_AUTH_TAG', `authTagLength required for ${algorithm}`, 'TypeError');
+    }
+    /* Node takes an authTagLength of 4 to 16 for GCM and for chacha20-poly1305 and refuses any
+       other, before it looks at the key; a cipher that seals nothing ignores the option. */
+    let tagLength = TAG_LENGTH;
+    const wanted = args?.options?.authTagLength;
+    if (spec.aead && wanted !== undefined && wanted !== null) {
+        tagLength = Number(wanted);
+        if (tagLength < 4 || tagLength > TAG_LENGTH) {
+            throw cipherFail('ERR_CRYPTO_INVALID_AUTH_TAG', `Invalid authentication tag length: ${wanted}`, 'TypeError');
+        }
     }
     const key = bytesArg(args?.key);
     if (key.length !== spec.keyLength) throw invalidKeyLength();
@@ -870,7 +1013,8 @@ function openCipher(args: any): { id: number; aead: boolean } {
         autoPadding: true,
         updated: false,
         emitted: false,
-        aad: new Uint8Array(0)
+        aad: new Uint8Array(0),
+        tagLength
     });
     return { id, aead: spec.aead };
 }
@@ -2368,8 +2512,12 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             keylen
         ));
     },
-    /** Args {}: the cipher names createCipheriv and createDecipheriv accept. */
-    'crypto.ciphers': () => CIPHER_NAMES.slice(),
+    /** Args {}: the cipher names createCipheriv and createDecipheriv accept, in Node's own order:
+     *  host Node 24.15 answers them sorted, where this table is built a family at a time. */
+    'crypto.ciphers': () => CIPHER_NAMES.slice().sort(),
+    /** Args {nameOrNid, keyLength?, ivLength?}: Node's getCipherInfo, or undefined for a name here
+     *  no cipher carries or a length the cipher does not have. */
+    'crypto.cipher.info': (args) => cipherInfo(args?.nameOrNid, args?.options),
     /** Args {algorithm, direction, key, iv}: validates key and IV, opens a host cipher; returns {id, aead}. */
     'crypto.cipher.open': (args) => openCipher(args),
     /** Args {id, data}: the bytes this call emits; aead modes emit nothing until final. Returns base64. */

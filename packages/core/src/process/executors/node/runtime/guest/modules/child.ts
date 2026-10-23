@@ -13,7 +13,7 @@
  * target with the child.ipcAttach capability, and installs process.send / process.connected /
  * process.disconnect (fork, cluster) or parentPort (worker). Messages cross as tagged JSON: undefined,
  * bigint, NaN and Infinity, Date, Map, Set and typed arrays keep their type; functions and symbols throw
- * DataCloneError. A forked child or cluster worker holds a ref while it has 'message' or 'disconnect'
+ * DataCloneError. A Buffer is the one view that comes back a Uint8Array; every other kind keeps its own. A forked child or cluster worker holds a ref while it has 'message' or 'disconnect'
  * listeners, as Node's refCounted channel does. An uncaught error in a worker thread is sent to the parent
  * as an 'error' event before the thread exits with code 1.
  *
@@ -72,6 +72,19 @@ function cpErrorFrom(json) {
   return err;
 }
 
+/* The typed array kinds a clone can hand back, in the order a Buffer is found in: a Buffer is a
+   Uint8Array subclass, so its base class is the one its clone gets. */
+var CP_VIEWS = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
+  'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array'];
+
+function cpViewClass(value) {
+  for (var i = 0; i < CP_VIEWS.length; i++) {
+    var Ctor = globalThis[CP_VIEWS[i]];
+    if (typeof Ctor === 'function' && value instanceof Ctor) return CP_VIEWS[i];
+  }
+  return 'Uint8Array';
+}
+
 function cpEncode(value) {
   if (value === undefined) return { $t: 'u' };
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
@@ -99,10 +112,19 @@ function cpEncode(value) {
     });
     return { $t: 'S', v: members };
   }
+  if (value instanceof DataView) {
+    /* A structured clone keeps the class of a view: host Node 24.15 answers DataView for a DataView
+       and Int32Array for an Int32Array, and Uint8Array only for a Buffer. */
+    return { $t: 'B', c: 'DataView', v: Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64') };
+  }
   if (ArrayBuffer.isView(value)) {
-    /* Only the bytes cross: a structured clone of a Buffer is a Uint8Array, so the class the
-       view had where it was posted is not part of the clone and is not recorded. */
-    return { $t: 'B', v: Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64') };
+    /* Only the bytes cross, but the class does too: a Buffer is the one view whose clone is a
+       Uint8Array, and a view of any other kind comes back as the kind it was posted as. A subclass
+       answers the base class it extends, as it does on the host. */
+    return {
+      $t: 'B', c: cpViewClass(value),
+      v: Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64')
+    };
   }
   if (value instanceof ArrayBuffer) return { $t: 'AB', v: Buffer.from(value).toString('base64') };
   if (Array.isArray(value)) {
@@ -142,14 +164,18 @@ function cpDecode(value) {
           return cpDecode(item);
         }));
       case 'B': {
-        /* A structured clone of a Buffer is a Uint8Array: host Node 24.15 answers
-           Buffer.isBuffer(m) false and m.constructor.name 'Uint8Array' for
-           parentPort.postMessage(Buffer.from('worker-buf')), so the class the value had
-           where it was posted is not part of the clone. */
+        /* A structured clone keeps the class of a view: host Node 24.15 answers Int32Array for an
+           Int32Array and DataView for a DataView, and Uint8Array only for a Buffer, so the class
+           the value had where it was posted is part of the clone after all. */
         var raw = Buffer.from(value.v, 'base64');
         var bytes = new Uint8Array(raw.length);
         bytes.set(raw);
-        return bytes;
+        var cls = value.c;
+        if (cls === 'DataView') return new DataView(bytes.buffer, 0, bytes.byteLength);
+        if (CP_VIEWS.indexOf(cls) < 0) return bytes;
+        var Ctor = globalThis[cls];
+        if (typeof Ctor !== 'function') return bytes;
+        return new Ctor(bytes.buffer, 0, raw.length / Ctor.BYTES_PER_ELEMENT);
       }
       case 'AB': {
         var decoded = Buffer.from(value.v, 'base64');
