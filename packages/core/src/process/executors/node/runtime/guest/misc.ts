@@ -2115,6 +2115,16 @@ BF.crypto = function () {
     return err;
   }
 
+  /*
+   * A sign handed no key at all. Node asks for the key before it parses it, so null and undefined
+   * answer their own code where a key of the wrong type is an argument error like any other.
+   */
+  function noKeyToSign() {
+    var err = new Error('No key provided to sign');
+    err.code = 'ERR_CRYPTO_SIGN_KEY_REQUIRED';
+    return err;
+  }
+
   function randomBytes(size, callback) {
     if (typeof size !== 'number') throw invalidArgType('size', 'of type number', size);
     /* Node bounds size before it allocates: a negative length is a range error, not a typed-array one. */
@@ -2255,9 +2265,54 @@ BF.crypto = function () {
   }
 
   /*
+   * The data a hash, a sign or a verify is fed. Node reads an encoding it does not know as utf8
+   * rather than refusing it, and that covers an encoding that is not text at all: a number, an
+   * object, a Symbol or null all hash the string, so update('a', 1) is update('a') and only a value
+   * that is not data reaches the type check above.
+   */
+  function toDataBytes(data, encoding, name, list) {
+    var enc = encoding === undefined || encoding === null || typeof encoding === 'string' ? encoding : 'utf8';
+    try {
+      return toBytes(data, enc, name, list);
+    } catch (unknown) {
+      if (String(unknown && unknown.message).indexOf('Unknown encoding') !== 0) throw unknown;
+      return toBytes(data, 'utf8', name, list);
+    }
+  }
+
+  /*
+   * The signature a one-shot crypto.verify reads. It is the one argument Node names a short list
+   * for: a Buffer, a TypedArray or a DataView and not a string and not an ArrayBuffer, which is not
+   * the list the same argument gets on a Verify object.
+   */
+  function signatureBytes(signature) {
+    if (typeof signature === 'string' || !ArrayBuffer.isView(signature)) {
+      var err = new TypeError('The "signature" argument must be an instance of Buffer, TypedArray, or DataView. Received ' + receivedAs(signature));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    return Buf.from(signature.buffer, signature.byteOffset, signature.byteLength);
+  }
+
+  /*
+   * The data a one-shot crypto.verify reads: a bare ArrayBuffer is refused, and it is refused with
+   * the short list, where any other value that is not data gets the long one.
+   */
+  function verifyDataBytes(data) {
+    if (data instanceof ArrayBuffer) {
+      var err = new TypeError('The "data" argument must be an instance of Buffer, TypedArray, or DataView. Received an instance of ArrayBuffer');
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    return toBytes(data, undefined, 'data');
+  }
+
+  /*
    * Node's digest, sign and secret output encoding: an encoding it does not recognise is not an
    * error, it is simply no encoding at all -- digest('nope'), digest(32), digest(null) and
-   * digest({}) all answer the Buffer, and only a Symbol refuses, because String() of one throws.
+   * digest({}) all answer the Buffer. A Symbol is the one value that refuses: Node reads the
+   * encoding with a template, which is the one form of ToString that throws on a Symbol, so
+   * digest(Symbol()) raises a TypeError where digest(1) answers the Buffer.
    * 'buffer' names the same answer, and an alias like 'utf-8' or 'binary' is read as its own.
    */
   var OUTPUT_ENCODINGS = {
@@ -2268,7 +2323,7 @@ BF.crypto = function () {
   };
 
   function outputOf(bytes, encoding) {
-    /* String(encoding) is the one step that can throw, and it is Node's own message for it. */
+    if (typeof encoding === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
     var name = typeof encoding === 'string' ? encoding : String(encoding);
     var as = OUTPUT_ENCODINGS[name.toLowerCase()];
     return as === undefined || as === 'buffer' ? bytes : bytes.toString(as);
@@ -2525,7 +2580,15 @@ BF.crypto = function () {
     return typeof encoding.format === 'string' ? bytes.toString('utf8') : bytes;
   }
 
+  /*
+   * Node reads options as an object whenever a caller hands it one at all: ed25519, ed448, x25519,
+   * x448 and ec need none and still refuse 1, while rsa, rsa-pss, dsa and dh refuse an absent one
+   * too, because each of them reads a size out of it.
+   */
   function generateKeyPairSync(type, options) {
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
+      throw invalidArgType('options', 'of type object', options);
+    }
     return keyPairOf(cryptoCap('crypto.key.generate', { type: String(type), options: options === undefined ? undefined : wrapOptions(options) }), options);
   }
 
@@ -2568,10 +2631,11 @@ BF.crypto = function () {
     this._chunks = [];
   }
   Sign.prototype.update = function (data, encoding) {
-    this._chunks.push(toBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView'));
+    this._chunks.push(toDataBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView'));
     return this;
   };
   Sign.prototype.sign = function (privateKey, encoding) {
+    if (privateKey === undefined || privateKey === null) throw noKeyToSign();
     var signature = cryptoCap('crypto.key.sign', {
       id: keyIdOf(privateKey, 'private'),
       algorithm: this._algorithm,
@@ -2595,7 +2659,7 @@ BF.crypto = function () {
     this._used = false;
   }
   Verify.prototype.update = function (data, encoding) {
-    this._chunks.push(toBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView'));
+    this._chunks.push(toDataBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView'));
     return this;
   };
   Verify.prototype.verify = function (publicKey, signature, encoding) {
@@ -2629,10 +2693,13 @@ BF.crypto = function () {
 
   /* sign and verify without a streaming object: one call over the same capability. */
   function signOne(algorithm, data, key, callback) {
+    /* Node names the arguments in the order it reads them: the data, then the key. */
+    var bytes = toBytes(data, undefined, 'data').toString('base64');
+    if (key === undefined || key === null) throw noKeyToSign();
     var signature = Buf.from(cryptoCap('crypto.key.sign', {
       id: keyIdOf(key, 'private'),
       algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
-      data: toBytes(data, undefined, 'data').toString('base64'),
+      data: bytes,
       dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined,
       padding: key !== null && typeof key === 'object' ? key.padding : undefined,
       saltLength: key !== null && typeof key === 'object' ? key.saltLength : undefined
@@ -2645,11 +2712,14 @@ BF.crypto = function () {
   }
 
   function verifyOne(algorithm, data, key, signature, callback) {
+    /* The data, then the signature, then the key: crypto.verify() with nothing at all names data. */
+    var bytes = verifyDataBytes(data).toString('base64');
+    var sig = signatureBytes(signature).toString('base64');
     var answer = cryptoCap('crypto.key.verify', {
       id: keyIdOf(key, 'public'),
       algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
-      data: toBytes(data, undefined, 'data').toString('base64'),
-      signature: toBytes(signature, undefined, 'signature').toString('base64'),
+      data: bytes,
+      signature: sig,
       dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined,
       padding: key !== null && typeof key === 'object' ? key.padding : undefined,
       saltLength: key !== null && typeof key === 'object' ? key.saltLength : undefined
@@ -2667,7 +2737,12 @@ BF.crypto = function () {
    */
   function DiffieHellman(id) {
     var self = this;
-    self._id = id;
+    /*
+     * The host's handle and the cached bits are not part of Node's surface: a DiffieHellman that
+     * somebody JSON.stringify()s carries verifyError and nothing else, so they sit on it hidden.
+     */
+    Object.defineProperty(self, '_id', { value: id, writable: true, configurable: true });
+    Object.defineProperty(self, '_verifyError', { value: undefined, writable: true, configurable: true });
     /*
      * Node's DH_check bits, kept as the own enumerable property a DiffieHellman has them on. They
      * are read the first time a caller asks: deciding whether a 1024-bit modulus is prime is two
@@ -2893,14 +2968,7 @@ BF.crypto = function () {
       sealed.code = 'ERR_CRYPTO_HASH_FINALIZED';
       throw sealed;
     }
-    /* Node reads an encoding it does not know as utf8 rather than refusing it. */
-    var bytes;
-    try {
-      bytes = toBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView');
-    } catch (unknown) {
-      if (typeof encoding !== 'string' || String(unknown && unknown.message).indexOf('Unknown encoding') !== 0) throw unknown;
-      bytes = toBytes(data, 'utf8', 'data', 'string or an instance of Buffer, TypedArray, or DataView');
-    }
+    var bytes = toDataBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView');
     this._chunks.push(bytes);
     return this;
   };

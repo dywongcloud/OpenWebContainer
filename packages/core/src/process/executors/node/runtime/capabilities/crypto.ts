@@ -1300,9 +1300,24 @@ let nextKeyId = 1;
 /** Keys a process abandoned are dropped rather than kept forever, as ciphers are below. */
 const OPEN_KEY_LIMIT = 256;
 
-function keyFail(code: string, message: string, kind: 'Error' | 'RangeError' | 'TypeError' = 'Error'): never {
+function keyFail(code: string | null, message: string, kind: 'Error' | 'RangeError' | 'TypeError' = 'Error'): never {
     const Ctor = kind === 'RangeError' ? RangeError : kind === 'TypeError' ? TypeError : Error;
-    throw Object.assign(new Ctor(message), { code, owcErrorClass: kind });
+    throw Object.assign(new Ctor(message), { code: code ?? 'ERR_CAPABILITY', owcErrorClass: kind, owcUncoded: code === null });
+}
+
+/**
+ * How Node names what it was handed at the end of an ERR_INVALID_ARG_TYPE: "type string ('x')" for
+ * text, "type number (1)" for any other primitive, and "an instance of ArrayBuffer" for an object.
+ * An ERR_OUT_OF_RANGE prints the bare value instead, so only the argument errors use this.
+ */
+function receivedLike(value: unknown): string {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'string') return `type string ('${value}')`;
+    if (typeof value !== 'object' && typeof value !== 'function') return `type ${typeof value} (${String(value)})`;
+    const made = (value as { constructor?: { name?: string } }).constructor;
+    const named = made !== null && made !== undefined && typeof made.name === 'string' ? made.name : null;
+    return named === null || named === '' ? 'an instance of Object' : `an instance of ${named}`;
 }
 
 /** PBES2 (RFC 8018): the KDF, the PRFs it may name, and the ciphers a PKCS#8 key is sealed with. */
@@ -2136,16 +2151,20 @@ function generatePair(type: unknown, options: any): { public: number; private: n
      */
     if (kind === 'rsa' || kind === 'rsa-pss' || kind === 'dsa' || kind === 'dh') {
         if (options === undefined || options === null || typeof options !== 'object') {
-            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options" argument must be of type object. Received ' + String(options), 'TypeError');
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options" argument must be of type object. Received ' + receivedLike(options), 'TypeError');
         }
     }
     if (kind === 'rsa' || kind === 'rsa-pss') {
         if (typeof options?.modulusLength !== 'number') {
-            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.modulusLength" property must be of type number. Received ' + String(options?.modulusLength), 'TypeError');
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.modulusLength" property must be of type number. Received ' + receivedLike(options?.modulusLength), 'TypeError');
         }
         const modulusLength = options.modulusLength;
-        if (!Number.isInteger(modulusLength) || modulusLength < 16) {
-            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.modulusLength" is out of range. It must be >= 16. Received ' + String(options?.modulusLength), 'RangeError');
+        if (!Number.isInteger(modulusLength)) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.modulusLength" is out of range. It must be an integer. Received ' + String(modulusLength), 'RangeError');
+        }
+        /* OpenSSL's own floor for an RSA modulus, and the uncoded error it answers below it. */
+        if (modulusLength < 512) {
+            throw keyFail(null, 'error:1C8000AB:Provider routines::key size too small');
         }
         const exponent = options?.publicExponent === undefined || options?.publicExponent === null ? 65537n : BigInt(String(options?.publicExponent));
         if (exponent < 3n || (exponent & 1n) === 0n) {
@@ -2160,13 +2179,17 @@ function generatePair(type: unknown, options: any): { public: number; private: n
     }
     if (kind === 'dsa') {
         if (typeof options?.modulusLength !== 'number') {
-            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.modulusLength" property must be of type number. Received ' + String(options?.modulusLength), 'TypeError');
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.modulusLength" property must be of type number. Received ' + receivedLike(options?.modulusLength), 'TypeError');
         }
         const modulusLength = options.modulusLength;
-        const divisorLength = options?.divisorLength === undefined || options?.divisorLength === null ? 224 : Number(options?.divisorLength);
-        if (!Number.isInteger(modulusLength) || modulusLength < 32) {
-            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.modulusLength" is out of range. It must be >= 32. Received ' + String(options?.modulusLength), 'RangeError');
+        if (!Number.isInteger(modulusLength)) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.modulusLength" is out of range. It must be an integer. Received ' + String(modulusLength), 'RangeError');
         }
+        /* DSA reaches its provider below 512 bits and fails there, which is not a range error. */
+        if (modulusLength < 512) {
+            throw keyFail(null, 'error:030000E9:digital envelope routines::provider keymgmt failure');
+        }
+        const divisorLength = options?.divisorLength === undefined || options?.divisorLength === null ? 224 : Number(options?.divisorLength);
         const ints = generateDsa(modulusLength, divisorLength);
         const size = modulusSize(ints.p as bigint);
         return {
