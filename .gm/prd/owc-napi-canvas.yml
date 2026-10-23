@@ -1,4 +1,30 @@
 id: owc-napi-canvas
+title: 'VERIFIED at HEAD: the canvas shim matches the real canvas 3.2.3 add-on on 95 of 96 probe lines'
 subject: 'The node-canvas (canvas) API subset reimplemented in pure JavaScript: the 2D context with paths, fills, strokes, text and images, and PNG and JPEG output. Partial and documented, since Cairo is not reproducible in full. Oracle: canvas on Node 24.15 for the subset. Depends on owc-napi-loader.'
 session_id: 82e15910-75ce-4750-b785-b7acfbfe2bfb
-status: pending
+owner: adv7-exec-napi
+classification: GUEST
+status: completed
+resolved_at: 8f36844 (local main; packages/core/src/napi/canvas identical on origin/main c9e85b4)
+body: |-
+  Reappearance, re-verified at HEAD and retired. Host node v24.15.0 with the real canvas 3.2.3
+  add-on against the container shim reached through a placeholder at build/Release/canvas.node,
+  one probe (/tmp/owc-r4/adv7-napi/src-canvas/main.js, copied whole to cont-canvas) run on both
+  sides, twice, each run independent: 95 of 96 lines identical both times, host exit 0, container
+  exit 0, both stderr empty (the container frame's trailing "[owc exit 0]" is the driver's, not the
+  program's). Identical lines cover: module shape and createCanvas; width and height; fillRect and
+  getImageData (255,0,0,255 and 3200 bytes); clearRect; an rgba fill (0,0,255,127) and its parsed
+  fillStyle; strokeStyle, lineWidth and the strokeRect white pixels; a triangle path fill; an arc
+  fill; a linear gradient's endpoints and midpoint; translate+scale; rotate; globalAlpha 0.5
+  (255,255,255,128); the font shorthand round trip; measureText width, a number, and its ordering;
+  fillText ink; textBaseline and textAlign; clip; createImageData, putImageData and new ImageData;
+  drawImage canvas-to-canvas (18,52,86,255); globalCompositeOperation; the PNG magic
+  89504e470d0a1a0a, the data:image/png;base64, prefix, the JPEG ffd8 lead and the 3200-byte raw
+  buffer; lineCap, lineJoin and miterLimit defaults and setLineDash/getLineDash; isPointInPath;
+  createPattern repeat; a quadratic curve; an ellipse; shadow colour, blur and offset; roundRect;
+  setTransform/getTransform/resetTransform; and a stroked line's alpha.
+  The one difference is the documented refusal the row records: createCanvas(10,10,'pdf') creates a
+  surface on the host and throws OWC_CANVAS_UNSUPPORTED: canvas type "pdf" in the container.
+  No source change: the behaviour the row asks for is already in the committed tree.
+  Machine state while measured: load 12.4-14.7, free pages 3565-4448 (about 58-73 MB) at the
+  canvas arm of both runs; the second run reproduced the first line for line.
