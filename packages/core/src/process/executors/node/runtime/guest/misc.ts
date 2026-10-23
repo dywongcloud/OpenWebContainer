@@ -2913,11 +2913,15 @@ BF.crypto = function () {
 
   function createCipher(direction) {
     return function (algorithm, key, iv, options) {
+      var opts = options !== undefined && options !== null && typeof options === 'object'
+        ? { authTagLength: options.authTagLength }
+        : undefined;
       var opened = cipherCap('crypto.cipher.open', {
         algorithm: String(algorithm),
         direction: direction,
         key: cipherKeyBytes(key).toString('base64'),
-        iv: iv === null || iv === undefined ? null : cipherBytes(iv, undefined, 'iv').toString('base64')
+        iv: iv === null || iv === undefined ? null : cipherBytes(iv, undefined, 'iv').toString('base64'),
+        options: opts
       });
       var cipher = new Cipher(String(algorithm), direction, opened.id, opened.aead === true);
       if (direction === 'decrypt') cipher.setAuthTag = decipherSetAuthTag;
@@ -3022,6 +3026,21 @@ BF.crypto = function () {
       RSA_PSS_SALTLEN_AUTO: -2
     },
     getCiphers: function () { return callCap('crypto.ciphers'); },
+    /* Node's getCipherInfo: name or nid, and undefined for a cipher this container has no table
+       entry for, as on the host for one it does not carry either. */
+    getCipherInfo: function (nameOrNid, options) {
+      if (typeof nameOrNid !== 'string' && typeof nameOrNid !== 'number') {
+        throw invalidArgType('nameOrNid', 'one of type string or number', nameOrNid);
+      }
+      var args = { nameOrNid: nameOrNid };
+      if (options !== undefined && options !== null && typeof options === 'object') {
+        args.options = { keyLength: options.keyLength, ivLength: options.ivLength };
+      }
+      /* A capability answer is JSON, so a name no cipher carries comes back null; Node answers
+         undefined, and that is what a caller asks about with === undefined. */
+      var info = callCap('crypto.cipher.info', args);
+      return info === null ? undefined : info;
+    },
     sign: signOne,
     verify: verifyOne,
     createCipheriv: createCipher('encrypt'),

@@ -478,6 +478,39 @@ export const SRC = String.raw`
     return false;
   }
 
+  /* The offending line and a caret under it, the way V8 carries them above a syntax error: a buffer
+     of 'var y = {' then '2+2' answers "2+2\n ^\n\n". QuickJS words the error its own way and shows
+     no source of its own, but it does put the position in the stack of a compile it did itself, and
+     the token the lexer finds there is the span V8 underlines -- so the frame is recoverable in
+     guest code even though the two words the engine says are not. Only a source that does not
+     compile is handed to that compile, so nothing that reaches it can run. */
+  function replErrorFrame(code, err) {
+    if (!isObjectLike(err) || err.name !== 'SyntaxError') return '';
+    if (compiles(code)) return '';
+    var pos = null;
+    try {
+      (0, eval)(code);
+    } catch (inner) {
+      var at = /<input>:(\d+):(\d+)/.exec(String(inner && inner.stack));
+      if (at !== null) pos = { line: Number(at[1]), col: Number(at[2]) };
+    }
+    if (pos === null) return '';
+    var text = String(code).split('\n')[pos.line - 1];
+    if (text === undefined) return '';
+    var span = 1;
+    var toks = vmLex(text).toks;
+    for (var i = 0; i < toks.length; i++) {
+      if (toks[i].pos === pos.col - 1 && toks[i].end > toks[i].pos) {
+        span = toks[i].end - toks[i].pos;
+        break;
+      }
+    }
+    var caret = '';
+    for (var k = 1; k < pos.col; k++) caret += ' ';
+    for (var j = 0; j < span; j++) caret += '^';
+    return text + '\n' + caret + '\n\n';
+  }
+
   function replErrorHeader(err) {
     if (isObjectLike(err) && typeof err.name === 'string') {
       return String(err.name) + (err.message ? ': ' + err.message : '');
@@ -1239,6 +1272,8 @@ export const SRC = String.raw`
       var code = src;
       if (/^\s*\{/.test(src) && compiles('(' + src + '\n)')) code = '(' + src + '\n)';
       code = rewriteTopLexical(code);
+      /* The source the engine was handed, kept for the frame a syntax error is reported with. */
+      this._code = code;
       if (this.useGlobal) return (0, eval)(code);
       return vm.runInContext(code, this.context);
     };
@@ -1248,7 +1283,8 @@ export const SRC = String.raw`
       try {
         result = this._run(src);
       } catch (err) {
-        this._writeOut('Uncaught ' + replErrorHeader(err) + '\n');
+        this._writeOut(replErrorFrame(this._code === undefined ? src : this._code, err) +
+          'Uncaught ' + replErrorHeader(err) + '\n');
         return;
       }
       this.context._ = result;
