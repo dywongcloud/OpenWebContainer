@@ -374,6 +374,47 @@ function formatTable(): Record<string, unknown> {
 }
 
 /**
+ * `sharp.concurrency` and `sharp.simd` are a setting and its reading, not two constants:
+ * `sharp.concurrency(4)` sets the size of the pool libvips uses and `sharp.concurrency()` reads it
+ * back, and `sharp.simd(true)` turns the vector path on. Both used to answer a fixed value and
+ * ignore their argument, so a caller that set either one read the old answer straight back.
+ *
+ * The count starts at the number of CPUs, which is libvips' own default and the number host sharp
+ * 0.33.5 reports here; this shim still runs on one thread, so the number is the setting libvips
+ * would be handed and not a claim about threads it runs. `simd` starts `false` and stays false
+ * until a caller turns it on: the shim is scalar, and reporting `true` would claim a vector unit
+ * it has not got, which is the one part of host sharp's answer this does not follow.
+ */
+declare const requireBuiltin: ((name: string) => unknown) | undefined;
+declare const require: ((name: string) => unknown) | undefined;
+
+function cpuCount(): number {
+    try {
+        let os: any;
+        if (typeof requireBuiltin === 'function') os = requireBuiltin('os');
+        if (!os) {
+            const proc: any = (globalThis as any).process;
+            if (proc && typeof proc.getBuiltinModule === 'function') os = proc.getBuiltinModule('os');
+        }
+        if (!os && typeof require === 'function') os = require('os');
+        const n = os && typeof os.cpus === 'function' ? os.cpus().length : 0;
+        return n > 0 ? n : 1;
+    } catch {
+        return 1;
+    }
+}
+
+let concurrencySetting: number | undefined;
+let simdSetting = false;
+
+/** The pool size libvips would be given: the count of CPUs until a caller sets it otherwise. */
+function concurrencyOf(n?: number): number {
+    if (typeof n === 'number' && Number.isFinite(n) && n >= 1) concurrencySetting = Math.floor(n);
+    if (concurrencySetting === undefined) concurrencySetting = cpuCount();
+    return concurrencySetting;
+}
+
+/**
  * The add-on's exports. sharp's wrapper calls metadata, stats and pipeline with (options, callback); the
  * rest it reads once on load.
  */
@@ -456,9 +497,12 @@ export function createAddon(host: SharpAddonHost = {}): object {
         stats,
         pipeline,
         cache: () => ({ memory: { current: 0, high: 0, max: 0 }, files: { current: 0, max: 0 }, items: { current: 0, max: 0 } }),
-        concurrency: () => 1,
+        concurrency: (n?: number) => concurrencyOf(n),
         counters: () => ({ queue: 0, process: 0 }),
-        simd: () => false,
+        simd: (on?: boolean) => {
+            if (typeof on === 'boolean') simdSetting = on;
+            return simdSetting;
+        },
         // libvips 8.15.3 is what sharp 0.33.5's add-on is built against, and what this shim stands in for;
         // no libvips is loaded.
         libvipsVersion: () => ({ semver: '8.15.3', isGlobal: false, isWasm: false }),

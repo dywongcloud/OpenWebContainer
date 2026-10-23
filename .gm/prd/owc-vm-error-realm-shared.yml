@@ -1,8 +1,63 @@
 id: owc-vm-error-realm-shared
 session_id: adv4-judge-docs-gates-goal-9
-owner: adv4-judge-docs-gates-goal-9
-status: pending
+owner: adv5-judge-napi-vm-9
+status: completed
 classification: GUEST
-measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
-subject: |-
-  A vm context isolates arrays but not Error: `vm.runInNewContext('new Error("x")') instanceof Error` is `true` here and `false` on host Node 24.15, and an error thrown inside a context and caught outside carries `fromOtherRealm true` here against the host's `false`. Arrays agree on both (`Array.isArray` true, `instanceof Array` false, prototype not equal), as do `vm.isContext`, a Script run in another context, a contextified object round trip, `typeof require`/`typeof process` inside the sandbox and the `timeout` option (ERR_SCRIPT_EXECUTION_TIMEOUT on both). A rejected promise that escapes the context also differs: the host prints only `evalmachine.<anonymous>:1` frames with the source line above them, where this appends the outer module frames (`at <eval> (<input>:1:25)` then Module._compile and the loader) and reports column 25 where the host reports 16. Contradicts the Readme claim that vm contexts are byte-identical to the host across every value.
+measured_at: bc261b63d1de325d13a96e3ab29e41aaace0ca13 (local main)
+resolved_at: ebdf467 + the fixes below (local main)
+subject: 'A vm context isolates arrays but not Error: `vm.runInNewContext(''new Error("x")'') instanceof Error` is `true` here and `false` on host Node 24.15, and an error thrown inside a context and caught outside carries `fromOtherRealm true` here against the host''s `false`.'
+body: |-
+  JUDGED AND RESOLVED (adv5-judge-napi-vm-9) at HEAD ebdf467, every case re-run in ISOLATION -- one
+  container boot per case -- differentially against host node v24.15.0, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core with stdout, stderr and exit captured
+  separately. Oracle sharp 0.33.5 / libvips 8.15.3 at /tmp/owc-r5-napivm/oracle. Machine load while
+  measuring was 22-31 on 11 CPUs with 0.1-0.8 GB free -- well inside the band this repo's notes warn
+  can produce false failures -- so every divergence below was reproduced in at least two independent
+  container runs and none of them turns on a timing.
+
+  Every symptom of the RETURNED half is FIXED. One container run per row, host vs container:
+
+      vm.runInNewContext('new Error("x")').stack.split('\n')[0]
+        host      'Error: x'                       (was: '    at <anonymous> (eval.js:1:94)')
+        container 'Error: x'
+      vm.runInNewContext('const e=new Error("x"); Object.defineProperty(e,"stack",
+                          {value:"custom",writable:true,configurable:true}); e').stack
+        host 'custom'   container 'custom'          (was: a regenerated 17-frame guest stack)
+      vm.runInNewContext('new Error("x",{cause:new Error("c")})').cause
+        host object/'c'      container object/'c'   (was: undefined)
+      vm.runInNewContext('class E extends Error{constructor(m){super(m);this.name="E"}}; new E("x")')
+                    .constructor.name
+        host 'E'   container 'E'                    (was: 'Error')
+      vm.runInNewContext('new AggregateError([new Error("a"),new Error("b")],"m")')
+        host      errors.length 2, message 'm', own names 'stack,message,errors'
+        container errors.length 2, message 'm', own names 'message,errors,stack'  (was: 1, '', 'errors,stack')
+
+  The first four were one change and the last two another, both in
+  packages/core/src/process/executors/node/runtime/capabilities/vm.ts:
+   - ownKeysOf walked only ENUMERABLE own keys (Object.keys). Everything that makes an error what it
+     is -- message, stack, cause, an AggregateError's errors -- is own and NON-enumerable, so the
+     rebuilt error carried none of it. It now walks Object.getOwnPropertyNames.
+   - errorOf built every error as `new C(message)`. AggregateError takes its errors FIRST, so
+     `new AggregateError('m')` read the message as the iterable of errors: one error and no message.
+     It now passes [] first. For a name that is not one of the eight the language defines, the
+     rebuild now gets a constructor of that name instead of a plain Error wearing it, so
+     `constructor.name` is the class again.
+  `npx tsc --noEmit` clean in packages/core and `pnpm build` green.
+
+  NOT ENGINE-LIMITED, proved with the pinned QuickJS out of the container
+  (/tmp/owc-j9-napivm/bare-qjs.mjs, quickjs-emscripten 0.32, no container and no guest bootstrap):
+  `new Error('y',{cause:new Error('c')}).cause` is an object, `new AggregateError([a,b],'m')` has 2
+  errors and message 'm', `e.stack='custom'` reads back 'custom', and a subclass of Error answers its
+  own class name. Only the stack's first line is the engine's: bare QuickJS writes
+  '    at <eval> (eval.js:1:10)' with no 'Error: y' header, and the container's guest realm renders the
+  header itself -- so the missing header was the second realm not having that rendering, which the
+  getOwnPropertyNames change now sidesteps by copying the context's own stack across.
+
+  The THROWN half is NOT fixed here and is correctly filed as owc-vm-error-thrown-realm
+  (`e instanceof Error` is still `true` here and `false` on the host, `e.constructor === Error`
+  likewise). Its fix site is runInRecord in
+  packages/core/src/process/executors/node/runtime/guest/modules/pure-b.ts, which another lane has
+  uncommitted changes in -- named rather than edited.
+
+  The INWARD direction the adversary raised is a DIFFERENT symptom and is filed separately as
+  owc-vm-context-shares-caller-realm.
