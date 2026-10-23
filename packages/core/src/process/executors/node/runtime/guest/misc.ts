@@ -2017,8 +2017,24 @@ BF.crypto = function () {
     throw err;
   }
 
+  /*
+   * Node's digest, sign and secret output encoding: an encoding it does not recognise is not an
+   * error, it is simply no encoding at all -- digest('nope'), digest(32), digest(null) and
+   * digest({}) all answer the Buffer, and only a Symbol refuses, because String() of one throws.
+   * 'buffer' names the same answer, and an alias like 'utf-8' or 'binary' is read as its own.
+   */
+  var OUTPUT_ENCODINGS = {
+    hex: 'hex', base64: 'base64', base64url: 'base64url',
+    utf8: 'utf8', 'utf-8': 'utf8', 'unicode-1-1-utf-8': 'utf8',
+    utf16le: 'utf16le', 'utf-16le': 'utf16le', ucs2: 'utf16le', 'ucs-2': 'utf16le',
+    latin1: 'latin1', binary: 'latin1', ascii: 'ascii', buffer: 'buffer'
+  };
+
   function outputOf(bytes, encoding) {
-    return encoding === undefined || encoding === 'buffer' ? bytes : bytes.toString(encoding);
+    /* String(encoding) is the one step that can throw, and it is Node's own message for it. */
+    var name = typeof encoding === 'string' ? encoding : String(encoding);
+    var as = OUTPUT_ENCODINGS[name.toLowerCase()];
+    return as === undefined || as === 'buffer' ? bytes : bytes.toString(as);
   }
 
   /*
@@ -2377,7 +2393,7 @@ BF.crypto = function () {
     return outputOf(this._public, encoding);
   };
   DiffieHellman.prototype.getPrivateKey = function (encoding) {
-    if (this._private === undefined) this.generateKeys();
+    if (this._private === undefined) throw cipherStateError('No private key - did you forget to generate one?');
     return outputOf(this._private, encoding);
   };
   DiffieHellman.prototype.setPublicKey = function (key, encoding) {
@@ -2636,18 +2652,59 @@ BF.crypto = function () {
    * is one synchronous host call and the callback still runs on a later microtask, so a caller
    * that awaits it behaves the same either way.
    */
+  /*
+   * scrypt names each parameter twice: N and cost, r and blockSize, p and parallelization. Node
+   * reads whichever half it is handed and refuses to see both halves of one pair at once. A half
+   * handed over as null was handed over, so it is a type error; one handed over as undefined was
+   * not handed over at all, so it neither clashes with its pair nor offends the type check.
+   */
+  function scryptParam(opts, name, alias) {
+    var own = opts[name];
+    var other = opts[alias];
+    if (own !== undefined && typeof own !== 'number') throw invalidArgType(name, 'of type number', own);
+    if (other === undefined) return own;
+    if (own !== undefined) {
+      var clash = new TypeError('Option "' + name + '" cannot be used in combination with option "' + alias + '"');
+      clash.code = 'ERR_INCOMPATIBLE_OPTION_PAIR';
+      throw clash;
+    }
+    if (typeof other !== 'number') throw invalidArgType(alias, 'of type number', other);
+    return other;
+  }
+
+  function scryptParams(message) {
+    var err = new RangeError(message === undefined ? 'Invalid scrypt params' : message);
+    err.code = 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS';
+    return err;
+  }
+
   function scryptSync(password, salt, keylen, options) {
     var opts = options === undefined || options === null ? {} : options;
     var len = Number(keylen);
     if (!(len >= 0 && len <= 2147483647)) throw outOfRange('keylen', '>= 0 && <= 2147483647', keylen);
+    /* Node reaches its default for a parameter handed over as zero, and rejects a set it cannot
+       derive with before it derives anything: N a power of two above one, r and p positive, and
+       the whole 128*N*r working set inside the budget. */
+    var cost = scryptParam(opts, 'N', 'cost');
+    var block = scryptParam(opts, 'r', 'blockSize');
+    var par = scryptParam(opts, 'p', 'parallelization');
+    var want = opts.maxmem === undefined ? undefined : Number(opts.maxmem);
+    var n = cost === undefined || cost === 0 ? 16384 : cost;
+    var r = block === undefined || block === 0 ? 8 : block;
+    var p = par === undefined || par === 0 ? 1 : par;
+    var budget = want === undefined || want === 0 ? 32 * 1024 * 1024 : want;
+    if (!(n > 1) || (n & (n - 1)) !== 0 || !(r > 0) || !(p > 0)) throw scryptParams();
+    if (128 * n * r > budget) {
+      throw scryptParams('Invalid scrypt params: error:030000AC:digital envelope routines::memory limit exceeded');
+    }
     var out = callCap('crypto.scrypt', {
       password: toBytes(password, undefined, 'password').toString('base64'),
       salt: toBytes(salt, undefined, 'salt').toString('base64'),
       keylen: len,
-      N: opts.N === undefined ? undefined : Number(opts.N),
-      r: opts.r === undefined ? undefined : Number(opts.r),
-      p: opts.p === undefined ? undefined : Number(opts.p),
-      maxmem: opts.maxmem === undefined ? undefined : Number(opts.maxmem)
+      N: cost,
+      r: block,
+      p: par,
+      maxmem: want
     });
     return Buf.from(out, 'base64');
   }
@@ -2669,13 +2726,20 @@ BF.crypto = function () {
    * so the bytes the host answers with are copied into one here.
    */
   function hkdfSync(digest, key, salt, info, keylen) {
-    /* Node requires a salt and bounds the key length by the hash's own block budget. */
+    /* Node requires a salt, and reads the key length as a plain length before it reads it as a key
+       length: one that is not a number, is negative, or is not a whole number is out of range. */
     if (salt === undefined || salt === null) {
       throw invalidArgType('salt', 'of type string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer', salt);
     }
-    if (!(Number(keylen) >= 1 && Number(keylen) <= 8160)) {
-      if (Number(keylen) === 0) throw new Error('Deriving bits failed');
-      var long = new Error('Invalid key length');
+    if (typeof keylen !== 'number') throw invalidArgType('length', 'of type number', keylen);
+    if (!(keylen >= 0 && keylen <= 9007199254740991)) throw outOfRange('length', '>= 0 && <= 9007199254740991', keylen);
+    if (Math.floor(keylen) !== keylen) throw outOfRange('length', 'an integer', keylen);
+    /* An extensible-output digest cannot be the hash of an HKDF: OpenSSL derives nothing. */
+    var hash = String(digest).toLowerCase();
+    if (hash === 'shake128' || hash === 'shake256') throw new Error('Deriving bits failed');
+    if (keylen === 0) throw new Error('Deriving bits failed');
+    if (keylen > 8160) {
+      var long = new RangeError('Invalid key length');
       long.code = 'ERR_CRYPTO_INVALID_KEYLEN';
       throw long;
     }
@@ -2863,6 +2927,22 @@ BF.crypto = function () {
     return cipherBytes(key, undefined, 'key');
   }
 
+  /*
+   * Node fixes a cipher's output encoding on the first update() or final() that names one and
+   * refuses a later call that names a different one, as an assertion rather than a type error.
+   */
+  function cipherOut(cipher, bytes, encoding) {
+    if (encoding === null || encoding === undefined || encoding === false || encoding === 'buffer') return bytes;
+    if (typeof encoding !== 'string') return bytes;
+    if (cipher._encoding !== undefined && cipher._encoding !== encoding) {
+      var clash = new Error('Cannot change encoding');
+      clash.code = 'ERR_INTERNAL_ASSERTION';
+      throw clash;
+    }
+    cipher._encoding = encoding;
+    return bytes.toString(encoding);
+  }
+
   function Cipher(algorithm, direction, id, aead) {
     this._algorithm = algorithm;
     this._direction = direction;
@@ -2870,13 +2950,14 @@ BF.crypto = function () {
     this._aead = aead;
     this._finalized = false;
     this._tag = undefined;
+    this._encoding = undefined;
   }
 
   Cipher.prototype.update = function (data, inputEncoding, outputEncoding) {
     if (this._finalized) throw new Error('Trying to add data in unsupported state');
     var bytes = cipherBytes(data, inputEncoding, 'data');
     var out = Buf.from(cipherCap('crypto.cipher.update', { id: this._id, data: bytes.toString('base64') }), 'base64');
-    return typeof outputEncoding === 'string' ? out.toString(outputEncoding) : out;
+    return cipherOut(this, out, outputEncoding);
   };
 
   Cipher.prototype.final = function (outputEncoding) {
@@ -2885,7 +2966,7 @@ BF.crypto = function () {
     var result = cipherCap('crypto.cipher.final', { id: this._id });
     if (result.tag !== undefined) this._tag = Buf.from(result.tag, 'base64');
     var out = Buf.from(result.data, 'base64');
-    return typeof outputEncoding === 'string' ? out.toString(outputEncoding) : out;
+    return cipherOut(this, out, outputEncoding);
   };
 
   Cipher.prototype.setAutoPadding = function (autoPadding) {
@@ -3291,8 +3372,14 @@ BF.module = function () {
   Module.builtinModules = Object.freeze(NODE_BUILTIN_NAMES.slice());
   Module.isBuiltin = function isBuiltin(name) {
     var id = typeof name === 'string' ? name : '';
-    return Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, id)
-      || Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, stripNodePrefix(id));
+    if (Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, id)) return true;
+    /* One 'node:' and no more: the remainder has to be a name of its own -- 'node:sea' is one, so
+       'node:node:sea' is not, and neither is 'node:node:test/reporters' -- where 'node:fs' is,
+       'fs' being one. Two prefixes stripped would make both of those true. */
+    if (id.indexOf('node:') !== 0) return false;
+    var rest = id.slice(5);
+    if (rest.indexOf('node:') === 0) return false;
+    return Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, rest);
   };
   /* The table of extension handlers: var hoisting made the assignment where the class is built run
      before the table's own initialiser, so the static was undefined while require.extensions -- the

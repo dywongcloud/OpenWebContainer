@@ -352,6 +352,23 @@ function normalizeHeaderValue(value) {
    visible a record of entries could live. */
 var HEADERS_LIST = new WeakMap();
 
+/* The guard Node gives a Headers, beside the instance like the list: 'immutable' on the one a
+   Response.redirect or a Response.error carries, and 'none' on every other, so a write to either
+   of those two throws 'immutable' where the same write to any other Headers succeeds. Node makes
+   the name and the value valid first and the guard second, so it is the guard that answers last. */
+var HEADERS_GUARD = new WeakMap();
+
+function headersRefuseWrite(headers) {
+  /* the brand check a read of the guard goes through too: a plain object is no more immutable
+     than it is a Headers whose list can be reached */
+  headersList(headers);
+  if (HEADERS_GUARD.get(headers) === 'immutable') throw new TypeError('immutable');
+}
+
+function headersImmutable(headers) {
+  HEADERS_GUARD.set(headers, 'immutable');
+}
+
 /* The brand check Node makes before any of the methods: the receiver has to be a Headers, so
    Headers.prototype.get.call({}) and a real Headers whose prototype was swapped out both report
    'Illegal invocation' rather than reading a list that is not theirs. */
@@ -412,6 +429,7 @@ Headers.prototype.append = function append(name, value) {
       throw new TypeError('Headers.append: "' + rawValue + '" is an invalid header value.');
     }
   }
+  headersRefuseWrite(this);
   headersList(this).push({ name: rawName.toLowerCase(), value: normalizeHeaderValue(rawValue) });
 };
 Headers.prototype.delete = function (name) {
@@ -419,6 +437,7 @@ Headers.prototype.delete = function (name) {
   var kept = [];
   var list = headersList(this);
   for (var i = 0; i < list.length; i++) if (list[i].name !== lower) kept.push(list[i]);
+  headersRefuseWrite(this);
   HEADERS_LIST.set(this, kept);
 };
 /* 'delete' cannot be written as a function's own name, so this one is given the name it has on
@@ -882,6 +901,9 @@ Response.prototype.clone = function () {
     url: source.url,
     headers: new Headers(source.headers)
   };
+  /* a clone of a Response whose headers no write can reach keeps them out of reach: the guard is
+     not one of the entries a copy of the Headers reads, so it is carried over by hand */
+  if (HEADERS_GUARD.get(source.headers) === 'immutable') headersImmutable(state.headers);
   RESPONSE_STATE.set(copy, state);
   var from = bodySlots(this);
   var into = bodySlots(copy);
@@ -961,16 +983,29 @@ Response.json = function json(data, init = {}) {
    var in this scope, and the later one wins -- which is why Response.redirect threw "not a
    function" at REDIRECT_STATUSES.indexOf, the set having replaced the list by the time it ran. */
 var REDIRECT_STATUS_LIST = [301, 302, 303, 307, 308];
+/* The status Node reads off the argument: an unsigned short, so 301.5 arrives as the 301 it is
+   truncated to, and a NaN, an infinity or either zero arrives as 0. It is the number after that
+   conversion the range check makes and the one the message quotes -- 'Invalid status code 0' for
+   a NaN, not 'Invalid status code NaN'. */
+function redirectStatusCode(status) {
+  var x = Number(status);
+  if (x !== x || x === 0 || x === Infinity || x === -Infinity) return 0;
+  return (x < 0 ? -Math.floor(-x) : Math.floor(x)) % 65536;
+}
 Response.redirect = function redirect(url, status = 302) {
   if (arguments.length < 1) throw new TypeError('Response.redirect: 1 argument required, but 0 found.');
-  var code = status === undefined ? 302 : Number(status);
-  if (REDIRECT_STATUS_LIST.indexOf(code) < 0) throw new RangeError('Invalid status code ' + String(status));
+  var code = status === undefined ? 302 : redirectStatusCode(status);
+  if (REDIRECT_STATUS_LIST.indexOf(code) < 0) throw new RangeError('Invalid status code ' + String(code));
   var parsed = requestableUrl(url);
   if (parsed === null) throw unparseableUrl(url);
-  return new Response(null, { status: code, headers: { location: parsed.href } });
+  var res = new Response(null, { status: code, headers: { location: parsed.href } });
+  headersImmutable(responseState(res).headers);
+  return res;
 };
 Response.error = function error() {
   var res = Object.create(Response.prototype);
+  var headers = new Headers();
+  headersImmutable(headers);
   RESPONSE_STATE.set(res, {
     status: 0,
     statusText: '',
@@ -978,7 +1013,7 @@ Response.error = function error() {
     type: 'error',
     redirected: false,
     url: '',
-    headers: new Headers()
+    headers: headers
   });
   return res;
 };
@@ -1050,6 +1085,14 @@ function requestState(req) {
   return state;
 }
 
+/* One field of the options a Request is built with: what init names, else what the Request being
+   copied already carries, else the default the field has on a Request built from a URL. */
+function requestOption(options, inherited, key, fallback) {
+  if (options[key] !== undefined) return String(options[key]);
+  if (inherited !== null && inherited !== undefined && inherited[key] !== undefined) return inherited[key];
+  return fallback;
+}
+
 function requestField(name, key) {
   Object.defineProperty(Request.prototype, name, {
     get: function () { return requestState(this)[key]; },
@@ -1067,6 +1110,10 @@ function Request(target, options) {
   var rawMethod = 'GET';
   var headersInit = undefined;
   var bodyIn = null;
+  /* Everything a Request carries that init can name, and that a Request built from a Request
+     therefore starts out with: only what init names is taken from init, so 'redirect' survives
+     into a copy that says nothing about it. */
+  var inherited = null;
   if (target instanceof Request) {
     var given = bodySlots(target);
     if (given.used) {
@@ -1075,6 +1122,7 @@ function Request(target, options) {
     url = target.url;
     rawMethod = target.method;
     headersInit = target.headers;
+    inherited = requestState(target);
     if (given.bytes !== null && given.bytes !== undefined) bodyIn = given.bytes;
     else if (given.stream !== null && given.stream !== undefined) bodyIn = given.stream;
     else if (given.pending !== null && given.pending !== undefined) bodyIn = given.pending;
@@ -1104,19 +1152,20 @@ function Request(target, options) {
   slots.pending = made.pending;
   slots.used = false;
   state.signal = options.signal !== undefined && options.signal !== null ? options.signal : undefined;
-  state.mode = options.mode === undefined ? 'cors' : String(options.mode);
-  state.credentials = options.credentials === undefined ? 'same-origin' : String(options.credentials);
-  state.cache = options.cache === undefined ? 'default' : String(options.cache);
-  state.redirect = options.redirect === undefined ? 'follow' : String(options.redirect);
+  state.mode = requestOption(options, inherited, 'mode', 'cors');
+  state.credentials = requestOption(options, inherited, 'credentials', 'same-origin');
+  state.cache = requestOption(options, inherited, 'cache', 'default');
+  state.redirect = requestOption(options, inherited, 'redirect', 'follow');
   /* a mode that is not one of the three is refused here too, and not only when the Request is fetched */
   if (state.redirect !== 'follow' && state.redirect !== 'manual' && state.redirect !== 'error') {
     throw new TypeError('undefined: ' + String(options.redirect) +
       ' is not an accepted type. Expected one of follow, manual, error.');
   }
-  state.referrer = options.referrer === undefined ? 'about:client' : String(options.referrer);
-  state.referrerPolicy = options.referrerPolicy === undefined ? '' : String(options.referrerPolicy);
-  state.integrity = options.integrity === undefined ? '' : String(options.integrity);
-  state.keepalive = options.keepalive === undefined ? false : !!options.keepalive;
+  state.referrer = requestOption(options, inherited, 'referrer', 'about:client');
+  state.referrerPolicy = requestOption(options, inherited, 'referrerPolicy', '');
+  state.integrity = requestOption(options, inherited, 'integrity', '');
+  state.keepalive = options.keepalive !== undefined ? !!options.keepalive
+    : (inherited !== null ? !!inherited.keepalive : false);
   state.destination = '';
   state.isReloadNavigation = false;
 }
@@ -1177,7 +1226,14 @@ Object.defineProperty(Request.prototype, Symbol.toStringTag, { value: 'Request',
 /* Node's order on the prototype: clone, then the ways to read a body, then the attribute slot. */
 Request.prototype.clone = function () {
   if (bodySlots(this).used) throw new TypeError('unusable');
-  var copy = new Request(this.url, { method: this.method, headers: this.headers });
+  /* a clone is a copy of the whole Request and not only of its URL, method and headers: the mode,
+     the credentials, the cache and the redirect mode all come with it */
+  var source = requestState(this);
+  var copy = new Request(this.url, { method: this.method, headers: this.headers,
+    mode: source.mode, credentials: source.credentials, cache: source.cache,
+    redirect: source.redirect, referrer: source.referrer,
+    referrerPolicy: source.referrerPolicy, integrity: source.integrity,
+    keepalive: source.keepalive });
   var from = bodySlots(this);
   var into = bodySlots(copy);
   if (from.stream !== null && from.stream !== undefined) {

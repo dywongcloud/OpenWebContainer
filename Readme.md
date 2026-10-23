@@ -622,6 +622,18 @@ Recorded rather than fixed:
   there too, against `number` under host Node 24.15), so this is the engine's own parse and not a
   rewrite of this container's. (`owc-quickjs032-get-newline`.)
 
+Two `repl` shapes are left that no rewrite here closes, both measured against host Node 24.15: a
+rejected top-level await prints no frame -- `await Promise.reject(new TypeError("bad"))` is
+`> Uncaught TypeError: bad\n> ` here where the host prints `> Uncaught TypeError: bad\n    at REPL19:1:54\n> `,
+the column being the offset of the throw site inside Node's own async wrapper, which is not a string
+this container builds and so not one it can number; and a line that opens with a brace is
+paren-wrapped by the host even when the result does not compile, so `{ await 3 }` is reported by the
+host as `({ await 3 })` with `Cannot use 'await' as identifier inside an async function` and here as
+the unwrapped `{ await 3 }` with the engine's `expecting ';'` -- the wrap here is tried only when
+`('{' + line + '\n)')` compiles. Bare QuickJS 0.32 with no container in the way refuses
+`if (1) { await 3 }` and `var a = await [1,2]` outright (`expecting ';'`, `'await' is not defined`),
+so both belong to the wrapper this repl builds and not to the engine.
+
 ### ⚠️ Old toolchains that call Node internals: `npx create-react-app my-app`
 
 `create-react-app@5.1.0` is a 2022 toolchain, and on its way to `Creating a new React app` it loads
