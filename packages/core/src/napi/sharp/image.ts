@@ -712,6 +712,24 @@ export interface ResizeSpec {
      * REDUCEV_STRIP_DECODED.
      */
     decoded?: boolean;
+    /**
+     * Where the entropy crop landed, and so where the resample has to clock. A gravity crop knows
+     * its own left and top before the resample runs -- `offsetOf` reads them off `position` -- but
+     * `vips_smartcrop` does not: it writes its whole input to memory to score it, which generates
+     * every row from row 0, and only then does `vips_extract_area` ask the resample for the rows
+     * the crop keeps. Those rows come from a SECOND render, one whose running sum starts at the
+     * crop's own top and left, not at 0 -- so an entropy crop is a gravity crop at whatever offset
+     * the scoring picked, and the resample has to be clocked to that offset and not to the centre
+     * `offsetOf`'s default answers for a position it does not know.
+     *
+     * Measured against sharp 0.33.5 on a 96x64 -> cover 33x17 nearest resize: the host's entropy
+     * crop is (0, 0) and its 1683 bytes hash 2190852216, byte for byte what `position: 'top'` gives
+     * -- the same crop, the same clock -- while `centre`, whose clock is the 3 the default answers,
+     * hashes 2277544656. Clocking the resample to the crop the shim itself picked restores that
+     * equality at the six shapes it was measured at, and leaves the 46 gravity positions alone.
+     */
+    cropLeft?: number;
+    cropTop?: number;
 }
 
 /**
@@ -939,6 +957,7 @@ export function resizeImage(image: Image, spec: ResizeSpec): { image: Image; res
  * it (16x8 -> 10x5 fill nearest agrees at every column).
  */
 function horizontalClock(spec: ResizeSpec, sw: number): number {
+    if (spec.cropLeft !== undefined) return spec.cropLeft;
     const cw = Math.min(spec.width > 0 ? spec.width : sw, sw);
     if (cw >= sw) return 0;
     return offsetXOf(spec.position, sw, cw, true);
@@ -1004,6 +1023,7 @@ function verticalClock(spec: ResizeSpec, sh: number): number {
     if (spec.canvas !== 'crop' || spec.transposed === true) return 0;
     const ch = Math.min(spec.height > 0 ? spec.height : sh, sh);
     if (ch >= sh) return 0;
+    if (spec.cropTop !== undefined) return spec.flipRows === true ? sh - spec.cropTop - ch : spec.cropTop;
     const top = offsetOf(spec.position, sh, ch, true);
     return spec.flipRows === true ? sh - top - ch : top;
 }
