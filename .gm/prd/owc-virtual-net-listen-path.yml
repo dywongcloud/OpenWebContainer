@@ -23,3 +23,8 @@ body: |-
 
       host node 24.15:        listen(path) listening=yes code=none
       container (HEAD bc261b6): listen(path) listening=no code=THREW ERR_SOCKET_BAD_PORT
+
+  RE-MEASURED (adv5-fix-http2-net-5) at HEAD 0379fed + the hub fix of row owc-virtual-net-ipv6-family,
+  four container runs, all four identical: still listening=no code=THREW ERR_SOCKET_BAD_PORT against
+  the host's listening=yes code=none. Unfixed: closing it means implementing unix domain sockets,
+  which this runtime does not have and which no shard of this run owns. The row stays open.
