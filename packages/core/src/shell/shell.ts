@@ -167,7 +167,11 @@ export class Shell implements IShell {
             this.moduleFs,
             this.process.pid
         );
-        this.shellState.shellName = 'sh';
+        /* `$0` -- and the prefix of every diagnostic this shell writes -- is the name the shell was
+           started under, which is the path a caller named when it named one: a host's `exec`, which
+           runs `/bin/sh`, answers `/bin/sh`, where a `spawn('sh', ...)` answers `sh`. Anything the
+           process carries no name for is the bare name, as it was when it was written here. */
+        this.shellState.shellName = options.process.executablePath || 'sh';
         this.shellState.host = this;
         /* An interactive shell has job control -- `fg` can resume a job and `&` announces one --
            and `sh -c <line>` has none: it has no terminal to hand to a job, which is why bash
@@ -665,11 +669,13 @@ export class Shell implements IShell {
         if (handler !== undefined) {
             try {
                 const result = handler(this.moduleContext(args, input));
-                /* `printf` is a built-in of a host's shell and not a utility on PATH, and a
-                   built-in's complaint carries the shell's name and the line it stands on:
-                   `printf '%d' notanumber` is `sh: line 0: printf: notanumber: invalid number`,
-                   where the utility's own text named no shell at all. */
-                if (command === 'printf' && result.exitCode !== 0 && result.stderr !== '' && !result.stderr.startsWith('usage:')) {
+                /* `printf` and `kill` are built-ins of a host's shell and not utilities on PATH,
+                   and a built-in's complaint carries the shell's name and the line it stands on:
+                   `printf '%d' notanumber` is `sh: line 0: printf: notanumber: invalid number` and
+                   `kill -X 1` is `sh: line 0: kill: X: invalid signal specification`, where the
+                   utility's own text named no shell at all. */
+                if ((command === 'printf' || command === 'kill') && result.exitCode !== 0 && result.stderr !== ''
+                    && !/^(usage:|[a-z]+: usage:)/.test(result.stderr)) {
                     return { ...result, stderr: `${diagnosticPrefix(this.shellState)}${result.stderr}` };
                 }
                 return result;
@@ -843,6 +849,16 @@ export class Shell implements IShell {
                             joined += numbered(input ?? '');
                             continue;
                         }
+                        /* No terminal stands behind a shell whose line was handed to it, which is
+                           what opening `/dev/tty` meets there: `cat: /dev/tty: Device not
+                           configured` and 1, the same refusal the redirection `> /dev/tty` already
+                           gives. The file system holds no `/dev/tty` to open, so it was answered
+                           as a path that is not there -- `No such file or directory` -- which is a
+                           different failure than the one a host's own open of the name reports. */
+                        if (name === '/dev/tty') {
+                            errors += `cat: ${name}: Device not configured\n`;
+                            continue;
+                        }
                         const path = at(name);
                         /* A directory is named and passed over, not read as if it were a file:
                            `mkdir sd; cat sd` is `cat: sd: Is a directory` on a host, with the
@@ -982,13 +998,30 @@ export class Shell implements IShell {
                     return ok();
                 case 'cd': {
                     const target = args[0] || '/';
-                    const next = at(target);
-                    if (!fs.isDirectory(next)) return fail(`Directory not found: ${target}`);
+                    /* `-` is the directory the shell came from, and a host names the one it lands
+                       on as it changes: `cd /tmp; cd -` prints the directory it went back to and
+                       leaves 0, where reading `-` as the name of a directory gave ENOENT on
+                       `/tmp/-`. */
+                    const back = target === '-';
+                    const previous = this.currentDirectory;
+                    const wanted = back ? (this.env.get('OLDPWD') ?? previous) : target;
+                    const next = at(wanted);
+                    if (!this.isDirectorySafe(next)) {
+                        /* The reason a host gives is the one the name itself asks for: a path no
+                           directory and no file stand behind is `No such file or directory`, and
+                           one a file stands behind is `Not a directory` -- `cd /nosuchdir` is the
+                           first and `cd f`, `f` being a file, the second. A built-in's complaint
+                           carries the shell's name and the line it stands on, which is how the
+                           utility's own bare text read here before. */
+                        const reason = this.fileExistsSafe(next) ? 'Not a directory' : 'No such file or directory';
+                        return fail(`${diagnosticPrefix(this.shellState)}cd: ${target}: ${reason}\n`);
+                    }
                     this.shellState.cwd = next;
                     this.currentDirectory = next;
+                    this.env.set('OLDPWD', previous);
                     this.env.set('PWD', next);
                     this.shellState.scopes[0].set('PWD', { value: next, export: true });
-                    return ok();
+                    return back ? ok(`${wanted}\n`) : ok();
                 }
                 case 'cp':
                     return this.copyCommand(args);
