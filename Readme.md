@@ -469,7 +469,12 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   `spawn('sh', ['-c', 'trap "echo TRAPPED" TERM; echo A; sleep 2; echo B'], { timeout: 400, killSignal:
   'SIGTERM' })` prints `A`, `TRAPPED`, `B` and exits 0 at 2010 ms there, and prints `A` with signal SIGTERM
   and no status at 404 ms here. The caller's timer terminates the shell process rather than delivering the
-  signal into it, and the exit the caller is given is the kill's, not the line's.
+  signal into it, and the exit the caller is given is the kill's, not the line's. The trap is not merely
+  bypassed on that path: with no `timeout` and no host timer anywhere in the line,
+  `sh -c 'trap "echo TRAPPED" TERM; kill -TERM $$; echo after'` answers `TRAPPED\nafter\n` with status 0
+  on the host and nothing at all with status -1 here, while `trap ... EXIT` agrees on both (`X\nBYE\n`,
+  0). A `TERM` trap is registered and never run -- `runTrap` in
+  `packages/core/src/shell/commands/builtins.ts` is exported for `EXIT`, `ERR` and `DEBUG` only.
 - **A `timeout` on a `sh -c` line ends the line's own child as well.** `spawn('sh', ['-c', 'echo shell; node
   busy.js'], { timeout: 400, killSignal: 'SIGKILL' })` closes at 408 ms here with `shell`, where host node
   24.15 closes at 5033 ms with `shell` and `BUSY-DONE`: the host kills only the `sh` it spawned, and the
@@ -525,6 +530,17 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   process `unhandledRejection` listener on both -- and over the eight combinations of a domain that
   listens, an `uncaughtException` listener and an `unhandledRejection` listener the two sides now
   agree on stdout, stderr and exit code in all eight.
+- **A child that ends by a signal reports the number, where a host reports the signal.**
+  `spawn(process.execPath, ['sig.js', 'SIGUSR1'])` with the child sending that name to itself gives a
+  parent `status=null, signal=SIGUSR1` on host node 24.15 and `status=158, signal=null` here, and the
+  same for every fatal name: measured over 31 names with no listener registered and 31 with one
+  registered and removed, the two sides agree throughout on *which* names end a process and which are
+  ignored (`SIGURG`, `SIGCONT`, `SIGCHLD`, `SIGIO`, `SIGWINCH`, `SIGINFO`, and with no listener
+  `SIGPIPE`, `SIGXFSZ` and `SIGUSR1`), and differ only in how the end is reported -- plus `SIGSTOP`,
+  which stops a host process and ends this one at 145. A `sh` child the caller's own `timeout` killed
+  does report its signal, because that path sets one. The site is the exit status a child hands its
+  parent in `packages/core/src/process/executors/node/runtime/capabilities/child.ts`
+  (`record.killSignal ?? null`), which has no signal to name for a process that ended itself.
 - **`process.setuid` and the rest of the id surface are refused, not missing.** `getuid`, `geteuid`, `getgid`,
   `getegid` and `getgroups` answer, and `setuid`, `seteuid`, `setgid`, `setegid`, `setgroups` and
   `initgroups` throw the host's `EPERM` as they do for a process that is not root; `getgroups` returns the
@@ -706,13 +722,29 @@ Two `repl` shapes are left that no rewrite here closes, both measured against ho
 rejected top-level await prints no frame -- `await Promise.reject(new TypeError("bad"))` is
 `> Uncaught TypeError: bad\n> ` here where the host prints `> Uncaught TypeError: bad\n    at REPL19:1:54\n> `,
 the column being the offset of the throw site inside Node's own async wrapper, which is not a string
-this container builds and so not one it can number; and a line that opens with a brace is
-paren-wrapped by the host even when the result does not compile, so `{ await 3 }` is reported by the
-host as `({ await 3 })` with `Cannot use 'await' as identifier inside an async function` and here as
-the unwrapped `{ await 3 }` with the engine's `expecting ';'` -- the wrap here is tried only when
-`('{' + line + '\n)')` compiles. Bare QuickJS 0.32 with no container in the way refuses
-`if (1) { await 3 }` and `var a = await [1,2]` outright (`expecting ';'`, `'await' is not defined`),
-so both belong to the wrapper this repl builds and not to the engine.
+this container builds and so not one it can number; and the object a session's lines run against is not
+the object `globalThis` names inside one, so a binding set through `globalThis` does not come back --
+`globalThis.zz = 3` then `zz` prints `3` on the host and raises `ReferenceError: zz is not defined`
+here, `globalThis === this` is `true` there and `false` here, and `require`, `global` and `console` are
+`undefined` inside a session (`typeof module` is `function` here and `object` there). The site is the
+context a session runs in: `vm.createContext` hands out a sandbox that `vm.runInContext` reads through a
+with-scope, so a bare name resolves against the sandbox while `globalThis` is the engine's own global --
+and the sandbox is not a proxy, so pointing `globalThis` at it would cost `globalThis.Math` and every
+other intrinsic it does not carry. Bare QuickJS 0.32 with no container in the way refuses
+`if (1) { await 3 }` and `var a = await [1,2]` outright (`expecting ';'`, `'await' is not defined`), so
+the await frame belongs to the wrapper this repl builds and not to the engine.
+
+Two shapes of that same surface were closed here. A line that opens with a brace is paren-wrapped as the
+host wraps it -- `{ await 3 }` is now reported as `({ await 3 })` on both sides, `{ a: 1 } // c` answers
+`1` and no longer `{ a: 1 }`, and nine of ten brace shapes are byte-identical; the words under the caret
+stay the engine's (`expecting '}'`) where V8's are `Cannot use 'await' as identifier inside an async
+function`. And a second declaration of a name the session already bound is refused as the host refuses
+it: `const c1` twice, `let l1` twice, `class C1` twice, `var m1` then `let m1`, `let n1` then `var n1`,
+and `function n3` then `const n3` each answer
+`Uncaught SyntaxError: Identifier 'c1' has already been declared`, twelve of twelve shapes
+byte-identical on both sides. The names are kept on the session rather than left to the context, because
+the rewrite that carries a `let` across lines turns it into a `var` and the context would never see the
+name twice.
 
 ### ⚠️ Old toolchains that call Node internals: `npx create-react-app my-app`
 

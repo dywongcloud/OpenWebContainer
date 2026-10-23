@@ -290,6 +290,32 @@ export const SRC = String.raw`
     return out + src.slice(cursor);
   }
 
+  /* REPL only: the names a line binds at its own top level, split the way node's context holds
+     them. A let, a const and a class are lexical, and a context that already binds the name
+     refuses the second one with a SyntaxError that names it; a var and a function are not, and
+     may be declared again. Only a declaration the line opens with is one: a let a for keeps
+     inside its parens and one a block keeps inside its braces are at a depth that is not 0, and
+     a name that is not an identifier -- a destructuring pattern, a generator's star -- is left
+     out rather than guessed at. */
+  function replTopDecls(src) {
+    var toks = vmLex(src).toks;
+    var lexical = [];
+    var loose = [];
+    for (var k = 0; k < toks.length; k++) {
+      var t = toks[k];
+      if (t.t !== 'id' || t.depth !== 0) continue;
+      var lexicalKind = t.v === 'let' || t.v === 'const' || t.v === 'class';
+      if (lexicalKind !== true && t.v !== 'var' && t.v !== 'function') continue;
+      var prev = toks[k - 1];
+      if (prev && !(prev.t === 'punct' && (prev.v === ';' || prev.v === '}'))) continue;
+      var nx = toks[k + 1];
+      if (nx === undefined || nx.t !== 'id') continue;
+      if (lexicalKind) lexical.push(nx.v);
+      else loose.push(nx.v);
+    }
+    return { lexical: lexical, loose: loose };
+  }
+
   // Names introduced by var anywhere in the code. Reads of these resolve to undefined
   // instead of ReferenceError; nested-function vars over-approximate harmlessly.
   function declaredNames(src) {
@@ -2384,6 +2410,12 @@ export const SRC = String.raw`
       this._closed = false;
       this._detach = null;
       this._rl = null;
+      /* The names this session has bound at its top level: _lexical the ones a let, a const or a
+         class made, and _bound every one of them, which is what a second declaration is checked
+         against -- node's context refuses a name it already holds, and the rewrite that keeps a
+         binding alive across lines would otherwise hide that. */
+      this._lexical = Object.create(null);
+      this._bound = Object.create(null);
       this.context = undefined;
       installBuiltinCommands(this);
       this._resetContext();
@@ -2456,7 +2488,33 @@ export const SRC = String.raw`
       var code = src;
       this._awaited = false;
       this._awaitValue = false;
-      if (/^\s*\{/.test(src) && compiles('(' + src + '\n)')) code = '(' + src + '\n)';
+      /* A line that opens with a brace: node wraps it in one pair of parens so it reads as an
+         object literal and not as a block, and decides by trying both readings. The wrapped one
+         wins whenever it compiles -- '{ a: 1 }' is an object and not a block, and '{ "a": 1 }'
+         compiles only wrapped. When it does not, the unwrapped one wins if it compiles: '{ 1 }',
+         '{ let x = 1 }' and '{ a: 1 } // c', whose comment would eat the closing paren. When
+         neither compiles it is still the wrapped form node reports, which is why '{ await 3 }'
+         is shown and caret'd as '({ await 3 })' and not as it was written. Measured against host
+         node 24.15 over ten brace shapes; the message the engine words is its own either way. */
+      if (/^\s*\{/.test(src)) {
+        var braced = '(' + src + ')';
+        var bracedAwaits = replTopLevelAwait(src);
+        if (compiles(braced)) code = braced;
+        else if (!compiles(src) && (bracedAwaits === null || bracedAwaits.code === null)) code = braced;
+      }
+      /* Read before the rewrite below, which turns a let, a const and a class into a var and so
+         would leave nothing to tell one from another. */
+      var decls = replTopDecls(code);
+      for (var dl = 0; dl < decls.lexical.length; dl++) {
+        if (this._bound[decls.lexical[dl]] === true) {
+          throw new SyntaxError("Identifier '" + decls.lexical[dl] + "' has already been declared");
+        }
+      }
+      for (var dd = 0; dd < decls.loose.length; dd++) {
+        if (this._lexical[decls.loose[dd]] === true) {
+          throw new SyntaxError("Identifier '" + decls.loose[dd] + "' has already been declared");
+        }
+      }
       code = rewriteTopLexical(code);
       /* A line with a top-level await runs inside the wrapper instead, and says so: the value the
          promise it hands back resolves to is what the session sees, and the prompt waits for it. */
@@ -2471,8 +2529,16 @@ export const SRC = String.raw`
          line as it was written, and not the wrapper, which is what Node underlines too. */
       this._code = code;
       if (this._awaitValue === true) code = wrapped.code;
-      if (this.useGlobal) return (0, eval)(code);
-      return vm.runInContext(code, this.context);
+      var value = this.useGlobal ? (0, eval)(code) : vm.runInContext(code, this.context);
+      /* A binding that survived the line is one the next line cannot make again: the rewrite
+         above turns a let, a const and a class into a var, so the context they run in never sees
+         the name twice and would never refuse it. Node's does, so the names are kept here. */
+      for (var dn = 0; dn < decls.lexical.length; dn++) {
+        this._lexical[decls.lexical[dn]] = true;
+        this._bound[decls.lexical[dn]] = true;
+      }
+      for (var dv = 0; dv < decls.loose.length; dv++) this._bound[decls.loose[dv]] = true;
+      return value;
     };
 
     REPLServer.prototype._showResult = function (value) {
