@@ -9,7 +9,7 @@ import { sha384, sha512 } from '@noble/hashes/sha512';
 import { sha512_224, sha512_256 } from '@noble/hashes/sha2';
 import { sha3_224, sha3_256, sha3_384, sha3_512, shake128, shake256 } from '@noble/hashes/sha3';
 import { cbc, cfb, ctr, ecb, gcm } from '@noble/ciphers/aes';
-import { chacha20poly1305 } from '@noble/ciphers/chacha';
+import { chacha20, chacha20poly1305 } from '@noble/ciphers/chacha';
 import { ed25519 as nobleEd25519, x25519 as nobleX25519 } from '@noble/curves/ed25519';
 import { ed448 as nobleEd448, x448 as nobleX448 } from '@noble/curves/ed448';
 import { p256, p384, p521 } from '@noble/curves/nist';
@@ -296,28 +296,96 @@ function hkdfBytes(spec: DigestSpec, ikm: Uint8Array, salt: Uint8Array, info: Ui
  * update(); the concatenation of update() and final() is Node's either way.
  * ------------------------------------------------------------------------------------------ */
 
-type CipherMode = 'ecb' | 'cbc' | 'ctr' | 'cfb' | 'gcm' | 'cc20p';
+type CipherMode =
+    | 'ecb'
+    | 'cbc'
+    | 'ctr'
+    | 'cfb'
+    | 'cfb8'
+    | 'cfb1'
+    | 'ofb'
+    | 'xts'
+    | 'gcm'
+    | 'cc20p'
+    | 'cc20'
+    | 'wrap'
+    | 'wrappad'
+    | 'ccm'
+    | 'ocb';
 
 interface CipherSpec {
     mode: CipherMode;
     keyLength: number;
     /** 16 where OpenSSL emits a block at a time, 1 where it emits everything it is given. */
     blockSize: number;
-    /** 0 for ECB, an exact length for the rest, -1 for GCM's variable nonce. */
+    /** 0 for ECB, an exact length for the rest, -1 for GCM's variable nonce, -2 for a range. */
     ivLength: number;
+    /** The ends of that range: CCM takes 7..13 and OCB 1..15, both named by their standards. */
+    ivMin?: number;
+    ivMax?: number;
+    /** CCM and OCB are refused unless createCipheriv is given an authTagLength, which the guest
+     *  never passes: Node's own default here is to throw, so these two are listed and no more. */
+    needsAuthTagLength?: boolean;
     aead: boolean;
 }
 
 const CIPHER_SPECS: Record<string, CipherSpec> = {};
+/** The names getCiphers() answers, spelled as OpenSSL spells them. Lookup is case-insensitive. */
+const CIPHER_NAMES: string[] = [];
+
+function addCipher(name: string, spec: CipherSpec): void {
+    CIPHER_SPECS[name.toLowerCase()] = spec;
+    CIPHER_NAMES.push(name);
+}
+
 for (const bits of [128, 192, 256]) {
     const keyLength = bits / 8;
-    CIPHER_SPECS[`aes-${bits}-ecb`] = { mode: 'ecb', keyLength, blockSize: 16, ivLength: 0, aead: false };
-    CIPHER_SPECS[`aes-${bits}-cbc`] = { mode: 'cbc', keyLength, blockSize: 16, ivLength: 16, aead: false };
-    CIPHER_SPECS[`aes-${bits}-ctr`] = { mode: 'ctr', keyLength, blockSize: 1, ivLength: 16, aead: false };
-    CIPHER_SPECS[`aes-${bits}-cfb`] = { mode: 'cfb', keyLength, blockSize: 1, ivLength: 16, aead: false };
-    CIPHER_SPECS[`aes-${bits}-gcm`] = { mode: 'gcm', keyLength, blockSize: 1, ivLength: -1, aead: true };
+    const cbc: CipherSpec = { mode: 'cbc', keyLength, blockSize: 16, ivLength: 16, aead: false };
+    const gcm: CipherSpec = { mode: 'gcm', keyLength, blockSize: 1, ivLength: -1, aead: true };
+    const ccm: CipherSpec = {
+        mode: 'ccm', keyLength, blockSize: 1, ivLength: -2, ivMin: 7, ivMax: 13, aead: true, needsAuthTagLength: true
+    };
+    const wrap: CipherSpec = { mode: 'wrap', keyLength, blockSize: 1, ivLength: 8, aead: false };
+    const wrapPad: CipherSpec = { mode: 'wrappad', keyLength, blockSize: 1, ivLength: 4, aead: false };
+    addCipher(`aes-${bits}-ecb`, { mode: 'ecb', keyLength, blockSize: 16, ivLength: 0, aead: false });
+    addCipher(`aes-${bits}-cbc`, cbc);
+    addCipher(`aes-${bits}-ctr`, { mode: 'ctr', keyLength, blockSize: 1, ivLength: 16, aead: false });
+    addCipher(`aes-${bits}-cfb`, { mode: 'cfb', keyLength, blockSize: 1, ivLength: 16, aead: false });
+    addCipher(`aes-${bits}-cfb8`, { mode: 'cfb8', keyLength, blockSize: 1, ivLength: 16, aead: false });
+    addCipher(`aes-${bits}-cfb1`, { mode: 'cfb1', keyLength, blockSize: 1, ivLength: 16, aead: false });
+    addCipher(`aes-${bits}-ofb`, { mode: 'ofb', keyLength, blockSize: 1, ivLength: 16, aead: false });
+    addCipher(`aes-${bits}-gcm`, gcm);
+    addCipher(`aes-${bits}-ccm`, ccm);
+    addCipher(`aes-${bits}-ocb`, {
+        mode: 'ocb', keyLength, blockSize: 1, ivLength: -2, ivMin: 1, ivMax: 15, aead: true, needsAuthTagLength: true
+    });
+    /* OpenSSL carries no aes-192-xts: the tweak key would be a 192-bit half, and neither the
+       standard nor the provider defines one. */
+    if (bits !== 192) addCipher(`aes-${bits}-xts`, { mode: 'xts', keyLength: keyLength * 2, blockSize: 1, ivLength: 16, aead: false });
+    /* The aliases OpenSSL answers: the bare size is CBC, and id-aes* is the cipher's own OID name,
+       which keeps the upper-case tag its OID carries. */
+    addCipher(`aes${bits}`, cbc);
+    addCipher(`id-aes${bits}-GCM`, gcm);
+    addCipher(`id-aes${bits}-CCM`, ccm);
+    addCipher(`aes${bits}-wrap`, wrap);
+    addCipher(`aes${bits}-wrap-pad`, wrapPad);
+    addCipher(`id-aes${bits}-wrap`, wrap);
+    addCipher(`id-aes${bits}-wrap-pad`, wrapPad);
 }
-CIPHER_SPECS['chacha20-poly1305'] = { mode: 'cc20p', keyLength: 32, blockSize: 1, ivLength: 12, aead: true };
+/* OpenSSL accepts the spelled-out aes-<n>-wrap names as well but does not list them, so they are
+   looked up and never answered by getCiphers(). */
+function addAlias(name: string, spec: CipherSpec): void {
+    CIPHER_SPECS[name.toLowerCase()] = spec;
+}
+
+for (const bits of [128, 192, 256]) {
+    const keyLength = bits / 8;
+    addAlias(`aes-${bits}-wrap`, { mode: 'wrap', keyLength, blockSize: 1, ivLength: 8, aead: false });
+    addAlias(`aes-${bits}-wrap-pad`, { mode: 'wrappad', keyLength, blockSize: 1, ivLength: 4, aead: false });
+}
+/* OpenSSL's chacha20 takes a 16-byte IV: a 32-bit counter first, then the RFC 8439 nonce. */
+addCipher('chacha20', { mode: 'cc20', keyLength: 32, blockSize: 1, ivLength: 16, aead: false });
+addCipher('chacha20-poly1305', { mode: 'cc20p', keyLength: 32, blockSize: 1, ivLength: 12, aead: true });
 
 /** GCM accepts a nonce of almost any length in Node; @noble draws the line at 8 bytes. */
 const GCM_MIN_IV = 8;
@@ -341,6 +409,8 @@ interface CipherState {
     autoPadding: boolean;
     /** Whether any data has been through update(): AAD cannot be set after it has. */
     updated: boolean;
+    /** XTS and the two key wraps answer once and refuse a second update, as OpenSSL does. */
+    emitted: boolean;
     aad: Uint8Array;
     tag?: Uint8Array;
 }
@@ -388,6 +458,9 @@ function transformBlocks(state: CipherState, bytes: Uint8Array): Uint8Array {
     const { spec, key } = state;
     const encrypt = state.direction === 'encrypt';
     if (bytes.length === 0) return new Uint8Array(0);
+    if (spec.mode === 'ofb' || spec.mode === 'cfb8' || spec.mode === 'cfb1' || spec.mode === 'cc20') {
+        return streamBytes(state, bytes);
+    }
     switch (spec.mode) {
         case 'ecb': {
             const cipher = ecb(key, { disablePadding: true });
@@ -436,9 +509,224 @@ function transformBlocks(state: CipherState, bytes: Uint8Array): Uint8Array {
     }
 }
 
-/** The raw AES block encryption of the current register or counter: ECB over one block, padding off. */
+/** The raw AES block encryption of the current register or counter: ECB over one block, padding off.
+ *  @noble's cipher objects are one-shot, so each block gets its own. */
 function aesBlock(state: CipherState): Uint8Array {
     return ecb(state.key, { disablePadding: true }).encrypt(state.iv);
+}
+
+/* Streaming modes OpenSSL answers with everything it is given. OFB feeds the keystream block back
+ * into the register; CFB8 shifts the register one byte at a time and CFB8's one-bit cousin one bit
+ * at a time, each inserting the byte or bit it produced (or consumed) at the low end; and ChaCha20
+ * counts blocks from the counter OpenSSL takes as the first four bytes of the IV. */
+
+/** One pass over whole blocks, padding off: the caller pads, or holds a block back, itself. */
+function streamBytes(state: CipherState, bytes: Uint8Array): Uint8Array {
+    const key = state.key;
+    const encrypt = state.direction === 'encrypt';
+    const out = new Uint8Array(bytes.length);
+    switch (state.spec.mode) {
+        case 'ofb': {
+            for (let i = 0; i < bytes.length; i++) {
+                if (state.counterOffset === 0) {
+                    state.keystream = ecb(key, { disablePadding: true }).encrypt(state.iv);
+                    state.iv = Uint8Array.from(state.keystream);
+                }
+                out[i] = bytes[i] ^ state.keystream![state.counterOffset];
+                state.counterOffset = (state.counterOffset + 1) % BLOCK;
+            }
+            return out;
+        }
+        case 'cfb8': {
+            const reg = Uint8Array.from(state.iv);
+            for (let i = 0; i < bytes.length; i++) {
+                const produced = bytes[i] ^ ecb(key, { disablePadding: true }).encrypt(reg)[0];
+                out[i] = produced;
+                reg.copyWithin(0, 1);
+                reg[BLOCK - 1] = encrypt ? produced : bytes[i];
+            }
+            state.iv = reg;
+            return out;
+        }
+        case 'cfb1': {
+            const reg = Uint8Array.from(state.iv);
+            for (let i = 0; i < bytes.length; i++) {
+                let byte = 0;
+                for (let b = 7; b >= 0; b--) {
+                    const bit = ((bytes[i] >> b) & 1) ^ ((ecb(key, { disablePadding: true }).encrypt(reg)[0] >> 7) & 1);
+                    byte = (byte << 1) | bit;
+                    for (let j = 0; j < BLOCK - 1; j++) reg[j] = ((reg[j] << 1) | ((reg[j + 1] >> 7) & 1)) & 0xff;
+                    reg[BLOCK - 1] = ((reg[BLOCK - 1] << 1) | (encrypt ? bit : (bytes[i] >> b) & 1)) & 0xff;
+                }
+                out[i] = byte;
+            }
+            state.iv = reg;
+            return out;
+        }
+        default: {
+            const nonce = state.iv;
+            const stream = chacha20(key, nonce, bytes, undefined, state.counterOffset);
+            state.counterOffset += Math.ceil(bytes.length / 64);
+            return stream;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * XTS (IEEE 1619) and the two AES key wraps (RFC 3394 and RFC 5649), which OpenSSL answers in one
+ * shot: the first update emits everything, final() is empty, and a second update is refused.
+ * ------------------------------------------------------------------------------------------ */
+
+/** Multiplication by alpha, x, in GF(2^128) with the bytes read least significant first. */
+function xtsTweakStep(tweak: Uint8Array): Uint8Array {
+    const out = new Uint8Array(BLOCK);
+    let carry = 0;
+    for (let i = 0; i < BLOCK; i++) {
+        out[i] = ((tweak[i] << 1) | carry) & 0xff;
+        carry = (tweak[i] >> 7) & 1;
+    }
+    if (carry) out[0] ^= 0x87;
+    return out;
+}
+
+/** XTS carries two keys: the second encrypts the tweak and the first the data. */
+function xtsTransform(state: CipherState, data: Uint8Array): Uint8Array {
+    const half = state.key.length / 2;
+    const dataKey = state.key.subarray(0, half);
+    const tweakKey = state.key.subarray(half);
+    const encrypt = state.direction === 'encrypt';
+    const block = (key: Uint8Array, bytes: Uint8Array) =>
+        encrypt
+            ? ecb(key, { disablePadding: true }).encrypt(bytes)
+            : ecb(key, { disablePadding: true }).decrypt(bytes);
+    const out = new Uint8Array(data.length);
+    const whole = Math.floor(data.length / BLOCK);
+    const rem = data.length % BLOCK;
+    let tweak = ecb(tweakKey, { disablePadding: true }).encrypt(state.iv);
+    /* A short tail is stolen: the last whole block and the tail share one block, and the whole
+       block's ciphertext is cut down to the tail's length and written after the shared one. */
+    const full = rem > 0 ? whole - 1 : whole;
+    for (let i = 0; i < full; i++) {
+        const at = i * BLOCK;
+        const masked = new Uint8Array(BLOCK);
+        for (let j = 0; j < BLOCK; j++) masked[j] = data[at + j] ^ tweak[j];
+        const cc = block(dataKey, masked);
+        for (let j = 0; j < BLOCK; j++) out[at + j] = cc[j] ^ tweak[j];
+        tweak = xtsTweakStep(tweak);
+    }
+    if (rem === 0) return out;
+    if (encrypt) {
+        const at = full * BLOCK;
+        const masked = new Uint8Array(BLOCK);
+        for (let j = 0; j < BLOCK; j++) masked[j] = data[at + j] ^ tweak[j];
+        const cc = block(dataKey, masked);
+        for (let j = 0; j < BLOCK; j++) cc[j] ^= tweak[j];
+        const next = xtsTweakStep(tweak);
+        const stolen = new Uint8Array(BLOCK);
+        stolen.set(data.subarray(whole * BLOCK), 0);
+        for (let j = rem; j < BLOCK; j++) stolen[j] = cc[j];
+        for (let j = 0; j < BLOCK; j++) stolen[j] ^= next[j];
+        const cp = block(dataKey, stolen);
+        for (let j = 0; j < BLOCK; j++) cp[j] ^= next[j];
+        out.set(cp, at);
+        out.set(cc.subarray(0, rem), whole * BLOCK);
+        return out;
+    }
+    const at = full * BLOCK;
+    const next = xtsTweakStep(tweak);
+    const plainTail = new Uint8Array(BLOCK);
+    for (let j = 0; j < BLOCK; j++) plainTail[j] = data[at + j] ^ next[j];
+    const tail = block(dataKey, plainTail);
+    for (let j = 0; j < BLOCK; j++) tail[j] ^= next[j];
+    const cc = new Uint8Array(BLOCK);
+    cc.set(data.subarray(whole * BLOCK), 0);
+    cc.set(tail.subarray(rem), rem);
+    const masked = new Uint8Array(BLOCK);
+    for (let j = 0; j < BLOCK; j++) masked[j] = cc[j] ^ tweak[j];
+    const last = block(dataKey, masked);
+    for (let j = 0; j < BLOCK; j++) out[at + j] = last[j] ^ tweak[j];
+    out.set(tail.subarray(0, rem), whole * BLOCK);
+    return out;
+}
+
+/** The wrap counter t as eight bytes, most significant first. */
+function wrapCounter(t: number): Uint8Array {
+    const out = new Uint8Array(8);
+    let rest = t;
+    for (let k = 7; k >= 0; k--) {
+        out[k] = rest % 256;
+        rest = Math.floor(rest / 256);
+    }
+    return out;
+}
+
+function xorInto(a: Uint8Array, b: Uint8Array): Uint8Array {
+    const out = new Uint8Array(a.length);
+    for (let i = 0; i < a.length; i++) out[i] = a[i] ^ b[i];
+    return out;
+}
+
+/** RFC 3394, with the caller's IV as the starting value rather than the A6A6... default: OpenSSL
+ *  answers the wrap ciphers with whatever IV it was handed, and a caller sees that. */
+function aesWrap(key: Uint8Array, iv: Uint8Array, data: Uint8Array): Uint8Array {
+    const n = Math.floor(data.length / 8);
+    let a = Uint8Array.from(iv);
+    const blocks: Uint8Array[] = [];
+    for (let i = 0; i < n; i++) blocks.push(data.subarray(i * 8, i * 8 + 8));
+    for (let j = 0; j < 6; j++) {
+        for (let i = 0; i < n; i++) {
+            const b = ecb(key, { disablePadding: true }).encrypt(concatBytes(a, blocks[i]));
+            a = xorInto(b.subarray(0, 8), wrapCounter(n * j + i + 1));
+            blocks[i] = b.subarray(8);
+        }
+    }
+    let out = Uint8Array.from(a);
+    for (const block of blocks) out = concatBytes(out, block);
+    return out;
+}
+
+/** The unwrapped bytes and the starting value they authenticate, which RFC 5649 keeps the length in. */
+function aesUnwrap(key: Uint8Array, data: Uint8Array): { a: Uint8Array; plain: Uint8Array } {
+    const n = Math.floor(data.length / 8) - 1;
+    let a = Uint8Array.from(data.subarray(0, 8));
+    const blocks: Uint8Array[] = [];
+    for (let i = 0; i < n; i++) blocks.push(data.subarray(8 + i * 8, 16 + i * 8));
+    for (let j = 5; j >= 0; j--) {
+        for (let i = n - 1; i >= 0; i--) {
+            const b = ecb(key, { disablePadding: true }).decrypt(concatBytes(xorInto(a, wrapCounter(n * j + i + 1)), blocks[i]));
+            a = b.subarray(0, 8);
+            blocks[i] = b.subarray(8);
+        }
+    }
+    let out = new Uint8Array(0);
+    for (const block of blocks) out = concatBytes(out, block);
+    return { a, plain: out };
+}
+
+/** RFC 5649: a four-byte alternative IV and the plaintext's own length ahead of the padded data. */
+function aesWrapPad(key: Uint8Array, aiv: Uint8Array, data: Uint8Array): Uint8Array {
+    const padded = new Uint8Array(Math.max(8, Math.ceil(data.length / 8) * 8));
+    padded.set(data, 0);
+    const len = data.length;
+    const a = concatBytes(aiv, new Uint8Array([(len >>> 24) & 0xff, (len >>> 16) & 0xff, (len >>> 8) & 0xff, len & 0xff]));
+    if (padded.length === 8) return ecb(key, { disablePadding: true }).encrypt(concatBytes(a, padded));
+    return aesWrap(key, a, padded);
+}
+
+function aesUnwrapPad(key: Uint8Array, data: Uint8Array): Uint8Array {
+    if (data.length === 16) {
+        const b = ecb(key, { disablePadding: true }).decrypt(data);
+        return b.subarray(8, 8 + readWrapLength(b, 4));
+    }
+    /* The alternative IV OpenSSL was given comes back as the first half of the starting value, with
+       the plaintext's own length in the second half. */
+    const { a, plain } = aesUnwrap(key, data);
+    return plain.subarray(0, readWrapLength(a, 4));
+}
+
+/** The four bytes of a wrap's starting value at `at`, most significant first. */
+function readWrapLength(bytes: Uint8Array, at: number): number {
+    return ((bytes[at] * 16777216) + (bytes[at + 1] << 16) + (bytes[at + 2] << 8) + bytes[at + 3]) >>> 0;
 }
 
 function aeadCipher(state: CipherState) {
@@ -458,6 +746,22 @@ function unpad(bytes: Uint8Array): Uint8Array {
 
 function cipherUpdate(state: CipherState, input: Uint8Array): Uint8Array {
     state.updated = true;
+    /* XTS and the two key wraps answer in one shot: everything comes back from the first update. */
+    if (state.spec.mode === 'xts' || state.spec.mode === 'wrap' || state.spec.mode === 'wrappad') {
+        if (state.emitted) throw cipherFail(null, 'Trying to add data in unsupported state');
+        const all = concatBytes(state.pending, input);
+        state.pending = new Uint8Array(0);
+        state.emitted = true;
+        if (state.spec.mode === 'xts') {
+            if (all.length < BLOCK) throw cipherFail(null, 'Trying to add data in unsupported state');
+            return xtsTransform(state, all);
+        }
+        const encrypt = state.direction === 'encrypt';
+        if (state.spec.mode === 'wrap') {
+            return encrypt ? aesWrap(state.key, state.iv, all) : aesUnwrap(state.key, all).plain;
+        }
+        return encrypt ? aesWrapPad(state.key, state.iv, all) : aesUnwrapPad(state.key, all);
+    }
     if (state.spec.aead) {
         state.pending = concatBytes(state.pending, input);
         return new Uint8Array(0);
@@ -514,7 +818,8 @@ function stateFor(id: unknown, op: string): CipherState {
 }
 
 function openCipher(args: any): { id: number; aead: boolean } {
-    const spec = CIPHER_SPECS[String(args?.algorithm ?? '').toLowerCase()];
+    const algorithm = String(args?.algorithm ?? '');
+    const spec = CIPHER_SPECS[algorithm.toLowerCase()];
     if (spec === undefined) throw cipherFail('ERR_CRYPTO_UNKNOWN_CIPHER', 'Unknown cipher');
     /* Node reports a bad IV before a bad key, and an unknown cipher before either. */
     const iv = typeof args?.iv === 'string' ? base64ToBytes(args.iv) : new Uint8Array(0);
@@ -522,27 +827,49 @@ function openCipher(args: any): { id: number; aead: boolean } {
         if (iv.length !== 0) throw invalidIv();
     } else if (spec.ivLength > 0) {
         if (iv.length !== spec.ivLength) throw invalidIv();
-    } else if (iv.length < GCM_MIN_IV) {
+    } else if (spec.ivLength === -1) {
+        if (iv.length < GCM_MIN_IV) throw invalidIv();
+    } else if (iv.length < (spec.ivMin ?? 0) || iv.length > (spec.ivMax ?? 0)) {
         throw invalidIv();
+    }
+    /* CCM and OCB answer no tag length of their own, so Node refuses them outright and names the
+       cipher it refused; the guest passes no options, so the refusal is unconditional here. */
+    if (spec.needsAuthTagLength === true) {
+        throw cipherFail('ERR_CRYPTO_INVALID_AUTH_TAG', `authTagLength required for ${algorithm}`, 'TypeError');
     }
     const key = bytesArg(args?.key);
     if (key.length !== spec.keyLength) throw invalidKeyLength();
+    if (spec.mode === 'xts') {
+        const half = spec.keyLength / 2;
+        let duplicated = true;
+        for (let i = 0; i < half; i++) {
+            if (key[i] !== key[half + i]) {
+                duplicated = false;
+                break;
+            }
+        }
+        if (duplicated) throw cipherFail('ERR_OSSL_XTS_DUPLICATED_KEYS', 'error:1C800095:Provider routines::xts duplicated keys');
+    }
     if (CIPHER_STATE.size >= OPEN_CIPHER_LIMIT) {
         const oldest = CIPHER_STATE.keys().next().value;
         if (oldest !== undefined) CIPHER_STATE.delete(oldest);
     }
     const id = nextCipherId++;
+    /* OpenSSL's chacha20 takes the 16-byte IV as a 32-bit counter and then the RFC 8439 nonce. */
+    const nonce = spec.mode === 'cc20' ? iv.subarray(4) : iv;
+    const counter = spec.mode === 'cc20' ? iv[0] + iv[1] * 256 + iv[2] * 65536 + iv[3] * 16777216 : 0;
     CIPHER_STATE.set(id, {
         spec,
         direction: args?.direction === 'decrypt' ? 'decrypt' : 'encrypt',
         key,
-        iv,
-        counterOffset: 0,
+        iv: nonce,
+        counterOffset: counter,
         chainBuf: new Uint8Array(BLOCK),
         keystream: null,
         pending: new Uint8Array(0),
         autoPadding: true,
         updated: false,
+        emitted: false,
         aad: new Uint8Array(0)
     });
     return { id, aead: spec.aead };
@@ -2042,7 +2369,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         ));
     },
     /** Args {}: the cipher names createCipheriv and createDecipheriv accept. */
-    'crypto.ciphers': () => Object.keys(CIPHER_SPECS),
+    'crypto.ciphers': () => CIPHER_NAMES.slice(),
     /** Args {algorithm, direction, key, iv}: validates key and IV, opens a host cipher; returns {id, aead}. */
     'crypto.cipher.open': (args) => openCipher(args),
     /** Args {id, data}: the bytes this call emits; aead modes emit nothing until final. Returns base64. */

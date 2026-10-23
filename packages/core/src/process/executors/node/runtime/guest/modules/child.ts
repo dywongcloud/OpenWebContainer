@@ -601,7 +601,6 @@ function cpIpc(child, frame) {
   }
 }
 
-/* The signal name a kill, a timeout or a spawn's killSignal ends a child with, as Node names it. */
 function cpKillName(signal) {
   if (typeof signal === 'number') return cpSignalNames[signal] || 'SIGTERM';
   return String(signal === undefined || signal === null ? 'SIGTERM' : signal);
@@ -610,7 +609,9 @@ function cpKillName(signal) {
 function cpKill(child, signal) {
   if (!child._cpSpawned || child._cpExited) return false;
   if (signal === 0 || signal === '0') return true;
-  var name = cpKillName(signal);
+  var name = typeof signal === 'number'
+    ? (cpSignalNames[signal] || 'SIGTERM')
+    : String(signal === undefined || signal === null ? 'SIGTERM' : signal);
   var ok = callCap('child.kill', { pid: child.pid, signal: name });
   if (ok) child.killed = true;
   return ok === true;
