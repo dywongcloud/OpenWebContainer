@@ -729,6 +729,9 @@ export const SRC = String.raw`
       if (isLocked(this)) throw new TypeError('ReadableStream is locked');
       if (transform.writable.locked) throw new TypeError('WritableStream is locked');
       var opts = pipeOptions(options);
+      /* The standard sets the source's disturbed flag when the pipe is set up and not when the
+         first chunk moves, so a stream is disturbed the moment it has been piped anywhere. */
+      readableState(this).disturbed = true;
       handled(pipeReadableTo(this, transform.writable, opts));
       return transform.readable;
     }
@@ -742,6 +745,8 @@ export const SRC = String.raw`
       } catch (error) {
         return Promise.reject(error);
       }
+      /* As pipeThrough does: the flag is set when the pipe is set up, not on the first chunk. */
+      readableState(this).disturbed = true;
       return pipeReadableTo(this, destination, opts);
     }
     tee() {

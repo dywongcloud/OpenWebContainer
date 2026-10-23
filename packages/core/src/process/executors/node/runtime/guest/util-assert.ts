@@ -691,11 +691,16 @@ TextDecoderImpl.prototype.decode = function (input, options) {
   }
   var bad = textDecoderOptionsError(options);
   if (bad !== undefined) throw bad;
-  if (input === undefined) return '';
-    var bytes = decodeInputBytes(input);
+  /* No argument at all is not "nothing to decode": it is the flush, and a stream that ended in the
+     middle of a sequence still owes a replacement character for the bytes it kept. Only an argument
+     that is there and is not bytes is the type error. */
+  var bytes = [];
+  if (input !== undefined) {
+    bytes = decodeInputBytes(input);
     if (bytes === undefined) {
       throw textDecoderError(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "list" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView.');
     }
+  }
     var stream = options !== undefined && options !== null && Boolean(options.stream);
     var values = state.rest.slice();
     for (var i = 0; i < bytes.length; i++) values.push(bytes[i]);
@@ -728,6 +733,9 @@ Object.defineProperty(TextDecoderImpl.prototype, 'decode', { enumerable: true, c
 /* Its name, which a program reads off the constructor, is 'TextDecoder' and not the name it was
    built under here. */
 Object.defineProperty(TextDecoderImpl, 'name', { value: 'TextDecoder', configurable: true });
+/* Both of the constructor's arguments are optional in Node's own signature too, so the arity a
+   program reads off the constructor is 0 and not the 2 this implementation is written with. */
+Object.defineProperty(TextDecoderImpl, 'length', { value: 0, configurable: true });
 Object.defineProperty(TextDecoderImpl.prototype, Symbol.toStringTag, { value: 'TextDecoder', configurable: true });
 /* The two arguments are optional in Node's own signature and so are absent from its length: the
    arity a program reads is 0, and the method reads its arguments all the same. */

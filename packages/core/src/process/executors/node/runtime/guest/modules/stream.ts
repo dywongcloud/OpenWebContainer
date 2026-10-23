@@ -54,7 +54,9 @@ function owcBuildStreamCore() {
        anonymous function is "Received function " with the name left empty and not "<anonymous>". */
     if (typeof value === 'function') return ' Received function ' + (value.name || '');
     if (typeof value === 'object') {
-      if (value.constructor && value.constructor.name) return ' Received an instance of ' + value.constructor.name;
+      /* Node prints the constructor's own name even where it is empty -- a generator object's is --
+         so a value with a constructor and no name answers "an instance of ." and not its tag. */
+      if (value.constructor) return ' Received an instance of ' + (value.constructor.name || '');
       return ' Received ' + Object.prototype.toString.call(value);
     }
     var shown = typeof value === 'string' ? "'" + (value.length > 25 ? value.slice(0, 25) + '...' : value) + "'" : String(value);
@@ -1276,6 +1278,8 @@ function owcBuildStreamCore() {
     var failure = null;
     var finished = false;
 
+    var listening = false;
+
     function wake() {
       if (waiter !== null) {
         var resume = waiter;
@@ -1287,10 +1291,17 @@ function owcBuildStreamCore() {
       failure = err;
       wake();
     }
-    stream.on('readable', wake);
-    stream.on('end', wake);
-    stream.on('error', onError);
-    stream.on('close', wake);
+    /* Node's iterator leaves the stream alone until it is asked for a value: attaching a 'readable'
+       listener is what starts a read, so a stream whose iterator is built and never advanced has
+       pulled nothing and an operator over it has called nothing. */
+    function listen() {
+      if (listening) return;
+      listening = true;
+      stream.on('readable', wake);
+      stream.on('end', wake);
+      stream.on('error', onError);
+      stream.on('close', wake);
+    }
 
     function cleanup() {
       finished = true;
@@ -1302,6 +1313,7 @@ function owcBuildStreamCore() {
 
     return {
       next: function () {
+        listen();
         return new Promise(function (resolve, reject) {
           function attempt() {
             if (failure !== null) {
@@ -1567,12 +1579,15 @@ function owcBuildStreamCore() {
      finished results held for the consumer. Node floors both with Math.floor, validates them as
      integers -- the concurrency at 1 and the watermark at 0 -- and only then adds the concurrency
      to the watermark, so the default pair is 1 and 1 and a concurrency of 3 walks with 5. */
+  /* Node's validateInteger asks Number.isInteger before it asks the range, so a value that is not a
+     finite integer -- Infinity either side, and a value past MAX_SAFE_INTEGER -- answers "an
+     integer" and ">= min && <= 9007199254740991" in that order and not the range alone. */
   function validateOperatorInt(value, name, min) {
-    if (typeof value !== 'number' || value !== Math.floor(value)) {
+    if (typeof value !== 'number' || !Number.isInteger(value)) {
       throw owcErr(RangeError, 'ERR_OUT_OF_RANGE',
         'The value of "' + name + '" is out of range. It must be an integer. Received ' + value);
     }
-    if (value < min) {
+    if (value < min || value > 9007199254740991) {
       throw owcErr(RangeError, 'ERR_OUT_OF_RANGE',
         'The value of "' + name + '" is out of range. It must be >= ' + min + ' && <= 9007199254740991. Received ' + value);
     }
@@ -1603,6 +1618,8 @@ function owcBuildStreamCore() {
     var queue = [];
     var inFlight = 0;
     var done = false;
+    var failed = false;
+    var started = false;
     var resume = null;
     var waiting = null;
 
@@ -1637,14 +1654,22 @@ function owcBuildStreamCore() {
     function pump() {
       var running = (async function () {
         for (;;) {
-          if (done) break;
+          if (done || failed) break;
           var aborted = abortStep(signal);
           var step = await (aborted !== null ? aborted : inner.next());
           if (step.done) break;
           var value = step.value;
           enqueue((async function () {
-            var answer = await apply(value);
-            return answer.skip ? { skip: true } : { value: answer.value };
+            try {
+              var answer = await apply(value);
+              return answer.skip ? { skip: true } : { value: answer.value };
+            } catch (error) {
+              /* A call that threw is the last work the pump starts: Node stops pulling the source
+                 as soon as one has failed, so an error under concurrency reaches the consumer with
+                 the source no further along than the host's would be. */
+              failed = true;
+              throw error;
+            }
           })());
           if (queue.length >= limits.highWaterMark || inFlight >= limits.concurrency) {
             await new Promise(function (resolve) { resume = resolve; });
@@ -1662,9 +1687,17 @@ function owcBuildStreamCore() {
       });
     }
 
-    pump();
+    /* Node's operators are lazy: nothing is pulled from the source and no call of fn is started
+       until the consumer asks for the first value, so building the iterator is free and a stream
+       that is never read never runs. */
+    function startPump() {
+      if (started) return;
+      started = true;
+      pump();
+    }
 
     return operatorStream(function () {
+      startPump();
       return (async function () {
         for (;;) {
           if (queue.length === 0) {
@@ -1765,51 +1798,70 @@ function owcBuildStreamCore() {
     });
   };
 
+  /* Node runs forEach through the same bounded pump the value-keeping operators use, so its
+     options.concurrency counts there too even though it answers nothing. */
   Readable.prototype.forEach = async function (fn, options) {
     checkOperatorFn(fn);
     var signal = checkOperatorOptions(options);
+    var limits = operatorLimits(options);
+    var inner = this[Symbol.asyncIterator]();
+    var walked = concurrentOperator(inner, function (value) {
+      return Promise.resolve(fn(value, { signal: signal })).then(function () {
+        return { skip: true };
+      });
+    }, signal, limits);
+    var it = walked[Symbol.asyncIterator]();
+    for (;;) {
+      var step = await it.next();
+      if (step.done) return undefined;
+    }
+  };
+
+  /* some, every and find stop at the first answer, but they are operators still: Node validates
+     their options the same way and hands each call the signal, so an aborted signal fails them
+     before they ever look at the source. */
+  Readable.prototype.some = async function (fn, options) {
+    checkOperatorFn(fn);
+    var signal = checkOperatorOptions(options);
+    operatorLimits(options);
     var inner = this[Symbol.asyncIterator]();
     for (;;) {
       if (signal !== undefined && signal !== null && signal.aborted) throw abortErrorFor(signal);
       var step = await inner.next();
-      if (step.done) return undefined;
-      await fn(step.value, { signal: signal });
-    }
-  };
-
-  Readable.prototype.some = async function (fn) {
-    checkOperatorFn(fn);
-    var inner = this[Symbol.asyncIterator]();
-    for (;;) {
-      var step = await inner.next();
       if (step.done) return false;
-      if (await fn(step.value, {})) {
+      if (await fn(step.value, { signal: signal })) {
         await inner.return();
         return true;
       }
     }
   };
 
-  Readable.prototype.every = async function (fn) {
+  Readable.prototype.every = async function (fn, options) {
     checkOperatorFn(fn);
+    var signal = checkOperatorOptions(options);
+    operatorLimits(options);
     var inner = this[Symbol.asyncIterator]();
     for (;;) {
+      if (signal !== undefined && signal !== null && signal.aborted) throw abortErrorFor(signal);
       var step = await inner.next();
       if (step.done) return true;
-      if (!(await fn(step.value, {}))) {
+      if (!(await fn(step.value, { signal: signal }))) {
         await inner.return();
         return false;
       }
     }
   };
 
-  Readable.prototype.find = async function (fn) {
+  Readable.prototype.find = async function (fn, options) {
     checkOperatorFn(fn);
+    var signal = checkOperatorOptions(options);
+    operatorLimits(options);
     var inner = this[Symbol.asyncIterator]();
     for (;;) {
+      if (signal !== undefined && signal !== null && signal.aborted) throw abortErrorFor(signal);
       var step = await inner.next();
       if (step.done) return undefined;
-      if (await fn(step.value, {})) {
+      if (await fn(step.value, { signal: signal })) {
         await inner.return();
         return step.value;
       }
@@ -1833,18 +1885,19 @@ function owcBuildStreamCore() {
 
   Readable.prototype.reduce = async function (fn, initialValue, options) {
     if (typeof fn !== 'function') throw argTypeError('reducer', 'of type function', fn);
-    checkOperatorOptions(options);
+    var signal = checkOperatorOptions(options);
     var inner = this[Symbol.asyncIterator]();
     var hasInitial = arguments.length > 1;
     var acc = initialValue;
     for (;;) {
+      if (signal !== undefined && signal !== null && signal.aborted) throw abortErrorFor(signal);
       var step = await inner.next();
       if (step.done) break;
       if (!hasInitial) {
         acc = step.value;
         hasInitial = true;
       } else {
-        acc = await fn(acc, step.value, {});
+        acc = await fn(acc, step.value, { signal: signal });
       }
     }
     if (!hasInitial) {
@@ -2789,17 +2842,22 @@ function owcBuildStreamCore() {
     if (args.length < 2) throw owcErr(TypeError, 'ERR_MISSING_ARGS', 'The "streams" argument must be specified');
     var last = args.length - 1;
     for (var i = 0; i < args.length; i++) {
-      if (i > 0 && typeof args[i] === 'function' && !canFeedFunction(args[i - 1])) {
+      /* A link that is itself a stream is never refused here: Node hands the function the link
+         before it and lets the function's own answer be the fault, so a Writable before a
+         destination function raises the ERR_INVALID_RETURN_VALUE of the string it answered and not
+         a complaint about the Writable. */
+      if (i > 0 && typeof args[i] === 'function' && !isStreamLike(args[i - 1]) && !canFeedFunction(args[i - 1])) {
         throw argTypeError('val', 'an instance of Readable, Iterable, or AsyncIterable', args[i - 1]);
       }
-      args[i] = pipelineBody(args[i], i, i === last, i > 0 ? args[i - 1] : undefined);
+      args[i] = pipelineBody(args[i], i, i === last, i > 0 ? args[i - 1] : undefined,
+        opts === undefined || opts === null ? undefined : opts.signal);
     }
     return pipelineImpl(args, callback, opts);
   }
 
   // compose and pipeline both take non-stream bodies: a function becomes a Duplex over its async
   // generator, and a bare (async) iterable becomes a Readable over it.
-  function pipelineBody(value, index, isLast, previous) {
+  function pipelineBody(value, index, isLast, previous, signal) {
     if (isStreamLike(value)) return value;
     /* A web stream is a link of its own: Node's pipeline takes a WritableStream as a destination and
        a ReadableStream as a source, bridging each with fromWeb. */
@@ -2808,7 +2866,7 @@ function owcBuildStreamCore() {
        the middle the transform between its neighbours, and at the end the destination whose answer
        is the value the pipeline reports. */
     if (typeof value === 'function') {
-      if (index === 0) return sourceFuncToDuplex(value);
+      if (index === 0) return sourceFuncToDuplex(value, signal);
       if (isLast) return destinationFuncToDuplex(value, previous);
       return funcToDuplex(value, 'transform[' + (index - 1) + ']');
     }
@@ -2975,9 +3033,17 @@ function owcBuildStreamCore() {
   /* A function at the head of a pipeline is called at once, with the signal and nothing to read,
      and what it answers is the source: an iterable, an async iterable or a stream, and a promise
      is none of the three. */
-  function sourceFuncToDuplex(fn) {
-    var made = fn({ signal: undefined });
+  function sourceFuncToDuplex(fn, signal) {
+    var made = fn({ signal: signal });
     if (isStreamLike(made)) return made;
+    /* Node reads a string a source function answers one code point at a time, the way a yield-star
+       over it would, so 'abc' reaches the chain as three chunks and not as one. */
+    if (typeof made === 'string') {
+      var chars = [];
+      var sit = made[Symbol.iterator]();
+      for (var sstep = sit.next(); !sstep.done; sstep = sit.next()) chars.push(sstep.value);
+      return Readable.from(chars);
+    }
     if (made && (typeof made[Symbol.asyncIterator] === 'function' || typeof made[Symbol.iterator] === 'function')) {
       return Readable.from(made);
     }
@@ -2994,7 +3060,7 @@ function owcBuildStreamCore() {
     /* Node hands the destination function the async iterable of the link before it, so the chunks it
        sees are that link's own: a non-object-mode link coalesces what it is holding into one chunk
        as read() does, and an object-mode one hands over each value separately. */
-    var source = new PassThrough({ objectMode: !!(previous && previous.readableObjectMode) });
+    var source = new PassThrough({ objectMode: true });
     var answered = fn(source);
     var finishStep = null;
     /* The pipeline's own finish waits on this: the destination's answer is not known until the
