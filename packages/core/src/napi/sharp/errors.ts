@@ -42,8 +42,14 @@ export function badExtractArea(): Error {
 }
 
 /** A limit the shim honours exactly as sharp does: 0x3FFF x 0x3FFF pixels by default. */
-export function pixelLimit(width: number, height: number, limit: number): Error {
-    return new Error(`Input image exceeds pixel limit of ${limit} (${width} x ${height})`);
+/**
+ * The message libvips gives for an image over limitInputPixels. sharp 0.33.5 passes it through
+ * unchanged -- measured, and it carries neither the limit nor the size, which libvips puts in the
+ * message of a *pixel limit on the output* instead. Appending " of N (w x h)" here is the one place
+ * a caller could tell the shim from the add-on by the text.
+ */
+export function pixelLimit(_width: number, _height: number, _limit: number): Error {
+    return new Error('Input image exceeds pixel limit');
 }
 
 export function noHostFileSystem(): Error {

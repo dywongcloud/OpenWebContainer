@@ -158,9 +158,31 @@ function sat(r: number, g: number, b: number): number {
     return Math.max(r, g, b) - Math.min(r, g, b);
 }
 
+/**
+ * Lum(C) plus a constant, then the spec's ClipColor: adding the difference can push a channel out of
+ * [0,1], and clamping each channel there (what this did before) is not what the spec asks for and is
+ * not what the add-on does. ClipColor pulls the whole colour back along the line through its own
+ * luminance, keeping that luminance and the hue, so hue/color/luminosity read 169,148,127 over
+ * #ff8000 with rgba(0,128,255,0.5) rather than the 152,152,127 a per-channel clamp gives.
+ */
 function setLum(r: number, g: number, b: number, l: number): [number, number, number] {
     const d = l - lum(r, g, b);
-    return [clamp01(r + d), clamp01(g + d), clamp01(b + d)];
+    return clipColor(r + d, g + d, b + d);
+}
+
+function clipColor(r: number, g: number, b: number): [number, number, number] {
+    const l = lum(r, g, b);
+    const n = Math.min(r, g, b);
+    const x = Math.max(r, g, b);
+    if (n < 0) {
+        const k = l / (l - n);
+        r = l + (r - l) * k; g = l + (g - l) * k; b = l + (b - l) * k;
+    }
+    if (x > 1) {
+        const k = (1 - l) / (x - l);
+        r = l + (r - l) * k; g = l + (g - l) * k; b = l + (b - l) * k;
+    }
+    return [r, g, b];
 }
 
 function setSat(r: number, g: number, b: number, s: number): [number, number, number] {
@@ -178,8 +200,12 @@ function separable(mode: string, cb: number, cs: number): number {
         case 'overlay': return hardLight(cs, cb);
         case 'darken': return Math.min(cb, cs);
         case 'lighten': return Math.max(cb, cs);
-        case 'color-dodge': return cs === 0 ? 0 : cs === 1 ? 1 : Math.min(1, cb / (1 - cs));
-        case 'color-burn': return cs === 1 ? 1 : cs === 0 ? 0 : 1 - Math.min(1, (1 - cb) / cs);
+        // Both dodge and burn test the *backdrop*, not the source: the spec reads "if Cb == 0" for
+        // dodge and "if Cb == 1" for burn. Testing Cs instead makes opaque-dodge return 0 and
+        // opaque-burn return 1, which is what put 128 where the add-on reads 255 for color-dodge and
+        // 127 where it reads 0 for color-burn over #ff8000 with rgba(0,128,255,0.5).
+        case 'color-dodge': return cb === 0 ? 0 : cs === 1 ? 1 : Math.min(1, cb / (1 - cs));
+        case 'color-burn': return cb === 1 ? 1 : cs === 0 ? 0 : 1 - Math.min(1, (1 - cb) / cs);
         case 'hard-light': return hardLight(cb, cs);
         case 'soft-light': return softLight(cb, cs);
         case 'difference': return Math.abs(cb - cs);
@@ -379,7 +405,7 @@ function clampIndex(i: number, n: number): number {
 
 /** Bilinear sample of an RGBA byte surface at a real-valued position; outside is transparent. */
 export function sampleSurface(
-    s: Surface, x: number, y: number, smooth: boolean
+    s: Surface, x: number, y: number, smooth: boolean, extend?: 'pad'
 ): [number, number, number, number] {
     if (!smooth) {
         const ix = Math.floor(x), iy = Math.floor(y);
@@ -392,10 +418,17 @@ export function sampleSurface(
     let r = 0, g = 0, b = 0, a = 0;
     for (let j = 0; j < 2; j++) {
         for (let i = 0; i < 2; i++) {
+            // drawImage reads its source with EXTEND_PAD: a tap past an edge takes that edge pixel, so
+            // the alpha of an upscaled opaque image stays 255 at the border (4x4 into 8x8 reads 143 at
+            // (7,7) when the tap is dropped). A pattern does not pad -- its outside is transparent --
+            // so this is opt-in.
             const ix = x0 + i, iy = y0 + j;
-            if (ix < 0 || iy < 0 || ix >= s.width || iy >= s.height) continue;
+            if (ix < 0 || iy < 0 || ix >= s.width || iy >= s.height) {
+                if (extend !== 'pad') continue;
+            }
+            const cx = clampIndex(ix, s.width), cy = clampIndex(iy, s.height);
             const w0 = (i === 0 ? 1 - fx : fx) * (j === 0 ? 1 - fy : fy);
-            const at = (iy * s.width + ix) * 4;
+            const at = (cy * s.width + cx) * 4;
             const pa = s.data[at + 3] / 255;
             r += s.data[at] * pa * w0;
             g += s.data[at + 1] * pa * w0;

@@ -235,7 +235,10 @@ function decodeInput(options: Record<string, unknown>, host: SharpAddonHost | un
     if (input.rawWidth !== undefined) {
         const raw = input.buffer !== undefined ? bytesOf(input.buffer) : readFile(host, String(input.file));
         const image = imageFromRaw(input, raw);
-        return { image, format: 'raw', size: raw.length, hasProfile: false, hasAlpha: image.channels === 2 || image.channels === 4 };
+        // isProgressive is on a raw input's metadata too: libvips reports false for every image that is
+        // not a progressive jpeg, and the shim dropped it here, which left Object.keys() one short
+        // (10 where a raw-pixel input reports 11).
+        return { image, format: 'raw', size: raw.length, isProgressive: false, hasProfile: false, hasAlpha: image.channels === 2 || image.channels === 4 };
     }
     if (input.buffer !== undefined) {
         const bytes = bytesOf(input.buffer);
@@ -316,7 +319,7 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
     return { image: out, resized };
 }
 
-function encodeOutput(image: Image, options: Record<string, unknown>, inputFormat: string): { format: string; data: Uint8Array } {
+function encodeOutput(image: Image, options: Record<string, unknown>, inputFormat: string): { format: string; data: Uint8Array; channels: number } {
     let format = String(options.formatOut ?? 'input');
     // 'input' keeps whatever the input was, so a raw or created image comes out raw and a jpeg comes
     // out jpeg; only a png (and an input format with no raw form) falls back to png. Measured against
@@ -327,13 +330,17 @@ function encodeOutput(image: Image, options: Record<string, unknown>, inputForma
         const chroma = String(options.jpegChromaSubsampling ?? '4:2:0');
         if (chroma !== '4:4:4' && chroma !== '4:2:0' && chroma !== '4:2:2') throw unsupportedFormat('jpeg ' + chroma, 'output');
         const rgb = image.channels === 4 || image.channels === 3 ? toChannels(image, 3) : toChannels(image, 1);
-        return { format, data: encodeJpeg(rgb, quality, chroma) };
+        // A jpeg has no alpha band, so the bands the encoder wrote -- 3, or 1 for a greyscale input --
+        // are the channels sharp reports, not the bands the image had going in. Without this a
+        // 16x8 RGBA png written as jpeg reports channels 4 where sharp 0.33.5 reports 3, while the
+        // bytes themselves reopen as 3 on both sides: the info is the wrong one, not the file.
+        return { format, data: encodeJpeg(rgb, quality, chroma), channels: rgb.channels };
     }
     if (format === 'png') {
-        return { format, data: encodePng(image) };
+        return { format, data: encodePng(image), channels: image.channels };
     }
     if (format === 'raw') {
-        return { format, data: image.data };
+        return { format, data: image.data, channels: image.channels };
     }
     throw unsupportedFormat(format, 'output');
 }
@@ -527,7 +534,7 @@ export function createAddon(host: SharpAddonHost = {}): object {
                 format: encoded.format,
                 width: image.width,
                 height: image.height,
-                channels: image.channels
+                channels: encoded.channels
             };
             if (encoded.format === 'raw') info.depth = 'uchar';
             /*
@@ -573,7 +580,12 @@ export function createAddon(host: SharpAddonHost = {}): object {
         metadata,
         stats,
         pipeline,
-        cache: () => ({ memory: { current: 0, high: 0, max: 0 }, files: { current: 0, max: 0 }, items: { current: 0, max: 0 } }),
+        // libvips' own limits, which sharp sets at load (lib/utility.js: "Default cache settings of 50MB,
+        // 20 files, 100 items") and cache() reports back as the three maxima. Reporting 0 for them made
+        // this the one sharp answer that is wrong rather than refused: a caller sizing against
+        // cache().items.max saw 0 where the add-on says 100. current and high stay 0 -- the shim keeps
+        // no operation cache, so nothing has been cached here.
+        cache: () => ({ memory: { current: 0, high: 0, max: 50 }, files: { current: 0, max: 20 }, items: { current: 0, max: 100 } }),
         concurrency: (n?: number) => concurrencyOf(n),
         counters: () => ({ queue: 0, process: 0 }),
         simd: (on?: boolean) => {

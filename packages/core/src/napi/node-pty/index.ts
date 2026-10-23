@@ -164,10 +164,15 @@ function toCrlf(chunk: unknown): unknown {
 /**
  * The exit code node-pty reports: a number, never null. The add-on reads waitpid and reports the
  * exit status when the child exited and 0 when a signal ended it, with the signal beside it.
+ *
+ * The container's child has no waitpid: a death by signal comes back as a code of -1 with no signal
+ * name (measured: `sh -c 'kill -9 $$'` emits exit(-1, null)), so -1 here means "a signal ended it"
+ * and has to become 0. Left as it is, `kill -9 $$` reports exitCode -1 where the add-on reports 0.
  */
 function exitStatusCode(code: unknown): number {
   const status = Number(code);
-  return code === undefined || code === null || !Number.isFinite(status) ? 0 : status;
+  if (code === undefined || code === null || !Number.isFinite(status)) return 0;
+  return status < 0 ? 0 : status;
 }
 
 function asBuffer(chunk: unknown): any {
@@ -308,7 +313,10 @@ export function createAddon(env: PtyAddonEnv = {}): object {
     /** pty.resize: records the size. Nothing in the container has a window to resize. */
     function resize(fd: number, cols: number, rows: number): void {
         const record = table()[Number(fd)];
-        if (!record) return;
+        // The add-on resizes through the master descriptor, which the child's exit has closed, so a
+        // resize after the exit fails there (measured). The table entry is deleted on exit, which is
+        // what makes "no record" the same thing as "that terminal is gone".
+        if (!record) throw new Error(`resize: no terminal is open on fd ${Number(fd)}`);
         record.cols = size(cols, record.cols);
         record.rows = size(rows, record.rows);
         if (record.socket) {

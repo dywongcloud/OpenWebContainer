@@ -109,11 +109,19 @@ export class RadialGradient implements Paint {
             t = -c / b;
         } else {
             const disc = b * b - 4 * a * c;
-            if (disc < 0) return stopsAt(this.stops, 0);
+            if (disc < 0) return rgba(0, 0, 0, 0);
             const root = Math.sqrt(disc);
             const t1 = (-b + root) / (2 * a);
             const t2 = (-b - root) / (2 * a);
-            t = t1 > t2 ? t1 : t2;
+            // Both roots satisfy the cone equation, but only where the radius r0 + t*dr is still
+            // positive: past the apex the equation is satisfied by the cone reflected through it, and
+            // cairo paints nothing there. Of the roots that survive, the larger is the one it uses --
+            // measured on 6 geometries, including createRadialGradient(3,5,1,8,5,4), whose row at y=5
+            // is 0,0,0,0 at x=0 and x=1 (both roots behind the apex) and 0,0,255,255 from x=4 on.
+            const ok1 = this.r0 + t1 * dr >= 0;
+            const ok2 = this.r0 + t2 * dr >= 0;
+            if (!ok1 && !ok2) return rgba(0, 0, 0, 0);
+            t = ok1 && ok2 ? (t1 > t2 ? t1 : t2) : ok1 ? t1 : t2;
         }
         return stopsAt(this.stops, t);
     }

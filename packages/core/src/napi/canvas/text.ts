@@ -178,10 +178,41 @@ export interface LaidOut {
     metrics: TextMetrics;
 }
 
+/**
+ * The advance a monospace font uses, in font units: 0.60205078125 em, which is DejaVu Sans Mono's
+ * (1233/2048) and the number cairo reports for the generic `monospace` -- 10px monospace measures
+ * 18.0615234375 for 'MMM', 'iii' and 'WWW' alike.
+ */
+const MONO_ADVANCE = 602.05078125;
+
+/**
+ * The generic families and the font names a page is likely to ask for that mean "one advance for
+ * every glyph". The shim carries one font, so a monospace family cannot be honoured with different
+ * glyphs, but it can still be honoured where it matters: a caller that column-aligns output with a
+ * monospace font has to get the same advance for 'i' as for 'W', which the proportional skeleton
+ * table does not give it.
+ */
+const MONO_FAMILIES = [
+    'monospace', 'mono', 'courier', 'courier new', 'courier-new', 'menlo', 'monaco', 'consolas',
+    'andale mono', 'dejavu sans mono', 'liberation mono', 'ubuntu mono', 'source code pro',
+    'inconsolata', 'sf mono', 'roboto mono', 'noto sans mono', 'droid sans mono', 'fixed'
+];
+
+function isMonospace(family: string): boolean {
+    if (typeof family !== 'string' || family === '') return false;
+    const names = family.toLowerCase().split(',');
+    for (const name of names) {
+        const f = name.trim().replace(/^["']|["']$/g, '');
+        if (f === 'monospace' || f === 'mono' || f.endsWith(' mono') || MONO_FAMILIES.indexOf(f) >= 0) return true;
+    }
+    return false;
+}
+
 /** Lays text out along the baseline, before textAlign and textBaseline move it. */
 export function layoutText(text: string, font: FontSpec, maxWidth?: number): LaidOut {
     const scale = font.size / UNITS_PER_EM;
     const italic = font.style === 'italic' || font.style === 'oblique';
+    const mono = isMonospace(font.family) ? MONO_ADVANCE : 0;
     let pen = 0;
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     const strokes: number[][] = [];
@@ -205,6 +236,12 @@ export function layoutText(text: string, font: FontSpec, maxWidth?: number): Lai
                 if (y > maxY) maxY = y;
             }
             if (pts.length >= 2) strokes.push(pts);
+        }
+        if (mono !== 0) {
+            // One advance for every glyph: the ink keeps the width the skeleton gives it, but the pen
+            // always moves a full cell, so 'iii' and 'WWW' measure the same.
+            pen += mono * scale;
+            continue;
         }
         pen += glyph.advance * scale;
     }

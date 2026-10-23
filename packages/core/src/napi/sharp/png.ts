@@ -296,7 +296,10 @@ export function decodePng(bytes: Uint8Array): { image: Image; info: PngInfo } {
   }
   if (width === 0 || height === 0) throw new Error('bad PNG dimensions');
   if (colorType === 3 && !palette) throw new Error('missing PLTE chunk for palette PNG');
-  if (idat.length === 0) throw new Error('missing IDAT chunk');
+  // A png whose IDAT stops early: libvips fails the header load with "Input buffer has corrupt
+  // header: pngload_buffer: end of stream", which sharp passes through verbatim. The shim's own
+  // wording was the one place a caller catching a truncated png could tell the two apart.
+  if (idat.length === 0) throw new Error('Input buffer has corrupt header: pngload_buffer: end of stream');
 
   const bytesPerSample = bitDepth === 16 ? 2 : 1;
   const samples =
