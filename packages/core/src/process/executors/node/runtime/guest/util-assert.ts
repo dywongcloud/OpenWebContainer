@@ -27,7 +27,19 @@ function formatErrorStack(err) {
      a stack -- carries that report with it, and it goes out as it stands: no name and colon go
      in front of a report that already holds the line Node opens with. */
   if (err && typeof err.__owcWhole === 'string') return err.__owcWhole;
-  var header = String(err.name || 'Error') + (err.message ? ': ' + err.message : '');
+  /* 'class Z extends Error {}' prints 'Z [Error]: s' on host node 24.15: the constructor's name
+     in front and the error's own 'name' in brackets, because that name is the one Z inherited and
+     not one the error carries. A name the error *does* carry -- 'e.name = "Foo"', or a subclass
+     that sets its own -- is printed alone, as 'Foo: x', so what decides it is whether 'name' is
+     the error's own property and not whether it differs from the constructor's. */
+  var nameText = err.name === undefined || err.name === null ? 'Error' : String(err.name);
+  var header = nameText;
+  var ctorText = constructorNameOf(err);
+  if (ctorText && ctorText !== nameText && ctorText !== 'Object' &&
+      !Object.prototype.hasOwnProperty.call(err, 'name')) {
+    header = ctorText + ' [' + nameText + ']';
+  }
+  if (err.message) header += header === '' ? String(err.message) : ': ' + err.message;
   var stack = err.stack ? String(err.stack) : '';
   var lines = stack === '' ? [] : guestFramesOf(stack.split('\n'));
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
@@ -67,6 +79,10 @@ var INSPECT_FMT = null;
 function inspectValue(value, opts) {
   var maxDepth = opts && typeof opts.depth === 'number' ? opts.depth : 2;
   var stack = [];
+  /* The objects a circular reference points back at, numbered from 1 in the order one was met.
+     Cleared for every walk, so the count starts again and '<ref *1>' belongs to this value. */
+  var REF_IDS = new WeakMap();
+  var REF_NEXT = 1;
 
   function fmt(v, depth, indent) {
     if (v === null) return 'null';
@@ -80,7 +96,15 @@ function inspectValue(value, opts) {
       if (/^class[\s{]/.test(Function.prototype.toString.call(v))) return '[class ' + (name || '(anonymous)') + ']';
       return '[Function: ' + (name || '(anonymous)') + ']';
     }
-    if (stack.indexOf(v) >= 0) return '[Circular *1]';
+    /* A value the walk is already inside. Node numbers the objects a '[Circular *n]' marker points
+       back at -- in the order it meets them, from 1 -- and writes '<ref *n> ' in front of the one
+       it renders, which is why 'o.self = o' prints '<ref *1> { self: [Circular *1] }' and not
+       '{ self: [Circular] }'. The number is per value, so one object pointed at twice keeps it. */
+    if (stack.indexOf(v) >= 0) {
+      var seen = REF_IDS.get(v);
+      if (seen === undefined) { seen = REF_NEXT++; REF_IDS.set(v, seen); }
+      return '[Circular *' + seen + ']';
+    }
     /* The tag and not 'instanceof': a value out of a 'vm' context is of another realm, so
        'instanceof' answers false for it on host Node 24.15 too, and what 'util.inspect' reads
        there is the internal slot the tag is the face of. Asking 'instanceof' here made an error
@@ -91,6 +115,12 @@ function inspectValue(value, opts) {
     if (vTag === 'Date') return isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
     if (vTag === 'RegExp') return String(v);
     if (vTag === 'Promise') return promiseInspectOf(v, depth, indent);
+
+    /* The one thing a weak collection shows of what it holds: nothing, and that word. Node prints
+       'WeakMap { <items unknown> }' and 'WeakSet { <items unknown> }' for every one, empty or not,
+       where this walk would reach them as plain objects with no keys and print 'WeakMap {}'. */
+    if (utilBrandCheck(WeakMap.prototype.has, v)) return 'WeakMap { <items unknown> }';
+    if (utilBrandCheck(WeakSet.prototype.has, v)) return 'WeakSet { <items unknown> }';
 
     /* A value that writes its own output wins: Node asks the custom function before it looks at
        the object's own keys, which is the whole of what a Response or a Headers prints. */
@@ -156,6 +186,12 @@ function inspectValue(value, opts) {
       entries.push(keyText + ': ' + fmt(v[keys[k]], depth + 1, indent + 2));
     }
     stack.pop();
+
+    /* Read after the walk of the children and not before: a value is only a '<ref *n>' once a
+       circular reference inside it has been met, which happens while its entries are printed. */
+    var refNo = REF_IDS.get(v);
+    var head = refNo === undefined ? '' : '<ref *' + refNo + '> ';
+    prefix = head + prefix;
 
     if (entries.length === 0) return prefix + open + close;
     var multiline = false;
@@ -264,14 +300,228 @@ TextEncoderImpl.prototype.encode = function (input) {
   return encodeUtf8(input === undefined ? '' : String(input));
 };
 
-function TextDecoderImpl(label) {
-  this.encoding = String(label || 'utf-8').toLowerCase();
-}
-TextDecoderImpl.prototype.decode = function (input) {
-  if (input === undefined) return '';
-  var bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : input;
-  return decodeBytes(bytes, this.encoding === 'utf-8' ? 'utf8' : this.encoding);
+/*
+ * TextDecoder, as the encoding standard and Node 24.15 have it: a label names one of the
+ * encodings below and is answered by its canonical name, and one no label names is a RangeError
+ * and not a decoder that answers garbage. What a decoder knows of itself -- encoding, fatal,
+ * ignoreBOM -- the host reads off accessors on the prototype, so a decoder has no own names at all
+ * and its streaming state is kept beside it, in a WeakMap, rather than on it.
+ */
+var TEXT_DECODER_LABELS = {
+  'utf-8': 'utf-8', 'utf8': 'utf-8', 'unicode-1-1-utf-8': 'utf-8',
+  'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le', 'unicode': 'utf-16le',
+  'utf-16be': 'utf-16be',
+  'latin1': 'windows-1252', 'iso-8859-1': 'windows-1252', 'iso8859-1': 'windows-1252',
+  'windows-1252': 'windows-1252', 'cp1252': 'windows-1252', 'ascii': 'windows-1252',
+  'us-ascii': 'windows-1252'
 };
+/* The single-byte encoding the label 'latin1' names: every byte below 0x80 and above 0x9f is the
+   code point it already is, and the run between them is what windows-1252 puts there, which is
+   not what latin-1 does -- a decoder that answered latin-1 would print a control character where
+   Node prints a euro sign or a curly quote. */
+var WINDOWS_1252_HIGH = {
+  0x80: 0x20ac, 0x82: 0x201a, 0x83: 0x0192, 0x84: 0x201e, 0x85: 0x2026, 0x86: 0x2020,
+  0x87: 0x2021, 0x88: 0x02c6, 0x89: 0x2030, 0x8a: 0x0160, 0x8b: 0x2039, 0x8c: 0x0152,
+  0x8e: 0x017d, 0x91: 0x2018, 0x92: 0x2019, 0x93: 0x201c, 0x94: 0x201d, 0x95: 0x2022,
+  0x96: 0x2013, 0x97: 0x2014, 0x98: 0x02dc, 0x99: 0x2122, 0x9a: 0x0161, 0x9b: 0x203a,
+  0x9c: 0x0153, 0x9e: 0x017e, 0x9f: 0x0178
+};
+var TEXT_DECODER_STATE = new WeakMap();
+
+function textDecoderError(Ctor, code, message) {
+  var err = new Ctor(message);
+  err.code = code;
+  return err;
+}
+
+/** The bytes of anything decode() is allowed to be given, or undefined if it is not allowed. */
+function decodeInputBytes(input) {
+  if (input instanceof ArrayBuffer || (typeof SharedArrayBuffer === 'function' && input instanceof SharedArrayBuffer)) {
+    return new Uint8Array(input);
+  }
+  if (typeof ArrayBuffer.isView === 'function' && ArrayBuffer.isView(input)) {
+    return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+  }
+  return undefined;
+}
+
+/**
+ * UTF-8, decoded the way the standard walks it: a lead byte says how many continuations follow and
+ * what range the first of them may fall in -- which is what makes 0xc0 0x80, an overlong encoding
+ * of NUL, invalid where a naive count would accept it. That array is the bytes of this chunk behind
+ * the ones a previous chunk left; on a stream an incomplete sequence at the end is left for the
+ * next chunk, and off a stream it is one replacement character.
+ */
+function decodeUtf8Run(values, fatal, stream) {
+  var out = '';
+  var i = 0;
+  var n = values.length;
+  while (i < n) {
+    var b = values[i];
+    var need, cp, lower, upper, k, c, ok;
+    if (b <= 0x7f) { out += String.fromCharCode(b); i += 1; continue; }
+    if (b >= 0xc2 && b <= 0xdf) { need = 1; cp = b & 0x1f; lower = 0x80; upper = 0xbf; }
+    else if (b >= 0xe0 && b <= 0xef) {
+      need = 2; cp = b & 0x0f;
+      lower = b === 0xe0 ? 0xa0 : 0x80;
+      upper = b === 0xed ? 0x9f : 0xbf;
+    } else if (b >= 0xf0 && b <= 0xf4) {
+      need = 3; cp = b & 0x07;
+      lower = b === 0xf0 ? 0x90 : 0x80;
+      upper = b === 0xf4 ? 0x8f : 0xbf;
+    } else {
+      if (fatal) throw textDecoderError(TypeError, 'ERR_ENCODING_INVALID_ENCODED_DATA', 'The encoded data was not valid for encoding utf-8');
+      out += '�'; i += 1; continue;
+    }
+    if (i + need >= n) {
+      /* A sequence the input ends in the middle of is one replacement character and no more: the
+         bytes behind the lead are part of the sequence that failed and are not read again, which
+         is what makes two truncated bytes one character where reading them again would make two.
+         On a stream they are kept for the chunk that completes them. */
+      if (stream) return { out: out, rest: values.slice(i) };
+      if (fatal) throw textDecoderError(TypeError, 'ERR_ENCODING_INVALID_ENCODED_DATA', 'The encoded data was not valid for encoding utf-8');
+      return { out: out + '�', rest: [] };
+    }
+    ok = true;
+    for (k = 1; k <= need; k++) {
+      c = values[i + k];
+      if (c < (k === 1 ? lower : 0x80) || c > (k === 1 ? upper : 0xbf)) { ok = false; break; }
+      cp = (cp << 6) | (c & 0x3f);
+    }
+    if (!ok) {
+      /* The byte that broke the sequence is read again as the start of the next one -- which is
+         what makes 'c3 28' a replacement character followed by '(' and not two of them. */
+      if (fatal) throw textDecoderError(TypeError, 'ERR_ENCODING_INVALID_ENCODED_DATA', 'The encoded data was not valid for encoding utf-8');
+      out += '�'; i += k; continue;
+    }
+    /* A code point past the basic plane is a surrogate pair, which is what string it as text. */
+    if (cp > 0xffff) {
+      cp -= 0x10000;
+      out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    } else out += String.fromCharCode(cp);
+    i += need + 1;
+  }
+  return { out: out, rest: [] };
+}
+
+function decodeUtf16Run(values, little, stream) {
+  var out = '';
+  var i = 0;
+  var n = values.length - (values.length % 2);
+  for (; i < n; i += 2) {
+    out += String.fromCharCode(little ? (values[i] | (values[i + 1] << 8)) : ((values[i] << 8) | values[i + 1]));
+  }
+  /* One byte left over: off a stream it is dropped, as the standard drops it; on a stream it waits
+     for its pair. Either way a lone trailing byte is not an error the standard reports. */
+  var rest = stream && values.length % 2 === 1 ? values.slice(values.length - 1) : [];
+  return { out: out, rest: rest };
+}
+
+function textDecoderOptionsError(options) {
+  /* A dictionary Node reads off an argument: an object is one, a function is one, and null and
+     undefined are the absence of one. Anything else is refused in Node's own words, in which a
+     string is quoted and every other type is printed as it prints. */
+  if (options === undefined || options === null) return undefined;
+  if (typeof options === 'object' || typeof options === 'function') return undefined;
+  var got = typeof options === 'string' ? "string ('" + options + "')" : typeof options + ' (' + String(options) + ')';
+  return textDecoderError(TypeError, 'ERR_INVALID_ARG_TYPE',
+    'The "options" argument must be of type object. Received type ' + got);
+}
+
+function TextDecoderImpl(label, options) {
+  /* Node's own is a class, and a class called without 'new' is refused in a class's own words --
+     which name the class. This engine names the constructor differently, so what a program reads
+     for the call is written here and the engine's own answer is never reached. */
+  if (new.target === undefined) {
+    throw new TypeError("Class constructor TextDecoder cannot be invoked without 'new'");
+  }
+  /* A label is a string, and one that is not -- a Symbol -- is refused by the conversion itself:
+     String(symbol) would answer 'Symbol(s)', and this engine's own conversion answers it in words
+     that are not Node's. Both are the same refusal, so the refusal is written here. */
+  if (typeof label === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+  var name = label === undefined ? 'utf-8' : '' + label;
+  var canonical = TEXT_DECODER_LABELS[String(name).toLowerCase()];
+  if (canonical === undefined) {
+    throw textDecoderError(RangeError, 'ERR_ENCODING_NOT_SUPPORTED', 'The "' + name + '" encoding is not supported');
+  }
+  var bad = textDecoderOptionsError(options);
+  if (bad !== undefined) throw bad;
+  var opts = options === undefined || options === null ? {} : options;
+  TEXT_DECODER_STATE.set(this, {
+    encoding: canonical,
+    fatal: Boolean(opts.fatal),
+    ignoreBOM: Boolean(opts.ignoreBOM),
+    /* The BOM is only ever the first thing a decoder sees: one is stripped from the first bytes
+       of the stream and never from the middle of it, and a decoder told to ignore it keeps it as
+       text. The flag is false until the first chunk has settled the question. */
+    bom: false,
+    rest: []
+  });
+}
+/* The four the host's own prototype carries, and as the host carries them: a method and three
+   accessors, all of them writable and enumerable, which is what makes Object.keys of the
+   prototype answer their names. 'constructor' is the one name that is not. */
+Object.defineProperty(TextDecoderImpl.prototype, 'decode', { writable: true, enumerable: true, configurable: true });
+Object.defineProperty(TextDecoderImpl.prototype, 'encoding', {
+  get: function () { return TEXT_DECODER_STATE.get(this).encoding; }, enumerable: true, configurable: true
+});
+Object.defineProperty(TextDecoderImpl.prototype, 'fatal', {
+  get: function () { return TEXT_DECODER_STATE.get(this).fatal; }, enumerable: true, configurable: true
+});
+Object.defineProperty(TextDecoderImpl.prototype, 'ignoreBOM', {
+  get: function () { return TEXT_DECODER_STATE.get(this).ignoreBOM; }, enumerable: true, configurable: true
+});
+TextDecoderImpl.prototype.decode = function (input, options) {
+  var state = TEXT_DECODER_STATE.get(this);
+  /* 'Value of "this" must be of type TextDecoder': a brand no probe of the value itself can
+     give, since a decoder has no own names and no tag of its own -- only the record beside it
+     says this object was ever built by this constructor. */
+  if (state === undefined) {
+    throw textDecoderError(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type TextDecoder');
+  }
+  var bad = textDecoderOptionsError(options);
+  if (bad !== undefined) throw bad;
+  if (input === undefined) return '';
+    var bytes = decodeInputBytes(input);
+    if (bytes === undefined) {
+      throw textDecoderError(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "list" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView.');
+    }
+    var stream = options !== undefined && options !== null && Boolean(options.stream);
+    var values = state.rest.slice();
+    for (var i = 0; i < bytes.length; i++) values.push(bytes[i]);
+    if (!state.bom && !state.ignoreBOM) {
+      if (values.length >= 3) {
+        state.bom = true;
+        if (values[0] === 0xef && values[1] === 0xbb && values[2] === 0xbf) values = values.slice(3);
+      } else if (stream && values.length > 0 && values[0] === 0xef) {
+        /* Too early to say: the bytes could still turn out to be a BOM. */
+        state.rest = values;
+        return '';
+      } else if (!stream) state.bom = true;
+    }
+    var run;
+    if (state.encoding === 'utf-8') run = decodeUtf8Run(values, state.fatal, stream);
+    else if (state.encoding === 'utf-16le' || state.encoding === 'utf-16be') {
+      run = decodeUtf16Run(values, state.encoding === 'utf-16le', stream);
+    } else {
+      var out = '';
+      for (var j = 0; j < values.length; j++) {
+        var b = values[j];
+        out += String.fromCharCode(b < 0x80 || b > 0x9f ? b : WINDOWS_1252_HIGH[b]);
+      }
+      run = { out: out, rest: [] };
+    }
+    state.rest = stream ? run.rest : [];
+    return run.out;
+  };
+Object.defineProperty(TextDecoderImpl.prototype, 'decode', { enumerable: true, configurable: true });
+/* Its name, which a program reads off the constructor, is 'TextDecoder' and not the name it was
+   built under here. */
+Object.defineProperty(TextDecoderImpl, 'name', { value: 'TextDecoder', configurable: true });
+Object.defineProperty(TextDecoderImpl.prototype, Symbol.toStringTag, { value: 'TextDecoder', configurable: true });
+/* The two arguments are optional in Node's own signature and so are absent from its length: the
+   arity a program reads is 0, and the method reads its arguments all the same. */
+Object.defineProperty(TextDecoderImpl.prototype.decode, 'length', { value: 0, configurable: true });
 
 function utilArgError(code, message) {
   var err = new TypeError(message);
@@ -326,10 +576,12 @@ Object.defineProperty(globalThis.Proxy, 'revocable', {
   },
   writable: true, configurable: true
 });
+/* Written the way every name of the bridge is: this reaches the setter on the object behind the
+   global object (see loader.ts) and so is no own name of it, where a walk of the global object's
+   own names -- Object.keys, Object.getOwnPropertyNames -- would find it and Node's walk would not. */
 globalThis.__owcIsProxy = function (value) {
   return value !== null && (typeof value === 'object' || typeof value === 'function') && PROXIES_MADE.has(value);
 };
-
 /*
  * What a promise settled with, which is the one thing about one no probe of this engine answers:
  * 'Object.getOwnPropertyNames(promise)' is '[]', and the state is a slot no reflection reaches,
@@ -360,10 +612,35 @@ class TrackedPromise extends NATIVE_PROMISE {
       throw new TypeError('Promise resolver ' + String(executor) + ' is not a function');
     }
     super(function (resolve, reject) {
+      /* What a promise settles with is the value the settling ends at, not the thenable it starts
+         from: host node 24.15 prints 'Promise { 3 }' for 'Promise.resolve({ then: function (r)
+         { r(3); } })' and 'Promise { 5 }' for 'new Promise(function (r) { r(Promise.resolve(5)); })'.
+         A thenable is adopted by the engine alone -- it calls 'then' itself, and the value that
+         call is handed reaches no wrapper -- so the resolve handed on here is a stand-in thenable
+         of our own: it forwards the one call the engine makes and writes down what it was given.
+         The real 'then' is still called once, by us and not twice over. */
+      var resolveAdopting = function (value) {
+        var then = undefined;
+        try {
+          if (value !== null && (typeof value === 'object' || typeof value === 'function')) then = value.then;
+        } catch (x) { then = undefined; }
+        if (typeof then !== 'function') return resolve(value);
+        return resolve({
+          then: function (onFulfilled, onRejected) {
+            var wrote = function (how) {
+              return function (inner) {
+                if (cell.state === 1) { cell.state = how; cell.value = inner; }
+                return (how === 1 ? onFulfilled : onRejected)(inner);
+              };
+            };
+            return then.call(value, wrote(1), wrote(2));
+          }
+        });
+      };
       var took = function (how) {
         return function (value) {
           if (cell.state === 0) { cell.state = how; cell.value = value; }
-          return (how === 1 ? resolve : reject)(value);
+          return how === 1 ? resolveAdopting(value) : reject(value);
         };
       };
       var onResolve = took(1);
@@ -402,10 +679,15 @@ globalThis.__owcNotePromise = function (promise, cell) {
 
 /** What 'util.inspect' writes for a promise: the value it settled with, or why it is still open. */
 function promiseInspectOf(v, depth, indent) {
+  /* A subclass carries its own name in front: host node 24.15 prints 'P [Promise] { 1 }' for the
+     promise 'class P extends Promise {}' resolves, and plain 'Promise { 1 }' for one whose
+     constructor answers to the name 'Promise', which every promise this realm builds does. */
+  var ctorText = constructorNameOf(v);
+  var head = (ctorText && ctorText !== 'Promise' && ctorText !== 'Object') ? ctorText + ' [Promise]' : 'Promise';
   var cell = PROMISE_CELLS.get(v);
-  if (cell === undefined || cell.state === 0) return 'Promise { <pending> }';
-  if (cell.state === 2) return 'Promise { <rejected> ' + fmtPromiseValue(cell.value, depth, indent) + ' }';
-  return 'Promise { ' + fmtPromiseValue(cell.value, depth, indent) + ' }';
+  if (cell === undefined || cell.state === 0) return head + ' { <pending> }';
+  if (cell.state === 2) return head + ' { <rejected> ' + fmtPromiseValue(cell.value, depth, indent) + ' }';
+  return head + ' { ' + fmtPromiseValue(cell.value, depth, indent) + ' }';
 }
 
 /* The value inside a promise, printed at the depth the promise itself is at: Node gives the

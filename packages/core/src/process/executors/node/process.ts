@@ -699,6 +699,14 @@ const REJECTION_TRACKER_SRC = String.raw`
      builds each of them by constructing the species of the constructor it started from. */
   class Tracked extends Native {
     constructor(executor) {
+      /* 'new Promise()' with no resolver, or with one that is not a function: the synchronous
+         TypeError node raises, and not a rejection. This subclass stands in for 'Promise' and its
+         constructor runs before the one under it, so without this the throw happened inside the
+         'try' below, became a rejection of a promise nobody was holding, and ended the process
+         with exit 1 where host node 24.15 throws and exits 0. */
+      if (typeof executor !== 'function') {
+        throw new TypeError('Promise resolver ' + String(executor) + ' is not a function');
+      }
       var owner = globalThis.process;
       var cell = {
         reason: undefined,
@@ -2481,8 +2489,17 @@ export class NodeProcess extends Process {
         if (line === 0) return undefined;
         const column = number('columnNumber') || 1;
         const message = text('message');
+        /* The graph the entry imports is compiled inside the entry's own call, so the file the
+           engine failed on is not always the entry: a dependency that will not parse fails the
+           compilation of the module that imports it, and the line and column it reports are the
+           dependency's. The error's own stack is what names that file -- it is the one frame a
+           failure to compile has -- so the report is written over that file's source, and over
+           that file's frames, which are a linked dependency's and not a load the run started. */
+        const failed = syntaxFailureFile(text('stack'), file, (at) => this.fileSystem.readFile(at));
+        const failedSource = failed === file ? source : this.fileSystem.readFile(failed) ?? source;
         return esmCompileFailureText(
-            source, file, line, column, message, true, unterminatedStringSpan(source, line, column, message)
+            failedSource, failed, line, column, message, failed === file,
+            unterminatedStringSpan(failedSource, line, column, message)
         );
     }
 
@@ -2936,7 +2953,39 @@ export class NodeProcess extends Process {
         }
     }
 
+    /**
+     * Whether the module now being loaded was named by a dynamic import, read from the flag the
+     * guest stands for the length of one and cleared here. The answer is false whenever the flag is
+     * not there at all -- a load the engine starts while no context is running asks for nothing.
+     */
+    private takeDynamicLoad(): boolean {
+        const context = this.context;
+        if (context === null || context === undefined) return false;
+        try {
+            const flag = context.getProp(context.global, '__owc_dynamic_load');
+            let on = false;
+            try {
+                on = context.typeof(flag) === 'boolean' && context.dump(flag) === true;
+            } finally {
+                flag.dispose();
+            }
+            if (on) {
+                const cleared = context.false;
+                context.setProp(context.global, '__owc_dynamic_load', cleared);
+                cleared.dispose();
+            }
+            return on;
+        } catch {
+            return false;
+        }
+    }
+
     private loadModule(moduleName: string): { value: string } | { error: Error | QuickJSHandle } {
+        /* Whether this module is being loaded because a program asked for it by a dynamic import:
+           the argument of 'import(spec)' is read before the engine asks for the module it names, so
+           the guest has already said so by the time this runs. It is cleared as it is read, so it
+           names this one load and not every load after it. */
+        const dynamic = this.takeDynamicLoad();
         if (moduleName === '') {
             /* QuickJS loads an empty name only after the normalizer failed, and the error the
                normalizer raised is not the one that surfaces: this one is. It is built in the
@@ -2964,7 +3013,7 @@ export class NodeProcess extends Process {
                 return { value: `export default ${this.readRequired(file)};` };
             }
             if (this.resolver.isESM(file, file === this.requireFile)) {
-                return { value: this.esmSource(this.readRequired(file), file, false, suffix) };
+                return { value: this.esmSource(this.readRequired(file), file, false, suffix, dynamic) };
             }
             return { value: this.syntheticModule(file, false) };
         } catch (error) {
@@ -2979,7 +3028,7 @@ export class NodeProcess extends Process {
      * is used only when it changes the source and the engine fails to compile the source as it is; a
      * source that compiles reaches the engine unchanged.
      */
-    private esmSource(source: string, file: string, isMain: boolean, urlSuffix = ''): string {
+    private esmSource(source: string, file: string, isMain: boolean, urlSuffix = '', dynamicLoad = false): string {
         /* A frame the engine names in a file compiled as an ES module is one node names by the
            file's URL and not by its path, so the guest is told which files those are as they are
            compiled: a .js file is a module here or not by the package it sits in, which only the
@@ -3021,7 +3070,7 @@ export class NodeProcess extends Process {
                 message: `Identifier '${duplicate.name}' has already been declared`,
                 whole: esmCompileFailureText(
                     text, file, duplicate.line, duplicate.column,
-                    `Identifier '${duplicate.name}' has already been declared`, isMain, duplicate.span
+                    `Identifier '${duplicate.name}' has already been declared`, isMain || dynamicLoad, duplicate.span
                 ),
             };
             if (isMain) throw new GuestFailure(info.whole, true);
@@ -4032,6 +4081,26 @@ function lineColumnOf(source: string, index: number): { line: number; column: nu
  * Captured from the build NODE_VERSION names, as the usage block is -- a frame names a file this
  * container does not have, at a line only that build knows.
  */
+/**
+ * The file a failure to compile names, read out of the error's stack: the one frame such a failure
+ * carries is `at <file>:<line>:<column>`, and the file in it is the module the engine could not
+ * compile. A name that no file answers -- or the entry's own, which is what it is by default -- is
+ * answered as the file the caller already had, so a failure in the entry itself reads as it did.
+ */
+function syntaxFailureFile(stack: string, file: string, read: (at: string) => string | undefined): string {
+    if (stack === '') return file;
+    const frame = /^\s*at\s+(?:[^\s()]*\s*\()?([^()\s]+):\d+:\d+\)?/m.exec(stack);
+    const at = frame === null ? undefined : frame[1];
+    if (at === undefined || at === file) return file;
+    let text: string | undefined;
+    try {
+        text = read(at);
+    } catch {
+        return file;
+    }
+    return text === undefined ? file : at;
+}
+
 function esmCompileFrames(isMain: boolean, isTs = false): string {
     const shared = [
         '    at compileSourceTextModule (node:internal/modules/esm/utils:318:16)',

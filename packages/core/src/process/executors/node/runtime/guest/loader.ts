@@ -40,7 +40,19 @@ function owcBridgeName(name) {
   });
 }
 ['__owc_api', '__owcErrname', '__owc_importArg', '__owc_importMeta', '__owc_importWrap',
-  '__owc_moduleView', '__owc_import_failure', '__owcDependencyRequire', '__owc_esm_registry'
+  '__owc_moduleView', '__owc_import_failure', '__owcDependencyRequire', '__owc_esm_registry',
+  /* Set for the length of one dynamic import: the argument of 'import(spec)' is read before the
+     engine loads the module it names, so the flag is already standing when the host is asked for
+     that module's source and is what tells a load a program started from a dependency the entry
+     linked -- which is the only difference between the two stacks node prints for a module that
+     will not compile. The host clears it as it answers, so a later load does not inherit it. */
+  '__owc_dynamic_load',
+  /* The two records util.types.isProxy and util.inspect read, written from util-assert.ts, which
+     runs after this: they are the bridge's and not a program's, so they stand here with the rest
+     rather than as own names of the global object, where Object.getOwnPropertyNames would find
+     them. An assignment to globalThis.<name> reaches the setter below, so the writer there is
+     unchanged. */
+  '__owcIsProxy', '__owcNotePromise'
 ].forEach(owcBridgeName);
 var OWC_BRIDGE_FRONT = Object.create(OWC_BRIDGE);
 OWC_BRIDGE_FRONT.constructor = Object;
@@ -1291,6 +1303,7 @@ function errorModuleOf(info) {
    without "type": "json" is ERR_IMPORT_ATTRIBUTE_MISSING. A specifier that resolves to nothing is
    left alone, so it fails as a missing module, as it does in Node. */
 function importArgOf(spec, options, filename) {
+  globalThis.__owc_dynamic_load = true;
   var s = String(spec);
   var attrs = options && typeof options === 'object' && options.with && typeof options.with === 'object' ? options.with : null;
   /* JSON is named by a .json path, and by a data: URL whose media type is application/json. */
