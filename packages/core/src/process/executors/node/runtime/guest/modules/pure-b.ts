@@ -1423,6 +1423,7 @@ export const SRC = String.raw`
      * pid, and an event carries a timestamp and a stack trace.
      */
     var enabledSessions = [];
+    var connectedSessions = [];
     var consoleHooked = false;
     var CONSOLE_TYPES = { log: 'log', info: 'info', warn: 'warning', error: 'error', debug: 'debug' };
 
@@ -1443,12 +1444,15 @@ export const SRC = String.raw`
         globalThis.console[name] = function () {
           var args = Array.prototype.slice.call(arguments);
           var type = CONSOLE_TYPES[name];
-          for (var i = 0; i < enabledSessions.length; i++) {
-            notify(enabledSessions[i], 'Runtime.consoleAPICalled', {
+          for (var i = 0; i < connectedSessions.length; i++) {
+            var event = {
               type: type,
-              args: args.map(remoteObjectOf),
+              args: args.map(function (arg) { return remoteObjectOf(arg, { noId: true }); }),
               executionContextId: 1
-            });
+            };
+            var session = connectedSessions[i];
+            if (enabledSessions.indexOf(session) >= 0) notify(session, 'Runtime.consoleAPICalled', event);
+            else if (session._owcPending.length < 1000) session._owcPending.push(event);
           }
           return original.apply(this, args);
         };
@@ -1467,6 +1471,12 @@ export const SRC = String.raw`
         throw nodeError(Error, 'ERR_INSPECTOR_ALREADY_CONNECTED', 'The inspector session is already connected');
       }
       this._owcConnected = true;
+      /* A host starts recording the console the moment a session connects and hands the session
+         what it recorded when Runtime is enabled, so the lines a program wrote in between are not
+         lost -- they are the first Runtime.consoleAPICalled events the session sees. */
+      this._owcPending = [];
+      hookConsole();
+      if (connectedSessions.indexOf(this) < 0) connectedSessions.push(this);
     };
 
     Session.prototype.connectToMainThread = function () {
@@ -1476,6 +1486,9 @@ export const SRC = String.raw`
     Session.prototype.disconnect = function () {
       var at = enabledSessions.indexOf(this);
       if (at >= 0) enabledSessions.splice(at, 1);
+      var where = connectedSessions.indexOf(this);
+      if (where >= 0) connectedSessions.splice(where, 1);
+      this._owcPending = [];
       this._owcConnected = false;
     };
 
@@ -1493,7 +1506,70 @@ export const SRC = String.raw`
       return null;
     }
 
-    function remoteObjectOf(value) {
+    /* An object the protocol hands an id out for is reachable only through that id: the objectId a
+       Runtime.evaluate without returnByValue answers with is the one Runtime.getProperties is
+       called back with, and without it that half of the protocol cannot be reached at all. The
+       object is therefore kept here for as long as the session lives. The id is three dot-separated
+       numbers, the shape a host's has -- its first is a V8 isolate's own serial, which no two runs
+       of a host agree on either. row owc-inspector-returnbyvalue-notifications. */
+    var remoteObjects = [];
+    function objectIdOf(value) {
+      for (var i = 0; i < remoteObjects.length; i++) if (remoteObjects[i] === value) return '1.1.' + (i + 1);
+      remoteObjects.push(value);
+      return '1.1.' + remoteObjects.length;
+    }
+    function objectForId(id) {
+      var parts = String(id).split('.');
+      var at = Number(parts[parts.length - 1]);
+      if (!(at >= 1 && at <= remoteObjects.length)) return undefined;
+      return remoteObjects[at - 1];
+    }
+    function classNameOf(value) {
+      return value && value.constructor && typeof value.constructor.name === 'string'
+        ? value.constructor.name : 'Object';
+    }
+    /* A host describes an object it has handed an id out for by its class -- 'Object', not the
+       '{ x: 1, y: 2 }' it would print -- and an array by its length. An error is the exception:
+       what V8 describes there is the error's own text, stack and all. */
+    function descriptionOf(value) {
+      if (value instanceof Error) return inspectValue(value);
+      if (Array.isArray(value)) return 'Array(' + value.length + ')';
+      return classNameOf(value);
+    }
+    function propertiesOf(value) {
+      var out = [];
+      var names = Object.getOwnPropertyNames(value);
+      for (var i = 0; i < names.length; i++) {
+        var described = Object.getOwnPropertyDescriptor(value, names[i]);
+        out.push({
+          name: names[i],
+          value: remoteObjectOf(described.value),
+          writable: !!described.writable,
+          configurable: !!described.configurable,
+          enumerable: !!described.enumerable,
+          isOwn: true
+        });
+      }
+      return out;
+    }
+    function previewValueOf(value) {
+      if (value === undefined) return undefined;
+      if (typeof value === 'string') return value;
+      return String(value);
+    }
+    function previewOf(value) {
+      var names = Object.keys(value);
+      var limit = names.length > 100 ? 100 : names.length;
+      var shown = [];
+      for (var i = 0; i < limit; i++) {
+        var ro = remoteObjectOf(value[names[i]], { noId: true });
+        shown.push({ name: names[i], type: ro.type, value: previewValueOf(value[names[i]]) });
+      }
+      return { type: 'object', description: descriptionOf(value), overflow: names.length > limit, properties: shown };
+    }
+
+    function remoteObjectOf(value, options) {
+      var withId = !(options && options.noId === true);
       if (value === undefined) return { type: 'undefined' };
       if (value === null) return { type: 'object', subtype: 'null', value: null, description: 'null' };
       var kind = typeof value;
@@ -1506,10 +1582,16 @@ export const SRC = String.raw`
       if (kind === 'boolean') return { type: 'boolean', value: value, description: String(value) };
       if (kind === 'bigint') return { type: 'bigint', unserializableValue: String(value) + 'n', description: String(value) + 'n' };
       if (kind === 'symbol') return { type: 'symbol', value: String(value), description: String(value) };
-      if (kind === 'function') return { type: 'function', className: 'Function', description: inspectValue(value) };
-      var className = value && value.constructor && typeof value.constructor.name === 'string'
-        ? value.constructor.name : 'Object';
-      return { type: 'object', className: className, description: inspectValue(value) };
+      if (kind === 'function') {
+        var asFunction = { type: 'function', className: 'Function', description: inspectValue(value) };
+        if (withId) asFunction.objectId = objectIdOf(value);
+        return asFunction;
+      }
+      var described = { type: 'object', className: classNameOf(value), description: descriptionOf(value) };
+      if (Array.isArray(value)) described.subtype = 'array';
+      else if (value instanceof Error) described.subtype = 'error';
+      if (withId) described.objectId = objectIdOf(value);
+      return described;
     }
 
     /*
@@ -1537,11 +1619,15 @@ export const SRC = String.raw`
     function evaluateForInspector(params) {
       var expression = params && typeof params.expression === 'string' ? params.expression : '';
       var byValue = params && params.returnByValue === true;
+      var preview = params && params.generatePreview === true;
+      var evaluated;
       try {
-        var evaluated = (0, eval)(expression);
-        return { result: byValue ? returnByValueOf(evaluated) : remoteObjectOf(evaluated) };
+        evaluated = (0, eval)(expression);
       } catch (err) {
+        /* A host answers a throwing expression with the exceptionDetails and with a result holding
+           the value that was thrown, which is what a caller that reads result alone sees. */
         return {
+          result: remoteObjectOf(err),
           exceptionDetails: {
             exception: remoteObjectOf(err),
             text: 'Uncaught',
@@ -1550,11 +1636,41 @@ export const SRC = String.raw`
           }
         };
       }
+      /* awaitPromise: a host settles the promise before it answers, so the result is the value the
+         promise resolves to -- or the exceptionDetails of the value it rejects with -- and the
+         answer waits for it, the one case in which post cannot call back synchronously. */
+      if (params && params.awaitPromise === true && evaluated
+        && (typeof evaluated === 'object' || typeof evaluated === 'function')
+        && typeof evaluated.then === 'function') {
+        return { thenable: evaluated, byValue: byValue, preview: preview };
+      }
+      return { result: remoteResultOf(evaluated, byValue, preview) };
     }
 
+    function remoteResultOf(value, byValue, preview) {
+      var out = byValue ? returnByValueOf(value) : remoteObjectOf(value);
+      /* generatePreview: a host answers with the object's own enumerable entries under a preview,
+         and stops at a hundred of them, which is what overflow reports. */
+      if (preview && !byValue && out.type === 'object' && out.subtype !== 'null') out.preview = previewOf(value);
+      return out;
+    }
+
+    /* A host's post calls back from inside the call, which is what puts a callback's own output
+       before the line the program writes after it; deferring it to a timer, as this did, reorders
+       every program that posts in a loop. */
     function deliver(done, error, result) {
       if (typeof done !== 'function') return;
-      setTimeout(function () { done(error, result); }, 0);
+      done(error, result);
+    }
+
+    function settleEvaluation(done, request, value, thrown) {
+      if (thrown) {
+        deliver(done, null, {
+          exceptionDetails: { exception: remoteObjectOf(value), text: 'Uncaught', lineNumber: 0, columnNumber: 0 }
+        });
+        return;
+      }
+      deliver(done, null, { result: remoteResultOf(value, request.byValue, request.preview) });
     }
 
     Session.prototype.post = function (method, params, callback) {
@@ -1566,7 +1682,24 @@ export const SRC = String.raw`
       if (!this._owcConnected) throw nodeError(Error, 'ERR_INSPECTOR_NOT_CONNECTED', 'Session is not connected');
       if (method === 'Runtime.evaluate') {
         var outcome = evaluateForInspector(params);
-        deliver(callback, null, outcome);
+        if (outcome.thenable === undefined) {
+          deliver(callback, null, outcome);
+          return undefined;
+        }
+        var settle = function (value, thrown) { settleEvaluation(callback, outcome, value, thrown); };
+        try {
+          outcome.thenable.then(function (v) { settle(v, false); }, function (err) { settle(err, true); });
+        } catch (errSettling) {
+          settle(errSettling, true);
+        }
+        return undefined;
+      }
+      /* Runtime.getProperties is the other half of the objectId above: the own entries of the object
+         the id names, each one as the protocol describes a value. An id this session never handed
+         out names nothing, which is the empty answer a host gives for one. */
+      if (method === 'Runtime.getProperties') {
+        var asked = params && params.objectId !== undefined ? objectForId(params.objectId) : undefined;
+        deliver(callback, null, { result: asked === undefined ? [] : propertiesOf(asked), internalProperties: [] });
         return undefined;
       }
       if (method === 'Runtime.enable' || method === 'Runtime.disable' || method === 'Runtime.runIfWaitingForDebugger') {
@@ -1576,6 +1709,13 @@ export const SRC = String.raw`
           notify(this, 'Runtime.executionContextCreated', {
             context: { id: 1, origin: '', name: 'node[' + globalThis.process.pid + ']', auxData: { isDefault: true } }
           });
+          /* What the console wrote while the session was connected but Runtime was not: a host
+             delivers these first, in the order they were written. */
+          var pending = this._owcPending || [];
+          this._owcPending = [];
+          for (var pendingAt = 0; pendingAt < pending.length; pendingAt++) {
+            notify(this, 'Runtime.consoleAPICalled', pending[pendingAt]);
+          }
         } else if (method === 'Runtime.disable') {
           var at = enabledSessions.indexOf(this);
           if (at >= 0) enabledSessions.splice(at, 1);

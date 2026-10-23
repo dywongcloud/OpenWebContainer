@@ -3749,6 +3749,64 @@ BF.module = function () {
   /* Deprecated in node to the point of doing nothing: it prints no warning there and returns
      undefined, and so does this. */
   Module._debug = function _debug() { return undefined; };
+  /* internalModuleStat is one stat(2) call, so the errno it hands back is the kernel's, and three
+     of them this filesystem's statSync cannot name at all: ENOTDIR for a '.' or a '..' that it
+     folds into the path rather than walking through the component in front of it, ELOOP for a link
+     chain that comes back on itself (statSync reports one as missing), and ENAMETOOLONG for a
+     component past NAME_MAX. A path any of them decides is therefore walked here, component by
+     component: every one but the leaf has to be a directory, '.' and '..' are read as the traversal
+     they are instead of being dropped, and a link is followed under a hop count so a cycle ends as
+     ELOOP and not as a hang. It answers null where it has nothing to say -- a path that is not
+     absolute, or a link whose target will not read -- and the caller falls back to statSync and to
+     the parent walk below. row owc-module-stat-enotdir-for-file-parent. */
+  var STAT_ENOTDIR = -20;
+  var STAT_ELOOP = -62;
+  var STAT_ENAMETOOLONG = -63;
+  var STAT_NAME_MAX = 255;
+  function walkForStat(p) {
+    var fsWalk = requireBuiltin('fs');
+    if (typeof fsWalk.lstatSync !== 'function' || typeof fsWalk.readlinkSync !== 'function') return null;
+    /* Only an absolute path has components this can name: a relative one is resolved against a
+       working directory the loader, not this walk, is the authority on. */
+    if (p.charAt(0) !== '/') return null;
+    var pathWalk = requireBuiltin('path');
+    var raw = p.split('/');
+    var names = [];
+    for (var i = 0; i < raw.length; i++) if (raw[i].length > 0) names.push(raw[i]);
+    if (names.length === 0) return 1;
+    var at = '/';
+    var leaf = null;
+    for (var n = 0; n < names.length; n++) {
+      var seg = names[n];
+      if (seg === '.' || seg === '..') {
+        var here;
+        try { here = fsWalk.lstatSync(at); } catch (e) { return null; }
+        if (!here.isDirectory()) return STAT_ENOTDIR;
+        if (seg === '..') at = pathWalk.dirname(at);
+        leaf = null;
+        continue;
+      }
+      var next = (at === '/' ? '/' : at + '/') + seg;
+      var st;
+      try { st = fsWalk.lstatSync(next); } catch (e2) { return null; }
+      var hops = 0;
+      while (st.isSymbolicLink()) {
+        if (hops >= 40) return STAT_ELOOP;
+        var target;
+        try { target = fsWalk.readlinkSync(next); } catch (e3) { return null; }
+        next = target.charAt(0) === '/' ? target : pathWalk.resolve(pathWalk.dirname(next), target);
+        try { st = fsWalk.lstatSync(next); } catch (e4) { return null; }
+        hops++;
+      }
+      if (n < names.length - 1 && !st.isDirectory()) return STAT_ENOTDIR;
+      at = next;
+      leaf = st;
+    }
+    if (leaf === null) {
+      try { leaf = fsWalk.lstatSync(at); } catch (e5) { return null; }
+    }
+    return leaf.isDirectory() ? 1 : 0;
+  }
   /* internalModuleStat's own answer: 0 for a file, 1 for a directory and the negated errno for a
      path that is not there, which is what a caller of _stat compares against. Node's own stat is
      not this filesystem's statSync -- it is a call of its own, and it names ENOTDIR where it finds
@@ -3766,9 +3824,17 @@ BF.module = function () {
     if (filename === '') return -2;
     var fsForStat = requireBuiltin('fs');
     var ENOENT = -2;
-    var ENOTDIR = -20;
+    var ENOTDIR = STAT_ENOTDIR;
     function isNotDir(err) {
       return !!err && (err.code === 'ENOTDIR' || err.errno === 20);
+    }
+    /* A component past NAME_MAX is one the kernel refuses before it looks at anything else, and
+       ENAMETOOLONG is what node negates for it; statSync reads such a path as merely missing. */
+    var components = filename.split('/');
+    var dotSegment = false;
+    for (var c = 0; c < components.length; c++) {
+      if (components[c].length > STAT_NAME_MAX) return STAT_ENAMETOOLONG;
+      if (components[c] === '.' || components[c] === '..') dotSegment = true;
     }
     /* A trailing slash is the one component no walk can name: 'plain.js/' is not 'plain.js' looked
        up inside itself, it is the same file asked for as a directory, and that is ENOTDIR on a
@@ -3783,10 +3849,21 @@ BF.module = function () {
         /* Nothing there either: the walk below is what names it. */
       }
     }
+    /* Where the path names a '.' or a '..', statSync's answer is the path with it folded away,
+       which is not the answer of a call that has to walk through the component in front of it. */
+    if (dotSegment) {
+      var walkedDot = walkForStat(filename);
+      if (walkedDot !== null) return walkedDot;
+    }
     try {
       return fsForStat.statSync(filename).isDirectory() ? 1 : 0;
     } catch (e) {
       if (isNotDir(e)) return ENOTDIR;
+      /* A path that is there only through a link this filesystem's own statSync will not follow,
+         and one whose links come back on themselves, are two the walk can name and this catch
+         cannot: it reads both as missing. */
+      var walked = walkForStat(filename);
+      if (walked !== null) return walked;
       /* Which of the two it is has to be read off the nearest parent that does exist: a parent
          that is a file makes every path under it ENOTDIR, one that is a directory or is itself
          missing makes it ENOENT, exactly as node's own walk from the leaf upwards reads it. */
