@@ -1437,8 +1437,14 @@ class UnsetVariableError extends Error {}
  * reports with the text as it was written and a status of 1, and nothing behind it runs.
  */
 class BadSubstitutionError extends Error {
-    constructor(readonly raw: string) {
-        super(raw);
+    /**
+     * `raw` is the text between the braces -- `v^^` for the one a host refuses -- and `word` the
+     * text its diagnostic names: the whole word where the substitution was written unquoted, and
+     * the inside of the quotes where it was not. Written unquoted the whole word is named, case
+     * operator and all; inside a pair of double quotes only the quoted text is.
+     */
+    constructor(readonly raw: string, readonly word?: string) {
+        super(word ?? raw);
     }
 }
 
@@ -1463,6 +1469,15 @@ function assignmentOf(text: string): { name: string; append: boolean; rest: stri
 
 /** Parses the inside of `${...}`. */
 function parseVarRef(body: string): VarRef {
+    const ref = parseVarRefBody(body);
+    /* A case operator behind the name is one no 3.2 reads whatever stands behind it: a substring or
+       a default written behind `^^` is still a host's bad substitution, where reading the colon as
+       the one or the other left the operator in the name and the line running to its end. */
+    if (/[\^,]/.test(ref.name)) return { raw: ref.raw, name: ref.name, op: 'bad', arg: '' };
+    return ref;
+}
+
+function parseVarRefBody(body: string): VarRef {
     const raw = body;
     if (body.startsWith('#')) {
         const rest = body.slice(1);
@@ -1487,11 +1502,6 @@ function parseVarRef(body: string): VarRef {
     const subscript = /\[[^\]]*\]/.exec(body);
     const inSubscript = (at: number): boolean =>
         subscript !== null && at >= subscript.index && at < subscript.index + subscript[0].length;
-    let colon = body.indexOf(':');
-    while (colon > 0 && inSubscript(colon)) colon = body.indexOf(':', colon + 1);
-    if (colon > 0 && !'-+=?'.includes(body[colon + 1] ?? '')) {
-        return { raw, name: body.slice(0, colon), op: 'substr', arg: body.slice(colon + 1) };
-    }
     const operators = ['##', '%%', ':-', ':=', ':+', ':?', '//', '#', '%', '-', '=', '+', '?', '/'];
     let cut = -1;
     let op = '';
@@ -1502,6 +1512,16 @@ function parseVarRef(body: string): VarRef {
             cut = at;
             op = operator;
         }
+    }
+    let colon = body.indexOf(':');
+    while (colon > 0 && inSubscript(colon)) colon = body.indexOf(':', colon + 1);
+    /* Only a colon with no operator in front of it opens a substring: `${v%%:*}` is the suffix
+       pattern `:*` taken off the value -- a host's `a` for `v=a:b` -- where reading the colon first
+       made the name `v%%` and the argument the `*` an arithmetic evaluation then refused with
+       `syntax error: operand expected`. `${v:1:2}` and `${v: -3}` are still substrings, because no
+       operator of the list above stands in front of their colon. */
+    if (colon > 0 && (cut === -1 || colon < cut) && !'-+=?'.includes(body[colon + 1] ?? '')) {
+        return { raw, name: body.slice(0, colon), op: 'substr', arg: body.slice(colon + 1) };
     }
     /* `substr` is not an operator that was written: the `:` that opened it was, one character long,
        so the argument starts one past *it* and not one past the name this file gives the operator.
@@ -1514,12 +1534,14 @@ function parseVarRef(body: string): VarRef {
        `a=(x y); echo ${a[@]@Q}` is a host's `x y`, the plain array. Behind a bare name it is not
        ignored -- `echo ${v@Q}` is `${v@Q}: bad substitution` -- and neither is a case operator,
        `^` or `,`, which no 3.2 has: both are reported below. */
-    const trailing = /^([A-Za-z_][A-Za-z0-9_]*\[[@*]\])(.+)$/.exec(body);
+    const trailing = /^([A-Za-z_][A-Za-z0-9_]*\[[^\]]*\])(.+)$/.exec(body);
     if (trailing !== null) return { raw, name: trailing[1], op: '', arg: '' };
-    /* A case operator -- `^`, `^^`, `,`, `,,` -- and `@` behind a bare name are ones this shell's
-       bash 3.2 has no meaning for, and it says so when the word is expanded and not when the line
-       is read: `echo ${v^^}` is `sh: ${v^^}: bad substitution` and 1. */
-    if (/[\^,]/.test(body) || /^[A-Za-z_][A-Za-z0-9_]*@/.test(body)) return { raw, name: body, op: 'bad', arg: '' };
+    /* A case operator -- `^`, `^^`, `,`, `,,`, `~`, `~~` -- the `!` of a prefix and the `@` of a
+       transform are ones this shell's bash 3.2 has no meaning for, and it says so when the word is
+       expanded and not when the line is read: `echo ${v^^}`, `echo ${v~}` and `echo ${v!}` are each
+       `bad substitution` and 1. Behind a subscript it ignores them instead, as the arm above does.
+       A leading `!` -- the indirect `${!v}` -- is no operator at all and stays one. */
+    if (/^[A-Za-z_][A-Za-z0-9_]*[\^,~!@]/.test(body)) return { raw, name: body, op: 'bad', arg: '' };
     return { raw, name: body, op: '', arg: '' };
 }
 
@@ -1534,6 +1556,33 @@ function rawText(word: Word): string {
         else if (part.t === 'cmd') out += `$(${part.script})`;
     }
     return out;
+}
+
+function wordSourceText(word: Word, keepQuotes: boolean): string {
+    let out = '';
+    for (const part of word) {
+        if (part.t === 'lit') out += part.v;
+        else if (part.t === 'sq') out += keepQuotes ? `'${part.v}'` : part.v;
+        else if (part.t === 'dq') {
+            if (keepQuotes) out += '"';
+            out += wordSourceText(part.parts, keepQuotes);
+            if (keepQuotes) out += '"';
+        } else if (part.t === 'var') out += `\${${part.ref.raw}}`;
+        else if (part.t === 'arith') out += `$(( ${part.expr} ))`;
+        else if (part.t === 'cmd') out += `$(${part.script})`;
+    }
+    return out;
+}
+
+/** The word as it was written, quoting and all. */
+function sourceText(word: Word): string {
+    return wordSourceText(word, true);
+}
+
+/** The word as it was written with the quoting taken out: what a host names for a substitution it
+ *  met inside a pair of double quotes. */
+function dequotedSourceText(word: Word): string {
+    return wordSourceText(word, false);
 }
 
 /** Re-lexes the right-hand side of an assignment, which was split off at the `=`. */
@@ -3266,6 +3315,35 @@ function stripSuffix(text: string, pattern: string, greedy: boolean): string {
     return text;
 }
 
+/**
+ * `${v/pattern/replacement}`, with the two anchors a host reads in front of the pattern: `/#` pins
+ * it to the beginning of the value and `/%` to the end. For `v=abc`, `${v/#a/X}` is a host's `Xbc`
+ * and `${v/%c/X}` its `abX`, where reading the `#` and the `%` as part of the pattern looked for a
+ * literal `#a` in the value and, finding none, left it as it was.
+ */
+function replaceWithAnchor(text: string, anchor: string, arg: string, all: boolean): string {
+    /* No `/` behind the pattern is a replacement of nothing at all: `v=abc; echo ${v/a}` is a
+       host's `bc`, where requiring the slash left the value as it was. */
+    const slash = arg.indexOf('/');
+    const pattern = slash === -1 ? arg : arg.slice(0, slash);
+    const replacement = slash === -1 ? '' : arg.slice(slash + 1);
+    if (anchor === '') return replaceGlob(text, pattern, replacement, all);
+    /* An empty pattern matches the beginning or the end and nothing else, which is where it puts
+       the replacement: `v=abc; echo ${v/#/X}` is a host's `Xabc` and `${v/%/X}` its `abcX`. */
+    if (pattern === '') return anchor === '#' ? replacement + text : text + replacement;
+    const re = globToRegExp(pattern, true);
+    if (anchor === '#') {
+        for (let end = 1; end <= text.length; end += 1) {
+            if (re.test(text.slice(0, end))) return replacement + text.slice(end);
+        }
+        return text;
+    }
+    for (let start = text.length - 1; start >= 0; start -= 1) {
+        if (re.test(text.slice(start))) return text.slice(0, start) + replacement;
+    }
+    return text;
+}
+
 function replaceGlob(text: string, pattern: string, replacement: string, all: boolean): string {
     if (pattern === '') return text;
     const re = globToRegExp(pattern, true);
@@ -3299,7 +3377,15 @@ function replaceGlob(text: string, pattern: string, replacement: string, all: bo
 }
 
 function applyModifier(state: ShellState, ref: VarRef, value: string | undefined, set: boolean, name: string): string {
-    const arg = ref.arg === '' ? '' : expandToString(modifierText(ref.arg), state);
+    /* The `/#` and `/%` anchors are read off the argument as it was written and taken off before it
+       is expanded: a `#` at the front of the text the argument is re-lexed from is a comment to
+       that lexer, so what came back out of the expansion was empty and no replacement happened
+       at all -- `${v/#a/X}` left `abc` alone where a host prints `Xbc`. */
+    const anchor = (ref.op === '/' || ref.op === '//')
+        ? (ref.arg.startsWith('#') ? '#' : ref.arg.startsWith('%') ? '%' : '')
+        : '';
+    const rawArg = anchor === '' ? ref.arg : ref.arg.slice(1);
+    const arg = rawArg === '' ? '' : expandToString(modifierText(rawArg), state);
     switch (ref.op) {
         case '':
             if (value !== undefined) return value;
@@ -3348,11 +3434,8 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
         case '%%':
             return stripSuffix(value ?? '', arg, true);
         case '/':
-        case '//': {
-            const slash = arg.indexOf('/');
-            if (slash === -1) return value ?? '';
-            return replaceGlob(value ?? '', arg.slice(0, slash), arg.slice(slash + 1), ref.op === '//');
-        }
+        case '//':
+            return replaceWithAnchor(value ?? '', anchor, arg, ref.op === '//');
         default:
             return value ?? '';
     }
@@ -3388,7 +3471,13 @@ const DEFAULT_OPS = new Set(['-', ':-', '=', ':=', '+', ':+', '?', ':?']);
  */
 function arrayElementsFor(state: ShellState, name: string, ref: VarRef): string[] {
     const elements = arrayElements(state, `${name}[0]`);
-    const arg = ref.arg === '' ? '' : expandToString(modifierText(ref.arg), state);
+    /* As in `applyModifier`: the `/#` and `/%` anchors are taken off the argument as it was written,
+       before the argument is expanded. */
+    const anchor = (ref.op === '/' || ref.op === '//')
+        ? (ref.arg.startsWith('#') ? '#' : ref.arg.startsWith('%') ? '%' : '')
+        : '';
+    const rawArg = anchor === '' ? ref.arg : ref.arg.slice(1);
+    const arg = rawArg === '' ? '' : expandToString(modifierText(rawArg), state);
     switch (ref.op) {
         case 'len':
             return [String(elements.length)];
@@ -3405,7 +3494,7 @@ function arrayElementsFor(state: ShellState, name: string, ref: VarRef): string[
         case '//': {
             const slash = arg.indexOf('/');
             if (slash === -1) return elements;
-            return elements.map((element) => replaceGlob(element, arg.slice(0, slash), arg.slice(slash + 1), ref.op === '//'));
+            return elements.map((element) => replaceWithAnchor(element, anchor, arg, ref.op === '//'));
         }
         case '#':
         case '##':
@@ -3418,7 +3507,7 @@ function arrayElementsFor(state: ShellState, name: string, ref: VarRef): string[
     }
 }
 
-function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: Expanded): void {
+function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: Expanded, owner?: string): void {
     for (let index = 0; index < parts.length; index++) {
         const part = parts[index];
         if (part.t === 'lit') {
@@ -3440,7 +3529,10 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             continue;
         }
         if (part.t === 'dq') {
-            expandParts(state, part.parts, true, target);
+            /* A substitution a host meets inside a pair of double quotes is one it names by the
+               quoted text with the quotes taken out, and not by the whole word around it, so what
+               the parts inside are given to report is that text and not the word they stand in. */
+            expandParts(state, part.parts, true, target, dequotedSourceText(part.parts));
             continue;
         }
         if (part.t === 'arith') {
@@ -3464,7 +3556,7 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
         const ref = part.ref;
         /* An operator this shell's bash 3.2 has no meaning for: the line fails on it as it does on
            a host, with `sh: ${v^^}: bad substitution` written to its stderr and a status of 1. */
-        if (ref.op === 'bad') throw new BadSubstitutionError(ref.raw);
+        if (ref.op === 'bad') throw new BadSubstitutionError(ref.raw, owner ?? ref.raw);
         /* `"${a[@]}"` is one word per element, as `"$@"` is one word per positional parameter:
            `a=(x y z); for e in "${a[@]}"; do echo "<$e>"; done` is three lines on a host, where
            reading the array as one string gave one field holding all three. `"${a[*]}"` joins them
@@ -3563,7 +3655,7 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
 /** Expands a word to one string: no field splitting, no pathname expansion. */
 function expandToString(word: Word, state: ShellState): string {
     const target: Expanded = { text: '', quoted: [], split: [] };
-    expandParts(state, word, false, target);
+    expandParts(state, word, false, target, sourceText(word));
     return target.text.split(FIELD_MARK).join(' ');
 }
 
@@ -3657,7 +3749,7 @@ function expandWord(state: ShellState, word: Word): string[] {
         }
     }
     const target: Expanded = { text: '', quoted: [], split: [] };
-    expandParts(state, word, false, target);
+    expandParts(state, word, false, target, sourceText(word));
     if (target.text.includes(FIELD_MARK)) return target.text.split(FIELD_MARK);
     const ifs = getVar(state, 'IFS');
     /* Field splitting is something a shell does to the result of an expansion, so a word holding no
@@ -3984,6 +4076,9 @@ function runSubstitution(state: ShellState, script: string): string {
     const inherited = state.traps.get('EXIT');
     state.io = { stdout: '', stderr: '' };
     let status = 0;
+    /* Everything the substitution runs is one level deeper than the line it stands on, which is what
+       a host's `set -x` writes: `set -x; v=$(echo sub)` is `++ echo sub` and then `+ v=sub`. */
+    traceDepth++;
     try {
         const nodes = new Parser(script, state).parse();
         status = runCommandList(state, nodes, null);
@@ -3992,6 +4087,8 @@ function runSubstitution(state: ShellState, script: string): string {
         else if (!(error instanceof BreakSignal) && !(error instanceof ContinueSignal)) {
             writeErr(state, errorMessage(error) + '\n');
         }
+    } finally {
+        traceDepth--;
     }
     /* A substitution's own EXIT trap runs before its output is taken, so `x=$(trap 'echo inner'
        EXIT; echo hi)` captures `inner` into `x` -- and the shell's own trap is left for its exit. */
@@ -4187,7 +4284,9 @@ function runLinesBefore(state: ShellState, script: string, errorLine: number): v
 function runParsed(state: ShellState, script: string): number {
     try {
         const nodes = new Parser(script, state).parse();
-        return runCommandList(state, nodes, null);
+        /* The list a script was handed is the one a stray `break` or `continue` is nothing at all
+           in, which is why it is told it is the top of the script: see `runCommandList`. */
+        return runCommandList(state, nodes, null, true);
     } catch (error) {
         if (error instanceof ExitSignal) return error.code;
         if (error instanceof ReturnSignal) return error.code;
@@ -4238,7 +4337,7 @@ function runParsed(state: ShellState, script: string): number {
         if (error instanceof BadSubstitutionError) {
             /* `${v^^}` is the text a host names and not a variable's: `$0: ${v^^}: bad substitution`,
                with the status 1 a line that will not expand leaves, and nothing behind it runs. */
-            writeErr(state, `${state.shellName}: \${${error.raw}}: bad substitution\n`);
+            writeErr(state, `${state.shellName}: ${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
             return 1;
         }
         /* An arithmetic error already written the way a host writes it, carrying the status a host
@@ -4311,7 +4410,7 @@ export function checkSyntax(state: ShellState, script: string): { ok: boolean; m
     }
 }
 
-function runCommandList(state: ShellState, nodes: Node[], input: string | null): number {
+function runCommandList(state: ShellState, nodes: Node[], input: string | null, top = false): number {
     let status = 0;
     for (let i = 0; i < nodes.length; i++) {
         const node = nodes[i];
@@ -4332,6 +4431,16 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null):
                 runTrap(state, 'ERR');
                 if (state.options.errexit) throw new ExitSignal(status);
             }
+        } catch (error) {
+            /* A `break` or a `continue` no loop stands behind is nothing at all on a host: no
+               complaint, the status 0, and the commands behind it still run -- `sh -c 'break; echo
+               st=$?'` prints `st=0`. Only the list a script was handed can swallow one, because a
+               list inside a loop is the loop's to catch: every other one lets it through. Letting
+               one out of the script instead ended the line on it, and wrote the signal itself out
+               as `[object Object]`. */
+            if (!(top && (error instanceof BreakSignal || error instanceof ContinueSignal))) throw error;
+            status = 0;
+            state.lastStatus = 0;
         } finally {
             if (exempt) state.protectedDepth--;
         }
@@ -4443,6 +4552,15 @@ function runNode(state: ShellState, node: Node, input: string | null): number {
             let status = 0;
             try {
                 status = runCommand(state, node.commands[i], carried);
+            } catch (error) {
+                /* A word that will not expand ends the stage it stands in. Where stages stand behind
+                   it, they still run and the pipeline takes the last one's status: `echo ${v^^} |
+                   cat` is a host's `sh: ${v^^}: bad substitution` and then the 0 of the `cat`, where
+                   letting the error out of the pipeline ran nothing behind it. Where none does --
+                   a plain `echo ${v^^}` -- the error still ends the script, as on a host. */
+                if (!(error instanceof BadSubstitutionError) || node.commands.length < 2) throw error;
+                writeErr(state, `${state.shellName}: ${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
+                status = 1;
             } finally {
                 const captured = state.io;
                 state.io = savedIo;
@@ -4834,9 +4952,21 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
         case 'simple':
             return runSimple(state, command, input);
         case 'cond':
-            return runCompoundRedirected(state, command, input, () => evalConditional(state, command.words));
+            return runCompoundRedirected(state, command, input, () => {
+                /* `set -x` traces the conditional as it was written, brackets and all: `set -x;
+                   [[ a == a ]]` is a host's `+ [[ a == a ]]`, and `[[ -z '' ]]` its `[[ -z '' ]]`,
+                   the quotes the words carry still on them. */
+                if (state.options.xtrace) {
+                    traceWrite(state, `[[ ${command.words.map((word) => sourceText(word)).join(' ')} ]]`);
+                }
+                return evalConditional(state, command.words);
+            });
         case 'arithcmd':
             return runCompoundRedirected(state, command, input, () => {
+                /* The expression between the parentheses is written as it stands, spaces and all,
+                   which is why a host's `((1+1))` is `+ (( 1+1 ))` and its `(( 1 + 1 ))` is
+                   `+ ((  1 + 1  ))` -- the two spaces neither one was written with. */
+                if (state.options.xtrace) traceWrite(state, `(( ${command.expr} ))`);
                 try {
                     /* The status is the one a host takes from the value: 0 when the expression is
                        non-zero, 1 when it is zero, and 1 as well for one that will not evaluate --
@@ -4876,7 +5006,12 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                    `set -x; for i in 1 2; do echo $i; done` is `+ for i in 1 2` and then `+ echo 1`,
                    and then the same `+ for i in 1 2` again in front of the `+ echo 2`. */
                 if (state.options.xtrace) {
-                    writeErr(state, `+ for ${command.name} in ${items.map((word) => traceWord(word)).join(' ')}\n`);
+                    /* What a host writes is the words as they were written and not what they
+                       expanded to: `set -x; for i in "a b" c` is its `+ for i in '"a b"' c` and
+                       `v='a b'; for i in $v` is `+ for i in '$v'`, where tracing the expansion
+                       put the value there -- `+ for i in 'a b'` -- and dropped the quotes. */
+                    const written = command.words === null ? items : command.words.map((word) => sourceText(word));
+                    traceWrite(state, `for ${command.name} in ${written.map((word) => traceWord(word)).join(' ')}`);
                 }
                 setVar(state, command.name, item);
                 try {
@@ -4903,10 +5038,17 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
             const test = (parts[1] ?? '').trim();
             const next = (parts[2] ?? '').trim();
             const first = (parts[0] ?? '').trim();
-            if (first !== '') evalArith(state, first);
+            /* `set -x` traces each of the three as the arithmetic command it is, in the order a host
+               evaluates them: `set -x; for ((i=0;i<1;i++)); do echo $i; done` is `+ (( i=0 ))`,
+               `+ (( i<1 ))`, `+ echo 0`, `+ (( i++ ))` and `+ (( i<1 ))` again. An empty part is
+               no command at all and is traced no more than it is evaluated. */
+            const traceArith = (text: string): void => {
+                if (state.options.xtrace && text !== '') traceWrite(state, '((' + ' ' + text + ' ))');
+            };
+            if (first !== '') { traceArith(first); evalArith(state, first); }
             let status = 0;
             for (;;) {
-                if (test !== '' && evalArith(state, test) === 0) break;
+                if (test !== '') { traceArith(test); if (evalArith(state, test) === 0) break; }
                 try {
                     status = runCommandList(state, command.body, null);
                 } catch (error) {
@@ -4918,7 +5060,7 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                         if (error.count > 1) throw new ContinueSignal(error.count - 1);
                     } else throw error;
                 }
-                if (next !== '') evalArith(state, next);
+                if (next !== '') { traceArith(next); evalArith(state, next); }
             }
             return status;
             });
@@ -4954,6 +5096,10 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
         case 'case':
             return runCompoundRedirected(state, command, input, () => {
             const subject = expandToString(command.word, state);
+            /* `set -x` traces the head of a `case` once, in front of the commands of the branch it
+               takes: `set -x; case a in a) echo hit;; esac` is a host's `+ case a in` and then
+               `+ echo hit`, and not the `+ echo hit` alone. */
+            if (state.options.xtrace) traceWrite(state, `case ${traceWord(subject)} in`);
             for (const item of command.items) {
                 let matched = false;
                 for (const pattern of item.patterns) {
@@ -5215,6 +5361,16 @@ function applyExecRedirects(state: ShellState, redirects: Redirect[]): string | 
     };
     for (const redirect of redirects) {
         const target = expandToString(redirect.target, state);
+        /* `/dev/stdout`, `/dev/stderr` and `/dev/stdin` name the three standard descriptors here as
+           they do on a host, so `exec 3> /dev/stdout; echo hi >&3` is a `3` the standard output was
+           duplicated onto and not a file the container has no directory for. */
+        const devName = DEV_NAMES[target];
+        if (devName !== undefined && (redirect.op === '>' || redirect.op === '>>' || redirect.op === '<')) {
+            const resolved = duplicateOf(plan, devName, stdoutTo, stderrTo);
+            if (resolved === undefined) return `${state.shellName}: ${devName}: Bad file descriptor\n`;
+            setFd(redirect.fd, resolved);
+            continue;
+        }
         const devFd = /^\/dev\/fd\/([0-9]+)$/.exec(target);
         if (devFd !== null && (redirect.op === '>' || redirect.op === '>>' || redirect.op === '<')) {
             const resolved = duplicateOf(plan, devFd[1], stdoutTo, stderrTo);
@@ -5301,6 +5457,10 @@ function openForReadWrite(state: ShellState, target: string): void {
     }
 }
 
+/** `/dev/stdout`, `/dev/stderr` and `/dev/stdin`: the three standard descriptors under the names a
+ *  host's `/dev` holds them by, so a redirection onto one of them reaches the descriptor itself. */
+const DEV_NAMES: Record<string, string> = { '/dev/stdout': '1', '/dev/stderr': '2', '/dev/stdin': '0' };
+
 function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
     const plan: RedirectPlan = {
         stdoutTo: inherited(state.stdoutTarget),
@@ -5316,9 +5476,49 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
            to the standard output and `cat < /dev/fd/0` reads the standard input. The container
            holds no `/dev` to open, so the name is answered with the descriptor it stands for
            rather than with the `No such file or directory` a file that is not there gave. */
+        /* `/dev/stdout`, `/dev/stderr` and `/dev/stdin` are the three standard descriptors under
+           another name, exactly as they are on a host: `echo v > /dev/stderr` writes `v` to the
+           standard error and `cat < /dev/stdin` reads the standard input. */
+        const devName = DEV_NAMES[target];
+        if (devName !== undefined && (redirect.op === '>' || redirect.op === '>>' || redirect.op === '<')) {
+            if (redirect.op === '<' || devName !== '0') {
+                planDuplicate(state, plan, redirect.fd, devName);
+                continue;
+            }
+            /* A write onto the standard input is a write to whatever it is read from, which on a
+               host with nothing behind it is the null device: `echo v > /dev/stdin` writes nothing
+               at all and leaves 0, where sending the text into the shell's own input reported a
+               write it could not make. */
+            if (redirect.fd === 2) plan.stderrTo = { kind: 'file', file: NULL_DEVICE };
+            else if (redirect.fd === 1) plan.stdoutTo = { kind: 'file', file: NULL_DEVICE };
+            else plan.fds.set(redirect.fd, { kind: 'file', file: NULL_DEVICE });
+            continue;
+        }
         const devFd = /^\/dev\/fd\/([0-9]+)$/.exec(target);
         if (devFd !== null && (redirect.op === '>' || redirect.op === '>>' || redirect.op === '<')) {
+            if (devFd[1] === '0' && redirect.op !== '<') {
+                if (redirect.fd === 2) plan.stderrTo = { kind: 'file', file: NULL_DEVICE };
+                else if (redirect.fd === 1) plan.stdoutTo = { kind: 'file', file: NULL_DEVICE };
+                else plan.fds.set(redirect.fd, { kind: 'file', file: NULL_DEVICE });
+                continue;
+            }
+            /* A `/dev/fd/N` no descriptor answers to is the failure of the descriptor the operator
+               stands on and not of the one the name carries: `echo v > /dev/fd/9` is a host's
+               `sh: 1: Bad file descriptor` and `echo v 3> /dev/fd/9` is `sh: 3:`, where `>&9` -- a
+               duplicate and not an open -- names the 9 it was given. */
+            const before = plan.error;
             planDuplicate(state, plan, redirect.fd, devFd[1]);
+            if (before === undefined && plan.error !== undefined) {
+                plan.error = `${state.shellName}: ${redirect.fd}: Bad file descriptor\n`;
+            }
+            continue;
+        }
+        /* No terminal stands behind a shell whose line was handed to it, which is what a `/dev/tty`
+           meets there: `sh: /dev/tty: Device not configured` and 1, and the command behind the
+           operator never runs. The file system has no `/dev/tty` to open, so naming it here is what
+           keeps it from being answered as a path the container cannot write. */
+        if (target === '/dev/tty' && (redirect.op === '>' || redirect.op === '>>' || redirect.op === '<')) {
+            if (plan.error === undefined) plan.error = `${state.shellName}: /dev/tty: Device not configured\n`;
             continue;
         }
         switch (redirect.op) {
@@ -5765,8 +5965,24 @@ function finish(
     }
 }
 
+/**
+ * How deep in a command substitution the line now being traced stands, which is what a host writes
+ * in front of it: one `+` for the shell's own line and two for the line a `$( )` is running --
+ * `set -x; v=$(echo sub)` is `++ echo sub` and then `+ v=sub`. A subshell, a group, a pipeline and
+ * a function body are the shell's own line still, and get the one `+`.
+ */
+let traceDepth = 0;
+
+/** One line of a `set -x` trace, with the `+`s its depth asks for. */
+function traceWrite(state: ShellState, text: string): void {
+    writeErr(state, `${'+'.repeat(traceDepth + 1)} ${text}\n`);
+}
+
 function traceWords(name: string, args: string[]): string {
-    return [name, ...args.map(traceWord)].join(' ');
+    /* The command's own name is quoted by the same rule a word is -- `set -x; [ 1 -lt 2 ]` is a
+       host's `+ '[' 1 -lt 2 ']'`, the bracket single-quoted like the `]` beside it, where leaving
+       the name bare put the quoting on the last word of the line and nowhere else. */
+    return [traceWord(name), ...args.map(traceWord)].join(' ');
 }
 
 /** One word as `set -x` writes it: bare where it needs no quoting, single-quoted where it does. */
@@ -5779,6 +5995,10 @@ function traceAssign(entry: PendingAssign): string {
     if (entry.array !== undefined) {
         return `${entry.name}=(${entry.array.map(traceWord).join(' ')})`;
     }
+    /* An assignment of nothing at all is written with nothing behind the `=`, however it was
+       written: `set -x; q=` and `set -x; q=""` are both a host's `+ q=`, where quoting the empty
+       value put a pair of quotes behind it. */
+    if (entry.value === '') return `${entry.name}=`;
     return `${entry.name}=${traceWord(entry.value)}`;
 }
 
@@ -5894,7 +6114,7 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
         const status = substitutionStatus;
         /* `set -x` traces an assignment on a line of its own the way it traces a command: `set -x;
            v=1` is `+ v=1`, and `set -x; v='a b'` is `+ v='a b'`. */
-        if (state.options.xtrace) for (const entry of pending) writeErr(state, `+ ${traceAssign(entry)}\n`);
+        if (state.options.xtrace) for (const entry of pending) traceWrite(state, traceAssign(entry));
         /* An assignment with no command behind it is the one the shell keeps, so it is applied here
            and not undone: `IFS=:` on a line of its own is the shell's IFS from here on. One at a
            time, so the name a readonly variable refused is the name the complaint names. */
@@ -5965,8 +6185,8 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     /* An assignment in front of a command is traced on a line of its own, in front of the command
        it stands in front of: `set -x; v=1 echo hi` is a host's `+ v=1` and then `+ echo hi`. */
     if (state.options.xtrace) {
-        for (const entry of pending) writeErr(state, `+ ${traceAssign(entry)}\n`);
-        writeErr(state, `+ ${traceWords(name, args)}\n`);
+        for (const entry of pending) traceWrite(state, traceAssign(entry));
+        traceWrite(state, traceWords(name, args));
     }
     if (state.options.verbose) writeErr(state, `${traceWords(name, args)}\n`);
     runTrap(state, 'DEBUG');
@@ -6246,19 +6466,26 @@ const HOST_UTILITY_PATHS: Record<string, string> = {
     awk: '/usr/bin/awk', base64: '/usr/bin/base64', basename: '/usr/bin/basename',
     bunzip2: '/usr/bin/bunzip2', bzcat: '/usr/bin/bzcat', bzip2: '/usr/bin/bzip2',
     chmod: '/bin/chmod', chown: '/usr/sbin/chown', comm: '/usr/bin/comm',
-    compress: '/usr/bin/compress', cpio: '/usr/bin/cpio', cut: '/usr/bin/cut',
+    cp: '/bin/cp', compress: '/usr/bin/compress', cpio: '/usr/bin/cpio', cut: '/usr/bin/cut',
     date: '/bin/date', dd: '/bin/dd', df: '/bin/df', diff: '/usr/bin/diff',
     dirname: '/usr/bin/dirname', du: '/usr/bin/du', expr: '/bin/expr',
     find: '/usr/bin/find', fmt: '/usr/bin/fmt', grep: '/usr/bin/grep',
     gunzip: '/usr/bin/gunzip', gzip: '/usr/bin/gzip', head: '/usr/bin/head',
     install: '/usr/bin/install', join: '/usr/bin/join', link: '/bin/link', ln: '/bin/ln',
-    nl: '/usr/bin/nl', paste: '/usr/bin/paste', pr: '/usr/bin/pr', sed: '/usr/bin/sed',
-    seq: '/usr/bin/seq', sleep: '/bin/sleep', sort: '/usr/bin/sort', split: '/usr/bin/split',
-    stat: '/usr/bin/stat', tabs: '/usr/bin/tabs', tail: '/usr/bin/tail', tar: '/usr/bin/tar',
-    tee: '/usr/bin/tee', touch: '/usr/bin/touch', tr: '/usr/bin/tr',
-    uncompress: '/usr/bin/uncompress', unexpand: '/usr/bin/unexpand', uniq: '/usr/bin/uniq',
-    wc: '/usr/bin/wc', xargs: '/usr/bin/xargs', xxd: '/usr/bin/xxd', yes: '/usr/bin/yes',
-    zcat: '/usr/bin/zcat', zip: '/usr/bin/zip'
+    mkdir: '/bin/mkdir', mv: '/bin/mv', nl: '/usr/bin/nl', paste: '/usr/bin/paste',
+    pr: '/usr/bin/pr', printf: '/usr/bin/printf', rm: '/bin/rm', rmdir: '/bin/rmdir',
+    sed: '/usr/bin/sed', seq: '/usr/bin/seq', sleep: '/bin/sleep', sort: '/usr/bin/sort',
+    split: '/usr/bin/split', stat: '/usr/bin/stat', tabs: '/usr/bin/tabs', tail: '/usr/bin/tail',
+    tar: '/usr/bin/tar', tee: '/usr/bin/tee', test: '/bin/test', touch: '/usr/bin/touch',
+    /* `true` and `false` are builtins a host also holds as files, which is what `type -a` is for:
+       `type -a true` is its `true is a shell builtin` and then `true is /usr/bin/true`. */
+    true: '/usr/bin/true', false: '/usr/bin/false',
+    tr: '/usr/bin/tr', uncompress: '/usr/bin/uncompress', unexpand: '/usr/bin/unexpand',
+    uniq: '/usr/bin/uniq', wc: '/usr/bin/wc', which: '/usr/bin/which', xargs: '/usr/bin/xargs',
+    xxd: '/usr/bin/xxd', yes: '/usr/bin/yes', zcat: '/usr/bin/zcat', zip: '/usr/bin/zip',
+    /* `[` is a file on a host's PATH under that name, next to the builtin of the same one: `type -a
+       [` is `[ is a shell builtin` and then `[ is /bin/[`. */
+    '[': '/bin/[', env: '/usr/bin/env'
 };
 
 /** The source text of a function body, indented the way `type` prints it. */
@@ -6274,8 +6501,55 @@ function functionBody(def: FunctionDef): string {
         .join('\n');
 }
 
+/** The words a host's shell reserves, which `type -t` names `keyword` and not `builtin`. */
+const KEYWORDS = new Set([
+    'if', 'then', 'else', 'elif', 'fi', 'case', 'esac', 'for', 'select', 'while', 'until',
+    'in', 'do', 'done', 'function', 'time', '{', '}', '!', '[[', ']]'
+]);
+
+/** Names this shell implements that the host's bash 3.2 has no knowledge of at all, so `type` says
+ *  of them what it says of a name nothing answers to: `type mapfile` is a host's `type: mapfile:
+ *  not found` and 1. */
+const NOT_HOST_NAMES = new Set(['mapfile', 'readarray']);
+
+/** The builtins a host's bash 3.2 carries that this shell does not implement, which `type` and
+ *  `command` must still answer for: `type -t fc` is a host's `builtin`, `type fc` its `fc is a shell
+ *  builtin`, and `type -p fc` -- a PATH search that finds no file -- still the 0 a name the shell
+ *  knows leaves, where a name nothing answers to is the 1. The list is the host's own `enable`. */
+const HOST_ONLY_BUILTINS = new Set([
+    'compgen', 'complete', 'fc', 'help', 'logout', 'suspend', 'typeset'
+]);
+
+/** True for a name a host answers `builtin` to: one it carries in itself, and not one it runs from
+ *  a file of the same name -- `cat`, `ls`, `mkdir` and the rest are files out there and commands of
+ *  this shell's own here, which is why `type -t ls` is a host's `file` and not `builtin`. */
+function isBuiltinName(name: string): boolean {
+    if (NOT_HOST_NAMES.has(name)) return false;
+    return SHELL_OWN_NAMES.has(name) || (COMMANDS[name] !== undefined && HOST_UTILITY_PATHS[name] === undefined);
+}
+
+/** The file a host would run for `name`: the one PATH holds, or -- where the container holds none
+ *  because the utility is one of this shell's own commands -- the one a host's own disk holds. */
+function hostFileOf(state: ShellState, name: string): string | undefined {
+    const own = findOnPath(state, name);
+    if (own !== undefined) return own;
+    const hostPath = HOST_UTILITY_PATHS[name];
+    if (hostPath === undefined) return undefined;
+    /* A file a host's own PATH would never search is no answer here either: `chown` is a host's
+       `/usr/sbin/chown`, and `/usr/sbin` is not one of the directories this shell's PATH holds, so
+       `type chown` is its `type: chown: not found` and 1 -- and `type -p chown` the same 1 -- and
+       not a path a `sh` with this PATH would ever have run. */
+    const dir = hostPath.slice(0, hostPath.lastIndexOf('/'));
+    if (!(getVar(state, 'PATH') ?? '').split(':').includes(dir)) return undefined;
+    return hostPath;
+}
+
 function describeName(state: ShellState, name: string): string {
     if (state.aliases.has(name)) return `${name} is aliased to \`${state.aliases.get(name)}'`;
+    /* A word the shell reserved is a keyword and not a builtin, and it outranks one of the same
+       spelling: `type if` is a host's `if is a shell keyword`, and `type time` -- a name the shell
+       also carries -- is `time is a shell keyword`. */
+    if (KEYWORDS.has(name)) return `${name} is a shell keyword`;
     if (SHELL_OWN_NAMES.has(name)) return `${name} is a shell builtin`;
     if (state.functions.has(name)) {
         const def = state.functions.get(name) as FunctionDef;
@@ -6288,9 +6562,10 @@ function describeName(state: ShellState, name: string): string {
     /* A utility this shell runs as one of its own commands and no file on PATH answers to: a host
        has the file and names it, so `type -a chmod` is its `chmod is /bin/chmod` and not the
        `type: chmod: not found` and 1 a name nothing could be said about gave. */
-    const hostPath = HOST_UTILITY_PATHS[name];
+    const hostPath = hostFileOf(state, name);
     if (hostPath !== undefined) return `${name} is ${hostPath}`;
-    if (COMMANDS[name] !== undefined || HOST_BUILTINS.has(name)) return `${name} is a shell builtin`;
+    if (NOT_HOST_NAMES.has(name)) return '';
+    if (COMMANDS[name] !== undefined || HOST_BUILTINS.has(name) || HOST_ONLY_BUILTINS.has(name)) return `${name} is a shell builtin`;
     const fs = state.fs;
     if (fs && fs.fileExists(resolvePath(state, name))) return `${name} is ${resolvePath(state, name)}`;
     return '';
@@ -6319,11 +6594,15 @@ const CLOSES_ITS_STREAM = new Set(['cat']);
  *  carries itself, and for one no directory on PATH holds -- the name, as a host writes it. */
 function pathOfName(state: ShellState, name: string): string {
     if (SHELL_OWN_NAMES.has(name)) return name;
-    const path = findOnPath(state, name);
+    /* A reserved word has no file to name, so `command -v if` is a host's `if`, the name itself. */
+    if (KEYWORDS.has(name)) return name;
+    const path = hostFileOf(state, name);
     if (path !== undefined) return path;
     const fs = state.fs;
     if (fs && fs.fileExists(resolvePath(state, name))) return resolvePath(state, name);
-    if (state.aliases.has(name) || state.functions.has(name) || COMMANDS[name] !== undefined || HOST_BUILTINS.has(name)) {
+    if (NOT_HOST_NAMES.has(name)) return '';
+    if (state.aliases.has(name) || state.functions.has(name) || COMMANDS[name] !== undefined
+        || HOST_BUILTINS.has(name) || HOST_ONLY_BUILTINS.has(name)) {
         return name;
     }
     return '';
@@ -6479,6 +6758,7 @@ function exportBuiltin(ctx: CommandContext): CommandResult {
        `export FOO=1; export -n FOO` leaves a `FOO` of 1 that `env` no longer lists, and a status
        of 0 -- where reading the `-n` as a name made it `export: `-n': not a valid identifier`. */
     let unexport = false;
+    let named = false;
     for (const arg of ctx.args) {
         if (arg === '-n') {
             unexport = true;
@@ -6488,6 +6768,7 @@ function exportBuiltin(ctx: CommandContext): CommandResult {
             if (arg === '-f') continue;
             return failDiag(state, `export: ${arg}: invalid option\nexport: usage: export [-nf] [name[=value] ...] or export -p`, 2);
         }
+        named = true;
         const assign = splitAssign(arg);
         if (!assign) {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failDiag(state, `export: \`${arg}': not a valid identifier`, 1);
@@ -6502,6 +6783,19 @@ function exportBuiltin(ctx: CommandContext): CommandResult {
         const base = assign.append ? getVar(state, assign.name) ?? '' : '';
         setVar(state, assign.name, base + (assign.value ?? ''));
         if (!unexport) markExported(state, assign.name);
+    }
+    /* An option and nothing behind it is the list, the way a bare `export` and `export -p` are:
+       `export -n` names every exported variable and leaves 0, where an option with no name to work
+       on made the line print nothing at all. */
+    if (!named) return ok(printExported(state), state);
+    /* A declaration that carries a value is traced twice, once as the declaration and once as the
+       assignment it made: `set -x; export E=1` is a host's `+ export E=1` and then `+ E=1`, and
+       `export E=1 F=2` the two assignment lines behind it. `declare` is traced once. */
+    if (state.options.xtrace) {
+        for (const arg of ctx.args) {
+            const assign = splitAssign(arg);
+            if (assign !== null) traceWrite(state, `${assign.name}=${traceWord(getVar(state, assign.name) ?? '')}`);
+        }
     }
     return ok();
 }
@@ -6537,6 +6831,13 @@ function readonlyBuiltin(ctx: CommandContext): CommandResult {
         const base = assign.append ? getVar(state, assign.name) ?? '' : '';
         setVar(state, assign.name, base + (assign.value ?? ''));
         markReadonly(state, assign.name);
+    }
+    /* As `export` is: `set -x; readonly R=1` is a host's `+ readonly R=1` and then `+ R=1`. */
+    if (state.options.xtrace) {
+        for (const arg of ctx.args) {
+            const assign = splitAssign(arg);
+            if (assign !== null) traceWrite(state, `${assign.name}=${traceWord(getVar(state, assign.name) ?? '')}`);
+        }
     }
     return ok();
 }
@@ -6588,6 +6889,10 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
            with the body indented four spaces -- and not the name alone, which is what `declare -F`
            prints. */
         const names = rest.length > 0 ? rest : [...state.functions.keys()].sort();
+        /* A name no function stands behind is one a host prints nothing at all for: `declare -f
+           nosuch` is silent and leaves 1, where writing the name with no body behind it was a
+           `nosuch ()` line and the 0 of a line that succeeded. */
+        if (names.some((name) => !state.functions.has(name))) return { stdout: '', stderr: '', exitCode: 1 };
         return ok(joinLines(names.map((name) => declareFunction(state, name))), state);
     }
     if (functionNames) return ok(joinLines([...state.functions.keys()].sort().map((name) => `declare -f ${name}`)), state);
@@ -6783,6 +7088,12 @@ function aliasBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     if (ctx.args.length === 0 || ctx.args[0] === '-p') return ok(aliasList(state), state);
     for (const arg of ctx.args) {
+        /* An option `alias` does not know is the two lines a host writes and the 2 it leaves, and
+           not the `not found` a name no alias answers to gets: `alias -x` is `alias: -x: invalid
+           option` and then the usage line, where looking `-x` up as a name printed the other. */
+        if (arg.length > 1 && arg.startsWith('-') && arg !== '-p') {
+            return failDiag(state, `alias: ${arg}: invalid option\nalias: usage: alias [-p] [name[=value] ... ]`, 2);
+        }
         const eq = arg.indexOf('=');
         if (eq === -1) {
             const value = state.aliases.get(arg);
@@ -6819,34 +7130,47 @@ function typeBuiltin(ctx: CommandContext): CommandResult {
         else names.push(arg);
     }
     if (names.length === 0) return ok();
-    let status = 0;
+    /* A name nothing answers to is the status a host leaves, but only where *no* name of the line
+       answered: `type echo nosuchcmd` is the one line, the one diagnostic and a 0, where `type a b`
+       -- two names nothing answers to -- is the 1 a line that found nothing at all leaves. */
+    let found = 0;
     const lines: string[] = [];
     for (const name of names) {
-        if (flags.has('t')) {
-            if (state.aliases.has(name)) lines.push('alias');
-            else if (COMMANDS[name] !== undefined || HOST_BUILTINS.has(name)) lines.push('builtin');
-            else if (state.functions.has(name)) lines.push('function');
-            else if (findOnPath(state, name) !== undefined) lines.push('file');
-            else {
-                status = 1;
-                continue;
-            }
+        /* `-p` and `-t` together are a host's `-p` and not its `-t`: `type -tp ls` is a host's
+           `/bin/ls` and not the one word `file`, so the PATH search is asked first. */
+        if (flags.has('p') || flags.has('P')) {
+            /* `-p` is a PATH search and nothing else, so a name the shell carries itself is one it
+               names no file for -- `type -p printf` prints nothing and leaves 0 -- while a name no
+               directory holds at all is the one that leaves 1: `type -p nosuchcmd`. A reserved word
+               and a builtin this shell lacks are names it knows all the same, so `type -p if` and
+               `type -p fc` are the silent 0 a host leaves and not that 1. */
+            if (isBuiltinName(name) || HOST_ONLY_BUILTINS.has(name) || KEYWORDS.has(name)
+                || state.aliases.has(name) || state.functions.has(name)) { found++; continue; }
+            const path = hostFileOf(state, name);
+            if (path === undefined) continue;
+            found++;
+            lines.push(path);
             continue;
         }
-        if (flags.has('p') || flags.has('P')) {
-            const path = findOnPath(state, name);
-            if (path === undefined) {
-                status = 1;
-                continue;
-            }
-            lines.push(path);
+        if (flags.has('t')) {
+            /* The one word a host answers with, in the order it asks: a name it reserved is a
+               `keyword` before a name it carries is a `builtin`, and both come before the file on
+               PATH a `file` names -- `type -t if` is `keyword` and `type -t ls` is `file`, where
+               every name this shell runs as one of its own commands was `builtin`. */
+            if (state.aliases.has(name)) lines.push('alias');
+            else if (KEYWORDS.has(name)) lines.push('keyword');
+            else if (state.functions.has(name)) lines.push('function');
+            else if (isBuiltinName(name) || HOST_ONLY_BUILTINS.has(name)) lines.push('builtin');
+            else if (hostFileOf(state, name) !== undefined) lines.push('file');
+            else continue;
+            found++;
             continue;
         }
         /* `-a` is every answer and not the first one: `type -a echo` is the builtin and then the
            file PATH holds under the same name, in that order, as a host lists them. */
         if (flags.has('a')) {
             const described = describeName(state, name);
-            const onPath = findOnPath(state, name);
+            const onPath = hostFileOf(state, name);
             if (described !== '') lines.push(described);
             /* The file is listed once and not twice: `type -a ls` is a host's one `ls is /bin/ls`,
                where a name `describeName` had already answered from PATH was listed again behind
@@ -6855,19 +7179,20 @@ function typeBuiltin(ctx: CommandContext): CommandResult {
             if (onPath !== undefined && described !== `${name} is ${onPath}`) lines.push(`${name} is ${onPath}`);
             if (described === '' && onPath === undefined) {
                 writeErr(state, `${diagnosticPrefix(state)}type: ${name}: not found\n`);
-                status = 1;
+                continue;
             }
+            found++;
             continue;
         }
         const text = describeName(state, name);
         if (text === '') {
             writeErr(state, `${diagnosticPrefix(state)}type: ${name}: not found\n`);
-            status = 1;
             continue;
         }
+        found++;
         lines.push(text);
     }
-    return { stdout: joinLines(lines), stderr: '', exitCode: status };
+    return { stdout: joinLines(lines), stderr: '', exitCode: found === 0 ? 1 : 0 };
 }
 
 function whichBuiltin(ctx: CommandContext): CommandResult {
@@ -6908,10 +7233,24 @@ function commandBuiltin(ctx: CommandContext): CommandResult {
     const name = args[index];
     if (name === undefined) return ok();
     if (describe) {
-        /* `-V` is the one that describes; `-v` is the one that names, and prints the path alone. */
-        const text = describeFull ? describeName(state, name) : pathOfName(state, name);
-        if (text === '') return { stdout: '', stderr: '', exitCode: 1 };
-        return { stdout: (describeFull ? text.split('\n')[0] : text) + '\n', stderr: '', exitCode: 0 };
+        /* Every name behind the options, and not the first one alone: `command -v echo ls` is a
+           host's `echo` and then `/bin/ls`, one line for each. */
+        const lines: string[] = [];
+        let status = 0;
+        for (const name of args.slice(index)) {
+            /* `-V` is the one that describes; `-v` is the one that names, and prints the path alone. */
+            const text = describeFull ? describeName(state, name) : pathOfName(state, name);
+            if (text === '') {
+                status = 1;
+                /* Only the one that describes writes the complaint, and only for a name nothing
+                   answers to: `command -v nosuchcmd` is silent and 1, where `command -V nosuchcmd`
+                   is a host's `sh: line 0: command: nosuchcmd: not found` and the same 1. */
+                if (describeFull) writeErr(state, `${diagnosticPrefix(state)}command: ${name}: not found\n`);
+                continue;
+            }
+            lines.push(describeFull ? text.split('\n')[0] : text);
+        }
+        return { stdout: lines.length === 0 ? '' : joinLines(lines), stderr: '', exitCode: status };
     }
     const rest = args.slice(index + 1);
     const entry = COMMANDS[name];
@@ -7202,7 +7541,11 @@ function umaskBuiltin(ctx: CommandContext): CommandResult {
     for (const arg of ctx.args) {
         if (arg === '-S') symbolic = true;
         else if (arg === '-p') continue;
-        else if (arg.startsWith('-')) continue;
+        /* An option `umask` does not know: the two lines a host writes -- the complaint, and then
+           the usage line, which carries no shell name of its own -- and the 2 it leaves. Reading
+           every leading-dash word as one to skip printed the mask instead, which is what `umask -x`
+           did. */
+        else if (arg.length > 1 && arg.startsWith('-')) return failDiag(state, `umask: ${arg}: invalid option\numask: usage: umask [-p] [-S] [mode]`, 2);
         else value = arg;
     }
     if (value === undefined) return ok(symbolic ? `${umaskSymbolic(state.umask)}\n` : `${umaskString(state.umask)}\n`, state);
@@ -7552,6 +7895,18 @@ function shoptBuiltin(ctx: CommandContext): CommandResult {
         const names = [...table.keys()].sort();
         return ok(joinLines(names.map((name) => shoptLine(name, table.get(name) === true))), state);
     }
+    /* `-p` prints the options in a form a shell can read back -- `shopt -s name` where the option
+       is on and `shopt -u name` where it is off, one line for each, in the order a host lists them
+       -- and `-o` asks about the options `set -o` names and not the ones `shopt` keeps, in the same
+       two columns. Both were read as the names of options to look up, and both answered `invalid
+       shell option name` and 1 for a name no table held. */
+    if (args[0] === '-p') {
+        const printed = [...table.keys()].sort();
+        return ok(joinLines(printed.map((name) => `shopt ${table.get(name) === true ? '-s' : '-u'} ${name}`)), state);
+    }
+    if (args[0] === '-o') {
+        return ok(joinLines(OPTION_NAMES.map(([key, name]) => shoptLine(name, state.options[key]))), state);
+    }
     let setFlag = false;
     let unsetFlag = false;
     let quiet = false;
@@ -7563,6 +7918,14 @@ function shoptBuiltin(ctx: CommandContext): CommandResult {
         index++;
     }
     const names = args.slice(index);
+    /* A flag and no name behind it is the list of the options that hold, which is what a host
+       prints: `shopt -s` is the nine that are on and `shopt -u` the ones that are off, where a
+       flag with nothing to set printed nothing at all. */
+    if (names.length === 0 && (setFlag || unsetFlag)) {
+        const on = setFlag;
+        const listed = [...table.keys()].sort().filter((name) => (table.get(name) === true) === on);
+        return ok(joinLines(listed.map((name) => shoptLine(name, on))), state);
+    }
     let status = 0;
     const lines: string[] = [];
     for (const name of names) {
@@ -8315,6 +8678,12 @@ function trapBuiltin(ctx: CommandContext): CommandResult {
         }
         return ok(out + '\n', state);
     }
+    /* An option `trap` does not know -- every leading-dash word but `-p`, `-l` and the `-` that
+       resets a signal to what it was -- is the two lines a host writes and the 2 it leaves. Taken
+       as the action to run instead, `trap -x` set nothing at all and was silently 0. */
+    if (args[0].length > 1 && args[0].startsWith('-') && args[0] !== '--') {
+        return failDiag(state, `trap: ${args[0]}: invalid option\ntrap: usage: trap [-lp] [arg signal_spec ...]`, 2);
+    }
     const action = args[0];
     const reset = action === '-';
     const ignore = action === '';
@@ -8324,6 +8693,18 @@ function trapBuiltin(ctx: CommandContext): CommandResult {
         else state.traps.set(name, { action, reset, ignore });
     }
     return ok();
+}
+
+/**
+ * The builtins a host's `enable` names with no argument: one `enable <name>` line for each, sorted,
+ * which is the shell's own names together with the ones a host carries that this shell does not
+ * implement. It was `enable: command not found` and 127 before, which is the answer for a name no
+ * shell has -- and `enable` is one every shell has.
+ */
+function enableBuiltin(ctx: CommandContext): CommandResult {
+    const state = stateOf(ctx);
+    const names = [...new Set([...SHELL_OWN_NAMES, ...HOST_ONLY_BUILTINS])].sort();
+    return ok(joinLines(names.map((name) => `enable ${name}`)), state);
 }
 
 function colonBuiltin(ctx: CommandContext): CommandResult {
@@ -8340,6 +8721,7 @@ export const COMMANDS: Record<string, ShellCommand> = {
     shift: shiftBuiltin,
     unset: unsetBuiltin,
     export: exportBuiltin,
+    enable: enableBuiltin,
     readonly: readonlyBuiltin,
     local: localBuiltin,
     declare: declareBuiltin,

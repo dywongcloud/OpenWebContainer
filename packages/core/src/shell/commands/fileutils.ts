@@ -1880,7 +1880,29 @@ interface TestFile {
     symlink: boolean;
 }
 
+/**
+ * The `/dev` names that are the descriptors themselves and not files: `/dev/stdin`, `/dev/stdout`,
+ * `/dev/stderr` and the `/dev/fd/N` a host's own `/dev` holds them by. A host has them, so
+ * `test -e /dev/stdout` and `test -w /dev/stdout` are true there, where opening the name as a path
+ * in this file system found nothing at all. A descriptor above the three is one a line opened for
+ * itself and is there only while it is open, which is why only 0, 1 and 2 are answered here:
+ * `test -e /dev/fd/3` is false with no `3<` in front of the command.
+ */
+function devDescriptor(path: string): number | undefined {
+    if (path === '/dev/stdin') return 0;
+    if (path === '/dev/stdout') return 1;
+    if (path === '/dev/stderr') return 2;
+    const fd = /^\/dev\/fd\/([0-9]+)$/.exec(path);
+    return fd !== null && Number(fd[1]) <= 2 ? Number(fd[1]) : undefined;
+}
+
 function testFile(ctx: CommandContext, path: string): TestFile {
+    /* The three are readable and writable alike wherever a shell's streams go, and on a host each is
+       a symlink -- `/dev/stdout` is `-> fd/1` -- which is why `test -f /dev/stdout` is false there
+       and `test -L /dev/stdout` is true. */
+    if (devDescriptor(path) !== undefined) {
+        return { exists: true, type: 'file', size: 0, mode: 0o20666, symlink: true };
+    }
     const resolved = resolveAt(ctx, path);
     const stat = statOf(ctx.fs, resolved);
     if (stat === undefined) {
@@ -2185,7 +2207,11 @@ function applyConversion(spec: string, argument: string): string {
         return quoted;
     }
     if (conversion === 'd' || conversion === 'i') {
-        const value = Number.parseInt(argument, 10);
+        /* An argument that is not there at all is the zero a host reads for it: `printf '%d'` prints
+           `0` and leaves 0, where parsing the empty string behind it as a number was `: invalid
+           number` and the 1 of a line that failed. An argument that *is* there and is no number is
+           still the error -- `printf '%d' notanumber` is a host's `notanumber: invalid number`. */
+        const value = argument === '' ? 0 : Number.parseInt(argument, 10);
         if (Number.isNaN(value)) throw new Error(`${argument}: invalid number`);
         let digits = String(Math.abs(value));
         const sign = value < 0 ? '-' : flags.indexOf('+') >= 0 ? '+' : flags.indexOf(' ') >= 0 ? ' ' : '';

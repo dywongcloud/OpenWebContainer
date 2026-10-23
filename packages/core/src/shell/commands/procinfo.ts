@@ -712,7 +712,11 @@ const kill: ShellCommand = (ctx) => {
         if (/^SIG/i.test(signal)) return fail(`kill: ${signal}: invalid signal specification`, 1);
         const resolved = resolveSignal(signal);
         if (!resolved) {
-            return fail(`kill: unknown signal ${signal}; valid signals:\n${signalList(false)}`, 2);
+            /* The shell's own `kill` names a specification it cannot read the same way whether the
+               name carries the `SIG` prefix or not -- `kill -X 1` is `kill: X: invalid signal
+               specification` and the status 1 -- where the utility's list of every valid signal and
+               the 2 it leaves are a different command's answer. */
+            return fail(`kill: ${signal}: invalid signal specification`, 1);
         }
         signal = resolved;
     }
