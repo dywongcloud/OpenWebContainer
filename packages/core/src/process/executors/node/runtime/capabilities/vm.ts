@@ -34,6 +34,8 @@ interface VmHost {
     realm?: QuickJSContext;
     /** Values built in {@link VmHost.realm} and handed to the guest, freed with the binding. */
     realmValues: QuickJSHandle[];
+    /** Rebuilds the value a promise settles with, once per binding: see {@link promiseOf}. */
+    rehomeFn?: QuickJSHandle;
     /** `Array.isArray`, `Object.prototype.toString`, `Object.keys` and `Object.prototype`, once. */
     probes?: VmProbes;
     /** The standard globals of the guest realm beside their namesakes in the second realm, once. */
@@ -63,10 +65,27 @@ export type VmInterruption = 'vm' | 'cancel' | 'budget';
  */
 const YIELD_MS = 250;
 
-/** How deep a value is rebuilt in the second realm: past this it crosses as it is. */
-const REALM_MAX_DEPTH = 8;
-/** How many values one process rebuilds: past this they cross as they are, rather than pinning memory. */
-const REALM_MAX_VALUES = 4096;
+/**
+ * How deep a value is rebuilt in the second realm: past this it crosses as it is.
+ *
+ * A bound rather than a promise, and 8 was far too shallow for it: a 12-deep chain of plain objects
+ * out of a context is `false` to `instanceof Object` at every level on host Node 24.15 and stopped
+ * being so here at the ninth. Cycles are not what this bounds -- the `seen`/`twins` guard is -- so
+ * what it stands for is the recursion of one rebuild, and the cap on values below bounds that too.
+ */
+const REALM_MAX_DEPTH = 64;
+/**
+ * How many rebuilt values one process holds at once: past this the oldest are retired rather than
+ * pinning memory, and a single rebuild that would pass it crosses as it is.
+ *
+ * A rebuilt value is pinned for as long as the binding is, so that it is still there when the
+ * binding is unbound. QuickJS counts references, though: a value the guest has dropped needs no pin,
+ * and a pin given up over one the guest still reaches frees nothing -- `JS_FreeValue` on a value
+ * with a reference left is a count, not a free. So the oldest half is retired when the cap is
+ * reached, which is what keeps a long-lived process rebuilding every value it ever sees instead of
+ * every value it saw first.
+ */
+const REALM_MAX_VALUES = 16384;
 
 /**
  * The standard globals whose namesake in the second realm replaces the guest realm's when one of
@@ -182,6 +201,14 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
             }
         }
         host.builtins = undefined;
+    }
+    if (host.rehomeFn !== undefined) {
+        try {
+            host.rehomeFn.dispose();
+        } catch {
+            // a handle already gone is nothing to report
+        }
+        host.rehomeFn = undefined;
     }
     if (host.probes !== undefined) {
         for (const handle of [host.probes.object, host.probes.names, host.probes.isArray, host.probes.tag, host.probes.objectProto]) {
@@ -374,7 +401,11 @@ function rehomeInto(
             const message = typeof propDump(host, value, 'message') === 'string'
                 ? String(propDump(host, value, 'message'))
                 : '';
-            const error = errorOf(host, realm, name, message);
+            /* A subclass the second realm has never heard of: `class Z extends Error {}` out of a
+               context still answers `Z` to `err.constructor.name` on host Node 24.15, while its
+               `err.name` stays the inherited `Error`. The two are different names, so the rebuild
+               wears the constructor's and keeps the error's own. */
+            const error = errorOf(host, realm, name, ctorNameOf(host, value) ?? name, message);
             if (error === undefined) return value;
             made = error;
         } else if (tag === '[object Promise]') {
@@ -395,7 +426,7 @@ function rehomeInto(
     seen.push(value);
     twins.push(made);
     if (tag === '[object Map]' || tag === '[object Set]') {
-        fillEntries(host, realm, value, made, tag === '[object Map]');
+        fillEntries(host, realm, value, made, tag === '[object Map]', depth, seen, twins, kept);
     }
     try {
         const keys = ownKeysOf(host, value);
@@ -439,14 +470,27 @@ function emptyOf(host: VmHost, realm: QuickJSContext, name: string): QuickJSHand
  * fills an array or a plain object finds nothing on one. The callback is a host function, so an entry
  * arrives as a handle -- which a dump could not carry, a live object being nothing a dump can hold.
  *
- * An entry crosses as the very object it is rather than as a rebuild of itself, which is what host
- * Node 24.15 does: it hands back the context's own collection, keys and values and all. It matters
- * more here than it does for an array, because a `Map` is a lookup -- a key rebuilt on the way out is
- * a key `get` no longer finds, and a `Set` whose members were copied no longer `has` them. An entry
- * the walk cannot read is skipped rather than failing the whole rebuild, so a collection with one
- * awkward value still crosses as the rest of itself.
+ * An entry crosses as a rebuild of itself, not as the very object it is: host Node 24.15 hands back
+ * the context's own collection, keys and values and all, so what a caller reads out of one -- a key
+ * from `keys()`, a value from `get()`, a member of a `Set` -- is an object of the context's realm
+ * too and answers `false` to `instanceof Object`. A `Map` is a lookup, so the entries go through the
+ * same walk the properties of an array or a plain object do, and through the same `seen`/`twins`
+ * guard: a collection that holds itself, or one reached again from an object inside it, comes back
+ * holding its own twin rather than a second copy of itself. An entry the walk cannot read is skipped
+ * rather than failing the whole rebuild, so a collection with one awkward value still crosses as the
+ * rest of itself.
  */
-function fillEntries(host: VmHost, realm: QuickJSContext, value: QuickJSHandle, made: QuickJSHandle, isMap: boolean): void {
+function fillEntries(
+    host: VmHost,
+    realm: QuickJSContext,
+    value: QuickJSHandle,
+    made: QuickJSHandle,
+    isMap: boolean,
+    depth: number,
+    seen: QuickJSHandle[],
+    twins: QuickJSHandle[],
+    kept: QuickJSHandle[]
+): void {
     const entries: QuickJSHandle[][] = [];
     let collect: QuickJSHandle | undefined;
     try {
@@ -466,7 +510,10 @@ function fillEntries(host: VmHost, realm: QuickJSContext, value: QuickJSHandle, 
     }
     for (const entry of entries) {
         try {
-            const result = realm.callMethod(made, isMap ? 'set' : 'add', entry);
+            /* The entries are dups this walk owns and frees below, so they outlive the rebuild of
+               the value each one names -- which is what lets `seen` keep them for a twin to come. */
+            const into = entry.map((one) => rehomeInto(host, realm, one, depth + 1, seen, twins, kept));
+            const result = realm.callMethod(made, isMap ? 'set' : 'add', into);
             if (result.error) result.error.dispose();
             else result.value.dispose();
         } catch {
@@ -485,18 +532,54 @@ function fillEntries(host: VmHost, realm: QuickJSContext, value: QuickJSHandle, 
  * resolves to what it promised: the reactions are attached to the promise the context made rather
  * than to a snapshot of it, so a promise that is still pending when it crosses stays pending until
  * it settles, and a rejection crosses as a rejection.
+ *
+ * What it settles with crosses as any other value the context hands back does -- a rebuild in the
+ * second realm, so `await vm.runInNewContext('Promise.resolve({a:1})') instanceof Object` is
+ * `false`, and so is the `instanceof Error` of a rejection reason. The settling is a later turn,
+ * long after the walk that built the promise has been torn down, so the rebuild runs inside the
+ * reaction and carries a walk of its own: a `seen` kept from the earlier one would be compared
+ * against handles this binding has already freed.
  */
 function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle {
     try {
+        if (host.rehomeFn === undefined) {
+            host.rehomeFn = host.context.newFunction('rehome', (settled) => {
+                const kept: QuickJSHandle[] = [];
+                try {
+                    return rehomeInto(host, realm, settled, 1, [], [], kept);
+                } catch {
+                    return settled;
+                } finally {
+                    for (const own of kept) {
+                        try { own.dispose(); } catch { /* already gone with its context */ }
+                    }
+                }
+            });
+        }
         const built = realm.evalCode(
-            '(function (src) { return new Promise(function (res, rej) { src.then(res, rej); }); })'
+            /* A promise the context built with a subclass of `Promise` keeps the name of that
+               subclass: `class P extends Promise {}` out of a context still answers `P` to
+               `constructor.name` on host Node 24.15, and `false` to `instanceof Promise`. The second
+               realm has never heard of `P`, so it is given one of that name extending its own. */
+            '(function (src, rehome) {' +
+            'var proto = Object.getPrototypeOf(src);' +
+            'var name = proto && typeof proto.constructor === "function" ? String(proto.constructor.name) : "Promise";' +
+            'var sub = undefined;' +
+            'if (name !== "Promise" && name !== "") {' +
+            'try { sub = eval("(class " + name + " extends Promise {})"); } catch (x) { sub = undefined; }' +
+            '}' +
+            'function react(res, rej) {' +
+            'src.then(function (v) { res(rehome(v)); }, function (e) { rej(rehome(e)); });' +
+            '}' +
+            'return typeof sub === "function" ? Reflect.construct(sub, [react]) : new Promise(react);' +
+            '})'
         );
         if (built.error) {
             built.error.dispose();
             return value;
         }
         const bridge = host.context.unwrapResult(built);
-        const result = realm.callFunction(bridge, realm.undefined, [value]);
+        const result = realm.callFunction(bridge, realm.undefined, [value, host.rehomeFn]);
         bridge.dispose();
         if (result.error) {
             result.error.dispose();
@@ -536,6 +619,24 @@ function pin(host: VmHost, value: QuickJSHandle): QuickJSHandle {
 }
 
 /**
+ * Retires the oldest pins, the oldest half of them, when the cap on them is reached.
+ *
+ * Only between rebuilds: a walk in flight keeps its twins in this list, and a twin freed under it is
+ * a handle the rest of the walk would still compare against.
+ */
+function retire(host: VmHost): void {
+    if (host.realmValues.length < REALM_MAX_VALUES) return;
+    const drop = Math.floor(REALM_MAX_VALUES / 2);
+    for (const old of host.realmValues.splice(0, drop)) {
+        try {
+            old.dispose();
+        } catch {
+            // a handle already gone is nothing to report
+        }
+    }
+}
+
+/**
  * The error constructors of the second realm an error can be rebuilt as.
  *
  * An `Error` crossing out of a `vm` context is an object of another realm in host Node 24.15 --
@@ -556,25 +657,27 @@ const REALM_ERRORS = ['AggregateError', 'Error', 'EvalError', 'RangeError', 'Ref
  * the second realm's, which is the honest answer: the frames of the guest's own realm are the
  * container's, and no realm boundary makes them the host's.
  */
-function errorOf(host: VmHost, realm: QuickJSContext, name: string, message: string): QuickJSHandle | undefined {
+function errorOf(host: VmHost, realm: QuickJSContext, name: string, ctor: string, message: string): QuickJSHandle | undefined {
     try {
-        const ctor = REALM_ERRORS.indexOf(name) >= 0 ? name : 'Error';
+        const kind = REALM_ERRORS.indexOf(name) >= 0 ? name : 'Error';
         /* `AggregateError` takes its errors first and its message second, so a message alone would
            be read as the iterable of errors: `new AggregateError('m')` came out with one error --
            the string's one character -- and an empty message. Its `errors` are copied by the walk. */
-        const args = ctor === 'AggregateError' ? `[], ${JSON.stringify(message)}` : JSON.stringify(message);
+        const args = kind === 'AggregateError' ? `[], ${JSON.stringify(message)}` : JSON.stringify(message);
         const built = realm.evalCode(
             `(function () {` +
             `var n = ${JSON.stringify(name)};` +
+            `var k = ${JSON.stringify(ctor)};` +
             `var m = ${JSON.stringify(message)};` +
-            `var C = globalThis[${JSON.stringify(ctor)}];` +
+            `var C = globalThis[${JSON.stringify(kind)}];` +
             `var e = typeof C === 'function' ? new C(${args}) : new Error(m);` +
             `if (e.name !== n) e.name = n;` +
             /* A class the second realm has never heard of: an `Error` wearing its name still answers
                `Error` to `constructor.name`, where host Node hands back the context's own object and
-               so reads the class. Give the rebuild a constructor of that name instead. */
+               so reads the class. Give the rebuild a constructor of that name instead -- the
+               constructor's, which for a subclass is not the same as the error's own `name`. */
             `var p = Object.getPrototypeOf(e);` +
-            `if (!(p && p.constructor && p.constructor.name === n)) {` +
+            `if (!(p && p.constructor && p.constructor.name === k)) {` +
             `var S = function (mm) {` +
             `var o = new Error(mm);` +
             `Object.setPrototypeOf(o, S.prototype);` +
@@ -582,7 +685,7 @@ function errorOf(host: VmHost, realm: QuickJSContext, name: string, message: str
             `return o; };` +
             `Object.setPrototypeOf(S.prototype, p || Error.prototype);` +
             `S.prototype.constructor = S;` +
-            `try { Object.defineProperty(S, 'name', { value: n, configurable: true }); } catch (x) {}` +
+            `try { Object.defineProperty(S, 'name', { value: k, configurable: true }); } catch (x) {}` +
             `e = S(m);` +
             `}` +
             `return e; })()`
@@ -592,6 +695,20 @@ function errorOf(host: VmHost, realm: QuickJSContext, name: string, message: str
             return undefined;
         }
         return host.context.unwrapResult(built);
+    } catch {
+        return undefined;
+    }
+}
+
+/** The `name` of `value`'s constructor, read through the prototype chain as `value.constructor.name`. */
+function ctorNameOf(host: VmHost, value: QuickJSHandle): string | undefined {
+    try {
+        const ctor = host.context.getProp(value, 'constructor');
+        const name = host.context.getProp(ctor, 'name');
+        const answer = host.context.dump(name);
+        name.dispose();
+        ctor.dispose();
+        return typeof answer === 'string' && answer.length > 0 ? answer : undefined;
     } catch {
         return undefined;
     }
@@ -662,6 +779,7 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
             if (context.typeof(value) !== 'object' && context.typeof(value) !== 'function') return { rebuilt: false };
             const realm = realmOf(host);
             if (realm === undefined) return { rebuilt: false };
+            retire(host);
             const rebuilt = rehomeInto(host, realm, value, 0, [], [], kept);
             if (rebuilt === value) return { rebuilt: false };
             context.setProp(host.api, 'vmBack', rebuilt);
