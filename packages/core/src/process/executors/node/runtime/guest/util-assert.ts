@@ -116,7 +116,10 @@ function inspectValue(value, opts) {
     if (t === 'function') {
       var name = v.name ? v.name : '';
       if (/^class[\s{]/.test(Function.prototype.toString.call(v))) return '[class ' + (name || '(anonymous)') + ']';
-      return '[Function: ' + (name || '(anonymous)') + ']';
+      /* A function with no name is '[Function (anonymous)]' and not '[Function: (anonymous)]':
+         the colon belongs to the name that follows it, and node writes none when there is no name
+         to write -- which is what 'util.inspect(function () {})' prints on host node 24.15. */
+      return name ? '[Function: ' + name + ']' : '[Function (anonymous)]';
     }
     /* A value the walk is already inside. Node numbers the objects a '[Circular *n]' marker points
        back at -- in the order it meets them, from 1 -- and writes '<ref *n> ' in front of the one
@@ -160,12 +163,23 @@ function inspectValue(value, opts) {
     }
 
     var isArr = Array.isArray(v);
-    var isTyped = !isArr && ArrayBuffer.isView(v) && !(v instanceof DataView);
+    /* The tag and not 'instanceof' for the DataView exception as well: a DataView out of a 'vm'
+       context is of another realm, so 'v instanceof DataView' is false for it here and on host Node
+       24.15 alike, and the typed-array branch below printed it as 'DataView(undefined) []'. */
+    var isTyped = !isArr && ArrayBuffer.isView(v) && vTag !== 'DataView';
     var bare = Object.getPrototypeOf(v) === null;
     if (depth > maxDepth) {
       if (isArr) return '[Array]';
       return '[' + (bare ? nullPrototypeTagOf(v) + ': null prototype' : (ctor || 'Object')) + ']';
     }
+    /* An ArrayBuffer, a SharedArrayBuffer and a DataView print what no walk of own keys can reach:
+       node gives them the pseudo-entries '[Uint8Contents]' and '[byteLength]' -- and '[byteOffset]'
+       and '[buffer]' to a view -- which is why a 4-byte buffer prints
+       'ArrayBuffer { [Uint8Contents]: <00 00 00 00>, [byteLength]: 4 }' and not 'ArrayBuffer {}'.
+       The tag is what names them, so one a 'vm' context handed out prints the way host Node 24.15
+       prints it and not as a typed array of no length at all. */
+    if (vTag === 'ArrayBuffer' || vTag === 'SharedArrayBuffer') return bufferInspectOf(v, indent, opts);
+    if (vTag === 'DataView') return dataViewInspectOf(v, depth, indent, opts);
 
     stack.push(v);
     var entries = [];
@@ -207,6 +221,15 @@ function inspectValue(value, opts) {
       var keyText = isIdentifierKey(keys[k]) ? keys[k] : quoteStringLiteral(keys[k]);
       entries.push(keyText + ': ' + fmt(v[keys[k]], depth + 1, indent + 2));
     }
+    /* The enumerable own SYMBOL keys, after the string ones and in the order they were put on.
+       Node writes one where a string key goes, as 'Symbol(k): 1' -- no brackets and no quotes --
+       for an ordinary object, for an array and for a Map alike, and it writes none of the ones
+       that are not enumerable, which is why a symbol put on with 'enumerable: false' prints
+       nothing at all and 'showHidden' does not change that. */
+    var syms = utilEnumerableSymbols(v);
+    for (var si = 0; si < syms.length; si++) {
+      entries.push(String(syms[si]) + ': ' + fmt(v[syms[si]], depth + 1, indent + 2));
+    }
     stack.pop();
 
     /* Read after the walk of the children and not before: a value is only a '<ref *n>' once a
@@ -236,7 +259,9 @@ function inspectValue(value, opts) {
     }
     var start = entries.length + indent + open.length + prefix.length + 10;
     var totalLength = entries.length + start;
-    var fits = !multiline && !packed && totalLength + entries.length <= 80;
+    /* 'compact: false' is one entry per line and never a fit test: node's own inspect writes
+       '[1,2,3,4,5,6,7,8]' on one line by default and one number to a line under that option. */
+    var fits = !multiline && !packed && compactOf(opts) !== false && totalLength + entries.length <= 80;
     for (var s = 0; fits && s < entries.length; s++) {
       totalLength += entries[s].length;
       if (totalLength > 80) fits = false;
@@ -946,7 +971,83 @@ function fmtPromiseValue(value, depth, indent) {
   return INSPECT_FMT(value, depth, indent);
 }
 
+/* The entries of an object-like value, one line when node's own fit test lets them be and one per
+   line when it does not: the test the walk above uses, '{' and '}' for the braces, and two spaces
+   of indent in front of every entry past the fit. */
+function joinInspectEntries(prefix, entries, indent, opts) {
+  if (entries.length === 0) return prefix + '{}';
+  var width = opts && typeof opts.breakLength === 'number' ? opts.breakLength : 80;
+  var totalLength = entries.length + (entries.length + indent + 1 + prefix.length + 10);
+  var fits = true;
+  for (var i = 0; fits && i < entries.length; i++) {
+    totalLength += entries[i].length;
+    if (totalLength > width) fits = false;
+  }
+  if (fits) return prefix + '{ ' + entries.join(', ') + ' }';
+  var pad = ' '.repeat(indent + 2);
+  return prefix + '{\n' + entries.map(function (entry) { return pad + entry; }).join(',\n') + '\n' + ' '.repeat(indent) + '}';
+}
+
+/* The bytes a buffer prints: every one of them up to 'maxArrayLength' -- a hundred, node's default
+   -- in lowercase hex two characters to a byte, and '... n more bytes' for the rest, inside the
+   same angle brackets. That is why 'util.inspect(new ArrayBuffer(300))' prints a hundred bytes and
+   '... 200 more bytes', and the same buffer under '{ maxArrayLength: 5 }' five and '... 295 more
+   bytes'. A buffer that has been detached has no bytes to read and prints as none. */
+function bufferBytesText(value, opts) {
+  var max = opts && typeof opts.maxArrayLength === 'number' ? opts.maxArrayLength : 100;
+  if (!(max >= 0)) max = 0;
+  var bytes = [];
+  var total = 0;
+  try {
+    var view = new Uint8Array(value);
+    total = view.length;
+    var shown = Math.min(view.length, max);
+    for (var i = 0; i < shown; i++) bytes.push(hexByte(view[i]));
+  } catch (e) { /* detached */ }
+  var text = bytes.join(' ');
+  if (bytes.length < total) text += (text === '' ? '' : ' ') + '... ' + (total - bytes.length) + ' more bytes';
+  return '<' + text + '>';
+}
+
+/* What 'util.inspect' writes for an ArrayBuffer and for a SharedArrayBuffer. */
+function bufferInspectOf(v, indent, opts) {
+  var prefix = (constructorNameOf(v) || utilTag(v)) + ' ';
+  var length = 0;
+  try { length = v.byteLength; } catch (e) { /* detached */ }
+  return joinInspectEntries(prefix, ['[Uint8Contents]: ' + bufferBytesText(v, opts), '[byteLength]: ' + length], indent, opts);
+}
+
+/* What 'util.inspect' writes for a DataView: the three things about it, the buffer it views last
+   and at the next depth -- which is why 'util.inspect(new DataView(new ArrayBuffer(4)),
+   { depth: 0 })' ends '[buffer]: [ArrayBuffer]' and not the buffer itself. */
+function dataViewInspectOf(v, depth, indent, opts) {
+  var prefix = (constructorNameOf(v) || 'DataView') + ' ';
+  var length = 0;
+  var offset = 0;
+  try { length = v.byteLength; offset = v.byteOffset; } catch (e) { /* detached */ }
+  var buffer = '[ArrayBuffer]';
+  try {
+    buffer = INSPECT_FMT === null ? '[ArrayBuffer]' : INSPECT_FMT(v.buffer, depth + 1, indent + 2);
+  } catch (e) { /* detached */ }
+  return joinInspectEntries(prefix, ['[byteLength]: ' + length, '[byteOffset]: ' + offset, '[buffer]: ' + buffer], indent, opts);
+}
+
 /* the element type name of a typed array (Uint8Array and the rest), or undefined for any other value */
+/* The own symbol keys of a value that 'util.inspect' prints: the enumerable ones, in the order
+   they were put on. A non-enumerable symbol is not one of them, and neither is a symbol an object
+   inherits -- both print as nothing at all, which is what host node 24.15 answers for each. */
+function utilEnumerableSymbols(value) {
+  if (typeof Object.getOwnPropertySymbols !== 'function') return [];
+  var own = Object.getOwnPropertySymbols(value);
+  var out = [];
+  for (var i = 0; i < own.length; i++) {
+    var shown = false;
+    try { shown = Object.prototype.propertyIsEnumerable.call(value, own[i]); } catch (e) { shown = false; }
+    if (shown) out.push(own[i]);
+  }
+  return out;
+}
+
 function utilTypedName(value) {  if (value === null || typeof value !== 'object') return undefined;
   if (UTIL_TYPED_TAG !== null) return UTIL_TYPED_TAG.call(value);
   var tag = Object.prototype.toString.call(value).slice(8, -1);
