@@ -498,6 +498,31 @@ function shellPathOf(ctx: CapabilityContext, file: string, env: Record<string, s
 /** The directories a host's `sh` stands in, whichever of them this container's PATH happens to hold. */
 export const SHELL_DIRECTORIES = ['/bin', '/usr/bin', '/sbin', '/usr/sbin'];
 
+/**
+ * A path with `.`, `..` and repeated slashes collapsed, so the spellings of one path compare equal:
+ * `/bin/../bin/sh` and `//bin/sh` are both `/bin/sh`.
+ */
+function lexicalPath(path: string): string {
+    const parts: string[] = [];
+    for (const part of path.split('/')) {
+        if (part === '' || part === '.') continue;
+        if (part === '..') { parts.pop(); continue; }
+        parts.push(part);
+    }
+    return '/' + parts.join('/');
+}
+
+/**
+ * True when `name` names this container's own shell: the bare name a spawn gives it, or a path to
+ * `sh` in one of its directories -- `/bin/sh`, and every other spelling of that path. Only the bare
+ * name used to be recognised in the shell's own command runner, so a line that named the shell by
+ * path -- `/bin/sh -c 'echo hi'`, which is what `exec('/bin/sh -c "echo hi"')` runs -- matched
+ * nothing at all and closed 0 having written nothing.
+ */
+export function isContainerShell(name: string): boolean {
+    return name === 'sh' || SHELL_DIRECTORIES.some((directory) => lexicalPath(name) === `${directory}/sh`);
+}
+
 /** The names the container runs itself, so a spawn of one is never rewritten into a file on PATH. */
 const CONTAINER_EXECUTABLES = new Set(['node', 'npm', 'npx', 'sh', 'bash']);
 

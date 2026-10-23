@@ -4,6 +4,7 @@ import { ProcessEvent, ProcessState, ProcessType } from '../../base';
 import { IFileSystem } from '../../../filesystem';
 import type { NetworkHandle } from '../../../shell/commands/types';
 import { ShellCommandResult } from '../../../shell';
+import { isContainerShell } from '../node/runtime/capabilities/child';
 
 interface CommandHistoryEntry {
     command: string;
@@ -753,10 +754,12 @@ export class ShellProcess extends Process {
                     this.shell.getWorkingDirectory()
                 );
             }
-            /* `sh -c <line>` is a shell of its own, and it runs that line the way this shell runs one:
-               a command only a child can run -- `sh -c 'node x.js'` -- reaches a child through it,
-               where the engine's own `sh`, which cannot spawn, would refuse it with 127. */
-            if (command === 'sh' && cmdArgs[0] === '-c') {
+            /* `sh -c <line>` is a shell of its own, and so is any spelling of the path it stands at:
+               it runs that line the way this shell runs one, so a command only a child can run --
+               `sh -c 'node x.js'` -- reaches a child through it, where the engine's own `sh`, which
+               cannot spawn, would refuse it with 127. Only the bare name was recognised, so
+               `/bin/sh -c 'echo hi'` fell through to a file lookup and closed 0 having run nothing. */
+            if (isContainerShell(command) && cmdArgs[0] === '-c') {
                 this.liveChildOutput = true;
                 return await this.spawnChild(
                     command,
