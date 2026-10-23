@@ -31,6 +31,8 @@ interface VmRealm {
     builtins?: { from: QuickJSHandle[]; to: QuickJSHandle[] };
     /** `Object.getOwnPropertyNames` of this realm, once: what {@link syncOut} reads. */
     namesFn?: QuickJSHandle;
+    /** `Object.defineProperty` in this realm, once: what {@link defineHidden} uses. */
+    defineFn?: QuickJSHandle;
     /** The own names of this realm's global object as it was made: its intrinsics, not its sandbox. */
     base: Set<string>;
     /** The names on the global object that are the sandbox's: what {@link syncOut} writes back. */
@@ -443,7 +445,7 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
 
 /** Frees one second realm and every handle of the binding that was built inside it. */
 function disposeRealm(realm: VmRealm): void {
-    for (const handle of [realm.noteFn, realm.recordFn, realm.rehomeFn, realm.namesFn,
+    for (const handle of [realm.noteFn, realm.recordFn, realm.rehomeFn, realm.namesFn, realm.defineFn,
         ...(realm.builtins === undefined ? [] : [...realm.builtins.from, ...realm.builtins.to])]) {
         if (handle === undefined) continue;
         try {
@@ -456,6 +458,7 @@ function disposeRealm(realm: VmRealm): void {
     realm.recordFn = undefined;
     realm.rehomeFn = undefined;
     realm.namesFn = undefined;
+    realm.defineFn = undefined;
     realm.builtins = undefined;
     try {
         realm.ctx.dispose();
@@ -635,6 +638,39 @@ function deleteKey(ctx: QuickJSContext, target: QuickJSHandle, key: string): voi
         else result.value.dispose();
     } catch {
         // a name that will not come off still leaves the rest of the sync intact
+    }
+}
+
+/**
+ * `Object.defineProperty(globalThis, key, { value, writable: true, enumerable: false, configurable: true })`,
+ * in the realm's own terms: how a name a `vm` context is *given* arrives at its global object.
+ *
+ * Not the context API's own `defineProp`, whose descriptor carries no `writable` -- it is typed out
+ * of the object and the engine leaves it off, so the property it makes is read-only -- where host
+ * Node 24.15 answers `writable: true` for every global it hands a context, `console` among them.
+ */
+function defineHidden(realm: VmRealm, key: string, value: QuickJSHandle): void {
+    try {
+        if (realm.defineFn === undefined) {
+            const built = realm.ctx.evalCode(
+                '(function (k, v) {' +
+                'Object.defineProperty(globalThis, k,' +
+                ' { value: v, writable: true, enumerable: false, configurable: true });' +
+                '})'
+            );
+            if (built.error) {
+                built.error.dispose();
+                return;
+            }
+            realm.defineFn = realm.ctx.unwrapResult(built);
+        }
+        const name = realm.ctx.newString(key);
+        const result = realm.ctx.callFunction(realm.defineFn, realm.ctx.undefined, [name, value]);
+        name.dispose();
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // a global the realm will not take still leaves the run intact
     }
 }
 
@@ -1750,12 +1786,12 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
         try {
             syncIn(host, realm, sandbox);
             if (context.typeof(cons) === 'object') {
-                /* Not `setProp`: a property it creates is enumerable, and host node 24.15 answers
-                   '[]' for 'Object.keys(globalThis)' inside a context -- 'console' is a global a
-                   context is given and not one Node's own global object enumerates. */
-                realm.ctx.defineProp(realm.ctx.global, 'console', {
-                    value: cons, writable: true, enumerable: false, configurable: true
-                });
+                /* Neither `setProp` nor the context API's own `defineProp`: the first makes the
+                   name enumerable, and host node 24.15 answers '[]' for 'Object.keys(globalThis)'
+                   inside a context -- 'console' is a global a context is given and not one Node's
+                   own global object enumerates; the second leaves it read-only, where node's is
+                   writable. */
+                defineHidden(realm, 'console', cons);
                 realm.injected.add('console');
             }
             const source = context.dump(code);

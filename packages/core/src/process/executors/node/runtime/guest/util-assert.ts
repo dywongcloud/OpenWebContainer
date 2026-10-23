@@ -45,7 +45,17 @@ function formatErrorStack(err) {
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   var body = lines.join('\n');
   if (body === '') return header;
-  return body.indexOf(header) === 0 ? body : header + '\n' + body;
+  /* A stack that is no stack at all -- one the error was given by hand, 'L1\nL2', with no frame in
+     it -- is what node prints in brackets, '[L1\nL2]': not a report with a header in front of it
+     and not one with the header left off. */
+  if (body.indexOf('\n    at') < 0) return '[' + body + ']';
+  /* The engine of a 'vm' realm writes a stack of frames and no header -- '    at <eval> (...)' --
+     where node's own opens with 'Error: x', so the header goes in front. A stack that already
+     carries the error's header or report gets none, which is what makes 'util.inspect' of an error
+     thrown out of a 'vm' context open with the frame the host wrote, 'evalmachine.<anonymous>:1',
+     and not with 'Error: th': that report holds its own 'Error: th' further down, and a header of
+     ours in front would make the first line the one thing node does not print. */
+  return body.indexOf(header) >= 0 ? body : header + '\n' + body;
 }
 
 function hexByte(b) {
@@ -198,20 +208,118 @@ function inspectValue(value, opts) {
     for (var e = 0; e < entries.length; e++) {
       if (entries[e].indexOf('\n') >= 0) multiline = true;
     }
+    /* Node packs the entries of an array before it decides how to print them, and an array of more
+       than six that it packs never goes back to one line: eighty numbers come out twelve
+       right-aligned to a line, fourteen short strings three to a line, and '[1,2,3,4,5,6,7]' is
+       '[\n  1, 2, 3, 4,\n  5, 6, 7\n]' on host node 24.15 and not '[ 1, 2, 3, 4, 5, 6, 7 ]'. The
+       packing is node's own rule -- as near a square of entries as the line width, four times
+       'compact' and fifteen columns allow, a character being about 2.5 times as high as it is
+       wide -- and numbers and bigints are right-aligned in their column where every other kind is
+       left-aligned. */
+    var packed = false;
+    var shown = entries;
+    if ((isArr || isTyped) && entries.length > 6 && groupable(opts)) {
+      shown = groupArrayElements(entries, v, indent, compactOf(opts));
+      packed = shown.length !== entries.length;
+    }
     var start = entries.length + indent + open.length + prefix.length + 10;
     var totalLength = entries.length + start;
-    var fits = !multiline && totalLength + entries.length <= 80;
+    var fits = !multiline && !packed && totalLength + entries.length <= 80;
     for (var s = 0; fits && s < entries.length; s++) {
       totalLength += entries[s].length;
       if (totalLength > 80) fits = false;
     }
     if (fits) return prefix + open + ' ' + entries.join(', ') + ' ' + close;
     var pad = ' '.repeat(indent + 2);
-    return prefix + open + '\n' + entries.map(function (entry) { return pad + entry; }).join(',\n') + '\n' + ' '.repeat(indent) + close;
+    return prefix + open + '\n' + shown.map(function (entry) { return pad + entry; }).join(',\n') + '\n' + ' '.repeat(indent) + close;
   }
 
   INSPECT_FMT = fmt;
   return fmt(value, 0, 0);
+}
+
+function padBy(order, text, width) {
+  return order === 'padStart' ? text.padStart(width, ' ') : text.padEnd(width, ' ');
+}
+
+/* 'compact', the option node's own inspect carries: 3 unless the caller said otherwise, and the
+   packing of an array's entries is only done at all when it is a number of at least one -- 'compact:
+   false' and 'compact: true' both print one entry per line. It is also what caps the columns at
+   four times itself. */
+function compactOf(opts) {
+  if (opts === undefined || opts === null || opts.compact === undefined) return 3;
+  return opts.compact;
+}
+
+function groupable(opts) {
+  var compact = compactOf(opts);
+  return compact !== true && typeof compact === 'number' && compact >= 1;
+}
+
+/* How node packs the entries of an array too long for one line: the 'groupArrayElements' of its
+   own inspect, ports and all, in the terms of this walk. 'output' is the entries as they print,
+   'value' the array they came from -- only whether each of its items is a number or a bigint is
+   asked of it, because that is what decides which way the entries are padded -- and 'indent' the
+   indent the array itself is printed at. 80 is 'breakLength' and 3 is 'compact', both node's
+   defaults, and 100 is 'maxArrayLength', whose '... n more items' is not an entry to pack. */
+function groupArrayElements(output, value, indent, compact) {
+  var totalLength = 0;
+  var maxLength = 0;
+  var outputLength = output.length;
+  if (100 < output.length) outputLength--;
+  var dataLen = new Array(outputLength);
+  for (var i = 0; i < outputLength; i++) {
+    var len = output[i].length;
+    dataLen[i] = len;
+    totalLength += len + 2;
+    if (maxLength < len) maxLength = len;
+  }
+  var actualMax = maxLength + 2;
+  /* At least three entries have to fit next to each other, and an array whose entries are of very
+     different lengths is left alone -- one entry longer than a fifth of all of them would leave
+     an enormous gap beside the short ones. */
+  if (actualMax * 3 + indent >= 80 ||
+      (totalLength / actualMax <= 5 && maxLength > 6)) return output;
+  var averageBias = Math.sqrt(actualMax - totalLength / output.length);
+  var biasedMax = Math.max(actualMax - 3 - averageBias, 1);
+  var columns = Math.min(
+    Math.round(Math.sqrt(2.5 * biasedMax * outputLength) / biasedMax),
+    Math.floor((80 - indent) / actualMax),
+    compact * 4,
+    15
+  );
+  if (columns <= 1) return output;
+  var maxLineLength = [];
+  for (var c = 0; c < columns; c++) {
+    var lineMaxLength = 0;
+    for (var j = c; j < output.length; j += columns) {
+      if (dataLen[j] > lineMaxLength) lineMaxLength = dataLen[j];
+    }
+    maxLineLength[c] = lineMaxLength + 2;
+  }
+  var order = 'padStart';
+  if (value !== undefined) {
+    for (var q = 0; q < output.length; q++) {
+      if (typeof value[q] !== 'number' && typeof value[q] !== 'bigint') { order = 'padEnd'; break; }
+    }
+  }
+  var tmp = [];
+  for (var at = 0; at < outputLength; at += columns) {
+    var last = Math.min(at + columns, outputLength);
+    var line = '';
+    var k = at;
+    for (; k < last - 1; k++) {
+      /* Numbers and bigints are padded on the left of the comma and every other kind on the right,
+         which is why a column of numbers is right-aligned numbers -- '0' in a column two wide
+         prints as ' 0, ' and not as '   0, ' -- and a column of booleans is not. */
+      line += padBy(order, output[k] + ', ', maxLineLength[k - at] + output[k].length - dataLen[k]);
+    }
+    if (order === 'padStart') line += output[k].padStart(maxLineLength[k - at] + output[k].length - dataLen[k] - 2, ' ');
+    else line += output[k];
+    tmp.push(line);
+  }
+  if (100 < output.length) tmp.push(output[outputLength]);
+  return tmp;
 }
 
 function formatLogArgs(args) {
