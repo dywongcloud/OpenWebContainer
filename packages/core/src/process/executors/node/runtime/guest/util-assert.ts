@@ -571,6 +571,16 @@ Object.defineProperty(TextEncoderImpl.prototype, Symbol.toStringTag, { value: 'T
 /* The one argument encode takes is optional in Node's own signature and so is absent from its
    length: the arity a program reads is 0, and the method reads its argument all the same. */
 Object.defineProperty(TextEncoderImpl.prototype.encode, 'length', { value: 0, configurable: true });
+/* The names a program reads off the two methods and the accessor: a method written as an
+   assignment onto a prototype takes no name from the property it lands on, and a program that
+   prints fn.name -- or an assertion library that matches on it -- reads ''. Node's own answer
+   is the property's name, and the three getters there are named as a getter is, 'get encoding'.
+   encodeInto's arity is 2, since both of its arguments are required. */
+Object.defineProperty(TextEncoderImpl.prototype.encode, 'name', { value: 'encode', configurable: true });
+Object.defineProperty(TextEncoderImpl.prototype.encodeInto, 'name', { value: 'encodeInto', configurable: true });
+Object.defineProperty(TextEncoderImpl.prototype.encodeInto, 'length', { value: 2, configurable: true });
+var encoderEncodingGetter = Object.getOwnPropertyDescriptor(TextEncoderImpl.prototype, 'encoding').get;
+Object.defineProperty(encoderEncodingGetter, 'name', { value: 'get encoding', configurable: true });
 
 /*
  * TextDecoder, as the encoding standard and Node 24.15 have it: a label names one of the
@@ -700,6 +710,19 @@ function textDecoderOptionsError(options) {
     'The "options" argument must be of type object. Received type ' + got);
 }
 
+/* A label is looked up with the ASCII whitespace at its ends taken off -- tab, line feed, form
+   feed, carriage return and space, and nothing else: a vertical tab and a NUL are not
+   whitespace to the encoding standard and stay part of a label no lookup will find. */
+function isDecoderLabelSpace(code) {
+  return code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d || code === 0x20;
+}
+function trimDecoderLabel(label) {
+  var start = 0;
+  var end = label.length;
+  while (start < end && isDecoderLabelSpace(label.charCodeAt(start))) start += 1;
+  while (end > start && isDecoderLabelSpace(label.charCodeAt(end - 1))) end -= 1;
+  return label.slice(start, end);
+}
 function TextDecoderImpl(label, options) {
   /* Node's own is a class, and a class called without 'new' is refused in a class's own words --
      which name the class. This engine names the constructor differently, so what a program reads
@@ -712,7 +735,7 @@ function TextDecoderImpl(label, options) {
      that are not Node's. Both are the same refusal, so the refusal is written here. */
   if (typeof label === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
   var name = label === undefined ? 'utf-8' : '' + label;
-  var canonical = TEXT_DECODER_LABELS[String(name).toLowerCase()];
+  var canonical = TEXT_DECODER_LABELS[trimDecoderLabel(String(name)).toLowerCase()];
   if (canonical === undefined) {
     throw textDecoderError(RangeError, 'ERR_ENCODING_NOT_SUPPORTED', 'The "' + name + '" encoding is not supported');
   }
@@ -812,6 +835,15 @@ Object.defineProperty(TextDecoderImpl.prototype, Symbol.toStringTag, { value: 'T
 /* The two arguments are optional in Node's own signature and so are absent from its length: the
    arity a program reads is 0, and the method reads its arguments all the same. */
 Object.defineProperty(TextDecoderImpl.prototype.decode, 'length', { value: 0, configurable: true });
+/* The same three names on the decoder: the method's, which an assignment onto the prototype
+   leaves empty, and the three getters', which this engine leaves as 'get' where Node names the
+   property each reads -- 'get encoding', 'get fatal', 'get ignoreBOM'. */
+Object.defineProperty(TextDecoderImpl.prototype.decode, 'name', { value: 'decode', configurable: true });
+var decoderGetterNames = [['encoding', 'get encoding'], ['fatal', 'get fatal'], ['ignoreBOM', 'get ignoreBOM']];
+for (var dgn = 0; dgn < decoderGetterNames.length; dgn++) {
+  var decoderGetter = Object.getOwnPropertyDescriptor(TextDecoderImpl.prototype, decoderGetterNames[dgn][0]).get;
+  Object.defineProperty(decoderGetter, 'name', { value: decoderGetterNames[dgn][1], configurable: true });
+}
 
 function utilArgError(code, message) {
   var err = new TypeError(message);

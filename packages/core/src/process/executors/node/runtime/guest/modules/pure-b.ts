@@ -1412,8 +1412,17 @@ export const SRC = String.raw`
          * calling d.bind(...) puts that domain on the stack twice -- the driver's bind plus the
          * one bind's runInDomain does -- and host node 24.15 pops every duplicate and settles on
          * null, not undefined (measured: b06, t05, t07, v1, v3).
+         *
+         * Nor does the handling domain have to be the innermost one. Host node 24.15 reaches
+         * _errorHandler through process.domain and, when that domain has no 'error' listener,
+         * recurses outward -- EventEmitter rethrows the error and the catch hands it to
+         * stack[stack.length-1] -- so what is left below the domain that ends up handling it is
+         * what decides the idle value, whichever link of the chain that domain is. Three domains
+         * entered with only the middle one listening: host node 24.15 reads undefined and so did
+         * this container before, which read null because it asked only about the innermost link
+         * (measured: a7, a22, a23, a27, a29, a31).
          */
-        if (i === 0 && index > 0 && outerLeft > 0 && typeof process === 'object' && process !== null) {
+        if (index > 0 && outerLeft > 0 && typeof process === 'object' && process !== null) {
           Object.defineProperty(process, '_owcIdleUndefined', { value: true, writable: true, configurable: true });
         }
         return true;
@@ -2859,6 +2868,7 @@ export const SRC = String.raw`
     var failed = 0;
     var skipped = 0;
     var todos = 0;
+    var cancelled = 0;
     var suiteCount = 0;
     var failures = [];
     var startedAt = 0;
@@ -2903,7 +2913,9 @@ export const SRC = String.raw`
         only: parts.options.only === true, expectFailure: parts.options.expectFailure === true, hooks: [] };
       cursor.items.push(item);
       schedule();
-      return undefined;
+      /* node's test() answers the promise of the run it just joined, which is how a caller waits
+         for the report: awaiting it is a thing programs do, and it answers undefined otherwise. */
+      return draining;
     }
 
     function addSuite(args) {
@@ -2943,58 +2955,158 @@ export const SRC = String.raw`
       return chain;
     }
 
+    /* The hooks hung on the module itself are the outermost pair: node runs a module-level
+       beforeEach ahead of every test it collected, whatever suite the test sits in, and its
+       afterEach behind every one. */
     function hooksAround(item, ancestors) {
-      var beforeEach = [];
+      var beforeEach = root.beforeEach.slice();
       var afterEach = [];
       for (var i = 0; i < ancestors.length; i++) {
         beforeEach = beforeEach.concat(ancestors[i].beforeEach);
         afterEach = ancestors[i].afterEach.concat(afterEach);
       }
-      return { before: beforeEach, after: afterEach };
+      return { before: beforeEach, after: afterEach.concat(root.afterEach) };
     }
 
-    function runTest(item, ancestors, depth) {
+    /*
+     * The context a test body is handed. Node's own is an instance of TestContext and carries
+     * nothing of its own: the name, the signal, the assertions, the mock, the sub-test and the
+     * hooks are all accessors on its prototype, so Object.keys and getOwnPropertyNames of a
+     * context are both empty and every name is still read off it. The values behind them are
+     * per-test, so they are kept beside the instance rather than on it.
+     */
+    var CTX = new WeakMap();
+    function TestContext() { /* nothing of its own: every name is read off the prototype */ }
+    function ctxAccessor(name, read) {
+      Object.defineProperty(TestContext.prototype, name, {
+        get: function () { var state = CTX.get(this); return state === undefined ? undefined : read(state); },
+        configurable: true, enumerable: true
+      });
+    }
+    function newTestContext(item, pad) {
+      var context = new TestContext();
+      var state = { item: item, pad: pad, mark: undefined };
+      CTX.set(context, state);
+      return context;
+    }
+    var abortControllerOf = function () {
+      var controller = typeof globalThis.AbortController === 'function' ? new globalThis.AbortController() : undefined;
+      return controller;
+    };
+    ctxAccessor('name', function (state) { return state.item.name; });
+    ctxAccessor('fullName', function (state) { return state.item.fullName === undefined ? state.item.name : state.item.fullName; });
+    ctxAccessor('signal', function (state) {
+      if (state.signal === undefined) {
+        var controller = abortControllerOf();
+        state.signal = controller === undefined ? undefined : controller.signal;
+      }
+      return state.signal;
+    });
+    ctxAccessor('assert', function (state) {
+      if (state.assert === undefined) state.assert = Object.create(requireBuiltin('assert'));
+      return state.assert;
+    });
+    ctxAccessor('mock', function (state) {
+      if (state.mock === undefined) state.mock = testMock();
+      return state.mock;
+    });
+    ctxAccessor('test', function (state) {
+      return function (name, options, fn) { return addTest(Array.prototype.slice.call(arguments)); };
+    });
+    ctxAccessor('runOnly', function (state) { return state.item.only === true ? true : undefined; });
+    ctxAccessor('before', function (state) { return function (fn) { state.item.hooks.push(['before', fn]); return undefined; }; });
+    ctxAccessor('after', function (state) { return function (fn) { state.item.hooks.push(['after', fn]); return undefined; }; });
+    ctxAccessor('beforeEach', function (state) { return function (fn) { state.item.hooks.push(['beforeEach', fn]); return undefined; }; });
+    ctxAccessor('afterEach', function (state) { return function (fn) { state.item.hooks.push(['afterEach', fn]); return undefined; }; });
+    ctxAccessor('diagnostic', function (state) {
+      return function (text) { line(state.pad + '  ' + text); };
+    });
+    /* skip and todo are not verdicts a body reaches on its own: they are the body's own answer,
+       given while it runs, and they mark the test skipped or todo whenever it ends -- after the
+       rest of the body has had its say, which is why a line the body prints first comes first. */
+    ctxAccessor('skip', function (state) {
+      return function () { if (state.mark === undefined) state.mark = 'skip'; };
+    });
+    ctxAccessor('todo', function (state) {
+      return function () { if (state.mark === undefined) state.mark = 'todo'; };
+    });
+
+    /* The mark a test ends with: a skipped one is a small hyphen and '# SKIP', a todo the ordinary
+       tick and '# TODO', and one its author said must fail carries '# EXPECTED FAILURE' whichever
+       way it went. */
+    function expectedSuffix(item) { return item.expectFailure === true ? ' # EXPECTED FAILURE' : ''; }
+    function lineOk(item, pad, at) { line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ')' + expectedSuffix(item)); }
+    function lineNo(item, pad, at) { line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')' + expectedSuffix(item)); }
+    function lineSkipped(item, pad, at) { line(pad + '﹣ ' + item.name + ' (' + durationOf(at) + ') # SKIP'); }
+    function lineTodo(item, pad, at) { line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ') # TODO'); }
+
+    function runTest(item, ancestors, depth, tailAfter) {
       var pad = new Array(depth + 1).join('  ');
       if (item.skip === true || item.todo === true) {
-        if (item.todo === true) todos += 1; else skipped += 1;
-        line(pad + (item.todo === true ? '~ ' : '- ') + item.name);
+        var at0 = Date.now();
+        if (item.todo === true) { todos += 1; lineTodo(item, pad, at0); }
+        else { skipped += 1; lineSkipped(item, pad, at0); }
         return Promise.resolve();
       }
       var around = hooksAround(item, ancestors);
-      var context = { name: item.name, signal: undefined, diagnostic: function (text) { line(pad + '  ' + text); },
-        skip: function () { line(pad + '- ' + item.name); }, todo: function () { line(pad + '~ ' + item.name); } };
+      var context = newTestContext(item, pad);
       var at = Date.now();
       /* A test marked expectFailure is one its author says must not pass, so the verdict is
          inverted: a throw is the pass and a clean run is the failure. That is the whole meaning of
          the keyword, and it is decided here where the two outcomes already part. */
       var expectFail = item.expectFailure === true;
-      return callEach(around.before, context).then(function () {
-        return typeof item.fn === 'function' ? item.fn(context) : undefined;
-      }).then(function () {
+      var body = callEach(item.hooks.filter(function (h) { return h[0] === 'before'; }).map(function (h) { return h[1]; }), context)
+        .then(function () { return callEach(around.before, context); })
+        .then(function () { return typeof item.fn === 'function' ? item.fn(context) : undefined; });
+      /* A timeout is a cancellation, not a failure: node stops waiting when the clock passes it,
+         reports the test as cancelled and names the limit in the one string it throws. The body it
+         abandoned is left to finish on its own, which is why its own lines still come after. */
+      var limit = item.options !== undefined && typeof item.options.timeout === 'number'
+        ? item.options.timeout : undefined;
+      if (limit !== undefined) {
+        body = Promise.race([body, new Promise(function (resolve, reject) {
+          setTimeout(function () { reject('test timed out after ' + limit + 'ms'); }, limit);
+        })]);
+      }
+      var trail = function () {
         return callEach(around.after, context).then(function () {
+          return callEach(item.hooks.filter(function (h) { return h[0] === 'after'; }).map(function (h) { return h[1]; }), context);
+        }).then(function () { return callEach(tailAfter === undefined ? [] : tailAfter, context); });
+      };
+      return body.then(function () {
+        return trail().then(function () {
+          var mark = CTX.get(context).mark;
+          if (mark === 'skip') { skipped += 1; lineSkipped(item, pad, at); return undefined; }
+          if (mark === 'todo') { todos += 1; lineTodo(item, pad, at); return undefined; }
           if (expectFail) {
             failed += 1;
-            failures.push({ name: item.name, error: new Error('Expected the test to fail, but it passed') });
-            line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')');
+            failures.push({ name: item.name, error: 'test was expected to fail but passed', mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
+            lineNo(item, pad, at);
             return undefined;
           }
           passed += 1;
-          line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ')');
+          lineOk(item, pad, at);
         });
       }, function (err) {
-        return callEach(around.after, context).then(function () {
+        return trail().then(function () {
+          if (typeof err === 'string' && limit !== undefined && String(err).indexOf('timed out') >= 0) {
+            cancelled += 1;
+            failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
+            lineNo(item, pad, at);
+            return undefined;
+          }
           if (expectFail) {
             passed += 1;
-            line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ')');
+            lineOk(item, pad, at);
             return undefined;
           }
           failed += 1;
-          failures.push({ name: item.name, error: err });
-          line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')');
+          failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
+          lineNo(item, pad, at);
         }, function () {
           failed += 1;
-          failures.push({ name: item.name, error: err });
-          line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')');
+          failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
+          lineNo(item, pad, at);
         });
       });
     }
@@ -3002,6 +3114,8 @@ export const SRC = String.raw`
     function runSuite(suite, ancestors, depth) {
       var pad = new Array(depth + 1).join('  ');
       line(pad + '▶ ' + suite.name);
+      var at = Date.now();
+      var lost = failed + cancelled;
       var chain = callEach(suite.before, { name: suite.name });
       var inner = ancestors.concat([suite]);
       suite.items.forEach(function (item) {
@@ -3009,27 +3123,38 @@ export const SRC = String.raw`
           return item.kind === 'suite' ? runSuite(item, inner, depth + 1) : runTest(item, inner, depth + 1);
         });
       });
-      return chain.then(function () { return callEach(suite.after, { name: suite.name }); });
+      return chain.then(function () {
+        return callEach(suite.after, { name: suite.name });
+      }).then(function () {
+        /* A suite is reported the way a test is once its children have gone: a mark of its own,
+           failing if any of them did, which is the line a nested suite's name stands on. */
+        if (failed + cancelled > lost) lineNo(suite, pad, at);
+        else line(pad + '✔ ' + suite.name + ' (' + durationOf(at) + ')');
+      });
     }
 
     function runAll() {
-      var chain = Promise.resolve();
+      var chain = callEach(root.before, { name: undefined });
       var items = root.items.filter(function (item) { return item.only === true; });
       var chosen = items.length > 0 ? items : root.items;
-      chosen.forEach(function (item) {
+      chosen.forEach(function (item, index) {
+        /* The module's own after runs once, behind everything it collected -- and ahead of the
+           mark of the last test, which is where node puts it. */
+        var tailAfter = index === chosen.length - 1 && item.kind === 'test' ? root.after : [];
         chain = chain.then(function () {
-          return item.kind === 'suite' ? runSuite(item, [], 0) : runTest(item, [], 0);
+          return item.kind === 'suite' ? runSuite(item, [], 0) : runTest(item, [], 0, tailAfter);
         });
       });
       return chain.then(report);
     }
 
     function report() {
-      line('ℹ tests ' + (passed + failed + skipped + todos));
+      /* A test that was cancelled still ran: node counts it among the tests it reports. */
+      line('ℹ tests ' + (passed + failed + skipped + todos + cancelled));
       line('ℹ suites ' + suiteCount);
       line('ℹ pass ' + passed);
       line('ℹ fail ' + failed);
-      line('ℹ cancelled 0');
+      line('ℹ cancelled ' + cancelled);
       line('ℹ skipped ' + skipped);
       line('ℹ todo ' + todos);
       line('ℹ duration_ms ' + (Date.now() - startedAt));
@@ -3039,9 +3164,17 @@ export const SRC = String.raw`
         line('');
         failures.forEach(function (one) {
           line(one.name);
-          line('✖ ' + one.name);
-          line('  ' + String(one.error && one.error.stack ? one.error.stack : one.error));
+          line('✖ ' + one.name + (one.mark === undefined ? '' : one.mark));
+          /* What failed is printed the way node prints it: an Error by its stack, and a value a
+             test threw that is not one -- the string a timeout is cancelled with -- quoted. */
+          line('  ' + (typeof one.error === 'string' ? "'" + one.error + "'"
+            : String(one.error && one.error.stack ? one.error.stack : one.error)));
         });
+      }
+      /* A run that failed or was cancelled is a run that failed: node's test runner ends the
+         process on 1 for it, and does so by writing the code the process exits with. */
+      if (failed + cancelled > 0 && typeof globalThis.process === 'object' && globalThis.process !== null) {
+        try { globalThis.process.exitCode = 1; } catch (e) { /* a code that will not take stays */ }
       }
       return undefined;
     }
@@ -3061,25 +3194,33 @@ export const SRC = String.raw`
     test.after = function (fn) { return addHook('after', fn); };
     test.beforeEach = function (fn) { return addHook('beforeEach', fn); };
     test.afterEach = function (fn) { return addHook('afterEach', fn); };
-    /* mock.fn is a function that remembers how it was called: the arguments of every call and what
-       it answered, which is what an assertion about a double reads. */
-    test.mock = {
-      fn: function (impl) {
+    /* The mock surface, built by a factory because a context needs one of its own: node's is an
+       object with no own names at all -- fn is there and is not enumerable, so a walk of the
+       surface answers nothing -- and a call it remembers is the arguments it was given, what it
+       answered, and the stack the call was made from, in that order. fn is on the prototype the
+       surface stands on, not on the surface itself, which is why a walk of it answers nothing. */
+    var MockSurface = {};
+    function testMock() {
+      function fn(impl) {
         var calls = [];
         var spy = function () {
           var args = Array.prototype.slice.call(arguments);
           var answer = typeof impl === 'function' ? impl.apply(this, args) : undefined;
-          calls.push({ arguments: args, returnValue: answer });
+          calls.push({ arguments: args, result: answer, stack: new Error() });
           return answer;
         };
         spy.mock = { calls: calls, callCount: function () { return calls.length; } };
         return spy;
       }
-    };
+      Object.defineProperty(MockSurface, 'fn', { value: fn, writable: true, enumerable: true, configurable: true });
+      return Object.create(MockSurface);
+    }
+    test.mock = testMock();
     test.run = function () {
       if (draining === null) return Promise.resolve();
       return draining;
     };
+    Object.defineProperty(test.run, 'name', { value: 'run', configurable: true });
     /*
      * The four keywords node:test exports beside the test itself -- only, skip, todo and
      * expectFailure -- each register a test carrying the flag its name is, and change nothing else
@@ -3111,12 +3252,13 @@ export const SRC = String.raw`
      * does there after a register.
      */
     var ASSERTIONS = Object.create(null);
-    test.assert = Object.create(null);
+    test.assert = Object.create(requireBuiltin('assert'));
     test.assert.register = function (name, fn) {
       if (typeof name !== 'string') throw argError('name', 'of type string', name);
       if (typeof fn !== 'function') throw argError('fn', 'of type function', fn);
       ASSERTIONS[name] = fn;
     };
+    Object.defineProperty(test.assert.register, 'name', { value: 'register', configurable: true });
     /*
      * Snapshot testing's two settings: the serializers a snapshot is written with, and the function
      * that names the file it is written to. Both are kept, and neither has a reader yet -- a
@@ -3138,6 +3280,9 @@ export const SRC = String.raw`
         SNAPSHOT_RESOLVER = fn;
       }
     };
+    /* Node's snapshot surface stands on no prototype at all, so a walk of its own names is the
+       whole of it and Object.getPrototypeOf answers null. */
+    try { Object.setPrototypeOf(test.snapshot, null); } catch (e) { /* a prototype that will not move stays */ }
     return test;
   };
 

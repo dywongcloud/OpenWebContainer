@@ -4948,23 +4948,11 @@ BF.module = function () {
     }
   };
   /* The file a request resolves to under one of the given directories, or false: node's own
-     extension search, which the host resolver does, asked directory by directory. */
+     extension search, which the host resolver does, asked directory by directory. The cache is
+     read and written in findPathCached, which is where node reads and writes it -- inside its
+     own _findPath, keyed by the request and by the paths it was looked for in. */
   Module._findPath = function _findPath(request, paths, isMain) {
-    /* Node validates the request before it looks anywhere, so a caller handing it a number sees
-       ERR_INVALID_ARG_TYPE rather than the false a request that is merely unresolvable gets. */
-    if (typeof request !== 'string') {
-      var err = new TypeError('The "path" argument must be of type string. Received ' + receivedTypeOf(request));
-      err.code = 'ERR_INVALID_ARG_TYPE';
-      throw err;
-    }
-    var list = paths;
-    if (request.charAt(0) === '/') list = [''];
-    else if (!list || list.length === 0) return false;
-    for (var i = 0; i < list.length; i++) {
-      var found = host.resolve(request, list[i] === '' ? '/' : list[i], 'require');
-      if (found) return found;
-    }
-    return false;
+    return findPathCached(request, paths);
   };
   /* The package.json of a directory, as node's reader gives it: the few fields it reads out of the
      file -- name, main, type, exports and imports, in that order -- followed by exists and
@@ -5677,7 +5665,9 @@ TextDecoderImpl.prototype.decode = function (input, options) {
     options !== undefined && options !== null && Boolean(options.stream), state.rest.length > 0);
 };
 /* The two arguments are optional in Node's own signature, so the arity a program reads off the
-   method it was handed stays 0 here too. */
+   method it was handed stays 0 here too -- and its name stays the name of the property it was
+   pointed at, which a function written as an assignment onto a prototype does not take. */
 Object.defineProperty(TextDecoderImpl.prototype.decode, 'length', { value: 0, configurable: true });
+Object.defineProperty(TextDecoderImpl.prototype.decode, 'name', { value: 'decode', configurable: true });
 
 `;

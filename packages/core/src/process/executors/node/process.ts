@@ -3292,8 +3292,12 @@ export class NodeProcess extends Process {
             /* The url Node puts on a module it could not find: the file URL of the absolute path the
                specifier named. A bare specifier has no path behind it and so no url -- `Cannot find
                package 'lodash'` carries a code and a message and nothing else. */
-            const url = code === 'ERR_MODULE_NOT_FOUND' && scheme === undefined && directory === undefined
-                && target.startsWith('/') ? toFileUrl(target) : undefined;
+            /* A directory the specifier names is as findable as a file that is not there: the url
+               Node puts on the error is the file URL of the directory, which is what a caller that
+               reads err.url off a refused directory import gets. */
+            const url = scheme === undefined && directory === undefined && code === 'ERR_MODULE_NOT_FOUND'
+                && target.startsWith('/') ? toFileUrl(target)
+                : directory !== undefined ? toFileUrl(directory) : undefined;
             const message = directory !== undefined
                 ? `Directory import '${directory}' is not supported resolving ES modules imported from ${baseName}`
                 : scheme === undefined
