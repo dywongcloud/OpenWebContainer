@@ -1706,9 +1706,12 @@ BF['dgram'] = function () {
     _onHub(name, payload, bytes) {
       if (name !== 'message' || this._dead || !this._bound) return;
       var datagram = bytes === undefined ? Buffer.from(payload.data, 'base64') : Buffer.from(bytes);
+      /* The family is the one the peer's address is written in, not this socket's own: a udp6 socket
+         on the wildcard sees an IPv4 peer as '::ffff:127.0.0.1'/IPv6, and one bound to the mapped
+         loopback sees the same peer as '127.0.0.1'/IPv4, which is what host Node reports there. */
       this.emit('message', datagram, {
         address: payload.address,
-        family: this._family,
+        family: netFamilyName(payload.address),
         port: payload.port,
         size: datagram.length
       });
@@ -1805,7 +1808,15 @@ BF['dgram'] = function () {
           try {
             callCapBytes('net.udpSend', { socketId: self._hubId, address: resolved, port: port }, datagram);
           } catch (cause) {
-            // The socket is gone; UDP drops silently.
+            /* A datagram the hub refuses -- an IPv4 destination a socket bound to one address of its
+               own has no route to -- is the send's own answer, as uv_udp_send gives it. Anything
+               else raised here is a socket that is gone, and UDP drops those without a word. */
+            if (cause && cause.code === 'EADDRNOTAVAIL') {
+              var refused = netSystemError(cause, 'send', resolved, port);
+              if (typeof callback === 'function') netDefer(function () { callback(refused); });
+              else self.emit('error', refused);
+              return;
+            }
           }
         }
         if (typeof callback === 'function') netDefer(function () { callback(null, datagram.length); });

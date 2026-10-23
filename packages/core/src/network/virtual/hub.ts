@@ -183,7 +183,7 @@ export class VirtualNetwork {
            the caller named, before the fold: a bind on '::' is dual-stack and takes an IPv4 client,
            where one on '0.0.0.0' takes none. (net.listen passes no family; dgram's does.) */
         const family = request.family ?? hubFamilyOf(request.address ?? '');
-        if (!this.isLocal(address)) {
+        if (!this.isLocal(address) && !(protocol === 'udp' && mappedLoopback(address) !== null)) {
             throw new VirtualNetworkError('EADDRNOTAVAIL', `address not available ${displayAddress(address)}`);
         }
         const port = request.port || this.allocatePort(protocol, family, address);
@@ -440,12 +440,27 @@ export class VirtualNetwork {
     sendUdp(options: { socketId: number; address: string; port: number; data: Uint8Array }): boolean {
         const socket = this.udpSockets.get(options.socketId);
         if (!socket) return false;
-        const destination = this.hubDestination(options.address);
+        /* A datagram addressed to the IPv4-mapped loopback ('::ffff:127.0.0.1') is an IPv4 datagram
+           whatever family of socket sent it: the kernel routes it to the address it embeds and picks
+           a source in that family, so that is the peer the hub looks for and the address the sender
+           is named by at the other end -- where the receiver's own family decides how it is written,
+           a udp6 socket on '::' seeing '::ffff:127.0.0.1' and an IPv4 one seeing '127.0.0.1'. */
+        const mapped = v4MappedOf(options.address);
+        /* A udp6 socket bound to one address of its own has no route to an IPv4 destination: the
+           kernel refuses the send rather than picking a source the socket does not have, which is
+           the EADDRNOTAVAIL Node reports from uv_udp_send. */
+        if (mapped !== null && socket.family === 'IPv6' && socket.address !== '' && mappedLoopback(socket.address) === null) {
+            throw new VirtualNetworkError('EADDRNOTAVAIL', `send EADDRNOTAVAIL ${options.address}:${options.port}`);
+        }
+        const destination = this.hubDestination(mapped ?? options.address);
         if (!this.isLocal(destination)) return false;
-        const receiver = this.findEndpoint('udp', socket.family, destination, options.port);
+        const family: VirtualFamily = mapped === null ? hubFamilyOf(destination) : 'IPv4';
+        const receiver = this.findEndpoint('udp', family, destination, options.port);
         if (!receiver) return false;
+        const source = mapped !== null ? '::ffff:' + mapped
+            : (socket.family === 'IPv6' ? '::1' : '127.0.0.1');
         this.schedule(receiver.ownerPid, receiver.targetId, 'message', {
-            address: socket.family === 'IPv6' ? '::1' : '127.0.0.1',
+            address: udpPeerAddress(receiver, source),
             port: socket.port,
         }, undefined, undefined, options.data);
         return true;
@@ -584,11 +599,13 @@ export class VirtualNetwork {
             /* A unix binding is not an internet endpoint: it is reached by path, never by port. */
             if (candidate.path !== undefined) continue;
             if (protocol === 'udp') {
-                if (candidate.family !== family) continue;
+                if (candidate.family !== family && !udpTakes(candidate, family)) continue;
             } else if (candidate.address === '' && !wildcardTakes(candidate, family)) {
                 continue;
             }
-            if (candidate.address === address) return candidate;
+            /* A udp6 socket bound to the mapped loopback is reached by the address it embeds, as
+               well as by its own IPv6 spelling. */
+            if (candidate.address === address || mappedLoopback(candidate.address) === address) return candidate;
             if (candidate.address === '') wildcard = candidate;
         }
         return wildcard;
@@ -673,6 +690,42 @@ function v4MappedOf(address: string | undefined): string | null {
     const high = parseInt(groups[1], 16);
     const low = parseInt(groups[2], 16);
     return `${(high >> 8) & 255}.${high & 255}.${(low >> 8) & 255}.${low & 255}`;
+}
+
+/**
+ * The IPv4 address a local IPv4-mapped IPv6 literal names ('::ffff:127.0.0.1' -> '127.0.0.1'), or
+ * null for any other text -- a mapped literal holding an address that is not the loopback is not
+ * one this container can bind or reach.
+ */
+function mappedLoopback(address: string | undefined): string | null {
+    const mapped = v4MappedOf(address);
+    if (mapped === null) return null;
+    return mapped === '127.0.0.1' || mapped.startsWith('127.') ? mapped : null;
+}
+
+/**
+ * True when a UDP socket bound in one family receives a datagram of the other: a udp6 socket on the
+ * wildcard is dual-stack and takes an IPv4 datagram, and one bound to the v4-mapped loopback is an
+ * IPv4 socket under its IPv6 spelling, so it takes one too. The converse is not true -- an IPv4
+ * socket has no IPv6 address to answer on, and a udp6 socket bound to a specific address ('::1')
+ * has no route to an IPv4 destination.
+ */
+function udpTakes(candidate: Listener, family: VirtualFamily): boolean {
+    return family === 'IPv4' && candidate.family === 'IPv6'
+        && (candidate.address === '' || mappedLoopback(candidate.address) !== null);
+}
+
+/**
+ * The address a receiver names for the socket that sent a datagram, written in the family the
+ * receiver is bound in: a udp6 socket on the wildcard sees an IPv4 peer as '::ffff:127.0.0.1',
+ * where an IPv4 socket -- or a udp6 one bound to the mapped loopback -- sees it as '127.0.0.1'.
+ * That is the address and the family host Node reports in the `rinfo` of a datagram it receives.
+ */
+function udpPeerAddress(receiver: Listener, source: string): string {
+    const asIPv4 = receiver.family === 'IPv4' || mappedLoopback(receiver.address) !== null;
+    const embedded = v4MappedOf(source);
+    if (asIPv4) return embedded ?? source;
+    return embedded !== null || source.includes(':') ? source : '::ffff:' + source;
 }
 
 /**
