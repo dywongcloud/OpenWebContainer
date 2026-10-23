@@ -60,6 +60,10 @@ function nullPrototypeTagOf(obj) {
    an ordinary object of the same shape would print nothing at all. */
 var INSPECT_CUSTOM = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
 
+/* The 'fmt' of the 'inspectValue' walk now printing, so a value read out of a promise can be
+   printed at the depth the walk is at. One walk at a time, so one is all there is to remember. */
+var INSPECT_FMT = null;
+
 function inspectValue(value, opts) {
   var maxDepth = opts && typeof opts.depth === 'number' ? opts.depth : 2;
   var stack = [];
@@ -77,10 +81,16 @@ function inspectValue(value, opts) {
       return '[Function: ' + (name || '(anonymous)') + ']';
     }
     if (stack.indexOf(v) >= 0) return '[Circular *1]';
-    if (v instanceof Error) return formatErrorStack(v);
-    if (v instanceof Date) return isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
-    if (v instanceof RegExp) return String(v);
-    if (typeof Promise !== 'undefined' && v instanceof Promise) return 'Promise { <pending> }';
+    /* The tag and not 'instanceof': a value out of a 'vm' context is of another realm, so
+       'instanceof' answers false for it on host Node 24.15 too, and what 'util.inspect' reads
+       there is the internal slot the tag is the face of. Asking 'instanceof' here made an error
+       out of a context print 'Error {}' where the host prints 'Error: boom', and a promise
+       'Promise {}' where the host prints 'Promise { 1 }'. */
+    var vTag = utilTag(v);
+    if (vTag === 'Error') return formatErrorStack(v);
+    if (vTag === 'Date') return isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
+    if (vTag === 'RegExp') return String(v);
+    if (vTag === 'Promise') return promiseInspectOf(v, depth, indent);
 
     /* A value that writes its own output wins: Node asks the custom function before it looks at
        the object's own keys, which is the whole of what a Response or a Headers prints. */
@@ -164,6 +174,7 @@ function inspectValue(value, opts) {
     return prefix + open + '\n' + entries.map(function (entry) { return pad + entry; }).join(',\n') + '\n' + ' '.repeat(indent) + close;
   }
 
+  INSPECT_FMT = fmt;
   return fmt(value, 0, 0);
 }
 
@@ -319,6 +330,93 @@ globalThis.__owcIsProxy = function (value) {
   return value !== null && (typeof value === 'object' || typeof value === 'function') && PROXIES_MADE.has(value);
 };
 
+/*
+ * What a promise settled with, which is the one thing about one no probe of this engine answers:
+ * 'Object.getOwnPropertyNames(promise)' is '[]', and the state is a slot no reflection reaches,
+ * so 'util.inspect' had no way to print 'Promise { 1 }' for a settled promise and answered
+ * 'Promise { <pending> }' for every one -- where host Node 24.15 prints the value it settled with.
+ * What it reads instead is a record of the promises this realm has seen settle: every promise
+ * built through 'Promise' goes through one subclass, whose executor's 'resolve' and 'reject' are
+ * wrapped so that the moment the promise settles the cell beside it holds how and with what.
+ * The subclass is what 'globalThis.Promise' becomes, and it is the same shape the second realm of
+ * a 'vm' context is given, so a promise a context makes is a recorded one as well.
+ *
+ * An 'async' function is the one gap and it is the engine's: its promise is built from the
+ * intrinsic and never from the global binding, so no wrapper of 'Promise' sees it. Measured out
+ * of the container with bare QuickJS 0.32, replacing 'globalThis.Promise' with a subclass leaves
+ * '(async function () {})()' an instance of the native constructor and not of the subclass. Such a
+ * promise is printed as pending, which is the answer for a promise that has not been seen settle.
+ */
+var NATIVE_PROMISE = globalThis.Promise;
+var PROMISE_CELLS = new WeakMap();
+class TrackedPromise extends NATIVE_PROMISE {
+  constructor(executor) {
+    var cell = { state: 0, value: undefined };
+    if (typeof executor !== 'function') {
+      /* 'new Promise()' with no resolver: the synchronous TypeError node raises, and not a
+         rejection. The engine's own constructor throws one too -- 'not a function' -- but the
+         rejection tracker's wrapper is under this one and turns the throw into a rejection, so
+         it is raised here, where nothing is between it and the caller. */
+      throw new TypeError('Promise resolver ' + String(executor) + ' is not a function');
+    }
+    super(function (resolve, reject) {
+      var took = function (how) {
+        return function (value) {
+          if (cell.state === 0) { cell.state = how; cell.value = value; }
+          return (how === 1 ? resolve : reject)(value);
+        };
+      };
+      var onResolve = took(1);
+      var onReject = took(2);
+      try {
+        executor(onResolve, onReject);
+      } catch (err) {
+        onReject(err);
+      }
+    });
+    PROMISE_CELLS.set(this, cell);
+  }
+}
+/* A promise of a context, and one of this realm, both answer to the name 'Promise': host Node 24.15
+   reads 'p.constructor.name' as 'Promise' for either, whatever class carries the record. */
+Object.defineProperty(TrackedPromise, 'name', { value: 'Promise', configurable: true });
+/* 'x instanceof Promise' stays true for a promise this wrapper never built -- an 'async' function's,
+   which is of the native constructor -- exactly as 'instanceof' reads on the host. */
+Object.defineProperty(TrackedPromise, Symbol.hasInstance, {
+  value: function (x) { return x instanceof NATIVE_PROMISE; }, configurable: true
+});
+/* A promise derived from one -- 'p.then(...)', 'Promise.all([...])' -- is built through this
+   constructor too, so it is a recorded one as the promise it came from was. */
+Object.defineProperty(NATIVE_PROMISE, Symbol.species, {
+  get: function () { return TrackedPromise; }, configurable: true
+});
+Object.defineProperty(globalThis, 'Promise', { value: TrackedPromise, writable: true, configurable: true });
+
+/* The same record, written from the other side: the tracker of a 'vm' context's realm builds a
+   cell of its own for every promise it sees, and hands it here so that a promise out of a context
+   is in the record its own promises are in. It is the promise that is the key and not the cell,
+   because the cell is what the promise is looked up by. */
+globalThis.__owcNotePromise = function (promise, cell) {
+  if (promise !== null && (typeof promise === 'object' || typeof promise === 'function')) PROMISE_CELLS.set(promise, cell);
+};
+
+/** What 'util.inspect' writes for a promise: the value it settled with, or why it is still open. */
+function promiseInspectOf(v, depth, indent) {
+  var cell = PROMISE_CELLS.get(v);
+  if (cell === undefined || cell.state === 0) return 'Promise { <pending> }';
+  if (cell.state === 2) return 'Promise { <rejected> ' + fmtPromiseValue(cell.value, depth, indent) + ' }';
+  return 'Promise { ' + fmtPromiseValue(cell.value, depth, indent) + ' }';
+}
+
+/* The value inside a promise, printed at the depth the promise itself is at: Node gives the
+   settled value the one remaining level and no more, so 'Promise.resolve({a:{b:1}})' at depth 1
+   prints 'Promise { { a: [Object] } }'. 'INSPECT_FMT' is the 'fmt' of the walk now printing, which
+   is the only thing that can put a value at a depth. */
+function fmtPromiseValue(value, depth, indent) {
+  if (INSPECT_FMT === null) return typeof value === 'string' ? quoteStringLiteral(value) : String(value);
+  return INSPECT_FMT(value, depth, indent);
+}
+
 /* the element type name of a typed array (Uint8Array and the rest), or undefined for any other value */
 function utilTypedName(value) {  if (value === null || typeof value !== 'object') return undefined;
   if (UTIL_TYPED_TAG !== null) return UTIL_TYPED_TAG.call(value);
@@ -368,7 +466,10 @@ function utilTypes() {
     isModuleNamespaceObject: function (v) { return utilTag(v) === 'Module'; },
     isNativeError: function (v) { return utilTag(v) === 'Error'; },
     isNumberObject: function (v) { return utilBrandCheck(Number.prototype.valueOf, v); },
-    isPromise: function (v) { return typeof Promise === 'function' && v instanceof Promise; },
+    /* The tag and not 'instanceof': a promise out of a 'vm' context is of another realm, so
+       'instanceof Promise' is false for it on host Node 24.15 as well, and 'util.types.isPromise'
+       still answers true there -- it reads the internal slot and not the prototype. */
+    isPromise: function (v) { return utilTag(v) === 'Promise'; },
     isProxy: function (v) { return globalThis.__owcIsProxy(v) === true; },
     isRegExp: function (v) { return utilTag(v) === 'RegExp'; },
     isSet: function (v) { return utilBrandCheck(Set.prototype.has, v); },

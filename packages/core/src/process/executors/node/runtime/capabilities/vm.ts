@@ -23,6 +23,8 @@ interface VmRealm {
     ctx: QuickJSContext;
     /** Hands a cell the realm's tracker built to `api.noteRejection`, once per realm. */
     noteFn?: QuickJSHandle;
+    /** Hands the cell of a promise this realm built to the guest's record of what promises settled with. */
+    recordFn?: QuickJSHandle;
     /** Rebuilds the value a promise settles with, once per realm: see {@link promiseOf}. */
     rehomeFn?: QuickJSHandle;
     /** The standard globals of the guest realm beside their namesakes in this realm, once. */
@@ -200,18 +202,32 @@ const REALM_ENGINE_ONLY = ['InternalError'];
  * to be reported. A handler attached later marks the cell handled, so only a rejection nothing
  * handled is reported.
  */
-const REALM_REJECTION_SRC = '(function (note) {' +
+const REALM_REJECTION_SRC = '(function (note, record) {' +
     'var Native = Promise;' +
     'var CELLS = new WeakMap();' +
     'class Tracked extends Native {' +
     'constructor(executor) {' +
-    'var cell = { reason: undefined, rejected: false, handled: false, promise: null, domain: null };' +
+    'var cell = { reason: undefined, rejected: false, handled: false, promise: null, domain: null,' +
+    ' state: 0, value: undefined };' +
     'super(function (resolve, reject) {' +
-    'var wrapped = function (reason) { cell.rejected = true; cell.reason = reason; note(cell); reject(reason); };' +
-    'try { executor(resolve, wrapped); } catch (err) { wrapped(err); }' +
+    /* What a promise settles with is a slot no probe of this engine reaches, so `util.inspect` had
+       nothing to read and printed `Promise { <pending> }` for a settled promise out of a context.
+       The cell beside it keeps how it settled and with what, and the guest's record is handed both,
+       which is the same record its own promises are in -- without the promise ever being an
+       instance of the guest's constructor, which is what `instanceof Promise` asks and answers
+       false for, as on the host. */
+    'var onResolve = function (value) {' +
+    'if (cell.state === 0) { cell.state = 1; cell.value = value; }' +
+    'resolve(value); };' +
+    'var wrapped = function (reason) {' +
+    'cell.rejected = true; cell.reason = reason;' +
+    'if (cell.state === 0) { cell.state = 2; cell.value = reason; }' +
+    'note(cell); reject(reason); };' +
+    'try { executor(onResolve, wrapped); } catch (err) { wrapped(err); }' +
     '});' +
     'CELLS.set(this, cell);' +
     'cell.promise = this;' +
+    'if (typeof record === "function") { try { record(this, cell); } catch (x) { } }' +
     '}' +
     '}' +
     'Object.defineProperty(Native, Symbol.species, { get: function () { return Tracked; }, configurable: true });' +
@@ -229,6 +245,28 @@ const REALM_REJECTION_SRC = '(function (note) {' +
     'return nativeThen.call(this, onFulfilled, onRejected);' +
     '};' +
     '})';
+
+/**
+ * The standard globals a second realm is given the guest realm's own object for, outright, rather
+ * than its own namesake with the guest's statics copied onto it.
+ *
+ * These two are the ones whose *identity* is the thing: both keep a record in the guest realm of
+ * what they have made -- `Proxy` of every proxy, `Promise` of what every promise settled with --
+ * and that record is the only answer this engine has to `util.types.isProxy` and to the value a
+ * promise settled with, neither of which any probe of any realm can name. Handing the realm its
+ * own `Proxy` instead left every proxy a context made unrecorded, so `util.types.isProxy` read
+ * false where host Node 24.15 reads true.
+ *
+ * `Promise` is the exception that proves the rule and is not taken: a promise of the guest's own
+ * constructor is an instance of it, so `runInNewContext('Promise.resolve(1)') instanceof Promise`
+ * answered true the moment the realm was given that constructor, where host Node 24.15 answers
+ * false. What the realm gets instead is its own `Promise` wrapped by its own tracker, which hands
+ * what it settles with to the guest's record without ever being an instance of the guest's.
+ */
+const REALM_WHOLE = ['Proxy'];
+
+/** Dotted paths a second realm is *without* because host Node 24.15 is: see {@link bridgeGlobals}. */
+const REALM_GONE_STATICS = ['Math.sumPrecise'];
 
 /** `Array.isArray`, `Object.prototype.toString`, `Object.getOwnPropertyNames` and `Object.prototype`, once. */
 interface VmProbes {
@@ -380,7 +418,7 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
 
 /** Frees one second realm and every handle of the binding that was built inside it. */
 function disposeRealm(realm: VmRealm): void {
-    for (const handle of [realm.noteFn, realm.rehomeFn, realm.namesFn,
+    for (const handle of [realm.noteFn, realm.recordFn, realm.rehomeFn, realm.namesFn,
         ...(realm.builtins === undefined ? [] : [...realm.builtins.from, ...realm.builtins.to])]) {
         if (handle === undefined) continue;
         try {
@@ -390,6 +428,7 @@ function disposeRealm(realm: VmRealm): void {
         }
     }
     realm.noteFn = undefined;
+    realm.recordFn = undefined;
     realm.rehomeFn = undefined;
     realm.namesFn = undefined;
     realm.builtins = undefined;
@@ -485,11 +524,29 @@ function bridgeGlobals(host: VmHost, realm: VmRealm): void {
             '(function (src, both) {' +
             'var names = both[0];' +
             'var gone = both[1];' +
+            'var whole = both[2];' +
+            'var off = both[3];' +
             'for (var j = 0; j < gone.length; j++) {' +
             'try { delete globalThis[gone[j]]; } catch (x) { }' +
             '}' +
+            /* A static the engine carries and host Node 24.15 does not: `Math.sumPrecise`, which
+               QuickJS has and V8 does not. The realm is given the guest's statics but not the
+               guest's *absence* of one, so a name the guest does not carry has to come off here
+               too, or `typeof Math.sumPrecise` answers `function` inside a context and `undefined`
+               outside it. */
+            'for (var g = 0; g < off.length; g++) {' +
+            'var path = off[g].split(".");' +
+            'var at = globalThis;' +
+            'for (var p = 0; p < path.length - 1 && at !== undefined && at !== null; p++) at = at[path[p]];' +
+            'if (at !== undefined && at !== null) { try { delete at[path[path.length - 1]]; } catch (x) { } }' +
+            '}' +
+            'for (var w = 0; w < whole.length; w++) {' +
+            'if (src[whole[w]] === undefined) continue;' +
+            'try { Object.defineProperty(globalThis, whole[w], { value: src[whole[w]], writable: true, configurable: true }); } catch (x) { }' +
+            '}' +
             'for (var i = 0; i < names.length; i++) {' +
             'var n = names[i];' +
+            'if (whole.indexOf(n) >= 0) continue;' +
             'var s = src[n];' +
             'if (s === undefined) continue;' +
             'if (!Object.prototype.hasOwnProperty.call(globalThis, n)) {' +
@@ -515,7 +572,7 @@ function bridgeGlobals(host: VmHost, realm: VmRealm): void {
         }
         const bridge = realm.ctx.unwrapResult(built);
         const names = realm.ctx.unwrapResult(
-            realm.ctx.evalCode(JSON.stringify([REALM_ES_NAMES.concat(REALM_ENGINE_ONLY), REALM_ENGINE_ONLY]))
+            realm.ctx.evalCode(JSON.stringify([REALM_ES_NAMES.concat(REALM_ENGINE_ONLY), REALM_ENGINE_ONLY, REALM_WHOLE, REALM_GONE_STATICS]))
         );
         const result = realm.ctx.callFunction(bridge, realm.ctx.undefined, [context.global, names]);
         names.dispose();
@@ -669,7 +726,20 @@ function installRejections(host: VmHost, realm: VmRealm): void {
             return host.context.undefined;
         });
         realm.noteFn = note;
-        const result = ctx.callFunction(installer, ctx.undefined, [note]);
+        /* The record the guest keeps of what a promise settled with, handed to the realm's tracker:
+           a cell of this realm's, keyed in the guest's WeakMap by the promise it belongs to. */
+        let record: QuickJSHandle | undefined;
+        try {
+            const fn = host.context.getProp(host.context.global, '__owcNotePromise');
+            if (host.context.typeof(fn) === 'function') record = fn;
+            else fn.dispose();
+        } catch {
+            record = undefined;
+        }
+        realm.recordFn = record;
+        const args: QuickJSHandle[] = [note];
+        if (record !== undefined) args.push(record);
+        const result = ctx.callFunction(installer, ctx.undefined, args);
         installer.dispose();
         if (result.error) result.error.dispose();
         else result.value.dispose();
@@ -1533,6 +1603,24 @@ function errorOf(host: VmHost, realm: VmRealm, name: string, ctor: string, messa
             `S.prototype.constructor = S;` +
             `try { Object.defineProperty(S, 'name', { value: k, configurable: true }); } catch (x) {}` +
             `e = S(m);` +
+            `}` +
+            /* The order an error's own names come back in: host Node 24.15 builds `stack` first --
+               `new Error('x')` is `['stack','message']` and an `AggregateError` is
+               `['stack','message','errors']` -- where this engine puts `message` on first and
+               appends `stack` after it, so an error out of a context listed its names the other
+               way round. The order is what `Object.getOwnPropertyNames` reads and nothing else,
+               so it is put right here by taking the whole of the error's own properties off and
+               putting them back in the host's order, descriptors and all. */
+            `var wanted = ['stack', 'message', 'errors'];` +
+            `var had = Object.getOwnPropertyNames(e);` +
+            `var order = [];` +
+            `for (var w = 0; w < wanted.length; w++) { if (had.indexOf(wanted[w]) >= 0) order.push(wanted[w]); }` +
+            `for (var h = 0; h < had.length; h++) { if (order.indexOf(had[h]) < 0) order.push(had[h]); }` +
+            `if (order.join(',') !== had.join(',')) {` +
+            `var kept = [];` +
+            `for (var q = 0; q < order.length; q++) kept.push(Object.getOwnPropertyDescriptor(e, order[q]));` +
+            `for (var d = 0; d < order.length; d++) { try { delete e[order[d]]; } catch (x) { } }` +
+            `for (var r = 0; r < order.length; r++) { if (kept[r] !== undefined) Object.defineProperty(e, order[r], kept[r]); }` +
             `}` +
             `return e; })()`
         );

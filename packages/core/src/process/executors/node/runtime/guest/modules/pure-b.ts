@@ -463,8 +463,38 @@ export const SRC = String.raw`
     vmFired = res.fired === true;
     api.vmOut = undefined;
     api.vmThrow = undefined;
-    if (res.ok) return out;
-    throw vmDress(thrown, code, file, offset === undefined ? 0 : offset, frames);
+    if (res.ok) return errorOwnNames(out);
+    throw errorOwnNames(vmDress(thrown, code, file, offset === undefined ? 0 : offset, frames));
+  }
+
+  /*
+   * The order of an error's own names, which is the whole of what Object.getOwnPropertyNames reads
+   * and nothing else. Host Node 24.15 builds 'stack' first -- 'stack','message' for a plain Error,
+   * 'stack','message','errors' for an AggregateError -- where this engine puts 'message' on first and
+   * appends 'stack' after it, and the error a context hands out is the one its own realm built, so it
+   * crossed with the names in the engine's order. They are taken off and put back in the host's,
+   * descriptors and all, which leaves the error the error it was: 'stack' is an accessor on both,
+   * and redefining it under the same getter and setter changes nothing but its place.
+   */
+  function errorOwnNames(err) {
+    if (!isObjectLike(err) || Object.prototype.toString.call(err) !== '[object Error]') return err;
+    var had;
+    try { had = Object.getOwnPropertyNames(err); } catch (e1) { return err; }
+    var wanted = ['stack', 'message', 'errors'];
+    var order = [];
+    var i;
+    for (i = 0; i < wanted.length; i++) { if (had.indexOf(wanted[i]) >= 0) order.push(wanted[i]); }
+    for (i = 0; i < had.length; i++) { if (order.indexOf(had[i]) < 0) order.push(had[i]); }
+    if (order.join(',') === had.join(',')) return err;
+    try {
+      var kept = [];
+      for (i = 0; i < order.length; i++) kept.push(Object.getOwnPropertyDescriptor(err, order[i]));
+      for (i = 0; i < order.length; i++) { try { delete err[order[i]]; } catch (x1) { } }
+      for (i = 0; i < order.length; i++) {
+        if (kept[i] !== undefined) Object.defineProperty(err, order[i], kept[i]);
+      }
+    } catch (e2) { /* an error that will not be reordered still crosses as itself */ }
+    return err;
   }
 
   /* The frames host Node 24.15 puts under the frame of a script a context ran: its own vm entry

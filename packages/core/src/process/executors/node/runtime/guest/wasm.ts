@@ -398,5 +398,12 @@ export const WASM_SRC = String.raw`
     configurable: true,
     enumerable: false
   });
+  /* The tag host Node 24.15 answers for the namespace: 'Object.prototype.toString.call(WebAssembly)'
+     reads '[object WebAssembly]' there and not '[object Object]', which is what a bare namespace
+     object reads as. Node carries it as a non-enumerable, non-writable own property of the
+     namespace, and so does this one. */
+  Object.defineProperty(globalThis.WebAssembly, Symbol.toStringTag, {
+    value: 'WebAssembly', writable: false, enumerable: false, configurable: true
+  });
 })();
 `;

@@ -3329,6 +3329,81 @@ function circularStructureText(value, replacer) {
 })();
 
 /*
+ * 'Array.fromAsync', which host Node 24.15 carries and this engine does not: measured out of the
+ * container, bare QuickJS 0.32 answers 'undefined' for it, so it is a name the guest has to build
+ * and not one the engine is withholding. It is built to the specification -- an async iterable, a
+ * sync iterable or an array-like, awaited item by item in order, with the mapping function awaited
+ * too and called with 'thisArg' -- and answers a promise, as node's does, which rejects with the
+ * reason the first item, or the first mapping, rejects with. A subclass that calls it gets an
+ * instance of itself, which is what 'Array.from' already gives one.
+ */
+(function installArrayFromAsync() {
+  if (typeof Array.fromAsync === 'function') return;
+  function fromAsync(items, mapFn, thisArg) {
+    var C = this;
+    var mapped = typeof mapFn === 'function' ? mapFn : null;
+    var out = [];
+    var at = 0;
+    function take(value) {
+      var i = at;
+      at += 1;
+      return Promise.resolve(mapped === null ? value : mapped.call(thisArg, value, i))
+        .then(function (given) { out.push(given); });
+    }
+    function made() {
+      if (typeof C === 'function' && C !== Array && typeof C.from === 'function') return C.from(out);
+      return out;
+    }
+    if (items !== null && typeof items === 'object') {
+      var async = items[Symbol.asyncIterator];
+      if (typeof async === 'function') {
+        var it = async.call(items);
+        var step = function () {
+          return Promise.resolve(it.next()).then(function (r) {
+            if (r.done) return made();
+            return take(r.value).then(step);
+          });
+        };
+        return Promise.resolve().then(step);
+      }
+      var sync = items[Symbol.iterator];
+      if (typeof sync === 'function') {
+        var si = sync.call(items);
+        var stepSync = function () {
+          var r = si.next();
+          if (r.done) return made();
+          return take(r.value).then(stepSync);
+        };
+        return Promise.resolve().then(stepSync);
+      }
+    }
+    var len = items === null || items === undefined ? 0 : Number(items.length);
+    if (!isFinite(len) || len < 0) len = 0;
+    var stepLike = function () {
+      if (at >= len) return made();
+      return take(items[at]).then(stepLike);
+    };
+    return Promise.resolve().then(stepLike);
+  }
+  Object.defineProperty(fromAsync, 'length', { value: 1, configurable: true });
+  Object.defineProperty(fromAsync, 'name', { value: 'fromAsync', configurable: true });
+  Object.defineProperty(Array, 'fromAsync', {
+    value: fromAsync, writable: true, enumerable: false, configurable: true
+  });
+})();
+
+/*
+ * 'Math.sumPrecise', which this engine carries and host Node 24.15 does not: measured against the
+ * host, 'typeof Math.sumPrecise' reads 'undefined' there and 'function' here, and a package that
+ * asks whether the name is there gets an answer the host would not give. Off it comes, then, so
+ * that the surface a guest sees is the host's and not the engine's.
+ */
+(function dropMathSumPrecise() {
+  if (typeof Math.sumPrecise === 'undefined') return;
+  try { delete Math.sumPrecise; } catch (x) { }
+})();
+
+/*
  * The rest of what a host's 'process' enumerates: the internals node's own loader, debugger and
  * profiler reach for, the hooks a package asks for to decide what it is running under, and the
  * three stdio streams, which node has there as ordinary properties and this container had as lazy
