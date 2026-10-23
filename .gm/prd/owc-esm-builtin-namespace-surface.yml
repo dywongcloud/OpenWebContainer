@@ -4,4 +4,19 @@ description: 'Re-measured 2026-10-23 by the judge for shard esm-surface (session
 owner: lanmower
 session_id: adv6-judge-esm-surface-3
 witness_plan: Differential Object.keys(await import('node:path'|'node:fs'|'node:os')) sorted, plus the presence of each named export, host Node 24.15 vs container; every line must match.
+
+
+Re-measured 2026-10-23 by the judge for shard esm (session adv7-judge-esm-11), container
+against host Node 24.15, one container boot per case in isolation at load 9.7-19.5. Still open
+and almost entirely outside this shard's files. `node:stream/consumers` no longer belongs to
+the row -- it resolves and every one of arrayBuffer/blob/buffer/bytes/json/text matches over a
+Readable, a PassThrough and a node:stream/web ReadableStream -- and `worker_threads.threadName`
+no longer diverges: it is a writable data property holding a string on both sides now, read ''
+and written 'mine' on both. What is left, container against host: node:assert/strict,
+node:sys, node:test, node:sqlite, node:sea and node:wasi are ERR_MODULE_NOT_FOUND here and 23,
+35, 17, 6, 6 and 2 keys there; key counts node:fs 102/105, node:util 22/35, node:assert 17/23,
+node:path 16/18, node:events 13/16, node:os 22/24, node:vm 10/11, node:repl 7/8,
+node:worker_threads 18/22, node:module 29/31. Every fix site is outside this shard --
+runtime/guest/buffer-fs.ts, runtime/guest/misc.ts, runtime/guest/path-events.ts and whatever
+registers the builtin name beside BF -- so the row is named and not edited.
 status: pending
