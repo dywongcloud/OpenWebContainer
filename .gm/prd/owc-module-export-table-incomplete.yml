@@ -1,7 +1,9 @@
 id: owc-module-export-table-incomplete
 session_id: adv5-judge-async-als-3
 owner: adv5-judge-async-als-3
-status: pending
+status: open
+re_witnessed_at: ef30294 (local main)
+route_to: a lane owning packages/core/src/process/executors/node/runtime/guest/loader.ts
 classification: GUEST
 measured_at: af9e76d (local main)
 title: The module export table is missing 18 names, and builtinModules is 40 against the host's 72
@@ -10,3 +12,43 @@ acceptance_criteria:
 - Object.getOwnPropertyNames(require("module")) matches host node 24.15's 39 names, or the ones still missing are named in the Readme with the reason each cannot exist here
 - require("module").builtinModules is the host's 72 names, slash names included, with no name the host does not have
 witness_plan: Run /tmp/owc-r4/adv5-als-3/b-module/main.js and /tmp/owc-r4/adv5-als-3/b2-mods/main.js under host node and in the container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core and diff the key list, the COUNT line and the LIST line.
+body: |-
+  STILL OPEN, re-witnessed by adv7-fix-module-misc-12 at local main HEAD ef30294. Host node v24.15.0
+  against the container, /tmp/owc-r4/mm12-fix/a-modtable/main.js on both sides (machine while
+  measuring: load 9.5, 251 MB free -- inside the range that has produced false failures, so the run
+  was cross-checked against the independent adv7 judge witness at
+  /tmp/owc-r4/judge-mm12/a-modtable; the two are byte-identical). No source was changed: every arm
+  still diverging has its site in guest/loader.ts, which is outside the module-misc grant
+  (misc.ts, modules/child.ts, modules/pure-b.ts, modules/undici.ts).
+
+  Closed since af9e76d, all of it in the misc.ts arm this row also names: builtinModules is the
+  host's 72 names in the host's order, frozen, slash names included and no `undici`, and
+  `Object.getOwnPropertyNames(require('module'))` differs only in the six names below
+  (31 here against the host's 37). Of the eighteen originally missing, runMain, SourceMap,
+  constants, findPackageJSON, findSourceMap, getSourceMapsSupport, setSourceMapsSupport, _debug,
+  _findPath, _readPackage, _resolveLookupPaths and _stat are all present and agree.
+
+  Still diverging, site packages/core/src/process/executors/node/runtime/guest/loader.ts for all
+  five -- the Module class and its constructor at loader.ts:230-243 and createRequireFor at
+  loader.ts:1175:
+   1. Module.prototype is 'constructor,require' here against the host's
+      '_compile,constructor,isPreloading,load,parent,require': no _compile, no load, no isPreloading
+      getter, and no parent accessor.
+   2. new Module('/app/zz.js', null).filename is '/app/zz.js' here against null on the host: the
+      constructor sets this.filename where Node leaves it null until load().
+   3. new Module('/app/zz.js', null).paths is ['$CWD/node_modules','/node_modules'] here against
+      undefined on the host: the constructor runs nodeModulePaths(this.path) where Node leaves
+      paths unset.
+   4. createRequire('/app/x.js').resolve.paths and require.resolve.paths are undefined here --
+      TypeError: not a function -- and are functions on the host.
+   5. require('module').prototype.require.resolve: both throw, but the message is 'not a function'
+      here against 'm.require.resolve is not a function' on the host, which is the engine's own
+      wording for a call of an undefined property.
+
+  Engine-limited, recorded in Readme.md and not fixable in guest code: register, registerHooks,
+  stripTypeScriptTypes, enableCompileCache, flushCompileCache and getCompileCacheDir. QuickJS 0.32's
+  runtime exposes no code-cache API and no type stripper -- measured with the pinned engine out of
+  the container, getOwnPropertyNames of the QuickJSRuntime prototype carries no cache entry, and
+  CompileCache/CodeCache/CachedData/WriteObject appear in no file of quickjs-emscripten, of
+  quickjs-emscripten-core or of the asyncify singlefile variant. This row's first acceptance
+  criterion is met for those six by that record.

@@ -1,8 +1,55 @@
 id: owc-repl-unterminated-input-silent
 session_id: adv4-judge-docs-gates-goal-9
 owner: adv4-judge-docs-gates-goal-9
-status: pending
+status: completed
+resolved_by: adv7-fix-module-misc-12
+resolved_at: ef30294 (local main, HEAD at verification)
+re_witnessed_at: ef30294 (local main)
 classification: GUEST
-measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
-subject: |-
-  A repl fed `1+1`, `var y = {`, `2+2` on a non-terminal PassThrough prints `> 2\n> | | ` here -- the unterminated input produces no error text at all -- where host Node 24.15 prints `> 2\n> | 2+2\n ^\n\nUncaught SyntaxError: Unexpected token '+'\n> `. A clean session is byte-identical: eight evals including a ReferenceError, a function defined across two evals and an `await` all agree, so the gap is the syntax error a multi-line input raises and not the repl's output loop.
+measured_at: 8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)
+subject: 'A repl fed `1+1`, `var y = {`, `2+2` on a non-terminal PassThrough prints `> 2\n> | | ` here -- the unterminated input produces no error text at all -- where host Node 24.15 prints `> 2\n> | 2+2\n ^\n\nUncaught SyntaxError: Unexpected token ''+''\n> `. A clean session is byte-identical: eight evals including a ReferenceError, a function defined across two evals and an `await` all agree, so the gap is the syntax error a multi-line input raises and not the repl''s output loop.'
+body: |-
+  VERIFIED CLOSED (adv7-fix-module-misc-12) at local main HEAD ef30294 -- no source change needed,
+  and this row was a reappearance. Host node v24.15.0 against the container,
+  /tmp/owc-r4/mm12-fix/f-repltla2/main.js run on both sides (host: the file under node; container:
+  /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core). Machine while measuring: load 13-16,
+  71-466 MB free, i.e. inside the range that has produced false failures here, so every line below
+  was cross-checked against the independent adv7 judge run at /tmp/owc-r4/judge-mm12/ and both agree
+  byte for byte.
+
+  The row's own symptom is gone. `1+1`, `var y = {`, `2+2` now prints
+  "> 2\n> | 2+2\n ^\n\nUncaught SyntaxError: expecting ':'\n> " here against the host's
+  "> 2\n> | 2+2\n ^\n\nUncaught SyntaxError: Unexpected token '+' \n> " -- the prompt, the echoed
+  line, the caret, the blank line and the `Uncaught` header all agree, and what is left is only the
+  wording of the syntax error itself: QuickJS says `expecting ':'` where V8 says
+  `Unexpected token '+'`. That is the engine's own message, not this repl's, and it is the same
+  wording gap the two cases below carry.
+
+  One other line of the same witness is not a divergence at all: `for await (const x of [1,2])
+  console.log(x)` throws `TypeError: stream.removeListener is not a function` on the host only,
+  because the probe hands repl.start a duck-typed `{ write }` object instead of a stream. Given a
+  real stream.Writable the host prints "1\n2\nundefined" -- exactly what the container prints
+  (measured: /tmp/owc-r4/mm12-fix/hp3.js). The container is not implicated.
+
+  Two residuals stay open and are recorded in Readme.md rather than changed here, both in
+  guest/modules/pure-b.ts and both the wrapper this repl builds and not the engine -- bare
+  QuickJS 0.32 with no container in the way refuses `if (1) { await 3 }` and `var a = await [1,2]`
+  outright:
+   1. A rejected top-level await prints no frame: `await Promise.reject(new TypeError("bad"))` is
+      "> Uncaught TypeError: bad\n> " here against the host's
+      "> Uncaught TypeError: bad\n    at REPL19:1:54\n> ". The number is a process-global count of
+      evaluations any repl in the process has made (measured: first eval in a fresh process is
+      REPL1, and a second repl in the same process continues the same count), and the column is
+      the throw site inside Node's own `(async () => { return { value: (...) } })()` wrapper --
+      32 characters of prefix before a bare await expression, 24 before a hoisted declaration --
+      which is not the wrapper this repl builds, so numbering it here would print a wrong column.
+   2. A line that opens with a brace is paren-wrapped by the host even when the wrapped form does
+      not compile: `{ await 3 }` is "({ await 3 })" with
+      `Cannot use 'await' as identifier inside an async function` on the host and the unwrapped
+      "{ await 3 }" with the engine's `expecting ';'` here, because the wrap here is tried only
+      when '(' + line + '\n)' compiles, where the host's test is whether the *unwrapped* line
+      parses with await allowed outside a function. Wrapping as the host does would fix the frame
+      but not the message, which is the engine's.
+  Same engine wording, recorded with them: `function f(){ return await 1 }` and
+  `var ar = () => { await 1 }` both answer `expecting ';'` here against the host's
+  `Unexpected token '1'`, with the frame and caret identical on both sides.
