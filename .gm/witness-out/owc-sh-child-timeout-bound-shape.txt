@@ -1,0 +1,47 @@
+# owc-sh-child-timeout-bound-shape -- judged by adv6-judge-child-exec-9 at local main 1e0c5e77
+# driver: /tmp/owc-judge-child-exec/drive.mts (streaming) out of packages/core; probes d3, d4, d5, h1
+# MACHINE: 11 CPUs, load 7.3-22.0 while measuring, free 0.06-8.9 GB. 3 runs of every shape.
+# --- D3: exec('sleep 5; echo LATE', { timeout: 400 }) then the same with sleep 2
+--- HOST stdout
+RES {"name":"D3-sleep5-run1","ms":407,"out":"","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep5-run2","ms":403,"out":"","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep5-run3","ms":404,"out":"","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep2-run1","ms":403,"out":"","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep2-run2","ms":404,"out":"","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep2-run3","ms":403,"out":"","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+--- CONTAINER stdout (streamed, framed)
+RES {"name":"D3-sleep5-run1","ms":5026,"out":"LATE\n","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep5-run2","ms":5008,"out":"LATE\n","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep5-run3","ms":5008,"out":"LATE\n","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep2-run1","ms":2007,"out":"LATE\n","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep2-run2","ms":2012,"out":"LATE\n","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+RES {"name":"D3-sleep2-run3","ms":2007,"out":"LATE\n","err":"","code":"ERR","sig":"SIGTERM","killed":true}
+# --- D4: spawn('sh', ['-c', 'echo A; sleep N; echo B'], { timeout: 400, killSignal: 'SIGKILL' })
+--- HOST stdout (N=1,2,3 x3)
+RES {"name":"D4-N1-run3/exit","ms":414,"out":"A\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D4-N1-run3/close","ms":1028,"out":"A\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D4-N3-run1/exit","ms":406,"out":"A\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D4-N3-run1/close","ms":3019,"out":"A\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+--- CONTAINER stdout (streamed, framed)
+RES {"name":"D4-N1-run3/exit","ms":1009,"out":"A\nB\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D4-N2-run1/exit","ms":2007,"out":"A\nB\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D4-N3-run1/exit","ms":3005,"out":"A\nB\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D4-N3-run3/exit","ms":3009,"out":"A\nB\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+# --- D5: is the timeout signal trappable?
+--- HOST stdout
+RES {"name":"D5-CTL-exit-trap/exit","ms":34,"out":"X\nTRAPPED-EXIT\n","err":"","code":0,"sig":null,"killed":false}
+RES {"name":"D5A-node-run1/exit","ms":5072,"out":"A\nBUSY-DONE\nTRAPPED\n","err":"","code":0,"sig":null,"killed":true}
+RES {"name":"D5B-sleep-run1/exit","ms":2010,"out":"A\nTRAPPED\nB\n","err":"","code":0,"sig":null,"killed":true}
+--- CONTAINER stdout (streamed, framed)
+RES {"name":"D5-CTL-exit-trap/exit","ms":11,"out":"X\nTRAPPED-EXIT\n","err":"","code":0,"sig":null,"killed":false}
+RES {"name":"D5A-node-run3/exit","ms":405,"out":"A\n","err":"","code":null,"sig":"SIGTERM","killed":true}
+RES {"name":"D5B-sleep-run1/exit","ms":2012,"out":"A\nB\n","err":"","code":null,"sig":"SIGTERM","killed":true}
+# the EXIT trap control matches; the TERM trap the timeout should deliver never runs.
+# --- engine limit, proved live
+# bare QuickJS 0.32 (quickjs-emscripten 0.32.0, no container, no bootstrap, no guest globals):
+GLOBALS {"os":"undefined","osSetTimeout":"none","setTimeout":"undefined","setInterval":"undefined"}
+BUSY    {"waitedMs":3000}   hostTimerArmedFor400msFiredAtMs=-1
+AFTER   hostTimerArmedFor400msFiredAtMs=3001
+# --- the same thing measured in the container: a 100 ms interval during sh -c 'sleep 3'
+RES HOST      {"waitedMs":3017,"ticks":29,"maxTickGapMs":102}
+RES CONTAINER {"waitedMs":3013,"ticks":1,"maxTickGapMs":3011}

@@ -1,0 +1,65 @@
+# owc-exec-abs-bin-sh-runs-nothing -- judged at a1b76150 + fix, reproduced twice
+# case j4: exec() shell route vs execFile(); case j7: spawn('/bin/sh') vs spawn('sh') vs execSync
+--- j4 HOST stdout
+exit5 at 18 {"e":5,"so":""}
+echo at 19 {"e":null,"so":"EXEC-ECHO-OK\n","se":""}
+node at 50 {"e":null,"so":"102\n","se":""}
+execFile at 55 {"e":null,"so":"204\n"}
+--- j4 CONTAINER stdout (framed)
+---- program output ----
+echo at 36 {"e":null,"so":"","se":""}
+node at 37 {"e":null,"so":"","se":""}
+exit5 at 37 {"e":null,"so":""}
+execFile at 427 {"e":null,"so":"204\n"}
+---- program stderr ----
+[owc exit 0]
+--- j7 HOST stdout
+execSync at 36 "SYNC-OK\n"
+bare  at 43 "BARE-OK\n"
+abs   at 44 "ABS-OK\n"
+abs   close 45 code 0
+bare  close 45 code 0
+--- j7 CONTAINER stdout (framed)
+---- program output ----
+execSync at 14 "SYNC-OK\n"
+bare  at 42 "BARE-OK\n"
+bare  close 43 code 0
+abs   close 43 code 0
+---- program stderr ----
+[owc exit 0]
+
+# JUDGE adv6-judge-child-exec-9 (2026-10-23), local main 1e0c5e77 + the shell-name fix.
+# MACHINE: 11 CPUs, load 9-17 while measuring, 0.07-7.1 GB free. One case per process, 3 runs each.
+# Every line the row says ran empty now runs, and the residual (`$0` answered `sh` under `exec`) is fixed.
+--- HOST stdout
+RES {"name":"R-exec-echo","ms":7,"out":"EXEC-ECHO-OK\n","err":"","code":null,"sig":null}
+RES {"name":"R-exec-exit5","ms":4,"out":"","err":"","code":5,"sig":null}
+RES {"name":"R-exec-node","ms":38,"out":"102\n","err":"","code":null,"sig":null}
+RES {"name":"R-spawn-bare/exit","ms":7,"out":"BARE-OK\n","err":"","code":0,"sig":null}
+RES {"name":"R-spawn-abs/exit","ms":5,"out":"ABS-OK\n","err":"","code":0,"sig":null}
+RES {"name":"R-filesh-spawn/exit","ms":4,"out":"REAL-SH-FILE 0\n","err":"","code":0,"sig":null}
+RES {"name":"R-filesh-execfile","ms":6,"out":"REAL-SH-FILE 2\n","err":"","code":null,"sig":null}
+RES {"name":"R-sh-interpreter/exit","ms":7,"out":"SCRIPT-VIA-SH\n","err":"","code":0,"sig":null}
+RES {"name":"R-bin-echo/exit","ms":4,"out":"BINECHO-OK\n","err":"","code":0,"sig":null}
+RES {"name":"R-bin-cat/exit","ms":1,"out":"HELLO-FROM-FILE\n","err":"","code":0,"sig":null}
+RES {"name":"R-exec-notfound","ms":7,"out":"","err":"/bin/sh: nosuchcmd-xyz: command not found\n","code":127,"sig":null}
+RES {"name":"R-spawn-notfound/exit","ms":7,"out":"","err":"sh: nosuchcmd-xyz: command not found\n","code":127,"sig":null}
+--- CONTAINER stdout (streamed, framed)
+RES {"name":"R-exec-echo","ms":14,"out":"EXEC-ECHO-OK\n","err":"","code":null,"sig":null}
+RES {"name":"R-exec-exit5","ms":7,"out":"","err":"","code":5,"sig":null}
+RES {"name":"R-exec-node","ms":274,"out":"102\n","err":"","code":null,"sig":null}
+RES {"name":"R-spawn-bare/exit","ms":3,"out":"BARE-OK\n","err":"","code":0,"sig":null}
+RES {"name":"R-spawn-abs/exit","ms":4,"out":"ABS-OK\n","err":"","code":0,"sig":null}
+RES {"name":"R-filesh-spawn/exit","ms":7,"out":"REAL-SH-FILE 0\n","err":"","code":0,"sig":null}
+RES {"name":"R-filesh-execfile","ms":8,"out":"REAL-SH-FILE 2\n","err":"","code":null,"sig":null}
+RES {"name":"R-sh-interpreter/exit","ms":7,"out":"SCRIPT-VIA-SH\n","err":"","code":0,"sig":null}
+RES {"name":"R-bin-echo/exit","ms":6,"out":"BINECHO-OK\n","err":"","code":0,"sig":null}
+RES {"name":"R-bin-cat/exit","ms":7,"out":"HELLO-FROM-FILE\n","err":"","code":0,"sig":null}
+RES {"name":"R-exec-notfound","ms":4,"out":"","err":"/bin/sh: nosuchcmd-xyz: command not found\n","code":127,"sig":null}
+RES {"name":"R-spawn-notfound/exit","ms":6,"out":"","err":"sh: nosuchcmd-xyz: command not found\n","code":127,"sig":null}
+[owc exit 0]
+# the shell-name residual, measured before and after the fix (case d1)
+--- BEFORE  CONTAINER: exec('echo $0') -> "sh\n"      HOST: "/bin/sh\n"
+--- AFTER   CONTAINER: exec('echo $0') -> "/bin/sh\n" HOST: "/bin/sh\n"
+--- AFTER   CONTAINER: spawn('sh',['-c','echo $0'])      -> "sh\n"      HOST: "sh\n"
+--- AFTER   CONTAINER: spawn('/bin/sh',['-c','echo $0']) -> "/bin/sh\n" HOST: "/bin/sh\n"

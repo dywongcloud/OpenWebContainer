@@ -443,8 +443,11 @@ function executableOf(file: string): string {
 function spawnExecutableOf(ctx: CapabilityContext, file: string, env: Record<string, string>, cwd: string): string {
     /* The path the container's own shell is known by -- `/bin/sh`, the path a host's node runs an
        `exec` through and the one a program that shells out by absolute path names. It is the shell
-       itself on a host, so here it names the executor and not a file: see `shellPathOf`. */
-    if (shellPathOf(ctx, file, env, cwd)) return 'sh';
+       itself on a host, so here it names the executor and not a file: see `shellPathOf`. The path is
+       kept as it was given and not rewritten to the bare name, because it is also the name the shell
+       is started under -- the `$0` a host's `exec('echo $0')` answers with `/bin/sh` where a
+       `spawn('sh', ...)` answers `sh`, and the prefix of every diagnostic the shell writes. */
+    if (shellPathOf(ctx, file, env, cwd)) return file;
     /* `sh` and `node` are the container's own executors and are named as they are, never by a path;
        `npm` and `npx` are the npm process, which PATH also has an entry for and which has to stay
        that process -- a spawn of it as a file would run the shell's npm, which refuses everywhere
@@ -493,7 +496,7 @@ function shellPathOf(ctx: CapabilityContext, file: string, env: Record<string, s
 }
 
 /** The directories a host's `sh` stands in, whichever of them this container's PATH happens to hold. */
-const SHELL_DIRECTORIES = ['/bin', '/usr/bin', '/sbin', '/usr/sbin'];
+export const SHELL_DIRECTORIES = ['/bin', '/usr/bin', '/sbin', '/usr/sbin'];
 
 /** The names the container runs itself, so a spawn of one is never rewritten into a file on PATH. */
 const CONTAINER_EXECUTABLES = new Set(['node', 'npm', 'npx', 'sh', 'bash']);

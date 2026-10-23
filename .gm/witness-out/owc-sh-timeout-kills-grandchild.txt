@@ -1,0 +1,23 @@
+# owc-sh-timeout-kills-grandchild -- judged by adv6-judge-child-exec-9 at local main 1e0c5e77
+# driver: /tmp/owc-judge-child-exec/drive.mts (streaming) out of packages/core; probe d2
+# MACHINE: 11 CPUs, load 9.3-17.8 while measuring, free 0.07-7.1 GB. 3 runs of the one case.
+# case: spawn('sh', ['-c', 'echo shell; node /app/w/busy.js'], { timeout: 400, killSignal: 'SIGKILL' })
+--- HOST stdout
+RES {"name":"D2-run1/exit","ms":406,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run1/close","ms":5042,"out":"shell\nBUSY-DONE\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run2/exit","ms":405,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run2/close","ms":5048,"out":"shell\nBUSY-DONE\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run3/exit","ms":405,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run3/close","ms":5041,"out":"shell\nBUSY-DONE\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+--- HOST stderr
+--- CONTAINER stdout (streamed, framed)
+RES {"name":"D2-run1/exit","ms":416,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run1/close","ms":408,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run2/exit","ms":408,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run2/close","ms":408,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run3/exit","ms":408,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+RES {"name":"D2-run3/close","ms":408,"out":"shell\n","err":"","code":null,"sig":"SIGKILL","killed":true}
+---- program stderr ----
+[owc exit 0]
+# exit agrees; close and the grandchild's output do not. Re-measured unchanged after the
+# shell-name fix for owc-exec-abs-bin-sh-runs-nothing landed (416/408/408 ms, same stdout).

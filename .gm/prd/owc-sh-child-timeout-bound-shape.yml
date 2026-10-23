@@ -1,0 +1,55 @@
+id: owc-sh-child-timeout-bound-shape
+subject: 'The `timeout` of a `sh -c <line>` spawn is a deadline the caller is told about and not a signal the shell is killed with, so the line runs to the end of the step it is in: exec(''sleep 5; echo LATE'', { timeout: 400 }) answers ''LATE\n'' at 5008 ms where host node 24.15 answers '''' at 403 ms, and a `trap ... TERM` never fires'
+classification: GUEST
+owner: adv6-judge-child-exec-9
+session_id: adv6-judge-child-exec-9
+measured_at: 1e0c5e77da71238a4039828c02e56b45b913db62 (local main, with the owc-exec-abs-bin-sh-runs-nothing shell-name fix on top)
+status: pending
+body: |-
+  Measured by the judge for shard child-exec, differentially against host node v24.15.0, one case per
+  process, three runs of each shape, stdout / stderr / exit / close captured separately. Machine load
+  while measuring 7-22 on 11 CPUs with 0.06-8.9 GB free; every shape below is a three-run shape and
+  none of them turns on a millisecond. Driver /tmp/owc-judge-child-exec/drive.mts out of packages/core.
+
+    exec('sleep 5; echo LATE', { timeout: 400 })
+      host:      out ''        403 ms  code null  sig SIGTERM  killed true
+      container: out 'LATE\n' 5008 ms  code null  sig SIGTERM  killed true   (3 runs: 5026/5008/5008)
+      with sleep 2 instead of 5: host '' at 402 ms, container 'LATE\n' at 2007/2012/2007 ms
+
+    spawn('sh', ['-c', 'echo A; sleep 3; echo B'], { timeout: 400, killSignal: 'SIGKILL' })
+      host:      exit  406 ms out 'A\n'      (close 3008 ms: the sleep grandchild holds the pipe)
+      container: exit 3007 ms out 'A\nB\n'   (N=1 -> 1009-1028 ms, N=2 -> 2007-2013, N=3 -> 3005-3009)
+
+    spawn('sh', ['-c', 'trap "echo TRAPPED" TERM; echo A; sleep 2; echo B'],
+          { timeout: 400, killSignal: 'SIGTERM' })
+      host:      2010 ms  code 0       out 'A\nTRAPPED\nB\n'
+      container: 2010 ms  sig SIGTERM  out 'A\nB\n'          -- the trap never runs
+      same line with a node busy step in place of sleep: host 5067 ms code 0 'A\nBUSY-DONE\nTRAPPED\n',
+      container 405-552 ms sig SIGTERM 'A\n'
+      control, no timeout: sh -c 'trap "echo TRAPPED-EXIT" EXIT; echo X' -> 'X\nTRAPPED-EXIT\n'
+      code 0 on BOTH sides, so the trap machinery is present and only the timeout path bypasses it.
+
+  One cause behind all three: `armKillDeadline` (shell/process.ts:276) sets a HOST timer, and
+  `fireKillDeadline` (:307) only NOTIFIES the caller -- it marks the record with the signal so the
+  spawn reports it. It does not stop the line. `execute()` (:339) awaits `executeCommand()` to
+  completion and only then asks `deadlinePassed()`; `executeSteps` does ask between steps (:689) but
+  only a compound line containing a spawnable command reaches that loop, so a line of the shell's own
+  commands goes to the synchronous engine as one unit and never gets there at all.
+
+  WHY THE sleep HALF IS ENGINE-LIMITED, proved live and not assumed. Bare QuickJS 0.32
+  (quickjs-emscripten 0.32.0, no container, no bootstrap, no guest globals): `typeof os`,
+  `typeof setTimeout` and `typeof setInterval` are all `undefined` -- the engine has no timer of its
+  own, so every deadline here is a host timer. And a host `setTimeout(fn, 400)` armed before a
+  synchronous 3 s wait inside that engine fires at 3001 ms, not at 400 ms: the wait holds the thread.
+  Measured the same way in the container, a 100 ms interval in the process that runs
+  `sh -c 'sleep 3'` ticks 29 times with a largest gap of 102 ms on a host and once with a gap of
+  3011 ms here. A shell command handler is synchronous and cannot yield, which is exactly the case the
+  doc-comment at shell/process.ts:265-274 says it cannot solve. Per this repository's standard that is
+  one concrete line in Readme.md and not code bent around it.
+
+  WHAT IS NOT ENGINE-LIMITED. The trap half is not: in the node-busy form the container exits at
+  405 ms, so the host thread was free at the deadline and the bound was honoured -- it simply never
+  reached the shell's own signal machinery, which does work for `trap ... EXIT`. That is fixable at
+  shell/process.ts:307, by delivering the signal to the shell instead of only reporting it, and it is
+  out of this judge's reach: it changes how every timed-out shell line ends, including the exit status
+  a line with no trap reports, and is not one small change per symptom. Filed rather than attempted.
