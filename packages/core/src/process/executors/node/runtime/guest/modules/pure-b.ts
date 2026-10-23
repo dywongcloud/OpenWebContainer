@@ -436,15 +436,19 @@ export const SRC = String.raw`
    *
    * This runtime's parser reports no position with its errors, so the question is put to its
    * compiler instead: what closing its own open brackets cannot complete, with an operand offered
-   * where a trailing operator waits for one, is a syntax error.
+   * where a trailing operator waits for one, is a syntax error. A clause is owed as well as an
+   * operand: 'try' still needs a catch or a finally, 'catch' a binding, 'do' a while, and a header
+   * -- 'function f()', 'class A', 'for (;;)' -- the body that follows it, and none of those is a
+   * value an operand could stand in for.
    */
   function replIncomplete(src) {
     if (compiles(src)) return false;
     var lx = vmLex(src);
     /* a comment or a template runs to the end of what is written, and the next line can close it */
     if (lx.unterminated) return true;
-    /* a property name is still owed after a '.' */
-    if (/[.]\s*$/.test(src)) return true;
+    /* a property name is still owed after a '.' -- but a run of dots is no property access: '...'
+       is a spread or a rest, and an error however the line ends */
+    if (/[^.][.]\s*$/.test(src)) return true;
     var stack = [];
     for (var i = 0; i < lx.toks.length; i++) {
       var t = lx.toks[i];
@@ -458,7 +462,10 @@ export const SRC = String.raw`
       }
     }
     var tail = stack.reverse().join('');
-    return compiles(src + tail) || compiles(src + '1' + tail) || compiles(src + ' 1' + tail);
+    var owed = [tail, ' 1' + tail, tail + ' {}', 'e' + tail + '{}', tail + ' catch(e){}',
+      tail + ' while(0);', ' f(){}'];
+    for (var k = 0; k < owed.length; k++) if (compiles(src + owed[k])) return true;
+    return false;
   }
 
   function replErrorHeader(err) {
