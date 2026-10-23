@@ -35,7 +35,8 @@ import {
     resizeImage,
     rotateQuarters,
     spaceOf,
-    toChannels
+    toChannels,
+    toSrgb
 } from './image';
 import { optionsOf, unsupportedInput, unsupportedOption } from './options';
 import { JpegInfo, decodeJpeg, encodeJpeg, isJpeg } from './jpeg';
@@ -454,7 +455,10 @@ export function createAddon(host: SharpAddonHost = {}): object {
             if (limit > 0 && decoded.image.width * decoded.image.height > limit) {
                 throw pixelLimit(decoded.image.width, decoded.image.height, limit);
             }
-            const { image, cropLeft, cropTop } = applyOperations(decoded.image, opts);
+            const { image: worked, cropLeft, cropTop } = applyOperations(decoded.image, opts);
+            // The pipeline ends in sRGB, so one band comes out as three and two as four: this is
+            // what makes an 8x8x1 raw input 48 bytes of 4x4 raw output and not 16.
+            const image = toSrgb(worked);
             const encoded = encodeOutput(image, opts, decoded.format);
             bytes = encoded.data;
             fileOut = String(opts.fileOut ?? '');
