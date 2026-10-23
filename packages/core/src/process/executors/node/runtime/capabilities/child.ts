@@ -246,6 +246,14 @@ const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
                 registry.pending.delete(record.token);
                 registry.byPid.set(started.pid, record);
                 attachChildListeners(record, started);
+                /* A piped stdin is the child's own to read: a shell child reads what the parent
+                   writes as the text its line's command reads, the way a host's `sh -c 'cat'` does.
+                   A node child reads the same thing through `process.stdin`, which `OWC_STDIN` opens
+                   for it at bootstrap. */
+                if (modeOf(stdio[0]) === 'pipe') {
+                    const openStdin = (started as { openStdinPipe?: () => void }).openStdinPipe;
+                    if (typeof openStdin === 'function') openStdin.call(started);
+                }
                 /* `timeout`: the caller's own timer cannot end a child that holds the host thread, so
                    the bound is put on the child itself -- see armKillDeadline in node/process.ts. The
                    callback marks the record with the signal, which is what the parent reports. */
@@ -576,6 +584,13 @@ interface SyncShell {
     state?: ShellState;
     /** Set when a builtin ended the shell (`exec`, or an `exit` inside `eval`): no later command runs. */
     stopped?: boolean;
+    /**
+     * The wall-clock moment the caller's `timeout` runs out, or 0 when the caller named none. A
+     * synchronous shell has no host thread to end it with, so the moment is what the line reads
+     * between its commands: no command after it runs, the way no command of a host's `sh` runs once
+     * the shell has been killed.
+     */
+    deadlineAt?: number;
     /** The jobs of this line and the EXIT trap after them: see endOfLine. */
     jobs?: ShellJob[];
     /**
@@ -2592,6 +2607,8 @@ function shellStage(shell: SyncShell, words: RawWord[], input: string | null): S
         }
         // a line of assignments and nothing else has no command to run
         if (fields === null) return finishRedirects(shell, dest, { stdout: '', stderr: '', exitCode: ctx.substStatus ?? 0 });
+        const bounded = sleepWithinDeadline(shell, fields);
+        if (bounded !== null) return finishRedirects(shell, dest, bounded);
         return finishRedirects(shell, dest, shellCommand(shell, fields));
     } finally {
         shell.input = saved;
@@ -2851,6 +2868,16 @@ function runCompoundLine(shell: SyncShell, line: string): ShellStep {
  * `deferPendingJobs` is for a command substitution, which is a shell of its own inside this one: it
  * leaves the jobs it started for the line around it to run, so they are run after it, never in it.
  */
+/**
+ * True once the moment the caller's `timeout` named has come. A synchronous shell cannot be ended
+ * from outside -- the host thread is the one its commands run on -- so the bound is a moment the
+ * line reads for itself, between its commands.
+ */
+function deadlinePassed(shell: SyncShell): boolean {
+    const at = shell.deadlineAt;
+    return typeof at === 'number' && at > 0 && Date.now() >= at;
+}
+
 function shellLine(shell: SyncShell, line: string, deferPendingJobs = false): ShellStep {
     const body = stripComment(line);
     const syntax = syntaxErrorOf(body);
@@ -2872,6 +2899,9 @@ function shellLine(shell: SyncShell, line: string, deferPendingJobs = false): Sh
     for (let i = 0; i < segments.length; i++) {
         // `exec` replaced the shell, or an expansion error ended it: nothing after it runs
         if (shell.stopped) break;
+        /* The caller's `timeout` ran out inside the command before this one: no command after it
+           runs, as none does in a host's `sh`, which is dead by that moment. */
+        if (deadlinePassed(shell)) break;
         const segment = segments[i];
         if (segment.op === '&&' && exitCode !== 0) continue;
         if (segment.op === '||' && exitCode === 0) continue;
@@ -3422,11 +3452,16 @@ function runShell(
     env: Record<string, string>,
     cwd: string,
     input: string | null,
-    name: string
+    name: string,
+    /** The caller's `timeout`: the line is given the moment it runs out, since nothing can end it. */
+    timeoutMs: number = 0
 ): MaybeAsync<{ status: number | null; signal: string | null; stdout: string; stderr: string }> {
     if (argv.length === 0) throw notSupportedSync('an interactive sh (no command given)');
     const line = argv[0] === '-c' ? (argv[1] ?? '') : argv.join(' ');
-    const shell: SyncShell = { ctx, cwd, env, input, name, lastStatus: 0 };
+    const shell: SyncShell = {
+        ctx, cwd, env, input, name, lastStatus: 0,
+        deadlineAt: timeoutMs > 0 ? Date.now() + timeoutMs : 0
+    };
     let step: MaybeAsync<ShellStep>;
     try {
         step = shellLine(shell, line);
@@ -3449,6 +3484,52 @@ function runShell(
 /** `sh` ends a diagnostic with a newline; a command that wrote its own already ends in one. */
 function ended(stderr: string): string {
     return stderr === '' || stderr.endsWith('\n') ? stderr : stderr + '\n';
+}
+
+/**
+ * The wait a `sleep` names, in milliseconds, or null when the words are not a `sleep` the utility
+ * answers with nothing to print and status 0: a bad interval, a flag or no operand at all is left
+ * to the utility, which is what prints its own diagnostic for it.
+ */
+function sleepMsOfWords(words: string[]): number | null {
+    if (words.length < 2 || words[0] !== 'sleep') return null;
+    const units: Record<string, number> = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+    let total = 0;
+    for (const word of words.slice(1)) {
+        const match = /^([+]?[0-9]*\.?[0-9]+)([smhd]?)$/.exec(word);
+        if (match === null) return null;
+        const value = Number(match[1]);
+        if (!Number.isFinite(value) || value < 0) return null;
+        total += value * (units[match[2]] ?? units.s);
+    }
+    return Math.min(total, 86400000);
+}
+
+/**
+ * A `sleep` that would outrun the caller's `timeout`, cut to what is left of it: a synchronous run
+ * holds the host thread its own timers would need, so nothing can end the wait from outside, and
+ * the bound is honoured by not waiting past it. The remaining commands of the line are then dropped
+ * by `deadlinePassed`, and the run is reported as ended by the bound.
+ *
+ * Null for every other command, and for a wait that fits inside the bound, which sleeps as asked.
+ */
+function sleepWithinDeadline(shell: SyncShell, fields: string[]): ShellStep | null {
+    const at = shell.deadlineAt;
+    if (typeof at !== 'number' || at <= 0) return null;
+    const ms = sleepMsOfWords(fields);
+    if (ms === null) return null;
+    const left = at - Date.now();
+    if (ms <= left) return null;
+    if (left > 0) {
+        // the same block the utility itself uses: a synchronous command has nothing else to wait on
+        try {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.ceil(left));
+        } catch {
+            const until = Date.now() + left;
+            while (Date.now() < until) { /* spin */ }
+        }
+    }
+    return { stdout: '', stderr: '', exitCode: 0 };
 }
 
 /** One completed shell step as a synchronous run: the pid npm and the shell commands get. */
@@ -3491,10 +3572,18 @@ function runSyncCommand(
     killSignal: string,
     input: string | null
 ): SyncRun | Promise<SyncRun> {
+    /* The caller's `timeout`, dropped by every path below but the one that runs a node child: a
+       synchronous run holds the host thread its own timers would need, so the bound is measured
+       once the run is over and reported as `spawnSync` reports a child it ended -- no status, the
+       caller's signal and ETIMEDOUT -- instead of as a child that finished. */
+    const startedAt = Date.now();
+    const overran = (): boolean => timeoutMs > 0 && Date.now() - startedAt >= timeoutMs;
+    const bound = (run: SyncRun): SyncRun =>
+        overran() ? { ...run, status: null, signal: killSignal, timedOut: true } : run;
     if (file === 'sh' || file === '/bin/sh') {
-        const step = runShell(ctx, argv, env, cwd, input, file);
+        const step = runShell(ctx, argv, env, cwd, input, file, timeoutMs);
         const done = (r: { status: number | null; signal: string | null; stdout: string; stderr: string }): SyncRun =>
-            ({ pid: nextSyncPid++, status: r.status, signal: r.signal, stdout: r.stdout, stderr: r.stderr, timedOut: false });
+            bound({ pid: nextSyncPid++, status: r.status, signal: r.signal, stdout: r.stdout, stderr: r.stderr, timedOut: false });
         return step instanceof Promise ? step.then(done) : done(step);
     }
     if (file === 'node' || file === NODE_BINARY) return nodeRun(ctx, nodeInvocation(argv), env, cwd, timeoutMs, killSignal, input);
@@ -3504,9 +3593,9 @@ function runSyncCommand(
         // `npm install` is the one command here that can suspend the guest instead of refusing
         const install = file === 'npm' ? npmInstallStep(shell, argv) : undefined;
         if (install !== undefined) {
-            return install.then(syncStep);
+            return install.then((step) => bound(syncStep(step)));
         }
-        return syncStep(npmCommand(shell, argv));
+        return bound(syncStep(npmCommand(shell, argv)));
     }
     // `spawnSync('curl', ['--version'])`, `execFileSync('ls', ['-l'])` and every other name the
     // container's own synchronous shell can run: one dispatch for all three synchronous calls, the
@@ -3515,7 +3604,7 @@ function runSyncCommand(
     if (SHELL_BUILTINS.has(file) || SHELL_BUILTIN_NAMES.has(file) || SHELL_EXTERNALS.has(file)
         || isUnsupported(file) || SHELL_MODULE_COMMANDS[file] !== undefined) {
         const step = shellCommand({ ctx, cwd, env, input, lastStatus: 0 }, [file, ...argv]);
-        return syncStep(step);
+        return bound(syncStep(step));
     }
     /* Nothing claims the name, so it is looked for on PATH, the way a host looks for it, and runs
        through the interpreter its name or its shebang names: that is what makes
@@ -3528,7 +3617,7 @@ function runSyncCommand(
        enough. The bit is what the kernel reads, so it is what is read here. */
     if (found !== undefined) refuseWithoutExecuteBit(ctx, file, found, argv);
     const step = found === undefined ? undefined : runFileCommand(shell, found, argv, file);
-    if (step !== undefined) return syncStep(step);
+    if (step !== undefined) return bound(syncStep(step));
     throw new Error(`No executor found for: ${file}`);
 }
 
