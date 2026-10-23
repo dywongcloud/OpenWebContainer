@@ -1084,6 +1084,10 @@ export class CanvasRenderingContext2d {
     /* -------------------------------------------------- images */
 
     createImageData(a: number | ArrayBufferView, b?: number, c?: number): ImageData {
+        // The one-argument form takes an existing ImageData and returns a blank one of the same size
+        // (the spec's createImageData(imagedata)); its .data is not a view the constructor can read, so
+        // it has to be taken apart here rather than handed on.
+        if (a instanceof ImageData) return new ImageData(a.width, a.height);
         return new ImageData(a, b, c);
     }
 
@@ -1181,7 +1185,7 @@ export class CanvasRenderingContext2d {
             colorAt: (ux: number, uy: number): RGBA => {
                 const u = sx + ((ux - dx) / dw) * sw;
                 const v = sy + ((uy - dy) / dh) * sh;
-                const c = sampleSurface(source, u, v, smooth);
+                const c = sampleSurface(source, u, v, smooth, 'pad');
                 return rgba(c[0], c[1], c[2], c[3] * 255);
             }
         };
