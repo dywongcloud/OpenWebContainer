@@ -751,6 +751,29 @@ BF.url = function () {
     return nums.concat(tail).join('.');
   }
 
+  /*
+   * A domain is a run of dot-separated labels, each mapped on its own -- NFC and case-folded, the
+   * way UTS-46 maps it -- and any label that will not map makes the whole domain the empty string,
+   * which is what Node answers for a domain it cannot turn into ASCII.
+   *
+   * This is the mapping on its own, with no reading of a domain as an address beside it: the legacy
+   * parser does not read one, so 'http://0x7f.1/' keeps the host '0x7f.1' it was written with where
+   * the WHATWG parser writes '127.0.0.1'. Only the WHATWG parser, and domainToASCII itself, add the
+   * IPv4 reading -- url.parse('http://0x7f.1/').host is '0x7f.1' in host Node, and url.parse is the
+   * one caller here that must not have it.
+   */
+  function domainLabelsToASCII(domain) {
+    var labels = String(domain).split('.');
+    var out = [];
+    for (var i = 0; i < labels.length; i++) {
+      if (labels[i] === '') { out.push(''); continue; }
+      var ascii = asciiLabelOf(labels[i]);
+      if (ascii === null) return '';
+      out.push(ascii);
+    }
+    return out.join('.');
+  }
+
   function domainToASCII(domain) {
     var text = String(domain);
     if (text === '') return '';
@@ -760,15 +783,7 @@ BF.url = function () {
       var address = parseIpv4(text);
       return address === null ? '' : address;
     }
-    var labels = text.split('.');
-    var out = [];
-    for (var i = 0; i < labels.length; i++) {
-      if (labels[i] === '') { out.push(''); continue; }
-      var ascii = asciiLabelOf(labels[i]);
-      if (ascii === null) return '';
-      out.push(ascii);
-    }
-    return out.join('.');
+    return domainLabelsToASCII(text);
   }
 
   function domainToUnicode(domain) {
@@ -1139,7 +1154,9 @@ BF.url = function () {
         if (ipv6) {
           if (holdsAny(name, FORBIDDEN_IPV6_CHARS)) throw invalidUrl(text);
         } else {
-          name = domainToASCII(name);
+          /* the labels are case-folded and punycoded, but not read as an address: url.parse keeps
+             the host '0x7f.1' as it was written, and does not write '127.0.0.1' for it */
+          name = domainLabelsToASCII(name);
           if (name === '' || holdsAny(name, FORBIDDEN_HOST_CHARS)) throw invalidUrl(text);
         }
       }
