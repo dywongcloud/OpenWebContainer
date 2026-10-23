@@ -1898,7 +1898,7 @@ function testFile(ctx: CommandContext, path: string): TestFile {
 type TestOutcome = { value: boolean; next: number } | { error: string };
 
 /** The operators that take two operands and stand between them. */
-const BINARY_OPERATORS = new Set(['=', '!=', '-eq', '-ne', '-gt', '-ge', '-lt', '-le', '-nt', '-ot', '-ef']);
+const BINARY_OPERATORS = new Set(['=', '!=', '-eq', '-ne', '-gt', '-ge', '-lt', '-le', '-nt', '-ot', '-ef', '<', '>']);
 
 function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcome {
     const orLevel = (index: number): TestOutcome => {
@@ -2028,6 +2028,13 @@ function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcom
         // three argument forms: the operator stands between its two operands
         const second = args[index + 1];
         const third = args[index + 2];
+        if (second === '-a' || second === '-o') {
+            /* Not an operator of this argument's own: `-a` and `-o` join the two whole tests they
+               stand between, which the levels above do, so this one answers for its word alone and
+               leaves them behind it -- `[ a -a b ]` is true, where reading `-a` as an operator no
+               one knows gave `test: -a: unknown operator`. */
+            return { value: word !== '', next: index + 1 };
+        }
         if (second !== undefined && BINARY_OPERATORS.has(second) && third !== undefined) {
             if (second === '=' || second === '!=') {
                 const equal = word === third;
@@ -2044,6 +2051,19 @@ function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcom
                     return { value: second === '-nt' ? newer : !newer, next: index + 3 };
                 }
                 return { value: false, next: index + 3 };
+            }
+            if (second === '<' || second === '>') {
+                /* The order two strings collate in: `[ abc \< abd ]` is true, which is the only
+                   reading of `<` a host has here -- the redirection it is anywhere else is what the
+                   backslash in front of it is for. */
+                return { value: second === '<' ? word < third : word > third, next: index + 3 };
+            }
+            if (second === '-a' || second === '-o') {
+                /* Not an operator of this argument's own: `-a` and `-o` join the two whole tests
+                   they stand between, which the levels above do, so this one answers for its word
+                   alone and leaves them behind it -- `[ a -a b ]` is true, where reading `-a` as an
+                   operator no one knows gave `test: -a: unknown operator`. */
+                return { value: word !== '', next: index + 1 };
             }
             if (!isInteger(word) || !isInteger(third)) return { error: `integer expression expected: ${word}` };
             const a = Number.parseInt(word, 10);

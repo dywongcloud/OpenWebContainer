@@ -674,8 +674,23 @@ function getVar(state: ShellState, name: string): string | undefined {
     if (scope) return scope.get(name)?.value;
     if (name === 'PWD') return state.cwd;
     if (name === 'OLDPWD') return state.dirs[1];
+    /* `LINENO` is the line the shell stands on, which a host counts from the line it was handed --
+       `sh -c 'echo $LINENO'` is `0` there, the one line being the line before any was read.
+       `SHELLOPTS` is read from the options themselves and not from a variable that was set once,
+       so `set -o pipefail; echo $SHELLOPTS` ends with `pipefail` as it does on a host. */
+    if (name === 'LINENO') return String(Math.max(0, (state.line ?? 1) - 1));
+    if (name === 'SHELLOPTS') return shellOptionsValue(state.options);
     return undefined;
 }
+
+/** `SHELLOPTS`: the options that are on, with colons between them, in the order `set -o` lists
+ *  them -- `braceexpand:hashall:interactive-comments:posix`, which is what a host's own holds. */
+function shellOptionsValue(options: ShellOptions): string {
+    return OPTION_NAMES.filter(([key]) => options[key]).map(([, name]) => name).join(':');
+}
+
+/** `echo $BASH_VERSION` is `3.2.57(1)-release` on a host, and that is what it says here. */
+const BASH_VERSINFO = ['3', '2', '57', '1', 'release', 'arm64-apple-darwin25'];
 
 function isSet(state: ShellState, name: string): boolean {
     return getVar(state, name) !== undefined;
@@ -805,6 +820,38 @@ class ArithError extends Error {
 
 type ArithToken = { t: 'num'; v: number; at: number } | { t: 'name'; v: string; at: number } | { t: 'op'; v: string; at: number };
 
+/** `16#ff`, `2#101`, `64#z`: a base, a `#`, and the digits written in it. */
+const BASE_RE = /^([0-9]+)#([0-9a-zA-Z@_]+)/;
+
+/** What one character of a `base#digits` number stands for, once the ten digits run out. */
+function baseDigit(ch: string): number {
+    if (ch >= '0' && ch <= '9') return ch.charCodeAt(0) - 48;
+    if (ch >= 'a' && ch <= 'z') return ch.charCodeAt(0) - 87;
+    if (ch >= 'A' && ch <= 'Z') return ch.charCodeAt(0) - 29;
+    if (ch === '@') return 62;
+    return 63;
+}
+
+/** The value of the `digits` a `base#digits` number was written with. */
+function baseDigits(literal: string, digits: string, base: number): number {
+    if (base < 2 || base > 64) throw new ArithError('invalid arithmetic base', literal);
+    let value = 0;
+    for (const ch of digits) {
+        const digit = baseDigit(ch);
+        if (digit >= base) throw new ArithError('value too great for base', literal);
+        value = value * base + digit;
+    }
+    return value;
+}
+
+/** A leading-zero number read as the octal a host reads it as, or an error where it is not one. */
+function octalValue(digits: string): number {
+    for (const ch of digits.slice(1)) {
+        if (ch > '7') throw new ArithError('value too great for base', digits);
+    }
+    return Number.parseInt(digits, 8);
+}
+
 function arithLex(text: string): ArithToken[] {
     const tokens: ArithToken[] = [];
     let i = 0;
@@ -820,10 +867,22 @@ function arithLex(text: string): ArithToken[] {
                 j = i + 2;
                 while (j < text.length && /[0-9a-fA-F]/.test(text[j])) j++;
                 tokens.push({ t: 'num', v: Number.parseInt(text.slice(i + 2, j), 16), at: i });
+            } else if (BASE_RE.test(text.slice(i))) {
+                /* `base#digits`: the number in the base named in front of the `#` -- `$((16#ff))`
+                   is 255 and `$((2#101))` is 5 -- with the letters, `@` and `_` standing for the
+                   values a host gives them once the ten digits run out. */
+                const parts = BASE_RE.exec(text.slice(i))!;
+                const base = Number.parseInt(parts[1], 10);
+                const value = baseDigits(parts[0], parts[2], base);
+                tokens.push({ t: 'num', v: value, at: i });
+                j = i + parts[0].length;
             } else {
                 while (j < text.length && /[0-9]/.test(text[j])) j++;
                 const digits = text.slice(i, j);
-                const value = digits.length > 1 && digits.startsWith('0') ? Number.parseInt(digits, 8) : Number.parseInt(digits, 10);
+                /* A leading zero is the octal a host reads it as, and an octal a digit does not
+                   belong to is an error and not the zero a `parseInt` gave: `n=08` is `08: value
+                   too great for base`, where `010` is the eight it is. */
+                const value = digits.length > 1 && digits.startsWith('0') ? octalValue(digits) : Number.parseInt(digits, 10);
                 tokens.push({ t: 'num', v: Number.isNaN(value) ? 0 : value, at: i });
             }
             i = j;
@@ -1816,7 +1875,11 @@ class Parser {
         };
         while (this.pos < this.src.length) {
             const ch = this.src[this.pos];
-            if (Parser.STOP.has(ch) && !(this.keepSpaces && (ch === ' ' || ch === '\t')) && !(this.keepParens && (ch === '(' || ch === ')'))) break;
+            /* The text of an arithmetic expression was bounded by its `$(` and `))` before it ever
+               came here, so every character a word would otherwise stop on belongs to it: `$((3&1))`
+               is one expression and not the `3` a stop at the `&` left behind, and the same holds
+               for the `|` of `$((3|4))`, the `<` of `$((1<<3))` and the `>` of `$((3>2))`. */
+            if (Parser.STOP.has(ch) && !this.keepParens && !(this.keepSpaces && (ch === ' ' || ch === '\t'))) break;
             if (ch === '\\') {
                 const next = this.src[this.pos + 1];
                 if (next === '\n') {
@@ -2725,8 +2788,10 @@ function braceExpand(text: string): string[] | null {
         if (depth > 0) continue;
         if (open < 0) continue;
         const parts = splitBraceBody(text.slice(open + 1, i));
-        /* One alternative and no range is not a brace group: `echo {a}` is the text `{a}`. */
-        if (parts.length < 2) {
+        /* Neither a comma nor a range is not a brace group: `echo {a}` is the text `{a}`. A range
+           that comes to one value *is* one -- `echo {1..1}` prints `1` and `echo {a..a}` prints
+           `a`, where the text itself was what came out before. */
+        if (parts === null) {
             open = -1;
             continue;
         }
@@ -2749,8 +2814,14 @@ function braceExpand(text: string): string[] | null {
     return null;
 }
 
-/** Splits the inside of a brace group on its top-level commas, and expands `n..m` into a range. */
-function splitBraceBody(body: string): string[] {
+/** Splits the inside of a brace group on its top-level commas, and expands `n..m` into a range.
+ *
+ *  Returns null where the body is neither: one alternative and no range is the text it was written
+ *  as, which is the only way `echo {a}` can print `{a}`. A range of letters is a range too -- `echo
+ *  {a..e}` is `a b c d e` and `echo {z..a}` walks back down -- and one that comes to a single value
+ *  is still a group, so `{1..1}` is `1` and not the text `{1..1}`.
+ */
+function splitBraceBody(body: string): string[] | null {
     const parts: string[] = [];
     let current = '';
     let depth = 0;
@@ -2777,16 +2848,27 @@ function splitBraceBody(body: string): string[] {
     }
     parts.push(current);
     if (parts.length === 1) {
-        const range = /^(-?[0-9]+)\.\.(-?[0-9]+)$/.exec(parts[0]);
-        if (range === null) return parts;
-        const from = Number.parseInt(range[1], 10);
-        const to = Number.parseInt(range[2], 10);
-        const step = from <= to ? 1 : -1;
-        const out: string[] = [];
-        for (let value = from; step > 0 ? value <= to : value >= to; value += step) out.push(String(value));
-        return out;
+        const numeric = /^(-?[0-9]+)\.\.(-?[0-9]+)$/.exec(parts[0]);
+        if (numeric !== null) return numericRange(Number.parseInt(numeric[1], 10), Number.parseInt(numeric[2], 10));
+        const alpha = /^([A-Za-z])\.\.([A-Za-z])$/.exec(parts[0]);
+        if (alpha !== null) {
+            const from = alpha[1].charCodeAt(0);
+            const to = alpha[2].charCodeAt(0);
+            const out: string[] = [];
+            for (let code = from; from <= to ? code <= to : code >= to; code += from <= to ? 1 : -1) out.push(String.fromCharCode(code));
+            return out;
+        }
+        return null;
     }
     return parts;
+}
+
+/** `from` to `to` inclusive, counting down where `from` stands behind `to`: `{3..1}` is `3 2 1`. */
+function numericRange(from: number, to: number): string[] {
+    const step = from <= to ? 1 : -1;
+    const out: string[] = [];
+    for (let value = from; step > 0 ? value <= to : value >= to; value += step) out.push(String(value));
+    return out;
 }
 
 /**
@@ -2807,14 +2889,23 @@ function optionFlags(state: ShellState): string {
     if (state.options.noglob) out += 'f';
     if (state.options.hashall) out += 'h';
     if (state.options.interactive) out += 'i';
+    /* `keyword`, `privileged` and `onecmd` are letters a host spells -- `set -k` answers `hkBc`,
+       `set -p` answers `hpBc` and `set -t` answers `htBc` -- and they stand between `monitor` and
+       `nounset` in the order a host spells its letters in, which is the order below: `set -a -b -e
+       -f -h -k -m -p -t -u -v -x -B -C -H -P` answers `abefhkmptuvxBCHPc`. */
+    if (state.options.keyword) out += 'k';
     if (state.options.monitor) out += 'm';
     if (state.options.noexec) out += 'n';
+    if (state.options.privileged) out += 'p';
+    if (state.options.onecmd) out += 't';
     if (state.options.nounset) out += 'u';
     if (state.options.verbose) out += 'v';
     if (state.options.xtrace) out += 'x';
     if (state.options.braceexpand) out += 'B';
-    if (state.options.histexpand) out += 'H';
+    /* `noclobber` stands in front of `histexpand` and `physical` behind it, not the other way. */
     if (state.options.noclobber) out += 'C';
+    if (state.options.histexpand) out += 'H';
+    if (state.options.physical) out += 'P';
     /* A shell that reads no terminal and no file of its own was handed its one line with `-c`,
        which is the only way this container starts one. */
     if (!state.options.interactive) out += 'c';
@@ -3063,11 +3154,26 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             continue;
         }
         let name = ref.name;
+        /* The prefix form: `${!a*}` and `${!a@}` are the names that open with `a`, sorted and one
+           word each -- `a1=1; a2=2; echo ${!a*}` is a host's `a1 a2`, and `echo ${!PATH@}` is
+           `PATH`. The `@` and `*` behind the prefix are what tell it apart from indirection, which
+           is a name with no operator behind it at all. */
+        const prefix = /^!([A-Za-z_][A-Za-z0-9_]*)[@*]$/.exec(name);
+        if (prefix !== null && ref.op === '') {
+            const matches = varNames(state).filter((candidate) => candidate.startsWith(prefix[1])).sort();
+            for (let i = 0; i < matches.length; i++) {
+                if (i > 0) appendText(target, FIELD_MARK, true);
+                appendText(target, matches[i], true);
+            }
+            continue;
+        }
         /* Indirection: `${!k}` names the variable *in* `k` -- `k=target; target=hit; echo ${!k}` is
-           `hit`, and a `k` nothing was assigned to is an empty word, as it is on a host. The `!` is
-           only indirection where it stands in front of the name with no operator behind it, so
-           `${!k:-x}`, `${!k#y}` and the rest still mean what they meant. */
-        if (name.startsWith('!') && ref.op === '') name = getVar(state, name.slice(1)) ?? '';
+           `hit`, and a `k` nothing was assigned to is an empty word, as it is on a host. A host
+           reads the `!` as indirection with an operator behind the name as well, so `${!k:-def}`
+           is the `hit` the `k` names and not the default, and it reports the name as it was
+           written: `set -u; k=nope; echo ${!k}` is `!k: unbound variable`. */
+        const shown = name;
+        if (name.startsWith('!') && !/^![#@*]/.test(name)) name = getVar(state, name.slice(1)) ?? '';
         let value: string | undefined;
         let set = false;
         if (name === '@' || name === '*') {
@@ -3090,7 +3196,7 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             value = getVar(state, name);
             set = isSet(state, name);
         }
-        if (value === undefined && state.options.nounset && ref.op === '') throw new UnsetVariableError(`${name}: unbound variable`);
+        if (value === undefined && state.options.nounset && ref.op === '') throw new UnsetVariableError(`${shown}: unbound variable`);
         const substituted = ref.op !== '' && /^\s*['"`]/.test(ref.arg);
         appendText(target, applyModifier(state, ref, value, set, name), quoted || substituted);
     }
@@ -3136,19 +3242,45 @@ function wordIsQuoted(word: Word): boolean {
  * none. The parts around the one that holds the group are kept as they are, so `pre{a,b}$x` is two
  * words that each still carry the `$x` behind them.
  */
+const BRACE_OPEN = '\u0003';
+const BRACE_CLOSE = '\u0004';
+
 function braceWord(word: Word): Word[] | null {
-    for (let i = 0; i < word.length; i++) {
-        const part = word[i];
-        if (part.t !== 'lit') continue;
-        const expanded = braceExpand(part.v);
-        if (expanded === null) continue;
-        return expanded.map((text) => {
-            const copy = word.slice();
-            copy[i] = { t: 'lit', v: text };
-            return copy;
-        });
+    /* A group may straddle the parts a word is made of -- the `{$x,b}` of `x=q; echo {$x,b}` is the
+       literal `{`, the variable `x` and the literal `,b}` -- so the group is looked for in a
+       skeleton in which every part that is not text stands as one placeholder, and the parts are
+       put back where their placeholders came out. The placeholders are not braces, commas or
+       backslashes, so nothing in the group's own scanning can take them for a group of their own,
+       and a quoted part stands behind one too, which is why a group inside quotes is never taken
+       for a group: `echo "{a,b}"` prints `{a,b}`. */
+    const skeleton: string[] = [];
+    const stored: Part[] = [];
+    for (const part of word) {
+        if (part.t === 'lit') {
+            skeleton.push(part.v);
+            continue;
+        }
+        skeleton.push(`${BRACE_OPEN}${stored.length}${BRACE_CLOSE}`);
+        stored.push(part);
     }
-    return null;
+    const expanded = braceExpand(skeleton.join(''));
+    if (expanded === null) return null;
+    return expanded.map((text) => unbraceWord(text, stored));
+}
+
+/** Puts the parts a skeleton stood for back into one of the words it expanded to. */
+function unbraceWord(text: string, stored: Part[]): Word {
+    const out: Word = [];
+    let rest = text;
+    for (;;) {
+        const at = new RegExp(`${BRACE_OPEN}([0-9]+)${BRACE_CLOSE}`).exec(rest);
+        if (at === null) break;
+        if (at.index > 0) out.push({ t: 'lit', v: rest.slice(0, at.index) });
+        out.push(stored[Number(at[1])]);
+        rest = rest.slice(at.index + at[0].length);
+    }
+    if (rest !== '') out.push({ t: 'lit', v: rest });
+    return out;
 }
 
 /** Expands a word the way a command argument is expanded: splitting, then pathname expansion. */
@@ -3200,6 +3332,12 @@ function expandWords(state: ShellState, words: Word[]): string[] {
 }
 
 function expandAssignment(state: ShellState, assign: Assignment): string {
+    /* `+=` on a name the integer attribute was set on is arithmetic and not a string append:
+       `declare -i n=1; n+=2` is a `n` of 3, where putting the two texts next to each other left
+       `12`. The value stands in parentheses so `n+=1+2` adds the three and not the one. */
+    if (assign.append && lookupScope(state, assign.name)?.get(assign.name)?.integer === true) {
+        return `${getVar(state, assign.name) ?? ''}+(${expandToString(assign.value, state)})`;
+    }
     const base = assign.append ? getVar(state, assign.name) ?? '' : '';
     return base + expandToString(assign.value, state);
 }
@@ -3945,7 +4083,15 @@ function runNode(state: ShellState, node: Node, input: string | null): number {
        `false | true` is `1 0`. It is written before `!` and `pipefail` are applied, because both
        move the status of the pipeline and neither moves the status a stage ended with, and a
        command that ran on its own is a pipeline of one: `echo hi; echo ${PIPESTATUS[@]}` is `0`. */
-    setPipeStatus(state, statuses);
+    /* A `{ ...; }`, an `if`, a `while`, a `for` and a `case` are not pipelines of one however they
+       end: the pipelines inside them wrote `PIPESTATUS` as they ran, and the compound leaves what
+       the last of them wrote alone -- `{ true | false; }; echo ${PIPESTATUS[@]}` is a host's `0 1`,
+       where writing the group's own status over it answered `1`, and `{ echo hi; }` is `0` because
+       the `echo` inside it is a pipeline of one. A `( )` is: the subshell is one stage of the
+       pipeline it stands in, so `( true | false ); echo ${PIPESTATUS[@]}` is `1` and not `0 1`. */
+    const only = node.commands.length === 1 ? node.commands[0] : undefined;
+    const compound = only !== undefined && ['group', 'if', 'while', 'for', 'forarith', 'case'].includes(only.t);
+    if (!compound) setPipeStatus(state, statuses);
     let status = statuses.length > 0 ? statuses[statuses.length - 1] : 0;
     if (state.options.pipefail) {
         const failed = statuses.find((entry) => entry !== 0);
@@ -4057,6 +4203,38 @@ function condWordQuoted(word: Word): boolean {
     return false;
 }
 
+/**
+ * The modification time of `path`, for `-nt` and `-ot`. This file system keeps no time with a file,
+ * so every file carries the same one and neither operator ever holds -- which is what a host answers
+ * for a file compared with itself: `[[ /bin/sh -nt /bin/sh ]]` is false.
+ */
+function fileMtime(_state: ShellState, _path: string): number {
+    return 0;
+}
+
+/** The text of a regular expression that matches `text` and nothing else. */
+function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** A `[[ ]]` that answers with a status of its own: 2 for an expression no regex was made of. */
+class CondStatusError extends Error {
+    constructor(readonly status: number) {
+        super('');
+    }
+}
+
+/** Whether the file system the shell holds has `path` in it, as a file or as a directory. */
+function fileExists(state: ShellState, path: string): boolean {
+    const fs = state.fs;
+    if (fs === undefined || fs === null) return false;
+    try {
+        return fs.fileExists(path) || fs.isDirectory(path);
+    } catch {
+        return false;
+    }
+}
+
 /** The file tests a `[[ ]]` answers, read through the file system the shell holds. */
 function condFileTest(state: ShellState, op: string, path: string): boolean {
     const fs = state.fs;
@@ -4080,22 +4258,29 @@ function condFileTest(state: ShellState, op: string, path: string): boolean {
 }
 
 /**
- * The value of a `[[ ... ]]`: true where the expression holds, which is the status 0 a host gives
- * it, and false where it does not, which is 1.
+ * The value of a `[[ ... ]]` as the status a host gives it: 0 where the expression holds, 1 where it
+ * does not, and 2 where the expression itself is one no answer can come of.
  *
  * Nothing inside the brackets is field-split or globbed, so the words are expanded as strings and
  * taken as they stand, and the operators are the ones bash reads there: `==` and `!=` with a
  * pattern on the right, `=~` with a regular expression, `<` and `>` for the order two strings
  * collate in, the arithmetic `-eq` to `-ge`, `&&`, `||`, `!` and the parentheses that group them.
  */
-function evalConditional(state: ShellState, words: Word[]): boolean {
+function evalConditional(state: ShellState, words: Word[]): number {
     const tokens: CondWord[] = words.map((word) => ({ text: expandToString(word, state), quoted: condWordQuoted(word) }));
     let at = 0;
     const peek = (offset = 0): CondWord | undefined => tokens[at + offset];
     const globMatch = (text: string, pattern: string): boolean => new RegExp(`^${globToRegExp(pattern, true).source}$`).test(text);
+    /* The operands of `-eq` and the rest are arithmetic, as they are on a host: `[[ 1+1 -eq 2 ]]`
+       is true and so is `[[ 010 -eq 8 ]]`, the leading zero being the octal a host reads it as.
+       A name that was never assigned is the zero an unset variable evaluates to, and so is a word
+       no number can be read out of. */
     const numeric = (text: string): number => {
-        const value = Number(text.trim());
-        return Number.isNaN(value) ? 0 : value;
+        try {
+            return evalArith(state, text);
+        } catch {
+            return 0;
+        }
     };
     const primary = (): boolean => {
         const token = peek();
@@ -4122,6 +4307,15 @@ function evalConditional(state: ShellState, words: Word[]): boolean {
             if (peek() !== undefined) at++;
             return value;
         }
+        if (token.text === '-o' && peek(1) !== undefined) {
+            /* `[[ -o name ]]` is whether the option is on, which is what `set -o name` set: `[[ -o
+               braceexpand ]]` is true where a host's own is, and `[[ -o noclobber ]]` false until
+               something turns it on. */
+            const name = peek(1)!.text;
+            at += 2;
+            const entry = OPTION_NAMES.find(([, option]) => option === name);
+            return entry !== undefined && state.options[entry[0]];
+        }
         if (/^-(e|a|f|d|r|w|x|s|L|h)$/.test(token.text) && peek(1) !== undefined) {
             const op = token.text;
             at++;
@@ -4147,11 +4341,30 @@ function evalConditional(state: ShellState, words: Word[]): boolean {
         }
         if (operator.text === '=~') {
             at += 2;
+            /* A quoted right-hand side is the text it was written as and not a pattern of any
+               kind: `[[ abc =~ "a.c" ]]` is false, where the unquoted `[[ abc =~ a.c ]]` is true.
+               A right-hand side no expression can be made of is the status 2 a host answers with,
+               silently -- `[[ abc =~ [ ]]; echo $?` is a host's `2` and no diagnostic at all. */
+            if (right.quoted) return new RegExp(escapeRegExp(right.text)).test(token.text);
             try {
                 return new RegExp(right.text).test(token.text);
             } catch {
-                return false;
+                throw new CondStatusError(2);
             }
+        }
+        if (operator.text === '-ef' || operator.text === '-nt' || operator.text === '-ot') {
+            /* The two files a host compares: `-ef` is one and the same file, `-nt` newer than and
+               `-ot` older than. A file that is not there makes all three false, which is why `[[
+               abc -ef abc ]]` is false and not the true a bare word on its own would give, and a
+               file compared with itself is never newer than itself. */
+            at += 2;
+            const left = resolvePath(state, token.text);
+            const other = resolvePath(state, right.text);
+            if (!fileExists(state, left) || !fileExists(state, other)) return false;
+            if (operator.text === '-ef') return left === other;
+            return operator.text === '-nt'
+                ? fileMtime(state, left) > fileMtime(state, other)
+                : fileMtime(state, left) < fileMtime(state, other);
         }
         if (operator.text === '<') {
             at += 2;
@@ -4192,7 +4405,12 @@ function evalConditional(state: ShellState, words: Word[]): boolean {
         }
         return value;
     };
-    return disjunction();
+    try {
+        return disjunction() ? 0 : 1;
+    } catch (error) {
+        if (error instanceof CondStatusError) return error.status;
+        throw error;
+    }
 }
 
 function runCommand(state: ShellState, command: Command, input: string | null): number {
@@ -4201,7 +4419,7 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
         case 'simple':
             return runSimple(state, command, input);
         case 'cond':
-            return runCompoundRedirected(state, command, input, () => (evalConditional(state, command.words) ? 0 : 1));
+            return runCompoundRedirected(state, command, input, () => evalConditional(state, command.words));
         case 'arithcmd':
             return runCompoundRedirected(state, command, input, () => {
                 try {
@@ -4646,6 +4864,15 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
         switch (redirect.op) {
             case '>':
             case '>>':
+                /* `set -C` -- noclobber -- refuses a `>` onto a file that is already there, and the
+                   command behind it never runs: `set -C; echo x > f; echo y > f` is the second
+                   line's `sh: f: cannot overwrite existing file` and the status 1 a host leaves.
+                   `>>` is never refused, because appending to a file is not overwriting it. The
+                   name is reported as it was written, and not as the path it resolves to. */
+                if (redirect.op === '>' && state.options.noclobber && fileExists(state, resolvePath(state, target))) {
+                    if (plan.error === undefined) plan.error = `${state.shellName}: ${target}: cannot overwrite existing file\n`;
+                    break;
+                }
                 if (redirect.fd === 2) plan.stderrTo = { kind: 'file', file: target, append: redirect.op === '>>' };
                 else if (redirect.fd === 1) plan.stdoutTo = { kind: 'file', file: target, append: redirect.op === '>>' };
                 else {
@@ -5640,10 +5867,16 @@ function setBuiltin(ctx: CommandContext): CommandResult {
             if (body === 'o') {
                 const next = args[index + 1];
                 if (next === undefined) {
-                    /* The list a host prints: the name in a column fifteen characters wide, a tab,
-                       and `on` or `off` -- `allexport      \toff`, and `interactive-comments` longer
-                       than the column, so the tab is the only thing between it and its answer. */
-                    const lines = OPTION_NAMES.map(([key, name]) => `${name.padEnd(15)}\t${state.options[key] ? 'on' : 'off'}`);
+                    /* `set -o` lists the options as a table -- the name in a column fifteen
+                       characters wide, a tab, and `on` or `off` -- `allexport      \toff`, and
+                       `interactive-comments` longer than the column, so the tab is the only thing
+                       between it and its answer. `set +o` writes the same options back out as the
+                       lines that would set them again, which is what a script is handed back as:
+                       `set +o allexport` for one that is off and `set -o braceexpand` for one that
+                       is on, and one line for each of the twenty-seven. */
+                    const lines = enable
+                        ? OPTION_NAMES.map(([key, name]) => `${name.padEnd(15)}\t${state.options[key] ? 'on' : 'off'}`)
+                        : OPTION_NAMES.map(([key, name]) => `set ${state.options[key] ? '-o' : '+o'} ${name}`);
                     return ok(joinLines(lines), state);
                 }
                 const entry = OPTION_NAMES.find(([, name]) => name === next);
@@ -5765,6 +5998,8 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
     let readonlyFlag: boolean | null = null;
     let integer: boolean | null = null;
     let global = false;
+    let array = false;
+    let trace = false;
     let print = false;
     let functions = false;
     let functionNames = false;
@@ -5778,7 +6013,12 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
         if (flag === '-p') print = true;
         else if (flag === '-f') functions = true;
         else if (flag === '-F') functionNames = true;
-        else if (flag === '-g') global = true;
+        /* `-a` and `-t` are attributes a host's own `declare` takes -- `declare -a arr` and
+           `declare -t x=1` are both a status 0 there. `-g` is not: it is a bash-4 flag this
+           bash is one version too old for, and `declare -g x=1` is `declare: -g: invalid
+           option` and the status 2 a host gives an option it does not know. */
+        else if (flag === '-a') array = true;
+        else if (flag === '-t') trace = true;
         else if (flag === '-x') exportFlag = true;
         else if (flag === '+x') exportFlag = false;
         else if (flag === '-r') readonlyFlag = true;
@@ -5793,7 +6033,13 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
         index++;
     }
     const rest = args.slice(index);
-    if (functions) return ok(joinLines([...state.functions.keys()].sort().map((name) => `${name} ()`)), state);
+    if (functions) {
+        /* The whole function, as a host prints it -- `f () `, then the braces on lines of their own
+           with the body indented four spaces -- and not the name alone, which is what `declare -F`
+           prints. */
+        const names = rest.length > 0 ? rest : [...state.functions.keys()].sort();
+        return ok(joinLines(names.map((name) => declareFunction(state, name))), state);
+    }
     if (functionNames) return ok(joinLines([...state.functions.keys()].sort().map((name) => `declare -f ${name}`)), state);
     if (rest.length === 0 && !print) {
         const names = varNames(state).sort();
@@ -5804,7 +6050,14 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
         const lines: string[] = [];
         for (const name of names) {
             const variable = lookupScope(state, name)?.get(name);
-            lines.push(variable === undefined ? '' : declarePrint(name, variable));
+            /* A name that was named and is not there is an error a host reports -- `declare -p ZZ`
+               is `declare: ZZ: not found` and the status 1, where a name the list of every variable
+               carries and no scope holds is one the list simply leaves out. */
+            if (variable === undefined) {
+                if (rest.length > 0) return failDiag(state, `declare: ${name}: not found`, 1);
+                continue;
+            }
+            lines.push(declarePrint(name, variable));
         }
         return ok(joinLines(lines.filter((line) => line !== '')), state);
     }
@@ -5815,10 +6068,15 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
         const scope = state.scopes.length > 1 && !global ? state.scopes[state.scopes.length - 1] : state.scopes[0];
         if (assign) {
             const base = assign.append ? getVar(state, name) ?? '' : '';
+            /* `+=` on an integer name is arithmetic and not a string append: `declare -i n=1; n+=2`
+               is a `n` of 3, where putting the two texts next to each other gave `12`. The value
+               stands in parentheses so `n+=1+2` adds the three and not the one. */
+            const raw = integer === true && assign.append
+                ? `${base}+(${assign.value ?? ''})`
+                : base + (assign.value ?? '');
             /* `-i` makes the value arithmetic: `declare -i z=1+2` is a `z` of 3, which is what a
                host's own integer attribute leaves behind it. */
-            const raw = base + (assign.value ?? '');
-            const value = integer === true && !assign.append ? arithmeticValue(state, raw) : raw;
+            const value = integer === true ? arithmeticValue(state, raw) : raw;
             if (!scope.has(name)) scope.set(name, { value });
             else setVar(state, name, value);
         } else if (!lookupScope(state, name)) {
@@ -5842,6 +6100,17 @@ function declareBuiltin(ctx: CommandContext): CommandResult {
         }
     }
     return ok();
+}
+
+/** One function as `declare -f` prints it: `f () `, `{ `, the body indented four spaces, and `}`. */
+function declareFunction(state: ShellState, name: string): string {
+    const def = state.functions.get(name);
+    if (def === undefined) return `${name} ()`;
+    const body = (def.text ?? '').trim().replace(/;\s*$/, '');
+    /* The braces the body was written between are not part of it: `f(){ echo hi; }` leaves the
+       body `echo hi`, and a host prints that and not the `{ echo hi; }` it was written as. */
+    const inner = /^\{([\s\S]*)\}$/.exec(body);
+    return `${name} () \n{ \n    ${(inner !== null ? inner[1] : body).trim().replace(/;\s*$/, '')}\n}`;
 }
 
 /** The value of an arithmetic expression, or the text itself where it is not one. */
@@ -6121,7 +6390,15 @@ function hashBuiltin(ctx: CommandContext): CommandResult {
        0 whatever the table held, where reading it as an option `hash` did not know answered
        `hash: -d: invalid option` and 2. */
     let remove = false;
-    for (const arg of ctx.args) {
+    /* `-t` names what the table holds and nothing else: `hash -t ls` on a name `hash` never
+       remembered is a host's `hash: ls: not found` and the status 1, where looking the name up on
+       `PATH` as well made it print a path and answer 0. */
+    let print = false;
+    const printed: string[] = [];
+    const args = ctx.args;
+    let index = 0;
+    while (index < args.length) {
+        const arg = args[index++];
         if (arg === '-r') {
             state.hash.clear();
             continue;
@@ -6130,11 +6407,19 @@ function hashBuiltin(ctx: CommandContext): CommandResult {
             remove = true;
             continue;
         }
-        /* `-l` prints the table in a form a script can read back, `-p path name` remembers a path
-           of its own, and `-t` prints the paths the names hold: none of them is a name to look
-           up, and a host takes each with the argument behind it. */
-        if (arg === '-l' || arg === '-t') continue;
-        if (arg === '-p') continue;
+        /* `-l` prints the table in a form a script can read back, `-t` prints the paths the names
+           hold, and `-p path name` remembers a path of its own -- taking the two arguments behind
+           it, which is why the `myls` of `hash -p /bin/ls myls` is not a name to look up. */
+        if (arg === '-l' || arg === '-t') {
+            print = true;
+            continue;
+        }
+        if (arg === '-p') {
+            const path = args[index++];
+            const name = args[index++];
+            if (path !== undefined && name !== undefined) state.hash.set(name, path);
+            continue;
+        }
         if (arg.startsWith('-')) {
             /* An option `hash` does not know: the two lines a host writes, and the 2 it leaves. */
             return failDiag(
@@ -6145,6 +6430,16 @@ function hashBuiltin(ctx: CommandContext): CommandResult {
         }
         if (remove) {
             state.hash.delete(arg);
+            continue;
+        }
+        if (print) {
+            const path = state.hash.get(arg);
+            if (path === undefined) {
+                writeErr(state, `${diagnosticPrefix(state)}hash: ${arg}: not found\n`);
+                status = 1;
+                continue;
+            }
+            printed.push(path);
             continue;
         }
         const path = findOnPath(state, arg);
@@ -6159,7 +6454,7 @@ function hashBuiltin(ctx: CommandContext): CommandResult {
         const lines = [...state.hash.entries()].map(([, path]) => `   0\t${path}`);
         return { stdout: joinLines(lines), stderr: '', exitCode: status };
     }
-    return { stdout: '', stderr: '', exitCode: status };
+    return { stdout: printed.length === 0 ? '' : joinLines(printed), stderr: '', exitCode: status };
 }
 
 /** Every builtin name this module implements, sorted. */
@@ -6598,7 +6893,7 @@ function readBuiltin(ctx: CommandContext): CommandResult {
             } else if (ch === 'd') {
                 delimiter = args[index + 1] ?? '\n';
                 index++;
-            } else if (ch === 'n' || ch === 'N') {
+            } else if (ch === 'n') {
                 count = Number.parseInt(args[index + 1] ?? '0', 10);
                 index++;
             } else if (ch === 'p') {
@@ -7501,6 +7796,30 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
         xtrace: false,
         interactive: false
     };
+    /* The variables a host's own `/bin/sh` -- bash 3.2 -- sets before its first line runs, and the
+       ones it makes readonly: `echo $BASH_VERSION` is `3.2.57(1)-release` and `echo $HOSTTYPE` is
+       `arm64` there, where every one of them came out as an empty line. They are readonly because
+       a host marks them so, which is why `readonly R=1; readonly -p` lists `UID`, `EUID`, `PPID`,
+       `SHELLOPTS` and `BASH_VERSINFO` next to its own `R`. `BASH_VERSINFO` is the array a host
+       holds it as, written the way this shell writes every array: `BASH_VERSINFO[0]` is `3`.
+       `PPID` is left to the caller: it is the pid of the process that started this one, and no two
+       runs share it. */
+    for (const [name, value] of Object.entries({
+        BASH_VERSION: '3.2.57(1)-release',
+        MACHTYPE: 'arm64-apple-darwin25',
+        HOSTTYPE: 'arm64',
+        OSTYPE: 'darwin25'
+    })) {
+        if (!globals.has(name)) globals.set(name, { value, export: false, readonly: true });
+    }
+    for (let i = 0; i < BASH_VERSINFO.length; i++) {
+        globals.set(`BASH_VERSINFO[${i}]`, { value: BASH_VERSINFO[i], export: false, readonly: true });
+    }
+    globals.set('BASH_VERSINFO', { value: BASH_VERSINFO[0], export: false, readonly: true });
+    if (!globals.has('UID')) globals.set('UID', { value: '501', export: false, readonly: true });
+    if (!globals.has('EUID')) globals.set('EUID', { value: '501', export: false, readonly: true });
+    if (!globals.has('SHLVL')) globals.set('SHLVL', { value: '1', export: true, readonly: true });
+    globals.set('SHELLOPTS', { value: shellOptionsValue(options), export: false, readonly: true });
     const state: ShellState = {
         scopes: [globals],
         get env(): Record<string, string> {

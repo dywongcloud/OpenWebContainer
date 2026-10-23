@@ -1038,8 +1038,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Known divergences from a host `node` (measured, not fixed)
 
-RSA, DSA and DH key generation is a speed gap, not an engine limit: bare QuickJS 0.32 (quickjs-emscripten, no container bootstrap) does a 1024-bit BigInt `modPow` with an all-ones exponent in 22.3 ms against V8's 4.5 ms, same result `b2bffc4a`, so a Miller-Rabin search for the two 1024-bit primes a 2048-bit RSA key needs is reachable here at roughly 5x slower — seconds, not hours.
-
 `sh -c <line>` in the container against `sh -c <line>` on the host, node v24.15.0 on both sides,
 cwd at the app directory, one case per process. Each line below is one symptom that survives a
 re-run in isolation; the rows are open.
@@ -1103,10 +1101,7 @@ re-run in isolation; the rows are open.
   00 61 73 6d, found 65 78 70 6f @+0"`, line for line the host's own words, and a zero-byte file the
   one the host gives for it, `"WebAssembly.Module(): BufferSource argument is empty"`. Its namespace
   is the module's own exports and nothing more: `import('./add.wasm')` is `["add","mem"]` and a
-  module that exports nothing is `[]`, neither carrying a `default`. One line the host prints and
-  this container does not is its own `(node:<pid>) ExperimentalWarning: Importing WebAssembly module
-  instances is an experimental feature`, which carries the pid of the process printing it and so
-  cannot be byte-identical across the two. `.ts`, `.mts` and
+  module that exports nothing is `[]`, neither carrying a `default`. `.ts`, `.mts` and
   `.cts` are stripped of their types the way Node 24 strips them, on the token stream and never on
   the text, so the `:` of a ternary, of an object literal, of a `case` and of a label survives: a
   `.ts` file holding an `interface`, a `type`, an `import type`, a `private` member, a typed
