@@ -28,3 +28,9 @@ body: |-
 
       host node 24.15:         writeReturnedFalse=true bufferSizeGrew=true maxBufferSize=12582912
       container (HEAD bc261b6): writeReturnedFalse=true bufferSizeGrew=false maxBufferSize=0
+
+  RE-MEASURED (adv5-fix-http2-net-5) at HEAD 0379fed + the hub fix of row owc-virtual-net-ipv6-family,
+  four container runs, all four identical: this side is still writeReturnedFalse=true
+  bufferSizeGrew=false maxBufferSize=0, against a host that reads writeReturnedFalse=true
+  bufferSizeGrew=true maxBufferSize=11993088/12582912/12648448/12648448 -- the host's own figure moves
+  with the run, and this side's does not. Unfixed, for the reason above; the row stays open.

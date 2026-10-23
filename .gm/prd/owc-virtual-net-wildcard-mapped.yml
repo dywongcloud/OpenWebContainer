@@ -1,0 +1,42 @@
+id: owc-virtual-net-wildcard-mapped
+session_id: adv5-fix-http2-net-5
+owner: adv5-fix-http2-net-5
+status: pending
+classification: GUEST
+measured_at: 0379fed435111b08696ea7e3caf09eb7aaf57713 + the hub fix of row owc-virtual-net-ipv6-family (local main)
+subject: 'A server bound to the wildcard (server.listen(0), i.e. ::) accepts an IPv4 client on ::ffff:127.0.0.1 with family IPv6 -- host Node 24.15 -- where this container reports 127.0.0.1 with family IPv4. The client''s own four values (remoteAddress 127.0.0.1/IPv4, localAddress 127.0.0.1/IPv4) and the IPv6 client''s four (::1/IPv6 both ends) agree with the host; only the accepted socket''s view of the connection differs.'
+body: |-
+  OPEN, FILED BY THE REPAIR LANE (adv5-fix-http2-net-5), not fixed: it was not one of the divergences
+  the judge confirmed, and the fix site is wider than the files this shard owns.
+
+  Found while re-witnessing row owc-virtual-net-ipv6-family at HEAD 0379fed + the hub fix, in the same
+  differential (container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, host
+  node 24.15, one process per side, stdout/stderr/exit captured separately, four runs identical):
+
+      const server = net.createServer((s) => { say(s.localAddress + '/' + s.localFamily + ' ' +
+                                               s.remoteAddress + '/' + s.remoteFamily); s.end(); });
+      server.listen(0);                      // address :: family IPv6 on both sides
+      const host = '127.0.0.1';              // and then '::1'
+      const c = net.connect({ port, host, family: host === '::1' ? 6 : 4 });
+      // c's own addresses read at 'connect'
+
+      host node 24.15:  cli 127.0.0.1 remote=127.0.0.1/IPv4 local=127.0.0.1/IPv4
+                        srv local=::ffff:127.0.0.1/IPv6 remote=::ffff:127.0.0.1/IPv6
+                        cli ::1      remote=::1/IPv6      local=::1/IPv6
+                        srv local=::1/IPv6                remote=::1/IPv6
+      container:        cli 127.0.0.1 remote=127.0.0.1/IPv4 local=127.0.0.1/IPv4      (agrees)
+                        srv local=127.0.0.1/IPv4            remote=127.0.0.1/IPv4     (differs)
+                        cli ::1      remote=::1/IPv6        local=::1/IPv6            (agrees)
+                        srv local=::1/IPv6                  remote=::1/IPv6           (agrees)
+
+  The cause: hub.listen() stores address '' for every wildcard, so it cannot tell the IPv6 wildcard
+  '::' from the IPv4 one '0.0.0.0' -- netListenHub() in guest/modules/net.ts maps both to '' before
+  the call -- and hub.connect() then reports the accepted socket's local address as the address that
+  was dialled, which is a v4-mapped IPv6 address on a dual-stack listener and a plain IPv4 address on
+  a 0.0.0.0 one. Faithful output needs the bind family carried from net.listen through the
+  'net.listen' capability (packages/core/src/process/executors/node/runtime/capabilities/net.ts, a
+  file this shard does not own) into hub.listen(), stored on the Listener, and used to map a dialled
+  IPv4 address to '::ffff:<v4>' for an IPv6 wildcard bind. Not edited: the judge confirmed no such
+  divergence and the change would move the addresses every server in this container reports.
+
+  Recorded in Readme.md under "Virtual net".

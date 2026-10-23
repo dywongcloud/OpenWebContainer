@@ -1,34 +1,60 @@
 id: owc-virtual-net-ipv6-family
+title: 'RESOLVED: a TCP connection to a server bound on ::1 is IPv6 on both of its ends -- client remoteFamily/localFamily/remoteAddress/localAddress and the server socket''s own two ends are all ::1/IPv6, byte-identical to host Node 24.15. Filed by the judge (adv5-judge-http2-net-5) as a fix site it did not own; fixed in hub.ts'
 session_id: adv5-judge-http2-net-5
-status: pending
+owner: adv5-fix-http2-net-5
+status: completed
 classification: GUEST
-measured_at: bc261b63d1de325d13a96e3ab29e41aaace0ca13
-subject: 'A TCP client connected to a server bound on ::1 mis-reports its family: container remoteFamily=IPv4 localFamily=IPv4 remoteAddress=127.0.0.1, host Node 24.15 remoteFamily=IPv6 localFamily=IPv6 remoteAddress=::1. Both sides agree the listening address is ::1 / family IPv6, so only the client end is wrong.'
+measured_at: bc261b63d1de325d13a96e3ab29e41aaace0ca13 (judge), 0379fed435111b08696ea7e3caf09eb7aaf57713 + the hub fix below (local main)
+resolved_at: 0379fed435111b08696ea7e3caf09eb7aaf57713 + the hub fix below (local main)
 body: |-
-  OPEN, FILED BY THE JUDGE (adv5-judge-http2-net-5), not fixed: the fix site is
-  packages/core/src/network/virtual/hub.ts, which this shard does not own and which every protocol
-  here goes through, so it is named and not edited.
+  FIXED (adv5-fix-http2-net-5) in packages/core/src/network/virtual/hub.ts, the file the judge named
+  and the one this shard owns. The judge measured the divergence at bc261b6 and left it open only
+  because the hub was outside its shard:
 
-  The cause is in the hub, not in net.ts. hubAddress() folds every loopback name to '127.0.0.1'
-  (hub.ts:511-519), hubDestination() does the same for a connect (hub.ts:521-524), hub.connect()
-  hardcodes the client's local address as '127.0.0.1' and the server's remoteAddress as '127.0.0.1'
-  (hub.ts:240-249) and searches with findEndpoint('tcp', 'IPv4', ...) (hub.ts:204), and hub.listen()
-  defaults family to 'IPv4' because the 'net.listen' capability (capabilities/net.ts:86-93) passes
-  no family at all. net.ts then derives the family from the address string it is handed
-  (netFamilyName, net.ts:104), so it can only report what the hub admitted. Faithful families need
-  the family carried from net.listen/net.connect through the capability into hub.listen/hub.connect,
-  isLocal() widened to accept '::1', and the client's own local address picked per family.
-
-  Differential, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of
-  packages/core, stdout, stderr and exit captured separately:
-
-      const server = net.createServer((sock) => { say('srv remoteFamily=' + sock.remoteFamily); sock.end(); });
+      const server = net.createServer((sock) => { ...; sock.end(); });
       server.listen(0, '::1');
       const c = net.connect({ port: addr.port, host: '::1', family: 6 });
       await once(c, 'connect');
-      say('cli remoteFamily=' + c.remoteFamily + ' localFamily=' + c.localFamily + ' remoteAddress=' + c.remoteAddress);
 
-      host node 24.15:         listen family=IPv6 address=::1
-                               cli remoteFamily=IPv6 localFamily=IPv6 remoteAddress=::1
-      container (HEAD bc261b6): listen family=IPv6 address=::1
-                               cli remoteFamily=IPv4 localFamily=IPv4 remoteAddress=127.0.0.1
+      host node 24.15:         cli remoteFamily=IPv6 localFamily=IPv6 remoteAddress=::1 localAddress=::1
+                               srv remoteFamily=IPv6 remoteAddress=::1 localAddress=::1 localFamily=IPv6
+      container BEFORE:        cli remoteFamily=IPv4 localFamily=IPv4 remoteAddress=127.0.0.1 localAddress=127.0.0.1
+                               srv remoteFamily=IPv4 remoteAddress=127.0.0.1 localAddress=127.0.0.1 localFamily=IPv4
+
+  AFTER, measured on four container runs (/tmp/owc-r4/adv5-fix-http2-net-5/wit.sh, machine load
+  13-26), all four identical to the host and to each other on every value above.
+
+  The cause was the hub folding every loopback to one address before it did anything with it, and the
+  change is that the fold keeps the family:
+   - hubAddress() returned '127.0.0.1' for every name in LOOPBACK_NAMES, '::1' included; it now
+     returns '::1' for '::1' and still returns 127.0.0.1 for 'localhost' and for 127.0.0.1, which is
+     what Node's own lookup of 'localhost' reports here.
+   - isLocal() refused '::1', so a bind on ::1 was EADDRNOTAVAIL; it now accepts it.
+   - listen() defaulted family to 'IPv4' whatever the address, and net.listen passes no family at all
+     (capabilities/net.ts, not this shard's file); it now derives the family from the address when
+     the caller names none, so a '::1' bind is an IPv6 listener. dgram's bind already passed its own
+     family and is unchanged.
+   - connect() hardcoded the client's local address and the server's remoteAddress as '127.0.0.1' and
+     searched with findEndpoint('tcp', 'IPv4', ...); the family now follows the destination, so a
+     connect to '::1' is an IPv6 socket whose own address and whose peer's view of it are both '::1'.
+     A wildcard listener accepts on the address that was dialled, so '::' accepts an IPv6 client on
+     ::1 and an IPv4 one on 127.0.0.1.
+
+  No regression, measured in the same runs: HTTP/1.1 (200 and body), HTTP/2 over the same hub (200
+  and body), dgram udp4 on 127.0.0.1 and udp6 on ::1 both delivering their datagram with the right
+  rinfo family, a connect to 'localhost' against a server bound on 127.0.0.1 (falls back to
+  127.0.0.1/IPv4 after ::1 is refused, as the host does) and against a wildcard one (connects on
+  ::1/IPv6), and a connect to '::1' against a server bound on 127.0.0.1, which is ECONNREFUSED on
+  both sides now and was a silent cross-family connect before. `npx tsc --noEmit` clean in
+  packages/core for the file touched (the only error left in the project is capabilities/crypto.ts,
+  another lane's file). `pnpm build` could not be run to completion: another lane's
+  src/shell/commands/builtins.ts was mid-write and unparseable at the time.
+
+  STILL DIVERGES, FILED SEPARATELY (not confirmed by the judge, so not edited): the wildcard case.
+  A server bound to '::' accepts an IPv4 client on ::ffff:127.0.0.1/IPv6 on host Node 24.15 and
+  reports 127.0.0.1/IPv4 in this container -- the client's own four values agree on both sides. The
+  hub cannot tell a '::' wildcard bind from a '0.0.0.0' one because both reach it as '', so the fix
+  needs the bind family carried from net.listen through the capability this shard does not own
+  (row owc-virtual-net-wildcard-mapped).
+
+  Recorded in Readme.md under "Virtual net".
