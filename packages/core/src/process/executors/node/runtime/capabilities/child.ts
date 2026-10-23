@@ -441,6 +441,10 @@ function executableOf(file: string): string {
  * it was required.
  */
 function spawnExecutableOf(ctx: CapabilityContext, file: string, env: Record<string, string>, cwd: string): string {
+    /* The path the container's own shell is known by -- `/bin/sh`, the path a host's node runs an
+       `exec` through and the one a program that shells out by absolute path names. It is the shell
+       itself on a host, so here it names the executor and not a file: see `shellPathOf`. */
+    if (shellPathOf(ctx, file, env, cwd)) return 'sh';
     /* `sh` and `node` are the container's own executors and are named as they are, never by a path;
        `npm` and `npx` are the npm process, which PATH also has an entry for and which has to stay
        that process -- a spawn of it as a file would run the shell's npm, which refuses everywhere
@@ -454,6 +458,42 @@ function spawnExecutableOf(ctx: CapabilityContext, file: string, env: Record<str
     const interpreter = shebangInterpreter(ctx.fileSystem, found);
     return interpreter === 'node' || interpreter === 'sh' || interpreter === 'bash' ? found : file;
 }
+
+/**
+ * True when `file` is a path this container's own shell stands at, so the path names the shell and
+ * not a file to run.
+ *
+ * The file system keeps a stand-in at /bin/sh: a file whose whole content is a shebang naming the
+ * shell. A spawn of that path ran the stand-in *as a script* -- `sh /bin/sh -c <line>` runs no
+ * command at all -- so the child closed 0 with empty stdout, empty stderr and no error, and every
+ * `exec()` silently succeeded while `execSync`, which names the shell to the dispatcher, ran its
+ * line. The shell is not a file a host reads there: it *is* the shell, which is what the path has
+ * to mean. `/bin/ls` is a stand-in of the same shape with `ls "$@"` behind its shebang and stays a
+ * script; only a file with nothing behind the shebang is the shell.
+ */
+function shellPathOf(ctx: CapabilityContext, file: string, env: Record<string, string>, cwd: string): boolean {
+    if (!file.startsWith('/') || file.split('/').pop() !== 'sh') return false;
+    if (!SHELL_DIRECTORIES.some((directory) => file === `${directory}/sh`)
+        && resolveOnPath({ ctx, cwd, env, input: null, lastStatus: 0 }, 'sh') !== file) {
+        return false;
+    }
+    let content: string | undefined;
+    try {
+        content = ctx.fileSystem.readFile(ctx.fileSystem.normalizePath(file));
+    } catch {
+        return false;
+    }
+    if (content === undefined) return false;
+    const line = content.split('\n')[0] ?? '';
+    if (content.slice(line.length).trim() !== '') return false;
+    const shebang = /^#!(.*)/.exec(line);
+    if (shebang === null) return false;
+    const interpreter = shebang[1].trim().split(/\s+/).filter((token) => token !== '')[0];
+    return interpreter !== undefined && interpreter.split('/').pop() === 'sh';
+}
+
+/** The directories a host's `sh` stands in, whichever of them this container's PATH happens to hold. */
+const SHELL_DIRECTORIES = ['/bin', '/usr/bin', '/sbin', '/usr/sbin'];
 
 /** The names the container runs itself, so a spawn of one is never rewritten into a file on PATH. */
 const CONTAINER_EXECUTABLES = new Set(['node', 'npm', 'npx', 'sh', 'bash']);

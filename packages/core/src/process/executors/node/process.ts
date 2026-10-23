@@ -1222,6 +1222,12 @@ export class NodeProcess extends Process {
         let code = 1;
         try {
             if (this.flagAnswer === undefined) {
+                /* What is left of the bound the process that started this one runs under: a shell
+                   hands its command line to a child and then only waits, so the child is what holds
+                   the host thread, and the caller's `timeout` is what has to end it -- see
+                   `ShellProcess.killDeadlineLeft`. */
+                const inherited = this.deadlineFromParent();
+                if (inherited !== undefined) this.armKillDeadline(inherited.ms, inherited.signal);
                 this.claimParentTerminal();
                 const entryPath = await this.bootGuest();
                 this.installRunOptions();
@@ -1254,6 +1260,23 @@ export class NodeProcess extends Process {
             this._exitCode = code;
             this._state = code === 0 ? ProcessState.COMPLETED : ProcessState.FAILED;
         }
+    }
+
+    /**
+     * What is left of the bound the process that started this one runs under, for a parent that only
+     * hands a command line on -- a shell -- and waits while a child of it runs that line.
+     *
+     * A bound put on such a parent ends nothing by itself: the parent is idle in an await and the
+     * guest holding the host thread is the child, so the only thing that can interrupt it is the
+     * child's own interrupt handler. The bound is one wall-clock moment for the whole line, so what
+     * travels is what is left of it, and a line of several commands shares one deadline.
+     */
+    private deadlineFromParent(): { ms: number; signal: string } | undefined {
+        if (this.parentPid === undefined) return undefined;
+        const parent = processOf(this.parentPid) as (Process & {
+            killDeadlineLeft?: () => { ms: number; signal: string } | undefined;
+        }) | undefined;
+        return typeof parent?.killDeadlineLeft === 'function' ? parent.killDeadlineLeft() : undefined;
     }
 
     /**
