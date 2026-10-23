@@ -4983,7 +4983,186 @@ BF.module = function () {
     }
     return tsStripTypes(code);
   };
-  return Module;
+
+  /*
+   * Node's own instance surface, which the constructor in loader.ts does not carry. There 'parent'
+   * is a field the constructor owns; on a host it is an accessor on the prototype, so a module
+   * stores the one it was given without owning a key for it. 'isPreloading' is a getter answering
+   * false -- a CJS graph this loader walks has no preload phase to be inside. row
+   * owc-module-export-table-incomplete.
+   */
+  var moduleParents = typeof WeakMap === 'function' ? new WeakMap() : null;
+  Object.defineProperty(Module.prototype, 'parent', {
+    get: function getParent() {
+      return moduleParents === null ? undefined : moduleParents.get(this);
+    },
+    set: function setParent(value) {
+      if (moduleParents !== null) moduleParents.set(this, value);
+    },
+    enumerable: false, configurable: false
+  });
+  Object.defineProperty(Module.prototype, 'isPreloading', {
+    get: function getIsPreloading() { return false; },
+    enumerable: false, configurable: false
+  });
+
+  /* The require of a module of one's own: makeRequire is the loader's local, so this is the same
+     four keys over the module handed in -- resolve, main, extensions and cache -- with a request
+     resolved from the module's own directory. */
+  function requireForModule(mod) {
+    var req = function requireOf(id) { return Module.prototype.require.call(mod, id); };
+    req.resolve = function resolveOf(id) {
+      if (typeof id === 'string' && Module.isBuiltin(id)) return String(id);
+      var found = host.resolve(String(id), mod.path, 'require');
+      if (!found) throw notFoundError(id, mod.path, mod);
+      return found;
+    };
+    /* resolve.paths: the folders a bare request is looked for in, which is the module's own
+       node_modules chain followed by the global folders -- the list _resolveLookupPaths builds,
+       and null for a built-in, which has no folders to be looked for in. */
+    req.resolve.paths = function pathsOf(request) {
+      if (typeof request !== 'string') {
+        var badRequest = new TypeError('The "request" argument must be of type string. Received '
+          + receivedTypeOf(request));
+        badRequest.code = 'ERR_INVALID_ARG_TYPE';
+        throw badRequest;
+      }
+      return Module._resolveLookupPaths(request, mod);
+    };
+    req.main = mainModule;
+    req.extensions = Module._extensions;
+    req.cache = Module._cache;
+    return req;
+  }
+
+  /*
+   * load and _compile are the two halves of what the loader otherwise does with copies of its own:
+   * load names the file, builds the module's paths and hands the file to the extension handler,
+   * and _compile runs node's wrapper over a string a caller already holds.
+   */
+  Module.prototype.load = function load(filename) {
+    var pathForLoad = requireBuiltin('path');
+    this.filename = filename;
+    this.paths = Module._nodeModulePaths(pathForLoad.dirname(filename));
+    var extension = pathForLoad.extname(filename);
+    if (!Object.prototype.hasOwnProperty.call(Module._extensions, extension)) extension = '.js';
+    /* Node reads the file itself, so a path that is not there is ENOENT out of open(2) and not the
+       MODULE_NOT_FOUND a resolve that found nothing gives: the two are different errors there. */
+    if (host.readText(filename) === null) {
+      var noFile = new Error('ENOENT: no such file or directory, open \'' + filename + '\'');
+      noFile.code = 'ENOENT';
+      noFile.errno = -2;
+      noFile.syscall = 'open';
+      noFile.path = filename;
+      throw noFile;
+    }
+    Module._extensions[extension](this, filename);
+    this.loaded = true;
+    return undefined;
+  };
+  Module.prototype._compile = function compile(content, filename) {
+    var vmForCompile = requireBuiltin('vm');
+    var pathForCompile = requireBuiltin('path');
+    /* It does not name the module's file -- that is load()'s job -- so a caller of _compile alone
+       leaves filename and loaded as they were, exactly as one does on a host. */
+    var wrapper = vmForCompile.runInThisContext(Module.wrap(String(content)), { filename: filename });
+    wrapper.call(this.exports, this.exports, requireForModule(this), this, filename,
+      pathForCompile.dirname(filename));
+    return undefined;
+  };
+
+  /* createRequire hands out a require with no resolve.paths on it (the site is makeRequire and
+     createRequireFor in loader.ts, which is outside this grant); the require it builds resolves
+     from the file it was given, so the parent a lookup reads paths off is that file's own. */
+  var createRequireInner = Module.createRequire;
+  Module.createRequire = function createRequire(filename) {
+    var req = createRequireInner(filename);
+    var base = typeof filename === 'string' && filename.indexOf('file://') === 0
+      ? decodeURIComponent(filename.slice(7)) : String(filename);
+    var parentForPaths = {
+      id: base, filename: base, path: dirnameOf(base),
+      paths: Module._nodeModulePaths(dirnameOf(base))
+    };
+    req.resolve.paths = function pathsOf(request) {
+      if (typeof request !== 'string') {
+        var badRequest = new TypeError('The "request" argument must be of type string. Received '
+          + receivedTypeOf(request));
+        badRequest.code = 'ERR_INVALID_ARG_TYPE';
+        throw badRequest;
+      }
+      return Module._resolveLookupPaths(request, parentForPaths);
+    };
+    /* The order node's own makeRequire leaves on the require: resolve first, then main, extensions
+       and cache. The loader's local builds the same four the other way about, and the order is what
+       Object.keys(require) of one a caller asked for reads. */
+    var cacheOf = req.cache;
+    var mainOf = req.main;
+    var extensionsOf = req.extensions;
+    delete req.cache;
+    delete req.main;
+    delete req.extensions;
+    req.main = mainOf;
+    req.extensions = extensionsOf;
+    req.cache = cacheOf;
+    return req;
+  };
+
+  /*
+   * The class require('module') hands out. It carries the same prototype and the same statics as the
+   * loader's own Module -- the loader keeps that one, and fills a module's file name and its
+   * node_modules list in it, which is what it resolves from -- but it builds a module the way node's
+   * constructor does: a module names its file and builds its paths in load(), so one that has only
+   * been constructed answers null for the first and has no key at all for the second. The keys it
+   * does own are node's own six, in node's own order.
+   */
+  function ModuleOf(filename, parent) {
+    var built = new Module(
+      arguments.length > 0 && filename !== undefined ? String(filename) : '', parent);
+    var idOf = built.id;
+    var pathOf = built.path;
+    var exportsOf = built.exports;
+    var loadedOf = built.loaded;
+    var childrenOf = built.children;
+    delete built.id;
+    delete built.path;
+    delete built.exports;
+    delete built.filename;
+    delete built.loaded;
+    delete built.children;
+    delete built.paths;
+    built.id = idOf;
+    built.path = pathOf;
+    built.exports = exportsOf;
+    built.filename = null;
+    built.loaded = loadedOf;
+    built.children = childrenOf;
+    return built;
+  }
+  var moduleStatics = Object.getOwnPropertyNames(Module);
+  for (var msAt = 0; msAt < moduleStatics.length; msAt++) {
+    var staticName = moduleStatics[msAt];
+    if (staticName === 'prototype' || staticName === 'name' || staticName === 'length') continue;
+    Object.defineProperty(ModuleOf, staticName, Object.getOwnPropertyDescriptor(Module, staticName));
+  }
+  ModuleOf.prototype = Module.prototype;
+  /* Node's own descriptor for it: a getter, so require('module').prototype.constructor is the class
+     require('module') handed out and not the loader's own, and neither writable nor enumerable. */
+  Object.defineProperty(Module.prototype, 'constructor', {
+    get: function getConstructor() { return ModuleOf; },
+    enumerable: false, configurable: false
+  });
+  Object.defineProperty(ModuleOf, 'name', { value: 'Module', writable: false, configurable: true });
+  Object.defineProperty(ModuleOf, 'length', { value: 0, writable: false, configurable: true });
+  /* The self-reference node carries: require('module').Module is the class itself. */
+  ModuleOf.Module = ModuleOf;
+  /* _initPaths fills the static on the loader's own Module, so the copy is filled from it. */
+  var initPathsInner = ModuleOf._initPaths;
+  ModuleOf._initPaths = function _initPaths() {
+    var answer = initPathsInner();
+    ModuleOf.globalPaths = Module.globalPaths;
+    return answer;
+  };
+  return ModuleOf;
 };
 
 /* node:sys is util under another name: node's own sys module is a deprecation shim over it, so the
