@@ -124,6 +124,13 @@ export interface ShellVar {
      * `declare -i n=1; n=n+1` leaves a `n` of 2, where a name without it holds the text `n+1`.
      */
     integer?: boolean;
+    /**
+     * Declared and not assigned: `local x` and `declare x` name a variable a read of it finds
+     * unset -- `f() { local x; echo "[${x-unset}]"; }; x=out; f` is a host's `[unset]`, where
+     * making the name hold the empty string answered `[]` for it. The name is there, so an
+     * assignment behind the declaration is one the declaration's own scope takes.
+     */
+    declared?: boolean;
 }
 
 /** The element list `declare -p` and `readonly -p` print for an array: `([0]="1" [1]="2")`. */
@@ -717,7 +724,12 @@ function getVar(state: ShellState, name: string): string | undefined {
         return undefined;
     }
     const scope = lookupScope(state, name);
-    if (scope) return scope.get(name)?.value;
+    if (scope) {
+        const variable = scope.get(name);
+        /* A name a declaration made and no assignment filled in is one a read finds unset. */
+        if (variable !== undefined && variable.declared === true && variable.value === '') return undefined;
+        return variable?.value;
+    }
     if (name === 'PWD') return state.cwd;
     if (name === 'OLDPWD') return state.dirs[1];
     /* `LINENO` is the line the shell stands on, which a host counts from the line it was handed --
@@ -742,8 +754,23 @@ function isSet(state: ShellState, name: string): boolean {
     return getVar(state, name) !== undefined;
 }
 
+/**
+ * The key an assignment to a subscripted name writes, which is the one a read of the same
+ * subscript asks for: the subscript is the arithmetic expression a host reads it as, so `m[k]=v`
+ * behind an unset `k` writes `m[0]` -- the one element a host's 3.2 keeps, which has no
+ * associative array -- and `${m[k]}` then reads the `v` back, where writing the text `m[k]` left
+ * every read of it asking after a name nothing had been assigned to.
+ */
+function subscriptKey(state: ShellState, name: string): string {
+    const subscripted = ARRAY_RE.exec(name);
+    if (subscripted === null || subscripted[2] === '@' || subscripted[2] === '*') return name;
+    if (/^-?[0-9]+$/.test(subscripted[2])) return name;
+    return `${subscripted[1]}[${evalSubscript(state, subscripted[1], subscripted[2])}]`;
+}
+
 /** Assigns to the nearest scope already holding `name`, else the outermost (global) one. */
-function setVar(state: ShellState, name: string, value: string): boolean {
+export function setVar(state: ShellState, name: string, value: string): boolean {
+    name = subscriptKey(state, name);
     /* A bare assignment is one a host makes in the outermost scope and not in the function it stands
        in: `f() { x=9; }; f; echo $x` prints `9`, and `x` is still there behind the call, where
        making it a variable of the function's own scope left the name empty behind it. Only `local`
@@ -752,6 +779,9 @@ function setVar(state: ShellState, name: string, value: string): boolean {
     const scope = lookupScope(state, name) ?? state.scopes[0];
     const existing = scope.get(name);
     if (existing?.readonly) return false;
+    /* The name a bare `local x` declared is a name this assignment fills in, so it reads as set
+       from here on: `f() { local x; x=1; echo "[${x-unset}]"; }; f` is a host's `[1]`. */
+    if (existing !== undefined && existing.declared === true) existing.declared = false;
     /* The integer attribute `declare -i` set: the value assigned is arithmetic, so `n=n+1` behind
        a `declare -i n=1` leaves 2 and not the text `n+1`. A name the attribute was not set on keeps
        its text, and one whose value is not an expression keeps that too -- `declare -i n; n=x` is 0
@@ -1347,6 +1377,50 @@ function arithDiagnostic(state: ShellState, expression: string, error: ArithErro
     return `${plainPrefix(state)}${at}${text}: ${error.message}${token}`;
 }
 
+/**
+ * Where a quote stands in the text of an arithmetic *substitution*, or -1 where none does.
+ *
+ * A quote inside `$(( ))` is one a host leaves in the text it evaluates, so `echo $(( "3" + 1 ))`
+ * is its `sh: "3" + 1 : syntax error: operand expected (error token is ""3" + 1 ")` and 127,
+ * where taking the quotes off the expression first made it the 4 a `3 + 1` is. The arithmetic
+ * *command* is the other way round -- `(( "0" ))` is the false an `(( 0 ))` is -- which is why
+ * the substitution is the one this is asked about. A quote inside a substitution it carries is
+ * no part of the expression and is passed over.
+ */
+function bareQuoteAt(text: string): number {
+    let i = 0;
+    while (i < text.length) {
+        const ch = text[i];
+        if (ch === '\\') {
+            i += 2;
+            continue;
+        }
+        if (ch === '$' && text[i + 1] === '(') {
+            let depth = 0;
+            i += 2;
+            for (; i < text.length; i++) {
+                if (text[i] === '(') depth++;
+                else if (text[i] === ')') {
+                    if (depth === 0) {
+                        i++;
+                        break;
+                    }
+                    depth--;
+                }
+            }
+            continue;
+        }
+        if (ch === '`') {
+            const end = text.indexOf('`', i + 1);
+            i = end === -1 ? text.length : end + 1;
+            continue;
+        }
+        if (ch === '"' || ch === "'") return i;
+        i++;
+    }
+    return -1;
+}
+
 /* ================================================================== *
  * 4. Words and the parser
  * ================================================================== */
@@ -1451,6 +1525,13 @@ class ShellSyntaxError extends Error {
      * line from the construct rather than from the end of the input: see `readArithCommand`.
      */
     reportedLine: number | undefined;
+    /**
+     * Where the line a host echoes behind the report starts, where it is not the start of the line
+     * `at` stands on. A host echoes the command it was reading and not the line it stands on, and
+     * the command a `((` that turned out to be two subshells leaves it reading starts behind the
+     * first `(`: `((1+(2))` is reported with `(1+(2))` behind it and not with the whole line.
+     */
+    echoFrom: number | undefined;
     constructor(message: string, readonly reports: string[] = []) {
         super(message);
         this.name = 'ShellSyntaxError';
@@ -1473,6 +1554,15 @@ class BadSubstitutionError extends Error {
     constructor(readonly raw: string, readonly word?: string) {
         super(word ?? raw);
     }
+}
+
+/**
+ * A negative length in a substring: `v=hello; echo ${v:1:-1}` and `a=(x y z); echo ${a[@]:1:-1}`
+ * are both `sh: -1: substring expression < 0` on a host, with the status 1 a line that will not
+ * expand leaves and nothing behind it -- the `echo rc=$?` written after one never runs.
+ */
+class SubstringError {
+    constructor(readonly detail: string, readonly status: number) {}
 }
 
 class BreakSignal {
@@ -1511,6 +1601,13 @@ function parseVarRefBody(body: string): VarRef {
         if (/^[@*#?]$/.test(rest)) return { raw, name: rest, op: 'len', arg: '' };
         const arrayAll = /^([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]$/.exec(rest);
         if (arrayAll) return { raw, name: `${arrayAll[1]}[@]`, op: 'len', arg: '' };
+        /* `${#a[@]:1}` is the number of elements the array holds and not the length of the slice
+           behind the colon: a host's 3.2 reads the name and the `[@]` and stops there, so
+           `a=(x y z); echo ${#a[@]:1}` is its `3` -- the count -- where slicing first and asking
+           for the length of what was left answered an empty word. The offset and the length are
+           read no further, whichever they are: `${#a[@]:1:2}` is the same 3. */
+        const sliced = /^([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]:/.exec(rest);
+        if (sliced) return { raw, name: `${sliced[1]}[@]`, op: 'len', arg: '' };
         /* `${#a[1]}` is the length of the one element, as `${#a[@]}` is the number of them:
            `a=(x y z); echo ${#a[1]}` is a host's `1`, where reading the `1` as part of a name
            nothing was assigned to answered an empty word. */
@@ -1847,6 +1944,8 @@ class Parser {
         this.keepParens = keepParens;
     }
 
+    /** Set where a `((` was taken for the two subshells it is: the index of its first `(`. */
+    private parenRewind: number | undefined;
     private src: string;
     private readonly state: ShellState | null;
 
@@ -1859,7 +1958,10 @@ class Parser {
                and not the whole script. The outermost parse is the last to see the error, and it
                is the one whose `pos` is measured against the script a caller handed over -- an
                inner parse of a substitution measures against its own shorter source. */
-            if (error instanceof ShellSyntaxError) error.at = this.pos;
+            if (error instanceof ShellSyntaxError) {
+                error.at = this.pos;
+                if (this.parenRewind !== undefined) error.echoFrom = this.parenRewind + 1;
+            }
             throw error;
         }
     }
@@ -2032,19 +2134,24 @@ class Parser {
         return { closeAt, end: i };
     }
 
-    private readArithCommand(openAt: number): string {
+    private readArithCommand(openAt: number): string | null {
         const start = this.pos;
-        const { closeAt, end } = this.scanArithClose();
+        const { closeAt } = this.scanArithClose();
         if (this.src[closeAt + 1] !== ')') {
-            /* Where the parser stood when it gave up, so the report names the line the `((` stands
-               on and not the one the end of the input stands on. */
+            /* Where the `))` never comes a host does not evaluate what it read: it takes the `((`
+               for the two nested subshells they were written as, and reports what *those* come
+               to. `((1) )` is `( (1) )`, which runs `1` as a command and reports it as not found;
+               `((a) || ((b)))` is `( (a) || ((b)) )`, the false a `b` nothing was assigned to is;
+               and `((1+(2))` is the `(1+(2))` a host names `syntax error near unexpected token
+               `2'' for. Refusing the script here instead gave every one of them the same
+               `syntax error: unexpected end of file` and a status of 2.
+
+               Null, and the parser is put back in front of the first `(`: it is the subshell it
+               opens that is read, and the one it holds is read behind it. */
             this.pos = openAt;
-            if (closeAt === -1) throw new ShellSyntaxError("unexpected EOF while looking for matching `)'");
-            const tail = this.src.slice(closeAt + 1);
-            const error = new ShellSyntaxError('syntax error: unexpected end of file');
-            error.reportedLine = lineIndexOf(this.src, openAt) + 1 + (tail === '' || tail.includes('\n') ? 1 : 0);
-            throw error;
+            return null;
         }
+        const { end } = this.scanArithClose();
         this.pos = end;
         return this.src.slice(start, closeAt);
     }
@@ -2057,12 +2164,21 @@ class Parser {
      * `unexpected EOF while looking for matching `)'' and then the end of file -- where reading the
      * expression as complete evaluated `1+)` and printed its operand error.
      */
-    private readArithSubstitution(openAt: number): string {
+    private readArithSubstitution(openAt: number): string | null {
         const start = this.pos;
         const { closeAt, end } = this.scanArithClose();
         if (this.src[closeAt + 1] !== ')') {
-            this.pos = openAt;
-            throw new ShellSyntaxError("unexpected EOF while looking for matching `)'");
+            /* A `)` that is not one of a `))` is no close for the substitution either: a host takes
+               the `$(` for the command substitution it is and the `(` behind it for the subshell
+               it opens, so `echo $((1+2) )` is its `1+2: command not found` and an empty line,
+               where refusing the script gave two reports and a status of 2. Null, and the parser
+               is put back behind the `$(` for the caller to read it as one.
+
+               A `)` that never came at all is the end of file a host does report, and it stays
+               one: `echo $((1+)` is still the two lines it was written as. */
+            if (closeAt === -1) throw new ShellSyntaxError("unexpected EOF while looking for matching `)'");
+            this.pos = openAt + 2;
+            return null;
         }
         this.pos = end;
         return this.src.slice(start, closeAt);
@@ -2237,7 +2353,11 @@ class Parser {
         if (next === '(') {
             if (this.src[this.pos + 1] === '(') {
                 this.pos += 2;
-                return { t: 'arith', expr: this.readArithSubstitution(dollarAt) };
+                const expr = this.readArithSubstitution(dollarAt);
+                if (expr !== null) return { t: 'arith', expr };
+                /* The `))` never came: what stands behind the `$(` is the command substitution a
+                   host reads there, subshell and all. */
+                return { t: 'cmd', script: this.readCommandSubst() };
             }
             this.pos++;
             return { t: 'cmd', script: this.readCommandSubst() };
@@ -2616,11 +2736,36 @@ class Parser {
             if (this.atTerminator(terminators)) break;
             const rest = this.src.slice(this.pos).trim();
             if (rest !== '') {
-                throw new ShellSyntaxError(`syntax error near unexpected token \`${rest.split(/[\s;]/)[0]}'`);
+                throw new ShellSyntaxError(`syntax error near unexpected token \`${this.unexpectedToken(rest, nodes[nodes.length - 1])}'`);
             }
             break;
         }
         return nodes;
+    }
+
+    /**
+     * The token a host names where a command list wanted an operator, or the end of the input.
+     *
+     * A `(` behind exactly one word is the `(` of the function definition a host tries to read
+     * there, and what it names is the token standing behind *that* and not the brace itself:
+     * `badsyntax (x)` is `unexpected token `x'', a `badsyntax (` the input ends behind is the
+     * `newline` it ends on, and `(1+(2))` -- the `1+` a name was read as, and the `2` behind the
+     * `(` no `)` stands in front of -- is `2`. Behind two words there is no definition to try and
+     * the `(` is what is named: `echo ((1+1))` and `(1 + (2))` are both `unexpected token `(''.
+     *
+     * Anything else is the whole word standing there -- `for x in a; echo hi; done` names `echo`
+     * and not the `do` it wanted -- and `newline` where the line or the input ends.
+     */
+    private unexpectedToken(rest: string, last: Node | undefined): string {
+        if (!rest.startsWith('(')) return rest.split(/[\s;]/)[0] || 'newline';
+        const command = last?.commands[last.commands.length - 1];
+        const words = command !== undefined && command.t === 'simple' ? command.words : undefined;
+        if (words === undefined || words.length !== 1) return '(';
+        const behind = rest.slice(1).trim();
+        if (behind === '') return 'newline';
+        if (behind.startsWith('(')) return '(';
+        const word = /^[^\s;()|&<>\n'"`]+/.exec(behind);
+        return word === null ? '(' : word[0];
     }
 
     private parsePipelineWithOp(op: '&&' | '||' | null): Node {
@@ -2680,7 +2825,10 @@ class Parser {
             const openAt = this.pos;
             this.pos += 2;
             const expr = this.readArithCommand(openAt);
-            return { t: 'arithcmd', expr, redirects: this.readRedirects(), line };
+            /* Null where the `))` never came: the `(` arm below is what reads it now, and the `((`
+               behind it, so `((1) )` is the subshell holding a subshell a host runs `1` in. */
+            if (expr !== null) return { t: 'arithcmd', expr, redirects: this.readRedirects(), line };
+            this.parenRewind = openAt;
         }
         if (ch === '(') {
             this.pos++;
@@ -2905,7 +3053,13 @@ class Parser {
             // the source span keeps the quoting that rawText strips: `x='a b'` is one assignment
             const raw = this.src.slice(start, this.pos);
             if (!sawCommandWord) {
-                if (RESERVED_WORDS.has(text)) throw new ShellSyntaxError(`syntax error near unexpected token \`${text}'`);
+                /* `]]` where a command should stand is the close of a `[[` nothing opened, and a host
+               refuses the line rather than looking the word up: `echo a` newline `]]` is its
+               `syntax error near unexpected token `]]'' and 2, where running `]]` as a command
+               answered `]]: command not found` and 127. An argument is never one of these --
+               `echo ]]` prints `]]` -- so only the word a command opens with is asked about. */
+            if (text === ']]') throw new ShellSyntaxError("syntax error near unexpected token `]]'");
+            if (RESERVED_WORDS.has(text)) throw new ShellSyntaxError(`syntax error near unexpected token \`${text}'`);
                 /* A compound assignment `a=(x y z)`, `a=([2]=c)` and `a+=(w)`: the `(` stands where
                    an ordinary assignment's value would, and the words between the parens are the
                    elements of the array it makes. Read as text, `a=(x y z)` was the syntax error
@@ -3051,6 +3205,10 @@ class Parser {
             const openAt = this.pos;
             this.pos += 2;
             const expr = this.readArithCommand(openAt);
+            /* Behind a `for` the `((` is arithmetic whatever stands in it, so a `))` that never
+               comes is the end of file a host reports and not the subshell a bare `((` falls back
+               to: `for ((1) )` is `syntax error: unexpected end of file` and 2. */
+            if (expr === null) throw new ShellSyntaxError('syntax error: unexpected end of file');
             this.skipSpace(true);
             if (this.here() === ';') this.pos++;
             const tail = this.parseForTail();
@@ -3217,44 +3375,55 @@ class Parser {
  * "expanded to one word".
  */
 function braceExpand(text: string): string[] | null {
-    let depth = 0;
-    let open = -1;
-    for (let i = 0; i < text.length; i++) {
-        const ch = text[i];
+    /* The group a host takes is the first `{` whose own `}` closes it *and* whose body holds a
+       comma or a range of its own -- the alternatives it can split on. One that fails either test
+       is text, and the scan goes on *behind* its `{`, which is how a group nested in it is still
+       found: `{a{b,c}d}` is a host's `{abd} {acd}`, the inner group expanded and the braces
+       around it left as they were written, and `{{c,d}` is its `{c {d`, the outer brace never
+       closed and so no part of either. Taking the outermost group whatever its body held made
+       both the text they were written as. */
+    for (let open = 0; open < text.length; open++) {
+        const ch = text[open];
         if (ch === ESCAPED_BRACE) {
-            i++;
+            open++;
             continue;
         }
         if (ch === '\\') {
-            i++;
+            open++;
             continue;
         }
-        if (ch === '{') {
-            if (depth === 0) open = i;
-            depth++;
-            continue;
-        }
-        if (ch !== '}') continue;
-        depth--;
-        if (depth < 0) {
+        if (ch !== '{') continue;
+        let depth = 0;
+        let close = -1;
+        for (let i = open; i < text.length; i++) {
+            const at = text[i];
+            if (at === ESCAPED_BRACE) continue;
+            if (at === '\\') {
+                i++;
+                continue;
+            }
+            if (at === '{') {
+                depth++;
+                continue;
+            }
+            if (at !== '}') continue;
+            depth--;
+            if (depth === 0) {
+                close = i;
+                break;
+            }
             /* A `}` with no `{` behind it is text -- `echo x}` prints `x}` -- and not the close of
                a group the loop will look for later. */
-            depth = 0;
-            open = -1;
-            continue;
+            if (depth < 0) depth = 0;
         }
-        if (depth > 0) continue;
-        if (open < 0) continue;
-        const parts = splitBraceBody(text.slice(open + 1, i));
+        if (close === -1) continue;
+        const parts = splitBraceBody(text.slice(open + 1, close));
         /* Neither a comma nor a range is not a brace group: `echo {a}` is the text `{a}`. A range
            that comes to one value *is* one -- `echo {1..1}` prints `1` and `echo {a..a}` prints
            `a`, where the text itself was what came out before. */
-        if (parts === null) {
-            open = -1;
-            continue;
-        }
+        if (parts === null) continue;
         const prefix = text.slice(0, open);
-        const suffix = text.slice(i + 1);
+        const suffix = text.slice(close + 1);
         const out: string[] = [];
         for (const part of parts) {
             /* An alternative may hold a brace group of its own -- `{a,{b,c}}` is `a b c` -- and the
@@ -3514,7 +3683,11 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
         ? (ref.arg.startsWith('#') ? '#' : ref.arg.startsWith('%') ? '%' : '')
         : '';
     const rawArg = anchor === '' ? ref.arg : ref.arg.slice(1);
-    const arg = rawArg === '' ? '' : expandToString(modifierText(rawArg), state);
+    /* The offset and length of a substring are arithmetic expressions, and the parentheses one is
+       written in belong to the expression and not to the word around it: `v=hello; echo ${v:(-2)}`
+       is a host's `lo`, where a lexing that stopped at the `(` asked for the offset nothing
+       stands behind and gave the whole of `hello`. */
+    const arg = rawArg === '' ? '' : expandToString(ref.op === 'substr' ? arithText(rawArg) : modifierText(rawArg), state);
     switch (ref.op) {
         case '':
             if (value !== undefined) return value;
@@ -3529,6 +3702,12 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
             const text = value ?? '';
             let offset = evalArith(state, parts[0] === undefined || parts[0] === '' ? '0' : parts[0]);
             const length = parts[1] === undefined ? undefined : evalArith(state, parts[1]);
+            /* A length behind the start is one a host will not take: `v=hello; echo ${v:1:-1}` is
+               `sh: -1: substring expression < 0` and 1, with nothing behind it, where a slice of
+               a negative number of characters was the empty word and a status of 0. */
+            if (length !== undefined && length < 0) {
+                throw new SubstringError(`${plainPrefix(state)}${length}: substring expression < 0\n`, 1);
+            }
             if (offset < 0) offset = Math.max(text.length + offset, 0);
             return length === undefined ? text.slice(offset) : text.slice(offset, offset + length);
         }
@@ -3606,7 +3785,11 @@ function arrayElementsFor(state: ShellState, name: string, ref: VarRef): string[
         ? (ref.arg.startsWith('#') ? '#' : ref.arg.startsWith('%') ? '%' : '')
         : '';
     const rawArg = anchor === '' ? ref.arg : ref.arg.slice(1);
-    const arg = rawArg === '' ? '' : expandToString(modifierText(rawArg), state);
+    /* The offset and length of a substring are arithmetic expressions, and the parentheses one is
+       written in belong to the expression and not to the word around it: `v=hello; echo ${v:(-2)}`
+       is a host's `lo`, where a lexing that stopped at the `(` asked for the offset nothing
+       stands behind and gave the whole of `hello`. */
+    const arg = rawArg === '' ? '' : expandToString(ref.op === 'substr' ? arithText(rawArg) : modifierText(rawArg), state);
     switch (ref.op) {
         case 'len':
             return [String(elements.length)];
@@ -3614,6 +3797,12 @@ function arrayElementsFor(state: ShellState, name: string, ref: VarRef): string[
             const parts = arg.split(':');
             let offset = evalArith(state, parts[0] === undefined || parts[0] === '' ? '0' : parts[0]);
             const length = parts[1] === undefined ? undefined : evalArith(state, parts[1]);
+            /* The same refusal behind an array: `a=(x y z); echo ${a[@]:1:-1}` is a host's
+               `sh: -1: substring expression < 0` and 1, where a slice of a negative number of
+               elements was the empty word and a status of 0. */
+            if (length !== undefined && length < 0) {
+                throw new SubstringError(`${plainPrefix(state)}${length}: substring expression < 0\n`, 1);
+            }
             /* A negative offset counts back from the end, as it does for a string: `a=(x y z);
                echo ${a[@]: -2}` is a host's `y z`, and one behind the start is the start. */
             if (offset < 0) offset = Math.max(elements.length + offset, 0);
@@ -3668,6 +3857,20 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             /* An expression that will not evaluate fails the line it stands on, with the status a
                host gives it: `x=$((1+))` is `sh: 1+: syntax error: operand expected (error token is
                "+")` and 127, where the message alone and a status of 1 left the line runnable. */
+            /* A quote inside the expression is one a host hands to the evaluation as it stands, and
+               the evaluation refuses it: `echo $(( "3" + 1 ))` is `sh: "3" + 1 : syntax error:
+               operand expected (error token is ""3" + 1 ")` and 127, where taking the quotes off
+               the text first made it the 4 a `3 + 1` is. */
+            const quoteAt = bareQuoteAt(part.expr);
+            if (quoteAt !== -1) {
+                const shown = part.expr.replace(/^[ \t\n]+/, '');
+                const lead = part.expr.length - shown.length;
+                const token = shown.slice(Math.max(quoteAt - lead, 0));
+                throw new ArithFailure(
+                    `${arithDiagnostic(state, shown, new ArithError('syntax error: operand expected', token))}\n`,
+                    127
+                );
+            }
             let value: number;
             try {
                 value = evalArith(state, expandToString(arithText(part.expr), state));
@@ -4447,7 +4650,8 @@ function runParsed(state: ShellState, script: string): number {
             if (error.message.startsWith('syntax error near')) {
                 const spans = lineSpans(script);
                 const span = spans[Math.min(line, spans.length - 1)];
-                if (span !== undefined) writeErr(state, `${heading(line)}\`${script.slice(span.start, span.end).replace(/\n$/, '')}'\n`);
+                const from = error.echoFrom ?? span.start;
+                if (span !== undefined) writeErr(state, `${heading(line)}\`${script.slice(from, span.end).replace(/\n$/, '')}'\n`);
             } else if (error.message.startsWith('unexpected EOF while looking for matching')) {
                 /* An unclosed quote is two reports on a host, not one: the lexer names the quote
                    it never found the match for, and the parser then finds the input ended where a
@@ -4472,6 +4676,10 @@ function runParsed(state: ShellState, script: string): number {
         /* An arithmetic error already written the way a host writes it, carrying the status a host
            gives it -- 127 for an expression that will not evaluate, and 1 for `let` behind it. */
         if (error instanceof ArithFailure) {
+            writeErr(state, error.detail);
+            return error.status;
+        }
+        if (error instanceof SubstringError) {
             writeErr(state, error.detail);
             return error.status;
         }
@@ -5107,11 +5315,22 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                    `+ ((  1 + 1  ))` -- the two spaces neither one was written with. */
                 if (state.options.xtrace) traceWrite(state, `(( ${command.expr} ))`);
                 try {
+                    /* The expression is expanded before it is evaluated, the way a host expands it:
+                       `(( $(echo 1) ))` is the 1 the substitution wrote, `(( ${x:-1} ))` the 1 the
+                       default is and `(( $((1)) ))` the 1 inside, where reading the expression as
+                       it stands made every one of them the text a substitution was written as and
+                       an arithmetic evaluation then refused -- `sh: ((: $(echo 1) : syntax error`.
+                       Quotes come off with the rest of the expansion, which is why a host's
+                       `(( "0" ))` is the false an `(( 0 ))` is and not the operand error a quote
+                       left inside an arithmetic *substitution* is. */
+                    const text = expandToString(arithText(command.expr), state);
                     /* The status is the one a host takes from the value: 0 when the expression is
                        non-zero, 1 when it is zero, and 1 as well for one that will not evaluate --
                        `((1+))` is `sh: ((: 1+: syntax error: operand expected (error token is "+")`
-                       and the status 1, never the 127 a `$((1+))` that will not expand is. */
-                    return evalArith(state, command.expr) === 0 ? 1 : 0;
+                       and the status 1, never the 127 a `$((1+))` that will not expand is. An
+                       expression that expanded to nothing is the zero a host reads it as, so
+                       `(( $(echo $n) ))` behind an unset `n` is 1 and says nothing. */
+                    return evalArith(state, text) === 0 ? 1 : 0;
                 } catch (error) {
                     if (error instanceof ArithError) {
                         writeErr(state, `${arithDiagnostic(state, command.expr, error, '((')}\n`);
@@ -7169,20 +7388,51 @@ function localBuiltin(ctx: CommandContext): CommandResult {
     let integer = false;
     for (const arg of ctx.args) {
         /* The attributes `local` takes are the ones `declare` takes: `local -i n=3` is an integer
-           `n` in the function's own scope, as it is on a host. */
-        if (arg === '-i') {
-            integer = true;
+           `n` in the function's own scope, as it is on a host, and `local -a a=(1 2)` is the
+           array of two it names there -- an attribute is no name to declare, and reading `-a`
+           as one made the declaration `local: `-a': not a valid identifier` and 1, where a host
+           makes the array. */
+        if (/^-[a-zA-Z]+$/.test(arg)) {
+            if (arg.includes('i')) integer = true;
+            continue;
+        }
+        /* `local a=(1 2)`: the elements are the array it makes, in the order they were written,
+           and they are kept in the function's own scope -- `f() { local -a a=(1 2); echo
+           ${a[1]}; }; f` is a host's `2`, and the `a` the caller had keeps what it held. */
+        const compound = /^([A-Za-z_][A-Za-z0-9_]*)(\+?)=\(([\s\S]*)\)$/.exec(arg);
+        if (compound !== null) {
+            const name = compound[1];
+            const elements = new Parser(compound[3], state)
+                .readAllWordsPublic()
+                .flatMap((word) => expandWord(state, word));
+            const append = compound[2] === '+';
+            if (!append) for (const key of [...scope.keys()]) {
+                if (key.startsWith(`${name}[`) && key.endsWith(']')) scope.delete(key);
+            }
+            let index = append ? arrayElements(state, `${name}[0]`).length : 0;
+            for (const element of elements) {
+                const subscripted = /^\[([^\]]*)\]=([\s\S]*)$/.exec(element);
+                if (subscripted !== null) index = Number.parseInt(integerValue(state, subscripted[1]), 10);
+                if (Number.isNaN(index)) index = 0;
+                scope.set(`${name}[${index}]`, { value: subscripted === null ? element : subscripted[2] });
+                index++;
+            }
+            scope.set(name, { value: elements[0] ?? '' });
             continue;
         }
         const assign = splitAssign(arg);
         if (!assign) {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return failDiag(state, `local: \`${arg}': not a valid identifier`, 1);
-            scope.set(arg, { value: '' });
+            /* A bare `local x` names a variable no assignment has filled in, which is the unset
+               name a host leaves it as and not the empty string this made of it -- `f() { local
+               x; echo "[${x-unset}]"; }; x=out; f` is `[unset]` there and `[]` here, the `x` of
+               the caller having been shadowed either way. */
+            scope.set(arg, { value: '', declared: true });
             continue;
         }
         const base = assign.append ? getVar(state, assign.name) ?? '' : '';
         const raw = base + (assign.value ?? '');
-        scope.set(assign.name, { value: integer && !assign.append ? arithmeticValue(state, raw) : raw, integer: integer || undefined });
+        scope.set(subscriptKey(state, assign.name), { value: integer && !assign.append ? arithmeticValue(state, raw) : raw, integer: integer || undefined });
     }
     return ok();
 }
@@ -7534,8 +7784,8 @@ function hashBuiltin(ctx: CommandContext): CommandResult {
 /** Every builtin name this module implements, sorted. */
 export const IMPLEMENTED_BUILTINS: string[] = [
     ':', '.', 'alias', 'bg', 'bind', 'builtin', 'caller', 'command', 'declare', 'dirs', 'disown', 'eval', 'exec',
-    'export', 'fg', 'getopts', 'hash', 'help', 'jobs', 'let', 'local', 'mapfile', 'popd', 'pushd', 'read',
-    'readarray', 'readonly', 'set', 'shift', 'source', 'suspend', 'times', 'trap', 'type', 'typeset', 'ulimit',
+    'export', 'fg', 'getopts', 'hash', 'help', 'jobs', 'let', 'local', 'popd', 'pushd', 'read',
+    'readonly', 'set', 'shift', 'source', 'suspend', 'times', 'trap', 'type', 'typeset', 'ulimit',
     'umask', 'unalias', 'unset', 'wait', 'which'
 ].sort();
 
@@ -7563,7 +7813,6 @@ export const HELP: Record<string, string> = {
     jobs: 'jobs [-lnprs] [jobspec ...] -- list the jobs `&` started, running and done',
     let: 'let arg [arg ...] -- evaluate arithmetic expressions',
     local: 'local [option] name[=value] ... -- declare variables local to a function',
-    mapfile: 'mapfile [-t] [-n count] [-s count] [-O origin] [array] -- read lines into an array',
     popd: 'popd [-n] [+N] [-N] -- remove a directory from the stack',
     pushd: 'pushd [-n] [+N] [-N] [dir] -- push a directory onto the stack',
     read: 'read [-ers] [-a array] [-d delim] [-n nchars] [-p prompt] [name ...]',
@@ -7584,29 +7833,77 @@ export const HELP: Record<string, string> = {
     which: 'which [-a] name ... -- print the file that would be executed'
 };
 
+/**
+ * What a host's `help` prints: the banner, then every builtin it carries in two columns, in the
+ * order it lists them. It is the table a host's own bash 3.2 writes -- one no list of the names
+ * *this* shell implements can come to, because a host's list is not this shell's -- so the line
+ * a `help` with no argument prints is the one a host prints, text for text.
+ */
+const HELP_TABLE: string[] = [
+    'GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)',
+    'These shell commands are defined internally.  Type `help\' to see this list.',
+    'Type `help name\' to find out more about the function `name\'.',
+    'Use `info bash\' to find out more about the shell in general.',
+    'Use `man -k\' or `info\' to find out more about commands not in this list.',
+    '',
+    'A star (*) next to a name means that the command is disabled.',
+    '',
+    ' JOB_SPEC [&]                       (( expression ))',
+    ' . filename [arguments]             :',
+    ' [ arg... ]                         [[ expression ]]',
+    ' alias [-p] [name[=value] ... ]     bg [job_spec ...]',
+    ' bind [-lpvsPVS] [-m keymap] [-f fi break [n]',
+    ' builtin [shell-builtin [arg ...]]  caller [EXPR]',
+    ' case WORD in [PATTERN [| PATTERN]. cd [-L|-P] [dir]',
+    ' command [-pVv] command [arg ...]   compgen [-abcdefgjksuv] [-o option',
+    ' complete [-abcdefgjksuv] [-pr] [-o continue [n]',
+    ' declare [-afFirtx] [-p] [name[=val dirs [-clpv] [+N] [-N]',
+    ' disown [-h] [-ar] [jobspec ...]    echo [-neE] [arg ...]',
+    ' enable [-pnds] [-a] [-f filename]  eval [arg ...]',
+    ' exec [-cl] [-a name] file [redirec exit [n]',
+    ' export [-nf] [name[=value] ...] or false',
+    ' fc [-e ename] [-nlr] [first] [last fg [job_spec]',
+    ' for NAME [in WORDS ... ;] do COMMA for (( exp1; exp2; exp3 )); do COM',
+    ' function NAME { COMMANDS ; } or NA getopts optstring name [arg]',
+    ' hash [-lr] [-p pathname] [-dt] [na help [-s] [pattern ...]',
+    ' history [-c] [-d offset] [n] or hi if COMMANDS; then COMMANDS; [ elif',
+    ' jobs [-lnprs] [jobspec ...] or job kill [-s sigspec | -n signum | -si',
+    ' let arg [arg ...]                  local name[=value] ...',
+    ' logout                             popd [+N | -N] [-n]',
+    ' printf [-v var] format [arguments] pushd [dir | +N | -N] [-n]',
+    ' pwd [-LP]                          read [-ers] [-u fd] [-t timeout] [',
+    ' readonly [-af] [name[=value] ...]  return [n]',
+    ' select NAME [in WORDS ... ;] do CO set [--abefhkmnptuvxBCHP] [-o opti',
+    ' shift [n]                          shopt [-pqsu] [-o long-option] opt',
+    ' source filename [arguments]        suspend [-f]',
+    ' test [expr]                        time [-p] PIPELINE',
+    ' times                              trap [-lp] [arg signal_spec ...]',
+    ' true                               type [-afptP] name [name ...]',
+    ' typeset [-afFirtx] [-p] name[=valu ulimit [-SHacdfilmnpqstuvx] [limit',
+    ' umask [-p] [-S] [mode]             unalias [-a] name [name ...]',
+    ' unset [-f] [-v] [name ...]         until COMMANDS; do COMMANDS; done',
+    ' variables - Some variable names an wait [n]',
+    ' while COMMANDS; do COMMANDS; done  { COMMANDS ; }'
+];
+
 function helpBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     void state;
     if (ctx.args.length === 0) {
-        const names = IMPLEMENTED_BUILTINS.filter((name) => HELP[name] !== undefined);
-        const lines: string[] = [];
-        let line = '';
-        for (const name of names) {
-            if (line.length + name.length + 2 > 66) {
-                lines.push(line.trimEnd());
-                line = '';
-            }
-            line += `${name}  `;
-        }
-        if (line.trimEnd() !== '') lines.push(line.trimEnd());
-        return ok(joinLines(lines), state);
+        return ok(joinLines(HELP_TABLE), state);
     }
     const lines: string[] = [];
     let status = 0;
     for (const name of ctx.args) {
         const text = HELP[name];
         if (text === undefined) {
-            lines.push(`help: no help topics match \`${name}'.  Try \`help help'.`);
+            /* The complaint a host writes on its stderr, carrying the shell's name and the line it
+               stands on, and not the plain line this shell wrote to its stdout: `help mapfile`
+               is `sh: line 0: help: no help topics match `mapfile'.  Try `help help' or
+               `man -k mapfile' or `info mapfile'.` and the status 1, a mapfile being a builtin
+               of the bash 4 a host's own 3.2 is not. */
+            writeErr(state, `${diagnosticPrefix(state)}help: no help topics match \`${name}'.`
+                + `  Try \`help help' or \`man -k ${name}' or \`info ${name}'.\n`);
             status = 1;
             continue;
         }
@@ -8129,50 +8426,6 @@ function shoptBuiltin(ctx: CommandContext): CommandResult {
         if (!quiet) lines.push(shoptLine(name, on));
     }
     return { stdout: joinLines(lines), stderr: '', exitCode: status };
-}
-
-function mapfileBuiltin(ctx: CommandContext): CommandResult {
-    const state = stateOf(ctx);
-    let strip = false;
-    let name = 'MAPFILE';
-    let skip = 0;
-    let count = -1;
-    let origin = 0;
-    const args = ctx.args;
-    let index = 0;
-    while (index < args.length) {
-        const arg = args[index];
-        if (!arg.startsWith('-')) break;
-        if (arg === '-t') strip = true;
-        else if (arg === '-n') {
-            count = Number.parseInt(args[index + 1] ?? '0', 10);
-            index++;
-        } else if (arg === '-s') {
-            skip = Number.parseInt(args[index + 1] ?? '0', 10);
-            index++;
-        } else if (arg === '-O') {
-            origin = Number.parseInt(args[index + 1] ?? '0', 10);
-            index++;
-        } else if (arg === '-u' || arg === '-C' || arg === '-c') index++;
-        index++;
-    }
-    if (index < args.length) name = args[index];
-    const lines: string[] = [];
-    let text = state.inputBuffer.slice(state.inputCursor);
-    state.inputCursor = state.inputBuffer.length;
-    while (text.length > 0) {
-        const at = text.indexOf('\n');
-        if (at === -1) {
-            lines.push(text);
-            break;
-        }
-        lines.push(text.slice(0, at));
-        text = text.slice(at + 1);
-    }
-    const chosen = lines.slice(skip, count === -1 ? undefined : skip + count);
-    for (let i = 0; i < chosen.length; i++) setVar(state, `${name}[${origin + i}]`, strip ? chosen[i] : chosen[i] + '\n');
-    setVar(state, name, chosen.join(''));
-    return { stdout: '', stderr: '', exitCode: 0 };
 }
 
 function callerBuiltin(ctx: CommandContext): CommandResult {
@@ -8906,6 +9159,20 @@ function trapBuiltin(ctx: CommandContext): CommandResult {
  */
 function enableBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
+    /* `enable -n echo` disables the builtin it names and says nothing at all, with the status 0 a
+       host gives it, where answering every `enable` with the table of the builtins it carries
+       printed fifty-eight lines for it. `-p`, `-a` and a bare `enable` are that table. */
+    let disable = false;
+    const named: string[] = [];
+    for (const arg of ctx.args) {
+        if (arg === '-n') {
+            disable = true;
+            continue;
+        }
+        if (arg === '-p' || arg === '-a' || arg === '-d' || arg === '-s') continue;
+        named.push(arg);
+    }
+    if (disable && named.length > 0) return { stdout: '', stderr: '', exitCode: 0 };
     const names = [...new Set([...SHELL_OWN_NAMES, ...HOST_ONLY_BUILTINS])].sort();
     return ok(joinLines(names.map((name) => `enable ${name}`)), state);
 }
@@ -8945,8 +9212,6 @@ export const COMMANDS: Record<string, ShellCommand> = {
     eval: evalBuiltin,
     exec: execBuiltin,
     read: readBuiltin,
-    mapfile: mapfileBuiltin,
-    readarray: mapfileBuiltin,
     caller: callerBuiltin,
     dirs: dirsBuiltin,
     pushd: pushdBuiltin,

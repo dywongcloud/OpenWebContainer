@@ -28,7 +28,8 @@ import {
     plainPrefix,
     runPendingJobs,
     runScript,
-    setRunner
+    setRunner,
+    setVar
 } from './commands/builtins';
 import type { ShellJob, ShellState } from './commands/builtins';
 import type { CommandContext, CommandResult, ShellCommand } from './commands/types';
@@ -674,6 +675,45 @@ export class Shell implements IShell {
         if (script !== undefined) return script;
         if (this.hasShebang(command)) {
             return this.cannotRun(command, `it is a script, which only a child can run`);
+        }
+
+        /* `printf -v var` is the one option a host's own `printf` builtin takes that the utility
+           on PATH does not, and what it writes goes into the variable rather than to stdout:
+           `printf -v x '%d' 5; echo "[$x]"` is a host's `[5]` and no output at all, where handing
+           the flag to the utility printed `-v` and left the name empty. The usage a host writes
+           for a printf that has nothing to print -- and the status 2 it gives one -- are this
+           shell's to write as well, because the utility's own text names no `-v` in it and
+           leaves the status 1 a utility's failure has. */
+        if (command === 'printf') {
+            const usage = 'printf: usage: printf [-v var] format [arguments]\n';
+            if (args.length === 0) return { stdout: '', stderr: usage, exitCode: 2 };
+            let name: string | undefined;
+            let rest: string[] = args;
+            if (args[0] === '-v') {
+                name = args[1];
+                rest = args.slice(2);
+                /* A `-v` with no name behind it is the one option a host complains about, and the
+                   complaint carries the shell's name and the line it stands on where the usage
+                   behind it does not: `printf -v` is `sh: line 0: printf: -v: option requires an
+                   argument` and then the usage, with the status 2. */
+                if (name === undefined) {
+                    return {
+                        stdout: '',
+                        stderr: `${diagnosticPrefix(this.shellState)}printf: -v: option requires an argument\n${usage}`,
+                        exitCode: 2
+                    };
+                }
+            } else if (args[0].startsWith('-v') && args[0].length > 2) {
+                name = args[0].slice(2);
+                rest = args.slice(1);
+            }
+            if (name !== undefined) {
+                if (rest.length === 0) return { stdout: '', stderr: usage, exitCode: 2 };
+                const printed = MODULE_COMMANDS['printf'](this.moduleContext(rest, input));
+                if (printed.exitCode !== 0) return printed;
+                setVar(this.shellState, name, printed.stdout);
+                return { stdout: '', stderr: '', exitCode: 0 };
+            }
         }
 
         // A utility the container cannot have reports the reason it cannot, with status 1: never 127.
