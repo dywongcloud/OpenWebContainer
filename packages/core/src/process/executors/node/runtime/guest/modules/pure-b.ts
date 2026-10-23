@@ -1903,6 +1903,11 @@ export const SRC = String.raw`
 
     return {
       Session: PromiseSession,
+      /* The two domains the promise form carries as well: they are not sessions, so there is
+         nothing for a promise to wrap, and node hands over the very objects its inspector holds --
+         a caller of inspector/promises.Network lands on inspector.Network there, as here. */
+      Network: base.Network,
+      NetworkResources: base.NetworkResources,
       open: base.open,
       close: base.close,
       url: base.url,

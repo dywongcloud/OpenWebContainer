@@ -3814,6 +3814,583 @@ function receivedTypeOf(value) {
 /* require('module') is the Module class the loader builds modules with, carrying Node's statics.
    They are filled in here rather than where the class is built, so that the ones which read the
    builtin registry, the file system or the loader's own tables see them once they are real. */
+/*
+ * TypeScript type stripping, offered as a call: the pass node runs over a .ts source before it
+ * compiles it. A type is erasable syntax, so what comes back is the program with every type gone
+ * and every other character standing where it stood -- node blanks what it strips, so a
+ * 'const a: number = 1' comes back as 'const a         = 1' and a position or a source map read
+ * over the input still names the same character in the output.
+ *
+ * It scans tokens rather than parsing the grammar, and it refuses with node's own
+ * ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX the constructs only a parser can place -- an enum, a namespace
+ * or 'declare module' declaration, a parameter property, a decorator and an import-equals alias --
+ * which are the very ones node refuses itself in strip-only mode.
+ */
+var TS_REGEX_KEYWORDS = { 'return': true, 'typeof': true, 'instanceof': true, 'in': true, 'of': true,
+  'new': true, 'delete': true, 'void': true, 'case': true, 'do': true, 'else': true, 'yield': true,
+  'await': true };
+var TS_MODIFIERS = { 'public': true, 'private': true, 'protected': true, 'readonly': true,
+  'override': true, 'abstract': true };
+/* A word that can only begin a statement, used to end a type that no punctuation ends: a cast on
+   the last line of a block, or a type alias written without a semicolon. */
+var TS_STATEMENT_STARTERS = { 'const': true, 'let': true, 'var': true, 'function': true,
+  'class': true, 'return': true, 'if': true, 'for': true, 'while': true, 'switch': true,
+  'export': true, 'import': true, 'interface': true, 'type': true, 'enum': true, 'throw': true };
+var TS_CONTROL_BEFORE_PAREN = { 'if': true, 'while': true, 'for': true, 'switch': true,
+  'catch': true, 'return': true, 'typeof': true, 'new': true, 'delete': true, 'void': true,
+  'await': true, 'in': true, 'of': true, 'yield': true, 'case': true, 'do': true, 'else': true };
+
+/* The tokens of a source: words, numbers, strings, template literals, regex literals, comments and
+   single punctuation characters. Whitespace carries no token -- a range is what is cut, so only the
+   offsets matter. A '/' is a division where a value could have stood in front of it and the start
+   of a regex everywhere else, which is how node's own scanner reads one. */
+function tsTokenize(src) {
+  var tokens = [];
+  var prev = null;
+  var i = 0;
+  var n = src.length;
+  while (i < n) {
+    var ch = src.charAt(i);
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') { i++; continue; }
+    if (ch === '/' && src.charAt(i + 1) === '/') {
+      var lineEnd = src.indexOf('\n', i);
+      if (lineEnd < 0) lineEnd = n;
+      tokens.push({ k: 'c', s: i, e: lineEnd, v: '' });
+      i = lineEnd;
+      continue;
+    }
+    if (ch === '/' && src.charAt(i + 1) === '*') {
+      var blockEnd = src.indexOf('*/', i + 2);
+      blockEnd = blockEnd < 0 ? n : blockEnd + 2;
+      tokens.push({ k: 'c', s: i, e: blockEnd, v: '' });
+      i = blockEnd;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      var q = i + 1;
+      while (q < n) {
+        var qc = src.charAt(q);
+        if (qc === '\\') { q += 2; continue; }
+        if (qc === ch) { q++; break; }
+        if (qc === '\n') break;
+        q++;
+      }
+      prev = { k: 's', s: i, e: q, v: '' };
+      tokens.push(prev);
+      i = q;
+      continue;
+    }
+    /* 96 is the backtick: a template literal, scanned through to its close with the substitutions
+       inside it counted rather than parsed. Written as a code point because the character itself
+       would end the string this whole file is held in. */
+    if (src.charCodeAt(i) === 96) {
+      var tpl = i + 1;
+      while (tpl < n) {
+        var tc = src.charAt(tpl);
+        if (tc === '\\') { tpl += 2; continue; }
+        if (src.charCodeAt(tpl) === 96) { tpl++; break; }
+        if (tc === '$' && src.charAt(tpl + 1) === '{') {
+          var nested = 1;
+          tpl += 2;
+          while (tpl < n && nested > 0) {
+            var nc = src.charAt(tpl);
+            if (nc === '{') nested++;
+            else if (nc === '}') nested--;
+            else if (nc === '\\') tpl++;
+            tpl++;
+          }
+          continue;
+        }
+        tpl++;
+      }
+      prev = { k: 's', s: i, e: tpl, v: '' };
+      tokens.push(prev);
+      i = tpl;
+      continue;
+    }
+    if (ch === '/' && tsRegexStarts(prev)) {
+      var re = i + 1;
+      var inClass = false;
+      while (re < n) {
+        var rc = src.charAt(re);
+        if (rc === '\\') { re += 2; continue; }
+        if (rc === '\n') break;
+        if (inClass) { if (rc === ']') inClass = false; }
+        else if (rc === '[') inClass = true;
+        else if (rc === '/') { re++; break; }
+        re++;
+      }
+      while (re < n && tsIsFlag(src.charAt(re))) re++;
+      prev = { k: 'r', s: i, e: re, v: '' };
+      tokens.push(prev);
+      i = re;
+      continue;
+    }
+    var c0 = src.charCodeAt(i);
+    if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 === 36 || c0 === 95) {
+      var w = i + 1;
+      while (w < n) {
+        var wc = src.charCodeAt(w);
+        if ((wc >= 65 && wc <= 90) || (wc >= 97 && wc <= 122) || (wc >= 48 && wc <= 57)
+          || wc === 36 || wc === 95) w++;
+        else break;
+      }
+      prev = { k: 'w', s: i, e: w, v: src.slice(i, w) };
+      tokens.push(prev);
+      i = w;
+      continue;
+    }
+    if (c0 >= 48 && c0 <= 57) {
+      var d = i + 1;
+      while (d < n) {
+        var dc = src.charAt(d);
+        if ((dc >= '0' && dc <= '9') || dc === '.' || dc === 'e' || dc === 'E' || dc === 'x'
+          || dc === 'X' || dc === '_') d++;
+        else break;
+      }
+      prev = { k: 'n', s: i, e: d, v: '' };
+      tokens.push(prev);
+      i = d;
+      continue;
+    }
+    prev = { k: 'p', s: i, e: i + 1, v: ch };
+    tokens.push(prev);
+    i++;
+  }
+  return tokens;
+}
+
+function tsIsFlag(ch) {
+  return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+}
+
+function tsRegexStarts(prev) {
+  if (prev === null) return true;
+  if (prev.k === 'n' || prev.k === 's' || prev.k === 'r') return false;
+  if (prev.k === 'w') return TS_REGEX_KEYWORDS[prev.v] === true;
+  if (prev.k === 'p') return prev.v !== ')' && prev.v !== ']' && prev.v !== '}';
+  return true;
+}
+
+function tsUnsupportedSyntax(what) {
+  var err = new SyntaxError('TypeScript ' + what + ' is not supported in strip-only mode');
+  err.code = 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX';
+  return err;
+}
+
+/*
+ * The source with every type blanked out. A blanked character becomes a space, except a newline,
+ * which stays a newline, so every line keeps its number and every column its character.
+ */
+function tsStripTypes(src) {
+  var tokens = tsTokenize(src);
+  var total = tokens.length;
+  var gone = new Array(src.length);
+  var open = [];
+  var openIdx = [];
+  var matchOf = Object.create(null);
+  var i = 0;
+  var classPending = false;
+  var ternaries = 0;
+
+  function isP(k, v) {
+    var t = tokens[k];
+    return t !== undefined && t.k === 'p' && t.v === v;
+  }
+  function isW(k, v) {
+    var t = tokens[k];
+    return t !== undefined && t.k === 'w' && t.v === v;
+  }
+  function isWord(k) {
+    var t = tokens[k];
+    return t !== undefined && t.k === 'w';
+  }
+  /* The index of the significant token before 'k' and after it, comments skipped; and the index of
+     the bracket that matches the one at 'k', or -1. */
+  function prevIdx(k) {
+    var j = k - 1;
+    while (j >= 0 && tokens[j].k === 'c') j--;
+    return j;
+  }
+  function nextIdx(k) {
+    var j = k + 1;
+    while (j < total && tokens[j].k === 'c') j++;
+    return j < total ? j : -1;
+  }
+  /* Whether the token at 'k' is one a value can end on -- everything but a bare operator. */
+  function isValueAt(k) {
+    var t = tokens[k];
+    if (t === undefined) return false;
+    return t.k === 'w' || t.k === 'n' || t.k === 's' || t.k === 'r'
+      || t.v === ')' || t.v === ']' || t.v === '}';
+  }
+  function matchIdx(k) {
+    var depth = 0;
+    var j = k;
+    while (j < total) {
+      var t = tokens[j];
+      if (t.k === 'p') {
+        if (t.v === '(' || t.v === '[' || t.v === '{') depth++;
+        else if (t.v === ')' || t.v === ']' || t.v === '}') {
+          depth--;
+          if (depth === 0) return j;
+        }
+      }
+      j++;
+    }
+    return -1;
+  }
+  /* The '>' that closes the '<' at 'k', or -1 when the angles do not balance before a token that
+     ends the declaration anyway. */
+  function angleMatch(k) {
+    var depth = 0;
+    var j = k;
+    while (j < total) {
+      var t = tokens[j];
+      if (t.k === 'p') {
+        if (t.v === '<') depth++;
+        else if (t.v === '>') {
+          depth--;
+          if (depth === 0) return j;
+        } else if (t.v === '{' || t.v === ';' || t.v === ')' || t.v === '=') return -1;
+      }
+      j++;
+    }
+    return -1;
+  }
+  function blank(from, to) {
+    for (var b = from; b < to && b < src.length; b++) {
+      if (src.charAt(b) !== '\n') gone[b] = true;
+    }
+  }
+  /* Whether the token stands first on its line: only whitespace between it and the last newline. */
+  function atLineStart(k) {
+    for (var b = tokens[k].s - 1; b >= 0; b--) {
+      var c = src.charAt(b);
+      if (c === '\n') return true;
+      if (c !== ' ' && c !== '\t' && c !== '\r') return false;
+    }
+    return true;
+  }
+  /* Where a type that starts at token 'from' ends: the first comma, semicolon, assignment or
+     closing bracket at its own depth, the brace that opens a function body when the caller is
+     reading a return type, or the start of the next statement. An arrow in the type -- the '=>' of
+     a function type -- is part of the type and not the assignment that ends it. */
+  function typeEnd(from, stopAtBrace) {
+    var k = from;
+    var depth = 0;
+    while (k < total) {
+      var t = tokens[k];
+      if (t.k === 'p') {
+        if (t.v === '<' || t.v === '(' || t.v === '[') { depth++; k++; continue; }
+        if (t.v === '{') {
+          if (depth === 0 && stopAtBrace) return k;
+          depth++;
+          k++;
+          continue;
+        }
+        if (t.v === '>' || t.v === ')' || t.v === ']' || t.v === '}') {
+          if (depth === 0) return k;
+          depth--;
+          k++;
+          continue;
+        }
+        if (depth === 0 && (t.v === ',' || t.v === ';')) return k;
+        if (depth === 0 && t.v === '=') {
+          if (isP(k + 1, '>')) { k += 2; continue; }
+          return k;
+        }
+      }
+      if (depth === 0 && t.k === 'w' && k > from && atLineStart(k)
+        && TS_STATEMENT_STARTERS[t.v] === true) return k;
+      k++;
+    }
+    return total;
+  }
+  /* The token after the closing bracket matching the one at 'k', or null. */
+  function afterMatch(k) {
+    var close = matchIdx(k);
+    if (close < 0 || close + 1 >= total) return null;
+    return tokens[close + 1];
+  }
+
+  while (i < total) {
+    var t = tokens[i];
+    if (t.k === 'c') { i++; continue; }
+    if (t.k === 'p' && (t.v === '(' || t.v === '[' || t.v === '{')) {
+      /* A brace is a class body, a block or an object literal, and which one it is decides whether
+         a ':' inside it is a type annotation or the key of an object: '{ x: number }' declares a
+         field, '{ x: 1 }' names a property. What stands in front of the brace says which -- an
+         assignment, a comma, a colon or an opening bracket is an object; a class name or the ')'
+         that closed a parameter list is not. */
+      var kind = t.v;
+      if (t.v === '{') {
+        kind = 'block';
+        if (classPending) kind = 'class';
+        else {
+          var pb = prevIdx(i);
+          if (pb >= 0) {
+            var ptb = tokens[pb];
+            if (ptb.k === 'w' && ptb.v === 'return') kind = 'object';
+            else if (ptb.k === 'p' && (ptb.v === '=' || ptb.v === '(' || ptb.v === ','
+              || ptb.v === ':' || ptb.v === '[' || ptb.v === '?')) kind = 'object';
+            else if (ptb.k === 'p' && ptb.v === '>') {
+              var pbb = prevIdx(pb);
+              if (pbb >= 0 && tokens[pbb].k === 'p' && tokens[pbb].v === '=') kind = 'object';
+            }
+          }
+        }
+        classPending = false;
+      }
+      open.push(kind);
+      openIdx.push(i);
+      i++;
+      continue;
+    }
+    if (t.k === 'p' && (t.v === ')' || t.v === ']' || t.v === '}')) {
+      var opened = openIdx.pop();
+      if (opened !== undefined) matchOf[i] = opened;
+      open.pop();
+      i++;
+      continue;
+    }
+    if (t.k === 'p' && t.v === '@') throw tsUnsupportedSyntax('decorator');
+    if (t.k === 'w') {
+      /* A 'class' name is followed by the class body's brace, which is the one brace a ':' inside it
+         annotates a field of rather than a key of an object. */
+      if (t.v === 'class') classPending = true;
+      /* A modifier on a class member is erasable; the same word in a parameter list is a parameter
+         property, which is not -- it declares a field the emitted constructor assigns. */
+      if (TS_MODIFIERS[t.v] === true) {
+        var bi = prevIdx(i);
+        var before = bi >= 0 ? tokens[bi] : null;
+        var inParams = open.length > 0 && open[open.length - 1] === '('
+          && before !== null && (before.k === 'p' && (before.v === '(' || before.v === ','));
+        if (inParams) throw tsUnsupportedSyntax('parameter property');
+        blank(t.s, t.e);
+        i++;
+        continue;
+      }
+      /* An ambient declaration is a type and nothing else: node erases all of it, body and all.
+         Where 'declare' stands on anything else -- a field of a class -- it is only the word that
+         goes, as a modifier does. */
+      if (t.v === 'declare') {
+        var dw = isWord(i + 1) ? tokens[i + 1].v : '';
+        if (dw === 'const' || dw === 'let' || dw === 'var' || dw === 'function' || dw === 'class'
+          || dw === 'abstract' || dw === 'interface' || dw === 'type') {
+          var de = i + 1;
+          var dd = 0;
+          var closeD = total - 1;
+          while (de < total) {
+            var dt = tokens[de];
+            if (dt.k === 'p') {
+              if (dt.v === '{') { closeD = matchIdx(de); break; }
+              if (dt.v === ';' && dd === 0) { closeD = de; break; }
+              if (dt.v === '(' || dt.v === '[') dd++;
+              else if (dt.v === ')' || dt.v === ']') dd--;
+            }
+            de++;
+          }
+          if (closeD < 0) closeD = total - 1;
+          blank(t.s, tokens[closeD].e);
+          i = closeD + 1;
+          continue;
+        }
+        blank(t.s, t.e);
+        i++;
+        continue;
+      }
+      if (t.v === 'enum') throw tsUnsupportedSyntax('enum');
+      if (t.v === 'namespace' || t.v === 'module') throw tsUnsupportedSyntax('namespace');
+      if (t.v === 'interface') {
+        /* 'export interface' goes with the interface: node erases the export too, there being
+           nothing left for it to export. */
+        var fromI = isW(prevIdx(i), 'export') ? prevIdx(i) : i;
+        var at = i + 1;
+        var depthI = 0;
+        var endI = total;
+        while (at < total) {
+          var it = tokens[at];
+          if (it.k === 'p') {
+            if (it.v === '(' || it.v === '[') depthI++;
+            else if (it.v === ')' || it.v === ']') depthI--;
+            else if (it.v === '<') depthI++;
+            else if (it.v === '>') depthI--;
+            else if (it.v === '{') {
+              if (depthI === 0) {
+                var closeI = matchIdx(at);
+                endI = closeI < 0 ? total : closeI + 1;
+                break;
+              }
+              depthI++;
+            } else if (it.v === ';' && depthI === 0) { endI = at; break; }
+          }
+          at++;
+        }
+        /* endI is the token the declaration ends at; blank up to the end of the token before it,
+           or through the whole brace group when it is one. */
+        var lastI = endI - 1;
+        blank(tokens[fromI].s, lastI >= fromI ? tokens[lastI].e : tokens[fromI].e);
+        i = endI;
+        continue;
+      }
+      /* A type alias: 'type X = ...' or 'type X<T> = ...'. A bare 'type' in an import or export
+         brace list -- 'import { type A, B }' -- is only that one word. */
+      if (t.v === 'type' && isWord(i + 1) && (isP(i + 2, '=') || isP(i + 2, '<'))) {
+        var fromT = isW(prevIdx(i), 'export') ? prevIdx(i) : i;
+        var te = typeEnd(i + 3, false);
+        /* The semicolon ends the alias and goes with it: what node leaves is the newline alone. */
+        var endT = (te < total && tokens[te].k === 'p' && tokens[te].v === ';') ? te : te - 1;
+        if (endT < fromT) endT = fromT;
+        blank(tokens[fromT].s, tokens[endT].e);
+        i = endT + 1;
+        continue;
+      }
+      if (t.v === 'type' && (isP(i - 1, '{') || isP(i - 1, ','))) { blank(t.s, t.e); i++; continue; }
+      /* 'import type ... from ...' is one statement with nothing left of it. */
+      if (t.v === 'import' && isW(i + 1, 'type')) {
+        var ie = i + 1;
+        while (ie < total && !isP(ie, ';')) {
+          if (tokens[ie].k === 'w' && ie > i + 1 && atLineStart(ie)
+            && TS_STATEMENT_STARTERS[tokens[ie].v] === true) break;
+          ie++;
+        }
+        var lastIm = Math.min(ie, total - 1);
+        blank(t.s, tokens[lastIm].e);
+        i = ie + 1;
+        continue;
+      }
+      if (t.v === 'as' || t.v === 'satisfies') {
+        var ae = typeEnd(i + 1, false);
+        var lastA = ae - 1;
+        blank(t.s, lastA >= i ? tokens[lastA].e : t.e);
+        i = ae;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (t.k === 'p' && t.v === ':') {
+      var pi = prevIdx(i);
+      var p = pi >= 0 ? tokens[pi] : null;
+      /* A ':' is a type annotation where a name can stand in front of it -- a declarator, a
+         parameter, a class field, a catch clause -- and after the ')' that closes a parameter list,
+         where it is the return type. Anywhere else it is a label, a ternary or the key of an object
+         literal, and is left alone: inside an object literal no ':' is ever an annotation. */
+      var annotates = false;
+      var stopAtBrace = false;
+      var inside = open.length > 0 ? open[open.length - 1] : '';
+      /* The ':' of a ternary closes a '?' that is still open, and is never an annotation; one '?' can
+         open inside another, so they are counted rather than flagged. */
+      if (p !== null && ternaries > 0) { ternaries--; i++; continue; }
+      if (p !== null && inside !== 'object' && inside !== '[') {
+        if (p.k === 'w' || p.k === 'n' || p.k === 's' || p.v === ']' || p.v === '}') annotates = true;
+        else if (p.v === '?') annotates = true;
+        /* 'let m!: string' -- a definite assignment assertion, whose '!' goes with the annotation. */
+        else if (p.v === '!' && isValueAt(prevIdx(pi))) annotates = true;
+        else if (p.v === ')') {
+          var openAt = matchOf[pi];
+          if (openAt !== undefined) {
+            var nameAt = prevIdx(openAt);
+            /* The name the parameter list belongs to may sit behind a type parameter list the pass
+               has already blanked, so '<' and '>' are walked over to reach it. */
+            while (nameAt >= 0 && tokens[nameAt].k === 'p'
+              && (tokens[nameAt].v === '>' || tokens[nameAt].v === '<')) nameAt = prevIdx(nameAt);
+            var nameT = nameAt >= 0 ? tokens[nameAt] : null;
+            if (nameT !== null && nameT.k === 'w' && TS_CONTROL_BEFORE_PAREN[nameT.v] !== true) {
+              annotates = true;
+              stopAtBrace = true;
+            }
+          }
+        }
+      }
+      if (annotates) {
+        if (p !== null && p.v === '?') blank(p.s, p.e);
+        if (p !== null && p.v === '!') blank(p.s, p.e);
+        var ce = typeEnd(i + 1, stopAtBrace);
+        /* A member of a class that ends in a semicolon instead of a body -- an overload, or an
+           abstract method -- is a signature with no code behind it, and node erases all of it,
+           modifiers and all, rather than the type alone. */
+        if (stopAtBrace && inside === 'class' && ce < total && tokens[ce].k === 'p'
+          && tokens[ce].v === ';' && openAt !== undefined) {
+          var memberAt = prevIdx(openAt);
+          while (memberAt >= 0 && (tokens[memberAt].k === 'w' || (tokens[memberAt].k === 'p'
+            && (tokens[memberAt].v === '>' || tokens[memberAt].v === '<')))) memberAt = prevIdx(memberAt);
+          blank(tokens[memberAt + 1].s, tokens[ce].e);
+          i = ce + 1;
+          continue;
+        }
+        var lastC = ce - 1;
+        blank(t.s, lastC >= i ? tokens[lastC].e : t.e);
+        i = ce;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    /* An optional member or parameter: 'a?: T' and 'a?(x: T)'. Any other '?' is the ternary's, and
+       stays -- but it opens a ':' that is not an annotation, so it is counted here and closed there. */
+    if (t.k === 'p' && t.v === '?') {
+      if (isP(i + 1, ':') || isP(i + 1, '(')) { blank(t.s, t.e); i++; continue; }
+      ternaries++;
+      i++;
+      continue;
+    }
+    /* A non-null assertion: 'a!.b', 'a!)', 'a!;', 'm!: string'. A '!' in front of an expression is
+       not one, which is what the value in front of it says. */
+    if (t.k === 'p' && t.v === '!') {
+      var bpi = prevIdx(i);
+      var bni = nextIdx(i);
+      var bp = bpi >= 0 ? tokens[bpi] : null;
+      var bn = bni >= 0 ? tokens[bni] : null;
+      var afterValue = bp !== null && (bp.k === 'w' || bp.k === 'n' || bp.k === 's' || bp.k === 'r'
+        || bp.v === ')' || bp.v === ']' || bp.v === '}');
+      var closes = bn === null || bn.v === '.' || bn.v === ';' || bn.v === ',' || bn.v === ')'
+        || bn.v === ']' || bn.v === '}' || bn.v === ':';
+      if (afterValue && closes) { blank(t.s, t.e); i++; continue; }
+      i++;
+      continue;
+    }
+    /* A type parameter list: the '<...>' of a declaration of a class, of a function, of a method or
+       of an 'extends' clause. Anything else that looks like one is a comparison and stays. */
+    if (t.k === 'p' && t.v === '<') {
+      var gi = prevIdx(i);
+      var gp = gi >= 0 ? tokens[gi] : null;
+      var declares = false;
+      if (gp !== null && gp.k === 'w') {
+        var gii = prevIdx(gi);
+        var gpp = gii >= 0 ? tokens[gii] : null;
+        if (gpp !== null && gpp.k === 'w' && (gpp.v === 'class' || gpp.v === 'function'
+          || gpp.v === 'interface' || gpp.v === 'extends' || gpp.v === 'implements')) declares = true;
+        else {
+          /* Otherwise only a call can carry type arguments: what follows the matching '>' has to be
+             the argument list, and that is all that tells 'f<T>(x)' from 'a < b && c > d', a
+             comparison that has to survive. It also tells them apart from 'a < b) ', which no '>'
+             ever closes. Node reads a '<' in front of a call the same way, which is why
+             'a < b > (c)' is a call with a type argument there and not two comparisons. */
+          var closeG = angleMatch(i);
+          var afterG = closeG >= 0 ? nextIdx(closeG) : -1;
+          if (afterG >= 0 && tokens[afterG].k === 'p' && tokens[afterG].v === '(') declares = true;
+        }
+      }
+      if (declares) {
+        var ge = angleMatch(i);
+        if (ge < 0) { i++; continue; }
+        blank(t.s, tokens[ge].e);
+        i = ge + 1;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  var out = '';
+  for (var c2 = 0; c2 < src.length; c2++) out += gone[c2] ? ' ' : src.charAt(c2);
+  return out;
+}
+
 BF.module = function () {
   /* Both of these are frozen on the host: a package that pushes onto builtinModules or patches
      constants.compileCacheStatus meets a TypeError there, not a silent change. */
@@ -4212,7 +4789,110 @@ BF.module = function () {
   /* Node 24 exports no createRequireFromPath: the deprecated alias went with DEP0131, and a
      package asking for it here must see the same undefined it sees there. */
   delete Module.createRequireFromPath;
+  /* Four statics node defines with enumerable false. They are own properties of its Module class
+     exactly as they are of this one -- _stat and _readPackage are the loader's own stat and package
+     reader, wrap and wrapper the CommonJS source wrapper -- but none of the four stands in
+     Object.keys(require('module')) or in the namespace of an 'await import' of node:module, which is
+     why node's count is 31 where this one's was 29. The values stay: the loader calls _stat and
+     wrap itself, and only their enumerability is node's. */
+  var MODULE_HIDDEN_STATICS = ['_stat', '_readPackage', 'wrap', 'wrapper'];
+  for (var hiddenAt = 0; hiddenAt < MODULE_HIDDEN_STATICS.length; hiddenAt++) {
+    var hiddenStatic = MODULE_HIDDEN_STATICS[hiddenAt];
+    if (!Object.prototype.hasOwnProperty.call(Module, hiddenStatic)) continue;
+    Object.defineProperty(Module, hiddenStatic, {
+      value: Module[hiddenStatic],
+      writable: true,
+      enumerable: false,
+      configurable: true
+    });
+  }
+  /* The compile cache is a V8 code cache written beside the modules node loads, and there is no
+     code cache here: nothing is compiled to bytecode a later run could reuse. So the three entry
+     points answer the way node's do when its own cache is off -- DISABLED, no directory, nothing
+     to flush -- and the status is read off the frozen table above rather than written twice. */
+  Module.enableCompileCache = function enableCompileCache() {
+    return { status: Module.constants.compileCacheStatus.DISABLED, directory: undefined };
+  };
+  Module.flushCompileCache = function flushCompileCache() { return undefined; };
+  Module.getCompileCacheDir = function getCompileCacheDir() { return undefined; };
+  /* Module customization hooks. Node runs the hooks a registration names in a loader thread of its
+     own, before every resolve and every load; this loader has no such thread, so a registration is
+     recorded and no hook is ever called -- the graph a program sees is the one the loader resolves
+     and reads itself. The two calls keep node's own argument handling, including the
+     ERR_UNSUPPORTED_RESOLVE_REQUEST a specifier it cannot resolve raises: node resolves against the
+     parent URL a second argument gives and against 'data:', which is not hierarchical, when there
+     is none, so a relative specifier with no parent fails there exactly as it does here. */
+  var registeredHooks = null;
+  function unsupportedResolveRequest(specifier, base) {
+    var err = new Error('Failed to resolve module specifier "' + specifier + '" from "' + base
+      + '": Invalid relative URL or base scheme is not hierarchical.');
+    err.code = 'ERR_UNSUPPORTED_RESOLVE_REQUEST';
+    return err;
+  }
+  Module.register = function register(specifier, parentURL, options) {
+    var spec = typeof specifier === 'string' ? specifier : String(specifier);
+    var base = typeof parentURL === 'string' && parentURL.length > 0 ? parentURL : 'data:';
+    var resolved = '';
+    if (base !== 'data:') {
+      var from = base.indexOf('file://') === 0 ? base.slice(7) : base;
+      var cut = from.lastIndexOf('/');
+      resolved = host.resolve(spec, cut > 0 ? from.slice(0, cut) : '/', 'require');
+    } else if (spec.charAt(0) !== '.' && spec.charAt(0) !== '/') {
+      resolved = host.resolve(spec, host.cwd(), 'require');
+    }
+    if (!resolved) throw unsupportedResolveRequest(spec, base);
+    registeredHooks = { specifier: resolved, options: options };
+    return undefined;
+  };
+  Module.registerHooks = function registerHooks(hooks) {
+    if (hooks === null || typeof hooks !== 'object') {
+      var err = new TypeError('The "hooks" argument must be of type object. Received '
+        + receivedTypeOf(hooks));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    registeredHooks = { hooks: hooks };
+    /* Node hands back a ModuleHooks carrying the two hooks a caller gave, as own keys worth
+       undefined where it gave none. */
+    return { resolve: hooks.resolve, load: hooks.load };
+  };
+  /* The type stripper as a call, over a string of TypeScript a caller holds: what comes back is the
+     program with every type blanked out, which is what node's own .ts support compiles. It warns
+     once, as node does, that the call is experimental. */
+  var stripTypesWarned = false;
+  Module.stripTypeScriptTypes = function stripTypeScriptTypes(code, options) {
+    if (typeof code !== 'string') {
+      var badCode = new TypeError('The "code" argument must be of type string. Received '
+        + receivedTypeOf(code));
+      badCode.code = 'ERR_INVALID_ARG_TYPE';
+      throw badCode;
+    }
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
+      var badOptions = new TypeError('The "options" argument must be of type object. Received '
+        + receivedTypeOf(options));
+      badOptions.code = 'ERR_INVALID_ARG_TYPE';
+      throw badOptions;
+    }
+    if (!stripTypesWarned) {
+      stripTypesWarned = true;
+      var procWarn = globalThis.process;
+      if (procWarn && typeof procWarn.emitWarning === 'function') {
+        procWarn.emitWarning('stripTypeScriptTypes is an experimental feature and might change'
+          + ' at any time', 'ExperimentalWarning');
+      }
+    }
+    return tsStripTypes(code);
+  };
   return Module;
+};
+
+/* node:sys is util under another name: node's own sys module is a deprecation shim over it, so the
+   two are the same object there and are the same object here -- requireBuiltin caches under the
+   name it was asked for, and BC.sys is filled with what BC.util already holds. The name stands in
+   NODE_BUILTIN_NAMES above, so isBuiltin('sys') was true while require('sys') found nothing; this
+   is the factory that name was asking for. */
+BF['sys'] = function () {
+  return requireBuiltin('util');
 };
 
 BF.tty = function () {
