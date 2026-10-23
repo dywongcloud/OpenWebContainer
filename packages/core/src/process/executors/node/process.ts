@@ -728,6 +728,9 @@ const REJECTION_TRACKER_SRC = String.raw`
   }
 
   Object.defineProperty(Native, Symbol.species, { get: function () { return Tracked; }, configurable: true });
+  /* The subclass stands in for Promise everywhere, so it answers to Promise's own name too: host
+     node 24.15 reads Promise.name and Promise.reject(x).constructor.name both as 'Promise'. */
+  Object.defineProperty(Tracked, 'name', { value: 'Promise', configurable: true });
   Object.defineProperty(globalThis, 'Promise', { value: Tracked, writable: true, configurable: true });
   /* A promise the engine built itself is still a Promise to code that asks one */
   Object.defineProperty(Tracked, Symbol.hasInstance, { value: function (x) { return x instanceof Native; }, configurable: true });
@@ -751,8 +754,9 @@ const REJECTION_TRACKER_SRC = String.raw`
   }
 
   /* A rejection nothing handled goes to the domain that owns the promise, and only when no domain
-     owns it to an unhandledRejection listener on process, and only then ends the process: the
-     formatted reason of the first one that reaches that point, or '' when none does. */
+     owns it to an unhandledRejection listener on process, and only with neither of those to an
+     uncaughtException one, and only then ends the process: the formatted reason of the first one
+     that reaches that point, or '' when none does. */
   api.takeUnhandledRejection = function () {
     var found = [];
     for (var i = 0; i < WATCHED.length; i++) {
@@ -784,9 +788,47 @@ const REJECTION_TRACKER_SRC = String.raw`
         proc.emit('unhandledRejection', cell.reason, cell.promise);
         continue;
       }
-      return api.formatUncaught(cell.reason);
+      /* With no 'unhandledRejection' listener Node does not drop the rejection, it raises it as an
+         uncaught exception, and that is a second listener's chance to handle it: an
+         'uncaughtException' listener is given the reason with the origin Node passes for a
+         rejection, and the process goes on running. Only with neither listener does the rejection
+         end it. Measured on host node 24.15: Promise.reject(new Error('rej')) with only an
+         'uncaughtException' listener prints UNCAUGHT=rej, runs a timer queued after the rejection
+         and exits 0, where this container ended with 1 and nothing on stdout. */
+      if (listenerCountOf(proc, 'uncaughtException') > 0) {
+        proc.emit('uncaughtException', cell.reason, 'unhandledRejection');
+        continue;
+      }
+      /* An error of the second realm -- what the code of a vm context makes, and what a context
+         leaves unhandled -- is not an Error of this one, so the formatter that asks
+         (err instanceof Error) would answer with an inspection of it and none of its frames. Host
+         node 24.15 prints the stack of a rejection whatever realm its reason is of, so a reason that
+         is tagged [object Error] and is not one of this realm is handed to the formatter as an error
+         of this realm wearing the other's name, message and frames. */
+      function reasonOf(err) {
+        if (err instanceof Error) return api.formatUncaught(err);
+        if (err === null || (typeof err !== 'object' && typeof err !== 'function')) return api.formatUncaught(err);
+        if (Object.prototype.toString.call(err) !== '[object Error]') return api.formatUncaught(err);
+        var twin = new Error(typeof err.message === 'string' ? err.message : '');
+        try {
+          if (typeof err.name === 'string' && err.name !== '') twin.name = err.name;
+          if (typeof err.stack === 'string') twin.stack = err.stack;
+        } catch (inner) {
+          // a reason whose name or frames will not be read is still the reason
+        }
+        return api.formatUncaught(twin);
+      }
+      return reasonOf(cell.reason);
     }
     return '';
+  };
+
+  /* A rejection of the second realm: the code of a vm context runs there, and that realm has a
+     Promise of its own, so a promise it builds is not one this tracker saw. Its own tracker hands
+     the cells it records here, and a rejection of a context is then reported as any other is --
+     host node 24.15 reports one, with the context's frames above Script.runInContext. */
+  api.noteRejection = function (cell) {
+    WATCHED.push(cell);
   };
 })(globalThis.__owc_api);
 `;
