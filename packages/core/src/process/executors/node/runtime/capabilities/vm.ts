@@ -32,6 +32,12 @@ interface VmHost {
      * `instanceof Array` while `Array.isArray` still answers `true`.
      */
     realm?: QuickJSContext;
+    /** `Object.prototype.toString` and `Array.isArray` of the guest realm, once: see {@link VmProbes}. */
+    probes?: VmProbes;
+    /** `(v) => boolean`: whether `v` is a proxy the guest realm made, built once in that realm. */
+    proxyTest?: QuickJSHandle;
+    /** `Proxy` of the guest realm, once: what a rebuild wraps a proxy it hands back in. */
+    proxyCtor?: QuickJSHandle;
     /** Values built in {@link VmHost.realm} and handed to the guest, freed with the binding. */
     realmValues: QuickJSHandle[];
     /** Rebuilds the value a promise settles with, once per binding: see {@link promiseOf}. */
@@ -43,8 +49,6 @@ interface VmHost {
     twins?: QuickJSHandle;
     /** The pairs behind {@link VmHost.twins}, oldest first: the source, and the twin beside it. */
     memo: { src: QuickJSHandle; twin: QuickJSHandle }[];
-    /** `Array.isArray`, `Object.prototype.toString`, `Object.keys` and `Object.prototype`, once. */
-    probes?: VmProbes;
     /** The standard globals of the guest realm beside their namesakes in the second realm, once. */
     builtins?: { from: QuickJSHandle[]; to: QuickJSHandle[] };
     /** Armed deadline in epoch milliseconds; 0 while nothing is armed. */
@@ -133,6 +137,8 @@ interface VmProbes {
     object: QuickJSHandle;
     /** `Object.getOwnPropertyNames`: every own string key, enumerable or not. */
     names: QuickJSHandle;
+    /** `Object.getOwnPropertySymbols`: every own symbol key, which cross as handles, not as text. */
+    symbols: QuickJSHandle;
     isArray: QuickJSHandle;
     tag: QuickJSHandle;
     objectProto: QuickJSHandle;
@@ -259,8 +265,25 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
         }
         host.rehomeFn = undefined;
     }
+    if (host.proxyTest !== undefined) {
+        try {
+            host.proxyTest.dispose();
+        } catch {
+            // as above
+        }
+        host.proxyTest = undefined;
+    }
+    if (host.proxyCtor !== undefined) {
+        try {
+            host.proxyCtor.dispose();
+        } catch {
+            // as above
+        }
+        host.proxyCtor = undefined;
+    }
     if (host.probes !== undefined) {
-        for (const handle of [host.probes.object, host.probes.names, host.probes.isArray, host.probes.tag, host.probes.objectProto]) {
+        for (const handle of [host.probes.object, host.probes.names, host.probes.symbols,
+            host.probes.isArray, host.probes.tag, host.probes.objectProto]) {
             try {
                 handle.dispose();
             } catch {
@@ -409,6 +432,7 @@ function probesOf(host: VmHost): VmProbes {
     const probes: VmProbes = {
         object,
         names: context.getProp(object, 'getOwnPropertyNames'),
+        symbols: context.getProp(object, 'getOwnPropertySymbols'),
         isArray: context.getProp(array, 'isArray'),
         tag: context.getProp(objectProto, 'toString'),
         objectProto
@@ -454,6 +478,71 @@ function builtinOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): Q
     return undefined;
 }
 
+/**
+ * Whether `value` is a proxy: the one question only the realm that made it can answer, since no
+ * probe of any realm -- a tag, a prototype, an own name -- tells a proxy from the object it wraps.
+ * The guest realm keeps the record (see `util.types.isProxy`), so it is asked here.
+ */
+function isProxyValue(host: VmHost, value: QuickJSHandle): boolean {
+    try {
+        if (host.proxyTest === undefined) {
+            const built = host.context.evalCode(
+                '(function (v) { return typeof __owcIsProxy === "function" ? __owcIsProxy(v) === true : false; })'
+            );
+            if (built.error) {
+                built.error.dispose();
+                return false;
+            }
+            host.proxyTest = host.context.unwrapResult(built);
+        }
+        const result = host.context.callFunction(host.proxyTest, host.context.undefined, [value]);
+        if (result.error) {
+            result.error.dispose();
+            return false;
+        }
+        const answer = host.context.dump(result.value) === true;
+        result.value.dispose();
+        return answer;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * `value` wrapped in a proxy of the second realm, built through the guest realm's own `Proxy` so
+ * that the record that realm keeps -- and `util.types.isProxy` with it -- names it too.
+ */
+function proxyOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle | undefined {
+    const { context } = host;
+    try {
+        if (host.proxyCtor === undefined) host.proxyCtor = context.getProp(context.global, 'Proxy');
+        const object = realm.getProp(realm.global, 'Object');
+        const objectProto = realm.getProp(object, 'prototype');
+        const built = realm.evalCode(
+            '(function (orig, proto, P) {' +
+            'return new P(orig, { getPrototypeOf: function () { return proto; } });' +
+            '})'
+        );
+        object.dispose();
+        if (built.error) {
+            built.error.dispose();
+            objectProto.dispose();
+            return undefined;
+        }
+        const bridge = context.unwrapResult(built);
+        const result = realm.callFunction(bridge, realm.undefined, [value, objectProto, host.proxyCtor]);
+        bridge.dispose();
+        objectProto.dispose();
+        if (result.error) {
+            result.error.dispose();
+            return undefined;
+        }
+        return context.unwrapResult(result);
+    } catch {
+        return undefined;
+    }
+}
+
 /** Calls `value[name]()` in the guest realm and dumps the answer, or undefined if it throws. */
 function methodDump(host: VmHost, value: QuickJSHandle, name: string): unknown {
     const result = host.context.callMethod(value, name, []);
@@ -495,6 +584,17 @@ function rehomeInto(
     const kind = context.typeof(value);
     if (kind !== 'object' && kind !== 'function') return value;
     if (depth >= REALM_MAX_DEPTH) return value;
+    /* A proxy is the one value no probe of either realm can name -- this engine answers nothing
+       about one -- so what says an object is a proxy is the record the guest realm keeps of the
+       proxies it made. The rebuild wraps the original in a proxy of the second realm whose
+       `getPrototypeOf` answers that realm's `Object.prototype`: every other trap still reaches the
+       original, so the proxy behaves as it did, while `instanceof Object` reads false and
+       `util.types.isProxy` reads true, which is what host Node 24.15 reports for a proxy a context
+       hands back. */
+    if (isProxyValue(host, value)) {
+        const wrapped = proxyOf(host, realm, value);
+        if (wrapped !== undefined) return pin(host, wrapped);
+    }
     for (let i = 0; i < seen.length; i++) {
         if (context.eq(seen[i], value)) return twins[i];
     }
@@ -506,6 +606,13 @@ function rehomeInto(
     try {
         if (isArray) {
             made = realm.newArray();
+            /* An instance of a class that extends a host's own `Array` is an array to every probe --
+               `Array.isArray` and the `[object Array]` tag both say so -- but it still answers the
+               name of its class, not `Array`, to `o.constructor.name` on host Node 24.15. */
+            const arrayCtor = ctorNameOf(host, value);
+            if (arrayCtor !== undefined && arrayCtor !== 'Array' && arrayCtor !== 'Object') {
+                nameAfter(host, realm, made, arrayCtor);
+            }
         } else if (tag === '[object Object]') {
             made = realm.newObject();
             /* A class instance: `class C {}` out of a context still answers `C` to
@@ -559,6 +666,28 @@ function rehomeInto(
             const bytes = bytesOf(host, value);
             if (bytes === undefined) return value;
             return pin(host, realm.newArrayBuffer(bytes.buffer as ArrayBuffer));
+        } else if (tag === '[object DataView]') {
+            /* A `DataView` is a window on a buffer, and the buffer is the only part of it the caller
+               could not otherwise reach, so the rebuild is a copy of those bytes under a view of the
+               second realm: `new DataView(new ArrayBuffer(4))` out of a context answers false to
+               `instanceof DataView`, as it does on host Node 24.15. */
+            const bytes = bytesOf(host, value);
+            if (bytes === undefined) return value;
+            const built = realm.evalCode('(function (ab) { return new DataView(ab, 0); })');
+            if (built.error) {
+                built.error.dispose();
+                return value;
+            }
+            const bridge = context.unwrapResult(built);
+            const buffer = realm.newArrayBuffer(bytes.buffer as ArrayBuffer);
+            const result = realm.callFunction(bridge, realm.undefined, [buffer]);
+            bridge.dispose();
+            buffer.dispose();
+            if (result.error) {
+                result.error.dispose();
+                return value;
+            }
+            return pin(host, context.unwrapResult(result));
         } else if (REALM_TYPED_ARRAYS.indexOf(tag.slice(8, -1)) >= 0) {
             /* A typed array is its bytes and the name of its class: rebuilt in the second realm over
                a copy of them, so `new Uint8Array(2)` out of a context answers false to
@@ -593,7 +722,7 @@ function rehomeInto(
                `typeof` still reads `function`, a call still reaches the body -- `this` and arguments
                and all -- while `instanceof Function` reads false, as it does on host Node 24.15 for
                the function a context hands back. */
-            const fn = fnOf(host, realm, value);
+            const fn = fnOf(host, realm, value, tag);
             if (fn === undefined) return value;
             return pin(host, fn);
         } else {
@@ -670,18 +799,40 @@ function bytesOf(host: VmHost, value: QuickJSHandle): Uint8Array | undefined {
 /**
  * A function of the second realm that calls `value`, or undefined when it cannot be built.
  *
- * The wrapper is an ordinary function of the realm it was written in -- so `typeof` reads `function`
- * and `instanceof Function` reads false -- and everything a call makes of it is the original's:
- * `this`, the arguments, the value it returns, and a throw, which crosses the way any value the
- * context throws out does. Its own properties are not copied: `length` and `name` are the wrapper's,
- * and a class instance's fields are the walk of an object, not of a function.
+ * The wrapper is of the kind the original is -- an async function under an async one, a generator
+ * under a generator -- so `constructor.name` reads `AsyncFunction` and `GeneratorFunction` where a
+ * host reads them, and `await` and `yield*` reach the body the way a call does. It is a function of
+ * the realm it was written in, so `typeof` reads `function` and `instanceof Function` reads false,
+ * and everything a call makes of it is the original's: `this`, the arguments, the value it returns,
+ * and a throw, which crosses the way any value the context throws out does. Its `name` and `length`
+ * are the original's too -- `function foo(a, b)` out of a context is still `foo` of length 2 on host
+ * Node 24.15, and a class out of a context is still the name of that class, so `class D extends
+ * Array {}` crossing answers `D` and not `''`. The own properties of a function beyond those two are
+ * not copied: a class's statics are the walk of an object, not of a function.
  */
-function fnOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle | undefined {
+const REALM_FUNCTION_WRAPPERS: Record<string, string> = {
+    /* A class is a function to every probe but not to `new`: `new C()` on a class a context handed
+       back has to construct the original, not call it, which a plain `apply` refuses. */
+    '[object Function]': '(function (f) { return function () { if (new.target !== undefined) ' +
+        'return Reflect.construct(f, arguments, new.target); return f.apply(this, arguments); }; })',
+    '[object AsyncFunction]': '(function (f) { return async function () { return await f.apply(this, arguments); }; })',
+    '[object GeneratorFunction]': '(function (f) { return function* () { return yield* f.apply(this, arguments); }; })',
+    '[object AsyncGeneratorFunction]': '(function (f) { return async function* () { return yield* f.apply(this, arguments); }; })'
+};
+
+function fnOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle, tag: string): QuickJSHandle | undefined {
+    const source = REALM_FUNCTION_WRAPPERS[tag] ?? REALM_FUNCTION_WRAPPERS['[object Function]'];
     try {
-        const built = realm.evalCode('(function (f) { return function () { return f.apply(this, arguments); }; })');
+        let built = realm.evalCode(source);
         if (built.error) {
+            /* An engine whose parser will not take the kind's own syntax still gets the plain
+               wrapper rather than losing the function: a call reaches the body either way. */
             built.error.dispose();
-            return undefined;
+            built = realm.evalCode(REALM_FUNCTION_WRAPPERS['[object Function]']);
+            if (built.error) {
+                built.error.dispose();
+                return undefined;
+            }
         }
         const bridge = host.context.unwrapResult(built);
         const result = realm.callFunction(bridge, realm.undefined, [value]);
@@ -690,9 +841,40 @@ function fnOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJ
             result.error.dispose();
             return undefined;
         }
-        return host.context.unwrapResult(result);
+        const made = host.context.unwrapResult(result);
+        const name = typeof propDump(host, value, 'name') === 'string' ? String(propDump(host, value, 'name')) : '';
+        const wanted = Number(propDump(host, value, 'length'));
+        dressAs(realm, made, name, Number.isInteger(wanted) && wanted >= 0 ? wanted : 0);
+        return made;
     } catch {
         return undefined;
+    }
+}
+
+/** Gives the function `made` of the second realm the `name` and `length` of the function it wraps. */
+function dressAs(realm: QuickJSContext, made: QuickJSHandle, name: string, length: number): void {
+    try {
+        const built = realm.evalCode(
+            '(function (f, n, l) {' +
+            'try { Object.defineProperty(f, "name", { value: n, configurable: true }); } catch (x) {}' +
+            'try { Object.defineProperty(f, "length", { value: l, configurable: true }); } catch (x) {}' +
+            'return f; })'
+        );
+        if (built.error) {
+            built.error.dispose();
+            return;
+        }
+        const bridge = realm.unwrapResult(built);
+        const named = realm.newString(name);
+        const counted = realm.newNumber(length);
+        const result = realm.callFunction(bridge, realm.undefined, [made, named, counted]);
+        named.dispose();
+        counted.dispose();
+        bridge.dispose();
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // a function that will not wear the name still calls the original
     }
 }
 
@@ -838,9 +1020,15 @@ function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): Q
                subclass: `class P extends Promise {}` out of a context still answers `P` to
                `constructor.name` on host Node 24.15, and `false` to `instanceof Promise`. The second
                realm has never heard of `P`, so it is given one of that name extending its own. */
-            '(function (src, rehome) {' +
+            '(function (src, rehome, P) {' +
             'var proto = Object.getPrototypeOf(src);' +
-            'var name = proto && typeof proto.constructor === "function" ? String(proto.constructor.name) : "Promise";' +
+            /* What a host reads off a promise a context handed back is `Promise`, whatever this
+               runtime itself calls the class it tracks rejections with: the guest realm's own
+               Promise is a subclass of one name or another for its own reasons, and `Tracked` is
+               not an answer host Node 24.15 ever gives. A promise of a subclass the context made
+               does keep that subclass's name, as it does on the host. */
+            'var name = proto && proto.constructor === P ? "Promise"' +
+            ' : (proto && typeof proto.constructor === "function" ? String(proto.constructor.name) : "Promise");' +
             'var sub = undefined;' +
             'if (name !== "Promise" && name !== "") {' +
             'try { sub = eval("(class " + name + " extends Promise {})"); } catch (x) { sub = undefined; }' +
@@ -856,7 +1044,9 @@ function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): Q
             return value;
         }
         const bridge = host.context.unwrapResult(built);
-        const result = realm.callFunction(bridge, realm.undefined, [value, host.rehomeFn]);
+        const guestPromise = host.context.getProp(host.context.global, 'Promise');
+        const result = realm.callFunction(bridge, realm.undefined, [value, host.rehomeFn, guestPromise]);
+        guestPromise.dispose();
         bridge.dispose();
         if (result.error) {
             result.error.dispose();
@@ -874,19 +1064,55 @@ function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): Q
  * All of them, not only the enumerable ones: the properties that make an error what it is --
  * `message`, `stack`, `cause`, an `AggregateError`'s `errors` -- are own and non-enumerable, so an
  * enumerable-only walk handed back an error with none of them, which is not what host Node 24.15
- * does: it hands back the very object the context made, non-enumerable properties and all. Symbols
- * still do not cross, and are named in the Readme.
+ * does: it hands back the very object the context made, non-enumerable properties and all. The
+ * symbol keys are part of that too -- see {@link symbolKeysOf}.
  */
-function ownKeysOf(host: VmHost, value: QuickJSHandle): string[] {
+function ownKeysOf(host: VmHost, value: QuickJSHandle): (string | QuickJSHandle)[] {
+    const keys: (string | QuickJSHandle)[] = [];
     const result = host.context.callFunction(host.probes!.names, host.probes!.object, [value]);
     if (result.error) {
         result.error.dispose();
-        return [];
+    } else {
+        const names = host.context.dump(result.value);
+        result.value.dispose();
+        if (Array.isArray(names)) {
+            for (const name of names) keys.push(String(name));
+        }
     }
-    const names = host.context.dump(result.value);
-    result.value.dispose();
-    if (!Array.isArray(names)) return [];
-    return names.map((name) => String(name));
+    /* A symbol key crosses as the symbol itself, not as text: `Reflect.ownKeys` of an object a
+       context handed back with one reads `["a", Symbol(k)]` on host Node 24.15, so the twin is set
+       under the very symbol the context used rather than under a fresh one of the second realm. */
+    for (const symbol of symbolKeysOf(host, value)) keys.push(symbol);
+    return keys;
+}
+
+/** The own symbol keys of `value`, read as `Object.getOwnPropertySymbols` reads them, as handles. */
+function symbolKeysOf(host: VmHost, value: QuickJSHandle): QuickJSHandle[] {
+    const out: QuickJSHandle[] = [];
+    const { context } = host;
+    try {
+        const result = context.callFunction(host.probes!.symbols, host.probes!.object, [value]);
+        if (result.error) {
+            result.error.dispose();
+            return out;
+        }
+        const list = result.value;
+        try {
+            const counted = context.getProp(list, 'length');
+            const length = Number(context.dump(counted));
+            counted.dispose();
+            for (let i = 0; i < length; i++) {
+                const one = context.getProp(list, String(i));
+                if (context.typeof(one) === 'symbol') out.push(one);
+                else one.dispose();
+            }
+        } finally {
+            list.dispose();
+        }
+    } catch {
+        // a value whose symbols cannot be read crosses with the keys it has
+    }
+    return out;
 }
 
 /** Keeps a value built in the second realm alive for as long as the binding does, and returns it. */

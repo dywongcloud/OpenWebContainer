@@ -1866,8 +1866,23 @@ BF.crypto = function () {
   /* key bytes and CryptoKey state live here, never on the key objects, so user code sees only Node's surface */
   var KEY_STATE = new WeakMap();
 
+  /*
+   * How Node names what it was handed at the end of an ERR_INVALID_ARG_TYPE: "Received null" and
+   * "Received undefined" for the two that are neither, "Received type number (1)" -- the type and
+   * the value -- for a primitive, and "Received an instance of ArrayBuffer" for an object.
+   */
+  function receivedAs(value) {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    var kind = typeof value;
+    if (kind !== 'object' && kind !== 'function') return 'type ' + kind + ' (' + String(value) + ')';
+    var made = value.constructor;
+    var named = made !== undefined && made !== null && typeof made.name === 'string' ? made.name : null;
+    return named === null || named === '' ? 'an instance of Object' : 'an instance of ' + named;
+  }
+
   function invalidArgType(name, expected, value) {
-    var err = new TypeError('The "' + name + '" argument must be ' + expected + '. Received ' + (value === null ? 'null' : typeof value));
+    var err = new TypeError('The "' + name + '" argument must be ' + expected + '. Received ' + receivedAs(value));
     err.code = 'ERR_INVALID_ARG_TYPE';
     return err;
   }
@@ -1957,7 +1972,19 @@ BF.crypto = function () {
     return min + Math.floor(r * (max - min));
   }
 
+  /* The integer-typed arrays webcrypto.getRandomValues fills: a floating-point one and a DataView
+     are refused with the TypeError the webcrypto layer throws (code 17), as on a host. */
+  var INTEGER_TYPED_ARRAYS = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
+    'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array', 'BigUint64Array'];
+
   function getRandomValues(typed) {
+    var tag = Object.prototype.toString.call(typed).slice(8, -1);
+    if (INTEGER_TYPED_ARRAYS.indexOf(tag) < 0) {
+      var mismatched = new TypeError('The data argument must be an integer-type TypedArray');
+      mismatched.code = 17;
+      mismatched.name = 'TypeMismatchError';
+      throw mismatched;
+    }
     var bytes = decodeBase64(host.randomBase64(typed.byteLength));
     new Uint8Array(typed.buffer, typed.byteOffset, typed.byteLength).set(bytes);
     return typed;
@@ -2007,14 +2034,33 @@ BF.crypto = function () {
     queueMicrotask(function () { done(null, buf); });
   }
 
-  /* bytes from a string (with its encoding), a Buffer, a TypedArray, a DataView or an ArrayBuffer */
-  function toBytes(data, encoding, name) {
+  /*
+   * bytes from a string (with its encoding), a Buffer, a TypedArray, a DataView or an ArrayBuffer
+   *
+   * An ArrayBuffer is not in the list for one family of arguments: the data a hash, a sign or a
+   * verify is fed. Node names "string or an instance of Buffer, TypedArray, or DataView" there and
+   * refuses a bare buffer, while a password, a salt, a key or a signature -- the arguments named
+   * anywhere else -- take one. So the list is the caller's to choose, and the value it was handed
+   * is named at the end of the message as Node names it.
+   */
+  function toBytes(data, encoding, name, list) {
+    var expected = typeof list === 'string'
+      ? list : 'string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView';
+    /* Whether an ArrayBuffer is taken is read off the list itself: a family that does not name one
+       does not take one, which is how Node reads the same message. */
+    var allowArrayBuffer = expected.indexOf('ArrayBuffer') >= 0;
+    function refused() {
+      var err = new TypeError('The "' + name + '" argument must be of type ' + expected + '. Received ' + receivedAs(data));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      return err;
+    }
     if (typeof data === 'string') return Buf.from(data, encoding || 'utf8');
-    if (data instanceof ArrayBuffer) return Buf.from(data);
+    if (data instanceof ArrayBuffer) {
+      if (allowArrayBuffer) return Buf.from(data);
+      throw refused();
+    }
     if (ArrayBuffer.isView(data)) return Buf.from(data.buffer, data.byteOffset, data.byteLength);
-    var err = new TypeError('The "' + name + '" argument must be of type string or an instance of Buffer, TypedArray, or DataView.');
-    err.code = 'ERR_INVALID_ARG_TYPE';
-    throw err;
+    throw refused();
   }
 
   /*
@@ -2284,7 +2330,7 @@ BF.crypto = function () {
     this._chunks = [];
   }
   Sign.prototype.update = function (data, encoding) {
-    this._chunks.push(toBytes(data, encoding, 'data'));
+    this._chunks.push(toBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView'));
     return this;
   };
   Sign.prototype.sign = function (privateKey, encoding) {
@@ -2306,7 +2352,7 @@ BF.crypto = function () {
     this._chunks = [];
   }
   Verify.prototype.update = function (data, encoding) {
-    this._chunks.push(toBytes(data, encoding, 'data'));
+    this._chunks.push(toBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView'));
     return this;
   };
   Verify.prototype.verify = function (publicKey, signature, encoding) {
@@ -2491,10 +2537,10 @@ BF.crypto = function () {
     /* Node reads an encoding it does not know as utf8 rather than refusing it. */
     var bytes;
     try {
-      bytes = toBytes(data, encoding, 'data');
+      bytes = toBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView');
     } catch (unknown) {
       if (typeof encoding !== 'string' || String(unknown && unknown.message).indexOf('Unknown encoding') !== 0) throw unknown;
-      bytes = toBytes(data, 'utf8', 'data');
+      bytes = toBytes(data, 'utf8', 'data', 'string or an instance of Buffer, TypedArray, or DataView');
     }
     this._chunks.push(bytes);
     return this;

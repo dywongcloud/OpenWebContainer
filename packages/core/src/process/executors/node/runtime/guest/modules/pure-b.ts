@@ -1195,11 +1195,70 @@ export const SRC = String.raw`
     return exp;
   };
 
+  /*
+   * The domains the Chrome DevTools Protocol defines. A method of one of these this runtime cannot
+   * answer is an unimplemented one; a method of any other is a name the protocol has never heard of,
+   * which a host refuses differently.
+   */
+  var PROTOCOL_DOMAINS = {
+    Accessibility: true, Animation: true, Audits: true, BackgroundService: true, Browser: true,
+    CSS: true, CacheStorage: true, Cast: true, Console: true, DOM: true, DOMDebugger: true,
+    DOMSnapshot: true, Database: true, Debugger: true, DeviceAccess: true, DeviceOrientation: true,
+    Emulation: true, EventBreakpoints: true, FedCm: true, HeadlessExperimental: true, HeapProfiler: true,
+    IO: true, IndexedDB: true, Input: true, Inspector: true, LayerTree: true, Log: true, Media: true,
+    Memory: true, Network: true, NodeRuntime: true, NodeTracing: true, NodeWorker: true, Overlay: true,
+    Page: true, Performance: true, Preload: true, Profiler: true, Runtime: true, Schema: true,
+    Security: true, ServiceWorker: true, Storage: true, SystemInfo: true, Target: true, Tethering: true,
+    Tracing: true, WebAudio: true, WebAuthn: true
+  };
+
   // ---- inspector ----
 
   BF['inspector'] = function () {
     var EventEmitter = requireBuiltin('events');
     var exp = {};
+
+    /*
+     * The protocol's own events, which a session reads off 'inspectorNotification': a host emits
+     * Runtime.executionContextCreated when Runtime is enabled and Runtime.consoleAPICalled for
+     * everything the program writes to the console while it is. This runtime has no debugger behind
+     * the protocol, but it does have the console, so the two events that need nothing but a running
+     * program are emitted -- and a session that has not enabled Runtime is told nothing, as on a
+     * host. What a host cannot reproduce here is named in the Readme: the context name carries the
+     * pid, and an event carries a timestamp and a stack trace.
+     */
+    var enabledSessions = [];
+    var consoleHooked = false;
+    var CONSOLE_TYPES = { log: 'log', info: 'info', warn: 'warning', error: 'error', debug: 'debug' };
+
+    function notify(session, method, params) {
+      try {
+        session.emit('inspectorNotification', { method: method, params: params });
+      } catch (err) {
+        // a listener that throws must not stop the program that wrote the line
+      }
+    }
+
+    function hookConsole() {
+      if (consoleHooked) return;
+      consoleHooked = true;
+      Object.keys(CONSOLE_TYPES).forEach(function (name) {
+        var original = globalThis.console[name];
+        if (typeof original !== 'function') return;
+        globalThis.console[name] = function () {
+          var args = Array.prototype.slice.call(arguments);
+          var type = CONSOLE_TYPES[name];
+          for (var i = 0; i < enabledSessions.length; i++) {
+            notify(enabledSessions[i], 'Runtime.consoleAPICalled', {
+              type: type,
+              args: args.map(remoteObjectOf),
+              executionContextId: 1
+            });
+          }
+          return original.apply(this, args);
+        };
+      });
+    }
 
     function Session() {
       EventEmitter.call(this);
@@ -1220,6 +1279,8 @@ export const SRC = String.raw`
     };
 
     Session.prototype.disconnect = function () {
+      var at = enabledSessions.indexOf(this);
+      if (at >= 0) enabledSessions.splice(at, 1);
       this._owcConnected = false;
     };
 
@@ -1256,10 +1317,34 @@ export const SRC = String.raw`
       return { type: 'object', className: className, description: inspectValue(value) };
     }
 
+    /*
+     * The same object under returnByValue, which the protocol answers with the value itself rather
+     * than with a description of it: a host hands back the value of ({a:1}) with the flag and its
+     * className and description without it. A function has no JSON form at all, so it comes back as
+     * the empty object a host gives for one, and a value JSON cannot carry -- a cycle, a getter that
+     * throws -- falls back to the described form rather than failing the evaluate.
+     * the described form rather than failing the evaluate.
+     */
+    function returnByValueOf(value) {
+      if (value === undefined) return { type: 'undefined' };
+      if (value === null) return { type: 'object', subtype: 'null', value: null };
+      var kind = typeof value;
+      if (kind === 'number' || kind === 'string' || kind === 'boolean' || kind === 'bigint'
+        || kind === 'symbol') return remoteObjectOf(value);
+      if (kind === 'function') return { type: 'function', value: {} };
+      try {
+        return { type: 'object', value: JSON.parse(JSON.stringify(value)) };
+      } catch (err) {
+        return remoteObjectOf(value);
+      }
+    }
+
     function evaluateForInspector(params) {
       var expression = params && typeof params.expression === 'string' ? params.expression : '';
+      var byValue = params && params.returnByValue === true;
       try {
-        return { result: remoteObjectOf((0, eval)(expression)) };
+        var evaluated = (0, eval)(expression);
+        return { result: byValue ? returnByValueOf(evaluated) : remoteObjectOf(evaluated) };
       } catch (err) {
         return {
           exceptionDetails: {
@@ -1290,7 +1375,26 @@ export const SRC = String.raw`
         return undefined;
       }
       if (method === 'Runtime.enable' || method === 'Runtime.disable' || method === 'Runtime.runIfWaitingForDebugger') {
+        if (method === 'Runtime.enable') {
+          if (enabledSessions.indexOf(this) < 0) enabledSessions.push(this);
+          hookConsole();
+          notify(this, 'Runtime.executionContextCreated', {
+            context: { id: 1, origin: '', name: 'node[' + globalThis.process.pid + ']', auxData: { isDefault: true } }
+          });
+        } else if (method === 'Runtime.disable') {
+          var at = enabledSessions.indexOf(this);
+          if (at >= 0) enabledSessions.splice(at, 1);
+        }
         deliver(callback, null, {});
+        return undefined;
+      }
+      /* A method of a domain the protocol has never heard of is not an unimplemented one, and a
+         host says so with the protocol's own error: -32601, and the name of the method. */
+      var dot = method.indexOf('.');
+      var domain = dot > 0 ? method.slice(0, dot) : method;
+      if (PROTOCOL_DOMAINS[domain] !== true) {
+        deliver(callback, nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+          'Inspector error -32601: \'' + method + '\' wasn\'t found'), undefined);
         return undefined;
       }
       deliver(callback, nodeError(Error, 'ERR_INSPECTOR_NOT_AVAILABLE',

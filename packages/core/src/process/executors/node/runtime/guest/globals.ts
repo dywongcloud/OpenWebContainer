@@ -398,28 +398,69 @@ proc.cpuUsage = function () {
  * for a pid that is not there -- a container process's world is its own children, and a pid that
  * is not one of them is no more reachable here than a dead one is in Node.
  */
-var LETHAL_SIGNALS = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2, SIGHUP: 1, SIGQUIT: 3, SIGABRT: 6 };
+/* Every name a host Node answers to, with the number that host ends a process by: a process that
+   dies of a name leaves 128 + that number as its status. A name a host does not know is not a
+   signal to Node either -- it throws ERR_UNKNOWN_SIGNAL rather than ending anything -- so this is
+   also the set process.kill validates against. The numbers are the ones the host Node this is
+   measured against carries (Darwin), not the Linux set os.constants.signals reports: the status a
+   killed process leaves is read by the world outside the container, and that world numbers
+   signals as the machine it runs on does. */
+var SIGNAL_NUMBERS = {
+  SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6, SIGBUS: 10,
+  SIGFPE: 8, SIGKILL: 9, SIGUSR1: 30, SIGSEGV: 11, SIGUSR2: 31, SIGPIPE: 13, SIGALRM: 14,
+  SIGTERM: 15, SIGCHLD: 20, SIGCONT: 19, SIGSTOP: 17, SIGTSTP: 18, SIGTTIN: 21, SIGTTOU: 22,
+  SIGURG: 16, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 23,
+  SIGINFO: 29, SIGSYS: 12
+};
+/* The names whose default action on a host is to be ignored: a process that sends one to itself
+   with nothing listening for it goes on running, and kill answers true. */
+var IGNORED_SIGNALS = {
+  SIGPIPE: 1, SIGWINCH: 1, SIGCHLD: 1, SIGCONT: 1, SIGURG: 1, SIGXFSZ: 1, SIGIO: 1, SIGINFO: 1
+};
+function nameOfSignal(signal) {
+  if (typeof signal === 'number') {
+    if (signal !== signal || signal % 1 !== 0) return undefined;
+    for (var key in SIGNAL_NUMBERS) {
+      if (SIGNAL_NUMBERS[key] === signal) return key;
+    }
+    return undefined;
+  }
+  var name = String(signal);
+  return SIGNAL_NUMBERS[name] === undefined ? undefined : name;
+}
+function unknownSignalFor(signal) {
+  var bad = new TypeError('Unknown signal: ' + String(signal));
+  bad.code = 'ERR_UNKNOWN_SIGNAL';
+  return bad;
+}
 proc.kill = function (pid, signal) {
-  var name = signal === undefined || signal === null ? 'SIGTERM' : String(signal);
   var num = Number(pid);
-  // Signal 0 is the null signal: it only asks whether the process is there, and never ends it.
-  if (name === '0') {
+  var spec = signal === undefined || signal === null ? 'SIGTERM' : signal;
+  /* Signal 0 is the null signal: it only asks whether the process is there, and never ends it.
+     Node takes it as the number 0 -- the string '0' is not a name and is refused as unknown. */
+  if (spec === 0) {
     if (num === proc.pid) return true;
     if (callCap('child.kill', { pid: num, signal: '0' }) === true) return true;
     throw esrchFor(pid);
   }
+  var name = nameOfSignal(spec);
+  if (name === undefined) throw unknownSignalFor(spec);
   if (num === proc.pid) {
     /* A signal a listener was registered for reaches that listener: Node delivers it and leaves the
-       process running, and only a name nothing listens for ends the process with 128 + its number.
-       SIGKILL and SIGSTOP are the two a listener cannot be registered for, so they end it whatever
-       is on the process. Delivery is a turn of the loop later, as it is on the host -- the line
-       written straight after the kill still runs before the handler does. */
+       process running, and only a name nothing listens for takes its default action. SIGKILL and
+       SIGSTOP are the two a listener cannot be registered for, so they end it whatever is on the
+       process. Delivery is a turn of the loop later, as it is on the host -- the line written
+       straight after the kill still runs before the handler does. */
     if (name !== 'SIGKILL' && name !== 'SIGSTOP' && proc.listenerCount(name) > 0) {
       var delivered = name;
       setTimeout(function () { proc.emit(delivered); }, 0);
       return true;
     }
-    proc.exit(128 + (LETHAL_SIGNALS[name] === undefined ? 15 : LETHAL_SIGNALS[name]));
+    /* Two defaults of Node's own: SIGUSR1 opens the inspector and leaves the process running, and
+       a name a host ignores is ignored here too. */
+    if (name === 'SIGUSR1') return true;
+    if (IGNORED_SIGNALS[name] !== undefined) return true;
+    proc.exit(128 + SIGNAL_NUMBERS[name]);
     return true;
   }
   var table = globalThis.__owcPtyFds;

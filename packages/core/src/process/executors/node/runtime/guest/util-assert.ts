@@ -123,12 +123,12 @@ function inspectValue(value, opts) {
       close = ']';
       prefix = ctor + '(' + v.length + ') ';
       for (i = 0; i < v.length && i < 100; i++) entries.push(String(v[i]));
-    } else if (v instanceof Map) {
+    } else if (utilBrandCheck(Map.prototype.has, v)) {
       prefix = 'Map(' + v.size + ') ';
       v.forEach(function (val, key) {
         entries.push(fmt(key, depth + 1, indent + 2) + ' => ' + fmt(val, depth + 1, indent + 2));
       });
-    } else if (v instanceof Set) {
+    } else if (utilBrandCheck(Set.prototype.has, v)) {
       prefix = 'Set(' + v.size + ') ';
       v.forEach(function (val) {
         entries.push(fmt(val, depth + 1, indent + 2));
@@ -289,9 +289,38 @@ var UTIL_ARRAY_BUFFER_LENGTH = utilGetterOf(ArrayBuffer.prototype, 'byteLength')
 var UTIL_SHARED_BUFFER_LENGTH = typeof SharedArrayBuffer === 'function' ? utilGetterOf(SharedArrayBuffer.prototype, 'byteLength') : null;
 var UTIL_DATA_VIEW_LENGTH = utilGetterOf(DataView.prototype, 'byteLength');
 
+/*
+ * A proxy is the one object no brand check and no tag can name: this engine answers nothing about
+ * one, so util.types.isProxy had nothing to read. What it reads instead is a record of the proxies
+ * this realm has made -- every one of them is built through a wrapper of the engine's own Proxy,
+ * which keeps "new Proxy(t, h)", a subclass of Proxy and Proxy.revocable working exactly as they
+ * did while leaving the record behind. The vm rebuild reads the same record through __owcIsProxy,
+ * so a proxy a context hands back is still one when it crosses.
+ */
+var NATIVE_PROXY = globalThis.Proxy;
+var NATIVE_REVOCABLE = NATIVE_PROXY.revocable;
+var PROXIES_MADE = new WeakMap();
+globalThis.Proxy = new NATIVE_PROXY(NATIVE_PROXY, {
+  construct: function (target, args, newTarget) {
+    var made = Reflect.construct(target, args, newTarget === undefined ? NATIVE_PROXY : newTarget);
+    PROXIES_MADE.set(made, true);
+    return made;
+  }
+});
+Object.defineProperty(globalThis.Proxy, 'revocable', {
+  value: function (target, handler) {
+    var pair = NATIVE_REVOCABLE.call(NATIVE_PROXY, target, handler);
+    PROXIES_MADE.set(pair.proxy, true);
+    return pair;
+  },
+  writable: true, configurable: true
+});
+globalThis.__owcIsProxy = function (value) {
+  return value !== null && (typeof value === 'object' || typeof value === 'function') && PROXIES_MADE.has(value);
+};
+
 /* the element type name of a typed array (Uint8Array and the rest), or undefined for any other value */
-function utilTypedName(value) {
-  if (value === null || typeof value !== 'object') return undefined;
+function utilTypedName(value) {  if (value === null || typeof value !== 'object') return undefined;
   if (UTIL_TYPED_TAG !== null) return UTIL_TYPED_TAG.call(value);
   var tag = Object.prototype.toString.call(value).slice(8, -1);
   return /Array$/.test(tag) ? tag : undefined;
@@ -340,7 +369,7 @@ function utilTypes() {
     isNativeError: function (v) { return utilTag(v) === 'Error'; },
     isNumberObject: function (v) { return utilBrandCheck(Number.prototype.valueOf, v); },
     isPromise: function (v) { return typeof Promise === 'function' && v instanceof Promise; },
-    isProxy: function () { return false; },
+    isProxy: function (v) { return globalThis.__owcIsProxy(v) === true; },
     isRegExp: function (v) { return utilTag(v) === 'RegExp'; },
     isSet: function (v) { return utilBrandCheck(Set.prototype.has, v); },
     isSetIterator: function (v) { return utilTag(v) === 'Set Iterator'; },
