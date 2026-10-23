@@ -269,6 +269,22 @@ bridge costs and the same 16 MiB takes 2.1-2.8 s in the container against 0.09-0
 ~9 MiB/s is the price of a JavaScript HTTP/2 on this engine and not of the transport: the identical
 bytes over this container's own HTTP/1.1, on the identical bridge, are 372 MiB/s.
 
+**Re-measured at HEAD, and the two claims in that paragraph that do not hold.** The gap and its cause
+both survive, but "no change to the bridge can move" is too strong for the wall clock, and "this
+engine" is the wrong subject. Three 16 MiB runs, one process each, at machine load 23-45 (never idle,
+so a floor again): HTTP/2 took 2092-3055 ms here against the host's 68-108 ms, and HTTP/1.1 took
+443-715 ms against the host's 31-42 ms. Counting macrotask hops in that same process and pricing them
+with a `setImmediate` chain measured there -- 1.41-1.92 ms per turn here against 0.043-0.077 ms on
+host, a 20-40x penalty -- turns account for 1103 of the 2092 ms of HTTP/2 (53%) and 365 of the 443 ms
+of HTTP/1.1 (82%), and that term moves with the machine: it fell from 1.92 to 1.41 ms per turn as the
+load fell from 45 to 23. What is left is 59-93 ns per byte for HTTP/2 and 4.6-13 for HTTP/1.1, against
+the host's 4.1-5.4 and 1.9-2.0 -- so HTTP/2 is ~15x the host's per-byte work where HTTP/1.1 is ~2.5x,
+and HTTP/2 costs 6-13x this container's own HTTP/1.1 where the host's HTTP/2 costs 2.2-2.6x its own.
+The outlier is still HTTP/2 and the transport is still not the cause; but the largest single term in
+the wall clock is a bridge turn, and it is movable. It is not the engine's byte throughput either: the
+guest copies 16 MiB in 64 KiB blocks at 0.20 ns/byte against the host's 0.046, and concats 16 MiB at
+0.083 against 0.053 -- 1.6-4.5x, not the ~15x the HTTP/2 path shows.
+
 ### 🚧 In Progress
 
 - **Network Simulation hardening**
@@ -450,8 +466,8 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   name the bootstrap. What it does not reach is one property -- the `err.stack` of an error the engine
   raised itself, which is its own data property written at the throw site and still opens with a frame,
   still carries the bootstrap's frames, and whose column on line 1 of a required module is still 61 wide
-  (`owc-guest-error-engine-stack-no-header` below) -- and a trace out of an **ES module**, which carries
-  no loader frames at all (`owc-esm-runtime-stack-frames`). `util.inspect(new Error('boom'))`, an uncaught
+  (`owc-guest-error-engine-stack-no-header` below); a trace out of an **ES module** names node's own
+  ESM loader behind the module now (`owc-esm-runtime-stack-frames`). `util.inspect(new Error('boom'))`, an uncaught
   throw and an error the guest constructs all carry the `Error: boom` header.
 - **`/dev` holds four devices where a host holds hundreds.** `/dev/null`, `/dev/zero`, `/dev/random` and
   `/dev/urandom` are mounted as character devices and `fs.statSync('/dev/null')` agrees with the host --
@@ -1135,11 +1151,20 @@ re-run in isolation; the rows are open.
   so `function a() {} var a = 2;` and `var a = 1; function a() {}` are the SyntaxError the host
   raises. The caret keeps the tab of a tab-indented line, and a `.ts` entry gets the translator's
   own `ModuleLoader.<anonymous> (node:internal/modules/esm/translators:642:10)` frame where a `.mjs`
-  entry gets `TracingChannel.tracePromise`. Still the engine's and not V8's: the words -- `const;` is
-  `SyntaxError: variable name expected` here where the host says `Unexpected token ';'` -- the caret
-  span of a token V8 underlines whole (an unterminated string is one `^` here and fourteen there), a
-  name bound twice inside a function body, which only QuickJS catches, and the `Error: ` a syntax
-  error in an imported dependency is still prefixed with. Not only an ES module main: a `.cjs` main,
+  entry gets `TracingChannel.tracePromise`. A name bound twice is now caught in every scope and not
+  only at the top of a module -- a function body, a block and a class body each bind on their own, so
+  `function f() { const a = 1; const a = 2; }` is the host's own error at the host's own column, while
+  shadowing, a `var` a second `var` rebinds and a `var` a `function` of the same name rebinds inside a
+  function all stay legal -- and a dependency that fails to compile is printed as it stands, with no
+  `Error: ` in front of a report the host wrote whole. The caret under a token V8 underlines whole is
+  that token's own length now: an unterminated string spans from the quote that opened it to the end of
+  its line (`const s = 'abc;` gets five carets at column 11 and `  return 'x;` three at column 10),
+  where it used to be one. Still the engine's and not V8's: the words of an error this container does
+  not compose -- `const;` is `SyntaxError: variable name expected` here where the host says
+  `Unexpected token ';'`, and that unterminated string `unexpected end of string` where the host says
+  `Invalid or unexpected token`. Both are the pinned engine's own: bare QuickJS 0.32 with no container
+  in the way writes `variable name expected` for `const;` and `unexpected end of string` for that very
+  string, so no rewrite of this container's reaches either. Not only an ES module main: a `.cjs` main,
   a typeless `.js` main and an `import.meta` in a `.cjs` still lose the frame
   (row owc-esm-main-syntax-error-frame)
 - `owc-esm-runtime-stack-frames`: a trace out of an **ES module** names none of node's ESM loader --
@@ -1153,6 +1178,20 @@ re-run in isolation; the rows are open.
   `runtime.setModuleLoader`, which resolves and loads in one synchronous call, so there is no job and no
   loader behind a module for a frame to name; a **syntax** error in an ES module main already carries the
   whole report, frames included (row `owc-esm-main-syntax-error-frame`), a runtime trace does not.
+  **Fixed**: the host names every file it compiles as an ES module as it compiles it, so a frame in one
+  is rendered with the file's URL and not with its path -- `at go (file:///app/m1.mjs:1:39)`,
+  `at file:///app/main.mjs:3:5` -- and node's loader frames stand behind the module's own top-level
+  frame: the job, the loader, and for a module the entry point ran, the entry point. Measured at HEAD:
+  that `main.mjs` prints six lines against the host's six, and a graph two imports deep
+  (`main.mjs` -> `n1.mjs` -> `n2.mjs`) puts all three behind `n2.mjs`, as the host does. A module a
+  dynamic import loads gets the job and the loader and stops, which is what the host does too:
+  `import('./m.mjs')` written in a CommonJS main and in an ES module main both print the host's four
+  lines. A `.js` file a package's `"type": "module"` makes a module is named by its URL like any other.
+  Still the engine's and not node's is the **column** of the frame: host Node names the callee
+  (`at go (file:///app/m1.mjs:1:30)`) and this engine names the `(` behind it (`1:39`), and a member
+  access is named at its `.` where the host names the property; bare QuickJS 0.32 with no container in
+  the way writes the same 31 for the `new Error('boom')` host Node 24.15 writes as 22, so the column is
+  the engine's own and not one this container computed.
 - `owc-esm-cjs-dynamic-import-namespace`: `import('./m.mjs')` written in a CommonJS importer
   resolves to the engine's namespace and not to Node's view of one -- `ns.a = 99` throws
   `'a' is read-only` where the host throws `Cannot assign to read only property 'a' of object
@@ -1223,7 +1262,7 @@ re-run in isolation; the rows are open.
 - `owc-shell-diagnostic-line-position`: no diagnostic carries the position a host's does -- a host writes `/bin/sh: -c: line 1: syntax error near unexpected token `;'` and `/bin/sh: line 0: .: filename argument required`, the container the bare sentence; of 94 measured cases 37 differ on that prefix alone and nothing else.
 - `owc-shell-return-not-in-function-wording`: the complaint about a `return` outside a function is quoted with straight quotes and carries no shell name -- host ``/bin/sh: line 1: return: can only `return' from a function or sourced script``, container `return: can only 'return' from a function or sourced script`.
 - `owc-guest-getter-only-assignment-message`: a strict-mode write to an accessor that has a getter and no setter -- `e.type='y'` on an Event, `r.status=201` on a Response -- throws `TypeError: no setter for property` where host Node 24.15 throws `TypeError: Cannot set property type of #<Event> which has only a getter`. The text is the engine's: the same pair appears for a `class K { get a(){return 1} }` built inside the container. The descriptor, the sloppy-mode no-op and `Reflect.set` answering false all match, which is why those attributes carry no setter at all rather than a setter written only to reproduce this string. Bare QuickJS 0.32 with no container in the way says the same two words for the same class built in the same strict-mode body, so the string is the engine's and no guest-side definition of the accessor reaches it.
-- `owc-guest-error-engine-stack-no-header`: an error the engine raises itself -- `null.x`, `JSON.parse('{')` -- opens with a frame where host Node 24.15 opens with the error's own name and message: container `err.stack` is `    at <anonymous> (/app/main.js:12:11)`, host `TypeError: Cannot read properties of null (reading 'x')`. An error the guest constructs does carry its header, because its constructor is wrapped; these are raised at throw sites inside the engine that no guest-side definition reaches. Re-measured at HEAD: `null.x` gives `    at <anonymous> (/app/main.js:61:66)` against the host's `TypeError: Cannot read properties of null (reading 'x')`, and `JSON.parse('{')` gives `    at <input>:1:2` against `SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)`. There is no hook to put the header there either: an engine-raised error carries `stack` and `message` as its own **data** properties, written at the throw site, `Error.prototype.stack` is absent rather than an accessor, and a `message` getter installed on `Error.prototype` is never consulted (measured: not called once). What is *inside* that stack is the container's own, and the same wall keeps it: `null.x` at the top of `/app/main.js` writes `at call (native)`, `at loadCJS (owc-bootstrap.js:1425:21)`, `at runMain (owc-bootstrap.js:2032:14)` and `at <anonymous> (owc-bootstrap.js:10106:59)` behind the one real frame, where host Node 24.15 writes its eight CommonJS loader frames, and a frame on line 1 of a required module is 61 columns wider than the same code on line 5 of the same file (`at c (/app/k2.js:1:88)` against `at d (/app/k2.js:5:27)`), because the wrapper the host compiles a CommonJS body in sits in front of the module's first line. Both are put right everywhere this container renders a stack -- an uncaught throw, `console.log(e)`, `console.error(e)`, `util.inspect(e)`, and every error the guest constructs -- and both survive in the one property no rendering reaches: what a guest reads out of `err.stack` itself. The line number in the bootstrap's own frames is reproducible, not stable across commits: it is a line in this repository's own bootstrap, so it moves when the bootstrap does.
+- `owc-guest-error-engine-stack-no-header`: an error the engine raises itself -- `null.x`, `JSON.parse('{')` -- opens with a frame where host Node 24.15 opens with the error's own name and message: container `err.stack` is `    at <anonymous> (/app/main.js:12:11)`, host `TypeError: Cannot read properties of null (reading 'x')`. An error the guest constructs does carry its header, because its constructor is wrapped; these are raised at throw sites inside the engine that no guest-side definition reaches. Re-measured at HEAD: `null.x` gives `    at <anonymous> (/app/main.js:61:66)` against the host's `TypeError: Cannot read properties of null (reading 'x')`, and `JSON.parse('{')` gives `    at <input>:1:2` against `SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)`. There is no hook to put the header there either: an engine-raised error carries `stack` and `message` as its own **data** properties, written at the throw site, `Error.prototype.stack` is absent rather than an accessor, and a `message` getter installed on `Error.prototype` is never consulted (measured: not called once). A `stack` **setter** installed the same way is not consulted either: an engine-raised error and one the guest constructs both reach their `catch` with `stack` as their own `value` property and the setter's count still 0, here and in bare QuickJS 0.32 with no container in the way (`setterCalls=0`, `own=true`), so the write is a definition and not an assignment and no guest-side definition can get between the engine and the property. What is *inside* that stack is the container's own, and the same wall keeps it: `null.x` at the top of `/app/main.js` writes `at call (native)`, `at loadCJS (owc-bootstrap.js:1425:21)`, `at runMain (owc-bootstrap.js:2032:14)` and `at <anonymous> (owc-bootstrap.js:10106:59)` behind the one real frame, where host Node 24.15 writes its eight CommonJS loader frames, and a frame on line 1 of a required module is 61 columns wider than the same code on line 5 of the same file (`at c (/app/k2.js:1:88)` against `at d (/app/k2.js:5:27)`), because the wrapper the host compiles a CommonJS body in sits in front of the module's first line. Both are put right everywhere this container renders a stack -- an uncaught throw, `console.log(e)`, `console.error(e)`, `util.inspect(e)`, and every error the guest constructs -- and both survive in the one property no rendering reaches: what a guest reads out of `err.stack` itself. The line number in the bootstrap's own frames is reproducible, not stable across commits: it is a line in this repository's own bootstrap, so it moves when the bootstrap does.
 - `owc-shell-closed-fd-flush-target`: the text a closed descriptor could not hold lands where a host's buffer is flushed, not where the shell started -- `exec >d; echo hi >&-; exec >&2; echo O=[$(cat d)]` is host `O=[hi]` (and the text on the error stream) against the container's `O=[]` with `hi` on the original output; `{ echo hi >&-; } > f; echo O=[$(cat f)]` is host `O=[]` with `hi` on the original output against the container's `O=[hi]`; `exec 1>&-; echo hi 1>&1` is host stdout empty against the container's `hi`.
 - `owc-net-rst-unread-threshold`: a peer destroyed with bytes it never read is reset in the container where host Node 24.15 still closes gracefully -- with the server never reading and destroying after 400 ms, the client sees `cliEnd` / `cliClose:false` / a late write as `EPIPE` on the host at 0, 4 KiB, 16 KiB and 64 KiB unread, and `ECONNRESET` / `cliClose:true` / `ERR_STREAM_DESTROYED` in the container from 4 KiB up; only at 256 KiB and 1 MiB does the host reset too. The container's `readableLength` also reports the full unread count (262144, 1048576) where the host caps it at 65536.
 - `owc-http2-goaway-session-lifetime`: after its own error GOAWAY the container's server session is already destroyed where the host's is still alive -- `srvSession.goaway(2)` then a second `srvSession.goaway(0)` is `destroyed=false` and a no-op on the host and `destroyed=true` plus `ERR_HTTP2_INVALID_SESSION` in the container; and a client's own `c.goaway(0, 1, Buffer.from('clibye'))` reaches the server as `0 , 1 , dbg=clibye` in the container against the host's `0 , 0 , dbg=undefined`.

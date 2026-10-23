@@ -4,10 +4,10 @@ owner: adv5-judge-napi-vm-9
 status: pending
 classification: GUEST
 measured_at: ebdf467 (local main)
-title: A vm context shares the caller's realm: a value handed IN is still of the caller's intrinsics inside it
+title: 'A vm context shares the caller''s realm: a value handed IN is still of the caller''s intrinsics inside it'
 subject: 'The code of a `vm` context runs in the caller''s own realm, so a value the caller puts into a sandbox keeps its identity there: `vm.runInNewContext(''e instanceof Array'', { e: [1] })` is `true` here and `false` on host Node 24.15, and so are `e instanceof Date` for a Date, `e instanceof Object` for a plain object, and `e instanceof Error`, `e.constructor === Error` and `Object.getPrototypeOf(e) === Error.prototype` for an Error. `Array.isArray(e)` and `Object.prototype.toString.call(e)` agree on both, because those do not ask which realm the value is of. A value BORN inside the context agrees on both (`([]) instanceof Array` is `true` here and on the host). The second realm this container keeps is only ever used to rebuild what a context hands back OUT, so the inward half of a context''s isolation does not exist. Not an engine limit: quickjs-emscripten gives each context its own intrinsics and capabilities/vm.ts already makes a second one; what would have to change is where the context''s code is compiled and run.'
 acceptance_criteria:
-- vm.runInNewContext('e instanceof Array', { e: [1] }) is false here, as on host node 24.15
-- vm.runInNewContext('e instanceof Error', { e: new Error('x') }) is false here
-- Everything a context returns or throws still crosses: the owc-vm-error-thrown-realm and owc-vm-realm-map-set-promise-instanceof measurements do not regress
+- 'vm.runInNewContext(''e instanceof Array'', { e: [1] }) is false here, as on host node 24.15'
+- 'vm.runInNewContext(''e instanceof Error'', { e: new Error(''x'') }) is false here'
+- 'Everything a context returns or throws still crosses: the owc-vm-error-thrown-realm and owc-vm-realm-map-set-promise-instanceof measurements do not regress'
 witness_plan: One container boot per case, host node v24.15.0 against the container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core. Already witnessed at /tmp/owc-j9-napivm/cases/v1-inward (host.stdout and v1-inward.ct.out) and in the `in.*` keys of /tmp/owc-j9-napivm/cases/v8-regress.

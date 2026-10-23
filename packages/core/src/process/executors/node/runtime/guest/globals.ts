@@ -2778,26 +2778,28 @@ function circularStructureText(value, replacer) {
       this._done = false;
     }
     Object.defineProperty(Stack.prototype, 'disposed', { get: function () { return this._done; }, configurable: true });
-    Stack.prototype[this === undefined ? 'use' : 'use'] = function (value) {
+    /* Named: a method of the host's own carries its name, and a guest that reads the name of
+       DisposableStack.prototype.dispose is answered 'dispose' there and '' here otherwise. */
+    Stack.prototype.use = function use(value) {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       if (value === null || value === undefined) throw new TypeError('The "value" argument is not disposable');
       this._held.push({ kind: 'use', value: value });
       return value;
     };
-    Stack.prototype.adopt = function (value, onDispose) {
+    Stack.prototype.adopt = function adopt(value, onDispose) {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       if (typeof onDispose !== 'function') throw new TypeError('The "onDispose" argument must be of type function');
       this._held.push({ kind: 'use', value: { dispose: onDispose } });
       return value;
     };
-    Stack.prototype.defer = function (onDispose) {
+    Stack.prototype.defer = function defer(onDispose) {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       if (typeof onDispose !== 'function') throw new TypeError('The "onDispose" argument must be of type function');
       /* A deferred callback is a function and not a disposable: node calls it as it stands, and
          never looks for a Symbol.dispose on it. */
       this._held.push({ kind: 'defer', value: onDispose });
     };
-    Stack.prototype.move = function () {
+    Stack.prototype.move = function move() {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       var next = new Ctor();
       next._held = this._held;
@@ -2814,7 +2816,7 @@ function circularStructureText(value, replacer) {
     return self === undefined ? this : self;
   }
   DisposableStack.prototype = makeStack(DisposableStack, 'DisposableStack').prototype;
-  DisposableStack.prototype.dispose = function () {
+  DisposableStack.prototype.dispose = function dispose() {
     if (this._done) return;
     this._done = true;
     var held = this._held;
@@ -2838,7 +2840,7 @@ function circularStructureText(value, replacer) {
     return self === undefined ? this : self;
   }
   AsyncDisposableStack.prototype = makeStack(AsyncDisposableStack, 'AsyncDisposableStack').prototype;
-  AsyncDisposableStack.prototype.disposeAsync = function () {
+  AsyncDisposableStack.prototype.disposeAsync = function disposeAsync() {
     if (this._done) return Promise.resolve();
     this._done = true;
     var held = this._held;
@@ -3103,7 +3105,21 @@ api.emitExit = function (code) {
   exitEmitted = true;
   proc.emit('exit', code);
 };
+/* Whether a message is a report node wrote for itself and not an error's message: it opens with
+   the file it names -- a file URL for a module, the internal frame it throws through for a
+   TypeScript construct its stripper refuses -- and it carries the SyntaxError it ends in. */
+function isNodeReport(message) {
+  if (typeof message !== 'string' || message === '') return false;
+  if (message.indexOf('file:///') !== 0 && message.indexOf('node:internal/') !== 0) return false;
+  return message.indexOf('SyntaxError') >= 0;
+}
+
 api.formatUncaught = function (err) {
+  /* A failure the host has already written out the way node writes it -- a module that does not
+     compile, or a TypeScript construct node's stripper refuses -- is a report and not an error:
+     it carries the file, the source line, the caret, the SyntaxError and node's own frames, so
+     printing a name and a stack of this engine's in front of it would write the report twice. */
+  if (err instanceof Error && isNodeReport(err.message)) return String(err.message);
   if (err instanceof Error) return formatErrorStack(err);
   return inspectValue(err);
 };

@@ -2288,7 +2288,11 @@ export class NodeProcess extends Process {
         if (text('name') !== 'SyntaxError') return undefined;
         const line = number('lineNumber');
         if (line === 0) return undefined;
-        return esmCompileFailureText(source, file, line, number('columnNumber') || 1, text('message'), true);
+        const column = number('columnNumber') || 1;
+        const message = text('message');
+        return esmCompileFailureText(
+            source, file, line, column, message, true, unterminatedStringSpan(source, line, column, message)
+        );
     }
 
     private finishProcess(): number {
@@ -3821,6 +3825,21 @@ function esmCompileFailureText(
         `${esmCompileFrames(isMain, TS_EXTENSION.test(file))}\n\nNode.js ${NODE_VERSION}`;
 }
 
+/**
+ * How much of a line node underlines for a string the file never closes: the whole of the token,
+ * from the quote that opened it to the last character its line carries, where this engine names
+ * the quote alone -- `const s = 'abc;` gets five carets there and one here. Anything else is
+ * underlined as the single character this engine pointed at.
+ */
+function unterminatedStringSpan(source: string, line: number, column: number, message: string): number {
+    if (message !== 'unexpected end of string') return 1;
+    const lines = source.split('\n');
+    const shown = lines[Math.min(Math.max(line, 1), lines.length) - 1] ?? '';
+    const quote = shown[column - 1];
+    if (quote !== "'" && quote !== '"') return 1;
+    return Math.max(shown.length - column + 1, 1);
+}
+
 /** The three extensions Node strips types out of before it compiles the file. */
 const TS_EXTENSION = /\.[cm]?ts$/;
 
@@ -4331,12 +4350,13 @@ function tsUnsupportedText(source: string, file: string, info: TsUnsupported): s
 }
 
 /**
- * The SyntaxError Node gives for a module that binds one name twice at its top level, as the name
- * it binds again and where in the source that name stands; undefined when no name is bound twice.
- * QuickJS accepts a name brought in by an import and declared again by the module itself, and
- * accepts a redeclaration inside a block, so only names bound at module scope are counted.
- * `var` redeclaration stays legal, as it is in Node; a `function` declaration is a lexical binding
- * at module scope, as it is there, so a `var` or another `function` of the same name is not.
+ * The SyntaxError Node gives for a module that binds one name twice, as the name it binds again and
+ * where in the source that name stands; undefined when no name is bound twice. QuickJS accepts a
+ * name brought in by an import and declared again by the module itself, and accepts a redeclaration
+ * inside a block, so every scope -- the module's own, and the body of a function, of a class or of
+ * a block -- is counted on its own. `var` redeclaration stays legal, as it is in Node; a `function`
+ * declaration is a lexical binding at module scope, as it is there, so a `var` or another `function`
+ * of the same name is not, while inside a function it is hoisted as `var` is.
  */
 /**
  * Where node underlines a name bound twice: the start of the declaration that binds it a second
@@ -4386,23 +4406,76 @@ function duplicateSite(tokens: JsToken[], i: number, name: string): { at: number
     return { at, span: 1 };
 }
 
+/**
+ * Whether the `{` at `i` opens a scope that binds names of its own -- the body of a function, of a
+ * class or of a block -- and not an object literal or a destructuring pattern, which bind none.
+ */
+function opensScope(tokens: JsToken[], i: number): boolean {
+    const prev = tokens[i - 1];
+    if (prev === undefined) return true;
+    if (prev.t === 'id') {
+        /* `return { a }` returns an object and `of {` is a pattern, but `try`, `do`, `else` and
+           `finally` open the block that follows them, and the `{` behind a class's name is its body. */
+        if (prev.v === 'return' || prev.v === 'of' || prev.v === 'in' || prev.v === 'new' || prev.v === 'typeof') return false;
+        if (prev.v === 'try' || prev.v === 'do' || prev.v === 'else' || prev.v === 'finally' || prev.v === 'class') return true;
+        return isId(tokens[i - 2], 'class');
+    }
+    if (prev.t !== 'punc') return false;
+    /* The body of a function, and of everything else whose head ends in a `)`; and a block, which
+       stands in a statement's place. */
+    if (prev.v === ')' || prev.v === '{' || prev.v === '}' || prev.v === ';') return true;
+    /* A block behind a `case` or a `default`, and not the object a `:` of any other kind opens. */
+    if (prev.v === ':') return isId(tokens[i - 2], 'case') || isId(tokens[i - 2], 'default');
+    if (prev.v !== '=>') return false;
+    /* Behind an arrow the brace is either the body of the function or an object it returns, and
+       what stands inside it tells the two apart: a property name has a `:` behind it -- or a `,`
+       or a `}` for the shorthand -- and a spread has `...` in front of it. */
+    const first = tokens[i + 1];
+    if (first === undefined || isPunc(first, '}') || isPunc(first, '...')) return false;
+    if (first.t !== 'id' && first.t !== 'str') return true;
+    const second = tokens[i + 2];
+    return !(second !== undefined && (isPunc(second, ':') || isPunc(second, ',') || isPunc(second, '}')));
+}
+
+/** The names one scope binds: the lexical ones, and the `var` and `function` ones behind them. */
+interface BindingScope {
+    lexical: Set<string>;
+    hoisted: Set<string>;
+    /** The module's own scope, where a `function` declaration is a lexical binding, as it is in Node. */
+    module: boolean;
+    /** False for a brace that binds nothing: an object literal, a destructuring pattern. */
+    scope: boolean;
+}
+
 function duplicateModuleBinding(source: string)
     : { name: string; line: number; column: number; span: number } | undefined {
     const tokens = tokenizeJs(source);
-    const lexical = new Set<string>();
-    const hoisted = new Set<string>();
-    let depth = 0;
+    const scopes: BindingScope[] = [
+        { lexical: new Set(), hoisted: new Set(), module: true, scope: true }
+    ];
     let paren = 0;
+    /* The scope a binding here belongs to: the innermost brace that is one. */
+    const current = (): BindingScope => {
+        for (let k = scopes.length - 1; k >= 0; k--) {
+            const scope = scopes[k]!;
+            if (scope.scope) return scope;
+        }
+        return scopes[0]!;
+    };
     for (let i = 0; i < tokens.length; i++) {
         const tok = tokens[i];
         if (tok.t === 'punc') {
-            if (tok.v === '{') depth++;
-            else if (tok.v === '}') depth--;
-            else if (tok.v === '(' || tok.v === '[') paren++;
+            if (tok.v === '{') {
+                scopes.push({
+                    lexical: new Set(), hoisted: new Set(), module: false, scope: opensScope(tokens, i)
+                });
+            } else if (tok.v === '}') {
+                if (scopes.length > 1) scopes.pop();
+            } else if (tok.v === '(' || tok.v === '[') paren++;
             else if (tok.v === ')' || tok.v === ']') paren--;
             continue;
         }
-        if (tok.t !== 'id' || depth !== 0 || paren !== 0 || !startsDeclaration(tokens, i)) continue;
+        if (tok.t !== 'id' || paren !== 0 || !startsDeclaration(tokens, i)) continue;
         if (isPunc(tokens[i - 1], '.') || isPunc(tokens[i - 1], '?.')) continue;
         const names: string[] = [];
         let lexicalBinding = true;
@@ -4413,7 +4486,9 @@ function duplicateModuleBinding(source: string)
             const name = tokens[i + 1];
             if (name === undefined || name.t !== 'id') continue;
             names.push(name.v);
-            lexicalBinding = true;
+            /* A class is a lexical binding wherever it stands; a function is one at module scope,
+               where Node treats it as such, and a hoisted one inside a function, as it is there. */
+            lexicalBinding = tok.v === 'class' || current().module;
         } else if (tok.v === 'const' || tok.v === 'let' || tok.v === 'var') {
             lexicalBinding = tok.v !== 'var';
             let k = i + 1;
@@ -4431,15 +4506,16 @@ function duplicateModuleBinding(source: string)
         } else {
             continue;
         }
+        const scope = current();
         for (const name of names) {
             // a lexical name is never rebound; a var or function name is, by another var or function
-            if (lexical.has(name) || (lexicalBinding && hoisted.has(name))) {
+            if (scope.lexical.has(name) || (lexicalBinding && scope.hoisted.has(name))) {
                 const site = duplicateSite(tokens, i, name);
                 const where = lineColumnOf(source, site.at);
                 return { name, line: where.line, column: where.column, span: site.span };
             }
-            if (lexicalBinding) lexical.add(name);
-            else hoisted.add(name);
+            if (lexicalBinding) scope.lexical.add(name);
+            else scope.hoisted.add(name);
         }
     }
     return undefined;

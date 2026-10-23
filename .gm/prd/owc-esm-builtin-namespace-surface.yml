@@ -1,16 +1,7 @@
 id: owc-esm-builtin-namespace-surface
-subject: 'ESM: the namespace of a builtin module is thinner than Node''s, so Object.keys(await import("node:path")).length is 16 where host Node 24.15 gives 18 and node:fs lacks cp, glob, statfs, lutimes and openAsBlob'
-description: >-
-  Measured 2026-10-22 (judge lane, differential container vs host Node 24.15). node:path is missing
-  matchesGlob and _makeLong; node:fs is missing cp, cpSync, glob, globSync, statfs, statfsSync,
-  lutimes, lutimesSync, openAsBlob, mkdtempDisposableSync, FileReadStream, FileWriteStream and
-  Utf8Stream, and instead exposes F_OK/R_OK/W_OK/X_OK at top level where the host keeps them under
-  fs.constants only (81 keys vs 105); node:os is missing getPriority, setPriority and machine (20
-  keys vs 24). Fix belongs in the guest builtin modules (guest/modules/*): add the missing exports
-  and drop the four constants from the top level of fs.
+description: 'Re-measured 2026-10-23 at HEAD (6a101dc, executor for shard esm-surface) and again on 2026-10-23 by the repair lane adv5-fix-esm-surface-0, differential container vs host Node 24.15. The row''s own fix site is wrong: none of these three modules is defined under runtime/guest/modules/*. node:path is BF.path in runtime/guest/path-events.ts, node:fs is BF.fs in runtime/guest/buffer-fs.ts and node:os is BF.os in runtime/guest/misc.ts. What is left to do there, measured: node:path 16 vs 18 -- add matchesGlob and _makeLong; node:fs 90 vs 105 -- add FileReadStream, FileWriteStream, ReadStream, Utf8Stream, WriteStream, _toUnixTimestamp, fchown, fchownSync, futimes, futimesSync, glob, globSync, lchmod, lchmodSync, lchown, lchownSync, lutimes, lutimesSync and mkdtempDisposableSync, and drop F_OK/R_OK/W_OK/X_OK from the top level (the host keeps all four under fs.constants only); node:os 22 vs 24 -- add getPriority and setPriority. cp, cpSync, statfs, statfsSync, openAsBlob and machine, which the row also named, are already there. Re-measured wider by the judge lane: all 25 builtins it imported by name differ in Object.keys, not 19 of 34 -- node:constants 56 vs 232; node:crypto 45 vs 70; node:os''s constants itself is ''errno, signals'' here against the host''s ''UV_UDP_REUSEADDR, dlopen, errno, priority, signals'', with 33 signals against 31; node:module lacks stripTypeScriptTypes, register, enableCompileCache, findPackageJSON, SourceMap and runMain, and still carries wrap, wrapper and createRequireFromPath; node:fs/promises lacks glob, watch and mkdtempDisposable; node:stream/web lacks CompressionStream and DecompressionStream; node:sqlite, node:test, node:sea and node:wasi are ERR_MODULE_NOT_FOUND; and node:stream/consumers fails with "Cannot find package ''node:stream''". The os.constants fix site is BF.os in runtime/guest/misc.ts, which this shard does not own.'
+session_id: adv5-fix-esm-surface-0
 owner: lanmower
-session_id: adv-judge-fetch-url-esm-4
-witness_plan: >-
-  Differential Object.keys(await import('node:path'|'node:fs'|'node:os')) sorted, plus the presence
-  of each named export, host Node 24.15 vs container; every line must match.
 status: pending
+subject: 'ESM: the namespace of a builtin module is thinner than Node''s -- node:path 16 vs 18, node:fs 90 vs 105, node:os 22 vs 24, and all 25 builtins imported by name differ in Object.keys'
+witness_plan: Differential Object.keys(await import('node:path'|'node:fs'|'node:os'|...)) sorted, plus the presence of each named export, host Node 24.15 vs container; every line must match.
