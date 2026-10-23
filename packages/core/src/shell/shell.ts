@@ -835,8 +835,11 @@ export class Shell implements IShell {
                     let errors = '';
                     for (const name of operands) {
                         /* `-` is the standard input, as it is for the host's `cat`: `printf 'x' |
-                           cat -` prints `x`, and a name that is no file at all is still an error. */
-                        if (name === '-') {
+                           cat -` prints `x`, and a name that is no file at all is still an error.
+                           `/dev/stdin` and `/dev/fd/0` are that same stream under the names a
+                           host's own `/dev` holds it by: `printf x | cat /dev/stdin` prints `x`,
+                           where opening the name as a path found no such file in this file system. */
+                        if (name === '-' || name === '/dev/stdin' || name === '/dev/fd/0') {
                             joined += numbered(input ?? '');
                             continue;
                         }
