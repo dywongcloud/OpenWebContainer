@@ -812,7 +812,10 @@ function boundaryOf(headers) {
   return value === '' ? null : value;
 }
 
-/* One part of a multipart body: the headers above the blank line, and the raw bytes below it. */
+/* One part of a multipart body: the headers above the blank line, and the raw bytes below it.
+   The closed flag says the closing delimiter was reached; the malformed one says a part was split
+   off that is not a part -- it has no blank CRLF line ending its headers, or no header at all.
+   Node refuses the whole body for either, so the caller needs both and not just the parts. */
 function splitMultipart(bytes, boundary) {
   var text = bytes.toString('latin1');
   var delimiter = '--' + boundary;
@@ -821,30 +824,46 @@ function splitMultipart(bytes, boundary) {
      demanded one left the first part looking like the closing delimiter and dropped every part. */
   var parts = text.split(delimiter);
   var out = [];
+  var closed = false;
+  var malformed = false;
   /* From the first part on: what precedes the opening delimiter is the preamble, which is no part. */
   for (var i = 1; i < parts.length; i++) {
     var chunk = parts[i];
     /* The closing delimiter is the one two more dashes follow; what is after it is the epilogue. */
-    if (chunk.slice(0, 2) === '--') break;
+    if (chunk.slice(0, 2) === '--') { closed = true; break; }
     chunk = chunk.replace(/^[^\S\r\n]*\r\n/, '');
     var head = chunk.indexOf('\r\n\r\n');
-    if (head < 0) continue;
+    /* A part whose headers no blank CRLF ends is not a part: a body written with bare LF line
+       breaks is one of these, and Node refuses it rather than reading it as an empty part. */
+    if (head < 0) { malformed = true; continue; }
     var headerText = chunk.slice(0, head);
-    if (headerText.indexOf(':') < 0) continue;
+    if (headerText.indexOf(':') < 0) { malformed = true; continue; }
     out.push({ headers: headerText, body: chunk.slice(head + 4).replace(/\r\n$/, '') });
   }
-  return out;
+  return { parts: out, closed: closed, malformed: malformed };
 }
 
-/* The name and filename a part's content-disposition carries. */
+/* The name and filename a part's content-disposition carries. The header block reached this
+   function as latin1 bytes, so a name written in UTF-8 is decoded back out of it: 'é' arrived as
+   the two bytes c3 a9 and would otherwise be read as the two characters they are in latin1. */
 function dispositionOf(headerText) {
+  var text = Buffer.from(headerText, 'latin1').toString('utf8');
   var name = null;
   var filename = null;
-  var match = /name=(?:"([^"]*)"|([^;]*))/i.exec(headerText);
+  /* The name and the filename are looked for behind a delimiter or the start of the header, and
+     not anywhere in it: without that guard the "name=" inside "filename=" is found by the name
+     pattern, so a part that names only a file looks like one that named a field too. */
+  var match = /(?:^|[;\s])name=(?:"([^"]*)"|([^;]*))/i.exec(text);
   if (match !== null) name = match[1] !== undefined ? match[1] : match[2];
-  var file = /filename=(?:"([^"]*)"|([^;]*))/i.exec(headerText);
+  var file = /(?:^|[;\s])filename=(?:"([^"]*)"|([^;]*))/i.exec(text);
   if (file !== null) filename = file[1] !== undefined ? file[1] : file[2];
   return { name: name, filename: filename };
+}
+
+/* What Node answers for a body it will not read as a FormData: one message for every shape of
+   malformed multipart, and for a content type carrying no boundary. */
+function formDataParseFailure() {
+  return new TypeError('Failed to parse body as FormData.');
 }
 
 /* A body read as a FormData, which is what Node offers beside text and json: a urlencoded body and
@@ -869,20 +888,28 @@ function bodyFormData(body) {
       return made;
     }
     var boundary = boundaryOf(body.headers);
-    if (boundary === null) return made;
-    var parts = splitMultipart(bytes, boundary);
+    /* A multipart body with no boundary parameter cannot be split, and Node refuses it rather
+       than answering an empty FormData. */
+    if (boundary === null) throw formDataParseFailure();
+    var split = splitMultipart(bytes, boundary);
+    /* A body whose closing delimiter never came is refused whole, parts and all. */
+    if (!split.closed || split.malformed) throw formDataParseFailure();
+    var parts = split.parts;
     for (var i = 0; i < parts.length; i++) {
       var named = dispositionOf(parts[i].headers);
-      if (named.name === null || named.name === undefined) continue;
+      /* A part with no name is refused: Node reads a body with one as unparseable, whether the
+         nameless part carries a filename or no headers at all. */
+      if (named.name === null || named.name === undefined) throw formDataParseFailure();
       var typeMatch = /content-type\s*:\s*([^\r\n]*)/i.exec(parts[i].headers);
       var partType = typeMatch === null ? '' : typeMatch[1].trim();
       var raw = Buffer.from(parts[i].body, 'latin1');
-      if (named.filename !== null && named.filename !== undefined && named.filename !== '') {
-        made.append(named.name, new globalThis.File([raw], named.filename, { type: partType }), named.filename);
-      } else if (partType === '' || partType === 'text/plain') {
-        made.append(named.name, parts[i].body);
+      /* A part is a File exactly when its disposition names a file, even an empty one, and Node
+         defaults a part's type to text/plain where it names none. Every other part is a string,
+         whatever content type it carries, read back out of its bytes as UTF-8. */
+      if (named.filename !== null && named.filename !== undefined) {
+        made.append(named.name, new globalThis.File([raw], named.filename, { type: partType === '' ? 'text/plain' : partType }), named.filename);
       } else {
-        made.append(named.name, new globalThis.Blob([raw], { type: partType }));
+        made.append(named.name, raw.toString('utf8'));
       }
     }
     return made;

@@ -2408,6 +2408,20 @@ function owcBuildStreamCore() {
 
   function finishedImpl(stream, options, callback) {
     var opts = options || {};
+    var web = webStreamState(stream);
+    /* A web stream has no events to listen for, so the listener path below would call a method it
+       does not have. A host waits on the stream's own state instead, without locking it: it settles
+       when the stream closes and rejects with the error the stream stored, and it stays pending for
+       one that is simply never closed. */
+    if (web !== null) {
+      var settle = function (error) {
+        callback.call(stream, error === undefined ? undefined : error);
+      };
+      if (web.state === 'errored') process.nextTick(function () { settle(web.error); });
+      else if (web.state === 'closed') process.nextTick(function () { settle(); });
+      else web.settled.then(function () { settle(); }, function (error) { settle(error); });
+      return function () {};
+    }
     var rState = stream._readableState;
     var wState = stream._writableState;
     var readable = opts.readable !== undefined ? !!opts.readable : rState !== undefined;
@@ -2996,10 +3010,27 @@ function owcBuildStreamCore() {
     return !!((w && w.destroyed) || (r && r.destroyed));
   }
 
+  /* A web stream keeps its state private, so the bridge the web-streams module installs is the only
+     way in for the node:stream surface. It answers null for anything that is not one of its own
+     readable or writable, which is what a host answers for a value it cannot read that way. */
+  function webStreamState(stream) {
+    if (typeof BF !== 'object' || BF === null) return null;
+    var read = BF['webstream/state'];
+    if (typeof read !== 'function') return null;
+    try {
+      return read(stream);
+    } catch (error) {
+      return null;
+    }
+  }
+
   /* A web ReadableStream carries no 'readable' boolean, but a host's isReadable answers true for
      one all the same: its class is marked readable, so isReadable(new Blob(['ab']).stream()) is
-     true where any unmarked object is null. */
+     true where any unmarked object is null. That holds only while it still reads: one that has
+     closed or errored answers false, and a web writable answers null. */
   function streamIsReadable(stream) {
+    var web = webStreamState(stream);
+    if (web !== null) return web.kind === 'ReadableStream' ? web.state === 'readable' : null;
     if (isWebReadable(stream)) return true;
     if (!stream || typeof stream !== 'object' || typeof stream.readable !== 'boolean') return null;
     if (streamIsDestroyed(stream)) return false;
@@ -3008,6 +3039,9 @@ function owcBuildStreamCore() {
   }
 
   function streamIsWritable(stream) {
+    var web = webStreamState(stream);
+    /* An errored writable answers false; one that is closing, or has closed, still answers true. */
+    if (web !== null) return web.kind === 'WritableStream' ? web.state === 'writable' || web.state === 'closed' : null;
     if (isWebWritable(stream)) return true;
     if (!stream || typeof stream !== 'object' || typeof stream.writable !== 'boolean') return null;
     if (streamIsDestroyed(stream)) return false;
@@ -3099,6 +3133,9 @@ function owcBuildStreamCore() {
      while an object-mode stream hands its values over as they are. */
   function webChunkOf(value, objectMode) {
     if (objectMode) return value;
+    /* A Buffer is a Uint8Array, but the readable side of Readable.toWeb answers plain Uint8Array
+       chunks on a host, copying the bytes out of the Buffer rather than sharing its memory. */
+    if (value instanceof Buf) return new Uint8Array(value);
     if (value instanceof Uint8Array) return value;
     if (typeof value === 'string') return typeof TextEncoder === 'function' ? new TextEncoder().encode(value) : Buf.from(value);
     return value;

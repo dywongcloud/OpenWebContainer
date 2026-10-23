@@ -23,6 +23,42 @@ export const SRC = String.raw`
   function requireCreate(token) {
     if (token !== CREATE) throw new TypeError('Illegal constructor');
   }
+  /* A stream's own settled promise: it resolves when the stream closes and rejects with the stored
+     error when it errors. Nothing in the standard asks for one, but node:stream/promises finished()
+     waits on a web stream without locking it, so the state a caller can reach has to come from
+     the transitions themselves rather than from a reader or writer attached for the purpose. */
+  /* The symbols Node stamps on every web stream instance, with the same descriptions so a caller
+     that lists them sees the same names: its stream helpers read a web stream's kind and state
+     through these, and a closed-promise slot shaped like its own. They are own, non-enumerable and
+     configurable, and nothing in this file reads them -- the slots above stay the real state. */
+  var kType = Symbol('kType');
+  var kState = Symbol('kState');
+  var kIsClosedPromise = Symbol('nodejs.webstream.isClosedPromise');
+  var kControllerErrorFunction = Symbol('nodejs.webstream.controllerErrorFunction');
+  function controllerErrorFunctionStub() {}
+  function stamp(target, kind, slots) {
+    Object.defineProperty(target, kType, { value: kind, writable: true, configurable: true });
+    Object.defineProperty(target, kState, { value: slots, writable: true, configurable: true });
+  }
+  function stampStream(target, kind) {
+    var slots = SLOTS.get(target);
+    stamp(target, kind, slots);
+    Object.defineProperty(target, kIsClosedPromise, { value: slots.settled, writable: true, configurable: true });
+    Object.defineProperty(target, kControllerErrorFunction, { value: controllerErrorFunctionStub, writable: true, configurable: true });
+  }
+  function settledDeferred() {
+    var d = deferred();
+    handled(d.promise);
+    return d;
+  }
+  /* The state of a web stream, for the node:stream surface that has to read it without a reader or
+     a writer of its own: its kind, its state, the error it stored and the promise that settles. */
+  BF['webstream/state'] = function (stream) {
+    var slots = isObject(stream) ? SLOTS.get(stream) : undefined;
+    if (slots === undefined) return null;
+    if (slots.kind !== 'ReadableStream' && slots.kind !== 'WritableStream') return null;
+    return { kind: slots.kind, state: slots.state, error: slots.storedError, settled: slots.settled.promise };
+  };
   function deferred() {
     var d = {};
     d.promise = new Promise(function (resolve, reject) {
@@ -120,6 +156,7 @@ export const SRC = String.raw`
   function readableClose(stream) {
     var s = readableState(stream);
     s.state = 'closed';
+    s.settled.resolve(undefined);
     if (s.reader === undefined) return;
     var r = SLOTS.get(s.reader);
     r.closed.resolve(undefined);
@@ -135,6 +172,7 @@ export const SRC = String.raw`
     if (s.state !== 'readable') return;
     s.state = 'errored';
     s.storedError = error;
+    s.settled.reject(error);
     if (s.reader === undefined) return;
     var r = SLOTS.get(s.reader);
     handled(r.closed.promise);
@@ -433,6 +471,7 @@ export const SRC = String.raw`
     constructor(stream) {
       if (!(stream instanceof ReadableStream)) throw new TypeError('stream must be a ReadableStream');
       SLOTS.set(this, { kind: 'ReadableStreamDefaultReader', stream: undefined, closed: undefined, requests: [] });
+      stamp(this, 'ReadableStreamDefaultReader', SLOTS.get(this));
       attachReader(this, stream);
     }
     get closed() {
@@ -461,6 +500,7 @@ export const SRC = String.raw`
       if (!(stream instanceof ReadableStream)) throw new TypeError('stream must be a ReadableStream');
       if (!isByteStream(stream)) throw new TypeError('Cannot use a BYOB reader with a non-byte stream');
       SLOTS.set(this, { kind: 'ReadableStreamBYOBReader', stream: undefined, closed: undefined, requests: [] });
+      stamp(this, 'ReadableStreamBYOBReader', SLOTS.get(this));
       attachReader(this, stream);
     }
     get closed() {
@@ -655,7 +695,7 @@ export const SRC = String.raw`
       var start = methodOf(source, 'start');
       var pull = methodOf(source, 'pull');
       var cancel = methodOf(source, 'cancel');
-      SLOTS.set(this, { kind: 'ReadableStream', state: 'readable', storedError: undefined, reader: undefined, controller: undefined, disturbed: false, byteStream: String(type) === 'bytes' });
+      SLOTS.set(this, { kind: 'ReadableStream', state: 'readable', storedError: undefined, reader: undefined, controller: undefined, disturbed: false, byteStream: String(type) === 'bytes', settled: settledDeferred() });
       if (type === undefined) {
         var highWaterMark = highWaterMarkOf(options, 1);
         var size = sizeOf(options);
@@ -667,6 +707,7 @@ export const SRC = String.raw`
       } else {
         throw new RangeError('Invalid type is specified');
       }
+      stampStream(this, 'ReadableStream');
     }
     get locked() {
       return isLocked(this);
@@ -818,6 +859,7 @@ export const SRC = String.raw`
   function finishErroring(stream) {
     var s = writableState(stream);
     s.state = 'errored';
+    s.settled.reject(s.storedError);
     resetQueue(SLOTS.get(s.controller));
     var storedError = s.storedError;
     var requests = s.writeRequests;
@@ -904,6 +946,7 @@ export const SRC = String.raw`
         }
       }
       s.state = 'closed';
+      s.settled.resolve(undefined);
       if (s.writer !== undefined) {
         var w = SLOTS.get(s.writer);
         if (!w.closedDone) {
@@ -1043,6 +1086,7 @@ export const SRC = String.raw`
     constructor(stream) {
       if (!(stream instanceof WritableStream)) throw new TypeError('stream must be a WritableStream');
       SLOTS.set(this, { kind: 'WritableStreamDefaultWriter', stream: undefined, ready: undefined, readyDone: false, closed: undefined, closedDone: false });
+      stamp(this, 'WritableStreamDefaultWriter', SLOTS.get(this));
       attachWriter(this, stream);
     }
     get closed() {
@@ -1107,9 +1151,11 @@ export const SRC = String.raw`
         closeRequest: undefined,
         writeRequests: [],
         pendingAbort: undefined,
-        backpressure: false
+        backpressure: false,
+        settled: settledDeferred()
       });
       setupWritableController(this, sink, start, write, close, abort, highWaterMark, size);
+      stampStream(this, 'WritableStream');
     }
     get locked() {
       return writableState(this).writer !== undefined;
