@@ -898,8 +898,10 @@ function captureAsyncContext() {
   return ASYNC_CONTEXT.capture ? ASYNC_CONTEXT.capture() : null;
 }
 
+/* A callback scheduled with no frame captured must run with no frame, and not inherit one a later
+   enterWith leaves behind: node gives a timer queued before als.enterWith('E') undefined. */
 function runInAsyncContext(token, fn) {
-  if (token === null || token === undefined || !ASYNC_CONTEXT.run) return fn();
+  if (!ASYNC_CONTEXT.run) return fn();
   return ASYNC_CONTEXT.run(token, fn);
 }
 

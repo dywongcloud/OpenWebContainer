@@ -1009,14 +1009,15 @@ export const SRC = String.raw`
     };
   }
 
-  // Installed on the first run/enterWith. Reactions registered while a frame is
-  // active run with that frame restored; with no active frame it is a passthrough.
+  // Installed when async_hooks loads, so a reaction registered before any frame exists is bound to
+  // the frame of its registration -- none -- rather than to whatever a later enterWith leaves in
+  // the module-level frame: node runs fn with no store when it was registered before the enterWith,
+  // and gives a timer queued before it undefined too.
   function installAsyncContextHook() {
     if (originalThen !== null) return;
     originalThen = Promise.prototype.then;
     Promise.prototype.then = function then(onFulfilled, onRejected) {
       var frame = currentFrame;
-      if (frame === null) return originalThen.call(this, onFulfilled, onRejected);
       return originalThen.call(this, bindFrameCallback(onFulfilled, frame), bindFrameCallback(onRejected, frame));
     };
   }
@@ -1200,6 +1201,7 @@ export const SRC = String.raw`
   };
 
   BF.async_hooks = function () {
+    installAsyncContextHook();
     ASYNC_CONTEXT.capture = function () {
       return currentFrame;
     };
