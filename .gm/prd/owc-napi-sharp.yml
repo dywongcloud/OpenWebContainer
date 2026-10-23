@@ -1,4 +1,50 @@
 id: owc-napi-sharp
+title: 'VERIFIED at HEAD: the sharp shim matches sharp 0.33.5 on 88 of 95 probe lines, up from 87'
 subject: 'The sharp API subset reimplemented in pure JavaScript: metadata, resize, rotate, and format conversion to PNG and JPEG (and WebP where a pure-JS codec exists). Partial and documented, since libvips is not reproducible in full. Corpus entry sharp-native is currently ENGINE_WASM. Oracle: sharp on Node 24.15. Depends on owc-napi-loader.'
 session_id: 82e15910-75ce-4750-b785-b7acfbfe2bfb
-status: pending
+owner: adv7-exec-napi
+classification: GUEST
+status: completed
+resolved_at: 8f36844 (local main; packages/core/src/napi/sharp identical on origin/main c9e85b4)
+body: |-
+  Reappearance, re-verified at HEAD and retired. The stored witness for this row was measured at
+  0f410f40 and predates two commits that rewrote parts of the shim (154b3ff the crop-or-embed after
+  the rotation and libvips' own metadata, 8f36844 the affine inverse, jpeg_idct_islow and the info
+  shape), so the row was re-measured rather than reused. Host node v24.15.0 with the real sharp
+  0.33.5 add-on against the container shim reached through placeholders at
+  src/build/Release/sharp-{linuxnull-x64,linux-x64,wasm32}.node, one probe
+  (/tmp/owc-r4/adv7-napi/src-sharp/main.js, copied whole to cont-sharp) run on both sides, twice,
+  each run independent: 88 of 95 lines identical both times, host exit 0, container exit 0, both
+  stderr empty. That is one line better than the stored witness, and the line that moved is the one
+  154b3ff explains: sharp.format.webp.output.buffer was false here and is true on the host, and is
+  now true on both, because sharp.format is the libvips build's table and not this shim's codecs.
+  Identical lines cover: module shape; metadata of a decoded PNG (format, width 16, height 8,
+  channels 4, space srgb, depth uchar, hasAlpha, size 114); metadata of a created image and of raw
+  pixel input; resize to a width, to a height, and with fit contain/cover/fill/inside/outside;
+  withoutEnlargement; rotate 90/180/270 dimensions and their exact corner pixels; a JPEG round trip
+  through the decoder (format, width, height, channels 3, hasAlpha false, space, depth,
+  chromaSubsampling, isProgressive); flip and flop corner pixels; extract crop; the PNG output
+  magic; raw output channels and length; resize then rotate composed; and a corrupt buffer rejected.
+  The 7 remaining differences are all documented refusals or a documented codec limit: the JPEG byte
+  count 352 versus 710 (the shim's baseline encoder), and greyscale, negate, removeAlpha,
+  ensureAlpha, stats() and tiff output, each refused with "sharp: unsupported operation ... is not
+  implemented by the pure-JavaScript sharp shim".
+  Beyond the row's own probe, three surfaces the two new commits claim were measured on both sides
+  and still diverge; each is named here and left to its own row rather than fitted:
+  - a jpeg's pixels. On this row's own fixture (/tmp/owc-judge-sharp-8/case/fig.jpg, a 64x64 RGB
+    jpeg) sharp(fig).raw() is 12288 bytes on both and now 4 of them differ, each by 1, where the
+    filed row owc-sharp-jpeg-decode-pixels measured 474 differing by 1 or 2 -- so 8f36844's
+    jpeg_idct_islow took it from 474 to 4 but not to zero, and its acceptance criteria are not met.
+    sharp(fig).resize(16).raw() is 768 bytes on both and 672 of them differ, by up to 17, which is
+    the shrink-on-load path rather than the IDCT. On a fresh 64x64 RGB quality-90 jpeg with the
+    default 4:2:0 subsampling it is 2 of 12288, both by 1 and both in the green channel. Readme.md
+    still states the 474 figure and is now stale.
+  - png metadata. A png written with withMetadata({density: 300}) reports density 300 on both but
+    resolutionUnit 'inch' plus orientation, exif and icc on the host and none of the three here, so
+    the resolutionUnit that comes from the EXIF block is missing. A jpeg reports icc on the host and
+    not here.
+  - an encoded output's byte size. resize({width:20}).png() info.size is 779 on the host and 754
+    here, the same class as the 352-versus-710 line above.
+  No source change: the behaviour the row asks for is already in the committed tree.
+  Machine state while measured: load 12.4-14.7, free pages 20804-25685 (about 341-421 MB) at the
+  sharp arm of both runs; the second run reproduced the first line for line.
