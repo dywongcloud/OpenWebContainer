@@ -1,5 +1,6 @@
 /**
- * Guest-side `stream`, `stream/promises`, `readline` and `readline/promises`.
+ * Guest-side `stream`, `stream/promises`, `stream/consumers`, `readline` and
+ * `readline/promises`.
  * Ported from the observable behaviour of Node 24's lib/internal/streams and
  * lib/readline for the commonly used surface. Plain JavaScript inside a String.raw
  * snippet: no backticks and no template interpolation. The four factories share one
@@ -18,6 +19,9 @@ BF.stream = function () {
 };
 BF['stream/promises'] = function () {
   return owcStreamCore().streamPromises;
+};
+BF['stream/consumers'] = function () {
+  return owcStreamCore().streamConsumers;
 };
 BF.readline = function () {
   return owcStreamCore().readline;
@@ -2925,7 +2929,17 @@ function owcBuildStreamCore() {
     return pipelineStart(args, callback, null);
   }
 
+  /* Node's stream/promises module exports 'finished' first and 'pipeline' second, so the two keys
+     an Object.keys(require('stream/promises')) reads are in that order, not the alphabetical one. */
   var streamPromises = {
+    finished: function (stream, options) {
+      return new Promise(function (resolve, reject) {
+        finishedImpl(stream, options || {}, function (err) {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    },
     pipeline: function () {
       var args = Array.prototype.slice.call(arguments);
       var opts = null;
@@ -2938,16 +2952,16 @@ function owcBuildStreamCore() {
           else resolve();
         }, opts);
       });
-    },
-    finished: function (stream, options) {
-      return new Promise(function (resolve, reject) {
-        finishedImpl(stream, options || {}, function (err) {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
     }
   };
+
+  // A stream has finished when both the sides it has are done: the readable has emitted 'end' and
+  // the writable has emitted 'finish'. A side the stream does not have counts as done.
+  function streamIsFinished(stream) {
+    var r = stream._readableState;
+    var w = stream._writableState;
+    return (r ? r.endEmitted : true) && (w ? w.finished : true);
+  }
 
   function streamIsDestroyed(stream) {
     if (!stream || typeof stream !== 'object') return null;
@@ -3225,6 +3239,9 @@ function owcBuildStreamCore() {
    */
   Stream.destroy = function (stream, err) {
     if (!stream || streamIsDestroyed(stream)) return;
+    /* A caller who destroys a stream that has not finished gets an AbortError whether or not one was
+       asked for: on a host, stream.destroy(s) on a fresh PassThrough errors with ABORT_ERR. */
+    if (!err && !streamIsFinished(stream)) err = new AbortError();
     if (typeof stream.destroy !== 'function') return;
     stream.destroy(err);
   };
@@ -3249,7 +3266,9 @@ function owcBuildStreamCore() {
      line is not remembered, and a historySize of 0 remembers nothing. */
   function addHistory(self, line) {
     if (line.length === 0 || self.historySize === 0) return;
-    var h = self[kRlState].history;
+    /* The array a caller reads is the manager's, so a line recorded here is seen by a caller who
+       already holds rl.history. */
+    var h = self.history;
     if (h.length === 0 || h[0] !== line) {
       h.unshift(line);
       if (h.length > self.historySize) h.pop();
@@ -3360,6 +3379,9 @@ function owcBuildStreamCore() {
     if (b === undefined || b === null) return;
     var st = self[kRlState];
     var text = st.decoder.write(b);
+    /* A key that carries no text -- an arrow key, a function key -- changes no line at all: it is
+       the line editor's to answer and it leaves the line being read where it was. */
+    if (text.length === 0) return;
     if (self.terminal) {
       text = stripTerminalControls(self, text);
       if (text === null) return;
@@ -3371,10 +3393,14 @@ function owcBuildStreamCore() {
     /* Only a real tab *key* completes: a plain write() inserts the text it was given whole, tab
        included, so rl.write('a\\t') leaves the line as 'a\\t' and never calls the completer. */
     var completing = self.terminal && !!key && key.name === 'tab' && typeof self.completer === 'function';
+    /* Node echoes only the characters this write brought in, not the line they completed: a terminal
+       interface that has already echoed 'ab' writes 'cd' for the chunk 'cd\n', never 'abcd' again.
+       The prefix is what was on the line before this write, and it is spent by the first line end. */
+    var prefix = st.lineBuffer.length;
     if (self.terminal && completing) {
-      /* A terminal interface echoes the line as it is built, as Node's does: the characters typed
-         and then the text a completion adds. A non-terminal one writes nothing. */
-      text = completeTabs(self, st.lineBuffer, text, function (piece) { writeOutput(self, piece); });
+      /* A tab key completes the line as it stands: on a host, rl.write('f', { name: 'tab' }) asks the
+         completer for the empty line and takes its answer, and the text the call carried is dropped. */
+      text = completeTabs(self, st.lineBuffer, '\t', function (piece) { writeOutput(self, piece); });
       st.lineBuffer = '';
     } else {
       text = st.lineBuffer + text;
@@ -3385,7 +3411,8 @@ function owcBuildStreamCore() {
     var match;
     while ((match = pattern.exec(text)) !== null) {
       var done = text.slice(start, match.index);
-      if (self.terminal && !completing && done.length > 0) writeOutput(self, done);
+      if (self.terminal && !completing && done.length > 0) writeOutput(self, done.slice(prefix));
+      prefix = 0;
       deliverLine(self, done);
       /* Node ends each line a terminal interface finishes with a newline on the output. */
       if (self.terminal && !completing) writeOutput(self, '\r\n');
@@ -3394,7 +3421,7 @@ function owcBuildStreamCore() {
     var tail = text.slice(start);
     /* Node inserts whatever follows the last line ending even when that is the empty string, so a
        terminal write that ends a line also writes one empty chunk after the newline. */
-    if (self.terminal && !completing && text.length > 0) writeOutput(self, tail);
+    if (self.terminal && !completing && text.length > 0) writeOutput(self, tail.slice(prefix));
     st.lineBuffer = tail;
     if (text.length > 0 && text.charCodeAt(text.length - 1) === 13) st.sawReturnAt = Date.now();
     /* A terminal interface keeps the line it is reading on the interface, as Node's does: rl.line is
@@ -3446,8 +3473,24 @@ function owcBuildStreamCore() {
      accessors, so a manager carries no own property of its own. */
   var kHistory = Symbol('owcReplHistory');
 
-  function ReplHistory(iface) {
-    this[kHistory] = { iface: iface, index: -1, flushing: false, size: iface ? iface.historySize : 30, history: iface ? iface.history : [] };
+  /* The second argument is either the size the interface asked for or a bag carrying size and
+     history, the way a host's ReplHistory reads the options handed to setupHistoryManager; a number
+     or an array that is neither reads nothing. */
+  function ReplHistory(iface, options, history) {
+    var bag = options === null || options === undefined ? null : options;
+    var givenSize = typeof bag === 'number' ? bag
+      : (bag !== null && typeof bag.size === 'number' ? bag.size : undefined);
+    var givenHistory = Array.isArray(history) ? history
+      : (bag !== null && Array.isArray(bag.history) ? bag.history : undefined);
+    this[kHistory] = {
+      iface: iface === undefined ? null : iface,
+      index: -1,
+      flushing: false,
+      /* A manager reads only what it was handed: it does not fall back to the interface, so one built
+         with no history answers an empty array and a size of 30, as a host's does. */
+      size: givenSize === undefined ? 30 : givenSize,
+      history: givenHistory === undefined ? [] : givenHistory
+    };
   }
   ReplHistory.prototype.initialize = function (history) {
     var bag = this[kHistory];
@@ -3512,26 +3555,52 @@ function owcBuildStreamCore() {
   Object.setPrototypeOf(OwcRlBase.prototype, EventEmitter.prototype);
   Object.setPrototypeOf(OwcRlBase, EventEmitter);
   Object.defineProperty(OwcRlBase.prototype, 'columns', {
-    get: function () { return this.output === null || this.output === undefined ? undefined : this.output.columns; },
+    /* An interface with no output, or one whose output has no width, answers Infinity: that is what
+       a host's rl.columns reads when nothing is there to measure. */
+    get: function () { return this.output && this.output.columns ? this.output.columns : Infinity; },
     configurable: true
   });
   OwcRlBase.prototype.clearLine = function (dir) {
     var code = dir < 0 ? '\x1b[1K' : dir > 0 ? '\x1b[0K' : '\x1b[2K';
     writeOutput(this, code);
   };
-  OwcRlBase.prototype.setupHistoryManager = function (history, historySize) {
-    var manager = new ReplHistory(this);
-    if (Array.isArray(history)) manager.initialize(history);
-    if (typeof historySize === 'number') manager.size = historySize;
-    this.historyManager = manager;
+  /* Node's setupHistoryManager takes one options bag, not a history and a size: only
+     options.history / options.size are read off it and only options.onHistoryFileLoaded seeds the
+     array, so setupHistoryManager(['a', 'b'], 5) on a host leaves an empty history and a size of 30. */
+  OwcRlBase.prototype.setupHistoryManager = function (options) {
+    this.historyManager = new ReplHistory(this, options);
+    if (options !== null && options !== undefined && options.onHistoryFileLoaded) {
+      this.historyManager.initialize(options.onHistoryFileLoaded);
+    }
   };
 
+  /* Node defines history, historyIndex, historySize and isFlushing as own enumerable accessors that
+     read through to the manager, so they are keys of the interface and a read of one answers what the
+     manager holds even after the manager was replaced. Only the first two take a write. */
+  function defineHistoryProp(self, name, field, takesWrite) {
+    var desc = {
+      enumerable: true,
+      configurable: true,
+      get: function () { return this.historyManager[field]; }
+    };
+    if (takesWrite) desc.set = function (value) { this.historyManager[field] = value; };
+    Object.defineProperty(self, name, desc);
+  }
+
   function Interface(input, output, completer, terminal) {
+    /* Node's legacy Interface answers a construction when it is called without new, so
+       readline.Interface(options) is a working interface and not a TypeError. */
+    if (!(this instanceof Interface)) return new Interface(input, output, completer, terminal);
     var opts = input !== null && typeof input === 'object' && input.input !== undefined
       ? input
       : { input: input, output: output, completer: completer, terminal: terminal };
-    EventEmitter.call(this);
     var self = this;
+    /* Node wraps a completer that answers by returning into one that answers through its callback,
+       so rl.completer is not the function the caller handed in when that one takes one argument. */
+    if (typeof opts.completer === 'function' && opts.completer.length !== 2) {
+      var givenCompleter = opts.completer;
+      opts.completer = function (v, cb) { cb(null, givenCompleter(v)); };
+    }
     Object.defineProperty(this, kRlState, {
       value: {
         prompt: opts.prompt !== undefined ? String(opts.prompt) : '> ',
@@ -3545,6 +3614,7 @@ function owcBuildStreamCore() {
         decoder: createDecoder('utf8'),
         lineIterator: null,
         onData: null,
+        onKeyPress: null,
         onEnd: null,
         /* A history handed in with the options seeds the array the interface reads, as Node's does:
            createInterface({ history: ['x', 'y'] }) leaves rl.history holding those two lines. */
@@ -3555,30 +3625,48 @@ function owcBuildStreamCore() {
       configurable: true
     });
     var st = this[kRlState];
-    this.input = opts.input;
-    this.output = opts.output;
-    this.terminal = opts.terminal !== undefined ? !!opts.terminal : !!(opts.output && opts.output.isTTY);
+    /* The order these own keys are created in is the order Object.keys(rl) reads them back in, and
+       a host's is not the order they are declared in: the completion flag and the two timeouts come
+       before the three EventEmitter owns, then the manager and the four accessors that read through
+       to it, then the line, the two streams, the options and the terminal flag, and a terminal
+       interface's cursor last of all. A non-terminal one owns no cursor key at all. */
+    this.isCompletionEnabled = true;
+    this.escapeCodeTimeout = opts.escapeCodeTimeout !== undefined ? opts.escapeCodeTimeout : 500;
+    this.tabSize = opts.tabSize !== undefined ? opts.tabSize : 8;
+    EventEmitter.call(this);
+    this.historyManager = new ReplHistory(this, opts.historySize, st.history);
+    defineHistoryProp(this, 'history', 'history', true);
+    defineHistoryProp(this, 'historyIndex', 'index', true);
+    defineHistoryProp(this, 'historySize', 'size', false);
+    defineHistoryProp(this, 'isFlushing', 'isFlushing', false);
     this.line = '';
+    this.output = opts.output;
+    this.input = opts.input;
+    this.crlfDelay = opts.crlfDelay ? Math.max(100, opts.crlfDelay) : 100;
+    /* Node always sets the completer, so it is a key of the interface whether or not one was given. */
+    this.completer = typeof opts.completer === 'function' ? opts.completer : undefined;
+    this.terminal = opts.terminal !== undefined ? !!opts.terminal : !!(opts.output && opts.output.isTTY);
     /* Only a terminal interface gets a cursor: on a non-terminal one rl.cursor is not a key of the
        interface at all, and reading it answers undefined, as on the host. */
     if (this.terminal) this.cursor = 0;
-    this.tabSize = opts.tabSize !== undefined ? opts.tabSize : 8;
-    this.escapeCodeTimeout = opts.escapeCodeTimeout !== undefined ? opts.escapeCodeTimeout : 500;
-    /* Node always sets the completer, so it is a key of the interface whether or not one was given. */
-    this.completer = typeof opts.completer === 'function' ? opts.completer : undefined;
-    this.historySize = opts.historySize !== undefined ? opts.historySize : 30;
-    /* The history is the array a caller reads on the interface, so it is the one the state keeps:
-       a line recorded later is seen by a caller who already holds rl.history. */
-    this.history = st.history;
-    this.crlfDelay = opts.crlfDelay ? Math.max(100, opts.crlfDelay) : 100;
-    /* The history manager the interface keeps beside the array: historyIndex mirrors its index. */
-    this.historyIndex = -1;
-    this.historyManager = new ReplHistory(this);
-    this.isCompletionEnabled = true;
-    this.isFlushing = false;
 
     st.onData = function (chunk) {
       normalWrite(self, chunk);
+    };
+    st.onKeyPress = function (s, key) {
+      var name = key !== undefined && key !== null && typeof key.name === 'string' ? key.name : '';
+      /* A terminal interface hands the keys that edit the line to the editor and only the text to the
+         line buffer, as Node's does: the arrows, home, end, delete, backspace and every control and
+         meta key are answered there, while the keys that end a line stay on the path that splits it
+         and echoes it, so a '\r\n' pair is still one line. */
+      var editorKey = !!(key && (key.ctrl || key.meta)) || name === 'left' || name === 'right' ||
+        name === 'up' || name === 'down' || name === 'home' || name === 'end' ||
+        name === 'delete' || name === 'backspace' || name === 'escape';
+      if (editorKey) {
+        self._ttyWrite(s, key);
+        return;
+      }
+      normalWrite(self, s === undefined || s === null ? '' : s, key);
     };
     st.onEnd = function () {
       if (st.lineBuffer.length > 0) self.emit('line', st.lineBuffer);
@@ -3587,13 +3675,19 @@ function owcBuildStreamCore() {
     };
     this.once('close', function () {
       offListener(self.input, 'data', st.onData);
+      offListener(self.input, 'keypress', st.onKeyPress);
       offListener(self.input, 'end', st.onEnd);
     });
-    this.input.on('data', st.onData);
+    /* A terminal interface reads keys, as Node's does: it listens for 'keypress' on the input and
+       never for 'data', so a tab that arrives in the stream completes the line the way a tab key
+       does, while rl.write('a\t') -- which carries no key -- still inserts the tab as plain text. */
+    if (this.terminal) {
+      emitKeypressEvents(this.input, this);
+      this.input.on('keypress', st.onKeyPress);
+    } else {
+      this.input.on('data', st.onData);
+    }
     this.input.on('end', st.onEnd);
-    // A terminal interface decodes keys, as Node's does: the input stream emits 'keypress' and a
-    // caller can read the arrow keys, the function keys and the control characters it sends.
-    if (this.terminal) emitKeypressEvents(this.input, this);
     if (typeof this.input.resume === 'function') this.input.resume();
   }
   Object.setPrototypeOf(Interface.prototype, OwcRlBase.prototype);
@@ -3836,12 +3930,18 @@ function owcBuildStreamCore() {
 
   Interface.prototype._moveCursor = function (dx) {
     if (dx === 0) return;
+    /* Node only redraws when the cursor leaves the row it was on: a move that stays on the same row
+       is one relative jump, so a left arrow writes '\x1b[1D' and nothing else. */
+    var oldPos = this.getCursorPos();
     var at = rlCursor(this) + dx;
     var line = rlLine(this);
     if (at < 0) at = 0;
     else if (at > line.length) at = line.length;
     this.cursor = at;
-    if (this.terminal) this._refreshLine();
+    if (!this.terminal) return;
+    var newPos = this.getCursorPos();
+    if (oldPos.rows === newPos.rows) moveCursor(this.output, newPos.cols - oldPos.cols, 0);
+    else this._refreshLine();
   };
 
   /* The line, redrawn: back to the first column, clear what is below, write the prompt and the line,
@@ -3950,7 +4050,9 @@ function owcBuildStreamCore() {
     var st = this[kRlState];
     var previousKey = st.previousKey;
     st.previousKey = key === undefined || key === null ? {} : key;
-    if (s === undefined || s === null) return;
+    /* An arrow key, a function key and the control keys carry no text of their own: the key record
+       is the whole keypress, and the editor answers it. */
+    if (s === undefined || s === null) s = '';
     var name = key !== undefined && key !== null && typeof key.name === 'string' ? key.name : '';
     var ctrl = key !== undefined && key !== null ? !!key.ctrl : false;
     var meta = key !== undefined && key !== null ? !!key.meta : false;
@@ -4074,11 +4176,20 @@ function owcBuildStreamCore() {
   }
 
   function cursorTo(stream, x, y, callback) {
+    if (callback !== undefined && typeof callback !== 'function') throw argTypeError('callback', 'of type function', callback);
     if (typeof y === 'function') {
       callback = y;
       y = undefined;
     }
-    if (typeof x !== 'number') throw argTypeError('x', 'of type number', x);
+    /* Node refuses only a NaN coordinate; a stream that is missing, or a call that gives no numeric
+       coordinate at all, is a no-op that answers true and calls its callback with null. */
+    if (typeof x === 'number' && x !== x) throw owcErr(TypeError, 'ERR_INVALID_ARG_VALUE', "The argument 'x' is invalid. Received " + x);
+    if (typeof y === 'number' && y !== y) throw owcErr(TypeError, 'ERR_INVALID_ARG_VALUE', "The argument 'y' is invalid. Received " + y);
+    if (stream === null || stream === undefined || (typeof x !== 'number' && typeof y !== 'number')) {
+      if (typeof callback === 'function') process.nextTick(callback, null);
+      return true;
+    }
+    if (typeof x !== 'number') throw owcErr(Error, 'ERR_INVALID_CURSOR_POS', 'Cannot set cursor position without setting columns and rows');
     var code = typeof y !== 'number' ? '\x1b[' + (x + 1) + 'G' : '\x1b[' + (y + 1) + ';' + (x + 1) + 'H';
     return writeEscape(stream, code, callback);
   }
@@ -4176,16 +4287,19 @@ function owcBuildStreamCore() {
     });
   }
 
+  /* Node's readline module exports these seven in its own order, not the order they are defined in:
+     Object.keys(require('readline')) reads Interface, clearLine, clearScreenDown, createInterface,
+     cursorTo, emitKeypressEvents, moveCursor, promises. */
   var readlineExports = {
     Interface: Interface,
+    clearLine: clearLine,
+    clearScreenDown: clearScreenDown,
     createInterface: function (input, output, completer, terminal) {
       return new Interface(input, output, completer, terminal);
     },
-    clearLine: clearLine,
-    clearScreenDown: clearScreenDown,
     cursorTo: cursorTo,
-    moveCursor: moveCursor,
-    emitKeypressEvents: emitKeypressEvents
+    emitKeypressEvents: emitKeypressEvents,
+    moveCursor: moveCursor
   };
 
   function PromisesInterface(input, output, completer, terminal) {
@@ -4225,9 +4339,9 @@ function owcBuildStreamCore() {
 
   var readlineWriters = new WeakMap();
 
-  function ReadlineWriter(stream, options) {
+  function Readline(stream, options) {
     /* Node's Readline is a class, so calling it without new is a TypeError, not a construction. */
-    if (!(this instanceof ReadlineWriter)) throw new TypeError("Class constructor Readline cannot be invoked without 'new'");
+    if (!(this instanceof Readline)) throw new TypeError("Class constructor Readline cannot be invoked without 'new'");
     if (!isWritableStreamLike(stream)) throw argTypeError('stream', 'an instance of Writable', stream);
     readlineWriters.set(this, {
       stream: stream,
@@ -4242,13 +4356,13 @@ function owcBuildStreamCore() {
     else rec.todo.push(data);
   }
 
-  ReadlineWriter.prototype.cursorTo = function (x, y) {
+  Readline.prototype.cursorTo = function (x, y) {
     validateCursorInt(x, 'x');
     if (y !== null && y !== undefined) validateCursorInt(y, 'y');
     writerSend(this, y === null || y === undefined ? '\x1b[' + (x + 1) + 'G' : '\x1b[' + (y + 1) + ';' + (x + 1) + 'H');
     return this;
   };
-  ReadlineWriter.prototype.moveCursor = function (dx, dy) {
+  Readline.prototype.moveCursor = function (dx, dy) {
     validateCursorInt(dx, 'dx');
     validateCursorInt(dy, 'dy');
     if (!dx && !dy) return this;
@@ -4260,16 +4374,16 @@ function owcBuildStreamCore() {
     writerSend(this, data);
     return this;
   };
-  ReadlineWriter.prototype.clearLine = function (dir) {
+  Readline.prototype.clearLine = function (dir) {
     validateCursorRange(dir, 'dir', -1, 1);
     writerSend(this, dir < 0 ? '\x1b[1K' : dir > 0 ? '\x1b[0K' : '\x1b[2K');
     return this;
   };
-  ReadlineWriter.prototype.clearScreenDown = function () {
+  Readline.prototype.clearScreenDown = function () {
     writerSend(this, '\x1b[0J');
     return this;
   };
-  ReadlineWriter.prototype.commit = function () {
+  Readline.prototype.commit = function () {
     var rec = readlineWriters.get(this);
     var pending = rec.todo.join('');
     rec.todo = [];
@@ -4277,7 +4391,7 @@ function owcBuildStreamCore() {
       rec.stream.write(pending, resolve);
     });
   };
-  ReadlineWriter.prototype.rollback = function () {
+  Readline.prototype.rollback = function () {
     readlineWriters.get(this).todo = [];
     return this;
   };
@@ -4285,7 +4399,7 @@ function owcBuildStreamCore() {
   // readline/promises exports the Interface and the Readline writer side by side, as Node 24 does.
   var readlinePromisesExports = {
     Interface: PromisesInterface,
-    Readline: ReadlineWriter,
+    Readline: Readline,
     createInterface: function (input, output, completer, terminal) {
       return new PromisesInterface(input, output, completer, terminal);
     }
@@ -4293,9 +4407,67 @@ function owcBuildStreamCore() {
 
   readlineExports.promises = readlinePromisesExports;
 
+  /*
+   * stream/consumers: the six ways Node reads a stream whole. Each one drains the stream with a
+   * for-await over it, which is what lets a Node readable, a Web stream and a bare async iterable
+   * be read the same way, and the four that answer in bytes are built on blob(), whose chunks keep
+   * the type each one was written with -- a string, a Buffer or a view.
+   */
+  function consumersBlob(stream) {
+    return (async function () {
+      var chunks = [];
+      for await (var chunk of stream) chunks.push(chunk);
+      return new Blob(chunks);
+    })();
+  }
+
+  function consumersArrayBuffer(stream) {
+    return consumersBlob(stream).then(function (blob) { return blob.arrayBuffer(); });
+  }
+
+  /* A chunk that is already a string is appended as it stands; one that is bytes goes through a
+     decoder kept across the whole stream, so a character split over two chunks is one character,
+     and whatever the decoder still holds is flushed once the stream is out. */
+  function consumersText(stream) {
+    return (async function () {
+      var decoder = new TextDecoder();
+      var text = '';
+      for await (var chunk of stream) {
+        if (typeof chunk === 'string') text += chunk;
+        else text += decoder.decode(chunk, { stream: true });
+      }
+      return text + decoder.decode();
+    })();
+  }
+
+  function consumersBuffer(stream) {
+    return consumersArrayBuffer(stream).then(function (bytes) { return Buf.from(bytes); });
+  }
+
+  function consumersBytes(stream) {
+    return consumersArrayBuffer(stream).then(function (bytes) { return new Uint8Array(bytes); });
+  }
+
+  function consumersJson(stream) {
+    return consumersText(stream).then(function (text) { return JSON.parse(text); });
+  }
+
+  /* The six are the whole of the module's own exports, and the default export is the six and
+     nothing else -- which is what the module's default is already made of, so no 'default' key of
+     its own belongs here: a namespace that carried one inside another is one Node does not have. */
+  var streamConsumersExports = {
+    arrayBuffer: consumersArrayBuffer,
+    blob: consumersBlob,
+    buffer: consumersBuffer,
+    bytes: consumersBytes,
+    text: consumersText,
+    json: consumersJson
+  };
+
   return {
     stream: Stream,
     streamPromises: streamPromises,
+    streamConsumers: streamConsumersExports,
     readline: readlineExports,
     readlinePromises: readlinePromisesExports
   };

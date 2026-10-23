@@ -1140,6 +1140,13 @@ BF['child_process'] = function () {
     },
     execFileSync: function (file, args, options) {
       return cpExecFileSyncApi(file, args, options);
+    },
+    /* Node's child bootstrap calls this at the top of a forked child to hang process.send,
+       process.connected and process.disconnect off the channel its parent passed: the file
+       descriptor Node reads the channel from is one this container has already attached, so what
+       the name does here is the wiring itself. */
+    _forkChild: function (fd, serializationMode) {
+      cpWireProcess();
     }
   };
 };
@@ -1154,7 +1161,10 @@ BF['worker_threads'] = function () {
     this.port2 = pair.port2;
   }
   var isWorker = cpState.kind === 'worker';
-  return {
+  /* The name a program gave this thread, empty until it gives one, as it is in Node: the name is
+     read and written through the module, not through an object of its own. */
+  var threadName = '';
+  var workerThreads = {
     isMainThread: !isWorker,
     parentPort: isWorker ? cpState.port : null,
     workerData: isWorker ? cpDecode(cpState.data.workerData) : null,
@@ -1165,6 +1175,9 @@ BF['worker_threads'] = function () {
     MessageChannel: MessageChannel,
     MessagePort: Port,
     BroadcastChannel: BroadcastChannel,
+    /* A thread reached through this module is never one Node started for its own work, which is
+       the only kind the name marks. */
+    isInternalThread: false,
     receiveMessageOnPort: function (port) {
       if (!port || !port._q || port._q.length === 0) return undefined;
       return { message: port._q.shift() };
@@ -1178,6 +1191,13 @@ BF['worker_threads'] = function () {
     },
     setEnvironmentData: function () {}
   };
+  Object.defineProperty(workerThreads, 'threadName', {
+    get: function () { return threadName; },
+    set: function (name) { threadName = String(name); },
+    enumerable: true,
+    configurable: true
+  });
+  return workerThreads;
 };
 
 BF['cluster'] = function () {
