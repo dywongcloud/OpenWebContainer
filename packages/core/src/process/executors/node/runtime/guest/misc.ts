@@ -2168,6 +2168,8 @@ BF.crypto = function () {
     /* Node bounds size before it allocates: a negative length is a range error, not a typed-array one. */
     if (!(size >= 0 && size <= 2147483647)) throw outOfRange('size', '>= 0 && <= 2147483647', size);
     var bytes = Buf.from(decodeBase64(host.randomBase64(size)));
+    /* A draw that reached its end empties OpenSSL's error queue, as a derivation that did. */
+    scryptReason = null;
     if (typeof callback === 'function') {
       queueMicrotask(function () { callback(null, bytes); });
       return undefined;
@@ -2728,6 +2730,21 @@ BF.crypto = function () {
     if (options.divisorLength !== undefined) out.divisorLength = widthOption(options, 'divisorLength');
     if (options.primeLength !== undefined) out.primeLength = widthOption(options, 'primeLength');
     if (options.generator !== undefined) out.generator = options.generator;
+    /*
+     * 'rsa-pss' is the one kind that carries a digest and a salt of its own into the key, and
+     * they are what asymmetricKeyDetails answers back: the hash, the MGF1 hash and the salt
+     * length, with 'hash' the deprecated spelling of 'hashAlgorithm' Node still honours.
+     */
+    if (options.hash !== undefined) {
+      var procWarn = globalThis.process;
+      if (procWarn && typeof procWarn.emitWarning === 'function') {
+        procWarn.emitWarning('"options.hash" is deprecated, use "options.hashAlgorithm" instead', 'DeprecationWarning', 'DEP0154');
+      }
+    }
+    if (options.hashAlgorithm !== undefined) out.hashAlgorithm = options.hashAlgorithm;
+    if (options.hash !== undefined) out.hash = options.hash;
+    if (options.mgf1HashAlgorithm !== undefined) out.mgf1HashAlgorithm = options.mgf1HashAlgorithm;
+    if (options.saltLength !== undefined) out.saltLength = options.saltLength;
     return out;
   }
 
@@ -2870,6 +2887,14 @@ BF.crypto = function () {
      */
     var opts = keyOptionsOf(key);
     var sig = signatureBytes(signature).toString('base64');
+    /*
+     * The fifth argument is the callback and nothing else: Node reads the data, the key and the
+     * signature first, and only then insists that a fifth argument be a function -- so an options
+     * object there is a type error naming 'callback', not a second way to name a dsaEncoding.
+     */
+    if (callback !== undefined && typeof callback !== 'function') {
+      throw invalidArgType('callback', 'of type function', callback);
+    }
     var answer = cryptoCap('crypto.key.verify', {
       id: keyIdOf(key, 'public'),
       algorithm: algo,
@@ -3065,6 +3090,17 @@ BF.crypto = function () {
     var opts = options;
     if (!isKeyObject(opts.privateKey)) throw invalidArgValue('options.privateKey', opts.privateKey);
     if (!isKeyObject(opts.publicKey)) throw invalidArgValue('options.publicKey', opts.publicKey);
+    /*
+     * A secret key is a KeyObject with no asymmetric half in it, and it has no id to reach the
+     * host with, so Node's own answer -- it names the type it wanted -- is given here rather
+     * than the 'must be an instance of KeyObject' a missing id would otherwise produce.
+     */
+    var privateState = keyStateOf(opts.privateKey, 'key');
+    if (privateState !== undefined && privateState.type === 'secret') {
+      var wrong = new TypeError('Invalid key object type secret, expected private.');
+      wrong.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
+      throw wrong;
+    }
     return Buf.from(cryptoCap('crypto.dh.ecdh', {
       private: keyIdOf(opts.privateKey, 'private'),
       public: keyIdOf(opts.publicKey, 'public')
@@ -3140,6 +3176,11 @@ BF.crypto = function () {
     this._outputLength = outputLength;
     this._chunks = [];
     this._finished = false;
+    /* Both are Transform streams on the host, so a caller sees the two stream flags. */
+    this.readable = true;
+    this.writable = true;
+    /* Node gives a Hash a copy() and gives an Hmac none, though the two share this one class. */
+    if (key !== undefined) this.copy = undefined;
   }
   Hash.prototype.update = function (data, encoding) {
     if (this._finished) {
@@ -3221,6 +3262,10 @@ BF.crypto = function () {
     if (!(len >= 0 && len <= 2147483647)) throw outOfRange('keylen', '>= 0 && <= 2147483647', keylen);
     /* A zero-length derivation is in range but produces nothing, which OpenSSL reports as a failure. */
     if (len === 0) throw new Error('Deriving bits failed');
+    /* An extensible-output digest cannot be the hash of a PBKDF2 either: OpenSSL derives nothing
+       and calls it a failure, with no code, exactly as it does for an HKDF. */
+    var name = String(digest).toLowerCase();
+    if (name === 'shake128' || name === 'shake256') throw new Error('Deriving bits failed');
     var out = cryptoCap('crypto.pbkdf2', {
       digest: String(digest),
       password: toBytes(password, undefined, 'password').toString('base64'),
@@ -3228,6 +3273,9 @@ BF.crypto = function () {
       iterations: iterations,
       keylen: len
     });
+    /* A derivation that reached its end empties OpenSSL's error queue, so the reason a scrypt
+       overrun left there is gone by the time the next refusal reads it. */
+    scryptReason = null;
     return Buf.from(out, 'base64');
   }
 
@@ -3415,7 +3463,17 @@ BF.crypto = function () {
       opts = undefined;
     }
     if (typeof done !== 'function') throw invalidArgType('callback', 'of type function', done);
-    var key = scryptSync(password, salt, keylen, opts);
+    /*
+     * Node derives on its thread pool, and OpenSSL's error queue is the calling thread's, so a
+     * derivation started this way neither sets nor empties the reason a later refusal reads.
+     */
+    var queued = scryptReason;
+    var key;
+    try {
+      key = scryptSync(password, salt, keylen, opts);
+    } finally {
+      scryptReason = queued;
+    }
     queueMicrotask(function () { done(null, key); });
   }
 
@@ -3457,6 +3515,8 @@ BF.crypto = function () {
       info: toBytes(info, undefined, 'info', 'string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer').toString('base64'),
       keylen: Number(keylen)
     });
+    /* As a PBKDF2 does, a derivation that reached its end empties the queue. */
+    scryptReason = null;
     var bytes = Buf.from(out, 'base64');
     var buffer = new ArrayBuffer(bytes.length);
     new Uint8Array(buffer).set(bytes);
@@ -5678,7 +5738,6 @@ isBuiltinName = function isBuiltinName(name) {
   if (Object.prototype.hasOwnProperty.call(SCHEME_ONLY_NAMES, rest)) return false;
   return Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, rest);
 };
-
 
 /* node:sys is util under another name: node's own sys module is a deprecation shim over it, so the
    two are the same object there and are the same object here -- requireBuiltin caches under the

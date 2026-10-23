@@ -1864,3 +1864,28 @@ Two claims did not reproduce in isolation and are overturned. `pipeline(src, wri
 alreadyAborted })` is byte-identical: one catchable `AbortError` with `code ABORT_ERR`, exit 0 and
 empty stderr on both sides -- the container does not raise it twice. And the three `TextDecoder`
 label spellings `'utf8 '`, `' utf8'` and `'utf-8 '` are trimmed on both sides alike.
+
+---
+
+## Crypto: recorded rather than fixed (judge wave adv11-judge-crypto-0)
+
+Measured at local main, host node v24.15.0 against the container driven by
+`/tmp/owc-r4/probe2/run-owc-repo.mts` out of `packages/core`, 120 cases run one fresh process per
+case on both sides, 113 byte-identical.
+
+- **OpenSSL's error queue is shared and the container does not model it.** After a `scryptSync` that
+  overruns its `maxmem`, host node answers the *next* failing crypto call with the scrypt reason --
+  `createCipheriv('aes-128-xts', 32B, 16B)` throws `ERR_OSSL_EVP_MEMORY_LIMIT_EXCEEDED
+  "memory limit exceeded"` instead of its own `ERR_OSSL_XTS_DUPLICATED_KEYS`, and the same for
+  `createPrivateKey('garbage')`, a GCM decrypt with a bad tag and a `publicEncrypt` too large for
+  its key. The container answers each with the real error. Matching it means a global queue that
+  every crypto capability writes to and every failure reads, including a rule for which calls push
+  an entry of their own and which do not; it is recorded, not emulated.
+- **`createHmac('sha256', 'k').copy()`**: the host has no such method and raises
+  `TypeError: h.copy is not a function`; this runtime raises `TypeError: not a function`. The
+  message is QuickJS 0.32's own -- bare QuickJS 0.32 answering `var h={}; h.copy()` gives
+  `TypeError|NOCODE|not a function`, without the callee text V8 puts in front of it.
+- **`generateKeyPairSync('rsa-pss', { hash: ... })`** (the deprecated spelling): the details and
+  every byte of stdout match, but the host prints `(node:<pid>) [DEP0154] DeprecationWarning: ...`
+  on stderr and this runtime prints `(node) Warning: ...`. Site: `process.emitWarning` in
+  `guest/globals.ts`, which is not this shard's file.

@@ -246,13 +246,13 @@ function hkdfDigestFor(name: unknown): DigestSpec {
 /** The output length a digest() call produces: the XOF's option, or the digest's own. */
 function outputLengthFor(spec: DigestSpec, requested: unknown): number {
     if (requested === undefined || requested === null) return spec.out;
+    /*
+     * An outputLength handed to a digest that is not an XOF is simply ignored: the option is the
+     * XOF's alone, so createHash('sha512', { outputLength: 64 }) answers the ordinary 64-byte
+     * digest rather than the 'not XOF or invalid length' refusal OpenSSL's getter would give.
+     */
+    if (!spec.xof) return spec.out;
     const n = Number(requested);
-    if (!spec.xof) {
-        throw Object.assign(
-            new Error('error:030000B2:digital envelope routines::not XOF or invalid length'),
-            { code: 'ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH' }
-        );
-    }
     if (!Number.isInteger(n) || n < 0) {
         throw Object.assign(new Error('Invalid XOF output length'), { code: 'ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH' });
     }
@@ -1986,6 +1986,15 @@ function cipherUpdate(state: CipherState, input: Uint8Array): Uint8Array {
          * and is the same stream however the input was split across calls.
          */
         state.pending = concatBytes(state.pending, input);
+        /*
+         * SP800-38C's L is the width of the length field and is 15 less the nonce's own length,
+         * so the longest message a CCM cipher can seal is 2^(8L) - 1: a 13-byte nonce holds
+         * 65535 bytes and one byte more is 'Invalid message length', the RangeError Node raises,
+         * while the same 65536 bytes under a 12-byte nonce (L = 3) seal without complaint.
+         */
+        if (state.spec.mode === 'ccm' && state.pending.length > Math.pow(2, 8 * (15 - state.iv.length)) - 1) {
+            throw cipherFail('ERR_CRYPTO_INVALID_MESSAGELEN', 'Invalid message length', 'RangeError');
+        }
         const out = aeadData(state, state.pending);
         /* OCB seals a block only once it is whole: the bytes a partial block becomes depend on
            where the message ends, so they are held back rather than answered early and wrong. */
@@ -2499,7 +2508,15 @@ function openCipher(args: any): { id: number; aead: boolean } {
     let tagLength = TAG_LENGTH;
     if (spec.aead && wanted !== undefined && wanted !== null) {
         tagLength = Number(wanted);
-        if (tagLength < 4 || tagLength > TAG_LENGTH) {
+        /*
+         * OCB takes 0 to 16 -- a tag length of 0 opens a cipher that then takes no data, no AAD
+         * and names no tag, the state OpenSSL leaves it in -- while CCM takes only an even length
+         * (SP800-38C has no odd tag, so the odd ones are refused before anything else is looked
+         * at, including the plaintextLength that AAD asks for). GCM and chacha20 keep 4 to 16.
+         */
+        const shortest = spec.mode === 'ocb' ? 0 : 4;
+        const evenOnly = spec.mode === 'ccm';
+        if (tagLength < shortest || tagLength > TAG_LENGTH || (evenOnly && tagLength % 2 !== 0)) {
             throw cipherFail('ERR_CRYPTO_INVALID_AUTH_TAG', `Invalid authentication tag length: ${wanted}`, 'TypeError');
         }
     }
@@ -2755,6 +2772,8 @@ interface KeyRecord {
     ints?: IntKey;
     publicBytes?: Uint8Array;
     privateBytes?: Uint8Array;
+    /** An 'rsa-pss' key generated with a digest or a salt length named: what its details answer. */
+    pss?: { hashAlgorithm: string; mgf1HashAlgorithm: string; saltLength: number };
 }
 
 const KEY_STORE = new Map<number, KeyRecord>();
@@ -3321,7 +3340,9 @@ function emsaPkcs1(t: Uint8Array, size: number): Uint8Array {
 function emsaPssEncode(digest: Uint8Array, emBits: number, saltLength: number, hash: (message: Uint8Array) => Uint8Array, hLen: number): Uint8Array {
     const emLen = Math.ceil(emBits / 8);
     if (emLen < hLen + saltLength + 2) {
-        throw keyFail('ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS', 'error:0409D06A:rsa routines::data too large for modulus');
+        /* A salt the encoded message cannot hold is 'data too large for key size', the refusal
+           OpenSSL's RSA signing path names, not the 'too large for modulus' a raw block gives. */
+        throw keyFail('ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE', 'error:0200006E:rsa routines::data too large for key size');
     }
     const salt = randomOf(saltLength);
     const h = hash(concatBytes(concatBytes(new Uint8Array(8), digest), salt));
@@ -3375,7 +3396,14 @@ function pssSaltLength(saltLength: unknown, hLen: number): number {
  */
 const DEFAULT_DIGEST = 'sha256';
 function noDigestBytes(data: Uint8Array, algorithm: unknown): Uint8Array {
-    return digestFor(algorithm === undefined || algorithm === null ? DEFAULT_DIGEST : algorithm).fn(data, 0);
+    const spec = digestFor(algorithm === undefined || algorithm === null ? DEFAULT_DIGEST : algorithm);
+    /*
+     * A signature has to run over a digest of a known width, and an XOF has none: OpenSSL's
+     * digest lookup finds shake128 and shake256 but refuses to sign with either, which is the
+     * 'invalid digest' crypto.sign('shake128', data, ecKey) answers on the host.
+     */
+    if (spec.xof === true) throw keyFail('ERR_OSSL_INVALID_DIGEST', 'error:1C80007A:Provider routines::invalid digest');
+    return spec.fn(data, 0);
 }
 
 function rsaSignWith(ints: IntKey, digest: Uint8Array, name: string, padding: number, saltLength: number): Uint8Array {
@@ -3617,6 +3645,25 @@ function dsaVerifyWith(ints: IntKey, digest: Uint8Array, signature: Uint8Array, 
     }
 }
 
+/*
+ * The PSS parameters an 'rsa-pss' key answers on asymmetricKeyDetails: the digest, the MGF1
+ * digest (the same one unless another was named) and the salt length (the digest's own width
+ * unless one was named). A key generated with none of the three named carries none of them, so
+ * a bare generateKeyPairSync('rsa-pss') answers a modulus and an exponent and nothing else.
+ */
+function pssParamsOf(options: any): { hashAlgorithm: string; mgf1HashAlgorithm: string; saltLength: number } | undefined {
+    const named = options?.hashAlgorithm ?? options?.hash;
+    const mgf1 = options?.mgf1HashAlgorithm;
+    const salt = options?.saltLength;
+    if (named === undefined && mgf1 === undefined && salt === undefined) return undefined;
+    const hash = digestNameFor(String(named ?? 'sha1'));
+    return {
+        hashAlgorithm: hash,
+        mgf1HashAlgorithm: mgf1 === undefined ? hash : digestNameFor(String(mgf1)),
+        saltLength: salt === undefined ? (DIGEST_SPECS[hash]?.out ?? 20) : Number(salt)
+    };
+}
+
 function generatePair(type: unknown, options: any): { public: number; private: number } {
     /* Node reads the key type as text before it looks it up, so a number is a type error and not
        the 'supported key type' refusal a name it does not know answers. */
@@ -3666,9 +3713,10 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         }
         const ints = generateRsa(modulusLength, exponent);
         const size = modulusSize(ints.n as bigint);
+        const pss = kind === 'rsa-pss' ? pssParamsOf(options) : undefined;
         return {
-            public: storeKey({ type: 'public', kind, ints, publicBytes: bytesOf(ints.n as bigint, size) }),
-            private: storeKey({ type: 'private', kind, ints, publicBytes: bytesOf(ints.n as bigint, size), privateBytes: bytesOf(ints.d as bigint, size) })
+            public: storeKey({ type: 'public', kind, ints, pss, publicBytes: bytesOf(ints.n as bigint, size) }),
+            private: storeKey({ type: 'private', kind, ints, pss, publicBytes: bytesOf(ints.n as bigint, size), privateBytes: bytesOf(ints.d as bigint, size) })
         };
     }
     if (kind === 'dsa') {
@@ -4012,6 +4060,14 @@ function rsaModeFor(padding: unknown, kind: string): number {
 function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown, fromSign = false): Uint8Array {
     const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type ' + key.type + ', expected private.', 'TypeError');
+    /*
+     * An XOF has no fixed width, so no signature scheme that needs one can run on it: an RSA or a
+     * DSA key names 'digest not allowed', where an EC key answers the plainer 'invalid digest'.
+     */
+    if (key.kind === 'rsa' || key.kind === 'rsa-pss' || key.kind === 'dsa') {
+        const named = DIGEST_SPECS[digestNameFor(algorithm === undefined || algorithm === null ? DEFAULT_DIGEST : algorithm)];
+        if (named?.xof === true) throw keyFail('ERR_OSSL_DIGEST_NOT_ALLOWED', 'error:1C8000AE:Provider routines::digest not allowed');
+    }
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
         const mode = rsaModeFor(padding, key.kind);
         /*
@@ -4107,6 +4163,9 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
         }
     }
     const curve = key.curve as EcCurve;
+    /* The digest is taken outside the catch: an XOF has no width to sign or check against, and
+       that is a refusal Node raises -- 'invalid digest' -- not a signature that fails to check. */
+    const digest = noDigestBytes(data, algorithm);
     try {
         const digest = noDigestBytes(data, algorithm);
         /*
@@ -4361,8 +4420,9 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     /** Args {algorithm, key, data}: the HMAC of the bytes; returns base64. */
     'crypto.hmac': (args) => {
         const spec = digestFor(args?.algorithm);
-        /* Node's OpenSSL cannot HMAC through an XOF either: it fails with an empty error string. */
-        if (spec.xof === true) throw new Error('error:00000000:lib(0)::reason(0)');
+        /* Node's OpenSSL cannot HMAC through an XOF either: it fails with an empty error string,
+           and with no code at all, which is what keyFail(null, ...) leaves on the error. */
+        if (spec.xof === true) throw keyFail(null, 'error:00000000:lib(0)::reason(0)');
         return bytesToBase64(hmacBytes(spec, bytesArg(args?.key), bytesArg(args?.data)));
     },
     /** Args {}: the digest names getHashes() answers with, in Node's order. */
@@ -4429,7 +4489,15 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     /** Args {algorithm, direction, key, iv}: validates key and IV, opens a host cipher; returns {id, aead}. */
     'crypto.cipher.open': (args) => openCipher(args),
     /** Args {id, data}: the bytes this call emits; aead modes emit nothing until final. Returns base64. */
-    'crypto.cipher.update': (args) => bytesToBase64(cipherUpdate(stateFor(args?.id, 'update'), bytesArg(args?.data))),
+    'crypto.cipher.update': (args) => {
+        const state = stateFor(args?.id, 'update');
+        /* An OCB cipher opened with a tag length of 0 takes no data at all, which is the same
+           'unsupported state' OpenSSL's own OCB answers once it has refused to seal anything. */
+        if (state.spec.mode === 'ocb' && state.tagLength === 0) {
+            throw cipherFail(null, 'Trying to add data in unsupported state');
+        }
+        return bytesToBase64(cipherUpdate(state, bytesArg(args?.data)));
+    },
     /** Args {id}: the last bytes, with padding added or removed. Returns {data, tag?}. Releases the state. */
     'crypto.cipher.final': (args) => {
         const state = stateFor(args?.id, 'final');
@@ -4440,13 +4508,26 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     /** Args {id, aad}: the additional authenticated data of an AEAD cipher; only before any data. */
     'crypto.cipher.setAAD': (args) => {
         const state = stateFor(args?.id, 'setAAD');
-        if (!state.spec.aead || state.updated) invalidState('setAAD');
+        /*
+         * OCB is the one AEAD here that takes its associated data at any time and in any number
+         * of pieces: OpenSSL appends each call's bytes to the ones before it, so two calls of
+         * 'x' and 'y' are the AAD 'xy', and the order against update() does not change the tag
+         * (OCB keeps the data's own offset chain and the AAD's own PMAC apart). A cipher opened
+         * with a tag length of 0 is the exception: it takes no AAD at all.
+         */
+        const ocb = state.spec.mode === 'ocb';
+        if (ocb) {
+            if (state.tagLength === 0) invalidState('setAAD');
+        } else if (!state.spec.aead || state.updated) {
+            invalidState('setAAD');
+        }
         /* Node refuses associated data for CCM outright: it asks for a plaintextLength it has no
            way to supply from here, so the message is the one OpenSSL's CCM cannot take. */
         if (state.spec.mode === 'ccm') {
             throw cipherFail('ERR_MISSING_ARGS', 'options.plaintextLength required for CCM mode with AAD', 'TypeError');
         }
-        state.aad = bytesArg(args?.aad);
+        /* A second call appends, which is what OpenSSL does for GCM and OCB both. */
+        state.aad = concatBytes(state.aad, bytesArg(args?.aad));
         return true;
     },
     /** Args {id, tag}: the authentication tag a decrypting AEAD cipher checks its input against.
@@ -4482,6 +4563,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             /* Node answers publicExponent as a BigInt, so the width travels as text and the
                guest's own BigInt is what a caller actually sees on asymmetricKeyDetails. */
             details = { modulusLength: (ints?.n as bigint).toString(2).length, publicExponent: (ints?.e as bigint).toString() };
+            if (key.pss !== undefined) details = { ...details, ...key.pss };
         } else if (key.kind === 'dsa') {
             details = { modulusLength: (ints?.p as bigint).toString(2).length, divisorLength: (ints?.q as bigint).toString(2).length };
         }
@@ -4502,10 +4584,21 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         }
         let der: Uint8Array;
         let label: string;
+        /* PKCS#1 is the RSA pair of formats: an RSAPublicKey, and an RSAPrivateKey of its own. */
+        const rsaPkcs1 = kind === 'pkcs1' && (key.kind === 'rsa' || key.kind === 'rsa-pss');
         if (key.type === 'public') {
-            if (kind !== 'spki') throw keyFail('ERR_CRYPTO_INVALID_KEY_TYPE', 'Unsupported public key format: ' + kind);
-            der = encodeSpki(key);
-            label = 'PUBLIC KEY';
+            if (rsaPkcs1) {
+                der = rsaPublicDer(key.ints as IntKey);
+                label = 'RSA PUBLIC KEY';
+            } else if (kind !== 'spki') {
+                throw keyFail('ERR_CRYPTO_INVALID_KEY_TYPE', 'Unsupported public key format: ' + kind);
+            } else {
+                der = encodeSpki(key);
+                label = 'PUBLIC KEY';
+            }
+        } else if (rsaPkcs1) {
+            der = rsaPrivateDer(key.ints as IntKey);
+            label = 'RSA PRIVATE KEY';
         } else if (kind === 'pkcs8') {
             der = encodePkcs8(key);
             label = 'PRIVATE KEY';
@@ -4596,7 +4689,12 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         const prime = args?.prime === undefined || args?.prime === null
             ? primeOfBits(Number(args?.bits))
             : bigOf(bytesArg(args?.prime));
-        if (prime < 3n) throw dhFail('ERR_CRYPTO_INVALID_DH_PARAMETERS', 'Invalid prime');
+        /*
+         * An empty prime is the one group OpenSSL accepts and then has no p for: construction
+         * succeeds and only reading the prime back answers, with 'p is null'.
+         */
+        const empty = !(args?.prime === undefined || args?.prime === null) && bytesArg(args?.prime).length === 0;
+        if (!empty && prime < 3n) throw dhFail('ERR_CRYPTO_INVALID_DH_PARAMETERS', 'Invalid prime');
         const generator = generatorOf(args?.generator, args?.generatorIsNumber);
         const size = Math.ceil(prime.toString(16).length / 2);
         return { id: storeDh({ prime, generator, size, generated: args?.prime === undefined || args?.prime === null }) };
@@ -4611,6 +4709,8 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     /** Args {id}: the prime and generator, as base64, with the byte size both are padded to. */
     'crypto.dh.info': (args) => {
         const state = dhFor(args?.id, 'dh.info');
+        /* The group an empty prime left behind has no p to read, which is what Node reports. */
+        if (state.prime === 0n) throw dhFail('ERR_CRYPTO_INVALID_STATE', 'p is null');
         return {
             prime: bytesToBase64(bytesOf(state.prime, state.size)),
             generator: bytesToBase64(bytesOf(state.generator, 1)),
@@ -4652,11 +4752,18 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     'crypto.dh.secret': (args) => {
         const state = dhFor(args?.id, 'dh.secret');
         if (state.privateKey === undefined) throw dhFail('ERR_CRYPTO_INVALID_STATE', 'Invalid state for operation computeSecret');
-        const other = bigOf(bytesArg(args?.public));
-        /* Node rejects a peer key at 0, 1 or the prime itself before it exponentiates. */
-        if (other < 2n || other >= state.prime - 1n) {
-            throw dhFail('ERR_CRYPTO_INVALID_PUBLIC_KEY', 'Invalid public key');
-        }
+        const given = bytesArg(args?.public);
+        const other = bigOf(given);
+        /*
+         * Node sizes the peer's key against this side's prime before it exponentiates: a key with
+         * no bytes at all is 'too small', and one the prime cannot hold -- a longer buffer, or a
+         * value up at the prime itself -- is 'too large', both of them ERR_CRYPTO_INVALID_KEYLEN
+         * RangeErrors rather than the 'invalid public key' a key in range but out of bounds gets.
+         */
+        if (given.length === 0 || other < 2n) throw dhFail('ERR_CRYPTO_INVALID_KEYLEN', 'Supplied key is too small', 'RangeError');
+        /* Node rejects a peer key at the prime itself, or in a buffer longer than the prime, as
+           'too large' before it exponentiates. */
+        if (other >= (state.prime as bigint) - 1n) throw dhFail('ERR_CRYPTO_INVALID_KEYLEN', 'Supplied key is too large', 'RangeError');
         return bytesToBase64(bytesOf(modPow(other, state.privateKey, state.prime), state.size));
     },
     /** Args {id, op, data, padding, oaepHash, oaepLabel}: one raw RSA operation; base64 bytes. */
@@ -4683,7 +4790,11 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     'crypto.dh.ecdh': (args) => {
         const priv = keyFor(args?.private, 'dh.ecdh');
         const pub = keyFor(args?.public, 'dh.ecdh');
-        if (priv.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type public, expected private.');
+        /* Node names both key types when it cannot agree between them, in the order it was handed
+           them: 'x25519 and ec', 'x25519 and rsa', and even 'ed25519 and ed25519'. */
+        const dhIncompatible = (): never =>
+            keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY', `Incompatible key types for Diffie-Hellman: ${priv.kind} and ${pub.kind}`);
+        if (priv.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', `Invalid key object type ${priv.type}, expected private.`, 'TypeError');
         /* A classic DH agreement: both sides have to share the one group, and Node says so. */
         if (priv.kind === 'dh' || pub.kind === 'dh') {
             if (priv.kind !== 'dh' || pub.kind !== 'dh') throw keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Incompatible key types');
@@ -4696,7 +4807,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             if (other < 2n || other >= (mine.p as bigint) - 1n) throw keyFail('ERR_CRYPTO_INVALID_PUBLIC_KEY', 'Invalid public key');
             return bytesToBase64(bytesOf(modPow(other, mine.x as bigint, mine.p as bigint), modulusSize(mine.p as bigint)));
         }
-        if (pub.kind !== priv.kind) throw keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Incompatible key types');
+        if (pub.kind !== priv.kind) throw dhIncompatible();
         if (priv.kind === 'ec') {
             const curve = priv.curve as EcCurve;
             if (curve !== (pub.curve as EcCurve)) throw keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Incompatible curves');
@@ -4705,9 +4816,9 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             return bytesToBase64(point.subarray(1, 1 + curve.size));
         }
         const spec = EDWARDS[priv.kind];
-        if (spec === undefined || spec.getSharedSecret === undefined) {
-            throw keyFail('ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE', 'error:03000096:digital envelope routines::operation not supported for this keytype');
-        }
+        /* ed25519 and ed448 sign and do not agree: Node names the two types it was handed rather
+           than the 'operation not supported for this keytype' the pair would give on its own. */
+        if (spec === undefined || spec.getSharedSecret === undefined) throw dhIncompatible();
         return bytesToBase64(spec.getSharedSecret(priv.privateBytes as Uint8Array, pub.publicBytes as Uint8Array));
     },
 };
