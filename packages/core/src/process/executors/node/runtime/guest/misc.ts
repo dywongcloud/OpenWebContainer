@@ -2062,9 +2062,10 @@ BF.crypto = function () {
     return err;
   }
 
-  /* Node's ERR_CRYPTO_INVALID_DIGEST: createSign names no digest in the message, pbkdf2 does. */
+  /* Node's ERR_CRYPTO_INVALID_DIGEST is a TypeError everywhere but in createHash, which answers a
+     plain Error with no code: createSign names no digest in the message, pbkdf2 does. */
   function invalidDigest(name) {
-    var err = new Error('Invalid digest' + (name === undefined ? '' : ': ' + String(name)));
+    var err = new TypeError('Invalid digest' + (name === undefined ? '' : ': ' + String(name)));
     err.code = 'ERR_CRYPTO_INVALID_DIGEST';
     return err;
   }
@@ -2139,6 +2140,11 @@ BF.crypto = function () {
       max = min;
       min = 0;
     }
+    /* Node reads both bounds as safe integers before it looks at either, and then insists the
+       upper one is above the lower: a range the wrong way round is out of range, not empty. */
+    if (typeof max !== 'number' || !Number.isSafeInteger(max)) throw invalidArgType('max', 'a safe integer', max);
+    if (typeof min !== 'number' || !Number.isSafeInteger(min)) throw invalidArgType('min', 'a safe integer', min);
+    if (!(max > min)) throw outOfRange('max', 'greater than the value of "min" (' + min + ')', max);
     var r = randomBytes(4).readUInt32BE(0) / 4294967296;
     return min + Math.floor(r * (max - min));
   }
@@ -2353,8 +2359,19 @@ BF.crypto = function () {
     return timingSafeEqual(a.bytes, b.bytes);
   };
 
+  /* A secret key is bytes: a string is read with the encoding, and Node's message for anything
+     else names no string of its own, so a KeyObject is refused as "Received an instance of ...". */
+  function secretKeyBytes(value) {
+    if (!(Buf.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer)) {
+      var err = new TypeError('The "key" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' + receivedAs(value));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    return toBytes(value, undefined, 'key');
+  }
+
   function createSecretKey(key, encoding) {
-    var bytes = typeof key === 'string' ? Buf.from(key, encoding) : toBytes(key, undefined, 'key');
+    var bytes = typeof key === 'string' ? Buf.from(key, encoding) : secretKeyBytes(key);
     return new KeyObject('secret', Buf.from(bytes));
   }
 
@@ -2440,7 +2457,9 @@ BF.crypto = function () {
         if (typeof given.kty !== 'string') throw keyWrapperError(key.key, named);
         jwk = given;
       } else {
-        bytes = toBytes(given, undefined, 'key').toString('base64');
+        bytes = toBytes(given, undefined, 'key', named
+          ? 'string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey'
+          : undefined).toString('base64');
       }
       var opened = cryptoCap('crypto.key.import', { want: want, jwk: jwk, bytes: bytes, type: type, passphrase: passphrase === undefined ? undefined : String(passphrase) });
       return new KeyObject(want, undefined, opened.id);
@@ -2570,18 +2589,27 @@ BF.crypto = function () {
 
   function Verify(algorithm) {
     if (typeof algorithm !== 'string') throw invalidArgType('algorithm', 'of type string', algorithm);
+    if (!digestKnown(algorithm)) throw invalidDigest(undefined);
     this._algorithm = String(algorithm);
     this._chunks = [];
+    this._used = false;
   }
   Verify.prototype.update = function (data, encoding) {
     this._chunks.push(toBytes(data, encoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView'));
     return this;
   };
   Verify.prototype.verify = function (publicKey, signature, encoding) {
+    /* A verify consumes what it was fed for good: Node's own object is uninitialised again the
+       moment it answers, and not even a second update() re-arms it, so any later verify() on the
+       same object throws 'Not initialised'. */
+    if (this._used || this._chunks.length === 0) throw cipherStateError('Not initialised');
+    this._used = true;
+    var data = Buf.concat(this._chunks);
+    this._chunks = [];
     return cryptoCap('crypto.key.verify', {
       id: keyIdOf(publicKey, 'public'),
       algorithm: this._algorithm,
-      data: Buf.concat(this._chunks).toString('base64'),
+      data: data.toString('base64'),
       signature: toBytes(signature, encoding, 'signature').toString('base64'),
       dsaEncoding: publicKey !== null && typeof publicKey === 'object' ? publicKey.dsaEncoding : undefined,
       padding: publicKey !== null && typeof publicKey === 'object' ? publicKey.padding : undefined,
@@ -2714,7 +2742,14 @@ BF.crypto = function () {
         }
       }
     } else {
-      args.prime = toBytes(prime, typeof generatorOrEncoding === 'string' ? generatorOrEncoding : undefined, 'prime').toString('base64');
+      /* Node's one argument here is 'sizeOrKey' -- a width or the prime itself -- and its message
+         names both in the list, so a value that is neither is refused under that name. */
+      if (!(typeof prime === 'string' || Buf.isBuffer(prime) || ArrayBuffer.isView(prime) || prime instanceof ArrayBuffer)) {
+        var sizeOrKey = new TypeError('The "sizeOrKey" argument must be one of type number or string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' + receivedAs(prime));
+        sizeOrKey.code = 'ERR_INVALID_ARG_TYPE';
+        throw sizeOrKey;
+      }
+      args.prime = toBytes(prime, typeof generatorOrEncoding === 'string' ? generatorOrEncoding : undefined, 'sizeOrKey').toString('base64');
       if (generator !== undefined && generator !== null) {
         if (typeof generator === 'number') {
           args.generator = generator;
@@ -2731,7 +2766,14 @@ BF.crypto = function () {
   }
 
   function createDiffieHellmanGroup(name) {
-    return new DiffieHellman(cryptoCap('crypto.dh.group', { name: String(name) }).id);
+    /* Node reads the group name as a string before it looks it up, so a number is a type error and
+       not the ERR_CRYPTO_UNKNOWN_DH_GROUP an unresolvable name answers. */
+    if (typeof name !== 'string') {
+      var notText = new TypeError('Group name must be a string');
+      notText.code = 'ERR_INVALID_ARG_TYPE';
+      throw notText;
+    }
+    return new DiffieHellman(cryptoCap('crypto.dh.group', { name: name }).id);
   }
 
   /* Node's getDiffieHellman is the same call under its older name: a standard MODP group by name. */
@@ -2743,7 +2785,12 @@ BF.crypto = function () {
    * else in either slot is an invalid value rather than key material to import.
    */
   function diffieHellman(options) {
-    var opts = options === undefined || options === null ? {} : options;
+    /* Node reads the options object itself before it reads either key out of it: a call with no
+       object at all is an argument type error naming 'options', not an invalid value. */
+    if (options === null || typeof options !== 'object') {
+      throw invalidArgType('options', 'of type object', options);
+    }
+    var opts = options;
     if (!isKeyObject(opts.privateKey)) throw invalidArgValue('options.privateKey', opts.privateKey);
     if (!isKeyObject(opts.publicKey)) throw invalidArgValue('options.publicKey', opts.publicKey);
     return Buf.from(cryptoCap('crypto.dh.ecdh', {
@@ -2773,6 +2820,13 @@ BF.crypto = function () {
         given = given.key;
       }
       var state = keyStateOf(given, 'key');
+      /* An OAEP hash Node does not carry is named before the operation runs, whatever padding the
+         call asked for: OpenSSL resolves the digest and answers ERR_OSSL_EVP_INVALID_DIGEST. */
+      if (oaepHash !== undefined && oaepHash !== null && !digestKnown(String(oaepHash))) {
+        var noDigest = new Error('Invalid digest used');
+        noDigest.code = 'ERR_OSSL_EVP_INVALID_DIGEST';
+        throw noDigest;
+      }
       if (state !== undefined && want === 'private' && state.type !== 'private') {
         var wrong = new TypeError('Invalid key object type ' + state.type + ', expected private.');
         wrong.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
@@ -2800,7 +2854,9 @@ BF.crypto = function () {
 
   function keyBytesOf(key) {
     var state = keyStateOf(key, 'key');
-    if (state === undefined) return toBytes(key, undefined, 'key');
+    if (state === undefined) {
+      return toBytes(key, undefined, 'key', 'string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey');
+    }
     if (state.type !== 'secret') throw asymmetricUnavailable('createHmac');
     return state.bytes;
   }
@@ -2868,16 +2924,15 @@ BF.crypto = function () {
   }
 
   function createHash(algorithm, options) {
+    /* Node reads the algorithm as a string before it looks it up, so a number is a type error
+       and not the bare 'Digest method not supported' an unresolvable name answers. */
+    if (typeof algorithm !== 'string') throw invalidArgType('algorithm', 'of type string', algorithm);
     if (!digestKnown(algorithm)) throw new Error('Digest method not supported');
     return new Hash(algorithm, undefined, outputLengthOf(options));
   }
 
   function createHmac(algorithm, key, options) {
-    if (!digestKnown(algorithm)) {
-      var bad = new Error('Invalid digest: ' + String(algorithm));
-      bad.code = 'ERR_CRYPTO_INVALID_DIGEST';
-      throw bad;
-    }
+    if (!digestKnown(algorithm)) throw invalidDigest(String(algorithm));
     return new Hash(algorithm, keyBytesOf(key), outputLengthOf(options));
   }
 
@@ -2892,6 +2947,7 @@ BF.crypto = function () {
     if (typeof digest !== 'string') throw invalidArgType('digest', 'of type string', digest);
     if (!digestKnown(digest)) throw invalidDigest(digest);
     if (typeof iterations !== 'number') throw invalidArgType('iterations', 'of type number', iterations);
+    if (Math.floor(iterations) !== iterations) throw outOfRange('iterations', 'an integer', iterations);
     if (typeof keylen !== 'number') throw invalidArgType('keylen', 'of type number', keylen);
     if (!(iterations >= 1 && iterations <= 2147483647)) {
       throw outOfRange('iterations', '>= 1 && <= 2147483647', iterations);
@@ -2915,9 +2971,20 @@ BF.crypto = function () {
     queueMicrotask(function () { callback(null, key); });
   }
 
+  /* The bytes of a timing-safe compare: Node's message for the pair ends at the list, it names no
+     Received value and no "of type", and a string is not in the list -- the compare is over bytes. */
+  function bufferInstance(value, name) {
+    if (!(Buf.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer)) {
+      var err = new TypeError('The "' + name + '" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.');
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    return toBytes(value, undefined, name);
+  }
+
   function timingSafeEqual(a, b) {
-    var left = toBytes(a, undefined, 'buf1');
-    var right = toBytes(b, undefined, 'buf2');
+    var left = bufferInstance(a, 'buf1');
+    var right = bufferInstance(b, 'buf2');
     if (left.length !== right.length) {
       var length = new RangeError('Input buffers must have the same byte length');
       length.code = 'ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH';
@@ -3019,7 +3086,11 @@ BF.crypto = function () {
     var cost = scryptParam(opts, 'N', 'cost');
     var block = scryptParam(opts, 'r', 'blockSize');
     var par = scryptParam(opts, 'p', 'parallelization');
-    var want = opts.maxmem === undefined ? undefined : Number(opts.maxmem);
+    var maxmem = opts.maxmem;
+    if (maxmem !== undefined && maxmem !== null && typeof maxmem !== 'number') {
+      throw invalidArgType('maxmem', 'of type number', maxmem);
+    }
+    var want = maxmem === undefined || maxmem === null ? undefined : Number(maxmem);
     var n = cost === undefined || cost === 0 ? 16384 : cost;
     var r = block === undefined || block === 0 ? 8 : block;
     var p = par === undefined || par === 0 ? 1 : par;
@@ -3057,10 +3128,19 @@ BF.crypto = function () {
    * so the bytes the host answers with are copied into one here.
    */
   function hkdfSync(digest, key, salt, info, keylen) {
-    /* Node requires a salt, and reads the key length as a plain length before it reads it as a key
-       length: one that is not a number, is negative, or is not a whole number is out of range. */
+    /* Node reads the five arguments in order -- digest, ikm, salt, info, length -- and names the
+       first one that is wrong, so the checks sit in that order here. */
+    if (typeof digest !== 'string') throw invalidArgType('digest', 'of type string', digest);
+    var ikmOf = key !== null && typeof key === 'object' ? KEY_STATE.get(key) : undefined;
+    var ikm = ikmOf !== undefined && ikmOf.kind === 'key' && ikmOf.type === 'secret'
+      ? ikmOf.bytes
+      : toBytes(key, undefined, 'ikm', 'string or an instance of SecretKeyObject, ArrayBuffer, TypedArray, DataView, or Buffer');
     if (salt === undefined || salt === null) {
       throw invalidArgType('salt', 'of type string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer', salt);
+    }
+    /* An info is as required as a salt is: Node's HKDF takes five arguments, not four. */
+    if (info === undefined || info === null) {
+      throw invalidArgType('info', 'of type string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer', info);
     }
     if (typeof keylen !== 'number') throw invalidArgType('length', 'of type number', keylen);
     if (!(keylen >= 0 && keylen <= 9007199254740991)) throw outOfRange('length', '>= 0 && <= 9007199254740991', keylen);
@@ -3076,9 +3156,9 @@ BF.crypto = function () {
     }
     var out = cryptoCap('crypto.hkdf', {
       algorithm: String(digest),
-      ikm: toBytes(key, undefined, 'key').toString('base64'),
-      salt: toBytes(salt, undefined, 'salt').toString('base64'),
-      info: info === undefined || info === null ? undefined : toBytes(info, undefined, 'info').toString('base64'),
+      ikm: Buf.from(ikm).toString('base64'),
+      salt: toBytes(salt, undefined, 'salt', 'string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer').toString('base64'),
+      info: toBytes(info, undefined, 'info', 'string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer').toString('base64'),
       keylen: Number(keylen)
     });
     var bytes = Buf.from(out, 'base64');
@@ -3270,17 +3350,18 @@ BF.crypto = function () {
     return err;
   }
 
-  function cipherBytes(data, encoding, name) {
-    return typeof data === 'string' ? Buf.from(data, encoding || 'utf8') : toBytes(data, undefined, name);
+  function cipherBytes(data, encoding, name, list) {
+    return typeof data === 'string' ? Buf.from(data, encoding || 'utf8') : toBytes(data, undefined, name, list);
   }
 
+  /* A cipher key takes the same list a sign or a verify names: KeyObject and CryptoKey are in it. */
   function cipherKeyBytes(key) {
     var state = keyStateOf(key, 'key');
     if (state !== undefined) {
       if (state.type !== 'secret') throw asymmetricUnavailable('createCipheriv');
       return state.bytes;
     }
-    return cipherBytes(key, undefined, 'key');
+    return cipherBytes(key, undefined, 'key', 'string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey');
   }
 
   /*
@@ -3311,7 +3392,8 @@ BF.crypto = function () {
 
   Cipher.prototype.update = function (data, inputEncoding, outputEncoding) {
     if (this._finalized) throw new Error('Trying to add data in unsupported state');
-    var bytes = cipherBytes(data, inputEncoding, 'data');
+    /* The data a cipher is fed is one of the families that take no bare ArrayBuffer, as a hash's is. */
+    var bytes = cipherBytes(data, inputEncoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView');
     var out = Buf.from(cipherCap('crypto.cipher.update', { id: this._id, data: bytes.toString('base64') }), 'base64');
     return cipherOut(this, out, outputEncoding);
   };
@@ -3373,6 +3455,10 @@ BF.crypto = function () {
    */
   function checkPrimeSync(candidate, options) {
     var isBig = typeof candidate === 'bigint';
+    /* A candidate is a BigInt or bytes: Node names no string in the list, so text is refused. */
+    if (!isBig && !(Buf.isBuffer(candidate) || ArrayBuffer.isView(candidate) || candidate instanceof ArrayBuffer)) {
+      throw invalidArgType('candidate', 'of type bigint or an instance of ArrayBuffer, TypedArray, Buffer, or DataView', candidate);
+    }
     return cryptoCap('crypto.checkPrime', {
       value: isBig ? String(candidate) : toBytes(candidate, undefined, 'candidate').toString('base64'),
       valueIsBigInt: isBig,
@@ -3393,6 +3479,9 @@ BF.crypto = function () {
   }
 
   function generatePrimeSync(primeLength, options) {
+    /* Node reads the width as a number first and names it "size", which is not the name the
+       option carries inside generateKeyPairSync('dh'). */
+    if (typeof primeLength !== 'number') throw invalidArgType('size', 'of type number', primeLength);
     var result = cryptoCap('crypto.generatePrime', {
       bits: Number(primeLength),
       safe: options !== undefined && options !== null && options.safe === true,
@@ -3461,7 +3550,9 @@ BF.crypto = function () {
       POINT_CONVERSION_HYBRID: 6,
       RSA_PSS_SALTLEN_DIGEST: -1,
       RSA_PSS_SALTLEN_MAX_SIGN: -2,
-      RSA_PSS_SALTLEN_AUTO: -2
+      RSA_PSS_SALTLEN_AUTO: -2,
+      /* An OpenSSL option Node re-exports with the rest of the SSL_OP_* family. */
+      SSL_OP_LEGACY_SERVER_CONNECT: 4
     },
     getCiphers: function () { return cryptoCap('crypto.ciphers'); },
     /* Node's getCipherInfo: name or nid, and undefined for a cipher this container has no table
@@ -3749,6 +3840,44 @@ BF.module = function () {
   /* Deprecated in node to the point of doing nothing: it prints no warning there and returns
      undefined, and so does this. */
   Module._debug = function _debug() { return undefined; };
+  /* globalPaths is filled at bootstrap, from three places: the folders NODE_PATH names, then
+     $HOME/.node_modules and $HOME/.node_libraries, then the install prefix's own lib/node -- the
+     prefix being the directory two above the node binary, which is what makes the third one
+     $PREFIX/lib/node. They are the machine's own home directory and its own install prefix,
+     exactly as os.homedir() and process.execPath are, so the three folders named here are this
+     container's and not the host's: what is host-identical is the count, the order, the derivation
+     and the three a lookup path then carries, where an empty array dropped them from every lookup.
+     Node reads the home directory out of the environment and not out of os.homedir() -- a program
+     started with HOME set elsewhere gets the folders of the HOME it was given -- and an
+     environment with no HOME at all gets the prefix folder alone. loader.ts assigns the empty
+     array this replaces; the statics of require('module') are filled in here, so this is the
+     assignment that stands. row owc-module-globalpaths-empty. */
+  Module._initPaths = function _initPaths() {
+    var pathFor = requireBuiltin('path');
+    var proc = globalThis.process;
+    var env = proc && proc.env ? proc.env : {};
+    var isWindows = !!proc && proc.platform === 'win32';
+    var homeDir = isWindows ? env.USERPROFILE : env.HOME;
+    var paths = [];
+    if (env.NODE_PATH) {
+      var given = String(env.NODE_PATH).split(isWindows ? ';' : ':');
+      for (var g = 0; g < given.length; g++) {
+        if (given[g].length > 0) paths.push(pathFor.resolve(given[g]));
+      }
+    }
+    if (homeDir) {
+      paths.push(pathFor.resolve(homeDir, '.node_modules'));
+      paths.push(pathFor.resolve(homeDir, '.node_libraries'));
+    }
+    if (proc && typeof proc.execPath === 'string') {
+      paths.push(pathFor.resolve(proc.execPath, '..', '..', 'lib', 'node'));
+    }
+    Module.globalPaths = paths;
+    /* Node's own answers undefined -- it fills the static and hands nothing back -- so a caller
+       that reads the return of _initPaths() gets undefined here too. */
+    return undefined;
+  };
+  Module._initPaths();
   /* internalModuleStat is one stat(2) call, so the errno it hands back is the kernel's, and three
      of them this filesystem's statSync cannot name at all: ENOTDIR for a '.' or a '..' that it
      folds into the path rather than walking through the component in front of it, ELOOP for a link
@@ -4185,5 +4314,81 @@ BF.tty = function () {
     WriteStream: PtyWriteStream
   };
 };
+
+/*
+ * What a decoder answers when what it was handed is not bytes. Node raises that refusal from two
+ * places and they do not word it alike: the UTF-8 fast path decodes the whole input in one call
+ * and names the argument 'list', and every other decode parses its input first, names it 'input'
+ * and says what it received. Which of the two a UTF-8 decode takes is settled by the call and not
+ * by the encoding -- a decode that is one of a stream, or one asked of a decoder still holding
+ * the tail of an earlier chunk, parses, and only a whole decode with nothing held over is the
+ * fast path. UTF-16 reaches the converter instead, which names the argument 'input' and lists
+ * SharedArrayBuffer but never says what came, and the single-byte encodings parse whatever the
+ * options say. node:stream/consumers hands every chunk to decode with { stream: true }, so a
+ * stream whose chunks are not bytes meets the 'input' words and not the 'list' ones.
+ */
+function textDecoderReceivedType(value) {
+  /* Node's own reading of a value into words: one that is neither an object nor a function names
+     its type and shows itself, a function names itself, and an object names the constructor it
+     was built by. */
+  if (value === null) return 'null';
+  if (typeof value === 'bigint') return 'type bigint (' + value + 'n)';
+  if (typeof value === 'number') {
+    /* Zero prints with its sign, which is the one thing a number's own string does not carry. */
+    if (value === 0) return 1 / value === -Infinity ? 'type number (-0)' : 'type number (0)';
+    if (value !== value) return 'type number (NaN)';
+    if (value === Infinity) return 'type number (Infinity)';
+    if (value === -Infinity) return 'type number (-Infinity)';
+    return 'type number (' + value + ')';
+  }
+  if (typeof value === 'boolean') return value ? 'type boolean (true)' : 'type boolean (false)';
+  if (typeof value === 'symbol') return 'type symbol (' + String(value) + ')';
+  if (typeof value === 'function') return 'function ' + (typeof value.name === 'string' ? value.name : '');
+  if (typeof value === 'string') {
+    var shown = value.length > 28 ? value.slice(0, 25) + '...' : value;
+    /* A string holding no apostrophe is quoted with one, the way Node quotes it; one that does is
+       put in the other quotes Node reaches for, which are JSON's. */
+    if (shown.indexOf("'") === -1) return "type string ('" + shown + "')";
+    return 'type string (' + JSON.stringify(shown) + ')';
+  }
+  if (value.constructor && typeof value.constructor.name === 'string') return 'an instance of ' + value.constructor.name;
+  /* An object no constructor made -- one whose prototype is null -- is inspected instead, which
+     is the only shape Node names by its looks rather than by its maker. */
+  return inspectValue(value, { depth: 0 });
+}
+
+function textDecoderInputTypeError(input, encoding, stream, carrying) {
+  if (encoding === 'utf-16le' || encoding === 'utf-16be') {
+    return textDecoderError(TypeError, 'ERR_INVALID_ARG_TYPE',
+      'The "input" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView.');
+  }
+  if (encoding === 'utf-8' && !stream && !carrying) {
+    return textDecoderError(TypeError, 'ERR_INVALID_ARG_TYPE',
+      'The "list" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView.');
+  }
+  return textDecoderError(TypeError, 'ERR_INVALID_ARG_TYPE',
+    'The "input" argument must be an instance of ArrayBuffer or ArrayBufferView. Received ' +
+    textDecoderReceivedType(input));
+}
+
+/*
+ * util-assert.ts installs TextDecoder with one refusal for an input that is not bytes -- the
+ * 'list' one -- and the words belong to the call rather than to the module that makes them, so
+ * the method is pointed again here, where that module has already been built. A 'this' no decoder
+ * was made from, an options argument that is not one, and an input that is bytes or no input at
+ * all are left to the method it had: only the refusal is answered over.
+ */
+var textDecoderDecodeBytes = TextDecoderImpl.prototype.decode;
+TextDecoderImpl.prototype.decode = function (input, options) {
+  var state = TEXT_DECODER_STATE.get(this);
+  if (state === undefined || input === undefined) return textDecoderDecodeBytes.call(this, input, options);
+  if (textDecoderOptionsError(options) !== undefined) return textDecoderDecodeBytes.call(this, input, options);
+  if (decodeInputBytes(input) !== undefined) return textDecoderDecodeBytes.call(this, input, options);
+  throw textDecoderInputTypeError(input, state.encoding,
+    options !== undefined && options !== null && Boolean(options.stream), state.rest.length > 0);
+};
+/* The two arguments are optional in Node's own signature, so the arity a program reads off the
+   method it was handed stays 0 here too. */
+Object.defineProperty(TextDecoderImpl.prototype.decode, 'length', { value: 0, configurable: true });
 
 `;
