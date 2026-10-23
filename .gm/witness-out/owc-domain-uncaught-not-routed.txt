@@ -1,0 +1,38 @@
+row: owc-domain-uncaught-not-routed
+measured_at: 1fe0710 (local main, working tree dirty with other lanes' edits)
+probe: /tmp/owc-r4/adv5-fix-als-3/w.sh  (host node 24.15 vs container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core)
+host node: v24.15.0
+
+===== case c2 =====
+--- host stdout ---
+aboutToThrow=yes
+DOMAIN.ERROR=uncaught-in-run
+--- host stderr ---
+--- container (driver transcript) ---
+---- program output ----
+aboutToThrow=yes
+UNCAUGHT=uncaught-in-run
+---- program stderr ----
+[owc exit 0]
+
+===== case c3 =====
+--- host stdout ---
+aboutToThrow=yes
+DOMAIN.ERROR=uncaught-no-listener
+--- host stderr ---
+--- container (driver transcript) ---
+---- program output ----
+aboutToThrow=yes
+---- program stderr ----
+Error: uncaught-no-listener
+    at /app/main.js:6:30
+    at apply (native)
+    at Object.<anonymous> (/app/main.js:6:6)
+    at Module._compile (node:internal/modules/cjs/loader:1830:14)
+    at Object..js (node:internal/modules/cjs/loader:1961:10)
+    at Module.load (node:internal/modules/cjs/loader:1553:32)
+    at Module._load (node:internal/modules/cjs/loader:1355:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+[owc exit 1]

@@ -1,0 +1,137 @@
+row: owc-module-export-table-incomplete
+measured_at: 1fe0710 (local main, working tree dirty with other lanes' edits)
+probe: /tmp/owc-r4/adv5-fix-als-3/w.sh  (host node 24.15 vs container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core)
+host node: v24.15.0
+
+===== case b-module =====
+--- host stdout ---
+module.keys=Module,SourceMap,_cache,_debug,_extensions,_findPath,_initPaths,_load,_nodeModulePaths,_pathCache,_preloadModules,_readPackage,_resolveFilename,_resolveLookupPaths,_stat,builtinModules,constants,createRequire,enableCompileCache,findPackageJSON,findSourceMap,flushCompileCache,getCompileCacheDir,getSourceMapsSupport,globalPaths,isBuiltin,length,name,prototype,register,registerHooks,runMain,setSourceMapsSupport,stripTypeScriptTypes,syncBuiltinESMExports,wrap,wrapper
+node:module.sameKeys=true
+  Module=function
+  SourceMap=function
+  _cache=object
+  _debug=function
+  _extensions=object
+  _findPath=function
+  _initPaths=function
+  _load=function
+  _nodeModulePaths=function
+  _pathCache=object
+  _preloadModules=function
+  _readPackage=function
+  _resolveFilename=function
+  _resolveLookupPaths=function
+  _stat=function
+  builtinModules=object
+  constants=object
+  createRequire=function
+  enableCompileCache=function
+  findPackageJSON=function
+  findSourceMap=function
+  flushCompileCache=function
+  getCompileCacheDir=function
+  getSourceMapsSupport=function
+  globalPaths=object
+  isBuiltin=function
+  length=number
+  name=string
+  prototype=object
+  register=function
+  registerHooks=function
+  runMain=function
+  setSourceMapsSupport=function
+  stripTypeScriptTypes=function
+  syncBuiltinESMExports=function
+  wrap=function
+  wrapper=object
+isBuiltin.fs=true
+builtinModules.len=72
+createRequire.type=function
+constants.type=object
+enableCompileCache.type=function
+findSourceMap.type=function
+stripTypeScriptTypes.type=function
+syncBuiltinESMExports.type=function
+runMain.type=function
+register.type=function
+registerHooks.type=function
+Module.isModule=function
+SourceMap.type=function
+wrap.type=function
+--- host stderr ---
+--- container (driver transcript) ---
+---- program output ----
+module.keys=Module,_cache,_extensions,_initPaths,_load,_nodeModulePaths,_pathCache,_preloadModules,_resolveFilename,builtinModules,createRequire,createRequireFromPath,globalPaths,isBuiltin,length,name,prototype,syncBuiltinESMExports,wrap,wrapper
+node:module.sameKeys=true
+  Module=function
+  _cache=object
+  _extensions=undefined
+  _initPaths=function
+  _load=function
+  _nodeModulePaths=function
+  _pathCache=object
+  _preloadModules=function
+  _resolveFilename=function
+  builtinModules=object
+  createRequire=function
+  createRequireFromPath=function
+  globalPaths=object
+  isBuiltin=function
+  length=number
+  name=string
+  prototype=object
+  syncBuiltinESMExports=function
+  wrap=function
+  wrapper=object
+isBuiltin.fs=true
+builtinModules.len=40
+createRequire.type=function
+constants.type=undefined
+enableCompileCache.type=undefined
+findSourceMap.type=undefined
+stripTypeScriptTypes.type=undefined
+syncBuiltinESMExports.type=function
+runMain.type=undefined
+register.type=undefined
+registerHooks.type=undefined
+Module.isModule=function
+SourceMap.type=undefined
+wrap.type=function
+---- program stderr ----
+[owc exit 0]
+
+===== case b2-mods =====
+--- host stdout ---
+COUNT=72
+LIST=_http_agent _http_client _http_common _http_incoming _http_outgoing _http_server _stream_duplex _stream_passthrough _stream_readable _stream_transform _stream_wrap _stream_writable _tls_common _tls_wrap assert assert/strict async_hooks buffer child_process cluster console constants crypto dgram diagnostics_channel dns dns/promises domain events fs fs/promises http http2 https inspector inspector/promises module net node:sea node:sqlite node:test node:test/reporters os path path/posix path/win32 perf_hooks process punycode querystring readline readline/promises repl stream stream/consumers stream/promises stream/web string_decoder sys timers timers/promises tls trace_events tty url util util/types v8 vm wasi worker_threads zlib
+EXTENSIONS=object
+require.extensions=object
+require.extensions.keys=.js,.json,.node
+enableCompileCache=function
+findPackageJSON=function
+flushCompileCache=function
+getCompileCacheDir=function
+getSourceMapsSupport=function
+getSourceMapsSupport.val={"enabled":false,"nodeModules":false,"generatedCode":false}
+stripTypeScriptTypes=function
+strip=19
+--- host stderr ---
+(node:33226) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+--- container (driver transcript) ---
+---- program output ----
+COUNT=40
+LIST=assert async_hooks buffer child_process cluster console constants crypto dgram diagnostics_channel dns domain events fs http http2 https inspector module net os path perf_hooks process punycode querystring readline repl stream string_decoder timers tls tty undici url util v8 vm worker_threads zlib
+EXTENSIONS=undefined
+require.extensions=object
+require.extensions.keys=.js,.json,.node
+enableCompileCache=undefined
+findPackageJSON=undefined
+flushCompileCache=undefined
+getCompileCacheDir=undefined
+getSourceMapsSupport=undefined
+getSourceMapsSupport.THREW=not a function
+stripTypeScriptTypes=undefined
+strip.THREW=not a function
+---- program stderr ----
+[owc exit 0]

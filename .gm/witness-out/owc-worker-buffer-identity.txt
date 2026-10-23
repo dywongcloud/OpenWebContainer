@@ -1,0 +1,26 @@
+row: owc-worker-buffer-identity
+measured_at: 1fe0710 (local main, working tree dirty with other lanes' edits)
+probe: /tmp/owc-r4/adv5-fix-als-3/w.sh  (host node 24.15 vs container via /tmp/owc-r4/probe2/run-owc-repo.mts from packages/core)
+host node: v24.15.0
+
+===== case h-worker =====
+--- host stdout ---
+main.isBuffer=false
+main.ctor=Uint8Array
+main.instanceofUint8Array=true
+main.isView=true
+main.byteLength=10
+main.text=119,111,114,107,101,114,45,98,117,102
+END=ok
+--- host stderr ---
+--- container (driver transcript) ---
+---- program output ----
+main.isBuffer=true
+main.ctor=Buffer
+main.instanceofUint8Array=true
+main.isView=true
+main.byteLength=10
+main.text=worker-buf
+END=ok
+---- program stderr ----
+[owc exit 0]

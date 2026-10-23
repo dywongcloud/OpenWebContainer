@@ -2,3 +2,16 @@ id: owc-verifier-open-gaps
 session_id: claude-gm-owc-2
 subject: 'OPEN verifier findings not fixed: AsyncLocalStorage context across await and async resumption; vm timeout (a busy loop blocks the worker); http2 core stream API (stream event, respond); stream pipeline AbortSignal with ABORT_ERR; missing exports events.on and getEventListeners, util.parseArgs, timers/promises setInterval and scheduler, net.BlockList and SocketAddress, buffer.Blob, transcode and isUtf8, module.register; vm cross-realm instanceof; Buffer identity across worker messages (Node delivers Uint8Array)'
 status: pending
+refuted: >-
+  The "only module.register is still missing" reading of this row is refuted, re-witnessed at 1fe0710
+  by adv5-fix-async-als-3. module.register is 1 of 18 names require('module') does not export (21 own
+  keys here against host node 24.15's 39) and builtinModules is 40 against 72, and three of the
+  eighteen are an engine limit rather than a gap: QuickJS exposes no code cache, so enableCompileCache,
+  flushCompileCache and getCompileCacheDir cannot exist here at all. "vm cross-realm instanceof" is two
+  rows, not one, and neither is an engine limit: a second QuickJS context does give a value that
+  answers false to instanceof Map/Set/Promise (measured bare, out of the container), and the rebuild
+  also stops at the second nested container and drops every key after it. "Buffer identity across
+  worker messages (Node delivers Uint8Array)" is still open and the clone is the container's own
+  cpEncode/cpDecode in guest/modules/child.ts, not an engine clone -- QuickJS has no structuredClone.
+  See owc-module-export-table-incomplete, owc-vm-realm-rebuild-drops-keys,
+  owc-vm-realm-map-set-promise-instanceof and owc-worker-buffer-identity.
