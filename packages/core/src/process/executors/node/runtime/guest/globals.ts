@@ -849,8 +849,7 @@ if (procEnv.OWC_STDIN === 'pipe') {
   delete procEnv.OWC_STDIN;
   stdinOpen = true;
 }
-/* Node's own process is an accessor and not a data property, and its descriptor says so. */
-Object.defineProperty(globalThis, 'process', { get: function () { return proc; }, configurable: true, enumerable: true });
+globalThis.process = proc;
 BF.process = function () {
   return proc;
 };
@@ -974,34 +973,6 @@ var CJS_REQUIRE_TAIL = [
 var BOOTSTRAP_MARK = 'owc-bootstrap.js:';
 var CJS_CALL_FRAME = '    at call (native)';
 
-/*
- * The frames host node writes behind the body of an ES module: the job that ran the module and the
- * loader the job belongs to, then the entry that asked for the run. Captured from the build
- * NODE_VERSION names, as the frames of a module that is not there are.
- */
-var ESM_MAIN_TAIL = [
-  '    at ModuleJob.run (node:internal/modules/esm/module_job:437:25)',
-  '    at async node:internal/modules/esm/loader:639:26',
-  '    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)'
-];
-
-/*
- * Every file this process compiled as an ES module, named by the host as it compiles one. Node names
- * a frame in an ES module by the URL of its file -- file:///app/main.mjs -- and a frame in a
- * CommonJS one by its path, so which of the two a file is decides the form its frames take, and it
- * is the host that decides: a .js file is a module or not by the package it sits in.
- */
-var ESM_FILES = Object.create(null);
-/* The ones the entry point ran: a module the entry imports is evaluated inside the run the entry
-   point started, and node names that run -- asyncRunEntryPointWithESMLoader -- behind a trace out
-   of such a module and behind no module a dynamic import loads once the entry has finished. */
-var ESM_ENTRY_FILES = Object.create(null);
-api.markEsmFile = function (file, inEntryRun) {
-  if (typeof file !== 'string' || file === '') return;
-  ESM_FILES[file] = true;
-  if (inEntryRun) ESM_ENTRY_FILES[file] = true;
-};
-
 /* One frame of this container's own: every frame the bootstrap puts on a stack names its file. */
 function isBootstrapFrame(text) {
   return typeof text === 'string' && text.indexOf(BOOTSTRAP_MARK) >= 0;
@@ -1045,34 +1016,6 @@ function frameColumnUnwrapped(text) {
   return parsed[1] + parsed[2] + parsed[3] + ':1:' + column + (parsed[6] === undefined ? '' : parsed[6]);
 }
 
-/* How many of node's ESM loader frames go behind this one, and 0 when none do: 3 for the top-level
-   frame of a module the entry point ran, 2 for the top-level frame of any other ES module -- a
-   dynamic import loads its module outside the run the entry point started, so node names the job
-   and the loader and stops -- and 0 for a frame that is not one, which is every frame that names
-   the function it is in. */
-function esmTailOf(text) {
-  if (/^(\s*)at [^\s()]+:\d+:\d+\s*$/.test(text) === false) return 0;
-  var where = frameLocation(text);
-  if (ESM_ENTRY_FILES[where] === true) return 3;
-  return ESM_FILES[where] === true ? 2 : 0;
-}
-
-/* The file a frame names, without the line and column behind it. */
-function frameLocation(text) {
-  var parsed = FRAME_AT_COLUMN.exec(text);
-  return parsed === null ? '' : parsed[3];
-}
-
-/* The same frame with the URL of an ES module where the engine wrote the module's path: node names
-   file:///app/main.mjs for the file this engine names /app/main.mjs, and names the path alone for a
-   file it compiled inside the CommonJS wrapper. */
-function frameFileUrl(text) {
-  var parsed = FRAME_AT_COLUMN.exec(text);
-  if (parsed === null || ESM_FILES[parsed[3]] !== true) return text;
-  return parsed[1] + parsed[2] + 'file://' + parsed[3] + ':' + parsed[4] + ':' + parsed[5] +
-    (parsed[6] === undefined ? '' : parsed[6]);
-}
-
 /*
  * A guest's frames with this container's own taken out and node's put in their place: the call into
  * a compiled CommonJS body, the loader that made it and the require or the entry behind it are one
@@ -1108,17 +1051,7 @@ function guestFramesOf(lines) {
     out.push(line);
     at++;
   }
-  /* A run of frames out of an ES module ends in the module's own top-level frame -- a bare location,
-     with no function in front of it -- and node names the loader behind that one frame and no
-     other: the job it made of the module, the loader that ran the job, and, for a module the entry
-     point ran, the entry point itself. */
-  var n = 0;
-  for (; n < out.length; n++) out[n] = anonymousFrameName(frameColumnUnwrapped(out[n]));
-  var esmTail = out.length === 0 ? 0 : esmTailOf(out[out.length - 1]);
-  for (n = 0; n < out.length; n++) out[n] = frameFileUrl(out[n]);
-  if (esmTail > 0) {
-    for (var em = 0; em < esmTail && em < ESM_MAIN_TAIL.length; em++) out.push(ESM_MAIN_TAIL[em]);
-  }
+  for (var n = 0; n < out.length; n++) out[n] = anonymousFrameName(frameColumnUnwrapped(out[n]));
   return out;
 }
 
@@ -2084,18 +2017,14 @@ globalThis.atob = function (input) {
 globalThis.btoa = function (input) {
   return encodeBase64(encodeString(String(input), 'latin1'));
 };
-Object.defineProperty(globalThis, 'performance', {
-  get: function () {
-    return {
-      timeOrigin: Date.now() - (host.now() - startedAt),
-      now: function () { return host.now() - startedAt; }
-    };
-  }, configurable: true, enumerable: true
-});
+globalThis.performance = {
+  timeOrigin: Date.now() - (host.now() - startedAt),
+  now: function () { return host.now() - startedAt; }
+};
 globalThis.structuredClone = function (value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 };
-Object.defineProperty(globalThis, 'crypto', { get: function () { return nodeCrypto.webcrypto; }, configurable: true, enumerable: true });
+globalThis.crypto = nodeCrypto.webcrypto;
 /*
  * fetch, with the three classes Node also defines beside it (Headers, Request, Response). The
  * request goes out on the container's own http and https client, so a URL on the virtual network
@@ -2549,18 +2478,10 @@ function circularStructureText(value, replacer) {
   navProp('languages', function () { return Object.freeze(['en-US']); });
   navProp('platform', function () { return NAV_PLATFORM; });
   navProp('userAgent', function () { return 'Node.js/' + String(proc.versions.node).split('.')[0]; });
-  /* node 24 gives navigator.locks a LockManager, whose two methods this container has no
-     locks behind: it is the object a guest that asks is answered with. */
-  navProp('locks', function () { return navLocks; });
   Object.defineProperty(Navigator.prototype, Symbol.toStringTag, { value: 'Navigator', configurable: true });
   Object.defineProperty(Navigator.prototype, 'constructor', { value: Navigator, writable: true, configurable: true });
   globalThis.Navigator = Navigator;
-  var navInstance = Object.create(Navigator.prototype);
-  var navLocks = {
-    request: function () { return Promise.reject(new TypeError('The "locks" are not supported')); },
-    query: function () { return Promise.resolve({ held: [], pending: [] }); }
-  };
-  Object.defineProperty(globalThis, 'navigator', { get: function () { return navInstance; }, configurable: true, enumerable: true });
+  Object.defineProperty(globalThis, 'navigator', { value: Object.create(Navigator.prototype), writable: true, configurable: true, enumerable: true });
 
   /*
    * The 'Performance' family, on the clock the rest of this file already keeps: 'performance' is a
@@ -2648,10 +2569,8 @@ function circularStructureText(value, replacer) {
     return fn;
   };
   Performance.prototype.toJSON = function () {
-    return { timeOrigin: this.timeOrigin, nodeTiming: this.nodeTiming, eventLoopUtilization: this.eventLoopUtilization() };
+    return { timeOrigin: this.timeOrigin, nodeTiming: this.nodeTiming };
   };
-  /* The callback node leaves null until a listener is set. */
-  Object.defineProperty(Performance.prototype, 'onresourcetimingbufferfull', { get: function () { return null; }, configurable: true, enumerable: true });
   Object.defineProperty(Performance.prototype, 'nodeTiming', {
     get: function () {
       return { name: 'node', entryType: 'node', startTime: 0, duration: 0, nodeStart: 0, bootstrapComplete: 0 };
@@ -2682,9 +2601,7 @@ function circularStructureText(value, replacer) {
   PerformanceObserver.prototype.disconnect = function () { /* nothing was ever observed */ };
   PerformanceObserver.prototype.takeRecords = function () { return []; };
   Object.defineProperty(PerformanceObserver.prototype, Symbol.toStringTag, { value: 'PerformanceObserver', configurable: true });
-  /* An accessor, as node's is: a guest that reads the descriptor and not the value is answered
-     with a getter there, and with a writable data property here no longer. */
-  Object.defineProperty(globalThis, 'performance', { get: function () { return performance; }, configurable: true, enumerable: true });
+  Object.defineProperty(globalThis, 'performance', { value: performance, writable: true, configurable: true, enumerable: true });
   globalThis.Performance = Performance;
   globalThis.PerformanceEntry = PerformanceEntry;
   globalThis.PerformanceMark = entryMark;
@@ -2709,10 +2626,6 @@ function circularStructureText(value, replacer) {
   if (webcrypto !== undefined && webcrypto !== null) {
     if (Object.getPrototypeOf(webcrypto) === Object.prototype) Object.setPrototypeOf(webcrypto, Crypto.prototype);
     Object.defineProperty(Crypto.prototype, 'subtle', { get: function () { return webcrypto.subtle; }, configurable: true, enumerable: true });
-    /* The two methods of the instance are on the prototype in node too, so Crypto.prototype
-       lists them even where every one of them is read off the webcrypto behind it. */
-    Object.defineProperty(Crypto.prototype, 'getRandomValues', { get: function () { return webcrypto.getRandomValues; }, configurable: true, enumerable: true });
-    Object.defineProperty(Crypto.prototype, 'randomUUID', { get: function () { return webcrypto.randomUUID; }, configurable: true, enumerable: true });
     if (typeof webcrypto.CryptoKey === 'function') globalThis.CryptoKey = webcrypto.CryptoKey;
     if (webcrypto.subtle !== undefined && webcrypto.subtle !== null
         && Object.getPrototypeOf(webcrypto.subtle) === Object.prototype) {
@@ -2753,11 +2666,8 @@ function circularStructureText(value, replacer) {
     return err;
   }
   SuppressedError.prototype = Object.create(Error.prototype);
-  /* In the order Object.getOwnPropertyNames reads them in on a host: constructor, then name, then
-     the message every error carries. */
-  Object.defineProperty(SuppressedError.prototype, 'constructor', { value: SuppressedError, writable: true, configurable: true });
   SuppressedError.prototype.name = 'SuppressedError';
-  Object.defineProperty(SuppressedError.prototype, 'message', { value: '', writable: true, configurable: true });
+  Object.defineProperty(SuppressedError.prototype, 'constructor', { value: SuppressedError, writable: true, configurable: true });
 
   function disposeValue(value) {
     if (value === null || value === undefined) return;
@@ -2778,28 +2688,24 @@ function circularStructureText(value, replacer) {
       this._done = false;
     }
     Object.defineProperty(Stack.prototype, 'disposed', { get: function () { return this._done; }, configurable: true });
-    /* Named: a method of the host's own carries its name, and a guest that reads the name of
-       DisposableStack.prototype.dispose is answered 'dispose' there and '' here otherwise. */
-    Stack.prototype.use = function use(value) {
+    Stack.prototype[this === undefined ? 'use' : 'use'] = function (value) {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       if (value === null || value === undefined) throw new TypeError('The "value" argument is not disposable');
       this._held.push({ kind: 'use', value: value });
       return value;
     };
-    Stack.prototype.adopt = function adopt(value, onDispose) {
+    Stack.prototype.adopt = function (value, onDispose) {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       if (typeof onDispose !== 'function') throw new TypeError('The "onDispose" argument must be of type function');
       this._held.push({ kind: 'use', value: { dispose: onDispose } });
       return value;
     };
-    Stack.prototype.defer = function defer(onDispose) {
+    Stack.prototype.defer = function (onDispose) {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       if (typeof onDispose !== 'function') throw new TypeError('The "onDispose" argument must be of type function');
-      /* A deferred callback is a function and not a disposable: node calls it as it stands, and
-         never looks for a Symbol.dispose on it. */
-      this._held.push({ kind: 'defer', value: onDispose });
+      this._held.push({ kind: 'use', value: { dispose: onDispose } });
     };
-    Stack.prototype.move = function move() {
+    Stack.prototype.move = function () {
       if (this._done) throw new ReferenceError(tag + ' is already disposed');
       var next = new Ctor();
       next._held = this._held;
@@ -2816,7 +2722,7 @@ function circularStructureText(value, replacer) {
     return self === undefined ? this : self;
   }
   DisposableStack.prototype = makeStack(DisposableStack, 'DisposableStack').prototype;
-  DisposableStack.prototype.dispose = function dispose() {
+  DisposableStack.prototype.dispose = function () {
     if (this._done) return;
     this._done = true;
     var held = this._held;
@@ -2824,8 +2730,7 @@ function circularStructureText(value, replacer) {
     var first = null;
     for (var i = held.length - 1; i >= 0; i--) {
       try {
-        if (held[i].kind === 'defer') held[i].value();
-        else disposeValue(held[i].value);
+        disposeValue(held[i].value);
       } catch (error) {
         if (first === null) first = { error: error, suppressed: null };
         else first = { error: first.error, suppressed: first.suppressed === null ? error : new SuppressedError(first.suppressed, error) };
@@ -2840,7 +2745,7 @@ function circularStructureText(value, replacer) {
     return self === undefined ? this : self;
   }
   AsyncDisposableStack.prototype = makeStack(AsyncDisposableStack, 'AsyncDisposableStack').prototype;
-  AsyncDisposableStack.prototype.disposeAsync = function disposeAsync() {
+  AsyncDisposableStack.prototype.disposeAsync = function () {
     if (this._done) return Promise.resolve();
     this._done = true;
     var held = this._held;
@@ -2854,10 +2759,8 @@ function circularStructureText(value, replacer) {
         return Promise.reject(first.suppressed === null ? first.error
           : new SuppressedError(first.error, first.suppressed, 'An error was suppressed during disposal'));
       }
-      var entry = held[at--];
-      var value = entry.value;
-      return (entry.kind === 'defer' ? Promise.resolve(value()) : asyncDisposeValue(value))
-        .then(null, function (error) {
+      var value = held[at--].value;
+      return asyncDisposeValue(value).then(null, function (error) {
         if (first === null) first = { error: error, suppressed: null };
         else first = { error: first.error, suppressed: first.suppressed === null ? error : new SuppressedError(first.suppressed, error) };
       }).then(step);
@@ -3105,21 +3008,7 @@ api.emitExit = function (code) {
   exitEmitted = true;
   proc.emit('exit', code);
 };
-/* Whether a message is a report node wrote for itself and not an error's message: it opens with
-   the file it names -- a file URL for a module, the internal frame it throws through for a
-   TypeScript construct its stripper refuses -- and it carries the SyntaxError it ends in. */
-function isNodeReport(message) {
-  if (typeof message !== 'string' || message === '') return false;
-  if (message.indexOf('file:///') !== 0 && message.indexOf('node:internal/') !== 0) return false;
-  return message.indexOf('SyntaxError') >= 0;
-}
-
 api.formatUncaught = function (err) {
-  /* A failure the host has already written out the way node writes it -- a module that does not
-     compile, or a TypeScript construct node's stripper refuses -- is a report and not an error:
-     it carries the file, the source line, the caret, the SyntaxError and node's own frames, so
-     printing a name and a stack of this engine's in front of it would write the report twice. */
-  if (err instanceof Error && isNodeReport(err.message)) return String(err.message);
   if (err instanceof Error) return formatErrorStack(err);
   return inspectValue(err);
 };
