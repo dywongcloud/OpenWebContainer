@@ -4,13 +4,15 @@
  * that only registers BF factories, so no globals are introduced.
  *
  * vm model: a context is a sandbox object. Code runs through a `with` scope backed by
- * a Proxy: names the sandbox owns resolve there, ES builtins fall through to the host
- * realm, and every other free name reads and writes the sandbox, so undeclared
- * assignments and top-level var declarations land on the sandbox. Top-level function
- * declarations are copied onto the sandbox after each run. The code runs in this realm, so a
- * value it makes is rebuilt by the host inside a second one before it is handed back: prototypes,
- * builtins and instanceof of what comes back are that realm's, as they are for a value host
- * Node hands back from another context. See outOfRecord.
+ * a Proxy: names the sandbox owns resolve there, ES builtins fall through to a second
+ * realm -- the one the code itself runs in -- and every other free name reads and writes
+ * the sandbox, so undeclared assignments and top-level var declarations land on the
+ * sandbox. Top-level function declarations are copied onto the sandbox after each run.
+ * The code runs in that second realm and not in this one, so a value it makes is of
+ * another realm as it is made and is handed back as it is: prototypes, builtins and
+ * instanceof of what comes back are that realm's, as they are for a value host Node hands
+ * back from another context. See vmEval. The one value a context makes of its own realm
+ * still is the ERR_SCRIPT_EXECUTION_TIMEOUT of a timeout, raised here; see outOfRecord.
  */
 export const SRC = String.raw`
 (function () {
@@ -351,10 +353,39 @@ export const SRC = String.raw`
     return c;
   }
 
+  /* The ES globals the code of a vm context sees: the second realm's, not this one's.
+     The code runs there -- see vmEval -- so a name it reads and the object a literal of the same
+     name makes have to be one realm's: [] instanceof Array is true inside a context on host node
+     24.15, as it is here, while e instanceof Array for an array the caller put in is false there,
+     which only a second realm can give. The names are read out of that realm once. */
+  var esRealm = null;
+
+  function realmEs(key) {
+    if (esRealm === null) {
+      esRealm = false;
+      try {
+        callCap('vm.es', {});
+        if (api.vmEs !== undefined && api.vmEs !== null) esRealm = api.vmEs;
+        api.vmEs = undefined;
+      } catch (esErr) {
+        esRealm = false;
+      }
+    }
+    if (esRealm === false) return undefined;
+    try {
+      return esRealm[key];
+    } catch (esErr) {
+      return undefined;
+    }
+  }
+
   function fallbackGet(rec, key) {
     if (key === 'globalThis') return rec.G;
     if (key === 'console') return rec.console;
-    if (ES_NAMES[key] === true) return globalThis[key];
+    if (ES_NAMES[key] === true) {
+      var es = realmEs(key);
+      return es === undefined ? globalThis[key] : es;
+    }
     return undefined;
   }
 
@@ -385,7 +416,11 @@ export const SRC = String.raw`
         if (key in target) return target[key];
         if (decl[key] === true) return undefined;
         if (key === 'globalThis' || key === 'console' || ES_NAMES[key] === true) return fallbackGet(rec, key);
-        throw new ReferenceError(key + ' is not defined');
+        /* The ReferenceError a context raises for a name it does not know is one of the context's
+           own realm, as every error host Node 24.15 raises inside one is: outside it, an error out
+           of a context answers false to instanceof ReferenceError and to instanceof Error both. */
+        var Ref = realmEs('ReferenceError');
+        throw new (typeof Ref === 'function' ? Ref : ReferenceError)(key + ' is not defined');
       },
       set: function (target, key, value) {
         target[key] = value;
@@ -396,8 +431,48 @@ export const SRC = String.raw`
 
   // Runs with this = the global view. Free identifiers inside the eval resolve through
   // the with-proxy; internal __owcVm names and top-level function names stay local.
+  var NO_REALM = {};
+  /* Whether the last run through the second realm was stopped by an armed deadline, rather than by
+     the code in it. Set from the answer vm.exec gives, because an interruption QuickJS raises inside
+     the realm reaches the guest as an ordinary throw and not as the uncatchable error it is. */
+  var vmFired = false;
+
+  /* The code of a context, run in the second realm through its own copy of this wrapper's body --
+     the host's, compiled there. Everything a context makes is then of that realm as it is made, and
+     comes back as it is, which is what a rebuild of it could only approximate. NO_REALM means no
+     second realm could be made, and the run falls back to this one. */
+  function vmEval(code, scope, fns, sb, self) {
+    api.vmCode = code;
+    api.vmScope = scope;
+    api.vmFns = fns;
+    api.vmSb = sb;
+    api.vmSelf = self;
+    api.vmOut = undefined;
+    api.vmThrow = undefined;
+    var res;
+    try {
+      res = callCap('vm.exec', {});
+    } finally {
+      api.vmCode = undefined;
+      api.vmScope = undefined;
+      api.vmFns = undefined;
+      api.vmSb = undefined;
+      api.vmSelf = undefined;
+    }
+    if (res.unbound) return NO_REALM;
+    var out = api.vmOut;
+    var thrown = api.vmThrow;
+    vmFired = res.fired === true;
+    api.vmOut = undefined;
+    api.vmThrow = undefined;
+    if (res.ok) return out;
+    throw thrown;
+  }
+
   function runWrapped(__owcVmWith, __owcVmCode, __owcVmFns, __owcVmSb) {
     var __owcVmOut;
+    var __owcVmIn = vmEval(__owcVmCode, __owcVmWith, __owcVmFns, __owcVmSb, this);
+    if (__owcVmIn !== NO_REALM) return __owcVmIn;
     try {
       with (__owcVmWith) {
         __owcVmOut = eval(__owcVmCode);
@@ -425,17 +500,11 @@ export const SRC = String.raw`
     }
     var decl = declaredNames(src);
     var scope = new Proxy(rec.sb, withHandler(rec, fnSet, decl));
-    var out;
-    try {
-      out = runWrapped.call(rec.G, scope, rewriteTypeof(src), fns, rec.sb);
-    } catch (thrown) {
-      /* A value the context throws out of itself crosses the way one it hands back does: an error of
-         another realm, so e instanceof Error is false in the catch of
-         vm.runInNewContext('throw new Error("x")'), as on host Node 24.15, with name and message and
-         the properties its constructor put on it still reading as they did inside the context. */
-      throw outOfRecord(rec, thrown);
-    }
-    return outOfRecord(rec, out);
+    /* The code runs in the second realm, so what it answers -- and what it throws -- is already of
+       another realm: an error out of one is no more an Error of the caller than an array is. The
+       one error a context has no hand in is the ERR_SCRIPT_EXECUTION_TIMEOUT of a timeout, which is
+       raised here and rehomed on its way out like any other value this realm built. */
+    return runWrapped.call(rec.G, scope, rewriteTypeof(src), fns, rec.sb);
   }
 
   /* A source this module compiles for a context gets the loader's compatibility rewrite, as a
@@ -451,14 +520,15 @@ export const SRC = String.raw`
   }
 
   /**
-   * A value a vm context hands back, as host Node hands it back: an object of another realm.
+   * A value this realm built that a context hands out as one of the context's own: an object of
+   * another realm, as host Node hands it back.
    *
    * The host keeps a second realm -- a second QuickJS context on the same runtime -- and rebuilds
-   * the value there, so an array from runInContext answers false to instanceof Array while
-   * Array.isArray still answers true, and Object.prototype.toString.call still says [object Array].
-   * That is a copy rather than the object the context's code made, so a value the caller put into
-   * the sandbox itself is not rebuilt: a copy of it would drift from the original the moment either
-   * was changed, and Node hands the very same object back.
+   * the value there, so the ERR_SCRIPT_EXECUTION_TIMEOUT of a timeout answers false to
+   * instanceof Error while still carrying its own code, its name and its message. A value the
+   * code of a context made is already of that realm and is not rebuilt at all (see vmEval), and a
+   * value the caller put into the sandbox is not rebuilt either: a copy of it would drift from the
+   * original the moment either was changed, and Node hands the very same object back.
    */
   function outOfRecord(rec, out) {
     if (out === null || (typeof out !== 'object' && typeof out !== 'function')) return out;
@@ -834,8 +904,9 @@ export const SRC = String.raw`
       if (timeout === undefined) return run();
       function out(err) { return rec === undefined ? err : outOfRecord(rec, err); }
       var slot = null;
+      vmFired = false;
       api.vmThunk = function () {
-        try { slot = { ok: true, value: run() }; } catch (err) { slot = { ok: false, error: err }; }
+        try { slot = { ok: true, value: run() }; } catch (err) { slot = { ok: false, error: err, fired: vmFired }; }
       };
       var outcome;
       try {
@@ -844,7 +915,11 @@ export const SRC = String.raw`
         api.vmThunk = undefined;
       }
       if (outcome.unbound) return run();
-      if (outcome.interrupted) {
+      /* A deadline that stopped the code of a context: host Node raises ERR_SCRIPT_EXECUTION_TIMEOUT
+         in the realm of the context that overran it, and an interruption QuickJS raises inside the
+         second realm reaches this catch as an ordinary throw, so what says one happened is the
+         answer vm.exec gave rather than the error itself. */
+      if (outcome.interrupted || (slot !== null && slot.fired === true)) {
         /* Raised here rather than by the code that overran it, but host Node raises it in the
            context's realm, so the caller reads e instanceof Error as false there too. */
         throw out(nodeError(Error, 'ERR_SCRIPT_EXECUTION_TIMEOUT', 'Script execution timed out after ' + timeout + 'ms'));
@@ -886,6 +961,22 @@ export const SRC = String.raw`
       return Function.apply(null, list.concat([code]));
     }
 
+    /* The script a context is handed, compiled for it.
+       Host Node 24.15 compiles the code of runInContext and runInNewContext inside the context it
+       will run in, so the SyntaxError a bad script raises there is an error of that context and not
+       of the caller: vm.runInNewContext('var y = {') answers false to (e instanceof SyntaxError),
+       where new vm.Script('var y = {') -- a compile no context was named for -- answers true, and so
+       does new vm.Script('var y = {').runInContext(ctx), because that one throws before the context
+       is ever reached. A context here is a sandbox of the caller's own realm, so the compile is the
+       caller's too; the error is rehomed on the way out, the way a value the context hands back is. */
+    function scriptFor(rec, code) {
+      try {
+        return new Script(code);
+      } catch (err) {
+        throw outOfRecord(rec, err);
+      }
+    }
+
     return {
       Script: Script,
       createScript: function (code) { return new Script(code); },
@@ -895,11 +986,15 @@ export const SRC = String.raw`
         return vmRecords.has(obj);
       },
       runInThisContext: function (code, options) { return new Script(code).runInThisContext(options); },
+      /* The context is resolved before the code is compiled, as on host Node 24.15: a bad
+         context object is an ERR_INVALID_ARG_TYPE there even when the code is bad syntax too. */
       runInContext: function (code, contextifiedObject, options) {
-        return new Script(code).runInContext(contextifiedObject, options);
+        var rec = recordOf(contextifiedObject);
+        return scriptFor(rec, code).runInContext(contextifiedObject, options);
       },
       runInNewContext: function (code, sandbox, options) {
-        return new Script(code).runInNewContext(sandbox, options);
+        var rec = recordOf(createContextObject(sandbox));
+        return scriptFor(rec, code).runInContext(rec.sb, options);
       },
       compileFunction: compileFunction,
       constants: {

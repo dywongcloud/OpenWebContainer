@@ -24,12 +24,14 @@ interface VmHost {
     /** The guest bootstrap API object; vm.run reads the thunk from its `vmThunk` slot. */
     api: QuickJSHandle;
     /**
-     * A second realm: a second QuickJS context on the same runtime, made the first time a value has
-     * to cross out of a `vm` context. Its intrinsics are its own -- `Array` here is not the guest's
-     * `Array` -- because QuickJS gives each context its own set, while objects of one context are
-     * usable from another of the same runtime. That is the whole of what Node's cross-realm
-     * behaviour needs, and it is why a value from `runInContext` answers `false` to
-     * `instanceof Array` while `Array.isArray` still answers `true`.
+     * A second realm: a second QuickJS context on the same runtime, made the first time a `vm`
+     * context runs code -- or the first time a value of this realm has to cross out of one. The
+     * code of a context runs here, and its intrinsics are its own -- `Array` here is not the
+     * guest's `Array` -- because QuickJS gives each context its own set, while objects of one
+     * context are usable from another of the same runtime. That is the whole of what Node's
+     * cross-realm behaviour needs: a value the context made answers `false` to `instanceof Array`
+     * while `Array.isArray` still answers `true`, and one the caller put into the context is the
+     * caller's own object still.
      */
     realm?: QuickJSContext;
     /** `Object.prototype.toString` and `Array.isArray` of the guest realm, once: see {@link VmProbes}. */
@@ -42,6 +44,10 @@ interface VmHost {
     realmValues: QuickJSHandle[];
     /** Rebuilds the value a promise settles with, once per binding: see {@link promiseOf}. */
     rehomeFn?: QuickJSHandle;
+    /** The wrapper {@link REALM_EXEC_SRC} compiles to in {@link VmHost.realm}, once. */
+    execFn?: QuickJSHandle;
+    /** Hands a cell the realm's tracker built to `api.noteRejection`, once per binding. */
+    noteFn?: QuickJSHandle;
     /**
      * A `WeakMap` of the guest realm: the value a `vm` context handed back -> the twin it was
      * rebuilt as, so that what the context hands back twice comes back as one object.
@@ -130,6 +136,81 @@ const REALM_BUILTINS = ['AggregateError', 'Array', 'ArrayBuffer', 'Atomics', 'Bi
     'Reflect', 'RegExp', 'Set', 'SharedArrayBuffer', 'String', 'Symbol', 'SyntaxError', 'TypeError',
     'Uint16Array', 'Uint32Array', 'Uint8Array', 'Uint8ClampedArray', 'URIError', 'WeakMap',
     'WeakRef', 'WeakSet'];
+
+/** The ES globals of the second realm whose names the guest's `with` scope answers for. */
+const REALM_ES_NAMES = ['Infinity', 'NaN', 'undefined', 'eval', 'isFinite', 'isNaN', 'parseFloat',
+    'parseInt', 'encodeURI', 'encodeURIComponent', 'decodeURI', 'decodeURIComponent', 'escape',
+    'unescape'].concat(REALM_BUILTINS);
+
+/**
+ * The body a `vm` context's code runs under, compiled *inside* the second realm.
+ *
+ * A context used to run its code in the caller's own realm, with a `with` scope that handed the ES
+ * globals of that realm to it. No change to what the scope hands out can match host Node 24.15
+ * then: an array the caller puts into a context and an array the code of the context makes are the
+ * same kind of object there, so `e instanceof Array` and `[] instanceof Array` cannot come apart,
+ * and on the host they do (`false` and `true`). What separates them is the realm the code runs in,
+ * so the `with` scope is handed to a wrapper compiled in the second realm and the code is `eval`ed
+ * there: a value the context makes is of the second realm as it is made, one the caller put in is
+ * still the caller's, and both are handed back as they are.
+ *
+ * The names are the ones the scope's proxy leaves alone -- every other free name is the scope's to
+ * answer, so a parameter called `sb` would read as a sandbox property and not as the argument.
+ */
+const REALM_EXEC_SRC = '(function (__owcVmWith, __owcVmCode, __owcVmFns, __owcVmSb) {' +
+    'var __owcVmOut;' +
+    'try {' +
+    'with (__owcVmWith) { __owcVmOut = eval(__owcVmCode); }' +
+    '} finally {' +
+    'for (var __owcVmI = 0; __owcVmI < __owcVmFns.length; __owcVmI++) {' +
+    'try { __owcVmSb[__owcVmFns[__owcVmI]] = eval(__owcVmFns[__owcVmI]); }' +
+    'catch (__owcVmErr) {' +
+    'if (__owcVmSb[__owcVmFns[__owcVmI]] === undefined) delete __owcVmSb[__owcVmFns[__owcVmI]];' +
+    '}' +
+    '}' +
+    '}' +
+    'return __owcVmOut; })';
+
+/**
+ * The rejection tracker the second realm gets, so a promise a `vm` context leaves unhandled is
+ * still one the process reports.
+ *
+ * The realm has a `Promise` of its own -- it is a context -- so the tracker the guest installs
+ * never sees the rejections built inside one. This is that tracker's shape in the realm's own
+ * terms: every promise the realm builds goes through one subclass, and a rejection is handed to the
+ * guest's `api.noteRejection` as a cell, which is where every other rejection of the process waits
+ * to be reported. A handler attached later marks the cell handled, so only a rejection nothing
+ * handled is reported.
+ */
+const REALM_REJECTION_SRC = '(function (note) {' +
+    'var Native = Promise;' +
+    'var CELLS = new WeakMap();' +
+    'class Tracked extends Native {' +
+    'constructor(executor) {' +
+    'var cell = { reason: undefined, rejected: false, handled: false, promise: null, domain: null };' +
+    'super(function (resolve, reject) {' +
+    'var wrapped = function (reason) { cell.rejected = true; cell.reason = reason; note(cell); reject(reason); };' +
+    'try { executor(resolve, wrapped); } catch (err) { wrapped(err); }' +
+    '});' +
+    'CELLS.set(this, cell);' +
+    'cell.promise = this;' +
+    '}' +
+    '}' +
+    'Object.defineProperty(Native, Symbol.species, { get: function () { return Tracked; }, configurable: true });' +
+    '/* A promise of a context answers to the name Promise too: host node 24.15 reads Promise.name' +
+    '   and Promise.reject(x).constructor.name both as Promise. */' +
+    'Object.defineProperty(Tracked, "name", { value: "Promise", configurable: true });' +
+    'Object.defineProperty(globalThis, "Promise", { value: Tracked, writable: true, configurable: true });' +
+    'Object.defineProperty(Tracked, Symbol.hasInstance, { value: function (x) { return x instanceof Native; }, configurable: true });' +
+    'var nativeThen = Native.prototype.then;' +
+    'Native.prototype.then = function (onFulfilled, onRejected) {' +
+    'if (typeof onRejected === "function" || typeof onFulfilled === "function") {' +
+    'var cell = CELLS.get(this);' +
+    'if (cell !== undefined) cell.handled = true;' +
+    '}' +
+    'return nativeThen.call(this, onFulfilled, onRejected);' +
+    '};' +
+    '})';
 
 /** `Array.isArray`, `Object.prototype.toString`, `Object.getOwnPropertyNames` and `Object.prototype`, once. */
 interface VmProbes {
@@ -265,6 +346,22 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
         }
         host.rehomeFn = undefined;
     }
+    if (host.execFn !== undefined) {
+        try {
+            host.execFn.dispose();
+        } catch {
+            // as above
+        }
+        host.execFn = undefined;
+    }
+    if (host.noteFn !== undefined) {
+        try {
+            host.noteFn.dispose();
+        } catch {
+            // as above
+        }
+        host.noteFn = undefined;
+    }
     if (host.proxyTest !== undefined) {
         try {
             host.proxyTest.dispose();
@@ -336,14 +433,61 @@ function describeError(error: unknown): string {
     return String(error);
 }
 
-/** The second realm, made on the first value that has to cross, or undefined when it cannot be made. */
+/**
+ * The second realm, made on the first value that has to cross -- or on the first `vm` context that
+ * has to run -- or undefined when it cannot be made.
+ *
+ * A `vm` context's code runs here, so the realm is given the process's rejection tracker before
+ * anything runs in it: a promise the context leaves unhandled is otherwise one this process never
+ * hears about, where host Node 24.15 reports it.
+ */
 function realmOf(host: VmHost): QuickJSContext | undefined {
     if (host.realm !== undefined) return host.realm;
     try {
-        host.realm = host.runtime.newContext();
-        return host.realm;
+        const realm = host.runtime.newContext();
+        host.realm = realm;
+        installRejections(host, realm);
+        return realm;
     } catch {
         return undefined;
+    }
+}
+
+/**
+ * Gives a freshly made second realm the process's rejection tracker, whose cells are handed to the
+ * guest's `api.noteRejection`.
+ */
+function installRejections(host: VmHost, realm: QuickJSContext): void {
+    try {
+        const built = realm.evalCode(REALM_REJECTION_SRC);
+        if (built.error) {
+            built.error.dispose();
+            return;
+        }
+        const installer = realm.unwrapResult(built);
+        const note = host.context.newFunction('noteRejection', (cell) => {
+            try {
+                const fn = host.context.getProp(host.api, 'noteRejection');
+                if (host.context.typeof(fn) !== 'function') {
+                    fn.dispose();
+                    return host.context.undefined;
+                }
+                const result = host.context.callFunction(fn, host.api, [cell]);
+                fn.dispose();
+                if (result.error) result.error.dispose();
+                else result.value.dispose();
+            } catch {
+                // a rejection the tracker will not take is still not a reason to lose the run
+            }
+            return host.context.undefined;
+        });
+        host.noteFn = note;
+        const result = realm.callFunction(installer, realm.undefined, [note]);
+        installer.dispose();
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // a realm with an untracked Promise still runs the code of a context
     }
 }
 
@@ -1259,6 +1403,100 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
                must not read the reason as its own later */
             host.reason = undefined;
             thunk.dispose();
+        }
+    },
+
+    /**
+     * Runs the code of a `vm` context inside the second realm, with the `with` scope the guest built
+     * around its sandbox, and leaves what it answered at `api.vmOut` -- or what it threw at
+     * `api.vmThrow` with `{ ok: false }`.
+     *
+     * The code has to run there and not in the guest's own realm: see {@link REALM_EXEC_SRC}. The
+     * value comes back as it is, which is the whole point -- a value the context made is already of
+     * another realm, so `instanceof` reads false for it outside, and it is the very object the
+     * context made, so a value it hands back twice is one object.
+     */
+    'vm.exec': (_args, ctx) => {
+        const host = hosts.get(ctx);
+        if (!host) return { unbound: true };
+        const { context } = host;
+        const realm = realmOf(host);
+        if (realm === undefined) return { unbound: true };
+        if (host.execFn === undefined) {
+            const built = realm.evalCode(REALM_EXEC_SRC);
+            if (built.error) {
+                built.error.dispose();
+                return { unbound: true };
+            }
+            host.execFn = realm.unwrapResult(built);
+        }
+        const code = context.getProp(host.api, 'vmCode');
+        const scope = context.getProp(host.api, 'vmScope');
+        const fns = context.getProp(host.api, 'vmFns');
+        const sb = context.getProp(host.api, 'vmSb');
+        const self = context.getProp(host.api, 'vmSelf');
+        try {
+            const result = realm.callFunction(host.execFn, self, [scope, code, fns, sb]);
+            if (result.error) {
+                /* Whether the run was interrupted, which the guest cannot tell from the error alone:
+                   QuickJS raises an interruption as an uncatchable InternalError, but this call is a
+                   host boundary -- the throw the guest makes of what is handed back here is an
+                   ordinary one its own catch blocks do see, so a vm.run deadline that stopped a
+                   context would otherwise surface as that raw InternalError and not as the
+                   ERR_SCRIPT_EXECUTION_TIMEOUT host Node 24.15 raises in the context's realm. */
+                context.setProp(host.api, 'vmThrow', result.error);
+                result.error.dispose();
+                return { ok: false, fired: host.fired };
+            }
+            context.setProp(host.api, 'vmOut', result.value);
+            result.value.dispose();
+            return { ok: true };
+        } catch {
+            return { unbound: true };
+        } finally {
+            for (const handle of [code, scope, fns, sb, self]) {
+                try { handle.dispose(); } catch { /* already gone with its context */ }
+            }
+        }
+    },
+
+    /**
+     * Leaves the second realm's own ES globals at `api.vmEs`, under the names the guest's `with`
+     * scope answers for: the code of a `vm` context runs in that realm, so the `Array` its `[]` is
+     * an instance of has to be the realm's and not the caller's.
+     */
+    'vm.es': (_args, ctx) => {
+        const host = hosts.get(ctx);
+        if (!host) return { unbound: true };
+        const realm = realmOf(host);
+        if (realm === undefined) return { unbound: true };
+        try {
+            const built = realm.evalCode(
+                '(function (names) {' +
+                'var o = {};' +
+                'for (var i = 0; i < names.length; i++) {' +
+                'try { o[names[i]] = eval(names[i]); } catch (x) { }' +
+                '}' +
+                'return o; })'
+            );
+            if (built.error) {
+                built.error.dispose();
+                return { unbound: true };
+            }
+            const reader = realm.unwrapResult(built);
+            const names = realm.unwrapResult(realm.evalCode(JSON.stringify(REALM_ES_NAMES)));
+            const result = realm.callFunction(reader, realm.undefined, [names]);
+            names.dispose();
+            reader.dispose();
+            if (result.error) {
+                result.error.dispose();
+                return { unbound: true };
+            }
+            host.context.setProp(host.api, 'vmEs', result.value);
+            result.value.dispose();
+            return { built: true };
+        } catch {
+            return { unbound: true };
         }
     },
 
