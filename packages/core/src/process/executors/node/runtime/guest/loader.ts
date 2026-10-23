@@ -312,6 +312,16 @@ function makeRequire(mod) {
     if (!found) throw notFoundError(id, mod.path, mod);
     return found;
   };
+  /* resolve.paths: the folders a bare request is looked for in -- the module's own node_modules
+     chain followed by the global folders, and null for a built-in, which has none -- which is what
+     every CommonJS require here was missing, not only the one createRequire hands out.
+     row owc-module-export-table-incomplete. */
+  req.resolve.paths = function paths(request) {
+    if (typeof request !== 'string') {
+      throw new TypeError('The "request" argument must be of type string. Received ' + typeof request);
+    }
+    return Module._resolveLookupPaths(request, mod);
+  };
   req.cache = MODULE_CACHE;
   req.main = mainModule;
   req.extensions = EXTENSIONS;

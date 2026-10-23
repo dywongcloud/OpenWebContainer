@@ -2044,7 +2044,17 @@ BF.crypto = function () {
     /* Node renders a string the way util.inspect does, with its quotes on: "Received type string
        ('1')" for an offset handed in as text, which is not how a number is rendered. */
     if (kind === 'string') return "type string ('" + value + "')";
-    if (kind !== 'object' && kind !== 'function') return 'type ' + kind + ' (' + String(value) + ')';
+    /* A bigint keeps the suffix a script writes it with, and -0 keeps its sign: String() would
+       flatten both -- 10n to '10' and -0 to '0' -- where Node renders a value as it is written. */
+    if (kind === 'bigint') return 'type bigint (' + value.toString() + 'n)';
+    if (kind === 'number') return 'type number (' + (value === 0 && 1 / value < 0 ? '-0' : String(value)) + ')';
+    /* A function is named as one -- "Received function bar", and an anonymous one as "function "
+       with nothing after it, which is not how an instance of Function is described. */
+    if (kind === 'function') return 'function ' + (typeof value.name === 'string' ? value.name : '');
+    if (kind !== 'object') return 'type ' + kind + ' (' + String(value) + ')';
+    /* An object with no prototype has no constructor to name, so it is shown the way util.inspect
+       renders one -- "[Object: null prototype] {}" -- and not as an instance of Object. */
+    if (value.constructor === undefined) return requireBuiltin('util').inspect(value);
     var made = value.constructor;
     var named = made !== undefined && made !== null && typeof made.name === 'string' ? made.name : null;
     return named === null || named === '' ? 'an instance of Object' : 'an instance of ' + named;
@@ -2068,6 +2078,24 @@ BF.crypto = function () {
     var err = new TypeError('Invalid digest' + (name === undefined ? '' : ': ' + String(name)));
     err.code = 'ERR_CRYPTO_INVALID_DIGEST';
     return err;
+  }
+
+  /*
+   * The algorithm of a one-shot crypto.sign or crypto.verify, which Node checks before it reads
+   * anything else: a value that is neither a string nor null is an ERR_INVALID_ARG_TYPE, and a
+   * string naming no digest this runtime knows is an ERR_CRYPTO_INVALID_DIGEST. null and undefined
+   * are the one form that names no digest at all -- the raw signature a caller asks for -- so they
+   * pass through as null rather than being turned into the text 'null' or 'undefined'.
+   */
+  function algorithmOf(algorithm) {
+    if (algorithm === undefined || algorithm === null) return null;
+    if (typeof algorithm !== 'string') {
+      var err = new TypeError('The "algorithm" argument must be of type string. Received ' + receivedAs(algorithm));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    if (!digestKnown(algorithm)) throw invalidDigest(algorithm);
+    return algorithm;
   }
 
   /* Node renders the value with util.inspect, so a Buffer shows as <Buffer 00> -- and an empty
@@ -2694,11 +2722,12 @@ BF.crypto = function () {
   /* sign and verify without a streaming object: one call over the same capability. */
   function signOne(algorithm, data, key, callback) {
     /* Node names the arguments in the order it reads them: the data, then the key. */
+    var algo = algorithmOf(algorithm);
     var bytes = toBytes(data, undefined, 'data').toString('base64');
     if (key === undefined || key === null) throw noKeyToSign();
     var signature = Buf.from(cryptoCap('crypto.key.sign', {
       id: keyIdOf(key, 'private'),
-      algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
+      algorithm: algo,
       data: bytes,
       dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined,
       padding: key !== null && typeof key === 'object' ? key.padding : undefined,
@@ -2711,18 +2740,35 @@ BF.crypto = function () {
     return signature;
   }
 
+  /*
+   * The dsaEncoding, padding and saltLength a one-shot call reads off its key. The reads happen
+   * before the data and the signature are looked at, so a key that is missing fails here -- on
+   * the property read, the way Node's own code does -- rather than on a type check of its own.
+   */
+  function keyOptionsOf(key) {
+    /* The reads happen before the data and the signature are looked at, so a key that is missing
+       fails on the read -- Node's own code reads padding first, and its message names padding. */
+    var padding = key.padding;
+    var dsaEncoding = key.dsaEncoding;
+    var saltLength = key.saltLength;
+    return { dsaEncoding: dsaEncoding, padding: padding, saltLength: saltLength };
+  }
+
   function verifyOne(algorithm, data, key, signature, callback) {
-    /* The data, then the signature, then the key: crypto.verify() with nothing at all names data. */
+    var algo = algorithmOf(algorithm);
+    /* Node reads the key's own options before it looks at the data or the signature, so a key
+       that is not there fails on that read and not on a type check of its own. */
+    var opts = keyOptionsOf(key);
     var bytes = verifyDataBytes(data).toString('base64');
     var sig = signatureBytes(signature).toString('base64');
     var answer = cryptoCap('crypto.key.verify', {
       id: keyIdOf(key, 'public'),
-      algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
+      algorithm: algo,
       data: bytes,
       signature: sig,
-      dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined,
-      padding: key !== null && typeof key === 'object' ? key.padding : undefined,
-      saltLength: key !== null && typeof key === 'object' ? key.saltLength : undefined
+      dsaEncoding: opts.dsaEncoding,
+      padding: opts.padding,
+      saltLength: opts.saltLength
     }) === true;
     if (typeof callback === 'function') {
       queueMicrotask(function () { callback(null, answer); });
@@ -4962,23 +5008,34 @@ BF.module = function () {
      reader, wrap and wrapper the CommonJS source wrapper -- but none of the four stands in
      Object.keys(require('module')) or in the namespace of an 'await import' of node:module, which is
      why node's count is 31 where this one's was 29. The values stay: the loader calls _stat and
-     wrap itself, and only their enumerability is node's. */
-  var MODULE_HIDDEN_STATICS = ['_stat', '_readPackage', 'wrap', 'wrapper'];
-  for (var hiddenAt = 0; hiddenAt < MODULE_HIDDEN_STATICS.length; hiddenAt++) {
-    var hiddenStatic = MODULE_HIDDEN_STATICS[hiddenAt];
-    if (!Object.prototype.hasOwnProperty.call(Module, hiddenStatic)) continue;
-    Object.defineProperty(Module, hiddenStatic, {
-      value: Module[hiddenStatic],
-      writable: true,
+     wrap itself, and only their enumerability is node's.
+     Node keeps all four behind an accessor pair rather than behind a value, and it freezes the two
+     halves of the wrapper while leaving the two loader hooks open: wrap and wrapper are
+     configurable false there, _stat and _readPackage configurable true. An assignment lands through
+     the setter, as it does on a host -- what a caller sets is what the getter hands back.
+     row owc-module-export-table-incomplete. */
+  var MODULE_HIDDEN_STATICS = [['_stat', true], ['_readPackage', true], ['wrap', false], ['wrapper', false]];
+  function hideModuleStatic(owner, name, configurable) {
+    var held = owner[name];
+    Object.defineProperty(owner, name, {
+      get: function () { return held; },
+      set: function (value) { held = value; },
       enumerable: false,
-      configurable: true
+      configurable: configurable
     });
+  }
+  for (var hiddenAt = 0; hiddenAt < MODULE_HIDDEN_STATICS.length; hiddenAt++) {
+    var hiddenStatic = MODULE_HIDDEN_STATICS[hiddenAt][0];
+    if (!Object.prototype.hasOwnProperty.call(Module, hiddenStatic)) continue;
+    hideModuleStatic(Module, hiddenStatic, MODULE_HIDDEN_STATICS[hiddenAt][1]);
   }
   /* The compile cache is a V8 code cache written beside the modules node loads, and there is no
      code cache here: nothing is compiled to bytecode a later run could reuse. So the three entry
      points answer the way node's do when its own cache is off -- DISABLED, no directory, nothing
      to flush -- and the status is read off the frozen table above rather than written twice. */
-  Module.enableCompileCache = function enableCompileCache() {
+  /* The directory a caller names is one no cache can be written into, so the status stays DISABLED
+     whichever it is; the parameter is node's own arity, which is 1. */
+  Module.enableCompileCache = function enableCompileCache(cacheDir) {
     return { status: Module.constants.compileCacheStatus.DISABLED, directory: undefined };
   };
   Module.flushCompileCache = function flushCompileCache() { return undefined; };
@@ -4997,7 +5054,11 @@ BF.module = function () {
     err.code = 'ERR_UNSUPPORTED_RESOLVE_REQUEST';
     return err;
   }
-  Module.register = function register(specifier, parentURL, options) {
+  /* Node declares one parameter and reads the other two off its arguments -- the parent URL and the
+     options both default -- so a caller that reads register.length sees 1 there. */
+  Module.register = function register(specifier) {
+    var parentURL = arguments[1];
+    var options = arguments[2];
     var spec = typeof specifier === 'string' ? specifier : String(specifier);
     var base = typeof parentURL === 'string' && parentURL.length > 0 ? parentURL : 'data:';
     var resolved = '';
@@ -5028,7 +5089,10 @@ BF.module = function () {
      program with every type blanked out, which is what node's own .ts support compiles. It warns
      once, as node does, that the call is experimental. */
   var stripTypesWarned = false;
-  Module.stripTypeScriptTypes = function stripTypeScriptTypes(code, options) {
+  /* The options are read off the arguments for the same reason register's are: node declares the
+     code and nothing beside it, and its arity is 1. */
+  Module.stripTypeScriptTypes = function stripTypeScriptTypes(code) {
+    var options = arguments[1];
     if (typeof code !== 'string') {
       var badCode = new TypeError('The "code" argument must be of type string. Received '
         + receivedTypeOf(code));

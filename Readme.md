@@ -1603,8 +1603,8 @@ Rows this shard carried, each with its witness:
 - `owc-platform-gaps-round2` (retired, stale for 9 of the 11): the same batteries close guest
   `fetch`, the `WebSocket` global, `process.kill`, `inspector.Session.post('Runtime.evaluate')`,
   `vm.runInNewContext` realms, domain binding for promises, worker `Uint8Array` messages,
-  `readline` keypress and `repl` depth. `module.register` (still `undefined`) and `v8.serialize`
-  (still JSON text) survive and are recorded above.
+  `readline` keypress and `repl` depth. `module.register` (a function now, but the hooks it is
+  handed are never called) and `v8.serialize` (still JSON text) survive and are recorded above.
 - `owc-engine-quickjs-0.32` (retired, resolved): the pin is already `quickjs-emscripten` 0.32.0
   with `@jitl/quickjs-singlefile-browser-release-asyncify` 0.32.0, in `packages/core/package.json`
   and in the installed tree; the six teardown entries no longer assert and `sass` compiles; and
@@ -1642,3 +1642,43 @@ Re-judged in a later wave at HEAD `2a4e24f`, one case per process on both sides,
 - `owc-sr-web-stream-gaps` (measured, not fixed; fix site outside `modules/stream.ts`): three web-stream symptoms survive an isolated re-run at HEAD `2a4e24f`. (1) `stream.isReadable(new ReadableStream({ start(c) { c.close() } }))` is `false` on host Node 24.15 and `true` here -- the host reads its own `Symbol(nodejs.stream.readable)` flag, so a closed readable is `false`, one still readable is `true` and a web *writable* is `null`, while `streamIsReadable` here answers `true` for any web readable. (2) `stream/promises` `finished()` on a web stream rejects `TypeError: not a function` here, where the host settles from the stream's own `closed` promise: resolved for an already-drained readable, never settled for one with a queued chunk nobody read or for a writable nobody closed. (3) `Duplex.toWeb(d).writable.getWriter().write(Buffer.from('hi'))` reaches the node `PassThrough`'s own `'data'` listeners on the host (`"hi"`) and nothing here (`""`), because `Readable.toWeb` here subscribes an iterator at construction and drains the chunk before a later `'data'` listener is attached, while the host's leaves the stream paused until the web side pulls; `Writable.toWeb` alone and reading back through the returned readable both agree. All three need `runtime/guest/modules/web-streams.ts`: it exposes no `closed` promise and no readable state flag -- `util.inspect` prints `state: 'closed'`, but there is no such property and `Symbol(nodejs.stream.readable)` is absent -- so a faithful fix is a change to that file and not to `stream.ts`. Not engine-limited: bare QuickJS 0.32 has no `ReadableStream` or `WritableStream` at all (`typeof` is `'undefined'` in a bare `quickjs-emscripten` 0.32.0 context), so the whole behaviour is this container's own JavaScript. Re-measured at HEAD `9376836` against host Node 24.15: (3) no longer reproduces -- `Duplex.toWeb(d).writable.getWriter().write(Buffer.from('hi'))` now reaches the `PassThrough`'s own `'data'` listeners and prints `"hi"` on both sides -- while (1) and (2) still do, and four more of the same family were measured beside them: `stream.isWritable()` answers `true` for a web `WritableStream` that has been closed, aborted or errored, where the host answers `false` for all three and `isErrored()` `true` for the aborted and the errored one; `stream.isErrored()` on a web `ReadableStream` its controller errored is `false` here against the host's `true`; `stream.isDisturbed()` on one a reader has read, and on one drained to its end, is `false` here against the host's `true` for both. Every one of the six reads the single fact this container does not expose: the stream's own `state` slot (`'readable'`, `'closed'`, `'errored'`), which lives in `web-streams.ts`' private `SLOTS` WeakMap behind `slotsOf()` and is reachable from nowhere else -- and borrowing `getReader().closed` instead would not reproduce the host either, because the host's `finished()` does not lock the stream it waits on (`rs.locked` stays `false` after `await finished(rs)`, measured). Fix site unchanged: `runtime/guest/modules/web-streams.ts`.
 
 - `owc-esm-dynamic-import-compile-frames` (retired for the claim it names, one engine limit recorded): at HEAD `9c75c00`, one container boot per case against host Node 24.15, an entry of `await import('./dep.mjs')` over a duplicate `const` binding and over a duplicate `import` binding now prints node's own report end to end -- the file, the line, the source line, the caret, `SyntaxError: Identifier 'a' has already been declared`, and the two frames the row names, `at node:internal/modules/esm/loader:628:32` and `at TracingChannel.tracePromise (node:diagnostics_channel:362:14)` -- where it used to print `at ModuleJob.syncLink` and `at ModuleJob.link`; the two static controls match as well. What does not and cannot match is the wording of a parse error the engine itself raises: for `export const a = ;` the host prints `SyntaxError: Unexpected token ';'` and this container prints `SyntaxError: unexpected token in expression: ';'`, and the latter is bare QuickJS's own message -- a `quickjs-emscripten` 0.32.0 context with no container in the way, given that exact source as a module, answers `unexpected token in expression: ';'` -- so no guest-side code can change it. The same case also prints a two-line report under a dynamic import where the host prints fourteen lines; that half is not engine-limited and its fix site is `packages/core/src/process/executors/node/process.ts` (`esmCompileFrames`), which is outside this shard's grant.
+
+## The `module-events` shard, re-judged at HEAD `99cae36`: what is fixed, and what is recorded
+
+Host Node v24.15.0 against one fresh container per battery, each battery run twice and
+byte-identical across the two runs, stdout/stderr/exit on both sides (machine while measuring:
+load 5.7-7.9, 3.2 GB free -- never the 9-22 load / 170 MB band). Fixed here: an `inspector`
+session now fires one notification on both channels, so `session.on('Runtime.consoleAPICalled', fn)`
+hears what `session.on('inspectorNotification', fn)` always did; `Runtime.evaluate` answers `-32602`
+for a request with no expression and `-32000` for a context it never created, instead of evaluating
+both, and refuses a symbol under `returnByValue` as a host does; a `Date` by value is `{}` and not
+its ISO string; `events` carries `kMaxEventTargetListeners` and `kMaxEventTargetListenersWarned`
+(non-enumerable, worth symbols) so `Object.getOwnPropertyNames(require('events'))` is 22 as on a
+host, and `addAbortListener`'s listener is handed an event whose `target.reason` is the abort
+reason; `async_hooks.createHook({...}).enable()` hears the resources this runtime makes in
+JavaScript -- `init` for an `AsyncResource`, `before`/`after` around `runInAsyncScope`, `destroy`
+from `emitDestroy` on a later turn of the loop -- so `EventEmitterAsyncResource` is a real async
+resource and not a shell with plausible numbers; every CommonJS `require`, not only the one
+`createRequire` hands out, has a `resolve.paths`; and `Module._stat`, `_readPackage`, `wrap` and
+`wrapper` are accessor pairs with node's own configurability rather than plain data properties.
+
+Still measured and not fixed, each with its site: `Module.register` and `Module.registerHooks`
+accept hooks and never call them (`runtime/guest/misc.ts`), so a registered `load` hook changes
+nothing a program sees; 21 of the 72 `builtinModules` are not requirable though
+`Module.isBuiltin` answers `true` for them -- `assert/strict`, `trace_events`, `wasi`, `node:sea`,
+`node:sqlite`, `node:test`, `node:test/reporters` and the fourteen `_http_*`, `_stream_*` and
+`_tls_*` internals; the inspector domains a host answers (`Profiler.enable`, `HeapProfiler.enable`,
+`Network.enable`, `NodeRuntime.notifyWhenWaitingForDisconnect`, `Runtime.callFunctionOn`,
+`Debugger.enable`) still report `ERR_INSPECTOR_NOT_AVAILABLE`, a method of a known domain that does
+not exist there (`Runtime.noSuchMethod`) reports that instead of the host's `-32601`, and a
+circular object under `returnByValue` answers an `objectId` here where a host answers `Object
+reference chain is too long`; `async_hooks` sees nothing the engine itself would report -- the
+destroy of a timer, so the same battery counts 1 here against the host's 2 -- and QuickJS words a
+call of something that is not a function `not a function` where V8 words it `r.asyncId is not a
+function`; `fs.statSync`/`lstatSync` succeed for `plain.js/`, `plain.js/.`, `plain.js/./` and
+`plain.js/..` where a host answers `ENOTDIR`, and `readdirSync`, `opendirSync`, `rmdirSync`,
+`rmSync`, `truncateSync`, `linkSync`, `readlinkSync` and `mkdtempSync` answer `ENOENT` where it
+answers `ENOTDIR` -- the site is `runtime/guest/buffer-fs.ts`, outside this shard's grant, and it
+is named here rather than edited; `AbortSignal.timeout`'s timer keeps this process alive where a
+host's is unref'd and lets it exit; and no `MaxListenersExceededWarning` is ever emitted, so a
+host's stderr carries one for an eleventh listener and this one's is empty.

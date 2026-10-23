@@ -1107,6 +1107,7 @@ export const SRC = String.raw`
     if (typeof options === 'number') triggerId = options;
     else if (options && options.triggerAsyncId !== undefined) triggerId = options.triggerAsyncId;
     resourceStates.set(this, { type: type, asyncId: asyncIdCounter, triggerId: triggerId, frame: currentFrame });
+    asyncEmit('init', [asyncIdCounter, type, triggerId, this]);
   }
 
   AsyncResource.prototype.runInAsyncScope = function (fn, thisArg) {
@@ -1118,9 +1119,11 @@ export const SRC = String.raw`
     currentExecId = st.asyncId;
     currentTriggerId = st.triggerId;
     currentResource = this;
+    asyncEmit('before', [st.asyncId]);
     try {
       return runWithFrame(st.frame, fn, thisArg, args);
     } finally {
+      asyncEmit('after', [st.asyncId]);
       currentExecId = prevExec;
       currentTriggerId = prevTrigger;
       currentResource = prevResource;
@@ -1128,7 +1131,12 @@ export const SRC = String.raw`
   };
 
   AsyncResource.prototype.emitDestroy = function () {
-    resourceState(this);
+    var st = resourceState(this);
+    /* A host does not deliver a destroy while the call that reported it is still running: the
+       callback lands on a later turn of the loop, so a hook enabled and disabled either side of one
+       emitDestroy hears nothing at all. row owc-events-async-resource-missing. */
+    var destroyedId = st.asyncId;
+    globalThis.setTimeout(function () { asyncEmit('destroy', [destroyedId]); }, 0);
     return this;
   };
 
@@ -1175,12 +1183,39 @@ export const SRC = String.raw`
     return currentResource;
   }
 
-  function asyncCreateHook() {
+  /* A hook a caller enables is called for the async resources this runtime makes in JavaScript: an
+     AsyncResource a caller constructs, the scope it runs a function in and the destroy it reports
+     are node's own init, before, after and destroy, and they are calls node makes from its own code
+     rather than from its engine, so they can be made here too. What node's engine reports -- a
+     timer, a promise, a callback its event loop runs -- is not here at all, and no hook sees those.
+     row owc-events-async-resource-missing. */
+  var enabledAsyncHooks = [];
+  function asyncEmit(name, args) {
+    for (var at = 0; at < enabledAsyncHooks.length; at++) enabledAsyncHooks[at].emit(name, args);
+  }
+  var ASYNC_HOOK_NAMES = ['init', 'before', 'after', 'destroy', 'promiseResolve'];
+  function asyncCreateHook(callbacks) {
+    var given = callbacks === undefined || callbacks === null ? {} : callbacks;
+    for (var i = 0; i < ASYNC_HOOK_NAMES.length; i++) {
+      var fn = given[ASYNC_HOOK_NAMES[i]];
+      if (fn !== undefined && typeof fn !== 'function') {
+        throw invalidArgType(ASYNC_HOOK_NAMES[i], 'of type function', fn);
+      }
+    }
+    var entry = {
+      emit: function (name, args) {
+        var called = given[name];
+        if (typeof called === 'function') called.apply(undefined, args);
+      }
+    };
     var hook = {
       enable: function () {
+        if (enabledAsyncHooks.indexOf(entry) < 0) enabledAsyncHooks.push(entry);
         return hook;
       },
       disable: function () {
+        var at = enabledAsyncHooks.indexOf(entry);
+        if (at >= 0) enabledAsyncHooks.splice(at, 1);
         return hook;
       }
     };

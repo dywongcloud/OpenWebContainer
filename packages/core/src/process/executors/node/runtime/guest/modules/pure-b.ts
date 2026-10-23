@@ -1460,7 +1460,13 @@ export const SRC = String.raw`
 
     function notify(session, method, params) {
       try {
+        /* A host fires one notification on two channels: 'inspectorNotification' carries the
+           protocol's own envelope, and an event named after the method itself carries nothing but
+           its params -- which is the one a caller that writes
+           session.on('Runtime.consoleAPICalled', fn) is listening on, and which was the only channel
+           this runtime did not fire. row owc-inspector-returnbyvalue-notifications. */
         session.emit('inspectorNotification', { method: method, params: params });
+        session.emit(method, params);
       } catch (err) {
         // a listener that throws must not stop the program that wrote the line
       }
@@ -1640,11 +1646,16 @@ export const SRC = String.raw`
       if (kind === 'number' || kind === 'string' || kind === 'boolean' || kind === 'bigint'
         || kind === 'symbol') return remoteObjectOf(value);
       if (kind === 'function') return { type: 'function', value: {} };
+      var asJson;
       try {
-        return { type: 'object', value: JSON.parse(JSON.stringify(value)) };
+        asJson = JSON.parse(JSON.stringify(value));
       } catch (err) {
         return remoteObjectOf(value);
       }
+      /* A value whose JSON form is not an object at all -- a Date, which JSON writes as a string --
+         is one V8 hands back as the empty object rather than as that string. */
+      if (asJson === null || typeof asJson !== 'object') return { type: 'object', value: {} };
+      return { type: 'object', value: asJson };
     }
 
     /* The column an uncaught throw is attributed to is the column of its own throw keyword: a host
@@ -1713,9 +1724,20 @@ export const SRC = String.raw`
     }
 
     function evaluateForInspector(params, scriptId) {
-      var expression = params && typeof params.expression === 'string' ? params.expression : '';
-      var byValue = params && params.returnByValue === true;
-      var preview = params && params.generatePreview === true;
+      /* Two requests the protocol answers before it evaluates anything: one with no expression at
+         all, which is -32602, and one naming a context this runtime has not created, which is
+         -32000 -- a host does not quietly evaluate it in the only context there is.
+         row owc-inspector-returnbyvalue-notifications. */
+      if (params === undefined || params === null || typeof params.expression !== 'string') {
+        return { protocolError: nodeError(Error, 'ERR_INSPECTOR_COMMAND', 'Inspector error -32602: Invalid parameters') };
+      }
+      if (params.contextId !== undefined && params.contextId !== null && params.contextId !== 1) {
+        return { protocolError: nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+          'Inspector error -32000: Cannot find context with specified id') };
+      }
+      var expression = params.expression;
+      var byValue = params.returnByValue === true;
+      var preview = params.generatePreview === true;
       var evaluated;
       try {
         evaluated = (0, eval)(expression);
@@ -1733,6 +1755,12 @@ export const SRC = String.raw`
             scriptId: scriptId
           }
         };
+      }
+      /* A symbol has no JSON form at all, and a host refuses to hand one back by value: it answers
+         -32000 and no result, where this answered with a description of the symbol. */
+      if (byValue && typeof evaluated === 'symbol') {
+        return { protocolError: nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+          'Inspector error -32000: Object couldn\'t be returned by value') };
       }
       /* awaitPromise: a host settles the promise before it answers, so the result is the value the
          promise resolves to -- or the exceptionDetails of the value it rejects with -- and the
@@ -1796,6 +1824,12 @@ export const SRC = String.raw`
       if (!this._owcConnected) throw nodeError(Error, 'ERR_INSPECTOR_NOT_CONNECTED', 'Session is not connected');
       if (method === 'Runtime.evaluate') {
         var outcome = evaluateForInspector(params, nextScriptId());
+        /* A request the protocol refuses outright answers with the error alone: no result, and no
+           exceptionDetails, which is what distinguishes it from an expression that threw. */
+        if (outcome.protocolError !== undefined) {
+          deliver(callback, outcome.protocolError, undefined);
+          return undefined;
+        }
         if (outcome.thenable === undefined) {
           deliver(callback, null, outcome);
           return undefined;

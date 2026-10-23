@@ -873,19 +873,83 @@ BF.events = function () {
     if (value === null) return 'null';
     return 'type ' + typeof value + ' (' + String(value) + ')';
   }
+  /* Node's determineSpecificType: the tail ERR_INVALID_ARG_TYPE writes after "Received". */
+  function specificTypeOf(value) {
+    if (value === undefined) return 'undefined';
+    if (value === null) return 'null';
+    if (typeof value === 'function') return 'function ' + (value.name || '');
+    if (typeof value === 'object') {
+      var ctor = value.constructor;
+      if (ctor && ctor.name) return 'an instance of ' + ctor.name;
+      return String(value);
+    }
+    if (typeof value === 'string') {
+      /* inspect() quotes a string in single quotes unless it carries one of its own */
+      return 'type string (' + (value.indexOf("'") === -1 ? "'" + value + "'" : JSON.stringify(value)) + ')';
+    }
+    return 'type ' + typeof value + ' (' + String(value) + ')';
+  }
+  function invalidArgType(name, expected, value) {
+    var ofType = expected === 'object' || expected === 'string' || expected === 'function' ||
+      expected === 'number' || expected === 'boolean' || expected === 'symbol' || expected === 'bigint';
+    var err = new TypeError('The "' + name + (name.indexOf('.') === -1 ? '" argument must be ' : '" property must be ') +
+      (ofType ? 'of type ' + expected : 'an instance of ' + expected) + '. Received ' + specificTypeOf(value));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+  }
+  /*
+   * The error an aborted signal rejects with is not an Error.prototype object: Node's is an instance
+   * of a subclass -- getPrototypeOf(err) is that subclass's prototype and err.constructor.name is
+   * 'AbortError', while err instanceof Error still holds. 'name' and 'code' are own and enumerable
+   * and 'message' is not, which is what a host's own property list shows.
+   */
+  var ABORT_ERROR = (function () {
+    function AbortError(message) {
+      var err = new Error(message);
+      Object.setPrototypeOf(err, AbortError.prototype);
+      return err;
+    }
+    AbortError.prototype = Object.create(Error.prototype);
+    Object.defineProperty(AbortError.prototype, 'constructor', {
+      value: AbortError, writable: true, configurable: true
+    });
+    return AbortError;
+  })();
+  function isAbortSignalLike(signal) {
+    return typeof signal.addEventListener === 'function' &&
+      typeof signal.removeEventListener === 'function' && typeof signal.aborted === 'boolean';
+  }
   function abortErrorFor(signal) {
-    var err = new Error('The operation was aborted');
-    err.name = 'AbortError';
-    err.code = 'ABORT_ERR';
+    var err = ABORT_ERROR('The operation was aborted');
     try {
       var reason = signal === undefined || signal === null ? undefined : signal.reason;
       if (reason !== undefined) err.cause = reason;
     } catch (e) { /* a reason getter that throws is not the error's business */ }
+    err.code = 'ABORT_ERR';
+    err.name = 'AbortError';
     return err;
   }
   EventEmitter.once = function (emitter, name, options) {
+    /* Node reads options.signal first and validates it, then options, then the emitter: a caller
+       passing two bad arguments is told about the signal, not about the emitter. */
     var signal = options === undefined || options === null ? undefined : options.signal;
+    if (signal !== undefined && (signal === null || !isAbortSignalLike(signal))) {
+      return Promise.reject(invalidArgType('options.signal', 'AbortSignal', signal));
+    }
+    if (options !== undefined && (typeof options !== 'object' || options === null)) {
+      return Promise.reject(invalidArgType('options', 'object', options));
+    }
     return new Promise(function (resolve, reject) {
+      /* V8 words these two itself and QuickJS does not, so this module says them: a null emitter is
+         a property read that fails, and an emitter with an on but no once fails on the call. */
+      if (emitter === null || emitter === undefined) {
+        throw new TypeError("Cannot read properties of " + String(emitter) + " (reading 'on')");
+      }
+      if (typeof emitter.on !== 'function') {
+        reject(invalidArgType('emitter', 'EventEmitter', emitter));
+        return;
+      }
+      if (typeof emitter.once !== 'function') throw new TypeError('emitter.once is not a function');
       if (signal !== undefined && signal !== null && signal.aborted) {
         reject(abortErrorFor(signal));
         return;
@@ -993,6 +1057,23 @@ BF.events = function () {
    * inside an AsyncResource of its own, so async context survives an emit the way it does on a host.
    */
   EventEmitter.usingDomains = false;
+  /* The two names a host's events module carries beside usingDomains that Object.keys does not see:
+     the symbol keys its cap on the listeners of one event target is kept under. Both are data
+     properties worth a symbol and both are frozen -- writable, enumerable and configurable are
+     false -- so they stand in Object.getOwnPropertyNames, which is 22 on a host and was 20 here.
+     row owc-events-async-resource-missing. */
+  var EVENT_TARGET_CAP_NAMES = [
+    ['kMaxEventTargetListeners', 'events.maxEventTargetListeners'],
+    ['kMaxEventTargetListenersWarned', 'events.maxEventTargetListenersWarned']
+  ];
+  for (var capAt = 0; capAt < EVENT_TARGET_CAP_NAMES.length; capAt++) {
+    var capName = EVENT_TARGET_CAP_NAMES[capAt][0];
+    if (Object.prototype.hasOwnProperty.call(EventEmitter, capName)) continue;
+    Object.defineProperty(EventEmitter, capName, {
+      value: typeof Symbol === 'function' ? Symbol(EVENT_TARGET_CAP_NAMES[capAt][1]) : EVENT_TARGET_CAP_NAMES[capAt][1],
+      writable: false, enumerable: false, configurable: false
+    });
+  }
   EventEmitter.addAbortListener = function (signal, listener) {
     if (signal === undefined || signal === null || typeof signal.addEventListener !== 'function') {
       var bad = new TypeError('The "signal" argument must be an instance of AbortSignal. Received ' + receivedAs(signal));

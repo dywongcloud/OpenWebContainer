@@ -413,9 +413,24 @@ var SIGNAL_NUMBERS = {
   SIGINFO: 29, SIGSYS: 12
 };
 /* The names whose default action on a host is to be ignored: a process that sends one to itself
-   with nothing listening for it goes on running, and kill answers true. */
+   with nothing listening for it goes on running, and kill answers true. SIGTSTP, SIGTTIN and
+   SIGTTOU are in this set and not in the set below: a host node ignores all three outright, both
+   before a listener has ever been registered for them and after one has been taken away
+   (measured: exit 0 with the rest of the program running, against 146/149/150 here). */
 var IGNORED_SIGNALS = {
-  SIGPIPE: 1, SIGWINCH: 1, SIGCHLD: 1, SIGCONT: 1, SIGURG: 1, SIGXFSZ: 1, SIGIO: 1, SIGINFO: 1
+  SIGPIPE: 1, SIGWINCH: 1, SIGCHLD: 1, SIGCONT: 1, SIGURG: 1, SIGXFSZ: 1, SIGIO: 1, SIGINFO: 1,
+  SIGTSTP: 1, SIGTTIN: 1, SIGTTOU: 1
+};
+/* The names the operating system itself ignores, which is what is left once a listener that was
+   registered for one is taken away: node's removeListener closes the handle for the name and the
+   host's own disposition -- SIG_DFL -- comes back, not the one node started with. So SIGPIPE and
+   SIGXFSZ, which node ignores at startup, both end the process once a listener has been registered
+   for them and removed (measured 141 and 153), and SIGUSR1, whose default node replaces with the
+   inspector, ends it too (158, against exit 0 with 'Debugger listening' on stderr for a SIGUSR1 no
+   listener was ever registered for). */
+var DEFAULT_IGNORED_SIGNALS = {
+  SIGWINCH: 1, SIGCHLD: 1, SIGCONT: 1, SIGURG: 1, SIGIO: 1, SIGINFO: 1, SIGTSTP: 1, SIGTTIN: 1,
+  SIGTTOU: 1
 };
 function nameOfSignal(signal) {
   if (typeof signal === 'number') {
@@ -2326,7 +2341,10 @@ globalThis.crypto = nodeCrypto.webcrypto;
     st.reason = reason;
     var listeners = st.listeners;
     st.listeners = [];
-    listeners.forEach(function (fn) { fn({ type: 'abort' }); });
+    /* The event an abort hands its listeners names the signal as its target, which is how the
+       reason reaches them: events.addAbortListener's listener reads ev.target.reason, and a host
+       answers 'Error: boom' there where a listener handed no event at all saw nothing. */
+    listeners.forEach(function (fn) { fn({ type: 'abort', target: signal }); });
   }
   AbortSignal.abort = function abort(reason) {
     var signal = createSignal();
