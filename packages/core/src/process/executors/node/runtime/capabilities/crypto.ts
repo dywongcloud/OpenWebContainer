@@ -1451,7 +1451,12 @@ function encodeEcPrivateKey(key: KeyRecord, withParameters: boolean): Uint8Array
 }
 
 function exportJwk(key: KeyRecord): Record<string, unknown> {
-    if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
+    /* DSA, DH and 'rsa-pss' have no JWK form at all: an 'rsa-pss' key is an RSA key with a
+       restricted padding, and Node answers ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE for all three. */
+    if (key.kind === 'rsa-pss' || key.kind === 'dsa' || key.kind === 'dh') {
+        throw keyFail('ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE', 'Unsupported JWK Key Type.');
+    }
+    if (key.kind === 'rsa') {
         const ints = key.ints as IntKey;
         /* Node writes RSA as kty, n, e and then the private parts, and a caller that stringifies
            the export sees that order, so the keys are written in it here. */
@@ -1470,10 +1475,6 @@ function exportJwk(key: KeyRecord): Record<string, unknown> {
             jwk.qi = base64url(bytesOf(ints.qi as bigint, Math.ceil(size / 2)));
         }
         return jwk;
-    }
-    /* DSA and DH have no JWK form at all: Node answers ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE. */
-    if (key.kind === 'dsa' || key.kind === 'dh') {
-        throw keyFail('ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE', 'Unsupported JWK Key Type.');
     }
     if (key.kind === 'ec') {
         const curve = key.curve as EcCurve;
@@ -2040,7 +2041,7 @@ function rsaRawWith(key: KeyRecord, op: string, data: Uint8Array, padding: unkno
         : Number(padding);
     const exponent = (sealing ? ints.d : ints.e) as bigint;
     if (mode !== RSA_PKCS1_PADDING && mode !== RSA_PKCS1_OAEP_PADDING && mode !== RSA_NO_PADDING) {
-        throw keyFail('ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE', 'error:030000A6:digital envelope routines::illegal or unsupported padding mode');
+        throw keyFail('ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE', 'error:1C8000A5:Provider routines::illegal or unsupported padding mode');
     }
     if (op === 'private-encrypt' || op === 'public-encrypt') {
         let em: Uint8Array;
@@ -2076,32 +2077,45 @@ const bits2int = (digest: Uint8Array, bits: number): bigint => {
     return excess > 0 ? value >> BigInt(excess) : value;
 };
 
-/** DSA: r = (g^k mod p) mod q and s = k^-1 (z + x*r) mod q, written as a DER pair. */
-function dsaSignWith(ints: IntKey, digest: Uint8Array): Uint8Array {
+/** DSA: r = (g^k mod p) mod q and s = k^-1 (z + x*r) mod q, as a DER pair or as r||s. */
+function dsaSignWith(ints: IntKey, digest: Uint8Array, encoding: string): Uint8Array {
     const p = ints.p as bigint;
     const q = ints.q as bigint;
     const g = ints.g as bigint;
     const x = ints.x as bigint;
     const z = bits2int(digest, q.toString(2).length);
+    /* 'ieee-p1363' is r||s, each padded to q's own width; Node's default is the DER SEQUENCE. */
+    const size = Math.ceil(q.toString(2).length / 8);
     for (let attempt = 0; attempt < 100; attempt++) {
         const k = 1n + (bigOf(randomOf(Math.ceil(q.toString(2).length / 8))) % (q - 1n));
         const r = modPow(g, k, p) % q;
         if (r === 0n) continue;
         const s = (modInverse(k, q) * (z + x * r)) % q;
         if (s === 0n) continue;
+        if (encoding === 'ieee-p1363') return concatBytes(bytesOf(r, size), bytesOf(s, size));
         return derSequence([derIntegerBig(r), derIntegerBig(s)]);
     }
     throw keyFail('ERR_CRYPTO_INVALID_STATE', 'DSA signing failed');
 }
 
-function dsaVerifyWith(ints: IntKey, digest: Uint8Array, signature: Uint8Array): boolean {
+function dsaVerifyWith(ints: IntKey, digest: Uint8Array, signature: Uint8Array, encoding: string): boolean {
     try {
-        const root = derRead(signature);
-        if (root.tag !== DER_SEQUENCE || root.children.length !== 2) return false;
-        const r = intOf(root.children[0]);
-        const s = intOf(root.children[1]);
-        const p = ints.p as bigint;
         const q = ints.q as bigint;
+        let r: bigint;
+        let s: bigint;
+        if (encoding === 'ieee-p1363') {
+            /* A compact signature is exactly two halves of q's width; anything else is not one. */
+            const size = Math.ceil(q.toString(2).length / 8);
+            if (signature.length !== size * 2) return false;
+            r = bigOf(signature.subarray(0, size));
+            s = bigOf(signature.subarray(size));
+        } else {
+            const root = derRead(signature);
+            if (root.tag !== DER_SEQUENCE || root.children.length !== 2) return false;
+            r = intOf(root.children[0]);
+            s = intOf(root.children[1]);
+        }
+        const p = ints.p as bigint;
         const y = ints.y as bigint;
         if (r <= 0n || r >= q || s <= 0n || s >= q) return false;
         const w = modInverse(s, q);
@@ -2186,6 +2200,11 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         };
     }
     if (kind === 'ec') {
+        /* Node carries no default curve: an 'ec' pair has to name one, and it is a type error
+           naming 'options.namedCurve' when it does not. */
+        if (options?.namedCurve === undefined || options?.namedCurve === null) {
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.namedCurve" property must be of type string. Received ' + String(options?.namedCurve), 'TypeError');
+        }
         const curve = curveFor(options?.namedCurve ?? options?.curve ?? 'prime256v1');
         const priv = curve.curve.utils.randomPrivateKey();
         const pub = curve.curve.getPublicKey(priv, false);
@@ -2194,7 +2213,7 @@ function generatePair(type: unknown, options: any): { public: number; private: n
             private: storeKey({ type: 'private', kind: 'ec', curve, publicBytes: pub, privateBytes: priv })
         };
     }
-    throw keyFail('ERR_INVALID_ARG_VALUE', "The argument 'type' must be a supported key type. Received '" + String(type) + "'");
+    throw keyFail('ERR_INVALID_ARG_VALUE', "The argument 'type' must be a supported key type. Received '" + String(type) + "'", 'TypeError');
 }
 
 /** The kind of a key from the algorithm OID in its SPKI or PKCS#8 header. */
@@ -2405,18 +2424,35 @@ function dsaEncodingFor(value: unknown): 'der' | 'ieee-p1363' {
     return name;
 }
 
+/**
+ * The padding a sign or a verify runs under. Node reads the default off the key type: an
+ * 'rsa-pss' key is a PSS key, so a caller who names no padding gets PSS, and one who names
+ * PKCS#1 v1.5 is refused outright with OpenSSL's own words. A plain 'rsa' key defaults to v1.5
+ * and takes PSS when a caller asks for it.
+ */
+function rsaModeFor(padding: unknown, kind: string): number {
+    const named = padding === undefined || padding === null ? undefined : Number(padding);
+    if (kind === 'rsa-pss') {
+        if (named !== undefined && named !== RSA_PKCS1_PSS_PADDING) {
+            throw keyFail('ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE', 'error:1C8000A5:Provider routines::illegal or unsupported padding mode');
+        }
+        return RSA_PKCS1_PSS_PADDING;
+    }
+    return named === RSA_PKCS1_PSS_PADDING ? RSA_PKCS1_PSS_PADDING : RSA_PKCS1_PADDING;
+}
+
 function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown, fromSign = false): Uint8Array {
     const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type ' + key.type + ', expected private.', 'TypeError');
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
         const name = digestNameFor(algorithm);
         const spec = digestFor(name);
-        const mode = Number(padding) === RSA_PKCS1_PSS_PADDING ? RSA_PKCS1_PSS_PADDING : RSA_PKCS1_PADDING;
+        const mode = rsaModeFor(padding, key.kind);
         return rsaSignWith(key.ints as IntKey, spec.fn(data, 0), name, mode, pssSaltLength(saltLength, spec.out));
     }
     if (key.kind === 'dsa') {
         const name = digestNameFor(algorithm);
-        return dsaSignWith(key.ints as IntKey, digestFor(name).fn(data, 0));
+        return dsaSignWith(key.ints as IntKey, digestFor(name).fn(data, 0), encoding);
     }
     if (key.kind === 'dh') {
         throw keyFail('ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE', 'error:03000096:digital envelope routines::operation not supported for this keytype');
@@ -2461,14 +2497,14 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
         const name = digestNameFor(algorithm);
         const spec = DIGEST_SPECS[name];
         if (spec === undefined) return false;
-        const mode = Number(padding) === RSA_PKCS1_PSS_PADDING ? RSA_PKCS1_PSS_PADDING : RSA_PKCS1_PADDING;
+        const mode = rsaModeFor(padding, key.kind);
         /* A PSS check the caller named no salt length for is AUTO, which accepts any salt. */
         return rsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), name, signature, mode, saltLength === undefined || saltLength === null ? -2 : pssSaltLength(saltLength, spec.out));
     }
     if (key.kind === 'dsa') {
         const spec = DIGEST_SPECS[digestNameFor(algorithm)];
         if (spec === undefined) return false;
-        return dsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), signature);
+        return dsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), signature, encoding);
     }
     if (key.kind === 'dh') return false;
     const spec = EDWARDS[key.kind];
@@ -2705,13 +2741,25 @@ function primeOfBits(bits: number): bigint {
     if (bits > 4096) {
         throw dhFail('ERR_OUT_OF_RANGE', 'The value of "primeLength" is out of range. It must be >= 8 && <= 4096. Received ' + String(bits), 'RangeError');
     }
-    return randomPrime(bits);
+    /*
+     * A generated modulus is a safe prime, p = 2q+1 with q prime, which is what OpenSSL's own
+     * DH_generate_parameters writes and what makes DH_check report 0 for it. Node's DiffieHellman
+     * is refused a key pair when the check fails, so a plain prime would leave generateKeys()
+     * throwing 'Key generation failed' for every group this call made.
+     */
+    return 2n * searchPrime(bits - 1, { safe: true }) + 1n;
 }
 
 /** The generator: the caller's number or bytes, 2 when the caller names none (as Node defaults). */
 function generatorOf(value: unknown, asNumber: unknown): bigint {
     if (value === undefined || value === null) return 2n;
-    if (asNumber === true) return BigInt(Math.trunc(Number(value)));
+    if (asNumber === true) {
+        const g = BigInt(Math.trunc(Number(value)));
+        /* A generator of 1 generates nothing, and OpenSSL names it before it makes a group; a
+           zero is the 'no generator' Node reads as its own default of 2. */
+        if (g === 1n) throw dhFail('ERR_OSSL_DH_BAD_GENERATOR', 'error:02800065:Diffie-Hellman routines::bad generator');
+        return g < 2n ? 2n : g;
+    }
     if (typeof value === 'string') return bigOf(bytesArg(value));
     throw dhFail('ERR_INVALID_ARG_TYPE', 'The "generator" argument must be of type number, string, Buffer, TypedArray, or DataView.');
 }
@@ -2940,8 +2988,9 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     /** Args {bits, safe, bigint}: a fresh probable prime of that width, as base64 and as text. */
     'crypto.generatePrime': (args) => {
         const bits = Number(args?.bits);
-        if (!Number.isInteger(bits) || bits < 2) {
-            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "primeLength" is out of range. It must be >= 2. Received ' + String(args?.bits), 'RangeError');
+        /* Node names this argument "size", and bounds it by what an int32 can hold, not by two. */
+        if (!Number.isInteger(bits) || bits < 1 || bits > 2147483647) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "size" is out of range. It must be >= 1 && <= 2147483647. Received ' + String(args?.bits), 'RangeError');
         }
         const safe = args?.safe === true;
         for (let attempt = 0; attempt < 100000; attempt++) {
@@ -2986,6 +3035,12 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     /** Args {id}: the key pair this side uses; returns {public, private} as base64. */
     'crypto.dh.keys': (args) => {
         const state = dhFor(args?.id, 'dh.keys');
+        /* Node runs the group through DH_check before it makes a key pair from it and refuses
+           outright when the check names anything at all -- a modulus too small, one that is not
+           prime, one that is not a safe prime, or a generator that does not generate. */
+        if (dhVerifyError(state.prime, state.generator) !== 0) {
+            throw dhFail('ERR_CRYPTO_OPERATION_FAILED', 'Key generation failed');
+        }
         if (state.privateKey === undefined) {
             state.privateKey = randomExponent(state.prime);
             state.publicKey = modPow(state.generator, state.privateKey, state.prime);
