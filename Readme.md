@@ -285,6 +285,18 @@ the wall clock is a bridge turn, and it is movable. It is not the engine's byte 
 guest copies 16 MiB in 64 KiB blocks at 0.20 ns/byte against the host's 0.046, and concats 16 MiB at
 0.083 against 0.053 -- 1.6-4.5x, not the ~15x the HTTP/2 path shows.
 
+**Re-measured on a quieter machine, and the gap TCP and HTTP/1.1 are still said to have closed.**
+They have not. 16 MiB over loopback, server and client in one process, one write in flight, three
+container runs beside three host runs at machine load 9-12: TCP upload is 47.6-49.1 MiB/s here
+against the host's 800-1333, and HTTP/1.1 upload 40.3-46.0 against 571-1143 -- 17-21x at 64 KiB and
+16-27x at 1 MiB, and flat in chunk size here where the host scales with it. The gap is not the
+engine's byte work and not the 64 KiB piece size the hub delivers in -- host Node shows the same
+~262 `'data'` events per 16 MiB at every chunk size -- but one macrotask turn per delivery: a
+fixed count of 256 writes costs 0.215 ms per call at 1 KiB and 1.367 at 64 KiB, and the difference
+is 252 extra 64 KiB deliveries, which is 1.17 ms each, the guest's own `setImmediate` turn (1.1675 ms
+against the host's 0.02). The lower bound is a capability round trip with no payload, 0.145 ms here
+against the host's 0.004. That turn cost is filed as its own row rather than fixed here.
+
 ### 🚧 In Progress
 
 - **Network Simulation hardening**
