@@ -1,8 +1,0 @@
-id: owc-shell-diagnostic-line-position
-description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4b): 94 cases run against host /bin/sh (bash 3.2) and the container''s sh. 37 of them are equal on stdout, stderr and status and differ only in that a host puts the position in front of every diagnostic and the container does not -- a syntax error is "/bin/sh: -c: line 1: syntax error near unexpected token `;''\n/bin/sh: -c: line 1: `if; then''\n" against "syntax error near unexpected token `;''\n`if; then''\n", and a builtin''s is "/bin/sh: line 0: .: filename argument required" against "sh: .: filename argument required". The shell''s own name (`/bin/sh` against `sh`) is the difference the project records as known; the `-c: line N:` / `line N:` position is not, and a row named syntax-error-source-line cannot be closed while the line number is never compared. Fix site: the reporting of runParsed and the builtins'' `failLine`, packages/core/src/shell/commands/builtins.ts, which have the offending position in `error.at` but write no prefix.'
-owner: lanmower
-rule_bindings: []
-session_id: adv3-judge-shell-diag-4
-subject: no diagnostic carries the line a host's does
-witness_plan: 'Run `echo a\nif; then` on both sides; the container''s stderr must open with `sh: -c: line 1: ` on both of its lines.'
-status: pending
