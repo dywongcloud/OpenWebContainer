@@ -1404,20 +1404,48 @@ function urlGlobalOf(nodeUrl) {
    */
   var HEX_PAIR = /^[0-9A-Fa-f][0-9A-Fa-f]$/;
   var HEX_DIGIT = /^[0-9A-Fa-f]$/;
-  var FORBIDDEN_HOST = '\u0000 <>^|[]\\';
+  /*
+   * The forbidden host code points, whole: the NUL, the tab, the line feed and the carriage return,
+   * the space, and every one of '#' '/' ':' '<' '>' '?' '@' '[' '\' ']' '^' '|'. A host that holds
+   * any of them is no host at all -- which is what makes 'http://a%09b/' a URL that will not parse,
+   * since '%09' decodes to the tab the escape was written to hide.
+   */
+  var FORBIDDEN_HOST = '\u0000\u0009\u000a\u000d #/:<>?@[\\]^|';
 
   function forbiddenIn(text) {
     for (var i = 0; i < text.length; i++) if (FORBIDDEN_HOST.indexOf(text.charAt(i)) >= 0) return true;
     return false;
   }
 
+  /*
+   * A domain is IDNA, and IDNA refuses a control the forbidden set does not name -- a \u0001 or the
+   * DEL -- so 'http://a\u0001b/' is a URL that will not parse in Node. An opaque host, the host of
+   * a scheme that is not special, is not a domain and keeps them: 'foo://a\u0001b/' is the host
+   * 'a%01b'.
+   */
+  function controlIn(text) {
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      if (code <= 0x1f || code === 0x7f) return true;
+    }
+    return false;
+  }
+
+  /*
+   * An escape in a domain host is decoded, and a '%' that is not the start of one is a validation
+   * error that is no host at all: 'http://a%41/' is the host 'ha' and 'http://a%b/' is no URL.
+   * null is the failure, which the one caller reads as a host that will not parse.
+   */
   function percentDecode(text) {
     var out = '';
     for (var i = 0; i < text.length; i++) {
-      if (text.charAt(i) === '%' && i + 2 < text.length && HEX_PAIR.test(text.substr(i + 1, 2))) {
+      if (text.charAt(i) === '%') {
+        if (i + 2 >= text.length || !HEX_PAIR.test(text.substr(i + 1, 2))) return null;
         out += String.fromCharCode(parseInt(text.substr(i + 1, 2), 16));
         i += 2;
-      } else out += text.charAt(i);
+        continue;
+      }
+      out += text.charAt(i);
     }
     return out;
   }
@@ -1641,13 +1669,17 @@ function urlGlobalOf(nodeUrl) {
      */
     if (!special) return forbiddenIn(hostText) ? null : encodeOpaqueHost(hostText);
     /* an escape in a host is decoded, so 'h%41' is the host 'ha' */
-    var host = percentDecode(hostText).toLowerCase();
+    var decoded = percentDecode(hostText);
+    /* an escape that is no escape, and a '%' the decoding left behind -- which is what 'http://h%2541/'
+       carries once one pass has read it -- are each no host at all, as they are in Node */
+    if (decoded === null || decoded.indexOf('%') >= 0) return null;
+    var host = decoded.toLowerCase();
     /*
      * A byte no host may hold is read after the escapes are decoded, which is why
      * 'http://a%00b/' and 'http://a%20b/' are no URL at all: what the host holds is a NUL and a
      * space, and both are forbidden, though '%00' and '%20' as written carry neither.
      */
-    if (forbiddenIn(host)) return null;
+    if (forbiddenIn(host) || controlIn(host)) return null;
     if (special && host !== '' && endsInANumber(host)) {
       var address = ipv4AddressOf(host);
       return address === null ? null : ipv4TextOf(address);
@@ -1731,39 +1763,58 @@ function urlGlobalOf(nodeUrl) {
       }
       var authority = rest.slice(0, stop);
       rest = rest.slice(stop);
-      var at = authority.lastIndexOf('@');
-      var hostport = authority;
-      if (at >= 0) {
-        var userinfo = authority.slice(0, at);
-        hostport = authority.slice(at + 1);
-        var colon = userinfo.indexOf(':');
-        state.username = percentEncodeIn(colon >= 0 ? userinfo.slice(0, colon) : userinfo, USERINFO_EXTRA);
-        state.password = colon >= 0 ? percentEncodeIn(userinfo.slice(colon + 1), USERINFO_EXTRA) : '';
-      }
-      if (hostport.charAt(0) === '[') {
-        /* an IPv6 literal is one host, brackets and all: the ':' inside it is not a port */
-        var close = hostport.indexOf(']');
-        if (close < 0) throw invalidUrl(raw);
-        var after = hostport.slice(close + 1);
-        if (after !== '') {
-          if (after.charAt(0) !== ':') throw invalidUrl(raw);
-          state.port = portOf(after.slice(1), raw);
+      /*
+       * A file: URL names no userinfo and no port at all: the parser reads the authority as one
+       * host, the ':' of 'file://h:80/a' and the '@' of 'file://u@h/a' included, and both are bytes
+       * no host may hold -- which is why Node answers that neither is a URL.
+       */
+      if (protocol === 'file:') {
+        /*
+         * 'file://c:/a' and 'file://c|/a' name a Windows drive instead: no host, and a path whose
+         * first segment is the drive, so 'file://h:/a' is 'file:///h:/a' with the host ''.
+         */
+        if (/^[A-Za-z][:|]$/.test(authority)) rest = authority.charAt(0) + ':' + rest;
+        else {
+          var fileHost = hostNameOf(authority, protocol, special);
+          if (fileHost === null) throw invalidUrl(raw);
+          state.hostname = fileHost;
         }
-        var pieces = ipv6PiecesOf(hostport.slice(1, close));
-        if (pieces === null) throw invalidUrl(raw);
-        state.hostname = '[' + ipv6TextOf(pieces) + ']';
+        state.hasHost = true;
       } else {
-        var portAt = hostport.indexOf(':');
-        var hostText = portAt >= 0 ? hostport.slice(0, portAt) : hostport;
-        if (portAt >= 0) state.port = portOf(hostport.slice(portAt + 1), raw);
-        var named = hostNameOf(hostText, protocol, special);
-        if (named === null) throw invalidUrl(raw);
-        state.hostname = named;
+        var at = authority.lastIndexOf('@');
+        var hostport = authority;
+        if (at >= 0) {
+          var userinfo = authority.slice(0, at);
+          hostport = authority.slice(at + 1);
+          var colon = userinfo.indexOf(':');
+          state.username = percentEncodeIn(colon >= 0 ? userinfo.slice(0, colon) : userinfo, USERINFO_EXTRA);
+          state.password = colon >= 0 ? percentEncodeIn(userinfo.slice(colon + 1), USERINFO_EXTRA) : '';
+        }
+        if (hostport.charAt(0) === '[') {
+          /* an IPv6 literal is one host, brackets and all: the ':' inside it is not a port */
+          var close = hostport.indexOf(']');
+          if (close < 0) throw invalidUrl(raw);
+          var after = hostport.slice(close + 1);
+          if (after !== '') {
+            if (after.charAt(0) !== ':') throw invalidUrl(raw);
+            state.port = portOf(after.slice(1), raw);
+          }
+          var pieces = ipv6PiecesOf(hostport.slice(1, close));
+          if (pieces === null) throw invalidUrl(raw);
+          state.hostname = '[' + ipv6TextOf(pieces) + ']';
+        } else {
+          var portAt = hostport.indexOf(':');
+          var hostText = portAt >= 0 ? hostport.slice(0, portAt) : hostport;
+          if (portAt >= 0) state.port = portOf(hostport.slice(portAt + 1), raw);
+          var named = hostNameOf(hostText, protocol, special);
+          if (named === null) throw invalidUrl(raw);
+          state.hostname = named;
+        }
+        state.hasHost = true;
+        /* a special scheme that names no host is no URL at all -- except file:, which has none */
+        if (special && state.hostname === '' && protocol !== 'file:') throw invalidUrl(raw);
+        if (state.port !== '' && DEFAULT_PORTS[protocol] === state.port) state.port = '';
       }
-      state.hasHost = true;
-      /* a special scheme that names no host is no URL at all -- except file:, which has none */
-      if (special && state.hostname === '' && protocol !== 'file:') throw invalidUrl(raw);
-      if (state.port !== '' && DEFAULT_PORTS[protocol] === state.port) state.port = '';
     }
     var hashAt = rest.indexOf('#');
     if (hashAt >= 0) {
@@ -1834,11 +1885,30 @@ function urlGlobalOf(nodeUrl) {
   field('password', function () {
     return STATE.get(this).password;
   }, function (value) { STATE.get(this).password = percentEncodeIn(String(value), USERINFO_EXTRA); });
+  /*
+   * What a setter wrote, read the way the parser would read it: the tabs and the newlines go, and
+   * the host stops where the parser would stop reading one -- at a '/', a '?' or a '#', and at a
+   * '\' as well for a scheme that is special. Writing the hostname 'a/b' is the host 'a', then, and
+   * not a hostname that will not parse.
+   */
+  function hostWritten(value, special) {
+    var text = cleaned(value);
+    var stops = special ? '/?#' + String.fromCharCode(92) : '/?#';
+    var cut = text.length;
+    for (var i = 0; i < stops.length; i++) {
+      var found = text.indexOf(stops.charAt(i));
+      if (found >= 0 && found < cut) cut = found;
+    }
+    return text.slice(0, cut);
+  }
+
   field('hostname', function () {
     return STATE.get(this).hostname;
   }, function (value) {
     var state = STATE.get(this);
-    var named = hostNameOf(String(value), state.protocol, specialScheme(state.protocol));
+    /* as in the constructor, the tabs and newlines go before anything reads the host */
+    var named = hostNameOf(hostWritten(value, specialScheme(state.protocol)),
+      state.protocol, specialScheme(state.protocol));
     /* a value that is no host leaves the URL as it stands, as it does in Node */
     if (named === null) return;
     /* so does no host at all, for every scheme but file: and the schemes that are not special:
@@ -1846,11 +1916,19 @@ function urlGlobalOf(nodeUrl) {
     if (named === '' && refusesEmptyHost(state)) return;
     state.hostname = named;
   });
-  /* WHATWG: a port that is the scheme's own is not a port at all, so writing it leaves the port
-     empty -- http://h/ with port 80 written is still http://h/. */
-  function assignedPort(state, text, raw) {
-    var port = text === '' ? '' : portOf(text, raw);
-    return port !== '' && DEFAULT_PORTS[state.protocol] === port ? '' : port;
+  /*
+   * The port a setter writes, as the port state reads it: the digits at the front of the value and
+   * nothing behind them, because the state stops at the first byte that is no digit -- so '8 0' is
+   * the port 8 and '0x50' the port 0. A value with no digit at the front, or one whose digits pass
+   * 65535, is no port at all.
+   */
+  function writtenPort(text) {
+    var digits = /^[0-9]*/.exec(text)[0];
+    if (digits === '') return null;
+    var value = digits.replace(/^0+/, '');
+    if (value === '') value = '0';
+    if (Number(value) > 65535) return null;
+    return value;
   }
 
   field('port', function () {
@@ -1858,14 +1936,20 @@ function urlGlobalOf(nodeUrl) {
   }, function (value) {
     var state = STATE.get(this);
     var text = String(value);
-    state.port = assignedPort(state, text, state.protocol + '//' + state.hostname);
+    /* an empty string clears the port; a value that is no port leaves the one already there, which
+       is what Node does for '99999', for 'abc' and for '  8080  ' alike */
+    if (text === '') { state.port = ''; return; }
+    var port = writtenPort(text);
+    if (port === null) return;
+    state.port = port !== '' && DEFAULT_PORTS[state.protocol] === port ? '' : port;
   });
   field('host', function () {
     var state = STATE.get(this);
     return state.hostname + (state.port ? ':' + state.port : '');
   }, function (value) {
     var state = STATE.get(this);
-    var text = String(value);
+    /* as in the constructor, the tabs and newlines go before anything reads the host */
+    var text = hostWritten(value, specialScheme(state.protocol));
     /*
      * The port is what follows the last ':' outside a bracketed IPv6 literal -- '[::1]:8080' is one
      * host with the port 8080 behind it, and reading the first ':' instead would take '[' for the
@@ -1883,9 +1967,19 @@ function urlGlobalOf(nodeUrl) {
     /* a host that will not parse -- or, for every scheme but file: and the ones that are not
        special, no host at all -- leaves the URL as it stands, as it does in Node */
     if (named === null || (named === '' && refusesEmptyHost(state))) return;
-    var port;
-    /* a port that is no port leaves the whole assignment alone, 'h:abc' included */
-    try { port = assignedPort(state, portText, text); } catch (badPort) { return; }
+    var port = state.port;
+    /*
+     * A host and a port that will not part: the host is written whether the port beside it is one
+     * or not, and a port that is no port leaves the port already there -- 'http://x:8080/' written
+     * the host 'h:65536' is 'http://h:8080/', and written 'h:80' is 'http://h/' because 80 is the
+     * port http would have written anyway. No port at all, 'h' or 'h:', leaves it too.
+     */
+    if (portText !== '') {
+      var written = writtenPort(portText);
+      if (written !== null) {
+        port = written !== '' && DEFAULT_PORTS[state.protocol] === written ? '' : written;
+      }
+    }
     state.hostname = named;
     state.port = port;
   });

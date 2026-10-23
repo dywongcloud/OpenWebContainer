@@ -214,13 +214,32 @@ BF.url = function () {
       else if (b >= 0xe0 && b <= 0xef) { need = 2; cp = b & 0x0f; min = 0x800; }
       else if (b >= 0xf0 && b <= 0xf4) { need = 3; cp = b & 0x07; min = 0x10000; }
       else { out += '�'; i++; continue; }
+      /*
+       * The second byte of a sequence has a range of its own -- 'E0' takes A0..BF and 'ED' takes
+       * 80..9F, because the sequences either side of them would otherwise spell an overlong form or
+       * a surrogate -- and a byte outside it ends the sequence there.
+       */
+      var low2 = 0x80;
+      var high2 = 0xbf;
+      if (b === 0xe0) low2 = 0xa0;
+      else if (b === 0xed) high2 = 0x9f;
+      else if (b === 0xf0) low2 = 0x90;
+      else if (b === 0xf4) high2 = 0x8f;
       var ok = true;
+      var eaten = need;
       for (var j = 1; j <= need; j++) {
         var c = bytes[i + j];
-        if (c === undefined || (c & 0xc0) !== 0x80) { ok = false; break; }
+        if (c === undefined) { ok = false; eaten = j; break; }
+        if (c < (j === 1 ? low2 : 0x80) || c > (j === 1 ? high2 : 0xbf)) { ok = false; eaten = j; break; }
         cp = (cp << 6) | (c & 0x3f);
       }
-      if (!ok || cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) { out += '�'; i++; continue; }
+      /*
+       * A sequence that will not finish is one U+FFFD and no more, and the byte that ended it is
+       * read again as the start of the next one: 'a=%E0%A4%A' is the value '�' + 'A' and not
+       * the two replacements the bytes of the broken sequence would each be.
+       */
+      if (!ok) { out += '�'; i += eaten; continue; }
+      if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) { out += '�'; i += need + 1; continue; }
       out += String.fromCodePoint(cp);
       i += need + 1;
     }
@@ -774,9 +793,65 @@ BF.url = function () {
     return out.join('.');
   }
 
+  /*
+   * IDNA refuses what a browser would draw as nothing at all or as a break: the controls, the C1
+   * block and every space separator -- the no-break space and the U+2000 run among them -- so a
+   * domain carrying one is the empty string, as it is in Node. The whole of IDNA's derived-property
+   * table, which is what tells 'a᠆b' from 'a٠b', is beyond this file: it is the one
+   * reading of a domain that is still not Node's own.
+   */
+  /* '/', '?', '#' and the backslash: the four bytes that end the host of a URL, and so the domain */
+  var TEXT_STOP = '/?#' + String.fromCharCode(92);
+
+  function idnaSpaceCode(code) {
+    return code === 0x20 || code === 0xa0 || code === 0x1680 ||
+      (code >= 0x2000 && code <= 0x200a) ||
+      code === 0x2028 || code === 0x2029 || code === 0x202f || code === 0x205f || code === 0x3000;
+  }
+
+  function idnaDisallowedIn(text) {
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      if (code <= 0x20 || (code >= 0x7f && code <= 0x9f) || idnaSpaceCode(code)) return true;
+    }
+    return false;
+  }
+
   function domainToASCII(domain) {
     var text = String(domain);
     if (text === '') return '';
+    /*
+     * Node reads a domain the way it would read the host of 'http://' written in front of it: a
+     * '/', '?', '#' or '\' ends it -- 'x/y/z' is the domain 'x' -- and a ':' or an '@', which beside
+     * a real host would name a port or a userinfo, is no domain at all.
+     */
+    var cut = text.length;
+    for (var s = 0; s < 4; s++) {
+      var found = text.indexOf(TEXT_STOP.charAt(s));
+      if (found >= 0 && found < cut) cut = found;
+    }
+    if (cut >= 0 && cut < text.length) text = text.slice(0, cut);
+    if (text.indexOf(':') >= 0 || text.indexOf('@') >= 0) return '';
+    /*
+     * An escape is decoded, as the parser decodes one -- '%41' is the domain 'a' -- and a '%' that
+     * is not the start of an escape, or one the decoding left behind, is no domain: 'a%b' and
+     * 'a%2541' are both the empty string.
+     */
+    var decoded = '';
+    for (var p = 0; p < text.length; p++) {
+      if (text.charAt(p) === '%') {
+        if (p + 2 >= text.length || !isHexPair(text, p + 1)) return '';
+        decoded += String.fromCharCode(parseInt(text.substr(p + 1, 2), 16));
+        p += 2;
+        continue;
+      }
+      decoded += text.charAt(p);
+    }
+    if (decoded.indexOf('%') >= 0) return '';
+    text = decoded;
+    /* the tab, the line feed and the carriage return are mapped to nothing, as UTS-46 maps them */
+    text = text.replace(/[\t\n\r]/g, '');
+    if (idnaDisallowedIn(text)) return '';
     /* Node reads a domain that is a number as the address it names: 123 is '0.0.0.123', and one
        too large for an address is no domain at all, which is the empty string. */
     if (looksIpv4(text)) {
@@ -1857,23 +1932,26 @@ BF.url = function () {
     Object.defineProperty(URLPattern.prototype, 'constructor', patternCtor);
   }
 
-  var urlModule = {
-    URL: URL,
-    /* Node's legacy constructor, still on the module beside the WHATWG class */
-    Url: Url,
-    URLPattern: URLPattern,
-    URLSearchParams: URLSearchParams,
-    domainToASCII: domainToASCII,
-    domainToUnicode: domainToUnicode,
-    fileURLToPath: fileURLToPath,
-    fileURLToPathBuffer: fileURLToPathBuffer,
-    format: formatUrlExport,
-    parse: parseLegacy,
-    pathToFileURL: pathToFileURL,
-    resolve: resolveLegacy,
-    resolveObject: resolveObjectLegacy,
-    urlToHttpOptions: urlToHttpOptions
-  };
+  /*
+   * The names in the order Node hands them back: Object.keys(require('url')) walks the legacy
+   * parser first, then the WHATWG parts, then the helpers -- not the alphabetical order an object
+   * literal is written in would give.
+   */
+  var urlModule = {};
+  urlModule.Url = Url;
+  urlModule.parse = parseLegacy;
+  urlModule.resolve = resolveLegacy;
+  urlModule.resolveObject = resolveObjectLegacy;
+  urlModule.format = formatUrlExport;
+  urlModule.URL = URL;
+  urlModule.URLPattern = URLPattern;
+  urlModule.URLSearchParams = URLSearchParams;
+  urlModule.domainToASCII = domainToASCII;
+  urlModule.domainToUnicode = domainToUnicode;
+  urlModule.pathToFileURL = pathToFileURL;
+  urlModule.fileURLToPath = fileURLToPath;
+  urlModule.fileURLToPathBuffer = fileURLToPathBuffer;
+  urlModule.urlToHttpOptions = urlToHttpOptions;
   return urlModule;
 };
 
