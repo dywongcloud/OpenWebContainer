@@ -1516,6 +1516,10 @@ export const SRC = String.raw`
     TextEncoderStream: TextEncoderStream,
     TextDecoderStream: TextDecoderStream
   };
+  /* The two compression streams: node's 'stream/web' exports them, and globals.ts installs the
+     same two on the global object before this runs. */
+  if (typeof CompressionStream === 'function') exported.CompressionStream = CompressionStream;
+  if (typeof DecompressionStream === 'function') exported.DecompressionStream = DecompressionStream;
   Object.keys(exported).forEach(function (name) {
     var ctor = exported[name];
     if (ctor.prototype && !Object.prototype.hasOwnProperty.call(ctor.prototype, Symbol.toStringTag)) {
