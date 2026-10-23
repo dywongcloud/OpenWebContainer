@@ -735,13 +735,20 @@ const REJECTION_TRACKER_SRC = String.raw`
   /* A promise the engine built itself is still a Promise to code that asks one */
   Object.defineProperty(Tracked, Symbol.hasInstance, { value: function (x) { return x instanceof Native; }, configurable: true });
 
+  var HANDLED_LATE = [];
   var nativeThen = Native.prototype.then;
   Native.prototype.then = function (onFulfilled, onRejected) {
     /* a rejection handler on this promise, or a handler that forwards the rejection to the promise
        then returns, means the rejection is not left unhandled */
     if (typeof onRejected === 'function' || typeof onFulfilled === 'function') {
       var cell = CELLS.get(this);
-      if (cell !== undefined) cell.handled = true;
+      if (cell !== undefined) {
+        /* A handler attached only after the rejection was already reported as unhandled is what
+           node answers with a 'rejectionHandled' event; one attached in the same tick, before
+           the report, is answered with nothing at all -- measured on host node 24.15. */
+        if (cell.rejected && !cell.handled && cell.unhandled) HANDLED_LATE.push(cell.promise);
+        cell.handled = true;
+      }
     }
     return nativeThen.call(this, onFulfilled, onRejected);
   };
@@ -753,18 +760,81 @@ const REJECTION_TRACKER_SRC = String.raw`
     return 0;
   }
 
+  /* What host node 24.15 raises for a rejection whose reason is not an Error: an
+     UnhandledPromiseRejection of its own, whose message quotes the reason. A string is quoted
+     bare, a number, null and undefined are what they stringify to, and an object is '#<Object>'.
+     A reason that is an Error is raised as it is. */
+  function quoteUnhandledReason(reason) {
+    if (typeof reason === 'string') return reason;
+    if (reason !== null && typeof reason === 'object') return '#<Object>';
+    return String(reason);
+  }
+  class UnhandledPromiseRejection extends Error {
+    constructor(reason) {
+      super('This error originated either by throwing inside of an async function without a catch block, '
+        + 'or by rejecting a promise which was not handled with .catch(). The promise rejected with '
+        + 'the reason "' + quoteUnhandledReason(reason) + '".');
+      this.name = 'UnhandledPromiseRejection';
+      this.code = 'ERR_UNHANDLED_REJECTION';
+    }
+  }
+  /* An error of the second realm -- what the code of a vm context makes, and what a context
+     leaves unhandled -- is not an Error of this one, so the formatter that asks
+     (err instanceof Error) would answer with an inspection of it and none of its frames. Host
+     node 24.15 prints the stack of a rejection whatever realm its reason is of, so a reason that
+     is tagged [object Error] and is not one of this realm is handed to the formatter as an error
+     of this realm wearing the other's name, message and frames. */
+  function reasonOf(err) {
+    if (err instanceof Error) return api.formatUncaught(err);
+    if (err === null || (typeof err !== 'object' && typeof err !== 'function')) return api.formatUncaught(err);
+    if (Object.prototype.toString.call(err) !== '[object Error]') return api.formatUncaught(err);
+    var twin = new Error(typeof err.message === 'string' ? err.message : '');
+    try {
+      if (typeof err.name === 'string' && err.name !== '') twin.name = err.name;
+      if (typeof err.stack === 'string') twin.stack = err.stack;
+    } catch (inner) {
+      // a reason whose name or frames will not be read is still the reason
+    }
+    return api.formatUncaught(twin);
+  }
+
   /* A rejection nothing handled goes to the domain that owns the promise, and only when no domain
      owns it to an unhandledRejection listener on process, and only with neither of those to an
      uncaughtException one, and only then ends the process: the formatted reason of the first one
      that reaches that point, or '' when none does. */
   api.takeUnhandledRejection = function () {
+    var proc = globalThis.process;
+    /* Node reads a rejection that was reported unhandled and only afterwards caught -- a
+       'rejectionHandled' event, one per promise, read before it reports any new unhandled one --
+       and a program that counts them counts one that this container never emitted at all. */
+    while (HANDLED_LATE.length > 0) proc.emit('rejectionHandled', HANDLED_LATE.shift());
     var found = [];
     for (var i = 0; i < WATCHED.length; i++) {
       if (!WATCHED[i].handled) found.push(WATCHED[i]);
     }
     WATCHED = [];
     if (found.length === 0) return '';
-    var proc = globalThis.process;
+    /* the formatted reason of the first rejection that reaches the end of the road */
+    var report = '';
+    /* What Node does with a rejection no 'unhandledRejection' listener took: it raises it as an
+       uncaught exception. That goes first to the callback a caller recorded with
+       setUncaughtExceptionCaptureCallback -- host node 24.15 hands a rejection there and runs on,
+       and an 'uncaughtException' listener never sees it -- and only then to an
+       'uncaughtException' listener, and only with neither does it end the process. */
+    function raiseAsUncaught(reason, origin) {
+      var err = reason instanceof Error ? reason : new UnhandledPromiseRejection(reason);
+      if (typeof api.captureUncaught === 'function' && api.captureUncaught(err)) return;
+      /* With no 'uncaughtException' listener Node does not drop the rejection either, it is this
+         listener's chance to handle it: it is given the reason with the origin Node passes, and
+         the process goes on running. Measured on host node 24.15: Promise.reject(new Error('rej'))
+         with only an 'uncaughtException' listener prints UNCAUGHT=rej, runs a timer queued after
+         the rejection and exits 0, where this container ended with 1 and nothing on stdout. */
+      if (listenerCountOf(proc, 'uncaughtException') > 0) {
+        proc.emit('uncaughtException', err, origin);
+        return;
+      }
+      report = reasonOf(err);
+    }
     for (var j = 0; j < found.length; j++) {
       var cell = found[j];
       /*
@@ -780,47 +850,29 @@ const REJECTION_TRACKER_SRC = String.raw`
        * does not go through Domain.prototype._errorHandler.
        */
       var dom = cell.domain;
+      /* it has been reported as unhandled, so a handler attached from here on is a late one */
+      cell.unhandled = true;
       if (dom !== null && dom !== undefined) {
         dom.emit('error', cell.reason);
         continue;
       }
       if (listenerCountOf(proc, 'unhandledRejection') > 0) {
-        proc.emit('unhandledRejection', cell.reason, cell.promise);
-        continue;
-      }
-      /* With no 'unhandledRejection' listener Node does not drop the rejection, it raises it as an
-         uncaught exception, and that is a second listener's chance to handle it: an
-         'uncaughtException' listener is given the reason with the origin Node passes for a
-         rejection, and the process goes on running. Only with neither listener does the rejection
-         end it. Measured on host node 24.15: Promise.reject(new Error('rej')) with only an
-         'uncaughtException' listener prints UNCAUGHT=rej, runs a timer queued after the rejection
-         and exits 0, where this container ended with 1 and nothing on stdout. */
-      if (listenerCountOf(proc, 'uncaughtException') > 0) {
-        proc.emit('uncaughtException', cell.reason, 'unhandledRejection');
-        continue;
-      }
-      /* An error of the second realm -- what the code of a vm context makes, and what a context
-         leaves unhandled -- is not an Error of this one, so the formatter that asks
-         (err instanceof Error) would answer with an inspection of it and none of its frames. Host
-         node 24.15 prints the stack of a rejection whatever realm its reason is of, so a reason that
-         is tagged [object Error] and is not one of this realm is handed to the formatter as an error
-         of this realm wearing the other's name, message and frames. */
-      function reasonOf(err) {
-        if (err instanceof Error) return api.formatUncaught(err);
-        if (err === null || (typeof err !== 'object' && typeof err !== 'function')) return api.formatUncaught(err);
-        if (Object.prototype.toString.call(err) !== '[object Error]') return api.formatUncaught(err);
-        var twin = new Error(typeof err.message === 'string' ? err.message : '');
         try {
-          if (typeof err.name === 'string' && err.name !== '') twin.name = err.name;
-          if (typeof err.stack === 'string') twin.stack = err.stack;
-        } catch (inner) {
-          // a reason whose name or frames will not be read is still the reason
+          proc.emit('unhandledRejection', cell.reason, cell.promise);
+        } catch (thrown) {
+          /* A listener that throws does not end the run: Node raises what it threw as an uncaught
+             exception of its own -- its origin is 'uncaughtException', not the rejection's -- and
+             goes on. Measured on host node 24.15: UR=rej, then UC=ur-threw
+             origin=uncaughtException, then a queued timer, exit 0; this container ended the run,
+             exit 1, and never reached the timer. */
+          raiseAsUncaught(thrown, 'uncaughtException');
         }
-        return api.formatUncaught(twin);
+        continue;
       }
-      return reasonOf(cell.reason);
+      raiseAsUncaught(cell.reason, 'unhandledRejection');
+      if (report !== '') return report;
     }
-    return '';
+    return report;
   };
 
   /* A rejection of the second realm: the code of a vm context runs there, and that realm has a

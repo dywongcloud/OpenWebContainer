@@ -11,10 +11,12 @@
  *   lenient percent-decoding fallback, Node's per-chunk StringDecoder output and the
  *   punycode 2.1.0 source that Node bundles.
  * - AsyncLocalStorage propagates the store through synchronous calls, through promise
- *   reactions (Promise.prototype.then, which also covers catch, finally,
- *   queueMicrotask and process.nextTick) and through AsyncResource scopes. It does
- *   NOT propagate through await continuations, timers, or host callbacks, because the
- *   runtime has no engine hook for those.
+ *   reactions (Promise.prototype.then, which also covers catch, finally, queueMicrotask
+ *   and process.nextTick), through the container's own timers and immediates, and through
+ *   AsyncResource scopes. It does NOT propagate through await continuations, because the
+ *   engine unwinds the stack before it calls then for the suspension, so the continuation
+ *   runs in a job of its own with no frame to inherit -- measured on host node 24.15, which
+ *   keeps the store across every await.
  * - v8.serialize/deserialize use a JSON tagged encoding (owc-v8-json, version 1), not
  *   V8's wire format. Round trips cover the Node structured-clone types and cycles.
  * - Heap, code and event-loop statistics are fixed placeholders: the runtime measures
@@ -983,15 +985,6 @@ export const SRC = String.raw`
     return next;
   }
 
-  function frameWithout(frame, id) {
-    var next = Object.create(null);
-    var keys = Object.keys(frame);
-    for (var i = 0; i < keys.length; i++) {
-      if (keys[i] !== String(id)) next[keys[i]] = frame[keys[i]];
-    }
-    return next;
-  }
-
   function runWithFrame(frame, fn, thisArg, args) {
     var prev = currentFrame;
     currentFrame = frame;
@@ -1049,7 +1042,12 @@ export const SRC = String.raw`
 
   AsyncLocalStorage.prototype.getStore = function () {
     var st = alsState(this);
-    if (!st.enabled || currentFrame === null) return undefined;
+    /* The frame is the answer, not the flag: host node 24.15 reads the store a callback was
+       scheduled with even after a disable() that happened once the run had been left -- the
+       frame that disable cleared is the one outside, and the one the callback carries still
+       holds the store. Gating on the flag alone answered undefined for a nextTick and a timer
+       both of which node still reads A from. */
+    if (currentFrame === null) return undefined;
     var entry = currentFrame[st.id];
     return entry === undefined ? undefined : entry.store;
   };
@@ -1063,7 +1061,13 @@ export const SRC = String.raw`
 
   AsyncLocalStorage.prototype.disable = function () {
     var st = alsState(this);
-    if (currentFrame !== null && currentFrame[st.id] !== undefined) currentFrame = frameWithout(currentFrame, st.id);
+    /* The store comes out of the frame that is current, which is the frame a callback scheduled
+       before this shares, so it is that callback which stops seeing it: measured on host node
+       24.15, a disable() inside s.run leaves a nextTick and a timer queued before it both
+       reading undefined, while the same disable() once the run has been left -- whose frame never
+       held the store -- leaves both reading A. Rebinding the frame instead of emptying it left
+       the second case answering undefined. */
+    if (currentFrame !== null) delete currentFrame[st.id];
     st.enabled = false;
   };
 

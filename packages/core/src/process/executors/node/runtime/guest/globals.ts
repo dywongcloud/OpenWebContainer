@@ -433,18 +433,76 @@ function unknownSignalFor(signal) {
   bad.code = 'ERR_UNKNOWN_SIGNAL';
   return bad;
 }
+/* Node's own refusal of a pid it cannot signal, out of its argument checker: the words are the
+   ones it writes for the value it was given, and the code is the one its TypeError carries. A pid
+   that is not a number but becomes one -- a numeric string, a boolean, an empty array -- is the
+   pid that string names, which is what makes process.kill('123', 0) an EPERM and not a refusal. */
+function describePid(pid) {
+  if (pid === undefined) return 'undefined';
+  if (pid === null) return 'null';
+  if (typeof pid === 'number') return 'type number (' + String(pid) + ')';
+  if (typeof pid === 'string') return "type string ('" + pid + "')";
+  var ctor = pid === null || pid === undefined ? undefined : pid.constructor;
+  if (ctor !== undefined && ctor !== null && typeof ctor.name === 'string' && ctor.name !== '') {
+    return 'an instance of ' + ctor.name;
+  }
+  return 'an instance of Object';
+}
+function badPidFor(pid) {
+  var bad = new TypeError('The "pid" argument must be of type number. Received ' + describePid(pid));
+  bad.code = 'ERR_INVALID_ARG_TYPE';
+  return bad;
+}
+function pidOf(pid) {
+  if (typeof pid === 'number') {
+    if (pid !== pid || pid % 1 !== 0) throw badPidFor(pid);
+    return pid;
+  }
+  if (typeof pid === 'boolean') return pid ? 1 : 0;
+  if (typeof pid === 'string') {
+    if (pid === '') return 0;
+    var n = Number(pid);
+    if (n !== n || n % 1 !== 0) throw badPidFor(pid);
+    return n;
+  }
+  if (Array.isArray(pid)) {
+    var m = Number(pid);
+    if (m !== m || m % 1 !== 0) throw badPidFor(pid);
+    return m;
+  }
+  throw badPidFor(pid);
+}
+function einvalFor(signal) {
+  var bad = new Error('kill EINVAL');
+  bad.code = 'EINVAL';
+  bad.errno = -22;
+  bad.syscall = 'kill';
+  return bad;
+}
 proc.kill = function (pid, signal) {
-  var num = Number(pid);
-  var spec = signal === undefined || signal === null ? 'SIGTERM' : signal;
+  var num = pidOf(pid);
+  /* undefined is the one signal a caller leaves out, and it means SIGTERM. Every other falsy one
+     -- '', null, false, NaN and 0 -- is the null signal on a host: it asks only whether the
+     process is there and answers true, which is what process.kill(pid, '') measures. */
+  var spec = signal === undefined ? 'SIGTERM' : signal;
+  if (spec !== undefined && !spec) spec = 0;
   /* Signal 0 is the null signal: it only asks whether the process is there, and never ends it.
-     Node takes it as the number 0 -- the string '0' is not a name and is refused as unknown. */
+     Node takes it as the number 0 -- the string '0' is not a name and is refused as unknown.
+     Pid 0 is the process group, which is always there as far as a null signal is concerned. */
   if (spec === 0) {
-    if (num === proc.pid) return true;
+    if (num === proc.pid || num === 0) return true;
     if (callCap('child.kill', { pid: num, signal: '0' }) === true) return true;
     throw esrchFor(pid);
   }
   var name = nameOfSignal(spec);
-  if (name === undefined) throw unknownSignalFor(spec);
+  if (name === undefined) {
+    /* An integer no host numbers a signal by is not refused as unknown, it is handed to the
+       kill of the host, which refuses it with EINVAL: measured against node 24.15 on Darwin for
+       -1, 32, 33, 63, 64 and 1000000. A number that is not an integer, and a name no host
+       knows, are the two Node refuses itself, with ERR_UNKNOWN_SIGNAL and no errno. */
+    if (typeof spec === 'number' && spec === spec && spec % 1 === 0) throw einvalFor(spec);
+    throw unknownSignalFor(spec);
+  }
   if (num === proc.pid) {
     /* A signal a listener was registered for reaches that listener: Node delivers it and leaves the
        process running, and only a name nothing listens for takes its default action. SIGKILL and
@@ -453,7 +511,10 @@ proc.kill = function (pid, signal) {
        straight after the kill still runs before the handler does. */
     if (name !== 'SIGKILL' && name !== 'SIGSTOP' && proc.listenerCount(name) > 0) {
       var delivered = name;
-      setTimeout(function () { proc.emit(delivered); }, 0);
+      /* Node hands a signal listener two arguments -- the name and the number -- and a listener
+         that counts them counts 2; emitting the name alone left every one of the 25 names host
+         node 24.15 accepts reporting argc=0. */
+      setTimeout(function () { proc.emit(delivered, delivered, SIGNAL_NUMBERS[delivered]); }, 0);
       return true;
     }
     /* Two defaults of Node's own: SIGUSR1 opens the inspector and leaves the process running, and
@@ -3324,6 +3385,17 @@ function circularStructureText(value, replacer) {
     uncaughtCapture = typeof fn === 'function' ? fn : null;
   };
   proc.hasUncaughtExceptionCaptureCallback = function () { return uncaughtCapture !== null; };
+  /* The path that raises an uncaught exception asks here before it reaches an
+     'uncaughtException' listener: node hands it to the callback a caller recorded with
+     setUncaughtExceptionCaptureCallback instead, and the process goes on running either way,
+     which is what a program that records one and rejects a promise measures on host node 24.15 --
+     the rejection prints CB=..., a queued timer still runs and the exit is 0, and the listener
+     is never called at all. */
+  api.captureUncaught = function (err) {
+    if (uncaughtCapture === null) return false;
+    uncaughtCapture(err);
+    return true;
+  };
   /* A '.env' file, as node reads one: one KEY=VALUE per line, a '#' begins a comment, and a
      value's own matching quotes are taken off it. A file that is not there is an error, as on a
      host, so a caller that expects one finds out. */
