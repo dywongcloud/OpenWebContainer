@@ -32,7 +32,7 @@ function owcBuildStreamCore() {
   var defaultHighWaterMark = 65536;
   var defaultObjectHighWaterMark = 16;
   var KNOWN_ENCODINGS = { utf8: true, utf16le: true, latin1: true, ascii: true, base64: true, base64url: true, hex: true };
-  var kState = Symbol('owcReadlineState');
+  var kRlState = Symbol('owcReadlineState');
   var kTransformCallback = Symbol('owcTransformCallback');
 
   function owcErr(Ctor, code, message) {
@@ -43,7 +43,9 @@ function owcBuildStreamCore() {
 
   function describeReceived(value) {
     if (value === null || value === undefined) return ' Received ' + value;
-    if (typeof value === 'function') return ' Received function ' + (value.name || '<anonymous>');
+    /* Node names a function by its own name and prints nothing for one that has none, so an
+       anonymous function is "Received function " with the name left empty and not "<anonymous>". */
+    if (typeof value === 'function') return ' Received function ' + (value.name || '');
     if (typeof value === 'object') {
       if (value.constructor && value.constructor.name) return ' Received an instance of ' + value.constructor.name;
       return ' Received ' + Object.prototype.toString.call(value);
@@ -98,6 +100,9 @@ function owcBuildStreamCore() {
   }
 
   function normalizeEncoding(enc) {
+    /* Node's internal normalise treats a missing encoding as utf8: setEncoding(null),
+       setEncoding(undefined) and setEncoding('') all end up decoding utf8 rather than throwing. */
+    if (enc === null || enc === undefined || enc === '') return 'utf8';
     var e = String(enc).toLowerCase();
     if (e === 'utf-8') return 'utf8';
     if (e === 'ucs2' || e === 'ucs-2' || e === 'utf-16le') return 'utf16le';
@@ -207,44 +212,206 @@ function owcBuildStreamCore() {
     else defaultHighWaterMark = value;
   }
 
+  /* Node 24 keeps every boolean ReadableState/WritableState flag in *one* integer behind the
+     private Symbol(kState): a fresh readable state owns only highWaterMark, buffer, bufferIndex,
+     length, pipes and awaitDrainWriters plus that symbol, and a fresh writable state only
+     highWaterMark, length, corked, onwrite, writelen, bufferedIndex and pendingcb plus
+     Symbol(kState) and Symbol(kBufferedValue). Every flag lives on the prototype as a getter over
+     one bit, and a flag whose value is not a boolean (errored, decoder, encoding, defaultEncoding,
+     writecb, afterWriteTickInfo, buffered, the on-finished list) parks its value behind a second
+     symbol that only appears once the flag is first set. The bit numbers and the prototype order
+     below are copied from internal/streams/utils.js, readable.js and writable.js, so the integer
+     and the key order match the host exactly. */
+  var kState = Symbol('kState');
+  var kErroredValue = Symbol('kErroredValue');
+  var kDefaultEncodingValue = Symbol('kDefaultEncodingValue');
+  var kDecoderValue = Symbol('kDecoderValue');
+  var kEncodingValue = Symbol('kEncodingValue');
+  var kOnFinishedValue = Symbol('kOnFinishedValue');
+  var kWriteCbValue = Symbol('kWriteCbValue');
+  var kAfterWriteTickInfoValue = Symbol('kAfterWriteTickInfoValue');
+  var kBufferedValue = Symbol('kBufferedValue');
+
+  // Shared by both states (internal/streams/utils.js).
+  var kObjectMode = 1 << 0;
+  var kErrorEmitted = 1 << 1;
+  var kAutoDestroy = 1 << 2;
+  var kEmitClose = 1 << 3;
+  var kDestroyed = 1 << 4;
+  var kClosed = 1 << 5;
+  var kCloseEmitted = 1 << 6;
+  var kErrored = 1 << 7;
+  var kConstructed = 1 << 8;
+
+  var R_ENDED = 1 << 9;
+  var R_END_EMITTED = 1 << 10;
+  var R_READING = 1 << 11;
+  var R_SYNC = 1 << 12;
+  var R_NEED_READABLE = 1 << 13;
+  var R_EMITTED_READABLE = 1 << 14;
+  var R_READABLE_LISTENING = 1 << 15;
+  var R_RESUME_SCHEDULED = 1 << 16;
+  var R_MULTI_AWAIT_DRAIN = 1 << 17;
+  var R_READING_MORE = 1 << 18;
+  var R_DATA_EMITTED = 1 << 19;
+  var R_DEFAULT_UTF8 = 1 << 20;
+  var R_DECODER = 1 << 21;
+  var R_ENCODING = 1 << 22;
+  var R_HAS_FLOWING = 1 << 23;
+  var R_FLOWING = 1 << 24;
+  var R_HAS_PAUSED = 1 << 25;
+  var R_PAUSED = 1 << 26;
+
+  var W_SYNC = 1 << 9;
+  var W_FINAL_CALLED = 1 << 10;
+  var W_NEED_DRAIN = 1 << 11;
+  var W_ENDING = 1 << 12;
+  var W_FINISHED = 1 << 13;
+  var W_DECODE_STRINGS = 1 << 14;
+  var W_WRITING = 1 << 15;
+  var W_BUFFER_PROCESSING = 1 << 16;
+  var W_PREFINISHED = 1 << 17;
+  var W_ALL_BUFFERS = 1 << 18;
+  var W_ALL_NOOP = 1 << 19;
+  var W_ON_FINISHED = 1 << 20;
+  var W_HAS_WRITABLE = 1 << 21;
+  var W_WRITABLE = 1 << 22;
+  var W_DEFAULT_UTF8 = 1 << 24;
+  var W_WRITE_CB = 1 << 25;
+  var W_EXPECT_WRITE_CB = 1 << 26;
+  var W_AFTER_WRITE_TICK_INFO = 1 << 27;
+  var kBuffered = 1 << 29;
+  var W_ENDED = 1 << 30;
+
+  function bitAccessor(bit) {
+    return {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & bit) !== 0; },
+      set: function (value) { if (value) this[kState] |= bit; else this[kState] &= ~bit; }
+    };
+  }
+
+  function valueAccessor(bit, valueKey, empty) {
+    return {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & bit) !== 0 ? this[valueKey] : empty; },
+      set: function (value) {
+        this[valueKey] = value;
+        if (value) this[kState] |= bit;
+        else this[kState] &= ~bit;
+      }
+    };
+  }
+
+  function nop() {}
+
+  var ArrayPrototypeSlice = Array.prototype.slice;
+
+  // ---------------------------------------------------------------- ReadableState
+
+  function ReadableState() {}
+  Object.defineProperties(ReadableState.prototype, {
+    objectMode: bitAccessor(kObjectMode),
+    ended: bitAccessor(R_ENDED),
+    endEmitted: bitAccessor(R_END_EMITTED),
+    reading: bitAccessor(R_READING),
+    constructed: bitAccessor(kConstructed),
+    sync: bitAccessor(R_SYNC),
+    needReadable: bitAccessor(R_NEED_READABLE),
+    emittedReadable: bitAccessor(R_EMITTED_READABLE),
+    readableListening: bitAccessor(R_READABLE_LISTENING),
+    resumeScheduled: bitAccessor(R_RESUME_SCHEDULED),
+    errorEmitted: bitAccessor(kErrorEmitted),
+    emitClose: bitAccessor(kEmitClose),
+    autoDestroy: bitAccessor(kAutoDestroy),
+    destroyed: bitAccessor(kDestroyed),
+    closed: bitAccessor(kClosed),
+    closeEmitted: bitAccessor(kCloseEmitted),
+    multiAwaitDrain: bitAccessor(R_MULTI_AWAIT_DRAIN),
+    readingMore: bitAccessor(R_READING_MORE),
+    dataEmitted: bitAccessor(R_DATA_EMITTED),
+    errored: {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & kErrored) !== 0 ? this[kErroredValue] : null; },
+      set: function (value) {
+        if (value) {
+          this[kErroredValue] = value;
+          this[kState] |= kErrored;
+        } else {
+          this[kState] &= ~kErrored;
+        }
+      }
+    },
+    defaultEncoding: {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & R_DEFAULT_UTF8) !== 0 ? 'utf8' : this[kDefaultEncodingValue]; },
+      set: function (value) {
+        if (value === 'utf8' || value === 'utf-8') this[kState] |= R_DEFAULT_UTF8;
+        else {
+          this[kState] &= ~R_DEFAULT_UTF8;
+          this[kDefaultEncodingValue] = value;
+        }
+      }
+    },
+    decoder: valueAccessor(R_DECODER, kDecoderValue, null),
+    encoding: valueAccessor(R_ENCODING, kEncodingValue, null),
+    flowing: {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & R_HAS_FLOWING) !== 0 ? (this[kState] & R_FLOWING) !== 0 : null; },
+      set: function (value) {
+        if (value === null || value === undefined) this[kState] &= ~(R_HAS_FLOWING | R_FLOWING);
+        else if (value) this[kState] |= (R_HAS_FLOWING | R_FLOWING);
+        else {
+          this[kState] |= R_HAS_FLOWING;
+          this[kState] &= ~R_FLOWING;
+        }
+      }
+    },
+    pipesCount: {
+      enumerable: false,
+      configurable: true,
+      get: function () { return this.pipes.length; }
+    },
+    paused: {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & R_PAUSED) !== 0; },
+      set: function (value) {
+        this[kState] |= R_HAS_PAUSED;
+        if (value) this[kState] |= R_PAUSED;
+        else this[kState] &= ~R_PAUSED;
+      }
+    }
+  });
+
   function makeReadableState(options, isDuplex) {
     var opts = options || {};
     var objectMode = !!(opts.objectMode || (isDuplex && opts.readableObjectMode));
-    var state = {
-      objectMode: objectMode,
-      highWaterMark: pickHighWaterMark(opts, isDuplex ? 'readableHighWaterMark' : null, objectMode),
-      buffer: [],
-      length: 0,
-      pipes: [],
-      pipeHooks: [],
-      awaitDrain: [],
-      flowing: null,
-      paused: null,
-      ended: false,
-      endEmitted: false,
-      reading: false,
-      sync: true,
-      needReadable: false,
-      emittedReadable: false,
-      readableListening: false,
-      resumeScheduled: false,
-      readingMore: false,
-      dataEmitted: false,
-      errorEmitted: false,
-      closeEmitted: false,
-      closed: false,
-      destroyed: false,
-      errored: null,
-      emitClose: opts.emitClose !== false,
-      autoDestroy: opts.autoDestroy !== false,
-      readable: opts.readable !== false,
-      decoder: null,
-      encoding: null,
-      defaultEncoding: opts.defaultEncoding || 'utf8'
-    };
-    /* Node keeps the constructor's encoding verbatim ('utf-8' stays 'utf-8') while setEncoding
-       stores the decoder's normalised name; the option is validated here, at construction. */
-    if (opts.encoding !== undefined && opts.encoding !== null) {
+    var state = Object.create(ReadableState.prototype);
+    state[kState] = kEmitClose | kAutoDestroy | kConstructed | R_SYNC;
+    if (objectMode) state[kState] |= kObjectMode;
+    state.highWaterMark = pickHighWaterMark(opts, isDuplex ? 'readableHighWaterMark' : null, objectMode);
+    state.buffer = [];
+    state.bufferIndex = 0;
+    state.length = 0;
+    state.pipes = [];
+    if (opts.emitClose === false) state[kState] &= ~kEmitClose;
+    if (opts.autoDestroy === false) state[kState] &= ~kAutoDestroy;
+    var defaultEncoding = opts.defaultEncoding;
+    if (defaultEncoding === null || defaultEncoding === undefined || defaultEncoding === 'utf8' || defaultEncoding === 'utf-8') {
+      state[kState] |= R_DEFAULT_UTF8;
+    } else if (KNOWN_ENCODINGS[normalizeEncoding(defaultEncoding)]) {
+      state.defaultEncoding = defaultEncoding;
+    } else {
+      throw errUnknownEncoding(defaultEncoding);
+    }
+    state.awaitDrainWriters = null;
+    if (opts.encoding) {
       state.decoder = createDecoder(opts.encoding);
       state.encoding = opts.encoding;
     }
@@ -256,41 +423,136 @@ function owcBuildStreamCore() {
     return state.decoder ? state.decoder.encoding : null;
   }
 
-  function makeWritableState(options, isDuplex) {
+  function WritableState() {}
+  Object.defineProperties(WritableState.prototype, {
+    objectMode: bitAccessor(kObjectMode),
+    finalCalled: bitAccessor(W_FINAL_CALLED),
+    needDrain: bitAccessor(W_NEED_DRAIN),
+    ending: bitAccessor(W_ENDING),
+    ended: bitAccessor(W_ENDED),
+    finished: bitAccessor(W_FINISHED),
+    destroyed: bitAccessor(kDestroyed),
+    decodeStrings: bitAccessor(W_DECODE_STRINGS),
+    writing: bitAccessor(W_WRITING),
+    sync: bitAccessor(W_SYNC),
+    bufferProcessing: bitAccessor(W_BUFFER_PROCESSING),
+    constructed: bitAccessor(kConstructed),
+    prefinished: bitAccessor(W_PREFINISHED),
+    errorEmitted: bitAccessor(kErrorEmitted),
+    emitClose: bitAccessor(kEmitClose),
+    autoDestroy: bitAccessor(kAutoDestroy),
+    closed: bitAccessor(kClosed),
+    closeEmitted: bitAccessor(kCloseEmitted),
+    allBuffers: bitAccessor(W_ALL_BUFFERS),
+    allNoop: bitAccessor(W_ALL_NOOP),
+    errored: {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & kErrored) !== 0 ? this[kErroredValue] : null; },
+      set: function (value) {
+        if (value) {
+          this[kErroredValue] = value;
+          this[kState] |= kErrored;
+        } else {
+          this[kState] &= ~kErrored;
+        }
+      }
+    },
+    writable: {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & W_HAS_WRITABLE) !== 0 ? (this[kState] & W_WRITABLE) !== 0 : undefined; },
+      set: function (value) {
+        if (value === null || value === undefined) this[kState] &= ~(W_HAS_WRITABLE | W_WRITABLE);
+        else if (value) this[kState] |= (W_HAS_WRITABLE | W_WRITABLE);
+        else {
+          this[kState] |= W_HAS_WRITABLE;
+          this[kState] &= ~W_WRITABLE;
+        }
+      }
+    },
+    defaultEncoding: {
+      enumerable: false,
+      configurable: true,
+      get: function () { return (this[kState] & W_DEFAULT_UTF8) !== 0 ? 'utf8' : this[kDefaultEncodingValue]; },
+      set: function (value) {
+        if (value === 'utf8' || value === 'utf-8') this[kState] |= W_DEFAULT_UTF8;
+        else {
+          this[kState] &= ~W_DEFAULT_UTF8;
+          this[kDefaultEncodingValue] = value;
+        }
+      }
+    },
+    writecb: valueAccessor(W_WRITE_CB, kWriteCbValue, nop),
+    afterWriteTickInfo: valueAccessor(W_AFTER_WRITE_TICK_INFO, kAfterWriteTickInfoValue, null),
+    buffered: valueAccessor(kBuffered, kBufferedValue, [])
+  });
+  /* Kept byte-for-byte with internal/streams/writable.js: an inspected writable state prints this
+     function's source, so its own text is part of the observable surface. */
+  WritableState.prototype.getBuffer = function getBuffer() {
+  return (this[kState] & kBuffered) === 0 ? [] : ArrayPrototypeSlice(this.buffered, this.bufferedIndex);
+}
+
+  Object.defineProperty(WritableState.prototype, 'bufferedRequestCount', {
+    enumerable: false,
+    configurable: true,
+    get: function () { return (this[kState] & kBuffered) === 0 ? 0 : this[kBufferedValue].length - this.bufferedIndex; }
+  });
+
+  /* The on-finished list is the one flag Node parks behind a second symbol without an accessor of
+     its own, so it is reached through these two helpers rather than through state.onFinished. */
+  function onFinishedPush(state, cb) {
+    if (state[kOnFinishedValue] === null || state[kOnFinishedValue] === undefined) state[kOnFinishedValue] = [];
+    state[kState] |= W_ON_FINISHED;
+    state[kOnFinishedValue].push(cb);
+  }
+
+  function onFinishedTake(state) {
+    var list = state[kOnFinishedValue];
+    if (list === null || list === undefined) return [];
+    state[kOnFinishedValue] = null;
+    state[kState] &= ~W_ON_FINISHED;
+    return list;
+  }
+
+  /* state.buffered is a fresh empty array until something is buffered, so a push has to go through
+     the setter to make the array real. */
+  function bufferedPush(state, item) {
+    if ((state[kState] & kBuffered) === 0) state.buffered = [];
+    state[kBufferedValue].push(item);
+  }
+
+  function resetBuffer(state) {
+    state[kBufferedValue] = null;
+    state.bufferedIndex = 0;
+    state[kState] |= W_ALL_BUFFERS | W_ALL_NOOP;
+    state[kState] &= ~kBuffered;
+  }
+
+  function makeWritableState(options, isDuplex, stream) {
     var opts = options || {};
     var objectMode = !!(opts.objectMode || (isDuplex && opts.writableObjectMode));
-    var state = {
-      objectMode: objectMode,
-      highWaterMark: pickHighWaterMark(opts, isDuplex ? 'writableHighWaterMark' : null, objectMode),
-      length: 0,
-      buffered: [],
-      writing: false,
-      writecb: null,
-      writelen: 0,
-      writecount: 0,
-      corked: 0,
-      sync: false,
-      bufferProcessing: false,
-      needDrain: false,
-      ending: false,
-      ended: false,
-      finished: false,
-      finalCalled: false,
-      prefinished: false,
-      pendingcb: 0,
-      onFinished: [],
-      errored: null,
-      errorEmitted: false,
-      destroyed: false,
-      closed: false,
-      closeEmitted: false,
-      emitClose: opts.emitClose !== false,
-      autoDestroy: opts.autoDestroy !== false,
-      writable: opts.writable !== false,
-      decodeStrings: opts.decodeStrings !== false,
-      defaultEncoding: opts.defaultEncoding || 'utf8'
-    };
-    state.onwrite = null;
+    var state = Object.create(WritableState.prototype);
+    state[kState] = W_SYNC | kConstructed | kEmitClose | kAutoDestroy;
+    if (objectMode) state[kState] |= kObjectMode;
+    state.highWaterMark = pickHighWaterMark(opts, isDuplex ? 'writableHighWaterMark' : null, objectMode);
+    if (opts.decodeStrings !== false) state[kState] |= W_DECODE_STRINGS;
+    if (opts.emitClose === false) state[kState] &= ~kEmitClose;
+    if (opts.autoDestroy === false) state[kState] &= ~kAutoDestroy;
+    var defaultEncoding = opts.defaultEncoding === undefined ? null : opts.defaultEncoding;
+    if (defaultEncoding === null || defaultEncoding === undefined || defaultEncoding === 'utf8' || defaultEncoding === 'utf-8') {
+      state[kState] |= W_DEFAULT_UTF8;
+    } else if (KNOWN_ENCODINGS[normalizeEncoding(defaultEncoding)]) {
+      state.defaultEncoding = defaultEncoding;
+    } else {
+      throw errUnknownEncoding(defaultEncoding);
+    }
+    state.length = 0;
+    state.corked = 0;
+    state.onwrite = onwriteFor(stream);
+    state.writelen = 0;
+    resetBuffer(state);
+    state.pendingcb = 0;
     return state;
   }
 
@@ -406,17 +668,88 @@ function owcBuildStreamCore() {
     emitSafe(dest, 'pipe', source);
     return dest;
   };
+  /* Node declares eventNames on Stream.prototype itself (internal/streams/legacy.js), so the
+     own keys of Stream.prototype are constructor, pipe and eventNames. */
+  Stream.prototype.eventNames = function () {
+    var names = [];
+    var events = this._events || {};
+    var keys = Object.getOwnPropertyNames(events);
+    if (typeof Object.getOwnPropertySymbols === 'function') keys = keys.concat(Object.getOwnPropertySymbols(events));
+    for (var i = 0; i < keys.length; i++) {
+      var at = events[keys[i]];
+      if (typeof at === 'function' || (Array.isArray(at) && at.length > 0)) names.push(keys[i]);
+    }
+    return names;
+  };
 
   // ---------------------------------------------------------------- Readable
 
+  /* Async construction is opt in, so a stream starts out constructed; one that was given a
+     construct callback is not, and stays that way until the callback runs (internal/streams/destroy). */
+  var kConstructEvent = Symbol('kConstruct');
+
+  function readableOnConstructed(stream) {
+    var state = stream._readableState;
+    if (state && state.needReadable) maybeReadMore(stream, state);
+  }
+
+  function writableOnConstructed(stream) {
+    var state = stream._writableState;
+    if (!state) return;
+    if (!state.writing) clearBuffer(stream, state);
+    if (state.ending) finishMaybe(stream, state);
+  }
+
+  function constructStream(stream, onConstructed) {
+    if (typeof stream._construct !== 'function') return;
+    var r = stream._readableState;
+    var w = stream._writableState;
+    if (r) r.constructed = false;
+    if (w) w.constructed = false;
+    stream.once(kConstructEvent, onConstructed);
+    /* Duplex runs this once per side; the second call only adds a listener. */
+    if (listenerCountOf(stream, kConstructEvent) > 1) return;
+    process.nextTick(function () {
+      var called = false;
+      function done(err) {
+        if (called) {
+          errorOrDestroy(stream, err || errMultipleCallback());
+          return;
+        }
+        called = true;
+        if (r) r.constructed = true;
+        if (w) w.constructed = true;
+        if (err) errorOrDestroy(stream, err, true);
+        else stream.emit(kConstructEvent);
+      }
+      try {
+        stream._construct(function (err) { process.nextTick(done, err); });
+      } catch (err) {
+        process.nextTick(done, err);
+      }
+    });
+  }
+
   function Readable(options) {
     if (!(this instanceof Readable)) return new Readable(options);
+    /* Node seeds the listener map with the five events a readable stream uses most before
+       EventEmitter.init runs: init sees a defined _events and skips its own, so a fresh stream owns
+       no _eventsCount. */
+    if (this._events === undefined) {
+      this._events = { close: undefined, error: undefined, data: undefined, end: undefined, readable: undefined };
+    }
     this._readableState = makeReadableState(options, this instanceof Duplex);
     if (options) {
       if (typeof options.read === 'function') this._read = options.read;
       if (typeof options.destroy === 'function') this._destroy = options.destroy;
+      if (typeof options.construct === 'function') this._construct = options.construct;
+      if (options.signal) addAbortSignal(options.signal, this);
     }
     Stream.call(this, options);
+    if (this._construct !== undefined && this._construct !== null) {
+      var self = this;
+      constructStream(this, function () { readableOnConstructed(self); });
+    }
   }
   Object.setPrototypeOf(Readable.prototype, Stream.prototype);
   Object.setPrototypeOf(Readable, Stream);
@@ -673,7 +1006,7 @@ function owcBuildStreamCore() {
       n = 0;
     } else {
       state.length -= n;
-      state.awaitDrain = [];
+      pipeExtras(state).awaitDrain = [];
     }
     if (state.length === 0) {
       if (!state.ended) state.needReadable = true;
@@ -773,11 +1106,26 @@ function owcBuildStreamCore() {
   };
   Readable.prototype.off = Readable.prototype.removeListener;
 
+  /* pipe() keeps the per-destination cleanup hooks and the drain waiters off the state entirely, in
+     a WeakMap: the host keeps neither, so even a state that has been a pipe source owns no extra key
+     of its own beyond Symbol(kState). */
+  var pipeExtrasOf = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function pipeExtras(state) {
+    var extras = pipeExtrasOf === null ? null : pipeExtrasOf.get(state);
+    if (extras === null || extras === undefined) {
+      extras = { hooks: [], awaitDrain: [] };
+      if (pipeExtrasOf !== null) pipeExtrasOf.set(state, extras);
+      else state.owcPipeExtras = extras;
+    }
+    return extras;
+  }
+
   function pipeOnDrain(src, dest) {
     return function () {
       var state = src._readableState;
-      state.awaitDrain = state.awaitDrain.filter(function (d) { return d !== dest; });
-      if (state.awaitDrain.length === 0 && listenerCountOf(src, 'data') > 0) src.resume();
+      var extras = pipeExtras(state);
+      extras.awaitDrain = extras.awaitDrain.filter(function (d) { return d !== dest; });
+      if (extras.awaitDrain.length === 0 && listenerCountOf(src, 'data') > 0) src.resume();
     };
   }
 
@@ -800,7 +1148,8 @@ function owcBuildStreamCore() {
       offListener(src, 'end', onend);
       offListener(src, 'end', unpipe);
       offListener(src, 'data', ondata);
-      state.pipeHooks = state.pipeHooks.filter(function (hook) { return hook.dest !== dest; });
+      var extras = pipeExtras(state);
+      extras.hooks = extras.hooks.filter(function (hook) { return hook.dest !== dest; });
     }
 
     function unpipe() {
@@ -831,9 +1180,9 @@ function owcBuildStreamCore() {
     function pauseSource() {
       if (!cleanedUp) {
         if (state.pipes.length === 1 && state.pipes[0] === dest) {
-          state.awaitDrain = [dest];
+          pipeExtras(state).awaitDrain = [dest];
         } else if (state.pipes.indexOf(dest) !== -1) {
-          state.awaitDrain.push(dest);
+          pipeExtras(state).awaitDrain.push(dest);
         }
         src.pause();
       }
@@ -859,7 +1208,7 @@ function owcBuildStreamCore() {
       unpipe();
     }
 
-    state.pipeHooks.push({ dest: dest, cleanup: cleanup });
+    pipeExtras(state).hooks.push({ dest: dest, cleanup: cleanup });
     if (typeof dest.prependListener === 'function') dest.prependListener('error', onerror);
     else dest.on('error', onerror);
     if (doEnd) {
@@ -890,9 +1239,9 @@ function owcBuildStreamCore() {
     if (state.pipes.length === 0) return this;
     if (dest === undefined || dest === null) {
       var dests = state.pipes;
-      var hooks = state.pipeHooks.slice();
+      var hooks = pipeExtras(state).hooks.slice();
       state.pipes = [];
-      state.pipeHooks = [];
+      pipeExtras(state).hooks = [];
       this.pause();
       for (var i = 0; i < hooks.length; i++) hooks[i].cleanup();
       for (var j = 0; j < dests.length; j++) emitSafe(dests[j], 'unpipe', this, { hasUnpiped: false });
@@ -901,7 +1250,7 @@ function owcBuildStreamCore() {
     var index = state.pipes.indexOf(dest);
     if (index === -1) return this;
     state.pipes.splice(index, 1);
-    state.pipeHooks.filter(function (hook) { return hook.dest === dest; }).forEach(function (hook) { hook.cleanup(); });
+    pipeExtras(state).hooks.filter(function (hook) { return hook.dest === dest; }).forEach(function (hook) { hook.cleanup(); });
     if (state.pipes.length === 0) this.pause();
     emitSafe(dest, 'unpipe', this, { hasUnpiped: false });
     return this;
@@ -1342,6 +1691,21 @@ function owcBuildStreamCore() {
     }
   };
 
+  /* Node raises an internal ReduceAwareErrMissingArgs subclass, so both the constructor name
+     and the code of the reduce-without-initial-value error are observable. */
+  function ReduceAwareErrMissingArgs(message) {
+    var e = new TypeError(message);
+    Object.setPrototypeOf(e, ReduceAwareErrMissingArgs.prototype);
+    e.code = 'ERR_MISSING_ARGS';
+    return e;
+  }
+  ReduceAwareErrMissingArgs.prototype = Object.create(TypeError.prototype, {
+    constructor: { value: ReduceAwareErrMissingArgs, writable: true, configurable: true }
+  });
+  function makeReduceAwareErrMissingArgs() {
+    return new ReduceAwareErrMissingArgs('Reduce of an empty stream requires an initial value');
+  }
+
   Readable.prototype.reduce = async function (fn, initialValue, options) {
     if (typeof fn !== 'function') throw argTypeError('reducer', 'of type function', fn);
     checkOperatorOptions(options);
@@ -1359,7 +1723,7 @@ function owcBuildStreamCore() {
       }
     }
     if (!hasInitial) {
-      throw owcErr(TypeError, 'ERR_MISSING_ARGS', 'Reduce of an empty stream requires an initial value');
+      throw makeReduceAwareErrMissingArgs();
     }
     return acc;
   };
@@ -1436,20 +1800,68 @@ function owcBuildStreamCore() {
   }
   defineSharedGetters(Readable.prototype);
 
+  /* Node's deprecated _undestroy re-opens a destroyed stream: it resets the flags destroyImpl
+     set without touching the buffer or the pipes. */
+  Readable.prototype._undestroy = function () {
+    var r = this._readableState;
+    var w = this._writableState;
+    if (r) {
+      r.closed = false;
+      r.closeEmitted = false;
+      r.destroyed = false;
+      r.errored = null;
+      r.errorEmitted = false;
+      r.reading = false;
+      r.ended = r.readable === false;
+      r.endEmitted = r.readable === false;
+    }
+    if (w) {
+      w.destroyed = false;
+      w.closed = false;
+      w.closeEmitted = false;
+      w.errored = null;
+      w.errorEmitted = false;
+      w.finalCalled = false;
+      w.prefinished = false;
+      w.ended = w.writable === false;
+      w.ending = w.writable === false;
+      w.finished = w.writable === false;
+    }
+  };
+  Object.defineProperty(Readable.prototype, 'readableBuffer', {
+    get: function () { var r = this._readableState; return r ? r.buffer : undefined; },
+    set: function (value) { if (this._readableState) this._readableState.buffer = value; },
+    configurable: true
+  });
+  Readable.prototype.removeAllListeners = function (ev) {
+    var res = EventEmitter.prototype.removeAllListeners.apply(this, arguments);
+    if (ev === 'readable' || ev === undefined) process.nextTick(updateReadableListening, this);
+    return res;
+  };
+
   // ---------------------------------------------------------------- Writable
 
   function Writable(options) {
     var isDuplex = this instanceof Duplex;
     if (!isDuplex && !(this instanceof Writable)) return new Writable(options);
-    this._writableState = makeWritableState(options, isDuplex);
-    this._writableState.onwrite = onwriteFor(this);
+    /* Same shaped listener map as the readable side, with the five events a writable stream uses. */
+    if (this._events === undefined) {
+      this._events = { close: undefined, error: undefined, prefinish: undefined, finish: undefined, drain: undefined };
+    }
+    this._writableState = makeWritableState(options, isDuplex, this);
     if (options) {
       if (typeof options.write === 'function') this._write = options.write;
       if (typeof options.writev === 'function') this._writev = options.writev;
       if (typeof options.destroy === 'function') this._destroy = options.destroy;
       if (typeof options.final === 'function') this._final = options.final;
+      if (typeof options.construct === 'function') this._construct = options.construct;
+      if (options.signal) addAbortSignal(options.signal, this);
     }
     Stream.call(this, options);
+    if (this._construct !== undefined && this._construct !== null) {
+      var self = this;
+      constructStream(this, function () { writableOnConstructed(self); });
+    }
   }
   Object.setPrototypeOf(Writable.prototype, Stream.prototype);
   Object.setPrototypeOf(Writable, Stream);
@@ -1476,7 +1888,7 @@ function owcBuildStreamCore() {
   function finishStream(stream, state) {
     state.pendingcb--;
     state.finished = true;
-    var callbacks = state.onFinished.splice(0);
+    var callbacks = onFinishedTake(state);
     for (var i = 0; i < callbacks.length; i++) callbacks[i](null);
     stream.emit('finish');
     if (state.autoDestroy) {
@@ -1523,7 +1935,7 @@ function owcBuildStreamCore() {
       called = true;
       state.pendingcb--;
       if (err) {
-        var callbacks = state.onFinished.splice(0);
+        var callbacks = onFinishedTake(state);
         for (var i = 0; i < callbacks.length; i++) callbacks[i](err);
         errorOrDestroy(stream, err, state.sync);
       } else if (needFinish(state)) {
@@ -1585,16 +1997,19 @@ function owcBuildStreamCore() {
 
   function onwrite(stream, er) {
     var state = stream._writableState;
-    var sync = state.sync;
-    var cb = state.writecb;
-    if (typeof cb !== 'function') {
+    /* Node keeps "a write callback is expected" as its own bit, so a second call to onwrite for one
+       write is the ERR_MULTIPLE_CALLBACK case rather than a nop replay. */
+    if ((state[kState] & W_EXPECT_WRITE_CB) === 0) {
       errorOrDestroy(stream, errMultipleCallback());
       return;
     }
-    var count = state.writecount || 1;
-    state.writecount = 0;
-    state.writing = false;
+    var sync = state.sync;
+    var cb = (state[kState] & W_WRITE_CB) !== 0 ? state[kWriteCbValue] : nop;
+    /* A writev batch carries how many buffered writes it settles on the callback itself, so the
+       count needs no field of its own on the state. */
+    var count = (cb && cb.owcWriteCount) || 1;
     state.writecb = null;
+    state[kState] &= ~(W_WRITING | W_EXPECT_WRITE_CB);
     state.length -= state.writelen;
     state.writelen = 0;
     if (er) {
@@ -1612,13 +2027,12 @@ function owcBuildStreamCore() {
   function doWrite(stream, state, writev, len, chunk, encoding, cb, count) {
     state.writelen = len;
     state.writecb = cb;
-    state.writecount = count || 1;
-    state.writing = true;
-    state.sync = true;
+    if (count > 1 && typeof cb === 'function') cb.owcWriteCount = count;
+    state[kState] |= W_WRITING | W_SYNC | W_EXPECT_WRITE_CB;
     if (state.destroyed) state.onwrite(errDestroyed('write'));
     else if (writev) stream._writev(chunk, state.onwrite);
     else stream._write(chunk, encoding, state.onwrite);
-    state.sync = false;
+    state[kState] &= ~W_SYNC;
   }
 
   function clearBuffer(stream, state) {
@@ -1651,7 +2065,7 @@ function owcBuildStreamCore() {
     var ret = state.length < state.highWaterMark;
     if (!ret) state.needDrain = true;
     if (state.writing || state.corked || state.errored || state.destroyed) {
-      state.buffered.push({ chunk: chunk, encoding: encoding, callback: callback });
+      bufferedPush(state, { chunk: chunk, encoding: encoding, callback: callback });
     } else {
       doWrite(stream, state, false, len, chunk, encoding, callback, 1);
     }
@@ -1667,7 +2081,7 @@ function owcBuildStreamCore() {
     } else {
       if (!encoding) encoding = state.defaultEncoding;
       else if (encoding !== 'buffer' && !KNOWN_ENCODINGS[normalizeEncoding(encoding)]) throw errUnknownEncoding(encoding);
-      if (typeof cb !== 'function') cb = owcNoop;
+      if (typeof cb !== 'function') cb = nop;
     }
     if (chunk === null) {
       throw errNullValues();
@@ -1698,7 +2112,6 @@ function owcBuildStreamCore() {
     return writeOrBuffer(stream, state, chunk, encoding, cb);
   }
 
-  function owcNoop() {}
 
   Writable.prototype.write = function (chunk, encoding, cb) {
     return writeImpl(this, chunk, encoding, cb) === true;
@@ -1736,7 +2149,7 @@ function owcBuildStreamCore() {
     }
     if (typeof cb === 'function') {
       if (err || state.finished) process.nextTick(cb, err);
-      else state.onFinished.push(cb);
+      else onFinishedPush(state, cb);
     }
     return this;
   };
@@ -1817,31 +2230,95 @@ function owcBuildStreamCore() {
   defineWritableGetters(Writable.prototype);
   defineSharedGetters(Writable.prototype);
 
+  Writable.prototype._undestroy = Readable.prototype._undestroy;
+  /* Node declares _writev as an own null property: a stream opts in by assigning its own. */
+  Writable.prototype._writev = null;
+  Object.defineProperty(Writable.prototype, 'writableBuffer', {
+    get: function () { var w = this._writableState; return w ? w.buffered : undefined; },
+    set: function (value) { if (this._writableState) this._writableState.buffered = value; },
+    configurable: true
+  });
+  Object.defineProperty(Writable.prototype, 'writableAborted', {
+    get: function () {
+      var w = this._writableState;
+      if (!w) return false;
+      return (!!w.destroyed || !!w.errored) && !w.finished;
+    },
+    configurable: true
+  });
+  Writable.prototype.pipe = function () {
+    destroyImpl.call(this, owcErr(Error, 'ERR_STREAM_CANNOT_PIPE', 'Cannot pipe, not readable'));
+  };
+
   // ---------------------------------------------------------------- Duplex
 
   function Duplex(options) {
     if (!(this instanceof Duplex)) return new Duplex(options);
-    Readable.call(this, options);
-    Writable.call(this, options);
-    this.allowHalfOpen = !(options && options.allowHalfOpen === false);
-    if (options && options.readable === false) {
-      this._readableState.readable = false;
-      this._readableState.ended = true;
-      this._readableState.endEmitted = true;
+    /* Duplex builds both states itself and only then lets EventEmitter finish the job, so a duplex
+       owns no _read/_write until an option supplies them and _maxListeners lands last. */
+    if (this._events === undefined) {
+      this._events = {
+        close: undefined,
+        error: undefined,
+        prefinish: undefined,
+        finish: undefined,
+        drain: undefined,
+        data: undefined,
+        end: undefined,
+        readable: undefined
+      };
     }
-    if (options && options.writable === false) {
-      this._writableState.writable = false;
-      this._writableState.ending = true;
-      this._writableState.ended = true;
-      this._writableState.finished = true;
+    this._readableState = makeReadableState(options, true);
+    this._writableState = makeWritableState(options, true, this);
+    if (options) {
+      this.allowHalfOpen = options.allowHalfOpen !== false;
+      if (options.readable === false) {
+        this._readableState.readable = false;
+        this._readableState.ended = true;
+        this._readableState.endEmitted = true;
+      }
+      if (options.writable === false) {
+        this._writableState.writable = false;
+        this._writableState.ending = true;
+        this._writableState.ended = true;
+        this._writableState.finished = true;
+      }
+      if (typeof options.read === 'function') this._read = options.read;
+      if (typeof options.write === 'function') this._write = options.write;
+      if (typeof options.writev === 'function') this._writev = options.writev;
+      if (typeof options.destroy === 'function') this._destroy = options.destroy;
+      if (typeof options.final === 'function') this._final = options.final;
+      if (typeof options.construct === 'function') this._construct = options.construct;
+      if (options.signal) addAbortSignal(options.signal, this);
+    } else {
+      this.allowHalfOpen = true;
+    }
+    Stream.call(this, options);
+    if (this._construct !== undefined && this._construct !== null) {
+      var self = this;
+      constructStream(this, function () {
+        readableOnConstructed(self);
+        writableOnConstructed(self);
+      });
     }
   }
   Object.setPrototypeOf(Duplex.prototype, Readable.prototype);
   Object.setPrototypeOf(Duplex, Readable);
-  Object.keys(Writable.prototype).forEach(function (method) {
-    if (!Duplex.prototype[method]) Duplex.prototype[method] = Writable.prototype[method];
+  /* Node re-declares every Writable member on Duplex.prototype except the destroy/error/closed
+     group, so those names are own on Duplex rather than inherited from Readable. */
+  var DUPLEX_INHERIT_SKIP = { constructor: true, _destroy: true, _undestroy: true, closed: true, errored: true, pipe: true, writableAborted: true };
+  Object.getOwnPropertyNames(Writable.prototype).forEach(function (method) {
+    if (DUPLEX_INHERIT_SKIP[method] === true) return;
+    Object.defineProperty(Duplex.prototype, method, Object.getOwnPropertyDescriptor(Writable.prototype, method));
   });
   defineWritableGetters(Duplex.prototype);
+  /* Duplex.from: the same bodies Readable.from does not take -- a function, a promise and a
+     { readable, writable } pair -- over the same converter compose uses, so a generator function,
+     Duplex.from(Promise.resolve('pz')) and Duplex.from({ readable, writable }) all work as on a
+     host. Inherited from Readable it answered Readable.from and rejected all three as iterables. */
+  Duplex.from = function (body) {
+    return duplexFrom(body);
+  };
 
   // ---------------------------------------------------------------- Transform
 
@@ -2125,10 +2602,104 @@ function owcBuildStreamCore() {
   function pipelineBody(value) {
     if (isStreamLike(value)) return value;
     if (typeof value === 'function') return funcToDuplex(value);
+    if (value && typeof value.then === 'function') return promiseToDuplex(value);
+    if (value && (readableTrait(value.readable) || writableTrait(value.writable))) return pairToDuplex(value);
     if (value && (typeof value[Symbol.asyncIterator] === 'function' || typeof value[Symbol.iterator] === 'function')) {
       return Readable.from(value);
     }
     throw argBodyError(value);
+  }
+
+  /* A { readable, writable } pair is a body of its own: the two halves become the two sides of one
+     Duplex, which is what Duplex.from answers for that shape. */
+  function pairToDuplex(pair) {
+    var r = pair.readable;
+    var w = pair.writable;
+    var readable = readableTrait(r);
+    var writable = writableTrait(w);
+    var d = new Duplex({
+      objectMode: !!(r && r.readableObjectMode) || !!(w && w.writableObjectMode),
+      readable: readable,
+      writable: writable
+    });
+    if (readable) {
+      r.on('end', function () {
+        d.push(null);
+      });
+      r.on('readable', function () {
+        d._read();
+      });
+      d._read = function () {
+        for (;;) {
+          var chunk = r.read();
+          if (chunk === null) return;
+          if (!d.push(chunk)) return;
+        }
+      };
+    }
+    if (writable) {
+      d._write = function (chunk, encoding, callback) {
+        if (w.write(chunk, encoding)) callback();
+        else w.once('drain', callback);
+      };
+      d._final = function (callback) {
+        w.end(callback);
+      };
+    }
+    return d;
+  }
+
+  // A promise body settles into one chunk: whatever it resolves to is pushed once, as it is.
+  function promiseToDuplex(value) {
+    var out = new Duplex({
+      objectMode: true,
+      read: function () {},
+      /* What is written to it goes nowhere: a promise is a source, so a promise body in the middle
+         of a composed chain takes the link before it and answers with its own value instead. */
+      write: function (chunk, encoding, callback) {
+        callback();
+      },
+      final: function (callback) {
+        callback();
+      }
+    });
+    Promise.resolve(value).then(function (settled) {
+      if (!isStreamLike(settled)) {
+        out.push(settled);
+        out.push(null);
+        return;
+      }
+      out._read = function () {
+        settled.resume();
+      };
+      settled.on('data', function (chunk) {
+        if (!out.push(chunk)) settled.pause();
+      });
+      settled.on('end', function () {
+        out.push(null);
+      });
+      settled.on('error', function (err) {
+        out.destroy(err);
+      });
+    }, function (err) {
+      out.destroy(err);
+    });
+    return out;
+  }
+
+  /* What a body function answered with is a body in its own right, and Node reads it the same way it
+     reads one handed to compose: a string or a Buffer is one chunk, an iterable is its values, a
+     stream is the next link, and anything else is not a body at all. */
+  function bodyValue(value) {
+    if (isStreamLike(value)) return value;
+    if (typeof value === 'string' || Buf.isBuffer(value)) return Readable.from(value);
+    if (value && typeof value.then === 'function') return promiseToDuplex(value);
+    if (value && (readableTrait(value.readable) || writableTrait(value.writable))) return pairToDuplex(value);
+    if (value && typeof value[Symbol.asyncIterator] === 'function') return Readable.from(value);
+    if (value && typeof value[Symbol.iterator] === 'function') return Readable.from(value);
+    throw owcErr(TypeError, 'ERR_INVALID_RETURN_VALUE',
+      'Expected Iterable, AsyncIterable or AsyncFunction to be returned from the "body" function but got '
+      + describeReceived(value).replace(/^ Received /, '') + '.');
   }
 
   function readableTrait(value) {
@@ -2139,22 +2710,25 @@ function owcBuildStreamCore() {
     return !!value && typeof value === 'object' && value.writable !== false && typeof value.write === 'function';
   }
 
-  function traitName(value) {
-    if (value && value.constructor && value.constructor.name) return 'an instance of ' + value.constructor.name;
-    return String(value);
+  /* Node's ERR_INVALID_ARG_VALUE prints the value itself, not its class: a stream that lands in the
+     wrong position of a compose is dumped whole, cut at 128 characters. */
+  function inspectValue(value) {
+    try {
+      return requireBuiltin('util').inspect(value);
+    } catch (failure) {
+      return String(value);
+    }
   }
 
   function traitError(index, value, reason) {
+    var shown = inspectValue(value);
+    if (shown.length > 128) shown = shown.slice(0, 128) + '...';
     return owcErr(TypeError, 'ERR_INVALID_ARG_VALUE',
-      "The argument 'streams[" + index + "]' must be " + reason + '. Received ' + traitName(value));
+      "The argument 'streams[" + index + "]' must be " + reason + '. Received ' + shown);
   }
 
   // Duplex.from(fn): the writable side feeds the generator's argument, the readable side yields it.
-  function funcToDuplex(fn) {
-    if (typeof fn !== 'function') return fn;
-    var source = new PassThrough({ objectMode: true });
-    var iterator = fn(source);
-    if (!iterator || typeof iterator.next !== 'function') throw argBodyError(fn);
+  function iteratorToDuplex(iterator, source) {
     var duplex = new Duplex({
       objectMode: true,
       write: function (chunk, encoding, callback) {
@@ -2183,6 +2757,31 @@ function owcBuildStreamCore() {
       });
     }
     return duplex;
+  }
+
+  /* Node calls a function that takes no argument at once and takes what it answers as the next link
+     in the chain; one that takes the source is a generator over it, and what it answers is read as
+     an iterable even when it is a stream. */
+  function funcToDuplex(fn) {
+    if (typeof fn !== 'function') return fn;
+    if (fn.length === 0) {
+      var made = fn();
+      if (made === null || typeof made !== 'object') return bodyValue(made);
+      if (typeof made.next === 'function') return iteratorToDuplex(made, new PassThrough({ objectMode: true }));
+      return bodyValue(made);
+    }
+    var source = new PassThrough({ objectMode: true });
+    var iterator = fn(source);
+    if (iterator === null || typeof iterator !== 'object') return bodyValue(iterator);
+    if (typeof iterator.next !== 'function') {
+      /* A string or a Buffer answered by a body of one argument is one chunk, as Node reads it, and
+         not an iterable of characters or of bytes. */
+      if (typeof iterator === 'string' || Buf.isBuffer(iterator)) return bodyValue(iterator);
+      if (typeof iterator[Symbol.asyncIterator] === 'function') iterator = iterator[Symbol.asyncIterator]();
+      else if (typeof iterator[Symbol.iterator] === 'function') iterator = iterator[Symbol.iterator]();
+      else return bodyValue(iterator);
+    }
+    return iteratorToDuplex(iterator, source);
   }
 
   function duplexFrom(value) {
@@ -2235,6 +2834,8 @@ function owcBuildStreamCore() {
     // the transform between the two streams around it.
     for (var m = 0; m < streams.length; m++) {
       if (typeof streams[m] === 'function') streams[m] = funcToDuplex(streams[m]);
+      /* A promise is a body wherever it stands too, and what it settles to is the link. */
+      else if (streams[m] && typeof streams[m].then === 'function') streams[m] = promiseToDuplex(streams[m]);
     }
     for (var n = 0; n < streams.length; n++) {
       var item = streams[n];
@@ -2402,36 +3003,48 @@ function owcBuildStreamCore() {
   /* duplexPair: two duplexes wired to each other, so what one is written with the other reads.
      Each side's write pushes straight into the other's readable buffer and waits for that side to
      ask for more before it takes another chunk; ending one side ends the other's readable half. */
+  /* The two sides Node's duplexPair answers are instances of its own DuplexSide subclass of Duplex,
+     so that is the name a caller reads off them, and _read/_write/_final are methods on that
+     subclass's prototype rather than properties of each side: a side owns no underscore methods. */
+  var kDuplexSideCallback = Symbol('Callback');
+  var kDuplexSideOther = Symbol('owcOtherSide');
+
+  function DuplexSide(options) {
+    if (!(this instanceof DuplexSide)) return new DuplexSide(options);
+    Duplex.call(this, options);
+    this[kDuplexSideCallback] = null;
+    this[kDuplexSideOther] = null;
+  }
+  Object.setPrototypeOf(DuplexSide.prototype, Duplex.prototype);
+  Object.setPrototypeOf(DuplexSide, Duplex);
+  DuplexSide.prototype._read = function () {
+    var callback = this[kDuplexSideCallback];
+    if (callback) {
+      this[kDuplexSideCallback] = null;
+      callback();
+    }
+  };
+  DuplexSide.prototype._write = function (chunk, encoding, callback) {
+    var other = this[kDuplexSideOther];
+    if (chunk.length === 0) process.nextTick(callback);
+    else {
+      other.push(chunk);
+      other[kDuplexSideCallback] = callback;
+    }
+  };
+  DuplexSide.prototype._final = function (callback) {
+    var other = this[kDuplexSideOther];
+    other.on('end', callback);
+    other.push(null);
+  };
+
   function duplexPair(options) {
     var opts = options || {};
-    var sides = [];
-    var awaiting = [null, null];
-    function make(index) {
-      var other = 1 - index;
-      return new Duplex({
-        objectMode: !!opts.objectMode,
-        highWaterMark: opts.highWaterMark,
-        allowHalfOpen: true,
-        read: function () {
-          var cb = awaiting[index];
-          if (cb !== null) {
-            awaiting[index] = null;
-            cb();
-          }
-        },
-        write: function (chunk, encoding, callback) {
-          if (sides[other].push(chunk)) callback();
-          else awaiting[other] = callback;
-        },
-        final: function (callback) {
-          sides[other].push(null);
-          callback();
-        }
-      });
-    }
-    sides[0] = make(0);
-    sides[1] = make(1);
-    return sides;
+    var side0 = new DuplexSide({ objectMode: !!opts.objectMode, highWaterMark: opts.highWaterMark });
+    var side1 = new DuplexSide({ objectMode: !!opts.objectMode, highWaterMark: opts.highWaterMark });
+    side0[kDuplexSideOther] = side1;
+    side1[kDuplexSideOther] = side0;
+    return [side0, side1];
   }
 
   // ---------------------------------------------------------------- web streams
@@ -2584,25 +3197,25 @@ function owcBuildStreamCore() {
     return new Duplex(opts);
   };
 
-  Stream.Stream = Stream;
+  /*
+   * The order these are assigned in is the order Object.keys(require('node:stream')) reads them
+   * back in, and a host's order is not alphabetical: its five predicates come first, then the
+   * constructors and helpers, then 'promises', 'Stream', and the three underscore helpers last.
+   */
+  Stream.isDestroyed = streamIsDestroyed;
+  Stream.isDisturbed = streamIsDisturbed;
+  Stream.isErrored = streamIsErrored;
+  Stream.isReadable = streamIsReadable;
+  Stream.isWritable = streamIsWritable;
   Stream.Readable = Readable;
   Stream.Writable = Writable;
   Stream.Duplex = Duplex;
   Stream.Transform = Transform;
   Stream.PassThrough = PassThrough;
-  Stream.pipeline = pipeline;
-  Stream.finished = finished;
-  Stream.promises = streamPromises;
-  Stream.getDefaultHighWaterMark = getDefaultHighWaterMark;
-  Stream.setDefaultHighWaterMark = setDefaultHighWaterMark;
-  Stream.addAbortSignal = addAbortSignal;
-  Stream.compose = compose;
-  Stream.isReadable = streamIsReadable;
-  Stream.isWritable = streamIsWritable;
-  Stream.isErrored = streamIsErrored;
-  Stream.isDisturbed = streamIsDisturbed;
-  Stream.isDestroyed = streamIsDestroyed;
   Stream.duplexPair = duplexPair;
+  Stream.pipeline = pipeline;
+  Stream.addAbortSignal = addAbortSignal;
+  Stream.finished = finished;
   /*
    * The four a host's stream module exports beside these and this one did not: 'destroy' is the
    * destroy a caller hands a stream -- an aborted signal's handler gives it one -- and the three
@@ -2615,8 +3228,13 @@ function owcBuildStreamCore() {
     if (typeof stream.destroy !== 'function') return;
     stream.destroy(err);
   };
-  Stream._isUint8Array = function (value) { return value instanceof Uint8Array; };
+  Stream.compose = compose;
+  Stream.setDefaultHighWaterMark = setDefaultHighWaterMark;
+  Stream.getDefaultHighWaterMark = getDefaultHighWaterMark;
+  Stream.promises = streamPromises;
+  Stream.Stream = Stream;
   Stream._isArrayBufferView = function (value) { return ArrayBuffer.isView(value); };
+  Stream._isUint8Array = function (value) { return value instanceof Uint8Array; };
   Stream._uint8ArrayToBuffer = function (chunk) {
     return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
   };
@@ -2631,17 +3249,17 @@ function owcBuildStreamCore() {
      line is not remembered, and a historySize of 0 remembers nothing. */
   function addHistory(self, line) {
     if (line.length === 0 || self.historySize === 0) return;
-    var h = self[kState].history;
+    var h = self[kRlState].history;
     if (h.length === 0 || h[0] !== line) {
       h.unshift(line);
       if (h.length > self.historySize) h.pop();
     }
   }
 
-  function deliverLine(self, line) {
-    var st = self[kState];
-    addHistory(self, line);
-    if (st.questionCallback !== null) {
+  /* A finished line goes to the question waiting for one, or to the 'line' event. */
+  function dispatchLine(self, line) {
+    var st = self[kRlState];
+    if (st.questionCallback !== null && st.questionCallback !== undefined) {
       var answer = st.questionCallback;
       st.questionCallback = null;
       self.setPrompt(st.oldPrompt);
@@ -2651,12 +3269,20 @@ function owcBuildStreamCore() {
     }
   }
 
+  /* Node records history on the terminal path only: _line() remembers the line it finished, while a
+     non-terminal interface hands each line straight to _onLine and leaves rl.history empty. */
+  function deliverLine(self, line) {
+    if (self.terminal) addHistory(self, line);
+    if (self.historyIndex !== undefined) self.historyIndex = -1;
+    dispatchLine(self, line);
+  }
+
   /* A terminal interface answers the two control keys that end or interrupt a line the way Node's
      does: Ctrl-D on an empty line is end of file and closes the interface, and Ctrl-C raises
      SIGINT. Both are plain characters to a non-terminal interface, which only splits on newlines.
      The filter answers null once it has closed the interface, so nothing more is written to it. */
   function stripTerminalControls(self, text) {
-    var st = self[kState];
+    var st = self[kRlState];
     var out = '';
     var pending = st.lineBuffer.length;
     for (var i = 0; i < text.length; i++) {
@@ -2730,9 +3356,9 @@ function owcBuildStreamCore() {
     return out;
   }
 
-  function normalWrite(self, b) {
+  function normalWrite(self, b, key) {
     if (b === undefined || b === null) return;
-    var st = self[kState];
+    var st = self[kRlState];
     var text = st.decoder.write(b);
     if (self.terminal) {
       text = stripTerminalControls(self, text);
@@ -2742,7 +3368,10 @@ function owcBuildStreamCore() {
       if (text.charCodeAt(0) === 10) text = text.slice(1);
       st.sawReturnAt = 0;
     }
-    if (self.terminal) {
+    /* Only a real tab *key* completes: a plain write() inserts the text it was given whole, tab
+       included, so rl.write('a\\t') leaves the line as 'a\\t' and never calls the completer. */
+    var completing = self.terminal && !!key && key.name === 'tab' && typeof self.completer === 'function';
+    if (self.terminal && completing) {
       /* A terminal interface echoes the line as it is built, as Node's does: the characters typed
          and then the text a completion adds. A non-terminal one writes nothing. */
       text = completeTabs(self, st.lineBuffer, text, function (piece) { writeOutput(self, piece); });
@@ -2755,10 +3384,18 @@ function owcBuildStreamCore() {
     var start = 0;
     var match;
     while ((match = pattern.exec(text)) !== null) {
-      deliverLine(self, text.slice(start, match.index));
+      var done = text.slice(start, match.index);
+      if (self.terminal && !completing && done.length > 0) writeOutput(self, done);
+      deliverLine(self, done);
+      /* Node ends each line a terminal interface finishes with a newline on the output. */
+      if (self.terminal && !completing) writeOutput(self, '\r\n');
       start = pattern.lastIndex;
     }
-    st.lineBuffer = text.slice(start);
+    var tail = text.slice(start);
+    /* Node inserts whatever follows the last line ending even when that is the empty string, so a
+       terminal write that ends a line also writes one empty chunk after the newline. */
+    if (self.terminal && !completing && text.length > 0) writeOutput(self, tail);
+    st.lineBuffer = tail;
     if (text.length > 0 && text.charCodeAt(text.length - 1) === 13) st.sawReturnAt = Date.now();
     /* A terminal interface keeps the line it is reading on the interface, as Node's does: rl.line is
        the text typed so far and rl.cursor the column inside it. A non-terminal one only splits on
@@ -2804,35 +3441,127 @@ function owcBuildStreamCore() {
     };
   }
 
+  /* Node's HistoryManager (internal/repl/history.js, whose class is named ReplHistory): it owns the
+     array the interface exposes and the index of the line being navigated, both behind prototype
+     accessors, so a manager carries no own property of its own. */
+  var kHistory = Symbol('owcReplHistory');
+
+  function ReplHistory(iface) {
+    this[kHistory] = { iface: iface, index: -1, flushing: false, size: iface ? iface.historySize : 30, history: iface ? iface.history : [] };
+  }
+  ReplHistory.prototype.initialize = function (history) {
+    var bag = this[kHistory];
+    bag.history = Array.isArray(history) ? history : [];
+    bag.index = -1;
+  };
+  ReplHistory.prototype.addHistory = function () {
+    var bag = this[kHistory];
+    var line = bag.iface.line === undefined ? '' : bag.iface.line;
+    if (line.length === 0 || bag.size === 0) return line;
+    if (bag.history.length === 0 || bag.history[0] !== line) {
+      bag.history.unshift(line);
+      while (bag.history.length > bag.size) bag.history.pop();
+    }
+    bag.index = -1;
+    return line;
+  };
+  ReplHistory.prototype.canNavigateToNext = function () {
+    return this[kHistory].index > -1;
+  };
+  ReplHistory.prototype.navigateToNext = function () {
+    var bag = this[kHistory];
+    if (bag.index === -1) return '';
+    bag.index--;
+    return bag.index === -1 ? '' : bag.history[bag.index];
+  };
+  ReplHistory.prototype.canNavigateToPrevious = function () {
+    var bag = this[kHistory];
+    return bag.index < bag.history.length - 1;
+  };
+  ReplHistory.prototype.navigateToPrevious = function () {
+    var bag = this[kHistory];
+    bag.index++;
+    return bag.history[bag.index];
+  };
+  Object.defineProperty(ReplHistory.prototype, 'size', {
+    get: function () { return this[kHistory].size; },
+    set: function (value) { this[kHistory].size = value; },
+    configurable: true
+  });
+  Object.defineProperty(ReplHistory.prototype, 'isFlushing', {
+    get: function () { return this[kHistory].flushing; },
+    set: function (value) { this[kHistory].flushing = !!value; },
+    configurable: true
+  });
+  Object.defineProperty(ReplHistory.prototype, 'history', {
+    get: function () { return this[kHistory].history; },
+    set: function (value) { this[kHistory].history = value; },
+    configurable: true
+  });
+  Object.defineProperty(ReplHistory.prototype, 'index', {
+    get: function () { return this[kHistory].index; },
+    set: function (value) { this[kHistory].index = value; },
+    configurable: true
+  });
+
+  /* Node's readline Interface extends an internal base class: the public surface (clearLine, close,
+     columns, getCursorPos, getPrompt, pause, prompt, resume, setPrompt, setupHistoryManager, write)
+     is own on the base prototype, and the legacy Interface.prototype owns only the private
+     _-prefixed members plus question. */
+  function OwcRlBase() {}
+  Object.setPrototypeOf(OwcRlBase.prototype, EventEmitter.prototype);
+  Object.setPrototypeOf(OwcRlBase, EventEmitter);
+  Object.defineProperty(OwcRlBase.prototype, 'columns', {
+    get: function () { return this.output === null || this.output === undefined ? undefined : this.output.columns; },
+    configurable: true
+  });
+  OwcRlBase.prototype.clearLine = function (dir) {
+    var code = dir < 0 ? '\x1b[1K' : dir > 0 ? '\x1b[0K' : '\x1b[2K';
+    writeOutput(this, code);
+  };
+  OwcRlBase.prototype.setupHistoryManager = function (history, historySize) {
+    var manager = new ReplHistory(this);
+    if (Array.isArray(history)) manager.initialize(history);
+    if (typeof historySize === 'number') manager.size = historySize;
+    this.historyManager = manager;
+  };
+
   function Interface(input, output, completer, terminal) {
     var opts = input !== null && typeof input === 'object' && input.input !== undefined
       ? input
       : { input: input, output: output, completer: completer, terminal: terminal };
     EventEmitter.call(this);
     var self = this;
-    Object.defineProperty(this, kState, {
+    Object.defineProperty(this, kRlState, {
       value: {
         prompt: opts.prompt !== undefined ? String(opts.prompt) : '> ',
-        oldPrompt: '> ',
+        oldPrompt: undefined,
         questionCallback: null,
         lineBuffer: '',
         sawReturnAt: 0,
+        sawKeyPress: false,
+        previousKey: null,
+        prevRows: 0,
         decoder: createDecoder('utf8'),
         lineIterator: null,
         onData: null,
         onEnd: null,
-        history: []
+        /* A history handed in with the options seeds the array the interface reads, as Node's does:
+           createInterface({ history: ['x', 'y'] }) leaves rl.history holding those two lines. */
+        history: Array.isArray(opts.history) ? opts.history.slice() : []
       },
       enumerable: false,
       writable: true,
       configurable: true
     });
-    var st = this[kState];
+    var st = this[kRlState];
     this.input = opts.input;
     this.output = opts.output;
     this.terminal = opts.terminal !== undefined ? !!opts.terminal : !!(opts.output && opts.output.isTTY);
     this.line = '';
-    this.cursor = 0;
+    /* Only a terminal interface gets a cursor: on a non-terminal one rl.cursor is not a key of the
+       interface at all, and reading it answers undefined, as on the host. */
+    if (this.terminal) this.cursor = 0;
     this.tabSize = opts.tabSize !== undefined ? opts.tabSize : 8;
     this.escapeCodeTimeout = opts.escapeCodeTimeout !== undefined ? opts.escapeCodeTimeout : 500;
     /* Node always sets the completer, so it is a key of the interface whether or not one was given. */
@@ -2842,6 +3571,11 @@ function owcBuildStreamCore() {
        a line recorded later is seen by a caller who already holds rl.history. */
     this.history = st.history;
     this.crlfDelay = opts.crlfDelay ? Math.max(100, opts.crlfDelay) : 100;
+    /* The history manager the interface keeps beside the array: historyIndex mirrors its index. */
+    this.historyIndex = -1;
+    this.historyManager = new ReplHistory(this);
+    this.isCompletionEnabled = true;
+    this.isFlushing = false;
 
     st.onData = function (chunk) {
       normalWrite(self, chunk);
@@ -2862,22 +3596,22 @@ function owcBuildStreamCore() {
     if (this.terminal) emitKeypressEvents(this.input, this);
     if (typeof this.input.resume === 'function') this.input.resume();
   }
-  Object.setPrototypeOf(Interface.prototype, EventEmitter.prototype);
-  Object.setPrototypeOf(Interface, EventEmitter);
+  Object.setPrototypeOf(Interface.prototype, OwcRlBase.prototype);
+  Object.setPrototypeOf(Interface, OwcRlBase);
 
-  Interface.prototype.setPrompt = function (prompt) {
-    this[kState].prompt = String(prompt);
+  OwcRlBase.prototype.setPrompt = function (prompt) {
+    this[kRlState].prompt = String(prompt);
   };
 
-  Interface.prototype.getPrompt = function () {
-    return this[kState].prompt;
+  OwcRlBase.prototype.getPrompt = function () {
+    return this[kRlState].prompt;
   };
 
   /* getCursorPos answers the column and row the cursor sits on, counted from the start of the
      prompt: the prompt and the text of the line before the cursor give the column, and a line that
      fits the terminal's width, or one whose width is unknown, gives no row. */
-  Interface.prototype.getCursorPos = function () {
-    var cols = this[kState].prompt.length + (this.cursor === undefined ? 0 : this.cursor);
+  OwcRlBase.prototype.getCursorPos = function () {
+    var cols = this[kRlState].prompt.length + (this.cursor === undefined ? 0 : this.cursor);
     var columns = this.output === null || this.output === undefined ? undefined : this.output.columns;
     if (typeof columns === 'number' && columns > 0) return { cols: cols % columns, rows: Math.floor(cols / columns) };
     return { cols: cols, rows: 0 };
@@ -2886,22 +3620,33 @@ function owcBuildStreamCore() {
   /* A terminal interface redraws the line when it prompts, as Node does: back to the first column,
      clear what is below, the prompt and the line being read, then the cursor where the prompt and
      the column inside the line put it. Node leaves the cursor alone for a caller who asks it to. */
-  Interface.prototype.prompt = function (preserveCursor) {
+  OwcRlBase.prototype.prompt = function (preserveCursor) {
     if (this.paused) this.resume();
-    var st = this[kState];
+    var st = this[kRlState];
     if (!this.terminal) {
       writeOutput(this, st.prompt);
       return;
     }
     if (!preserveCursor) this.cursor = 0;
     var line = this.line === undefined ? '' : this.line;
-    writeOutput(this, '\x1b[1G\x1b[0J' + st.prompt + line + '\x1b[' + (st.prompt.length + this.cursor + 1) + 'G');
+    /* Four separate writes, as Node's _refreshLine makes: home, clear below, prompt plus the line
+       being read, then the cursor where the prompt and the column inside the line put it. */
+    writeOutput(this, '\x1b[1G');
+    writeOutput(this, '\x1b[0J');
+    writeOutput(this, st.prompt + line);
+    var pos = this.getCursorPos();
+    writeOutput(this, '\x1b[' + (pos.cols + 1) + 'G');
   };
 
   Interface.prototype.question = function (query, options, cb) {
     var callback = typeof options === 'function' ? options : cb;
     if (this.closed) throw errUseAfterClose();
-    var st = this[kState];
+    /* Node validates options.signal before it writes the query: a signal that is not an AbortSignal
+       is refused, and nothing is prompted. */
+    if (options !== null && typeof options === 'object' && options.signal !== undefined) {
+      checkSignalProp(options.signal);
+    }
+    var st = this[kRlState];
     if (st.questionCallback !== null) {
       this.prompt();
     } else {
@@ -2912,13 +3657,377 @@ function owcBuildStreamCore() {
     }
   };
 
-  Interface.prototype.write = function (data) {
-    if (this.closed) throw errUseAfterClose();
-    if (this.paused) this.resume();
-    normalWrite(this, data);
+  /*
+   * The private members Node's lib/readline.js declares on Interface.prototype. They are the line
+   * editor behind a terminal interface; on the non-terminal path, which is what an in-browser
+   * container runs, only _normalWrite, _onLine, _line, _addHistory, _writeToOutput and the
+   * accessors carry behaviour. The eight accessors read and write the interface's own state bag.
+   */
+  function defineRlAccessor(name, field) {
+    Object.defineProperty(Interface.prototype, name, {
+      get: function () { return this[kRlState][field]; },
+      set: function (value) { this[kRlState][field] = value; },
+      enumerable: false,
+      configurable: true
+    });
+  }
+  defineRlAccessor('_decoder', 'decoder');
+  defineRlAccessor('_line_buffer', 'lineBuffer');
+  defineRlAccessor('_oldPrompt', 'oldPrompt');
+  defineRlAccessor('_previousKey', 'previousKey');
+  defineRlAccessor('_prompt', 'prompt');
+  defineRlAccessor('_questionCallback', 'questionCallback');
+  defineRlAccessor('_sawKeyPress', 'sawKeyPress');
+  defineRlAccessor('_sawReturnAt', 'sawReturnAt');
+
+  Interface.prototype._writeToOutput = function (stringToWrite) {
+    if (typeof stringToWrite !== 'string') throw argTypeError('stringToWrite', 'of type string', stringToWrite);
+    writeOutput(this, stringToWrite);
   };
 
-  Interface.prototype.pause = function () {
+  Interface.prototype._setRawMode = function (mode) {
+    var wasInRawMode = this.input.isRaw;
+    if (typeof this.input.setRawMode === 'function') this.input.setRawMode(mode);
+    return wasInRawMode;
+  };
+
+  Interface.prototype._getCursorPos = OwcRlBase.prototype.getCursorPos;
+
+  /* The column and row a string ends on, counted with the terminal's width: the escape sequences a
+     prompt carries are not columns, a newline always costs a row, and a surrogate pair is one. */
+  Interface.prototype._getDisplayPos = function (str) {
+    var text = typeof str === 'string' ? str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '') : '';
+    var col = this.columns;
+    if (typeof col !== 'number' || col <= 0) col = Infinity;
+    var offset = 0;
+    var rows = 0;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (ch === '\n') {
+        rows += Math.ceil(offset / col) || 1;
+        offset = 0;
+        continue;
+      }
+      var code = text.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) i++;
+      offset++;
+      if (offset >= col) {
+        rows++;
+        offset = 0;
+      }
+    }
+    return { cols: offset, rows: rows };
+  };
+
+  function rlCursor(self) {
+    if (self.cursor === undefined || self.cursor === null) self.cursor = 0;
+    return self.cursor;
+  }
+  function rlLine(self) {
+    if (self.line === undefined || self.line === null) self.line = '';
+    return self.line;
+  }
+
+  Interface.prototype._insertString = function (c) {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at < line.length) this.line = line.slice(0, at) + c + line.slice(at);
+    else this.line = line + c;
+    this.cursor = at + c.length;
+    if (this.terminal) this._refreshLine();
+  };
+
+  /* A character left of the cursor is one UTF-16 unit, or two when it is half of a surrogate pair. */
+  function charSizeLeft(line, at) {
+    if (at <= 1) return 1;
+    var code = line.charCodeAt(at - 1);
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      var lead = line.charCodeAt(at - 2);
+      if (lead >= 0xd800 && lead <= 0xdbff) return 2;
+    }
+    return 1;
+  }
+  function charSizeAt(line, at) {
+    var code = line.charCodeAt(at);
+    if (code >= 0xd800 && code <= 0xdbff && at + 1 < line.length) return 2;
+    return 1;
+  }
+
+  Interface.prototype._deleteLeft = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at <= 0 || line.length === 0) return;
+    var size = charSizeLeft(line, at);
+    this.line = line.slice(0, at - size) + line.slice(at);
+    this.cursor = at - size;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteRight = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at >= line.length) return;
+    var size = charSizeAt(line, at);
+    this.line = line.slice(0, at) + line.slice(at + size);
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteLineLeft = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    this.line = line.slice(at);
+    this.cursor = 0;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteLineRight = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    this.line = line.slice(0, at);
+    if (this.terminal) this._refreshLine();
+  };
+
+  var WORD_LEFT = /^\s*(?:[^\w\s]+|\w+)?/;
+  var WORD_RIGHT = /^(?:\s+|[^\w\s]+|\w+)\s*/;
+
+  Interface.prototype._wordLeft = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at <= 0) return;
+    var leading = line.slice(0, at);
+    var match = WORD_LEFT.exec(leading);
+    var take = match === null ? 1 : match[0].length;
+    this.cursor = at - take;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._wordRight = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at >= line.length) return;
+    var match = WORD_RIGHT.exec(line.slice(at));
+    if (match === null) return;
+    this.cursor = at + match[0].length;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteWordLeft = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at <= 0) return;
+    var leading = line.slice(0, at);
+    var match = WORD_LEFT.exec(leading);
+    var take = match === null ? 1 : match[0].length;
+    this.line = leading.slice(0, leading.length - take) + line.slice(at);
+    this.cursor = at - take;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._deleteWordRight = function () {
+    var line = rlLine(this);
+    var at = rlCursor(this);
+    if (at >= line.length) return;
+    var trailing = line.slice(at);
+    var match = WORD_RIGHT.exec(trailing);
+    if (match === null) return;
+    this.line = line.slice(0, at) + trailing.slice(match[0].length);
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._moveCursor = function (dx) {
+    if (dx === 0) return;
+    var at = rlCursor(this) + dx;
+    var line = rlLine(this);
+    if (at < 0) at = 0;
+    else if (at > line.length) at = line.length;
+    this.cursor = at;
+    if (this.terminal) this._refreshLine();
+  };
+
+  /* The line, redrawn: back to the first column, clear what is below, write the prompt and the line,
+     then put the cursor where the prompt and the column inside the line put it. */
+  Interface.prototype._refreshLine = function () {
+    if (!this.terminal) return;
+    var st = this[kRlState];
+    var line = st.prompt + rlLine(this);
+    var dispPos = this._getDisplayPos(line);
+    if (st.prevRows > 0) moveCursor(this.output, 0, -st.prevRows);
+    cursorTo(this.output, 0);
+    clearScreenDown(this.output);
+    writeOutput(this, line);
+    var cursorPos = this.getCursorPos();
+    if (dispPos.rows > cursorPos.rows) moveCursor(this.output, 0, -(dispPos.rows - cursorPos.rows));
+    cursorTo(this.output, cursorPos.cols);
+    st.prevRows = dispPos.rows;
+    st.prevCols = dispPos.cols;
+  };
+
+  Interface.prototype._addHistory = function () {
+    var line = rlLine(this);
+    addHistory(this, line);
+    if (this.historyIndex !== undefined) this.historyIndex = -1;
+    return line;
+  };
+
+  Interface.prototype._historyNext = function () {
+    var mgr = this.historyManager;
+    if (mgr !== undefined && mgr !== null) {
+      if (!mgr.canNavigateToNext()) return;
+      this.line = mgr.navigateToNext();
+      this.historyIndex = mgr.index;
+    } else {
+      if (this.historyIndex <= 0) {
+        this.historyIndex = -1;
+        this.line = '';
+      } else {
+        this.historyIndex--;
+        this.line = this.history[this.historyIndex];
+      }
+    }
+    this.cursor = rlLine(this).length;
+    if (this.terminal) this._refreshLine();
+  };
+
+  Interface.prototype._historyPrev = function () {
+    var mgr = this.historyManager;
+    if (mgr !== undefined && mgr !== null) {
+      if (!mgr.canNavigateToPrevious()) return;
+      this.line = mgr.navigateToPrevious();
+      this.historyIndex = mgr.index;
+    } else {
+      if (this.historyIndex + 1 >= this.history.length) return;
+      this.historyIndex++;
+      this.line = this.history[this.historyIndex];
+    }
+    this.cursor = rlLine(this).length;
+    if (this.terminal) this._refreshLine();
+  };
+
+  /* The line is finished: it is remembered, the edit buffer is cleared and it is handed to whatever
+     is waiting for it, a question's callback or the 'line' event. */
+  Interface.prototype._line = function () {
+    var line = this._addHistory();
+    this.line = '';
+    this.cursor = 0;
+    if (this.terminal) this.clearLine();
+    this._onLine(line);
+  };
+
+  Interface.prototype._onLine = function (line) {
+    dispatchLine(this, line);
+  };
+
+  Interface.prototype._normalWrite = function (b) {
+    normalWrite(this, b);
+  };
+
+  Interface.prototype._tabComplete = function (lastKeypressWasTab) {
+    if (typeof this.completer !== 'function') return;
+    var self = this;
+    var string = rlLine(this).slice(0, rlCursor(this));
+    this.pause();
+    this.completer(string, function (err, value) {
+      self.resume();
+      if (err) {
+        self._writeToOutput('Tab completion error: ' + String(err));
+        return;
+      }
+      var hits = Array.isArray(value) ? value[0] : null;
+      if (hits === null || hits === undefined || hits.length === 0) {
+        if (lastKeypressWasTab === true) self._writeToOutput('\x07');
+        return;
+      }
+      var on = typeof value[1] === 'string' ? value[1] : string;
+      var prefix = commonPrefixOf(hits);
+      if (prefix.length > on.length) self._insertString(prefix.slice(on.length));
+      else if (lastKeypressWasTab === true && hits.length > 1) self._writeToOutput('\r\n' + hits.join('  ') + '\r\n');
+    });
+  };
+
+  /* One keypress, decoded: the keys that end a line, the keys that edit it, the history keys and the
+     two control keys. Anything else is text and joins the line. */
+  Interface.prototype._ttyWrite = function (s, key) {
+    var st = this[kRlState];
+    var previousKey = st.previousKey;
+    st.previousKey = key === undefined || key === null ? {} : key;
+    if (s === undefined || s === null) return;
+    var name = key !== undefined && key !== null && typeof key.name === 'string' ? key.name : '';
+    var ctrl = key !== undefined && key !== null ? !!key.ctrl : false;
+    var meta = key !== undefined && key !== null ? !!key.meta : false;
+    if (name === 'return' || name === 'enter' || s === '\r' || s === '\n') {
+      this._line();
+      return;
+    }
+    if (meta && name === 'y') return;
+    if (ctrl && name === 'c') {
+      this.emit('SIGINT');
+      return;
+    }
+    if (ctrl && name === 'd') {
+      if (rlLine(this).length === 0) this.close();
+      else this._deleteRight();
+      return;
+    }
+    if (name === 'backspace') {
+      this._deleteLeft();
+      return;
+    }
+    if (name === 'delete') {
+      this._deleteRight();
+      return;
+    }
+    if (name === 'tab') {
+      this._tabComplete(previousKey !== null && previousKey !== undefined && previousKey.name === 'tab');
+      return;
+    }
+    if (name === 'up' || (ctrl && name === 'p')) {
+      this._historyPrev();
+      return;
+    }
+    if (name === 'down' || (ctrl && name === 'n')) {
+      this._historyNext();
+      return;
+    }
+    if (name === 'left' || (ctrl && name === 'b')) {
+      this._moveCursor(-1);
+      return;
+    }
+    if (name === 'right' || (ctrl && name === 'f')) {
+      this._moveCursor(1);
+      return;
+    }
+    if (name === 'home' || (ctrl && name === 'a')) {
+      this.cursor = 0;
+      if (this.terminal) this._refreshLine();
+      return;
+    }
+    if (name === 'end' || (ctrl && name === 'e')) {
+      this.cursor = rlLine(this).length;
+      if (this.terminal) this._refreshLine();
+      return;
+    }
+    if (ctrl && name === 'u') {
+      this._deleteLineLeft();
+      return;
+    }
+    if (ctrl && name === 'k') {
+      this._deleteLineRight();
+      return;
+    }
+    if (ctrl && name === 'w') {
+      this._deleteWordLeft();
+      return;
+    }
+    if (s.length > 0) this._insertString(s);
+  };
+
+  OwcRlBase.prototype.write = function (data, key) {
+    if (this.closed) throw errUseAfterClose();
+    if (this.paused) this.resume();
+    normalWrite(this, data, key);
+  };
+
+  OwcRlBase.prototype.pause = function () {
     if (this.paused) return this;
     this.input.pause();
     this.paused = true;
@@ -2926,7 +4035,7 @@ function owcBuildStreamCore() {
     return this;
   };
 
-  Interface.prototype.resume = function () {
+  OwcRlBase.prototype.resume = function () {
     if (!this.paused) return this;
     this.input.resume();
     this.paused = false;
@@ -2934,7 +4043,7 @@ function owcBuildStreamCore() {
     return this;
   };
 
-  Interface.prototype.close = function () {
+  OwcRlBase.prototype.close = function () {
     if (this.closed) return;
     this.pause();
     this.closed = true;
@@ -2942,7 +4051,7 @@ function owcBuildStreamCore() {
   };
 
   Interface.prototype[Symbol.asyncIterator] = function () {
-    var st = this[kState];
+    var st = this[kRlState];
     if (st.lineIterator === null) st.lineIterator = createLineIterator(this);
     return st.lineIterator;
   };
