@@ -624,7 +624,27 @@ export const SRC = String.raw`
 
     function setActive(d) {
       exp.active = d;
-      if (typeof process === 'object' && process !== null) process.domain = d;
+      if (typeof process === 'object' && process !== null) {
+        process.domain = d;
+        /*
+         * The uncaught-exception capture callback node registers for exactly as long as a domain is
+         * entered: measured on host node 24.15, process.hasUncaughtExceptionCaptureCallback() is
+         * false before d.run(), true inside it, true between enter() and exit(), and false again
+         * after. Nothing here calls the callback -- the path that would hand an error over is the
+         * host's, which reads no capture callback, so the loader routes an error with no caller by
+         * asking process.domain -- but registering it is what makes the predicate agree with a host.
+         */
+        if (typeof process.setUncaughtExceptionCaptureCallback === 'function') {
+          process.setUncaughtExceptionCaptureCallback(d ? captureUncaught : null);
+        }
+      }
+    }
+
+    /* what the capture callback above would do with an error no caller is going to receive */
+    function captureUncaught(err) {
+      var dom = exp.active;
+      if (!dom) return;
+      uncaughtInDomain(dom, err);
     }
 
     function Domain() {
@@ -685,6 +705,37 @@ export const SRC = String.raw`
       self.exit();
       return ret;
     }
+
+    /*
+     * The route node gives an error no caller is going to receive while a domain is entered: the
+     * uncaught-exception capture callback node installs for as long as one is (true inside d.run()
+     * and between enter() and exit() on host node 24.15, false again after) leaves the domain the
+     * way exit() does and then emits the error on it, so the handler sees _stack without this
+     * domain and process.domain as the next one out -- measured: one domain entered, the handler
+     * sees _stack 0 and process.domain undefined; two entered, it sees _stack 1 and process.domain
+     * the outer one, and a timer that fires afterwards runs outside the domain. err.domain is the
+     * domain and domainThrown true, as on a host.
+     *
+     * False when this domain has no 'error' listener: node falls through to the process then, so a
+     * domain entered with no listener of its own prints the 'uncaughtException' handler instead,
+     * and one with no handler at all ends the process.
+     */
+    function uncaughtInDomain(self, err) {
+      if (self.listenerCount('error') === 0) return false;
+      self.exit();
+      if (isObjectLike(err)) {
+        Object.defineProperty(err, 'domain', { value: self, writable: true, configurable: true });
+        err.domainThrown = true;
+      }
+      self.emit('error', err);
+      return true;
+    }
+    /* the loader asks for this on process.domain: the one place an uncaught error is routed */
+    Object.defineProperty(Domain.prototype, '_owcUncaught', {
+      value: function (err) { return uncaughtInDomain(this, err); },
+      writable: true,
+      configurable: true
+    });
 
     Domain.prototype.run = function (fn) {
       installDomainPromiseHook();
