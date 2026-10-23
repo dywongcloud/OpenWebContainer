@@ -192,6 +192,63 @@ function splitCompoundLine(line: string): CompoundStep[] | null {
     return steps;
 }
 
+/**
+ * The utilities that read standard input when they are given no file to read instead: `cat` with no
+ * argument reads the pipe its parent writes, and `cat f.txt` reads the file and leaves the pipe
+ * alone. A `-c` line that opens with one of these waits for the parent to close the pipe before it
+ * runs, as a host's `sh -c 'cat'` waits.
+ */
+const STDIN_READING_COMMANDS = new Set([
+    'base32', 'base64', 'cat', 'cksum', 'comm', 'cut', 'expand', 'fmt', 'fold', 'head', 'join',
+    'md5sum', 'nl', 'od', 'pr', 'rev', 'sha1sum', 'sha224sum', 'sha256sum', 'sha384sum',
+    'sha512sum', 'sort', 'sum', 'tac', 'tail', 'tr', 'unexpand', 'uniq', 'wc', 'xxd'
+]);
+
+/** The builtins that read a line of standard input whatever their operands name: those are variables. */
+const STDIN_READING_BUILTINS = new Set(['read', 'readarray', 'mapfile']);
+
+/** The utilities whose first operand is a pattern or a script and not a file: `grep x` reads the pipe. */
+const SCRIPT_FIRST_COMMANDS = new Set(['awk', 'egrep', 'fgrep', 'grep', 'sed']);
+
+/**
+ * True when a command line reads the standard input this shell was given, which is what makes a
+ * `-c` line wait for the parent's end of file rather than run at once with an empty pipe.
+ *
+ * Only the first step of the line is asked: a step after a `|` reads what the step before it wrote,
+ * and an operand that is not a flag and not `-` is a file the command reads instead of the pipe.
+ */
+/**
+ * A `sleep` step of a line, as milliseconds, or null when the step is not one the utility answers
+ * with nothing to print and status 0: a bad interval, a flag or no operand at all is left to the
+ * engine, which is what prints the utility's own diagnostic for it.
+ */
+function sleepMsOf(text: string): number | null {
+    const words = splitCommandLine(text);
+    if (words.length < 2 || words[0] !== 'sleep') return null;
+    const units: Record<string, number> = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+    let total = 0;
+    for (const word of words.slice(1)) {
+        const match = /^([+]?[0-9]*\.?[0-9]+)([smhd]?)$/.exec(word);
+        if (match === null) return null;
+        const value = Number(match[1]);
+        if (!Number.isFinite(value) || value < 0) return null;
+        total += value * (units[match[2]] ?? units.s);
+    }
+    return Math.min(total, 86400000);
+}
+
+function lineReadsStdin(line: string): boolean {
+    const steps = splitCompoundLine(line);
+    const first = steps !== null && steps.length > 0 ? steps[0].text : line;
+    const words = splitCommandLine(first);
+    if (words.length === 0) return false;
+    const name = words[0];
+    if (STDIN_READING_BUILTINS.has(name)) return true;
+    const operands = words.slice(1).filter((word) => word !== '-' && !word.startsWith('-'));
+    if (SCRIPT_FIRST_COMMANDS.has(name)) return operands.length <= 1;
+    return STDIN_READING_COMMANDS.has(name) && operands.length === 0;
+}
+
 export class ShellProcess extends Process {
     private shell: Shell;
     private prompt: string;
@@ -231,6 +288,21 @@ export class ShellProcess extends Process {
     private killDeadlineFired = false;
     /** The host timer behind the bound, cleared when this shell ends. */
     private killDeadlineTimer?: ReturnType<typeof setTimeout>;
+
+    /**
+     * True when the spawn that started this shell gave it a piped standard input, so a parent may
+     * still write to it and will close it. Only that parent's writes and that close are what a `-c`
+     * line waits on; a shell the container started another way has no pipe to wait for.
+     */
+    private stdinPiped = false;
+    /** The text written to this shell's stdin pipe, in the order it arrived. */
+    private stdinText = '';
+    /** True once that pipe is closed: a reader of it then sees end of file, as it does in Node. */
+    private stdinClosed = false;
+    /** What to wake when the pipe closes: a `-c` line that reads it waits there. */
+    private stdinWaiters: (() => void)[] = [];
+    /** The text the line now being run reads on standard input, or null when it reads none. */
+    private lineInput: string | null = null;
 
     constructor(
         pid: number,
@@ -297,7 +369,12 @@ export class ShellProcess extends Process {
 
     /** True once the moment this shell's line was bounded by has come, and not reported yet. */
     private deadlinePassed(): boolean {
-        return this.killDeadlineAt > 0 && !this.killDeadlineFired && Date.now() >= this.killDeadlineAt;
+        return this.deadlineReached() && !this.killDeadlineFired;
+    }
+
+    /** True once that moment has come, reported or not: what ends the line, step by step. */
+    private deadlineReached(): boolean {
+        return this.killDeadlineAt > 0 && Date.now() >= this.killDeadlineAt;
     }
 
     /**
@@ -325,6 +402,41 @@ export class ShellProcess extends Process {
         }
     }
 
+    /**
+     * The spawn that started this shell gave it a piped standard input. A `-c` line whose command
+     * reads standard input then waits for the parent's end of file instead of running at once with
+     * an empty pipe, which is what a host's `sh -c 'cat'` does with what the parent writes.
+     */
+    openStdinPipe(): void {
+        this.stdinPiped = true;
+    }
+
+    /** A write to this shell's stdin pipe: kept as the text a command of the line reads. */
+    override writeInput(input: string): void {
+        this.stdinText += input;
+        super.writeInput(input);
+    }
+
+    /** The parent closed this shell's stdin pipe: whatever is waiting for end of file wakes. */
+    override endStdin(): void {
+        this.closeStdin();
+    }
+
+    /** End of input, whether the parent closed the pipe or this shell was terminated waiting on it. */
+    private closeStdin(): void {
+        if (this.stdinClosed) return;
+        this.stdinClosed = true;
+        for (const waiter of this.stdinWaiters.splice(0)) waiter();
+    }
+
+    /** Waits for end of file on this shell's stdin pipe, which a line that reads it does. */
+    private stdinEnded(): Promise<void> {
+        if (this.stdinClosed) return Promise.resolve();
+        return new Promise<void>((resolve) => {
+            this.stdinWaiters.push(resolve);
+        });
+    }
+
     protected async execute(): Promise<void> {
         try {
             // Handle initial command if provided in args
@@ -332,6 +444,14 @@ export class ShellProcess extends Process {
                 const commandLine = this.filteredArgs[0] === '-c'
                     ? (this.filteredArgs[1] ?? '')
                     : this.filteredArgs.join(' ');
+                /* A line that reads the pipe this shell was given waits for the parent to close it,
+                   so everything the parent writes is the text the line reads. A line that reads
+                   nothing -- `sh -c 'echo hi'`, which a host ends without a parent ever writing --
+                   runs at once, as it does there. */
+                if (this.stdinPiped && !this.stdinClosed && lineReadsStdin(commandLine)) {
+                    await this.stdinEnded();
+                }
+                this.lineInput = this.stdinText === '' ? null : this.stdinText;
                 const result = await this.executeCommand(commandLine);
                 /* The line outran the bound the caller put on it: the caller is told now, before the
                    exit this shell is about to emit, so the exit is the one a killed child gives --
@@ -376,7 +496,14 @@ export class ShellProcess extends Process {
     protected async onTerminate(): Promise<void> {
         this.running = false;
         this.disarmKillDeadline();
-        this.emitOutput('\nShell terminated.\n');
+        /* A line waiting for the parent's end of file is waiting on a process that has just been
+           ended: it is woken, so `start` is not left waiting for a close that will never come. */
+        this.closeStdin();
+        /* A shell that was given a line is not a terminal: ended, it prints nothing, as a host's
+           `sh -c <line>` prints nothing when the caller that started it ends it -- which is what a
+           spawn's `timeout` does. Only the shell reading lines from a terminal says it is through,
+           and only to that terminal. */
+        if (this.filteredArgs.length === 0) this.emitOutput('\nShell terminated.\n');
     }
 
     private async handleInput(input: string): Promise<void> {
@@ -632,7 +759,11 @@ export class ShellProcess extends Process {
 
         if (this.shell.isCompound(commandLine)) {
             const steps = splitCompoundLine(commandLine);
-            if (steps !== null && steps.some((step) => this.shell.isSpawnedCommand(spawnedAs(firstWordOf(step.text))))) {
+            /* The bound the caller put on this spawn is only honoured between the steps of the line:
+               a step that holds the host thread holds the timer too. Without a bound there is no
+               reason to take the line apart, and the engine runs it whole, as it always has. */
+            if (steps !== null && (this.killDeadlineAt > 0 && steps.length > 1
+                || steps.some((step) => this.shell.isSpawnedCommand(spawnedAs(firstWordOf(step.text)))))) {
                 const run = await this.executeSteps(steps);
                 if (this.shell.stopped) {
                     this.running = false;
@@ -648,7 +779,7 @@ export class ShellProcess extends Process {
             }
         }
 
-        const result = this.shell.executeLine(commandLine);
+        const result = await this.runEngineLine(commandLine, this.lineInput);
         this.rememberStopped(result.exitCode);
         /* `set -e` and a command that failed: the shell ends, with the status the command left, as
            /bin/sh does. Typed into the loop below -- which is the only reader of this flag -- it
@@ -673,7 +804,7 @@ export class ShellProcess extends Process {
             const step = steps[i];
             if (step.op === '&&' && exitCode !== 0) continue;
             if (step.op === '||' && exitCode === 0) continue;
-            const stage = await this.runStep(step.text, step.op === '|' ? piped : null);
+            const stage = await this.runStep(step.text, step.op === '|' ? piped : (i === 0 ? this.lineInput : null));
             stderr += stage.stderr;
             exitCode = stage.exitCode;
             const next = steps[i + 1];
@@ -687,7 +818,7 @@ export class ShellProcess extends Process {
             /* The bound ran out while that step held the thread: no step after it runs, the way no
                command of a host's `sh` runs once the shell has been killed -- `sh -c 'echo a; node
                busy.js; echo b'` prints no `b` when its timeout ends inside the busy one. */
-            if (this.deadlinePassed()) break;
+            if (this.deadlineReached()) break;
         }
         return { stdout, stderr, exitCode };
     }
@@ -716,7 +847,25 @@ export class ShellProcess extends Process {
             this.shell.noteChildStatus(run.exitCode);
             return run;
         }
-        return this.shell.executeLine(text, input);
+        return this.runEngineLine(text, input);
+    }
+
+    /**
+     * One step of a line, run on the script engine.
+     *
+     * The engine's `sleep` blocks the host thread for the whole of its wait -- `blockFor` in
+     * `shell/commands/fileutils.ts` -- and no timer runs on a thread that is blocked, so a line
+     * under the caller's `timeout` would sit out the whole sleep and never see the bound. A bounded
+     * line therefore waits on a timer instead, and only until the bound runs out: the thread is
+     * free meanwhile, the bound fires, and the line stops where it stands, as a host's `sh` does.
+     * With no bound there is nothing to interrupt, and the engine runs the step as it always has.
+     */
+    private async runEngineLine(text: string, input: string | null): Promise<ShellCommandResult> {
+        const ms = this.killDeadlineAt > 0 ? sleepMsOf(text) : null;
+        if (ms === null) return this.shell.executeLine(text, input);
+        const left = this.killDeadlineAt - Date.now();
+        if (left > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(ms, left)));
+        return { stdout: '', stderr: '', exitCode: 0 };
     }
 
     /** `exit` on a line of its own: the status it gave is the shell's. */

@@ -1352,46 +1352,36 @@ bare QuickJS 0.32, on both builds, as it does here; `JSON.parse('')` is the one 
   reaches its parent as events and `cpCloseWhenDone` (`runtime/guest/modules/child.ts:596`) ends the
   parent's stream when the child itself exits, so there is no inherited write end for a grandchild to
   keep open and no moment at which output written after the deadline could still arrive.
-- `owc-sh-child-timeout-bound-shape`: the `timeout` of a `sh -c <line>` spawn is a deadline the caller
-  is told about, not a signal the shell is killed with, so the line runs to the end of the step it is
-  in and often to the end of the line.
-  `exec('sleep 5; echo LATE', { timeout: 400 })` -- host: stdout `''`, 403 ms, killed true; here:
-  stdout `LATE\n`, 5008 ms, killed true (`sleep 2` in place of 5: `''` at 402 ms against `LATE\n` at
-  2007 ms). `spawn('sh', ['-c', 'echo A; sleep 3; echo B'], { timeout: 400, killSignal: 'SIGKILL' })`
-  -- host exit 406 ms with `A\n`; here exit 3007 ms with `A\nB\n`: `B` runs. And the signal is not
-  trappable, where a host's is: `spawn('sh', ['-c', 'trap "echo TRAPPED" TERM; echo A; sleep 2; echo B'],
-  { timeout: 400, killSignal: 'SIGTERM' })` -- host 2010 ms, code 0, `A\nTRAPPED\nB\n`; here 2010 ms,
-  SIGTERM, `A\nB\n`, no trap; the control `sh -c 'trap "echo TRAPPED-EXIT" EXIT; echo X'` answers
-  `X\nTRAPPED-EXIT\n` on both sides, so the trap machinery itself is there and only the timeout path
-  bypasses it. Not a QuickJS limit but a host-thread block of this container's own: `sleep` waits in
-  `blockFor` (`shell/commands/fileutils.ts:2482`), an `Atomics.wait` on the host thread that no timer
-  can interrupt, so the bound is missed by the whole sleep -- measured at HEAD with one fresh
-  container per case, `spawn('sh', ['-c', 'sleep 5'], { timeout: 400, killSignal: 'SIGKILL' })`
-  exits at 5015 ms here against 410 ms on host Node 24.15, `spawnSync('sh', ['-c', 'sleep 5'],
-  { timeout: 400 })` answers status 0 with no error at 5009 ms against 402 ms with ETIMEDOUT, and
-  the same bound on `sh -c 'node busy3.js'` fires at 417 ms here against 413 ms. Proved live: bare
-  QuickJS 0.32 (quickjs-emscripten, no container in the way) has no timer of its own at all -- `typeof os`, `typeof setTimeout` and
-  `typeof setInterval` are all `undefined` -- so every deadline here is a host timer, and a host
-  `setTimeout(..., 400)` armed before a synchronous 3 s wait inside the engine fires at 3001 ms and
-  not at 400 ms. The same thing measured in the container: a 100 ms interval in the process that runs
-  `sh -c 'sleep 3'` ticks 29 times with a largest gap of 102 ms on a host and once with a gap of
-  3011 ms here. A shell command handler is synchronous -- it cannot yield -- so `armKillDeadline`
-  (`shell/process.ts:276`) can only ever be honoured at a step boundary, which is what its own
-  doc-comment says and what `fireKillDeadline` (`:307`) does when it notifies the caller without
-  stopping the line. Re-measured at HEAD, one fresh container per case: `exec('sleep 5; echo LATE',
-  { timeout: 400 })` is 403 ms and `''` on the host against 5009 ms and `LATE\n` here; the `sleep 3`
-  line is host `exit` 405 ms and `close` 3015 ms with `A\n` against 3009 ms with `A\nB\n` here; the
-  `trap ... TERM` line is host 2014 ms, code 0, `A\nTRAPPED\nB\n` against 2006 ms, SIGTERM, `A\nB\n`
-  here; the `trap ... EXIT` control is `X\nTRAPPED-EXIT\n` and 0 on both sides. Proved live again
-  this turn, both ways: a 100 ms interval beside `sh -c 'sleep 3'` ticks 30 times with a largest gap
-  of 102 ms on a host and once with a gap of 3009 ms here, and bare QuickJS 0.32 with no container in
-  the way has no timer of its own (`typeof os`, `typeof setTimeout` and `typeof setInterval` all
-  `undefined`) while a host `setTimeout(..., 400)` armed before a synchronous 3 s wait inside it fires
-  at 3002 ms. The trap half is not an engine limit -- the run ends at 2006 ms, so the host thread was
-  free at the deadline, and the shell's own traps do run for EXIT -- and its fix site is outside this
-  shard: `runTrap` (`packages/core/src/shell/commands/builtins.ts:4113`) is not exported and is called
-  only for EXIT, ERR and DEBUG, so a TERM trap is registered and never run, and `fireKillDeadline`
-  has no way to hand the signal to the shell rather than only to the caller.
+- `owc-sh-child-timeout-bound-shape`: **fixed at HEAD** -- the `timeout` of a `sh -c <line>` spawn now
+  ends the line at the bound and runs no command after it. The engine's `sleep` is `blockFor`
+  (`packages/core/src/shell/commands/fileutils.ts:2482`), an `Atomics.wait` on the host thread that no
+  timer can interrupt, which is why the bound used to be missed by the whole sleep: measured before
+  this fix, `exec('sleep 5; echo LATE', { timeout: 400 })` was 5008 ms and `LATE\n` here against
+  403 ms and `''` on host Node 24.15. A bounded line now waits on a timer instead, and only until the
+  bound runs out (`runEngineLine` in `packages/core/src/process/executors/shell/process.ts`), and a
+  synchronous run cuts the wait to what is left of it (`sleepWithinDeadline` in
+  `packages/core/src/process/executors/node/runtime/capabilities/child.ts`). Re-measured at HEAD, one
+  fresh container per case, load 9-13: `exec('sleep 5; echo LATE', { timeout: 400 })` is 405 ms and
+  `''` here against 402 ms and `''`, and `spawn('sh', ['-c', 'sleep 1; echo AFTER1'],
+  { timeout: 400, killSignal: 'SIGKILL' })` exits and closes at 404 ms with `''` against the host's
+  `exit` 404 ms and `''`. One shape of that line still differs and no bound can reach it: the host's
+  `close` is 1020 ms there, because the grandchild `sleep` holds the stdout pipe open for a second
+  after `sh` was killed, and this container has no grandchild to hold a pipe
+  (`owc-sh-timeout-kills-grandchild`). A TERM trap is still not run by the timeout path --
+  `spawn('sh', ['-c', 'trap "echo TRAPPED" TERM; echo A; sleep 2; echo B'], { timeout: 400 })` -- and
+  its fix site is outside this shard: `runTrap`
+  (`packages/core/src/shell/commands/builtins.ts:4113`) is not exported and is called only for EXIT,
+  ERR and DEBUG, so a TERM trap is registered and never run, and `fireKillDeadline` has no way to
+  hand the signal to the shell rather than only to the caller.
+- `owc-no-bin-sleep-or-bash`: two names a host execs are not files this container's file system holds.
+  `sleep` exists only as a shell utility -- `spawn('sleep', ['1'])` and `spawn('/bin/sleep', ['1'])` are
+  ENOENT here where host Node 24.15 runs them for ~1 s and code 0 -- and there is no `/bin/bash`:
+  `spawn('/bin/bash', ['-c', 'echo hi'])` is ENOENT, `exec('bash -c "echo hi"')` is 127 with
+  `command not found`, and `exec(cmd, { shell: '/bin/bash' })` is ENOENT. A name that is neither a
+  utility, a shell builtin nor a file on PATH is a failed spawn here, exactly as it is on a host; what
+  is missing is the host's own `/bin`. The fix site is the executor registry and the `/bin` the
+  virtual file system boots with (`packages/core/src/process/executors/registry.ts`), outside this
+  shard.
 
 - `owc-esm-loader-divergences` (residual, engine): two messages a module reaches are QuickJS 0.32's
   own words and not this container's. A module that does not parse throws
