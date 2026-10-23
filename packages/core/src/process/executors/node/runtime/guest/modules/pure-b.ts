@@ -1427,6 +1427,20 @@ export const SRC = String.raw`
     var consoleHooked = false;
     var CONSOLE_TYPES = { log: 'log', info: 'info', warn: 'warning', error: 'error', debug: 'debug' };
 
+    /* exceptionId and scriptId are the protocol's own serials. A host numbers the exceptions it
+       reports from 1 and goes on numbering them for as long as the isolate lives: a second session
+       does not start again, so two sessions that throw once each report 1 and 2. Every script it
+       compiles gets an id of its own, and Runtime.evaluate compiles one per call, so a session
+       that evaluates six expressions hands out six. Both are opaque to whoever reads them -- they
+       are keys into the protocol's own tables, and no caller computes with them -- and both are
+       this runtime's numbering, exactly as V8's are V8's: they start where this runtime's owns
+       scripts and reported exceptions leave them, and no two runs agree on the number itself.
+       row owc-inspector-returnbyvalue-notifications. */
+    var exceptionSerial = 0;
+    var scriptSerial = 0;
+    function nextExceptionId() { exceptionSerial += 1; return exceptionSerial; }
+    function nextScriptId() { scriptSerial += 1; return String(scriptSerial); }
+
     function notify(session, method, params) {
       try {
         session.emit('inspectorNotification', { method: method, params: params });
@@ -1616,7 +1630,72 @@ export const SRC = String.raw`
       }
     }
 
-    function evaluateForInspector(params) {
+    /* The column an uncaught throw is attributed to is the column of its own throw keyword: a host
+       points the exceptionDetails at the statement that threw rather than at the value it threw,
+       so '  throw x' is 2, and a throw inside a function the expression calls is where that
+       function's keyword sits -- '(function(){ throw new Error("q") })()' is 13. The token is read
+       off the expression itself, skipping the string, template and comment text a throw spelled
+       inside is not one; -1 is the answer for an expression with no throw in it at all, which is
+       the only case in which the column comes from the error instead. */
+    var THROW_WORD = 'throw';
+    var QUOTE_TICK = String.fromCharCode(96);
+    var isNameChar = /[A-Za-z0-9_$]/;
+    function throwColumnOf(expression) {
+      var text = String(expression);
+      var len = text.length;
+      var at = 0;
+      while (at < len) {
+        var ch = text.charAt(at);
+        /* A string, a template or a comment is skipped whole: a throw spelled inside one is text,
+           and the first one outside them is the statement the exception belongs to. */
+        if (ch === '"' || ch === "'" || ch === QUOTE_TICK) {
+          var quote = ch;
+          at++;
+          while (at < len) {
+            var inside = text.charAt(at);
+            if (inside === '\\') { at += 2; continue; }
+            if (inside === quote) { at++; break; }
+            at++;
+          }
+          continue;
+        }
+        if (ch === '/' && text.charAt(at + 1) === '/') {
+          while (at < len && text.charAt(at) !== '\n') at++;
+          continue;
+        }
+        if (ch === '/' && text.charAt(at + 1) === '*') {
+          at += 2;
+          while (at < len && !(text.charAt(at) === '*' && text.charAt(at + 1) === '/')) at++;
+          at += 2;
+          continue;
+        }
+        /* throw is a word of its own: the character in front of it and the one after it are not
+           parts of a name, or the word is inside one -- 'athrow' and 'throws' are not it. */
+        if (text.slice(at, at + 5) === THROW_WORD
+          && !isNameChar.test(at === 0 ? '' : text.charAt(at - 1))
+          && !isNameChar.test(text.charAt(at + 5))) {
+          return at;
+        }
+        at++;
+      }
+      return -1;
+    }
+
+    /* An error the engine raises itself -- a property read off null, a name that is not defined --
+       is one no throw statement is behind, and the position a host reports for it is the one in
+       the engine's own stack: 'null.z' is 'at <eval> (<input>:1:5)' and 5 is the column a host
+       answers for it, as '({}).a.b' is 1:7 and 7. The frame says nothing when the error came out
+       of a native function instead -- 'at parse (native)' -- and there is no column to report
+       then, so it stays 0. row owc-inspector-returnbyvalue-notifications */
+    function columnOf(error, expression) {
+      var throwAt = throwColumnOf(expression);
+      if (throwAt >= 0) return throwAt;
+      var stack = error && error.stack ? String(error.stack) : '';
+      var frame = /:(\d+):(\d+)/.exec(stack.split('\n')[0] || '');
+      return frame ? Number(frame[2]) : 0;
+    }
+
+    function evaluateForInspector(params, scriptId) {
       var expression = params && typeof params.expression === 'string' ? params.expression : '';
       var byValue = params && params.returnByValue === true;
       var preview = params && params.generatePreview === true;
@@ -1632,7 +1711,9 @@ export const SRC = String.raw`
             exception: remoteObjectOf(err),
             text: 'Uncaught',
             lineNumber: 0,
-            columnNumber: 0
+            columnNumber: columnOf(err, expression),
+            exceptionId: nextExceptionId(),
+            scriptId: scriptId
           }
         };
       }
@@ -1642,7 +1723,7 @@ export const SRC = String.raw`
       if (params && params.awaitPromise === true && evaluated
         && (typeof evaluated === 'object' || typeof evaluated === 'function')
         && typeof evaluated.then === 'function') {
-        return { thenable: evaluated, byValue: byValue, preview: preview };
+        return { thenable: evaluated, byValue: byValue, preview: preview, scriptId: scriptId, expression: expression };
       }
       return { result: remoteResultOf(evaluated, byValue, preview) };
     }
@@ -1665,8 +1746,24 @@ export const SRC = String.raw`
 
     function settleEvaluation(done, request, value, thrown) {
       if (thrown) {
+        /* A promise that rejects is not a statement that threw: a host words it 'Uncaught
+           (in promise)' and follows that, for an error and for nothing else, with the error's own
+           name and message -- a rejection with 42 in it is the bare words. Its column and script
+           id are the same as any other exception's here, and a host's own are not one thing: the
+           rejection is the first evaluate of a session and it answers 0 and null, the same
+           expression evaluated before it and it answers the column and the id of the script that
+           created it, so what is stable about it is the wording and nothing else. */
+        var promised = 'Uncaught (in promise)';
+        if (value instanceof Error) promised += ' ' + String(value.name) + ': ' + String(value.message);
         deliver(done, null, {
-          exceptionDetails: { exception: remoteObjectOf(value), text: 'Uncaught', lineNumber: 0, columnNumber: 0 }
+          exceptionDetails: {
+            exception: remoteObjectOf(value),
+            text: promised,
+            lineNumber: 0,
+            columnNumber: columnOf(value, request.expression),
+            exceptionId: nextExceptionId(),
+            scriptId: request.scriptId
+          }
         });
         return;
       }
@@ -1681,7 +1778,7 @@ export const SRC = String.raw`
       }
       if (!this._owcConnected) throw nodeError(Error, 'ERR_INSPECTOR_NOT_CONNECTED', 'Session is not connected');
       if (method === 'Runtime.evaluate') {
-        var outcome = evaluateForInspector(params);
+        var outcome = evaluateForInspector(params, nextScriptId());
         if (outcome.thenable === undefined) {
           deliver(callback, null, outcome);
           return undefined;
@@ -1699,7 +1796,14 @@ export const SRC = String.raw`
          out names nothing, which is the empty answer a host gives for one. */
       if (method === 'Runtime.getProperties') {
         var asked = params && params.objectId !== undefined ? objectForId(params.objectId) : undefined;
-        deliver(callback, null, { result: asked === undefined ? [] : propertiesOf(asked), internalProperties: [] });
+        /* An id this session never handed out names no object at all, and a host says so with the
+           protocol's own error rather than with an empty answer: -32000, and no result. */
+        if (asked === undefined) {
+          deliver(callback, nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+            'Inspector error -32000: Cannot find context with specified id'), undefined);
+          return undefined;
+        }
+        deliver(callback, null, { result: propertiesOf(asked), internalProperties: [] });
         return undefined;
       }
       if (method === 'Runtime.enable' || method === 'Runtime.disable' || method === 'Runtime.runIfWaitingForDebugger') {
