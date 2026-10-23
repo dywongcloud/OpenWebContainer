@@ -502,40 +502,59 @@ function affineImage(image: Image, hscale: number, vscale: number, kernelName: s
  */
 function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelName: string, clock = 0, strip = REDUCEV_STRIP): Image {
     const srcSize = horizontal ? image.width : image.height;
-    const dstSize = roundU(srcSize / shrink);
-    if (dstSize >= srcSize) return image;
+    /*
+     * sharp hands vips_resize `scale`, the reciprocal of the shrink, and every number below comes
+     * off that reciprocal rather than off the shrink itself: vips_resize_build calls the reduce
+     * with `1.0 / vscale` (resample/resize.c), so the reduce's own shrink is 1 / (1 / shrink), and
+     * that round trip is not always the shrink it started from -- 138 of the 1652 (size, target)
+     * pairs up to 60 come back an ulp away. The last bit of it is which source pixel a window
+     * lands on. Measured against sharp 0.33.5 over all 3304 (size, target) pairs up to 60: this
+     * chain reproduces the source pixel every output pixel takes, and the plain shrink misses 19
+     * of them, every one a pixel whose position lands exactly on an integer.
+     */
+    const scale = 1 / shrink;
+    const reciprocal = 1 / scale;
     /*
      * vips_resize's `gap` of 2: the integer part of the shrink, as far as it goes with a gap of two
      * still to run, is taken before the kernel sees the image -- a vips_shrink box average for the
      * kernels, and a vips_subsample for NEAREST, which must not be given pixels a box would invent
      * -- and only the residual runs through the kernel. Below a shrink of two there is no integer
      * part at all, which is why a 3x reduction is a pure reduce and a 4x one is not.
+     *
+     * The integer part is counted off the size the RECIPROCAL asks for, ROUND(Xsize * hscale) --
+     * not off the size the shrink does -- and NEAREST and the other kernels take it from different
+     * places: NEAREST's subsample is sized in vips_resize itself, before the reduce is called, and
+     * the rest is vips_shrinkh inside the reduce's own build.
      */
-    const block = Math.max(1, Math.floor(srcSize / dstSize / RESIZE_GAP));
-    let work = image;
-    let residual = shrink;
-    let extra = dstSize * shrink - srcSize;
-    if (block > 1) {
-        if (kernelName === 'nearest') {
-            /*
-             * NEAREST is the one kernel vips_resize subsamples itself (resample/resize.c) before it
-             * calls vips_reduce, so the reduce is handed the subsampled image and counts its own
-             * unused pixels off that width -- not off the width before the subsample, and not
-             * divided by the subsample. 32 -> 5 nearest lands on source pixels 0, 6, 15, 21, 27 by
-             * this arithmetic and on 3, 9, 15, 21, 27 by the other.
-             */
-            work = subsampleAxis(image, block, horizontal);
-            residual = shrink / block;
-            extra = dstSize * residual - (horizontal ? work.width : work.height);
-        } else {
-            work = boxShrink(image, block, horizontal);
-            residual = shrink / block;
-            extra = extra / block;
-        }
+    if (kernelName === 'nearest') {
+        /*
+         * NEAREST is the one kernel vips_resize subsamples itself (resample/resize.c) before it
+         * calls vips_reduce, so the reduce is handed the subsampled image and counts its own
+         * unused pixels off that width -- not off the width before the subsample, and not divided
+         * by the subsample. 32 -> 5 nearest lands on source pixels 0, 6, 15, 21, 27 by this
+         * arithmetic and on 3, 9, 15, 21, 27 by the other. The residual is `1.0 / (hscale *
+         * block)`, the reciprocal of the scale the subsample left, which is not always the
+         * residual the shrink divides into.
+         */
+        const block = Math.max(1, Math.floor(srcSize / roundU(srcSize * scale) / RESIZE_GAP));
+        const work = block > 1 ? subsampleAxis(image, block, horizontal) : image;
+        const residual = 1 / (scale * block);
+        const workSize = horizontal ? work.width : work.height;
+        const dstSize = roundU(workSize / residual);
+        if (dstSize >= workSize) return work;
+        return reduceAxis(work, dstSize, residual, dstSize * residual - workSize, horizontal, kernelName, clock, strip);
     }
+    const dstSize = roundU(srcSize / reciprocal);
+    if (dstSize >= srcSize) return image;
+    const block = Math.max(1, Math.floor(srcSize / dstSize / RESIZE_GAP));
+    const extra = dstSize * reciprocal - srcSize;
+    const work = block > 1 ? boxShrink(image, block, horizontal) : image;
+    const residual = reciprocal / block;
     const workSize = horizontal ? work.width : work.height;
     if (dstSize === workSize) return work;
-    return reduceAxis(work, dstSize, residual, extra, horizontal, kernelName, clock, strip);
+    /* The unused pixels are the ones the box shrink did not take: vips_reduceh divides them by the
+       integer part it has just applied (resample/reduceh.cpp, vips_reduceh_build). */
+    return reduceAxis(work, dstSize, residual, extra / block, horizontal, kernelName, clock, strip);
 }
 
 /**
@@ -544,9 +563,9 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
  * rounds its own output size off it, so an axis that is only along for the ride -- `cover` with
  * an auto height -- is still reduced at the other axis' factor.
  */
-export function resample(image: Image, hshrink: number, vshrink: number, kernel: string, vclock = 0): Image {
+export function resample(image: Image, hshrink: number, vshrink: number, kernel: string, vclock = 0, strip = REDUCEV_STRIP): Image {
     let work = image;
-    if (vshrink > 1) work = resampleAxis(work, vshrink, false, kernel, vclock);
+    if (vshrink > 1) work = resampleAxis(work, vshrink, false, kernel, vclock, strip);
     if (hshrink > 1) work = resampleAxis(work, hshrink, true, kernel);
     /* Whether either axis actually ran a reduce: see the zoom branch below. */
     const reduced = work !== image;
@@ -604,6 +623,17 @@ export interface ResizeSpec {
      */
     flipRows?: boolean;
     transposed?: boolean;
+    /**
+     * Whether the pipeline carries a vertical mirror or a transposition -- a flip(), a rotate(90) or
+     * a rotate(270). Either one leaves libvips asking for the whole image as one tile rather than
+     * the fat strips of 16 rows it otherwise walks, so the vertical reduce runs its sum over the
+     * full height instead of restarting it at the top of each strip, and never clocks it at all.
+     * Measured against sharp 0.33.5 on a 48x48 -> 20x20 nearest resize: on its own the reduce takes
+     * source row 42 for output row 17, and under a flip(), a rotate(90) or a rotate(270) it takes
+     * 41 -- the row the horizontal reduce takes, which is the one sum with no strip to restart it.
+     * A flop() and a rotate(180) leave the rows the reduce walks in order and keep the strips.
+     */
+    wholeTile?: boolean;
 }
 
 /**
@@ -725,7 +755,10 @@ export function resizeImage(image: Image, spec: ResizeSpec): { image: Image; res
      */
     const alpha = image.channels === 2 || image.channels === 4;
     const src = alpha ? premultiplyImage(image) : image;
-    const out = resample(src, hshrink, vshrink, spec.kernel, verticalClock(spec, sh));
+    /* One tile leaves the vertical reduce neither a strip to restart at nor a clock to start from:
+       a strip taller than any image is one the top row is the only fresh start in. */
+    const tile = spec.wholeTile === true;
+    const out = resample(src, hshrink, vshrink, spec.kernel, tile ? 0 : verticalClock(spec, sh), tile ? Number.MAX_SAFE_INTEGER : REDUCEV_STRIP);
     return {
         image: alpha ? unpremultiplyImage(out) : out,
         resized: hshrink !== 1 || vshrink !== 1
@@ -759,11 +792,9 @@ export function premultiplyImage(image: Image): Image {
  * arithmetic: libvips divides 255 by the alpha once, in a float, and multiplies by it, so a band
  * that divides out exactly can land one ulp below its own quotient and truncate to one less --
  * colour 255 on an alpha of 7 is 254 and not the 255 a double gives. Measured against sharp 0.33.5
- * over the whole 65536-entry (colour, alpha) grid with a NEAREST zoom, which leaves every pixel
- * the round trip of its own (colour, alpha): `floor(fround(band * fround(255 / alpha)))` reproduces
- * every cell, and the same floor without the two fround()s misses 36, all of them a band that
- * divides out exactly. Bare QuickJS 0.32 agrees: fround(255 / 7) is 36.42856979370117 there and
- * floor(fround(7 * scale)) is 254.
+ * over the whole 65536-entry (colour, alpha) grid: `floor(fround(band * fround(255 / alpha)))`
+ * reproduces every cell, and the same floor without the two fround()s misses 36 of them, all of
+ * them a band that divides out exactly.
  *
  * The value can come out above 255 once a kernel with negative lobes has run, since the bands and
  * the alpha are resampled independently and the two no longer agree; the extra is clipped away,

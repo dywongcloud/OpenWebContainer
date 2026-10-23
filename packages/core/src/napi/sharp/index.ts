@@ -294,6 +294,7 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
             out = rotateQuarters(out, quarters, arrayOption(options, 'rotationBackground', [0, 0, 0, 255]));
         }
     };
+    const quarters = quartersOf(numberOption(options, 'angle', 0));
     const spec: ResizeSpec = {
         width: numberOption(options, 'width', -1),
         height: numberOption(options, 'height', -1),
@@ -306,8 +307,9 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
         background: arrayOption(options, 'resizeBackground', [0, 0, 0, 255]),
         /* How the flip, flop and rotation below leave the rows the crop will read, so the vertical
            reduce can clock its sum where the crop starts asking. */
-        flipRows: (options.flip === true) !== (quartersOf(numberOption(options, 'angle', 0)) === 2),
-        transposed: quartersOf(numberOption(options, 'angle', 0)) === 1 || quartersOf(numberOption(options, 'angle', 0)) === 3
+        flipRows: (options.flip === true) !== (quarters === 2),
+        transposed: quarters === 1 || quarters === 3,
+        wholeTile: options.flip === true || quarters === 1 || quarters === 3
     };
     if (rotationFirst) orient();
     if (numberOption(options, 'widthPre', -1) >= 0 || numberOption(options, 'heightPre', -1) >= 0) {
