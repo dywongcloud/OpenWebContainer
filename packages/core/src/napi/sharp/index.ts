@@ -35,13 +35,15 @@ import {
     padBackground,
     canvasImage,
     resizeImage,
+    smartcropEntropy,
     rotateQuarters,
+    shrinkOnLoadOf,
     spaceOf,
     toChannels,
     toSrgb
 } from './image';
 import { optionsOf, unsupportedInput, unsupportedOption } from './options';
-import { JpegInfo, decodeJpeg, encodeJpeg, isJpeg } from './jpeg';
+import { JpegInfo, decodeJpeg, encodeJpeg, isJpeg, jpegSize } from './jpeg';
 import { PngInfo, decodePng, encodePng, isPng } from './png';
 
 /** The part of the Buffer constructor the add-on needs: a view on bytes that is also a Buffer. */
@@ -160,16 +162,42 @@ function imageFromRaw(input: Record<string, unknown>, bytes: Uint8Array): Image 
     return { width, height, channels, data };
 }
 
-function decodeBytes(bytes: Uint8Array): Decoded {
+function decodeBytes(bytes: Uint8Array, shrink = 1): Decoded {
     if (isPng(bytes)) {
         const { image, info } = decodePng(bytes);
         return decodedFromPng(image, info, bytes.length);
     }
     if (isJpeg(bytes)) {
-        const { image, info } = decodeJpeg(bytes);
+        const { image, info } = decodeJpeg(bytes, shrink);
         return decodedFromJpeg(image, info, bytes.length);
     }
     throw unsupportedImageFormat('buffer');
+}
+
+/**
+ * The `scale_denom` a jpeg is decoded at, which is what sharp's fastShrinkOnLoad is: libjpeg
+ * shrinks the frame in the DCT rather than in the pixels, so the decode itself has to know the
+ * scale and the resize after it only carries what is left. Metadata reads the file undecoded and
+ * so never asks for one.
+ */
+function shrinkForLoad(bytes: Uint8Array, options: Record<string, unknown>): number {
+    const size = jpegSize(bytes);
+    if (size === undefined) return 1;
+    /* A pre-extract crops before the resize, so it is the crop the shrink is measured against. */
+    const widthPre = numberOption(options, 'widthPre', -1);
+    const heightPre = numberOption(options, 'heightPre', -1);
+    const width = widthPre >= 0 ? widthPre : size.width;
+    const height = heightPre >= 0 ? heightPre : size.height;
+    return shrinkOnLoadOf(
+        width,
+        height,
+        numberOption(options, 'width', -1),
+        numberOption(options, 'height', -1),
+        String(options.canvas ?? 'crop'),
+        options.withoutEnlargement === true,
+        options.withoutReduction === true,
+        options.fastShrinkOnLoad !== false
+    );
 }
 
 function decodedFromPng(image: Image, info: PngInfo, size: number): Decoded {
@@ -229,7 +257,11 @@ function readFile(host: SharpAddonHost | undefined, file: string): Uint8Array {
 }
 
 /** Load the input descriptor sharp built: a created image, raw pixels, a Buffer, or a file. */
-function decodeInput(options: Record<string, unknown>, host: SharpAddonHost | undefined): Decoded {
+function decodeInput(
+    options: Record<string, unknown>,
+    host: SharpAddonHost | undefined,
+    forPipeline = false
+): Decoded {
     const input = optionsOf(options.input);
     const unsupported = unsupportedInput(input);
     if (unsupported !== null) throw unsupportedOperationFor('input.' + unsupported);
@@ -260,12 +292,12 @@ function decodeInput(options: Record<string, unknown>, host: SharpAddonHost | un
     if (input.buffer !== undefined) {
         const bytes = bytesOf(input.buffer);
         if (bytes.length === 0) throw new Error('Input Buffer is empty');
-        return decodeBytes(bytes);
+        return decodeBytes(bytes, forPipeline && isJpeg(bytes) ? shrinkForLoad(bytes, options) : 1);
     }
     if (input.file !== undefined) {
         const bytes = readFile(host, String(input.file));
         if (!isPng(bytes) && !isJpeg(bytes)) throw unsupportedImageFormat('file');
-        return decodeBytes(bytes);
+        return decodeBytes(bytes, forPipeline && isJpeg(bytes) ? shrinkForLoad(bytes, options) : 1);
     }
     throw new Error('Invalid input');
 }
@@ -281,10 +313,16 @@ function decodeInput(options: Record<string, unknown>, host: SharpAddonHost | un
  * `.resize(20,10).rotate(90)` on a 40x30 input is 15x10 on host (20x15 resized, 15x20 rotated, then
  * cropped to 20x10, which the 15-pixel width clamps) and not the 10x20 a crop-first order gives.
  */
-function applyOperations(image: Image, options: Record<string, unknown>): { image: Image; resized: boolean } {
+function applyOperations(
+    image: Image,
+    options: Record<string, unknown>
+): { image: Image; resized: boolean; cropOffsetLeft?: number; cropOffsetTop?: number } {
     let out = image;
     const rotationFirst = options.rotateBeforePreExtract === true;
     let resized = false;
+    /* Set only by the entropy crop: see the note where they are assigned. */
+    let cropOffsetLeft: number | undefined;
+    let cropOffsetTop: number | undefined;
     const orient = (): void => {
         if (options.flip === true) out = flipImage(out);
         if (options.flop === true) out = flopImage(out);
@@ -328,7 +366,34 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
     }
     if (!rotationFirst) orient();
     if (spec.width >= 0 || spec.height >= 0) {
-        out = canvasImage(out, spec);
+        if (spec.canvas === 'crop' && spec.position >= 16) {
+            /*
+             * sharp's entropy crop: vips_smartcrop, not a gravity crop. Position 17 -- attention
+             * -- stays refused, see unsupportedOption. Like sharp's own `if (inputWidth !=
+             * baton->width || inputHeight != baton->height)`, it only runs when there is
+             * something to crop: a 64x64 -> 32x32 cover entropy resize lands exactly on the
+             * target and reports no cropOffset at all on host sharp 0.33.5.
+             */
+            const cw = Math.min(spec.width > 0 ? spec.width : out.width, out.width);
+            const ch = Math.min(spec.height > 0 ? spec.height : out.height, out.height);
+            if (cw === out.width && ch === out.height) {
+                out = canvasImage(out, spec);
+            } else {
+                const crop = smartcropEntropy(out, cw, ch);
+                out = extractImage(out, crop.left, crop.top, cw, ch);
+                /*
+                 * sharp reports these off the xoffset/yoffset the extract hands back, which for
+                 * a smartcrop is the crop's own left and top negated: measured against host
+                 * sharp 0.33.5, 100x60 -> 50x50 cover entropy is cropOffsetLeft -33 and 40x30
+                 * -> 100x10 cover attention is cropOffsetTop -9, the attention centre of the
+                 * second being 14 and the crop 5 down from it.
+                 */
+                cropOffsetLeft = -crop.left;
+                cropOffsetTop = -crop.top;
+            }
+        } else {
+            out = canvasImage(out, spec);
+        }
     }
     if (numberOption(options, 'widthPost', -1) >= 0 || numberOption(options, 'heightPost', -1) >= 0) {
         out = extractImage(
@@ -339,7 +404,7 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
             numberOption(options, 'heightPost', out.height)
         );
     }
-    return { image: out, resized };
+    return { image: out, resized, cropOffsetLeft, cropOffsetTop };
 }
 
 function encodeOutput(image: Image, options: Record<string, unknown>, inputFormat: string): { format: string; data: Uint8Array; channels: number } {
@@ -533,13 +598,14 @@ export function createAddon(host: SharpAddonHost = {}): object {
             const opts = optionsOf(options);
             const bad = unsupportedOption(opts);
             if (bad !== null) throw unsupportedOperationFor(bad);
-            const decoded = decodeInput(opts, host);
+            const decoded = decodeInput(opts, host, true);
             const input = optionsOf(opts.input);
             const limit = Number(input.limitInputPixels ?? 268402689);
             if (limit > 0 && decoded.image.width * decoded.image.height > limit) {
                 throw pixelLimit(decoded.image.width, decoded.image.height, limit);
             }
-            const { image: worked, resized } = applyOperations(decoded.image, opts);
+            const step = applyOperations(decoded.image, opts);
+            const { image: worked, resized } = step;
             // The pipeline ends in sRGB, so one band comes out as three and two as four: this is
             // what makes an 8x8x1 raw input 48 bytes of 4x4 raw output and not 16.
             const image = toSrgb(worked);
@@ -570,12 +636,25 @@ export function createAddon(host: SharpAddonHost = {}): object {
              */
             info.premultiplied = (decoded.image.channels === 2 || decoded.image.channels === 4) && resized;
             /*
-             * No cropOffsetLeft / cropOffsetTop: sharp sets `hasCropOffset` only inside the
-             * attention/entropy branch of its crop (src/pipeline.cc), off the `-left`/`-top`
-             * vips_smartcrop hands back. A gravity crop -- which is the only crop this shim
-             * has -- reports neither field on sharp 0.33.5, including a 64x64 jpeg -> 16
-             * downsize that never crops and an enlargement that reports nothing to crop.
+             * cropOffsetLeft / cropOffsetTop come only from the entropy crop: sharp sets
+             * `hasCropOffset` inside the attention/entropy branch of its crop (src/pipeline.cc)
+             * and nowhere else, off the `-left`/`-top` the extract hands back. A gravity crop
+             * -- which every other crop in this shim is -- reports neither field on sharp
+             * 0.33.5, including a 64x64 jpeg -> 16 downsize that never crops and an
+             * enlargement that reports nothing to crop.
              */
+            if (step.cropOffsetLeft !== undefined) {
+                info.cropOffsetLeft = step.cropOffsetLeft;
+                info.cropOffsetTop = step.cropOffsetTop;
+                /*
+                 * And the attention centre after them, which sharp 0.33.5 reports for the
+                 * entropy strategy too -- as a pair of zeros, since vips_smartcrop leaves them
+                 * at 0 unless the attention branch ran. `Object.keys(info)` is observable, so
+                 * dropping them here would leave a 40x30 -> 100x10 cover entropy two keys short.
+                 */
+                info.attentionX = 0;
+                info.attentionY = 0;
+            }
             info.size = bytes.length;
             if (fileOut !== '') {
                 // A raw file is not a format sharp can write to disk: the extension names the format,

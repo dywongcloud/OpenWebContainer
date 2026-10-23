@@ -39,6 +39,42 @@ export function isJpeg(bytes: Uint8Array): boolean {
   return bytes.length > 1 && bytes[0] === 0xff && bytes[1] === 0xd8;
 }
 
+/**
+ * The frame's width and height, read off the SOF marker without decoding anything. A caller that
+ * wants a reduced-size decode has to decide the scale before it decodes, because libjpeg takes
+ * `scale_denom` from the header and sharp's fastShrinkOnLoad is exactly that decision.
+ */
+export function jpegSize(bytes: Uint8Array): { width: number; height: number } | undefined {
+  let p = 2;
+  while (p + 1 < bytes.length) {
+    if (bytes[p] !== 0xff) {
+      p++;
+      continue;
+    }
+    const m = bytes[p + 1];
+    if (m === 0xff) {
+      p++;
+      continue;
+    }
+    if (m === 0x01 || (m >= 0xd0 && m <= 0xd9)) {
+      p += 2;
+      continue;
+    }
+    if (p + 4 > bytes.length) return undefined;
+    const len = (bytes[p + 2] << 8) | bytes[p + 3];
+    /* SOF0, SOF1, SOF2, SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15: every frame header but DHT,
+       JPG and DAC. */
+    const isSof = (m >= 0xc0 && m <= 0xc3) || (m >= 0xc5 && m <= 0xc7) ||
+      (m >= 0xc9 && m <= 0xcb) || (m >= 0xcd && m <= 0xcf);
+    if (isSof) {
+      if (p + 9 > bytes.length) return undefined;
+      return { height: (bytes[p + 5] << 8) | bytes[p + 6], width: (bytes[p + 7] << 8) | bytes[p + 8] };
+    }
+    p += 2 + len;
+  }
+  return undefined;
+}
+
 /* ------------------------------------------------------------------ tables */
 
 /* zigzag position -> natural (row major) index */
@@ -126,6 +162,22 @@ const FIX_2_053119869 = 16819;
 const FIX_2_562915447 = 20995;
 const FIX_3_072711026 = 25172;
 const IDCT_WS = new Int32Array(64);
+
+/*
+ * The constants jidctred.c precalculates at CONST_BITS == 13 for the reduced-size IDCTs below.
+ * Only the ones jidctint.c does not already name are listed here.
+ */
+const FIX_0_211164243 = 1730;
+const FIX_0_509795579 = 4176;
+const FIX_0_601344887 = 4926;
+const FIX_0_720959822 = 5906;
+const FIX_0_850430095 = 6967;
+const FIX_1_061594337 = 8697;
+const FIX_1_272758580 = 10426;
+const FIX_1_451774981 = 11893;
+const FIX_2_172734803 = 17799;
+const FIX_3_624509785 = 29692;
+const IDCT_WS_RED = new Int32Array(64);
 
 /* libjpeg's DESCALE: add half a step, then shift it off. The shift is C's
    arithmetic right shift, which is a floor. */
@@ -330,6 +382,102 @@ function idctIslow(coef: Float32Array, out: Float32Array): void {
     out[b + 3] = rangeLimit(descale(t13 + t0, CONST_BITS + PASS1_BITS + 3));
     out[b + 4] = rangeLimit(descale(t13 - t0, CONST_BITS + PASS1_BITS + 3));
   }
+}
+
+/* ------------------------------------------------- libjpeg's jpeg_idct_4x4 / _2x2 / _1x1
+ *
+ * jidctred.c, the inverse DCTs libjpeg runs when the caller asks for a reduced-size decode
+ * (`scale_num`/`scale_denom`, which is how sharp's fastShrinkOnLoad takes a jpeg down by 2, 4 or
+ * 8 on load). They are the LL&M algorithm of jidctint.c with each 8-to-8 1-D step replaced by an
+ * 8-to-4 step -- the four averages of two adjacent outputs -- or an 8-to-2 step, the two averages
+ * of four. 1x1 is the DC coefficient divided by 8.
+ *
+ * That is a different answer from decoding at full size and then resizing: the average is taken in
+ * the fixed-point domain before the level shift and the clamp, so a block whose samples would
+ * clamp at 255 does not come out at 255 here. Measured against sharp 0.33.5, a 64x64 RGB jpeg
+ * decoded with no operation agrees byte for byte (the islow path above), while
+ * `.resize({width:16})` -- a 1/4 decode -- does not, and only these three reproduce it.
+ */
+
+/**
+ * `jpeg_idct_4x4`: four averages of two from one block. `out` receives 16 samples, row major.
+ */
+function idct4x4(coef: Float32Array, out: Float32Array): void {
+  const ws = IDCT_WS_RED;
+  /* Pass 1: process columns from input, store into work array. Column 4 is skipped because the
+     second pass never reads it. */
+  for (let col = 0; col < 8; col++) {
+    if (col === 4) continue;
+    const c0 = coef[col];
+    const c2 = coef[16 + col];
+    const c6 = coef[48 + col];
+    let tmp0 = c0 * (1 << (CONST_BITS + 1));
+    const tmp2 = c2 * FIX_1_847759065 + c6 * -FIX_0_765366865;
+    const tmp10 = tmp0 + tmp2;
+    const tmp12 = tmp0 - tmp2;
+    const z1 = coef[56 + col];
+    const z2 = coef[40 + col];
+    const z3 = coef[24 + col];
+    const z4 = coef[8 + col];
+    tmp0 = z1 * -FIX_0_211164243 + z2 * FIX_1_451774981 + z3 * -FIX_2_172734803 + z4 * FIX_1_061594337;
+    const tmp2b = z1 * -FIX_0_509795579 + z2 * -FIX_0_601344887 + z3 * FIX_0_899976223 + z4 * FIX_2_562915447;
+    ws[col] = descale(tmp10 + tmp2b, CONST_BITS - PASS1_BITS + 1);
+    ws[24 + col] = descale(tmp10 - tmp2b, CONST_BITS - PASS1_BITS + 1);
+    ws[8 + col] = descale(tmp12 + tmp0, CONST_BITS - PASS1_BITS + 1);
+    ws[16 + col] = descale(tmp12 - tmp0, CONST_BITS - PASS1_BITS + 1);
+  }
+  /* Pass 2: process the four rows from the work array, store into the output. */
+  for (let row = 0; row < 4; row++) {
+    const b = row * 8;
+    let tmp0 = ws[b] * (1 << (CONST_BITS + 1));
+    const tmp2 = ws[b + 2] * FIX_1_847759065 + ws[b + 6] * -FIX_0_765366865;
+    const tmp10 = tmp0 + tmp2;
+    const tmp12 = tmp0 - tmp2;
+    const z1 = ws[b + 7];
+    const z2 = ws[b + 5];
+    const z3 = ws[b + 3];
+    const z4 = ws[b + 1];
+    tmp0 = z1 * -FIX_0_211164243 + z2 * FIX_1_451774981 + z3 * -FIX_2_172734803 + z4 * FIX_1_061594337;
+    const tmp2b = z1 * -FIX_0_509795579 + z2 * -FIX_0_601344887 + z3 * FIX_0_899976223 + z4 * FIX_2_562915447;
+    const d = row * 4;
+    out[d] = rangeLimit(descale(tmp10 + tmp2b, CONST_BITS + PASS1_BITS + 3 + 1));
+    out[d + 3] = rangeLimit(descale(tmp10 - tmp2b, CONST_BITS + PASS1_BITS + 3 + 1));
+    out[d + 1] = rangeLimit(descale(tmp12 + tmp0, CONST_BITS + PASS1_BITS + 3 + 1));
+    out[d + 2] = rangeLimit(descale(tmp12 - tmp0, CONST_BITS + PASS1_BITS + 3 + 1));
+  }
+}
+
+/** `jpeg_idct_2x2`: two averages of four from one block. `out` receives 4 samples. */
+function idct2x2(coef: Float32Array, out: Float32Array): void {
+  const ws = IDCT_WS_RED;
+  /* Columns 2, 4 and 6 are skipped: the second pass never reads them. */
+  for (let col = 0; col < 8; col++) {
+    if (col === 2 || col === 4 || col === 6) continue;
+    const tmp10 = coef[col] * (1 << (CONST_BITS + 2));
+    const tmp0 =
+      coef[56 + col] * -FIX_0_720959822 +
+      coef[40 + col] * FIX_0_850430095 +
+      coef[24 + col] * -FIX_1_272758580 +
+      coef[8 + col] * FIX_3_624509785;
+    ws[col] = descale(tmp10 + tmp0, CONST_BITS - PASS1_BITS + 2);
+    ws[8 + col] = descale(tmp10 - tmp0, CONST_BITS - PASS1_BITS + 2);
+  }
+  for (let row = 0; row < 2; row++) {
+    const b = row * 8;
+    const tmp10 = ws[b] * (1 << (CONST_BITS + 2));
+    const tmp0 =
+      ws[b + 7] * -FIX_0_720959822 +
+      ws[b + 5] * FIX_0_850430095 +
+      ws[b + 3] * -FIX_1_272758580 +
+      ws[b + 1] * FIX_3_624509785;
+    out[row * 2] = rangeLimit(descale(tmp10 + tmp0, CONST_BITS + PASS1_BITS + 3 + 2));
+    out[row * 2 + 1] = rangeLimit(descale(tmp10 - tmp0, CONST_BITS + PASS1_BITS + 3 + 2));
+  }
+}
+
+/** `jpeg_idct_1x1`: the average of the whole block, one eighth of the DC coefficient. */
+function idct1x1(coef: Float32Array, out: Float32Array): void {
+  out[0] = rangeLimit(descale(coef[0], 3));
 }
 
 /* Annex K quantisation tables, zigzag order */
@@ -839,10 +987,20 @@ interface DecodeComp {
   planeH: number;
   compW: number;
   compH: number;
+  /** How many samples one side of a block decodes to: 8 unscaled, or 4, 2 or 1 under DCT scaling. */
+  dctScaled: number;
 }
 
+/**
+ * `shrink` is libjpeg's `scale_denom` -- 1, 2, 4 or 8 -- which is how sharp's fastShrinkOnLoad
+ * takes a jpeg down on load: libjpeg then runs the reduced-size IDCTs above instead of
+ * jpeg_idct_islow, so a block becomes the average of its samples rather than the samples
+ * themselves. It is not the same as decoding at full size and resizing afterwards, and it is the
+ * only way to match sharp 0.33.5's `.resize(16)` on a 64x64 jpeg.
+ */
 export function decodeJpeg(
-  bytes: Uint8Array
+  bytes: Uint8Array,
+  shrink = 1
 ): { image: Image; info: JpegInfo } {
   if (!isJpeg(bytes)) throw new Error('bad JPEG signature');
 
@@ -1040,6 +1198,7 @@ export function decodeJpeg(
           planeH: 0,
           compW: 0,
           compH: 0,
+          dctScaled: 8,
         });
         q += 3;
       }
@@ -1091,16 +1250,37 @@ export function decodeJpeg(
 
   const mcusX = Math.ceil(width / (hmax * 8));
   const mcusY = Math.ceil(height / (vmax * 8));
+  /*
+   * libjpeg's DCT scaling. `minScaled` is 8 / scale_denom, the smallest block any component
+   * decodes to; a component then doubles its own scaled size as far as the sampling factors let
+   * it, so that the chroma of a 4:2:0 image is enlarged by the IDCT rather than by the
+   * upsampler -- at scale 4 a 64x64 4:2:0 jpeg decodes its luma with the 2x2 IDCT and its
+   * chroma with the 4x4 one, and neither is upsampled at all (jpeg_calc_output_dimensions,
+   * jdmaster.c).
+   */
+  const minScaled = 8 / shrink;
+  const outW = Math.ceil(width / shrink);
+  const outH = Math.ceil(height / shrink);
 
   for (let i = 0; i < comps.length; i++) {
     const c = comps[i];
-    const bw = mcusX * c.h * 8;
-    const bh = mcusY * c.v * 8;
+    let ssize = minScaled;
+    while (
+      ssize < 8 &&
+      (hmax * minScaled) % (c.h * ssize * 2) === 0 &&
+      (vmax * minScaled) % (c.v * ssize * 2) === 0
+    ) {
+      ssize = ssize * 2;
+    }
+    c.dctScaled = ssize;
+    const bw = mcusX * c.h * ssize;
+    const bh = mcusY * c.v * ssize;
     c.planeW = bw;
     c.planeH = bh;
     c.plane = new Uint8Array(bw * bh);
-    c.compW = Math.ceil((width * c.h) / hmax);
-    c.compH = Math.ceil((height * c.v) / vmax);
+    /* downsampled_width/height in libjpeg's sense: the size the component has after the IDCT. */
+    c.compW = Math.ceil((width * c.h * ssize) / (hmax * 8));
+    c.compH = Math.ceil((height * c.v * ssize) / (vmax * 8));
     if (c.compW > bw) c.compW = bw;
     if (c.compH > bh) c.compH = bh;
     if (quant[c.tq] === undefined) c.pred = 0;
@@ -1185,16 +1365,22 @@ export function decodeJpeg(
             /*
              * libjpeg's jpeg_idct_islow, not the float transform: the samples
              * it writes are already clamped and level shifted, so the +128.5
-             * the float path needed is gone.
+             * the float path needed is gone. Under DCT scaling it is the
+             * reduced-size pair of that transform instead, writing
+             * `dctScaled` x `dctScaled` samples per block.
              */
-            idctIslow(coef, outb);
+            const n = c.dctScaled;
+            if (n === 8) idctIslow(coef, outb);
+            else if (n === 4) idct4x4(coef, outb);
+            else if (n === 2) idct2x2(coef, outb);
+            else idct1x1(coef, outb);
 
-            const blockX = (mx * c.h + bx) * 8;
-            const blockY = (my * c.v + by) * 8;
-            for (let yy = 0; yy < 8; yy++) {
+            const blockX = (mx * c.h + bx) * n;
+            const blockY = (my * c.v + by) * n;
+            for (let yy = 0; yy < n; yy++) {
               let o = (blockY + yy) * c.planeW + blockX;
-              const src = yy * 8;
-              for (let xx = 0; xx < 8; xx++) {
+              const src = yy * n;
+              for (let xx = 0; xx < n; xx++) {
                 c.plane[o++] = outb[src + xx];
               }
             }
@@ -1205,26 +1391,26 @@ export function decodeJpeg(
     }
   }
 
-  /* upsample every component to full resolution */
+  /*
+   * Upsample every component to the output resolution, which under DCT scaling is the shrunk one
+   * and not the image's. The ratios follow from the sizes libjpeg ends up with rather than from
+   * the sampling factors: a component whose IDCT was scaled up to the output size is 1:1 even
+   * where its sampling factors are not, which is the whole point of scaling the chroma in the
+   * IDCT. A ratio that does not divide exactly rounds up, and the upsampler clips the extra
+   * samples off the right and bottom the way libjpeg drops them.
+   */
   const planes: Uint8Array[] = [];
   for (let i = 0; i < comps.length; i++) {
     const c = comps[i];
+    const hr = Math.max(1, Math.round(outW / c.compW));
+    const vr = Math.max(1, Math.round(outH / c.compH));
     planes.push(
-      upsampleComponent(
-        c.plane,
-        c.planeW,
-        c.compW,
-        c.compH,
-        width,
-        height,
-        hmax / c.h,
-        vmax / c.v
-      )
+      upsampleComponent(c.plane, c.planeW, c.compW, c.compH, outW, outH, hr, vr)
     );
   }
 
   /* assemble */
-  const npx = width * height;
+  const npx = outW * outH;
   let channels: 1 | 2 | 3 | 4;
   const data = new Uint8Array(npx * (comps.length === 1 ? 1 : 3));
 
@@ -1292,7 +1478,7 @@ export function decodeJpeg(
   if (icc !== undefined) info.icc = icc;
   if (xmp !== undefined) info.xmp = xmp;
 
-  return { image: { width, height, channels, data }, info };
+  return { image: { width: outW, height: outH, channels, data }, info };
 }
 
 /* ----------------------------------------------------------------- encode -- */

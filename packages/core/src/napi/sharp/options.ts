@@ -256,7 +256,10 @@ export function unsupportedOption(options: Record<string, unknown>): string | nu
     }
     if (options.kernel !== undefined && KERNEL_VALUES.indexOf(String(options.kernel)) === -1) return 'kernel=' + String(options.kernel);
     const position = typeof options.position === 'number' ? options.position : 0;
-    if (position < 0 || position > 8) return 'position=' + String(options.position);
+    /* 16 is the entropy strategy, which this shim now runs; 17 is attention, which it does not. */
+    if (position < 0 || position > 8) {
+        if (position !== 16) return 'position=' + String(options.position);
+    }
     if (options.formatOut !== undefined && OUTPUT_FORMATS.indexOf(String(options.formatOut)) === -1) {
         return 'formatOut=' + String(options.formatOut);
     }

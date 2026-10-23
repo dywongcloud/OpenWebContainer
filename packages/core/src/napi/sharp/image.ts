@@ -293,18 +293,29 @@ function reduceAxis(
      * is 24 -- while a sum that runs from the top of the image reaches 23.999999999999996 and
      * takes 23, which is what its columns do.
      */
-    const atOf = (d: number): number =>
-        horizontal ? 0 : (stripStart(d) + 0.5) * shrink - 0.5 - offset;
-    /* The top of the strip `d` falls in, never above the first row asked for. */
-    const stripStart = (d: number): number =>
-        strip <= 0 || d <= clock ? clock : clock + Math.floor((d - clock) / strip) * strip;
-    const freshStrip = (d: number): boolean => strip > 0 && (d === clock || (d > clock && (d - clock) % strip === 0));
+    /*
+     * The position every output pixel takes in the source, built once. vips_reducev_gen and
+     * vips_reduceh_gen both start their running sum at `(first + 0.5) * shrink - 0.5 - offset`,
+     * where `first` is the top -- or the left -- of the region they were asked to fill, and then
+     * add the shrink once per pixel. Only the vertical one restarts on the way, at the top of each
+     * strip it is asked for; a horizontal reduce is handed whole rows, so its sum runs the width.
+     *
+     * The pixels before the clock are not part of what was asked for -- a crop has already thrown
+     * them away -- so they are walked backwards from the clock with the same step, which is the
+     * only thing that keeps the row continuous for a caller that reads all of it.
+     */
+    const first = Math.min(Math.max(clock, 0), dstSize - 1);
+    const sp = strip > 0 ? strip : Number.MAX_SAFE_INTEGER;
+    const pos: number[] = new Array(dstSize);
+    for (let d = first; d < dstSize; d++) {
+        pos[d] = d === first || (d - first) % sp === 0
+            ? (d + 0.5) * shrink - 0.5 - offset
+            : pos[d - 1] + shrink;
+    }
+    for (let d = first - 1; d >= 0; d--) pos[d] = pos[d + 1] - shrink;
     for (let o = 0; o < other; o++) {
-        let at = 0.5 * shrink - 0.5 - offset;
         for (let d = 0; d < dstSize; d++) {
-            if (!horizontal) {
-                at = freshStrip(d) ? atOf(d) : at + shrink;
-            }
+            const at = pos[d];
             const start = Math.trunc(at);
             const phase = Math.trunc(at * TRANSFORM_SCALE * 2) & (TRANSFORM_SCALE * 2 - 1);
             const coef = table[(phase + 1) >> 1];
@@ -320,7 +331,6 @@ function reduceAxis(
                 const j = horizontal ? (o * dstSize + d) * ch + c : (d * other + o) * ch + c;
                 out.data[j] = v < 0 ? 0 : v > 255 ? 255 : v;
             }
-            if (horizontal) at += shrink;
         }
     }
     return out;
@@ -514,6 +524,8 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
      */
     const scale = 1 / shrink;
     const reciprocal = 1 / scale;
+    /* A horizontal reduce is handed whole rows, so there is no strip for its sum to restart at. */
+    const sp = horizontal ? Number.MAX_SAFE_INTEGER : strip;
     /*
      * vips_resize's `gap` of 2: the integer part of the shrink, as far as it goes with a gap of two
      * still to run, is taken before the kernel sees the image -- a vips_shrink box average for the
@@ -542,7 +554,7 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
         const workSize = horizontal ? work.width : work.height;
         const dstSize = roundU(workSize / residual);
         if (dstSize >= workSize) return work;
-        return reduceAxis(work, dstSize, residual, dstSize * residual - workSize, horizontal, kernelName, clock, strip);
+        return reduceAxis(work, dstSize, residual, dstSize * residual - workSize, horizontal, kernelName, clock, sp);
     }
     const dstSize = roundU(srcSize / reciprocal);
     if (dstSize >= srcSize) return image;
@@ -554,7 +566,7 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
     if (dstSize === workSize) return work;
     /* The unused pixels are the ones the box shrink did not take: vips_reduceh divides them by the
        integer part it has just applied (resample/reduceh.cpp, vips_reduceh_build). */
-    return reduceAxis(work, dstSize, residual, extra / block, horizontal, kernelName, clock, strip);
+    return reduceAxis(work, dstSize, residual, extra / block, horizontal, kernelName, clock, sp);
 }
 
 /**
@@ -563,10 +575,24 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
  * rounds its own output size off it, so an axis that is only along for the ride -- `cover` with
  * an auto height -- is still reduced at the other axis' factor.
  */
-export function resample(image: Image, hshrink: number, vshrink: number, kernel: string, vclock = 0, strip = REDUCEV_STRIP): Image {
+export function resample(image: Image, hshrink: number, vshrink: number, kernel: string, vclock = 0, strip = REDUCEV_STRIP, hclock = 0): Image {
     let work = image;
-    if (vshrink > 1) work = resampleAxis(work, vshrink, false, kernel, vclock, strip);
-    if (hshrink > 1) work = resampleAxis(work, hshrink, true, kernel);
+    /*
+     * Whether a vips_affine will run after the reduces. When one does, it is the last operation in
+     * the resize and it prepares the whole strip of rows it interpolates from in one request, so
+     * vips_reducev is asked for its full output at once and clocks its running sum once, at row 0:
+     * there is no strip for it to restart at, and no crop between it and the affine to start it
+     * part-way down. Measured against sharp 0.33.5 at 64x64 -> Wx60 nearest: the reduce takes
+     * source row 23 for output row 22 at every W from 65 to 200 -- where an affine follows the
+     * 1.0667 vertical reduce -- and row 24 at W = 64, where nothing does. 22.5 * 64/60 is exactly
+     * 24, so which of the two it lands on is the last bit of the sum, and a sum restarted at row 16
+     * reaches 24.0 where one run from row 0 reaches 23.999999999999996.
+     */
+    const affine = 1 / hshrink > 1 || 1 / vshrink > 1;
+    if (vshrink > 1) {
+        work = resampleAxis(work, vshrink, false, kernel, affine ? 0 : vclock, affine ? Number.MAX_SAFE_INTEGER : strip);
+    }
+    if (hshrink > 1) work = resampleAxis(work, hshrink, true, kernel, hclock);
     /* Whether either axis actually ran a reduce: see the zoom branch below. */
     const reduced = work !== image;
     const hscale = 1 / hshrink;
@@ -723,6 +749,49 @@ function resolveShrink(
 }
 
 /**
+ * The integer libvips is handed as jpegload's `shrink`, and so the `scale_denom` the reduced-size
+ * IDCTs in jpeg.ts run at. It is src/pipeline.cc's, quirks and all (v0.33.5):
+ *
+ *   - the largest of 8, 4 and 2 the COMMON shrink -- the smaller of the two axes -- reaches,
+ *     because one `scale_denom` covers the whole frame;
+ *   - halved again wherever the shrink is exactly that factor, which sharp files as "known
+ *     libjpeg rounding errors". A 64x64 jpeg asked for 32 therefore decodes at 1/1 and is then
+ *     resized, while the same jpeg asked for 20 decodes at 1/2; measured against sharp 0.33.5,
+ *     `.resize({width:32})` and `.resize({width:24})` are byte-identical to a full decode
+ *     followed by the resize, and `.resize({width:20})` is not;
+ *   - and taken only when fastShrinkOnLoad is on, which halves the factor it is measured
+ *     against: with it off a shrink has to reach 4, 8 or 16 before anything is shrunk on load.
+ */
+export function shrinkOnLoadOf(
+    width: number,
+    height: number,
+    targetWidth: number,
+    targetHeight: number,
+    canvas: string,
+    withoutEnlargement: boolean,
+    withoutReduction: boolean,
+    fastShrinkOnLoad: boolean
+): number {
+    const { hshrink, vshrink } = resolveShrink(
+        width,
+        height,
+        targetWidth,
+        targetHeight,
+        canvas,
+        withoutEnlargement,
+        withoutReduction
+    );
+    const shrink = Math.min(hshrink, vshrink);
+    const factor = fastShrinkOnLoad ? 1 : 2;
+    let scale = 1;
+    if (shrink >= 8 * factor) scale = 8;
+    else if (shrink >= 4 * factor) scale = 4;
+    else if (shrink >= 2 * factor) scale = 2;
+    if (scale > 1 && Math.trunc(shrink) === scale) scale = scale / 2;
+    return scale;
+}
+
+/**
  * The resample alone, with whether it changed anything. The crop or embed that finishes a resize is
  * `canvasImage`, and sharp runs it later than this: after the flip, flop and rotation, not before.
  *
@@ -758,11 +827,45 @@ export function resizeImage(image: Image, spec: ResizeSpec): { image: Image; res
     /* One tile leaves the vertical reduce neither a strip to restart at nor a clock to start from:
        a strip taller than any image is one the top row is the only fresh start in. */
     const tile = spec.wholeTile === true;
-    const out = resample(src, hshrink, vshrink, spec.kernel, tile ? 0 : verticalClock(spec, sh), tile ? Number.MAX_SAFE_INTEGER : REDUCEV_STRIP);
+    /*
+     * What libvips hands the reduce's output to decides whether its running sum is restarted at
+     * strips. An affine that enlarges afterwards is the last operation in the resize and reads the
+     * whole of the reduce's output in one request, which leaves one sum from row 0; a resize whose
+     * reduce output is the image itself is walked in strips. A crop or embed after it does not
+     * change that -- measured against sharp 0.33.5 over 4800 resizes, an embed that made the sum
+     * continuous fixed 40x30 -> 30x30 contain nearest and broke 18 other contain and inside
+     * nearest cases, so the strips stay.
+     */
+    const follower = tile || 1 / hshrink > 1 || 1 / vshrink > 1;
+    const out = resample(
+        src,
+        hshrink,
+        vshrink,
+        spec.kernel,
+        follower ? 0 : verticalClock(spec, sh),
+        follower ? Number.MAX_SAFE_INTEGER : REDUCEV_STRIP,
+        spec.canvas === 'crop' ? horizontalClock(spec, sw) : 0
+    );
     return {
         image: alpha ? unpremultiplyImage(out) : out,
         resized: hshrink !== 1 || vshrink !== 1
     };
+}
+
+/**
+ * The column of the reduce's output the crop that follows will ask for first, the horizontal twin
+ * of `verticalClock`. vips_reduceh_gen clocks its running sum to `r->left`, the left edge of the
+ * region it was asked to fill, so the columns a crop keeps are reached by a sum that starts there
+ * and not by one that starts at column 0. Measured against sharp 0.33.5 at 16x8 -> cover 5x5
+ * nearest: the crop keeps columns 3 to 7 of the 10-column reduce, and the host's seven is source
+ * column 12 -- what a sum started at 3.5 * 1.6 gives, where one started at 0.5 * 1.6 reaches
+ * 11.999999999999998 and takes 11, which is also what the same reduce answers when nothing crops
+ * it (16x8 -> 10x5 fill nearest agrees at every column).
+ */
+function horizontalClock(spec: ResizeSpec, sw: number): number {
+    const cw = Math.min(spec.width > 0 ? spec.width : sw, sw);
+    if (cw >= sw) return 0;
+    return offsetXOf(spec.position, sw, cw, true);
 }
 
 /**
@@ -827,6 +930,77 @@ function verticalClock(spec: ResizeSpec, sh: number): number {
     if (ch >= sh) return 0;
     const top = offsetOf(spec.position, sh, ch, true);
     return spec.flipRows === true ? sh - top - ch : top;
+}
+
+/**
+ * libvips' `vips_hist_entropy` (histogram/hist_entropy.c) over the histogram `vips_hist_find` makes
+ * of a region: `-sum(p * log2(p))` over the 256 bins, a bin nothing fell into contributing nothing,
+ * which is the limit of `p * log2(p)` as p goes to zero.
+ *
+ * It is taken one band at a time and the bands added, which in exact arithmetic is the same
+ * ordering as the pooled `-sum` the C computes -- normalising every bin by pixels * bands instead
+ * of by pixels only adds a constant and a factor of one over the band count -- but it is not the
+ * same two doubles. Measured against sharp 0.33.5 over 210 entropy crops, the two decide every
+ * slice the same way except in two: 80x50 -> 50x50 cover and 100x60 -> 100x10 cover, where the
+ * image is a wrapped gradient whose two ends are within an ulp of each other and the host keeps
+ * the crop at 0.
+ */
+function histEntropy(image: Image, left: number, top: number, width: number, height: number): number {
+    const bins = new Int32Array(256 * image.channels);
+    const ch = image.channels;
+    for (let y = top; y < top + height; y++) {
+        let i = (y * image.width + left) * ch;
+        for (let x = left; x < left + width; x++) {
+            for (let c = 0; c < ch; c++) bins[image.data[i + c] + c * 256]++;
+            i += ch;
+        }
+    }
+    let entropy = 0;
+    for (let c = 0; c < ch; c++) {
+        const total = width * height;
+        for (let b = 0; b < 256; b++) {
+            const count = bins[b + c * 256];
+            if (count === 0) continue;
+            const p = count / total;
+            entropy -= p * (Math.log(p) / Math.log(2));
+        }
+    }
+    return entropy;
+}
+
+/**
+ * libvips' `vips_smartcrop` with `VIPS_INTERESTING_ENTROPY` (conversion/smartcrop.c): repeatedly
+ * take a slice off whichever axis still has the most to lose, score the slice at each end of that
+ * axis by the entropy of its histogram, and keep the end that scores higher -- so the crop walks
+ * towards the busier half of the image. The slice is a eighth of the distance left to travel on
+ * the axis that has furthest to go, and the two axes are trimmed in the same pass.
+ */
+export function smartcropEntropy(image: Image, width: number, height: number): { left: number; top: number } {
+    let left = 0;
+    let top = 0;
+    let w = image.width;
+    let h = image.height;
+    const maxSlice = Math.max(
+        Math.ceil((image.width - width) / 8),
+        Math.ceil((image.height - height) / 8)
+    );
+    while (w > width || h > height) {
+        const sliceW = Math.min(w - width, maxSlice);
+        const sliceH = Math.min(h - height, maxSlice);
+        if (sliceW > 0) {
+            const before = histEntropy(image, left, top, sliceW, h);
+            const after = histEntropy(image, left + w - sliceW, top, sliceW, h);
+            w -= sliceW;
+            if (before < after) left += sliceW;
+        }
+        if (sliceH > 0) {
+            const before = histEntropy(image, left, top, w, sliceH);
+            const after = histEntropy(image, left, top + h - sliceH, w, sliceH);
+            h -= sliceH;
+            if (before < after) top += sliceH;
+        }
+    }
+    return { left, top };
 }
 
 /**
