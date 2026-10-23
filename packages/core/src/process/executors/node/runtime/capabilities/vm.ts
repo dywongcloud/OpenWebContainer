@@ -33,10 +33,18 @@ interface VmRealm {
     namesFn?: QuickJSHandle;
     /** `Object.defineProperty` in this realm, once: what {@link defineHidden} uses. */
     defineFn?: QuickJSHandle;
+    /** `Object.defineProperty` of the sandbox's own keys on this realm's global, once. */
+    projectFn?: QuickJSHandle;
+    /** Whether a name on the global object is an accessor, once: what {@link syncOut} reads. */
+    descFn?: QuickJSHandle;
     /** The own names of this realm's global object as it was made: its intrinsics, not its sandbox. */
     base: Set<string>;
     /** The names on the global object that are the sandbox's: what {@link syncOut} writes back. */
     held: Set<string>;
+    /** The names of those that were the sandbox's own to begin with: what {@link syncIn} takes off. */
+    from: Set<string>;
+    /** Names the caller has dropped from the sandbox that the code of the context had made. */
+    detached: Set<string>;
     /** Names this container put on the global object itself: never written back to the sandbox. */
     injected: Set<string>;
 }
@@ -271,6 +279,17 @@ const REALM_REJECTION_SRC = '(function (note, record) {' +
     '}' +
     'return nativeThen.call(this, onFulfilled, onRejected);' +
     '};' +
+    /* 'Object.getOwnPropertyNames(Promise.prototype)' is 'catch', 'constructor', 'finally', 'then'
+       on host Node 24.15 and was 'constructor' alone in a context: 'Promise' there is this
+       subclass, so its prototype is a fresh object with nothing of its own but its constructor and
+       the three a promise answers to are inherited from the intrinsic's. They go on it here, the
+       same functions under the same flags, so the list of own names is the host's and nothing a
+       promise does changes. */
+    'for (var pi = 0; pi < 3; pi++) {' +
+    'var pk = ["then", "catch", "finally"][pi];' +
+    'var pd = Object.getOwnPropertyDescriptor(Native.prototype, pk);' +
+    'if (pd !== undefined) Object.defineProperty(Tracked.prototype, pk, pd);' +
+    '}' +
     '})';
 
 /**
@@ -597,6 +616,7 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
 /** Frees one second realm and every handle of the binding that was built inside it. */
 function disposeRealm(realm: VmRealm): void {
     for (const handle of [realm.noteFn, realm.recordFn, realm.rehomeFn, realm.namesFn, realm.defineFn,
+        realm.projectFn, realm.descFn,
         ...(realm.builtins === undefined ? [] : [...realm.builtins.from, ...realm.builtins.to])]) {
         if (handle === undefined) continue;
         try {
@@ -610,6 +630,8 @@ function disposeRealm(realm: VmRealm): void {
     realm.rehomeFn = undefined;
     realm.namesFn = undefined;
     realm.defineFn = undefined;
+    realm.projectFn = undefined;
+    realm.descFn = undefined;
     realm.builtins = undefined;
     try {
         realm.ctx.dispose();
@@ -672,7 +694,8 @@ function realmFor(host: VmHost, id: number): VmRealm | undefined {
     if (found !== undefined) return found;
     try {
         const ctx = host.runtime.newContext();
-        const realm: VmRealm = { ctx, base: new Set<string>(), held: new Set<string>(), injected: new Set<string>() };
+        const realm: VmRealm = { ctx, base: new Set<string>(), held: new Set<string>(), injected: new Set<string>(),
+            from: new Set<string>(), detached: new Set<string>() };
         host.realms.set(id, realm);
         bridgeGlobals(host, realm);
         installStacks(realm);
@@ -702,6 +725,13 @@ function bridgeGlobals(host: VmHost, realm: VmRealm): void {
     try {
         const built = realm.ctx.evalCode(
             '(function (src, both) {' +
+            /* The tag this engine puts on its own global object: QuickJS's `globalThis` carries an
+               own `Symbol.toStringTag` of 'global', so `Object.prototype.toString.call(globalThis)`
+               answers '[object global]' inside a context where host Node 24.15 answers
+               '[object Object]' -- a context's global is Node's own contextified object and not a
+               raw engine global, and it carries no tag. The name is the realm's own and nothing
+               else in it reads it, so it comes off here; every other tag is untouched. */
+            'try { delete globalThis[Symbol.toStringTag]; } catch (t) { }' +
             'var names = both[0];' +
             'var gone = both[1];' +
             'var whole = both[2];' +
@@ -883,22 +913,126 @@ function realmNames(host: VmHost, realm: VmRealm): string[] {
  * A name the sandbox no longer carries is taken off the global object with it, so a property the
  * caller drops between two runs is gone inside the context too.
  */
+/**
+ * The sandbox's own string keys, put onto the realm's global object *as they are on the sandbox*:
+ * the flags of the descriptor each one carries, and the accessor it is when it is one.
+ *
+ * Not `setProp`, which is an assignment and so makes every name enumerable, writable and
+ * configurable and reads an accessor's value out of it: host Node 24.15 answers `enumerable: false`
+ * for a non-enumerable property of the sandbox read inside a context, and an accessor of the sandbox
+ * is an accessor there -- `Object.getOwnPropertyDescriptor(globalThis, 'g')` names `get` and not
+ * `value`, and the getter is called once by the read that asked for it and not again by the copy.
+ *
+ * It runs in the realm, whose `Object.getOwnPropertyDescriptor` reads a property of the guest's
+ * sandbox as readily as one of its own -- the two are objects of one runtime -- so the descriptor
+ * never has to cross, and the functions of an accessor are handed on whole.
+ */
+function projectIn(host: VmHost, realm: VmRealm, sandbox: QuickJSHandle, keys: string[]): void {
+    if (keys.length === 0) return;
+    try {
+        if (realm.projectFn === undefined) {
+            const built = realm.ctx.evalCode(
+                '(function (sb, keys) {' +
+                'for (var i = 0; i < keys.length; i++) {' +
+                'var k = keys[i];' +
+                'try {' +
+                'var d = Object.getOwnPropertyDescriptor(sb, k);' +
+                'if (d === undefined) continue;' +
+                'if (d.get !== undefined || d.set !== undefined) {' +
+                'Object.defineProperty(globalThis, k,' +
+                ' { get: d.get, set: d.set, enumerable: d.enumerable, configurable: d.configurable });' +
+                '} else {' +
+                'Object.defineProperty(globalThis, k,' +
+                ' { value: d.value, writable: d.writable === true, enumerable: d.enumerable === true,' +
+                ' configurable: d.configurable === true });' +
+                '}' +
+                '} catch (x) { }' +
+                '}' +
+                '})'
+            );
+            if (built.error) {
+                built.error.dispose();
+                return;
+            }
+            realm.projectFn = realm.ctx.unwrapResult(built);
+        }
+        const list = realm.ctx.unwrapResult(realm.ctx.evalCode(JSON.stringify(keys)));
+        const result = realm.ctx.callFunction(realm.projectFn, realm.ctx.global, [sandbox, list]);
+        list.dispose();
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // a sandbox whose descriptors cannot be read leaves the globals of the last run standing
+    }
+}
+
+/** Whether a name on a realm's global object is an accessor, which {@link syncOut} must not read. */
+function accessorOf(realm: VmRealm, name: string): boolean {
+    try {
+        if (realm.descFn === undefined) {
+            const built = realm.ctx.evalCode(
+                '(function (k) {' +
+                'var d = Object.getOwnPropertyDescriptor(globalThis, k);' +
+                'return d !== undefined && (d.get !== undefined || d.set !== undefined);' +
+                '})'
+            );
+            if (built.error) {
+                built.error.dispose();
+                return false;
+            }
+            realm.descFn = realm.ctx.unwrapResult(built);
+        }
+        const key = realm.ctx.newString(name);
+        const result = realm.ctx.callFunction(realm.descFn, realm.ctx.global, [key]);
+        key.dispose();
+        if (result.error) {
+            result.error.dispose();
+            return false;
+        }
+        const answer = realm.ctx.dump(result.value);
+        result.value.dispose();
+        return answer === true;
+    } catch {
+        return false;
+    }
+}
+
 function syncIn(host: VmHost, realm: VmRealm, sandbox: QuickJSHandle): void {
     const { context } = host;
     const seen = new Set<string>();
+    const names: string[] = [];
     try {
         for (const key of ownKeysOf(host, sandbox)) {
+            if (typeof key === 'string') {
+                names.push(key);
+                seen.add(key);
+                const wasHeld = realm.held.has(key);
+                realm.held.add(key);
+                /* Only a name the sandbox brought is one {@link syncIn} may take off again. One the
+                   context made is written back onto the sandbox by {@link syncOut}, so it is on the
+                   sandbox by the next run without ever having come from it, and counting it here
+                   would make the caller's `delete` of it take it out of the context too. */
+                if (realm.from.has(key) || !wasHeld) realm.from.add(key);
+                continue;
+            }
             const value = context.getProp(sandbox, key);
             realm.ctx.setProp(realm.ctx.global, key, value);
             value.dispose();
-            if (typeof key === 'string') {
-                seen.add(key);
-                realm.held.add(key);
-            }
         }
+        projectIn(host, realm, sandbox, names);
         for (const held of [...realm.held]) {
             if (seen.has(held)) continue;
+            /* Only a name the sandbox itself brought is taken off the global object with it. Host
+               Node 24.15 keeps one the code of the context made: `vm.runInContext('w = 4', ctx)`
+               followed by `delete sandbox.w` still answers `number` to `typeof w` inside the
+               context, and the sandbox stays without the name, so such a name is left on the global
+               object and kept off the sandbox by {@link syncOut} instead. */
+            if (!realm.from.has(held)) {
+                realm.detached.add(held);
+                continue;
+            }
             realm.held.delete(held);
+            realm.from.delete(held);
             deleteKey(realm.ctx, realm.ctx.global, held);
         }
     } catch {
@@ -922,6 +1056,19 @@ function syncOut(host: VmHost, realm: VmRealm, sandbox: QuickJSHandle): void {
     try {
         for (const name of names) {
             if (realm.base.has(name) || realm.injected.has(name)) continue;
+            /* A name the caller dropped from the sandbox after the context had made it: host Node
+               24.15 leaves the sandbox without it, so it is not written back. */
+            if (realm.detached.has(name)) continue;
+            /* An accessor is not read on the way out: `Object.getOwnPropertyNames` names it, and
+               reading it would call the getter the sandbox carries -- once more than host Node 24.15
+               calls it, which answers `1` where this read made it `2` -- and hand the sandbox a
+               plain value where host leaves the accessor it came in with. */
+            if (accessorOf(realm, name)) {
+                /* Still the sandbox's, so {@link syncOut} leaves it there rather than deleting it
+                   for not having been read. */
+                present.add(name);
+                continue;
+            }
             const value = realm.ctx.getProp(realm.ctx.global, name);
             context.setProp(sandbox, name, value);
             value.dispose();

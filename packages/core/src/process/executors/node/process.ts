@@ -707,20 +707,29 @@ const REJECTION_TRACKER_SRC = String.raw`
       if (typeof executor !== 'function') {
         throw new TypeError('Promise resolver ' + String(executor) + ' is not a function');
       }
-      var owner = globalThis.process;
       var cell = {
         reason: undefined,
         rejected: false,
         handled: false,
         promise: null,
-        /* the domain the promise was built in: Node sends the rejection of a promise a domain owns
-           to that domain, even when the domain has already been left by the time it is detected */
-        domain: owner !== undefined && owner !== null && owner.domain !== undefined ? owner.domain : null
+        /* the domain the rejection belongs to, filled in when the promise rejects and not when it
+           is built: host node 24.15 hands a rejection to the domain that is active at the moment
+           of the rejection, whichever domain was active when the promise was made. Measured with a
+           promise built outside every domain and rejected inside d.run(...) -- host prints the
+           domain's handler -- and with the two halves the other way round, a promise built inside
+           d.run(...) and rejected after it has returned, where host prints a process
+           'unhandledRejection' listener instead; a promise built in one domain and rejected in
+           another goes to the second. */
+        domain: null
       };
       super(function (resolve, reject) {
         var wrapped = function (reason) {
           cell.rejected = true;
           cell.reason = reason;
+          var at = globalThis.process;
+          cell.domain = at !== undefined && at !== null && at.domain !== undefined && at.domain !== null
+            ? at.domain
+            : null;
           WATCHED.push(cell);
           reject(reason);
         };
@@ -760,6 +769,17 @@ const REJECTION_TRACKER_SRC = String.raw`
     }
     return nativeThen.call(this, onFulfilled, onRejected);
   };
+
+  /* 'Object.getOwnPropertyNames(Promise.prototype)' is 'catch', 'constructor', 'finally', 'then'
+     on host Node 24.15 and was 'constructor' alone here: 'Promise' is this subclass, so
+     'Promise.prototype' is a fresh object with nothing of its own but its constructor and the
+     three a promise answers to are inherited from the prototype under it. They go on it here --
+     the same functions under the same flags, so a promise reads them either way and only the list
+     of own names changes. */
+  ['then', 'catch', 'finally'].forEach(function (key) {
+    var desc = Object.getOwnPropertyDescriptor(Native.prototype, key);
+    if (desc !== undefined) Object.defineProperty(Tracked.prototype, key, desc);
+  });
 
   function listenerCountOf(emitter, type) {
     if (emitter === null || emitter === undefined) return 0;
@@ -861,7 +881,25 @@ const REJECTION_TRACKER_SRC = String.raw`
       /* it has been reported as unhandled, so a handler attached from here on is a late one */
       cell.unhandled = true;
       if (dom !== null && dom !== undefined) {
-        dom.emit('error', cell.reason);
+        /*
+         * The domain gets the reason as an 'error' event whether or not it listens, so the case a
+         * listener is missing for is the one host node 24.15's own emitter answers with a throw:
+         * an Error reason is thrown as it is and any other is wrapped in ERR_UNHANDLED_ERROR. That
+         * throw is an uncaught exception of its own -- host node 24.15 hands it to an
+         * 'uncaughtException' listener with origin 'uncaughtException' and runs on, and ends the
+         * process only with neither that nor the domain's own listener. Measured over the eight
+         * combinations of a domain that listens, an 'uncaughtException' listener and an
+         * 'unhandledRejection' listener: with the domain silent and no 'uncaughtException' listener
+         * both sides end at exit 1 with nothing after the rejection on stdout, and with an
+         * 'uncaughtException' listener the host prints UNCAUGHT and a timer queued after the
+         * rejection still runs, which this container did not.
+         */
+        try {
+          dom.emit('error', cell.reason);
+        } catch (thrown) {
+          raiseAsUncaught(thrown, 'uncaughtException');
+          if (report !== '') return report;
+        }
         continue;
       }
       if (listenerCountOf(proc, 'unhandledRejection') > 0) {
