@@ -896,6 +896,17 @@ Object.defineProperty(NATIVE_PROMISE, Symbol.species, {
 });
 Object.defineProperty(globalThis, 'Promise', { value: TrackedPromise, writable: true, configurable: true });
 
+/* 'Object.getOwnPropertyNames(Promise.prototype)' is 'catch', 'constructor', 'finally', 'then' on
+   host Node 24.15, and is 'constructor' alone while 'Promise' is a subclass whose prototype is a
+   fresh object: the three a promise answers to are own on the intrinsic's prototype and inherited
+   here. They go on it -- the same functions under the same flags, so a promise reads them either
+   way and only the list of own names changes. The rejection tracker of the process builds a
+   subclass of this one for its own reasons and takes the same three from it, so both are complete. */
+['then', 'catch', 'finally'].forEach(function (key) {
+  var desc = Object.getOwnPropertyDescriptor(NATIVE_PROMISE.prototype, key);
+  if (desc !== undefined) Object.defineProperty(TrackedPromise.prototype, key, desc);
+});
+
 /* The same record, written from the other side: the tracker of a 'vm' context's realm builds a
    cell of its own for every promise it sees, and hands it here so that a promise out of a context
    is in the record its own promises are in. It is the promise that is the key and not the cell,
