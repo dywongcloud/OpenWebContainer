@@ -1252,7 +1252,7 @@ function dataResponse(url) {
   } catch (undecodable) {
     bytes = Buffer.from(payload, 'utf8');
   }
-  var made = new Response(bytes, { status: 200, headers: { 'content-type': base64 ? meta.slice(0, meta.length - 7) : (meta === '' ? 'text/plain;charset=US-ASCII' : meta) }, url: url });
+  var made = new Response(bytes, { status: 200, statusText: 'OK', headers: { 'content-type': base64 ? meta.slice(0, meta.length - 7) : (meta === '' ? 'text/plain;charset=US-ASCII' : meta) }, url: url });
   /* the bytes came from the url itself rather than from another origin, as Node reports it */
   RESPONSE_STATE.get(made).type = 'basic';
   return made;
@@ -1386,9 +1386,10 @@ function fetch(target, options) {
       } catch (unresolvable) {
         return answer(res, at, hops, tainted);
       }
-      if (next === null || next.hostname === '') return answer(res, at, hops, tainted);
+      if (next === null) return answer(res, at, hops, tainted);
       /* a scheme there is no client for fails the fetch, as it does in Node, rather than answering
-         the redirect as though the Location had never been read */
+         the redirect as though the Location had never been read; a hostless Location -- data:,
+         mailto:, file: -- has no host to check and is answered by the scheme it carries */
       if (next.protocol !== 'http:' && next.protocol !== 'https:') {
         throw new Error('URL scheme must be a HTTP(S) scheme');
       }
