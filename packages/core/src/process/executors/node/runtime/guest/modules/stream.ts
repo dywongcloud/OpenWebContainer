@@ -2603,15 +2603,18 @@ function owcBuildStreamCore() {
   function pipelineStart(args, callback, opts) {
     if (args.length === 1 && Array.isArray(args[0])) args = args[0];
     if (args.length < 2) throw owcErr(TypeError, 'ERR_MISSING_ARGS', 'The "streams" argument must be specified');
-    for (var i = 0; i < args.length; i++) args[i] = pipelineBody(args[i]);
+    for (var i = 0; i < args.length; i++) args[i] = pipelineBody(args[i], i);
     return pipelineImpl(args, callback, opts);
   }
 
   // compose and pipeline both take non-stream bodies: a function becomes a Duplex over its async
   // generator, and a bare (async) iterable becomes a Readable over it.
-  function pipelineBody(value) {
+  function pipelineBody(value, index) {
     if (isStreamLike(value)) return value;
-    if (typeof value === 'function') return funcToDuplex(value);
+    /* A web stream is a link of its own: Node's pipeline takes a WritableStream as a destination and
+       a ReadableStream as a source, bridging each with fromWeb. */
+    if (isWebWritable(value)) return Writable.fromWeb(value);
+    if (typeof value === 'function') return funcToDuplex(value, index > 0 ? 'transform[' + (index - 1) + ']' : undefined);
     if (value && typeof value.then === 'function') return promiseToDuplex(value);
     if (value && (readableTrait(value.readable) || writableTrait(value.writable))) return pairToDuplex(value);
     if (value && (typeof value[Symbol.asyncIterator] === 'function' || typeof value[Symbol.iterator] === 'function')) {
@@ -2772,7 +2775,7 @@ function owcBuildStreamCore() {
   /* Node calls a function that takes no argument at once and takes what it answers as the next link
      in the chain; one that takes the source is a generator over it, and what it answers is read as
      an iterable even when it is a stream. */
-  function funcToDuplex(fn) {
+  function funcToDuplex(fn, what) {
     if (typeof fn !== 'function') return fn;
     if (fn.length === 0) {
       var made = fn();
@@ -2782,6 +2785,16 @@ function owcBuildStreamCore() {
     }
     var source = new PassThrough({ objectMode: true });
     var iterator = fn(source);
+    /* A middle link of a pipeline is a transform, and Node insists that a transform function answer
+       an AsyncIterable or a stream: a promise, a string or a plain sync iterable is refused with
+       ERR_INVALID_RETURN_VALUE naming the transform's own place in the chain. */
+    if (what !== undefined && what !== null) {
+      if (!isStreamLike(iterator) && !(iterator && typeof iterator[Symbol.asyncIterator] === 'function')) {
+        throw owcErr(TypeError, 'ERR_INVALID_RETURN_VALUE',
+          'Expected AsyncIterable to be returned from the "' + what + '" function but got '
+          + describeReceived(iterator).replace(/^ Received /, '') + '.');
+      }
+    }
     if (iterator === null || typeof iterator !== 'object') return bodyValue(iterator);
     if (typeof iterator.next !== 'function') {
       /* A string or a Buffer answered by a body of one argument is one chunk, as Node reads it, and
@@ -2950,7 +2963,10 @@ function owcBuildStreamCore() {
       var args = Array.prototype.slice.call(arguments);
       var opts = null;
       var last = args[args.length - 1];
-      if (last && typeof last === 'object' && !isStreamLike(last) && !Array.isArray(last)) opts = args.pop();
+      /* The trailing options object is the one thing the last argument can be that is not a stream:
+         a web stream has no 'on' either, so it too is a link and not the options. */
+      if (last && typeof last === 'object' && !isStreamLike(last) && !Array.isArray(last)
+        && !isWebReadable(last) && !isWebWritable(last)) opts = args.pop();
       return new Promise(function (resolve, reject) {
         checkSignalProp(opts === null || opts === undefined ? undefined : opts.signal);
         pipelineStart(args, function (err) {
@@ -4080,7 +4096,16 @@ function owcBuildStreamCore() {
     dispatchLine(this, line);
   };
 
+  /* An undefined argument is a no-op that answers undefined; every other value that cannot be
+     written as bytes is refused the way Node refuses it. */
+  function checkWriteBuf(data) {
+    if (data !== undefined && typeof data !== 'string' && !ArrayBuffer.isView(data)) {
+      throw argTypeError('buf', 'an instance of Buffer, TypedArray, or DataView', data);
+    }
+  }
+
   Interface.prototype._normalWrite = function (b) {
+    checkWriteBuf(b);
     normalWrite(this, b);
   };
 
@@ -4253,6 +4278,11 @@ function owcBuildStreamCore() {
      such a key stays on the path that echoes what the call brought in. */
   OwcRlBase.prototype.write = function (data, key) {
     if (this.closed) throw errUseAfterClose();
+    /* A non-terminal interface writes bytes, and Node says so before it looks at the key or the
+       output: anything that is neither a string nor a view over bytes is refused with
+       ERR_INVALID_ARG_TYPE under the name 'buf'. A terminal one takes the same values without
+       complaint, so only the path that decodes carries the check. */
+    if (!this.terminal) checkWriteBuf(data);
     if (this.paused) this.resume();
     if (this.terminal && key !== null && key !== undefined && (!!key.ctrl || !!key.meta)) {
       this._ttyWrite(data, key);
@@ -4410,8 +4440,18 @@ function owcBuildStreamCore() {
   var keypressStreams = new WeakMap();
 
   function emitKeypressEvents(stream, iface) {
-    if (stream === null || stream === undefined || typeof stream.on !== 'function') return;
+    /* Node reads its decoder symbol off whatever it is handed, writes it back, and then asks for a
+       keypress listener count, so a value that is not a stream fails on that access with the words
+       V8 gives for it rather than being silently skipped. */
+    if (stream === null || stream === undefined) {
+      throw new TypeError("Cannot read properties of " + String(stream) + " (reading 'Symbol(keypress-decoder)')");
+    }
+    if (typeof stream !== 'object' && typeof stream !== 'function') {
+      throw new TypeError("Cannot create property 'Symbol(keypress-decoder)' on " + typeof stream + " '" + String(stream) + "'");
+    }
     if (keypressStreams.has(stream)) return;
+    if (typeof stream.listenerCount !== 'function') throw new TypeError('stream.listenerCount is not a function');
+    if (typeof stream.on !== 'function') throw new TypeError('stream.on is not a function');
     keypressStreams.set(stream, { iface: iface === undefined ? null : iface });
     var decoder = createDecoder('utf8');
     var pending = '';
@@ -4449,8 +4489,12 @@ function owcBuildStreamCore() {
   Object.setPrototypeOf(PromisesInterface, Interface);
   PromisesInterface.prototype.question = function (query, options) {
     var self = this;
-    return new Promise(function (resolve) {
+    return new Promise(function (resolve, reject) {
       Interface.prototype.question.call(self, query, options, resolve);
+      /* An aborted signal ends the wait at once, as it does on a host: the question is never put to
+         anyone and the promise falls with the signal's abort error. */
+      var signal = options === null || typeof options !== 'object' ? undefined : options.signal;
+      if (signal !== undefined && signal !== null && signal.aborted) reject(abortErrorFor(signal));
     });
   };
 
