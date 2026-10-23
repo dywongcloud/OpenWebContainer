@@ -2322,6 +2322,16 @@ function owcBuildStreamCore() {
     Object.defineProperty(Duplex.prototype, method, Object.getOwnPropertyDescriptor(Writable.prototype, method));
   });
   defineWritableGetters(Duplex.prototype);
+  /* Node answers a body handed to Duplex.from through a class of its own, and a program reads that
+     class as 'Duplexify' and not 'Duplex' -- the name is part of what Duplex.from answers, so the
+     class is named here too and behaves as a plain Duplex in every other way. */
+  function Duplexify(options) {
+    if (!(this instanceof Duplexify)) return new Duplexify(options);
+    Duplex.call(this, options);
+  }
+  Object.setPrototypeOf(Duplexify.prototype, Duplex.prototype);
+  Object.setPrototypeOf(Duplexify, Duplex);
+
   /* Duplex.from: the same bodies Readable.from does not take -- a function, a promise and a
      { readable, writable } pair -- over the same converter compose uses, so a generator function,
      Duplex.from(Promise.resolve('pz')) and Duplex.from({ readable, writable }) all work as on a
@@ -2609,6 +2619,40 @@ function owcBuildStreamCore() {
     return !!value && typeof value === 'object' && typeof value.on === 'function';
   }
 
+  /* Node asks whether a value is a stream at all before it asks which way it flows: a value that is
+     neither a node stream nor a web one is left out of compose's check altogether and handed to the
+     body conversion instead, which is what makes a number there a "body" fault and not a trait one. */
+  function isNodeStreamValue(value) {
+    return !!value && typeof value === 'object'
+      && (value._readableState || value._writableState
+        || (typeof value.write === 'function' && typeof value.on === 'function')
+        || (typeof value.pipe === 'function' && typeof value.on === 'function'));
+  }
+  function isWebReadableValue(value) {
+    return !!value && typeof value === 'object' && !isNodeStreamValue(value)
+      && typeof value.pipeThrough === 'function' && typeof value.getReader === 'function'
+      && typeof value.cancel === 'function';
+  }
+  function isWebWritableValue(value) {
+    return !!value && typeof value === 'object' && !isNodeStreamValue(value)
+      && typeof value.getWriter === 'function' && typeof value.abort === 'function';
+  }
+  /* A TransformStream is a web stream with both sides, and compose counts it as readable and as
+     writable in one link. */
+  function isWebTransformValue(value) {
+    return !!value && typeof value === 'object' && !isNodeStreamValue(value)
+      && typeof value.readable === 'object' && typeof value.writable === 'object';
+  }
+  function isWebStreamValue(value) {
+    return isWebReadableValue(value) || isWebWritableValue(value) || isWebTransformValue(value);
+  }
+  /* A Blob is a body of its own: Node reads one as the promise of the bytes it holds. */
+  function isBlobValue(value) {
+    return !!value && typeof value === 'object' && typeof value.arrayBuffer === 'function'
+      && typeof value.stream === 'function' && typeof value.size === 'number'
+      && typeof value.type === 'string';
+  }
+
   function argBodyError(value) {
     return owcErr(TypeError, 'ERR_INVALID_ARG_TYPE',
       'The "body" argument must be of type function or an instance of Blob, ReadableStream, WritableStream, Stream, Iterable, AsyncIterable, or Promise or { readable, writable } pair.' + describeReceived(value));
@@ -2630,6 +2674,9 @@ function owcBuildStreamCore() {
     if (isWebWritable(value)) return Writable.fromWeb(value);
     if (typeof value === 'function') return funcToDuplex(value, index > 0 ? 'transform[' + (index - 1) + ']' : undefined);
     if (value && typeof value.then === 'function') return promiseToDuplex(value);
+    /* A Blob is read the way Node reads one: as the promise of the bytes it holds, so the chunk it
+       becomes is an ArrayBuffer and not the characters of a string. */
+    if (isBlobValue(value)) return promiseToDuplex(value.arrayBuffer());
     if (value && (readableTrait(value.readable) || writableTrait(value.writable))) return pairToDuplex(value);
     if (value && (typeof value[Symbol.asyncIterator] === 'function' || typeof value[Symbol.iterator] === 'function')) {
       return Readable.from(value);
@@ -2644,7 +2691,7 @@ function owcBuildStreamCore() {
     var w = pair.writable;
     var readable = readableTrait(r);
     var writable = writableTrait(w);
-    var d = new Duplex({
+    var d = new Duplexify({
       objectMode: !!(r && r.readableObjectMode) || !!(w && w.writableObjectMode),
       readable: readable,
       writable: writable
@@ -2678,7 +2725,7 @@ function owcBuildStreamCore() {
 
   // A promise body settles into one chunk: whatever it resolves to is pushed once, as it is.
   function promiseToDuplex(value) {
-    var out = new Duplex({
+    var out = new Duplexify({
       objectMode: true,
       read: function () {},
       /* What is written to it goes nowhere: a promise is a source, so a promise body in the middle
@@ -2756,7 +2803,7 @@ function owcBuildStreamCore() {
 
   // Duplex.from(fn): the writable side feeds the generator's argument, the readable side yields it.
   function iteratorToDuplex(iterator, source) {
-    var duplex = new Duplex({
+    var duplex = new Duplexify({
       objectMode: true,
       write: function (chunk, encoding, callback) {
         if (source.write(chunk, encoding)) callback();
@@ -2789,10 +2836,37 @@ function owcBuildStreamCore() {
   /* Node calls a function that takes no argument at once and takes what it answers as the next link
      in the chain; one that takes the source is a generator over it, and what it answers is read as
      an iterable even when it is a stream. */
+  /* A link in the middle of a chain must answer an AsyncIterable, and Node says so in the
+     transform's own words whatever the function answered: a sync iterable, a string, a number, a
+     promise and a bare undefined are each refused. */
+  function asyncIterableReturnError(what, value) {
+    return owcErr(TypeError, 'ERR_INVALID_RETURN_VALUE',
+      'Expected AsyncIterable to be returned from the "' + what + '" function but got '
+      + describeReceived(value).replace(/^ Received /, '') + '.');
+  }
+
   function funcToDuplex(fn, what) {
     if (typeof fn !== 'function') return fn;
     if (fn.length === 0) {
       var made = fn();
+      if (what !== undefined && what !== null) {
+        if (!isStreamLike(made) && !(made && typeof made[Symbol.asyncIterator] === 'function')) {
+          throw asyncIterableReturnError(what, made);
+        }
+      }
+      /* A function at either end that answers a promise is a body with no readable side at all,
+         which is what makes compose(asyncFn, W) answer 'streams[0] must be readable' rather than
+         build a chain out of it: the promise is awaited for its failure alone. */
+      if (what === undefined && made && typeof made.then === 'function') {
+        var sink = new Duplexify({
+          objectMode: true,
+          readable: false,
+          write: function (chunk, encoding, callback) { callback(); },
+          final: function (callback) { callback(); }
+        });
+        Promise.resolve(made).then(function () { }, function (err) { sink.destroy(err); });
+        return sink;
+      }
       if (made === null || typeof made !== 'object') return bodyValue(made);
       if (typeof made.next === 'function') return iteratorToDuplex(made, new PassThrough({ objectMode: true }));
       return bodyValue(made);
@@ -2804,9 +2878,7 @@ function owcBuildStreamCore() {
        ERR_INVALID_RETURN_VALUE naming the transform's own place in the chain. */
     if (what !== undefined && what !== null) {
       if (!isStreamLike(iterator) && !(iterator && typeof iterator[Symbol.asyncIterator] === 'function')) {
-        throw owcErr(TypeError, 'ERR_INVALID_RETURN_VALUE',
-          'Expected AsyncIterable to be returned from the "' + what + '" function but got '
-          + describeReceived(iterator).replace(/^ Received /, '') + '.');
+        throw asyncIterableReturnError(what, iterator);
       }
     }
     if (iterator === null || typeof iterator !== 'object') return bodyValue(iterator);
@@ -2821,65 +2893,89 @@ function owcBuildStreamCore() {
     return iteratorToDuplex(iterator, source);
   }
 
-  function duplexFrom(value) {
-    if (typeof value === 'function') return funcToDuplex(value);
-    if (isStreamLike(value)) {
-      var readable = readableTrait(value);
-      var writable = writableTrait(value);
-      if (readable && writable) return value;
-      var wrapper = new Duplex({
-        objectMode: !!(value.readableObjectMode || value.writableObjectMode),
-        readable: readable,
-        writable: writable
+  /* Node's Duplex.from takes one trait at a time and answers a duplex that has the side the body
+     gave it: a Readable becomes the readable side, a Writable the writable one, and a bare iterable
+     or a Blob a readable with no writable at all. Never a Readable, which is what this returned for
+     the bodies it built one from. */
+  /* withSink: Node's own Duplexify for a function body always carries a writable side -- the one
+     that feeds the generator's source -- even what the function answered is only readable, so
+     Duplex.from(function () { return [1, 2] }) is writable as well as readable. */
+  function wrapDuplex(value, withSink) {
+    var readable = readableTrait(value);
+    var writable = writableTrait(value);
+    if (readable && writable) return value;
+    if (withSink === true) writable = true;
+    var wrapper = new Duplexify({
+      objectMode: !!(value.readableObjectMode || value.writableObjectMode),
+      readable: readable,
+      writable: writable
+    });
+    if (readable) {
+      value.on('end', function () {
+        wrapper.push(null);
       });
-      if (readable) {
-        value.on('end', function () {
-          wrapper.push(null);
-        });
-        value.on('readable', function () {
-          wrapper._read();
-        });
-        wrapper._read = function () {
-          for (;;) {
-            var chunk = value.read();
-            if (chunk === null) return;
-            if (!wrapper.push(chunk)) return;
-          }
-        };
-      }
-      if (writable) {
-        wrapper._write = function (chunk, encoding, callback) {
-          if (value.write(chunk, encoding)) callback();
-          else value.once('drain', callback);
-        };
-        wrapper._final = function (callback) {
-          value.end(callback);
-        };
-      }
-      return wrapper;
+      value.on('readable', function () {
+        wrapper._read();
+      });
+      wrapper._read = function () {
+        for (;;) {
+          var chunk = value.read();
+          if (chunk === null) return;
+          if (!wrapper.push(chunk)) return;
+        }
+      };
     }
-    return pipelineBody(value);
+    if (!writable && withSink === true) {
+      /* What is written to it goes nowhere: the body answered without a source to feed, so the
+         writable side is the sink Node's own duplexify carries all the same. */
+      wrapper._write = function (chunk, encoding, callback) { callback(); };
+      wrapper._final = function (callback) { callback(); };
+    }
+    if (writable) {
+      wrapper._write = function (chunk, encoding, callback) {
+        if (value.write(chunk, encoding)) callback();
+        else value.once('drain', callback);
+      };
+      wrapper._final = function (callback) {
+        value.end(callback);
+      };
+    }
+    return wrapper;
+  }
+
+  function duplexFrom(value) {
+    if (typeof value === 'function') return wrapDuplex(funcToDuplex(value), true);
+    return wrapDuplex(pipelineBody(value, 0));
   }
 
   function compose() {
     var streams = Array.prototype.slice.call(arguments);
     if (streams.length === 0) throw owcErr(TypeError, 'ERR_MISSING_ARGS', 'The "streams" argument must be specified');
-    if (streams.length === 1) return duplexFrom(streams[0]);
-    if (typeof streams[0] === 'function') streams[0] = funcToDuplex(streams[0]);
+    if (streams.length === 1) return Duplex.from(streams[0]);
+    /* The value a fault names is the one the caller handed in, not the link it became. */
+    var orgStreams = streams.slice();
     var last = streams.length - 1;
-    // A generator function is a body wherever it stands, not only at either end: in the middle it is
-    // the transform between the two streams around it.
-    for (var m = 0; m < streams.length; m++) {
-      if (typeof streams[m] === 'function') streams[m] = funcToDuplex(streams[m]);
-      /* A promise is a body wherever it stands too, and what it settles to is the link. */
-      else if (streams[m] && typeof streams[m].then === 'function') streams[m] = promiseToDuplex(streams[m]);
-    }
+    /* Node turns a function into a body at either end of the chain and only at the ends: one in the
+       middle is the transform between the two links around it, and pipeline is what reads it. */
+    if (typeof streams[0] === 'function') streams[0] = Duplex.from(streams[0]);
+    if (typeof streams[last] === 'function') streams[last] = Duplex.from(streams[last]);
     for (var n = 0; n < streams.length; n++) {
       var item = streams[n];
-      if (!item || typeof item !== 'object') continue;
-      if (n < last && !readableTrait(item)) throw traitError(n, item, 'readable');
-      if (n > 0 && !writableTrait(item)) throw traitError(n, item, 'writable');
+      /* A value that is not a stream at all is no fault here: it is a body, and it is the body
+         conversion further down that refuses it. Skipping it is what makes compose(5, W) answer
+         the "body" fault rather than 'streams[0] must be readable'. */
+      if (!isNodeStreamValue(item) && !isWebStreamValue(item)) continue;
+      if (n < last && !(streamIsReadable(item) || isWebReadableValue(item) || isWebTransformValue(item))) {
+        throw traitError(n, orgStreams[n], 'readable');
+      }
+      if (n > 0 && !(streamIsWritable(item) || isWebWritableValue(item) || isWebTransformValue(item))) {
+        throw traitError(n, orgStreams[n], 'writable');
+      }
     }
+    // What is left is a body, and Node converts the links in the order they stand: a generator
+    // function in the middle is the transform between its neighbours, and a value no body can be
+    // made of is refused here, in pipeline's own words.
+    for (var m = 0; m < streams.length; m++) streams[m] = pipelineBody(streams[m], m);
     var head = streams[0];
     var tail = streams[last];
     var writable = writableTrait(head);
