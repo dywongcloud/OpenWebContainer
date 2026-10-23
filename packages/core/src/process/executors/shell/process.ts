@@ -726,6 +726,17 @@ export class ShellProcess extends Process {
     }
 
     /**
+     * The file a command naming one stands at. A name written with a `/` in it is a path already;
+     * any other is a file in the directory this shell stands in -- `./node_modules/.bin/cowsay`,
+     * which a host's `sh` executes from there and which the file system answers only once the
+     * directory is put in front of it.
+     */
+    private commandFile(command: string): string {
+        if (command.startsWith('/')) return command;
+        return joinOnPath(this.fileSystem, this.shell.getWorkingDirectory(), command);
+    }
+
+    /**
      * Runs a command that only a child process can run, or returns undefined when the command is not
      * one of those and the line belongs to the script engine.
      */
@@ -781,7 +792,7 @@ export class ShellProcess extends Process {
             // check for shebang: a name that is not a file to read is not one, and says so by throwing
             let content: string | undefined;
             try {
-                content = this.fileSystem.readFile(command);
+                content = this.fileSystem.readFile(this.commandFile(command));
             } catch {
                 content = undefined;
             }
@@ -795,7 +806,15 @@ export class ShellProcess extends Process {
                         if (tokens.length == 1)
                             throw "executor not specified"
                         let newCommand = tokens[1]
-                        return await this.spawnChild(newCommand, [command, ...cmdArgs]);
+                        /* The script is run where this shell stands and with this shell's variables,
+                           the way a host's `sh` hands it to its interpreter: a relative name means
+                           the file beside the shell and nothing at all from the file system root,
+                           which is where a child with no directory of its own looks for it. As in
+                           every other path here, the child writes to this shell as it runs, so the
+                           result's own copy of that output is not written again. */
+                        this.liveChildOutput = true;
+                        return await this.spawnChild(newCommand, [command, ...cmdArgs],
+                            Object.fromEntries(this.env), this.shell.getWorkingDirectory());
                     }
                 }
             }
