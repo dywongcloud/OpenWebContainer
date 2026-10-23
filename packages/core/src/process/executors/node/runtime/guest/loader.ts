@@ -1072,7 +1072,20 @@ function fireTimer(id) {
     try {
       t.fn.apply(undefined, t.args);
     } catch (err) {
-      dom.exit();
+      /*
+       * A throw out of the callback leaves the extra enter in place, and the route is reached with
+       * process.domain still the innermost one -- which is host node 24.15's rule too. Node's
+       * topLevelDomainCallback enters in a plain statement pair, with no try/finally, and its
+       * async_hooks after() -- the domain.exit() that would undo the immediate's own enter -- is
+       * skipped for a callback that failed, so the uncaught route reads process.domain as the
+       * domain the callback ran in and not the one entered when it fired. Exiting here instead
+       * splices at the lastIndexOf() of the entered domain, which takes the callback's own domain
+       * off the stack with it and routes the error to the outer one: three domains entered, the
+       * callback owned by the middle one, host node 24.15 runs the middle handler and this
+       * container ran the outer one (measured: b11, b15, b18, and b17, where the entered domain is
+       * silent and host node 24.15 still handles the error where this container fell through to
+       * 'uncaughtException'). The route empties the stack either way, so the enter is not a leak.
+       */
       uncaughtFromCallback(err);
       /*
        * An immediate that throws leaves the process on undefined at the next timer, not on the null
