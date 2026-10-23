@@ -5353,10 +5353,41 @@ BF.module = function () {
      createRequireFor in loader.ts, which is outside this grant); the require it builds resolves
      from the file it was given, so the parent a lookup reads paths off is that file's own. */
   var createRequireInner = Module.createRequire;
+  /* The one argument node's createRequire accepts: a file: URL object, a 'file://' string, or an
+     absolute path. Every other argument -- a relative path, an empty string, a number, a boolean,
+     null, a plain object and a URL of any scheme but file: -- raises ERR_INVALID_ARG_VALUE with
+     node's own wording, and the value it names is what util.inspect prints for the argument. A
+     'file://x.js' with no path behind the scheme is refused too: a URL with no absolute path in it
+     is the "not hierarchical" answer node gives there. row owc-module-export-table-incomplete. */
+  var URLForRequire = typeof URL === 'function' ? URL : null;
+  function createRequireBaseOf(filename) {
+    if (URLForRequire !== null && filename instanceof URLForRequire) {
+      if (String(filename.protocol) !== 'file:') return null;
+      return decodeURIComponent(String(filename.pathname));
+    }
+    if (typeof filename !== 'string') return null;
+    if (filename.indexOf('file://') === 0) {
+      var afterScheme = filename.slice(7);
+      var slashOf = afterScheme.indexOf('/');
+      if (slashOf < 0) return null;
+      return decodeURIComponent(afterScheme.slice(slashOf));
+    }
+    return requireBuiltin('path').isAbsolute(filename) ? filename : null;
+  }
   Module.createRequire = function createRequire(filename) {
+    var base = createRequireBaseOf(filename);
+    if (base === null) {
+      /* Node cuts the value it prints at 128 characters and marks the cut with three dots, so a
+         URL argument is not the whole of its inspect in the message -- measured on host 24.15:
+         a 126-character string prints whole and a 127-character one is cut. */
+      var inspectedFilename = requireBuiltin('util').inspect(filename);
+      if (inspectedFilename.length > 128) inspectedFilename = inspectedFilename.slice(0, 128) + '...';
+      var badFilename = new TypeError("The argument 'filename' must be a file URL object, file URL"
+        + ' string, or absolute path string. Received ' + inspectedFilename);
+      badFilename.code = 'ERR_INVALID_ARG_VALUE';
+      throw badFilename;
+    }
     var req = createRequireInner(filename);
-    var base = typeof filename === 'string' && filename.indexOf('file://') === 0
-      ? decodeURIComponent(filename.slice(7)) : String(filename);
     var parentForPaths = {
       id: base, filename: base, path: dirnameOf(base),
       paths: Module._nodeModulePaths(dirnameOf(base))
