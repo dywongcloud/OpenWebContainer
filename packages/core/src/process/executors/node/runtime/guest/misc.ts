@@ -5,13 +5,49 @@
  */
 export const MISC_SRC = String.raw`
 BF.os = function () {
+  /*
+   * The signals the machine under the host actually has, which is the set Node's own os.constants
+   * carries there: SIGINFO is a BSD signal a Linux box has no number for, and SIGPOLL, SIGPWR and
+   * SIGSTKFLT are the other way round -- they belong to Linux and the host does not list them. A
+   * set of 33 answered every one of the 31 a host prints plus three a host does not have.
+   */
   var signals = {
-    SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6, SIGBUS: 7,
-    SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14,
-    SIGTERM: 15, SIGCHLD: 17, SIGSTKFLT: 16, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21,
-    SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28,
-    SIGIO: 29, SIGPOLL: 29, SIGPWR: 30, SIGSYS: 31
+    SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6, SIGBUS: 10,
+    SIGFPE: 8, SIGKILL: 9, SIGUSR1: 30, SIGSEGV: 11, SIGUSR2: 31, SIGPIPE: 13, SIGALRM: 14,
+    SIGTERM: 15, SIGCHLD: 20, SIGCONT: 19, SIGSTOP: 17, SIGTSTP: 18, SIGTTIN: 21,
+    SIGTTOU: 22, SIGURG: 16, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28,
+    SIGIO: 23, SIGINFO: 29, SIGSYS: 12
   };
+  var priority = {
+    PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
+    PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20
+  };
+  var dlopen = { RTLD_LAZY: 1, RTLD_NOW: 2, RTLD_GLOBAL: 8, RTLD_LOCAL: 4 };
+
+  /*
+   * The argument check the two priority calls share: not a number at all is ERR_INVALID_ARG_TYPE,
+   * a number that is not a 32-bit integer is ERR_OUT_OF_RANGE, and a priority outside the host's
+   * own -20..19 is ERR_OUT_OF_RANGE with that range named. A pid of undefined is the caller's own.
+   */
+  function priorityArgError(name, value, isPriority) {
+    if (typeof value !== 'number') {
+      var shown = typeof value === 'string' ? "'" + value + "'" : String(value);
+      var typeErr = new TypeError('The "' + name + '" argument must be of type number. Received type ' + typeof value + ' (' + shown + ')');
+      typeErr.code = 'ERR_INVALID_ARG_TYPE';
+      return typeErr;
+    }
+    if (value !== (value | 0)) {
+      var intErr = new RangeError('The value of "' + name + '" is out of range. It must be an integer. Received ' + value);
+      intErr.code = 'ERR_OUT_OF_RANGE';
+      return intErr;
+    }
+    if (isPriority === true && (value < -20 || value > 19)) {
+      var rangeErr = new RangeError('The value of "' + name + '" is out of range. It must be >= -20 && <= 19. Received ' + value);
+      rangeErr.code = 'ERR_OUT_OF_RANGE';
+      return rangeErr;
+    }
+    return null;
+  }
   var errno = {
     E2BIG: 7, EACCES: 13, EADDRINUSE: 98, EADDRNOTAVAIL: 99, EAFNOSUPPORT: 97, EAGAIN: 11,
     EALREADY: 114, EBADF: 9, EBADMSG: 74, EBUSY: 16, ECANCELED: 125, ECHILD: 10,
@@ -102,8 +138,36 @@ BF.os = function () {
         ]
       };
     },
+    /*
+     * os.getPriority and os.setPriority read and write the nice value of a process. This runtime
+     * has no scheduler of its own and cannot ask about another process, so the answer is the one a
+     * host gives for a process that has never been reniced: 0, and a set that changes nothing.
+     * What is not shimmed is the argument checking -- a pid has to be a 32-bit integer and a
+     * priority has to sit in the range the host's own does, with the host's wording for both --
+     * because a program that validates against a real host validates against those messages.
+     */
+    getPriority: function (pid) {
+      var value = pid === undefined ? 0 : pid;
+      var err = priorityArgError('pid', value, false);
+      if (err !== null) throw err;
+      return 0;
+    },
+    setPriority: function (pid, priorityValue) {
+      var err = priorityArgError('pid', pid === undefined ? 0 : pid, false);
+      if (err !== null) throw err;
+      if (priorityValue === undefined) return undefined;
+      err = priorityArgError('priority', priorityValue, true);
+      if (err !== null) throw err;
+      return undefined;
+    },
     userInfo: function () { return { username: 'user', uid: 1000, gid: 1000, shell: '/bin/sh', homedir: '/home' }; },
-    constants: { signals: signals, errno: errno }
+    constants: {
+      UV_UDP_REUSEADDR: 4,
+      dlopen: dlopen,
+      errno: errno,
+      priority: priority,
+      signals: signals
+    }
   };
 };
 
@@ -114,7 +178,14 @@ BF.timers = function () {
     setInterval: setIntervalImpl,
     clearInterval: clearTimer,
     setImmediate: setImmediateImpl,
-    clearImmediate: clearTimer
+    clearImmediate: clearTimer,
+    /*
+     * Node hangs the promise form off the callback module itself -- timers.promises *is* the
+     * node:timers/promises namespace, and a program that compares the two, or reaches setTimeout
+     * through either, sees one object. It is asked for through requireBuiltin, which caches, so
+     * the identity a host has between the two holds here.
+     */
+    promises: requireBuiltin('timers/promises')
   };
 };
 
@@ -2012,9 +2083,11 @@ BF.crypto = function () {
     return String(value);
   }
 
-  /* Node's ERR_INVALID_ARG_VALUE: "The property 'a.b' is invalid. Received x", with an optional reason. */
+  /* Node's ERR_INVALID_ARG_VALUE: "The property 'a.b' is invalid. Received x", with an optional
+     reason. Node raises it as a TypeError, so `crypto.diffieHellman({...})` and a key's export
+     format answer the constructor host Node 24.15 answers and not the RangeError they did here. */
   function invalidArgValue(name, value, reason) {
-    var err = new RangeError("The property '" + name + "' " + (reason === undefined ? 'is invalid' : reason) + '. Received ' + shownOf(value));
+    var err = new TypeError("The property '" + name + "' " + (reason === undefined ? 'is invalid' : reason) + '. Received ' + shownOf(value));
     err.code = 'ERR_INVALID_ARG_VALUE';
     return err;
   }
@@ -2214,7 +2287,7 @@ BF.crypto = function () {
     if (state === undefined) throw invalidArgType('key', 'an instance of KeyObject', key);
     if (state.id === undefined) return { asymmetricKeyType: undefined, asymmetricKeyDetails: undefined };
     if (state.info === undefined) {
-      state.info = callCap('crypto.key.info', { id: state.id });
+      state.info = cryptoCap('crypto.key.info', { id: state.id });
       /* Node answers an RSA publicExponent as a BigInt, which no capability argument can carry. */
       var details = state.info.asymmetricKeyDetails;
       if (details !== undefined && details !== null && typeof details.publicExponent === 'string') {
@@ -2244,7 +2317,7 @@ BF.crypto = function () {
     }
     var opts = options;
     var format = opts.format;
-    var result = callCap('crypto.key.export', { id: state.id, format: format, type: opts.type });
+    var result = cryptoCap('crypto.key.export', { id: state.id, format: format, type: opts.type });
     if (format === 'jwk') return result.jwk;
     /* A PEM export is text on Node, and a DER one is bytes: only the latter comes back as a Buffer. */
     var bytes = Buf.from(result.bytes, 'base64');
@@ -2257,7 +2330,7 @@ BF.crypto = function () {
     var b = keyStateOf(other, 'key');
     if (a.id !== undefined || b.id !== undefined) {
       if (a.id === undefined || b.id === undefined) return false;
-      return callCap('crypto.key.equal', { a: a.id, b: b.id }) === true;
+      return cryptoCap('crypto.key.equal', { a: a.id, b: b.id }) === true;
     }
     if (a.type !== b.type || a.bytes.length !== b.bytes.length) return false;
     return timingSafeEqual(a.bytes, b.bytes);
@@ -2313,7 +2386,7 @@ BF.crypto = function () {
           wrong.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
           throw wrong;
         }
-        return new KeyObject('public', undefined, callCap('crypto.key.public', { id: state.id }).id);
+        return new KeyObject('public', undefined, cryptoCap('crypto.key.public', { id: state.id }).id);
       }
       var jwk = undefined;
       var bytes = undefined;
@@ -2323,7 +2396,7 @@ BF.crypto = function () {
       } else {
         bytes = toBytes(given, undefined, 'key').toString('base64');
       }
-      var opened = callCap('crypto.key.import', { want: want, jwk: jwk, bytes: bytes, type: type, passphrase: passphrase === undefined ? undefined : String(passphrase) });
+      var opened = cryptoCap('crypto.key.import', { want: want, jwk: jwk, bytes: bytes, type: type, passphrase: passphrase === undefined ? undefined : String(passphrase) });
       return new KeyObject(want, undefined, opened.id);
     };
   }
@@ -2335,14 +2408,14 @@ BF.crypto = function () {
       var inner = keyStateOf(key.key, 'key');
       if (inner !== undefined) {
         if (inner.id === undefined) throw invalidArgType('key', 'an instance of KeyObject', key.key);
-        if (want === 'public' && inner.type === 'private') return callCap('crypto.key.public', { id: inner.id }).id;
+        if (want === 'public' && inner.type === 'private') return cryptoCap('crypto.key.public', { id: inner.id }).id;
         return inner.id;
       }
     }
     var state = keyStateOf(key, 'key');
     if (state !== undefined) {
       if (state.id === undefined) throw invalidArgType('key', 'an instance of KeyObject', key);
-      if (want === 'public' && state.type === 'private') return callCap('crypto.key.public', { id: state.id }).id;
+      if (want === 'public' && state.type === 'private') return cryptoCap('crypto.key.public', { id: state.id }).id;
       return state.id;
     }
     return keyStateOf(importKey(want)(key), 'key').id;
@@ -2371,19 +2444,23 @@ BF.crypto = function () {
     return pair;
   }
 
-  /* A key half Node hands back as text instead of as a KeyObject, when its encoding asks for it. */
+  /* A key half Node hands back as text instead of as a KeyObject, when its encoding asks for it.
+     A `{format: 'jwk'}` encoding is the one shape that is not bytes at all: Node answers the JWK
+     object itself, so `generateKeyPairSync('ec', {publicKeyEncoding: {format: 'jwk'}})` gives a
+     caller `{"kty": "EC", "crv": "P-256", ...}` and not a Buffer it never made. */
   function exportedKey(key, encoding, defaultType) {
-    var result = callCap('crypto.key.export', {
+    var result = cryptoCap('crypto.key.export', {
       id: keyStateOf(key, 'key').id,
       format: encoding.format === undefined ? 'pem' : encoding.format,
       type: encoding.type === undefined ? defaultType : encoding.type
     });
+    if (encoding.format === 'jwk') return result.jwk;
     var bytes = Buf.from(result.bytes, 'base64');
     return typeof encoding.format === 'string' ? bytes.toString('utf8') : bytes;
   }
 
   function generateKeyPairSync(type, options) {
-    return keyPairOf(callCap('crypto.key.generate', { type: String(type), options: options === undefined ? undefined : wrapOptions(options) }), options);
+    return keyPairOf(cryptoCap('crypto.key.generate', { type: String(type), options: options === undefined ? undefined : wrapOptions(options) }), options);
   }
 
   function generateKeyPair(type, options, callback) {
@@ -2429,7 +2506,7 @@ BF.crypto = function () {
     return this;
   };
   Sign.prototype.sign = function (privateKey, encoding) {
-    var signature = callCap('crypto.key.sign', {
+    var signature = cryptoCap('crypto.key.sign', {
       id: keyIdOf(privateKey, 'private'),
       algorithm: this._algorithm,
       data: Buf.concat(this._chunks).toString('base64'),
@@ -2451,7 +2528,7 @@ BF.crypto = function () {
     return this;
   };
   Verify.prototype.verify = function (publicKey, signature, encoding) {
-    return callCap('crypto.key.verify', {
+    return cryptoCap('crypto.key.verify', {
       id: keyIdOf(publicKey, 'public'),
       algorithm: this._algorithm,
       data: Buf.concat(this._chunks).toString('base64'),
@@ -2473,7 +2550,7 @@ BF.crypto = function () {
 
   /* sign and verify without a streaming object: one call over the same capability. */
   function signOne(algorithm, data, key, callback) {
-    var signature = Buf.from(callCap('crypto.key.sign', {
+    var signature = Buf.from(cryptoCap('crypto.key.sign', {
       id: keyIdOf(key, 'private'),
       algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
       data: toBytes(data, undefined, 'data').toString('base64'),
@@ -2489,7 +2566,7 @@ BF.crypto = function () {
   }
 
   function verifyOne(algorithm, data, key, signature, callback) {
-    var answer = callCap('crypto.key.verify', {
+    var answer = cryptoCap('crypto.key.verify', {
       id: keyIdOf(key, 'public'),
       algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
       data: toBytes(data, undefined, 'data').toString('base64'),
@@ -2514,16 +2591,16 @@ BF.crypto = function () {
     this.verifyError = 0;
   }
   DiffieHellman.prototype.generateKeys = function (encoding) {
-    var keys = callCap('crypto.dh.keys', { id: this._id });
+    var keys = cryptoCap('crypto.dh.keys', { id: this._id });
     this._public = Buf.from(keys.public, 'base64');
     this._private = Buf.from(keys.private, 'base64');
     return outputOf(this._public, encoding);
   };
   DiffieHellman.prototype.getPrime = function (encoding) {
-    return outputOf(Buf.from(callCap('crypto.dh.info', { id: this._id }).prime, 'base64'), encoding);
+    return outputOf(Buf.from(cryptoCap('crypto.dh.info', { id: this._id }).prime, 'base64'), encoding);
   };
   DiffieHellman.prototype.getGenerator = function (encoding) {
-    return outputOf(Buf.from(callCap('crypto.dh.info', { id: this._id }).generator, 'base64'), encoding);
+    return outputOf(Buf.from(cryptoCap('crypto.dh.info', { id: this._id }).generator, 'base64'), encoding);
   };
   /*
    * A public key is made from a private one by generateKeys(), not by setPrivateKey(): Node keeps
@@ -2539,17 +2616,17 @@ BF.crypto = function () {
   };
   DiffieHellman.prototype.setPublicKey = function (key, encoding) {
     this._public = toBytes(key, encoding, 'publicKey');
-    callCap('crypto.dh.set', { id: this._id, public: this._public.toString('base64') });
+    cryptoCap('crypto.dh.set', { id: this._id, public: this._public.toString('base64') });
     return this;
   };
   DiffieHellman.prototype.setPrivateKey = function (key, encoding) {
     this._private = toBytes(key, encoding, 'privateKey');
     this._public = undefined;
-    callCap('crypto.dh.set', { id: this._id, private: this._private.toString('base64') });
+    cryptoCap('crypto.dh.set', { id: this._id, private: this._private.toString('base64') });
     return this;
   };
   DiffieHellman.prototype.computeSecret = function (otherPublicKey, inputEncoding, outputEncoding) {
-    var secret = Buf.from(callCap('crypto.dh.secret', {
+    var secret = Buf.from(cryptoCap('crypto.dh.secret', {
       id: this._id,
       public: toBytes(otherPublicKey, inputEncoding, 'otherPublicKey').toString('base64')
     }), 'base64');
@@ -2586,12 +2663,15 @@ BF.crypto = function () {
         args.generatorIsNumber = true;
       }
     }
-    return new DiffieHellman(callCap('crypto.dh.create', args).id);
+    return new DiffieHellman(cryptoCap('crypto.dh.create', args).id);
   }
 
   function createDiffieHellmanGroup(name) {
-    return new DiffieHellman(callCap('crypto.dh.group', { name: String(name) }).id);
+    return new DiffieHellman(cryptoCap('crypto.dh.group', { name: String(name) }).id);
   }
+
+  /* Node's getDiffieHellman is the same call under its older name: a standard MODP group by name. */
+  var getDiffieHellman = createDiffieHellmanGroup;
 
   /*
    * diffieHellman({privateKey, publicKey}): the shared secret with no object to keep. Node takes two
@@ -2602,7 +2682,7 @@ BF.crypto = function () {
     var opts = options === undefined || options === null ? {} : options;
     if (!isKeyObject(opts.privateKey)) throw invalidArgValue('options.privateKey', opts.privateKey);
     if (!isKeyObject(opts.publicKey)) throw invalidArgValue('options.publicKey', opts.publicKey);
-    return Buf.from(callCap('crypto.dh.ecdh', {
+    return Buf.from(cryptoCap('crypto.dh.ecdh', {
       private: keyIdOf(opts.privateKey, 'private'),
       public: keyIdOf(opts.publicKey, 'public')
     }), 'base64');
@@ -2651,8 +2731,8 @@ BF.crypto = function () {
     this._finished = true;
     var data = Buf.concat(this._chunks).toString('base64');
     var out = this._key === undefined
-      ? callCap('crypto.digest', { algorithm: this._algorithm, data: data, outputLength: this._outputLength })
-      : callCap('crypto.hmac', { algorithm: this._algorithm, key: this._key.toString('base64'), data: data });
+      ? cryptoCap('crypto.digest', { algorithm: this._algorithm, data: data, outputLength: this._outputLength })
+      : cryptoCap('crypto.hmac', { algorithm: this._algorithm, key: this._key.toString('base64'), data: data });
     return outputOf(Buf.from(out, 'base64'), encoding);
   };
   Hash.prototype.copy = function () {
@@ -2710,7 +2790,7 @@ BF.crypto = function () {
     if (!(len >= 0 && len <= 2147483647)) throw outOfRange('keylen', '>= 0 && <= 2147483647', keylen);
     /* A zero-length derivation is in range but produces nothing, which OpenSSL reports as a failure. */
     if (len === 0) throw new Error('Deriving bits failed');
-    var out = callCap('crypto.pbkdf2', {
+    var out = cryptoCap('crypto.pbkdf2', {
       digest: String(digest),
       password: toBytes(password, undefined, 'password').toString('base64'),
       salt: toBytes(salt, undefined, 'salt').toString('base64'),
@@ -2746,7 +2826,7 @@ BF.crypto = function () {
   function hashNames() {
     if (HASH_NAMES === null) {
       HASH_NAMES = {};
-      var list = callCap('crypto.hashes');
+      var list = cryptoCap('crypto.hashes');
       for (var i = 0; i < list.length; i++) HASH_NAMES[String(list[i]).toLowerCase()] = true;
     }
     return HASH_NAMES;
@@ -2757,7 +2837,7 @@ BF.crypto = function () {
   }
 
   function getHashes() {
-    return callCap('crypto.hashes');
+    return cryptoCap('crypto.hashes');
   }
 
   /*
@@ -2838,7 +2918,7 @@ BF.crypto = function () {
     if (128 * n * r > budget) {
       throw scryptParams('Invalid scrypt params: error:030000AC:digital envelope routines::memory limit exceeded');
     }
-    var out = callCap('crypto.scrypt', {
+    var out = cryptoCap('crypto.scrypt', {
       password: toBytes(password, undefined, 'password').toString('base64'),
       salt: toBytes(salt, undefined, 'salt').toString('base64'),
       keylen: len,
@@ -2884,7 +2964,7 @@ BF.crypto = function () {
       long.code = 'ERR_CRYPTO_INVALID_KEYLEN';
       throw long;
     }
-    var out = callCap('crypto.hkdf', {
+    var out = cryptoCap('crypto.hkdf', {
       algorithm: String(digest),
       ikm: toBytes(key, undefined, 'key').toString('base64'),
       salt: toBytes(salt, undefined, 'salt').toString('base64'),
@@ -2968,7 +3048,7 @@ BF.crypto = function () {
   }
 
   function hmacDigest(state, bytes) {
-    return callOp('crypto.hmac', {
+    return cryptoOp('crypto.hmac', {
       algorithm: digestOf(state.algorithm.hash).digest,
       key: state.bytes.toString('base64'),
       data: bytes.toString('base64')
@@ -2980,7 +3060,7 @@ BF.crypto = function () {
       return settled(function () {
         var alg = digestOf(algorithm);
         var bytes = bufferSourceBytes(data, 'data');
-        return callOp('crypto.digest', { algorithm: alg.digest, data: bytes.toString('base64') }).then(function (b64) {
+        return cryptoOp('crypto.digest', { algorithm: alg.digest, data: bytes.toString('base64') }).then(function (b64) {
           return arrayBufferOf(Buf.from(b64, 'base64'));
         });
       });
@@ -3038,15 +3118,40 @@ BF.crypto = function () {
    * the constructor Node uses, which the capability envelope cannot carry.
    */
   function cipherCap(op, args) {
+    return capabilityCall(op, args, callCap);
+  }
+
+  /*
+   * A failing capability reaches the guest as a plain Error: the envelope carries a code and a
+   * message but not a constructor, and the spine that rebuilds it has no class to rebuild. The
+   * capability names the class it threw with in `owcErrorClass`, so every crypto call rebuilds
+   * here -- `crypto.sign` with a bad `dsaEncoding` and `createDiffieHellman(8)` are TypeErrors on
+   * host Node 24.15 and were plain Errors here, and `createDiffieHellman(1.5)` a RangeError.
+   * The asynchronous path rejects the same way, so `scrypt` and `pbkdf2` with a callback agree.
+   */
+  function capabilityError(err) {
+    var Ctor = err && err.owcErrorClass === 'RangeError' ? RangeError : err && err.owcErrorClass === 'TypeError' ? TypeError : Error;
+    var again = new Ctor(err && err.message !== undefined ? err.message : String(err));
+    if (err && err.code !== undefined && !err.owcUncoded) again.code = err.code;
+    if (err && err.errno !== undefined) again.errno = err.errno;
+    if (err && err.syscall !== undefined) again.syscall = err.syscall;
+    return again;
+  }
+
+  function capabilityCall(op, args, send) {
     try {
-      return callCap(op, args);
+      return send(op, args);
     } catch (err) {
-      var Ctor = err && err.owcErrorClass === 'RangeError' ? RangeError : err && err.owcErrorClass === 'TypeError' ? TypeError : Error;
-      var again = new Ctor(err && err.message !== undefined ? err.message : String(err));
-      if (err && err.code !== undefined && !err.owcUncoded) again.code = err.code;
-      if (err && err.errno !== undefined) again.errno = err.errno;
-      throw again;
+      throw capabilityError(err);
     }
+  }
+
+  function cryptoCap(op, args) {
+    return capabilityCall(op, args, callCap);
+  }
+
+  function cryptoOp(op, args) {
+    return callOp(op, args).then(null, function (err) { throw capabilityError(err); });
   }
 
   function cipherStateError(message) {
@@ -3158,7 +3263,7 @@ BF.crypto = function () {
    */
   function checkPrimeSync(candidate, options) {
     var isBig = typeof candidate === 'bigint';
-    return callCap('crypto.checkPrime', {
+    return cryptoCap('crypto.checkPrime', {
       value: isBig ? String(candidate) : toBytes(candidate, undefined, 'candidate').toString('base64'),
       valueIsBigInt: isBig,
       checks: options === undefined || options === null ? undefined : Number(options.checks)
@@ -3178,7 +3283,7 @@ BF.crypto = function () {
   }
 
   function generatePrimeSync(primeLength, options) {
-    var result = callCap('crypto.generatePrime', {
+    var result = cryptoCap('crypto.generatePrime', {
       bits: Number(primeLength),
       safe: options !== undefined && options !== null && options.safe === true,
       bigint: options !== undefined && options !== null && options.bigint === true
@@ -3232,6 +3337,7 @@ BF.crypto = function () {
     generateKeyPair: generateKeyPair,
     createDiffieHellman: createDiffieHellman,
     createDiffieHellmanGroup: createDiffieHellmanGroup,
+    getDiffieHellman: getDiffieHellman,
     diffieHellman: diffieHellman,
     subtle: subtle,
     webcrypto: webcrypto,
@@ -3247,7 +3353,7 @@ BF.crypto = function () {
       RSA_PSS_SALTLEN_MAX_SIGN: -2,
       RSA_PSS_SALTLEN_AUTO: -2
     },
-    getCiphers: function () { return callCap('crypto.ciphers'); },
+    getCiphers: function () { return cryptoCap('crypto.ciphers'); },
     /* Node's getCipherInfo: name or nid, and undefined for a cipher this container has no table
        entry for, as on the host for one it does not carry either. */
     getCipherInfo: function (nameOrNid, options) {
@@ -3260,7 +3366,7 @@ BF.crypto = function () {
       }
       /* A capability answer is JSON, so a name no cipher carries comes back null; Node answers
          undefined, and that is what a caller asks about with === undefined. */
-      var info = callCap('crypto.cipher.info', args);
+      var info = cryptoCap('crypto.cipher.info', args);
       return info === null ? undefined : info;
     },
     sign: signOne,
@@ -3534,7 +3640,9 @@ BF.module = function () {
      undefined, and so does this. */
   Module._debug = function _debug() { return undefined; };
   /* internalModuleStat's own answer: 0 for a file, 1 for a directory and the negated errno for a
-     path that is not there, which is what a caller of _stat compares against. */
+     path that is not there, which is what a caller of _stat compares against. Node's own stat is
+     not this filesystem's statSync -- it is a call of its own, and it names ENOTDIR where it finds
+     a component that is not a directory. row owc-module-stat-enotdir-for-file-parent. */
   Module._stat = function _stat(filename) {
     /* Node asserts on a path that is not a string rather than reporting it as missing, and an
        empty one is one no filesystem of its own will look up: it is ENOENT there, not the
@@ -3546,11 +3654,44 @@ BF.module = function () {
       throw bad;
     }
     if (filename === '') return -2;
+    var fsForStat = requireBuiltin('fs');
+    var ENOENT = -2;
+    var ENOTDIR = -20;
+    function isNotDir(err) {
+      return !!err && (err.code === 'ENOTDIR' || err.errno === 20);
+    }
+    /* A trailing slash is the one component no walk can name: 'plain.js/' is not 'plain.js' looked
+       up inside itself, it is the same file asked for as a directory, and that is ENOTDIR on a
+       host. This filesystem's statSync drops the slash and answers the file (the site is
+       guest/buffer-fs.ts), so the slash has to be read here, before anything else is looked up. */
+    var bare = filename;
+    while (bare.length > 1 && bare.charAt(bare.length - 1) === '/') bare = bare.slice(0, -1);
+    if (bare !== filename) {
+      try {
+        if (!fsForStat.statSync(bare).isDirectory()) return ENOTDIR;
+      } catch (e) {
+        /* Nothing there either: the walk below is what names it. */
+      }
+    }
     try {
-      var st = requireBuiltin('fs').statSync(filename);
-      return st.isDirectory() ? 1 : 0;
+      return fsForStat.statSync(filename).isDirectory() ? 1 : 0;
     } catch (e) {
-      return e && typeof e.errno === 'number' && e.errno > 0 ? -e.errno : -2;
+      if (isNotDir(e)) return ENOTDIR;
+      /* Which of the two it is has to be read off the nearest parent that does exist: a parent
+         that is a file makes every path under it ENOTDIR, one that is a directory or is itself
+         missing makes it ENOENT, exactly as node's own walk from the leaf upwards reads it. */
+      var at = dirnameOf(bare);
+      for (var guard = 0; guard < 4096; guard++) {
+        try {
+          return fsForStat.statSync(at).isDirectory() ? ENOENT : ENOTDIR;
+        } catch (inner) {
+          if (isNotDir(inner)) return ENOTDIR;
+          var up = dirnameOf(at);
+          if (up === at) return ENOENT;
+          at = up;
+        }
+      }
+      return ENOENT;
     }
   };
   /* The file a request resolves to under one of the given directories, or false: node's own
@@ -3627,7 +3768,10 @@ BF.module = function () {
     if (parent && parent.paths && parent.paths.length > 0) {
       paths = parent.paths.slice().concat(paths);
     }
-    return paths.length > 0 ? paths : null;
+    /* Node answers the array it built, empty or not, and only ever answers null for a request a
+       built-in answers for; with no parent and no global folders it is an empty array, not null.
+       row owc-module-globalpaths-empty. */
+    return paths;
   };
   /* The package.json of the package a specifier names, as a path: the specifier is resolved as a
      module and the walk goes up from what it found to the nearest package.json carrying that name,
