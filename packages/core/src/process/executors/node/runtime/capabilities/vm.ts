@@ -322,11 +322,12 @@ function methodDump(host: VmHost, value: QuickJSHandle, name: string): unknown {
  * true, `Object.prototype.toString.call` still `[object Array]`, which is what host Node 24.15
  * reports for the same probe.
  *
- * Only arrays, plain objects, `Date`s and `RegExp`s are rebuilt. Everything else -- a function, a
- * `Map`, a class instance -- crosses as it is: a function's body belongs to the realm it was
- * compiled in and cannot be recompiled into another, and a live `Map` cannot be copied without
- * running code that could itself be interrupted. A value too deep, a cycle, or one past the cap on
- * rebuilt values also crosses as it is, so nothing here can grow without bound or loop.
+ * Arrays, plain objects, `Date`s, `RegExp`s, errors, `Map`s, `Set`s and promises are rebuilt.
+ * Everything else -- a function, a class instance, a `WeakMap` -- crosses as it is: a function's body
+ * belongs to the realm it was compiled in and cannot be recompiled into another, and the keys of a
+ * `WeakMap` are the one part of a collection no walk can read, so a copy of one would come back
+ * empty. A value too deep, a cycle, or one past the cap on rebuilt values also crosses as it is, so
+ * nothing here can grow without bound or loop.
  */
 function rehomeInto(
     host: VmHost,
@@ -376,6 +377,14 @@ function rehomeInto(
             const error = errorOf(host, realm, name, message);
             if (error === undefined) return value;
             made = error;
+        } else if (tag === '[object Promise]') {
+            return promiseOf(host, realm, value);
+        } else if (tag === '[object Map]' || tag === '[object Set]') {
+            /* A `Map` or a `Set` the context has just handed back is finished with: nothing inside
+               the guest still holds it, so unlike a live one it can be copied. */
+            const empty = emptyOf(host, realm, tag === '[object Map]' ? 'Map' : 'Set');
+            if (empty === undefined) return value;
+            made = empty;
         } else {
             return value;
         }
@@ -385,6 +394,9 @@ function rehomeInto(
     pin(host, made);
     seen.push(value);
     twins.push(made);
+    if (tag === '[object Map]' || tag === '[object Set]') {
+        fillEntries(host, realm, value, made, tag === '[object Map]');
+    }
     try {
         const keys = ownKeysOf(host, value);
         for (const key of keys) {
@@ -404,6 +416,96 @@ function rehomeInto(
         // a value whose own names cannot be read crosses as the empty shell it is so far
     }
     return made;
+}
+
+/** `new Map()` or `new Set()` of the second realm, or undefined when it cannot be built. */
+function emptyOf(host: VmHost, realm: QuickJSContext, name: string): QuickJSHandle | undefined {
+    try {
+        const built = realm.evalCode(`new ${name}()`);
+        if (built.error) {
+            built.error.dispose();
+            return undefined;
+        }
+        return host.context.unwrapResult(built);
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Fills the empty `Map` or `Set` of the second realm with the entries of `value`.
+ *
+ * `forEach` is the only way in: the entries of a `Map` are not properties, so the own-name walk that
+ * fills an array or a plain object finds nothing on one. The callback is a host function, so an entry
+ * arrives as a handle -- which a dump could not carry, a live object being nothing a dump can hold.
+ *
+ * An entry crosses as the very object it is rather than as a rebuild of itself, which is what host
+ * Node 24.15 does: it hands back the context's own collection, keys and values and all. It matters
+ * more here than it does for an array, because a `Map` is a lookup -- a key rebuilt on the way out is
+ * a key `get` no longer finds, and a `Set` whose members were copied no longer `has` them. An entry
+ * the walk cannot read is skipped rather than failing the whole rebuild, so a collection with one
+ * awkward value still crosses as the rest of itself.
+ */
+function fillEntries(host: VmHost, realm: QuickJSContext, value: QuickJSHandle, made: QuickJSHandle, isMap: boolean): void {
+    const entries: QuickJSHandle[][] = [];
+    let collect: QuickJSHandle | undefined;
+    try {
+        collect = host.context.newFunction('collect', (one, two) => {
+            /* The argument handles die when this call returns: keep copies of the ones the fill
+               still needs after `forEach` is over. `forEach` hands a `Map`'s value first and its key
+               second, and a `Set`'s value twice, so a `Map` keeps them the other way round. */
+            entries.push(isMap ? [two.dup(), one.dup()] : [one.dup()]);
+        });
+        const result = host.context.callMethod(value, 'forEach', [collect]);
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // an object whose entries cannot be walked crosses as the empty collection it is so far
+    } finally {
+        if (collect !== undefined) collect.dispose();
+    }
+    for (const entry of entries) {
+        try {
+            const result = realm.callMethod(made, isMap ? 'set' : 'add', entry);
+            if (result.error) result.error.dispose();
+            else result.value.dispose();
+        } catch {
+            // one entry that will not go in leaves the rest of the collection intact
+        } finally {
+            for (const handle of entry) {
+                try { handle.dispose(); } catch { /* already gone with its context */ }
+            }
+        }
+    }
+}
+
+/**
+ * A promise of the second realm that settles the way `value` does, so a promise out of a `vm`
+ * context answers `false` to `instanceof Promise` -- as it does on host Node 24.15 -- and still
+ * resolves to what it promised: the reactions are attached to the promise the context made rather
+ * than to a snapshot of it, so a promise that is still pending when it crosses stays pending until
+ * it settles, and a rejection crosses as a rejection.
+ */
+function promiseOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle {
+    try {
+        const built = realm.evalCode(
+            '(function (src) { return new Promise(function (res, rej) { src.then(res, rej); }); })'
+        );
+        if (built.error) {
+            built.error.dispose();
+            return value;
+        }
+        const bridge = host.context.unwrapResult(built);
+        const result = realm.callFunction(bridge, realm.undefined, [value]);
+        bridge.dispose();
+        if (result.error) {
+            result.error.dispose();
+            return value;
+        }
+        return pin(host, host.context.unwrapResult(result));
+    } catch {
+        return value;
+    }
 }
 
 /**
