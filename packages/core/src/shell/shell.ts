@@ -21,6 +21,7 @@ import {
 import {
     COMMANDS as SHELL_BUILTIN_UTILS,
     createShellState,
+    diagnosticPrefix,
     echoWords,
     formatJobText,
     getRunner,
@@ -663,7 +664,15 @@ export class Shell implements IShell {
         const handler = MODULE_COMMANDS[command];
         if (handler !== undefined) {
             try {
-                return handler(this.moduleContext(args, input));
+                const result = handler(this.moduleContext(args, input));
+                /* `printf` is a built-in of a host's shell and not a utility on PATH, and a
+                   built-in's complaint carries the shell's name and the line it stands on:
+                   `printf '%d' notanumber` is `sh: line 0: printf: notanumber: invalid number`,
+                   where the utility's own text named no shell at all. */
+                if (command === 'printf' && result.exitCode !== 0 && result.stderr !== '' && !result.stderr.startsWith('usage:')) {
+                    return { ...result, stderr: `${diagnosticPrefix(this.shellState)}${result.stderr}` };
+                }
+                return result;
             } catch (error: any) {
                 return { stdout: '', stderr: error instanceof Error ? error.message : String(error), exitCode: 1 };
             }
