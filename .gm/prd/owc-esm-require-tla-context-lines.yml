@@ -1,7 +1,0 @@
-id: owc-esm-require-tla-context-lines
-subject: 'ESM: require() of a graph with top-level await omits the two context lines host Node writes above the require stack'
-description: 'Measured 2026-10-23 (judge lane, differential container vs host Node 24.15). require("./tla.mjs") on a module whose graph has top-level await: the host prints the ERR_REQUIRE_ASYNC_MODULE stack with two lines above it -- "  From <app>/main.js" and "  Requiring <app>/tla.mjs" -- and then "- <app>/main.js"; the container prints the last line only. The code and message agree; only the two context lines are missing. Fix: write the requiring module and the required module ahead of the stack, as the CJS loader does.'
-owner: lanmower
-session_id: adv2-judge-esm-1
-witness_plan: Differential require() of an ESM graph with top-level await, host Node 24.15 vs container; all three lines must match.
-status: pending

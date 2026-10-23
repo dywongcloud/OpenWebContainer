@@ -1,7 +1,0 @@
-id: owc-guest-requirestack-undefined
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931, reproduced, and FIXED in packages/core/src/process/executors/node/runtime/guest/loader.ts: requireStackOf is split into requireStackNames and moduleNotFound assigns err.requireStack from it, so require(), require.resolve() and the resolve-failure path all carry it as an own enumerable data property, exactly as host Node leaves it. After the change the container gives ["APP/main.js"] for a direct require and for require.resolve, and ["APP/sub/mid.js","APP/main.js"] nested -- the host''s own values. See .gm/witness-out/owc-guest-requirestack-undefined.txt.'
-owner: judge-guest-6
-session_id: adv2-judge-guest-6
-subject: 'e.requireStack on a MODULE_NOT_FOUND error is undefined, where host Node gives the array of requiring files'
-witness_plan: 'require a missing module in the container and under host Node 24.15 and compare `e.requireStack`; both must be an array naming the requiring file.'
-status: pending

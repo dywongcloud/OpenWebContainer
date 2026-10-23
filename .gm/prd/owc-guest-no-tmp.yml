@@ -1,7 +1,0 @@
-id: owc-guest-no-tmp
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931 and CLOSED. /tmp and /var/tmp exist, are directories, pass accessSync W_OK, and fs.mkdtempSync succeeds with a write+read round-trip of "hi"; os.tmpdir() is "/tmp" and TMPDIR is set. The path itself differs from the host''s /var/folders/... as it must. See .gm/witness-out/owc-guest-no-tmp.txt.'
-owner: drain-corpus
-session_id: adv2-judge-guest-6
-subject: 'container FS has no /tmp directory and TMPDIR is unset, so anything using os.tmpdir() gets ENOENT'
-witness_plan: 'Run `ls -d /tmp; echo c=$?` and `echo TMPDIR=[$TMPDIR]` in the container and with /bin/sh, then mkdtemp and write into it.'
-status: pending

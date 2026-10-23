@@ -1,7 +1,0 @@
-id: owc-guest-process-getuid-absent
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931. `typeof process.getuid === ''function''` is false in the container (and geteuid with it) where host Node 24.15 returns 501, so a package that guards on the accessor takes the other branch. The number itself is already decided inside the container: os.userInfo() there reports {"uid":1000,"gid":1000,"username":"user","homedir":"/home","shell":"/bin/sh"}, so only the accessor is missing. Recorded in Readme.md. See .gm/witness-out/owc-guest-process-getuid-absent.txt.'
-owner: judge-guest-6
-session_id: adv2-judge-guest-6
-subject: 'process.getuid and process.geteuid do not exist in the container, though its own os.userInfo() reports a uid'
-witness_plan: 'Print typeof process.getuid, process.getuid() and os.userInfo().uid in the container and under host Node 24.15; the two must agree.'
-status: pending

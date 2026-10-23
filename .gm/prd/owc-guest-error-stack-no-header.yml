@@ -1,7 +1,0 @@
-id: owc-guest-error-stack-no-header
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931 and CONFIRMED, not fixed. Container String(e.stack).split(''\n'') is ["    at methodFrame (/app/main.js:31:3)","    at <anonymous> (/app/main.js:44:16)","    at call (native)","    at loadCJS (owc-bootstrap.js:1006:21)","    at runMain (owc-bootstrap.js:1484:14)",""] -- five lines beginning at a frame -- where host Node 24.15 gives ["Error: boom","    at Object.methodFrame ...", then seven node:internal frames], ten lines. The descriptor is as the row says: container own data property (writable true, enumerable false, configurable true) against the host''s own accessor. util.inspect(new Error(''boom'')) and the uncaught-throw stderr DO carry "Error: boom", because formatErrorStack prepends it; only err.stack itself does not. Left unfixed: the stack is an own data property the engine (QuickJS) writes at construction, so giving it a header means replacing or reproxying the guest''s global Error -- not one small change -- and runtime/guest/globals.ts, its only natural home, is mid-edit by a concurrent lane. See .gm/witness-out/owc-guest-error-stack-no-header.txt.'
-owner: judge-guest-6
-session_id: adv2-judge-guest-6
-subject: 'a guest error stack has no Error: <message> header line, so its first line is a frame'
-witness_plan: 'Throw an Error in the container and under host Node 24.15 and compare the first line of e.stack; both must read Error: boom.'
-status: pending

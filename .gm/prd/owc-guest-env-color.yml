@@ -1,7 +1,0 @@
-id: owc-guest-env-color
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931 and CLOSED. The container''s env now carries TERM=xterm, COLORTERM=truecolor and LANG=C.UTF-8 -- nine keys (COLORTERM HOME LANG LOGNAME PATH PWD TERM TMPDIR USER) against the host''s 66 -- and the three real libraries that decide from the environment agree with the host: chalk@4.1.2 level 0 with chalk.red(''x'') === "x", picocolors@1.1.1 isColorSupported false with red(''x'') === "x", supports-color@7.2.0 stdout falsey, on both sides, with tty.isatty(1) false on both. What still differs is values no tested library reads: TERM xterm against xterm-ghostty and no CLICOLOR. See .gm/witness-out/owc-guest-env-color.txt.'
-owner: drain-corpus
-session_id: adv2-judge-guest-6
-subject: 'guest env has no TERM/COLORTERM/CLICOLOR, so packages that guess colour support from the environment print without ANSI'
-witness_plan: 'Print Object.keys(process.env) and run chalk, picocolors and supports-color in the container and under host Node 24.15 with stdout piped; all three libraries must report no colour support on both.'
-status: pending

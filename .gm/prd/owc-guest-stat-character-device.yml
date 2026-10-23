@@ -1,7 +1,0 @@
-id: owc-guest-stat-character-device
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931 and FIXED in packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts: makeStats now derives isFile, isDirectory, isBlockDevice, isCharacterDevice, isFIFO and isSocket from mode & S_IFMT, falling back to the store''s type only when the mode carries no format, instead of hardcoding the last four to false. After the change fs.statSync(''/dev/null'') gives {"isFile":false,"isDir":false,"chr":true,"blk":false,"fifo":false,"sock":false,"size":0,"mode":8630} in the container -- the host''s own figures -- and the same for /dev/zero, /dev/random and /dev/urandom. See .gm/witness-out/owc-guest-stat-character-device.txt.'
-owner: judge-guest-6
-session_id: adv2-judge-guest-6
-subject: 'a guest''s fs.statSync of /dev/null reports isFile() true and isCharacterDevice() false, where a host reports the reverse'
-witness_plan: 'Stat /dev/null, /dev/zero, /dev/random and /dev/urandom in the container and on host Node 24.15; isFile(), isCharacterDevice() and mode must agree on both.'
-status: pending

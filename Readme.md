@@ -297,6 +297,22 @@ is 252 extra 64 KiB deliveries, which is 1.17 ms each, the guest's own `setImmed
 against the host's 0.02). The lower bound is a capability round trip with no payload, 0.145 ms here
 against the host's 0.004. That turn cost is filed as its own row rather than fixed here.
 
+**Re-measured at HEAD `9376836`, one process per side, machine load 7.9-10.2 with about 500-540 MB
+free.** The turn is the whole gap and it has not moved. A 300-hop chain prices a guest macrotask at
+`setImmediate` 1.267 ms/turn, `setTimeout(f, 0)` 1.315 and `setTimeout(f, 1)` 1.246, against host
+Node 24.15's 0.021, 1.278 and 1.240 on the same script: `setImmediate` is 60x the host's and the two
+`setTimeout`s are already the host's own 1 ms, so the guest has no cheaper phase to schedule onto.
+16 MiB over loopback in that same process -- TCP upload 383 ms (41.8 MiB/s) against the host's 28 ms
+(571), download 374 against 23, HTTP/1.1 upload 386 against 20, download 403 against 16, HTTP/2
+upload 1551 against 57 and download 1738 against 35 -- with 256 `'data'` events per 16 MiB on both
+sides at 1.496 ms per event here against the host's 0.103. The clamp is
+`if (!(delay >= 1)) delay = 1` in `scheduleTimer`
+(`packages/core/src/process/executors/node/runtime/guest/loader.ts:968`), which `setImmediateImpl`
+reaches with a delay of `0` (`loader.ts:1043`); the host side adds a 0 ms timer per delivery at
+`packages/core/src/network/virtual/hub.ts:525` and `:541`. Both files are outside this shard's grant,
+so the site is named and not edited -- and routing every host-side 0 ms timer onto the check phase
+moves TCP upload 516 -> 453 ms while leaving the per-turn cost at 1.285 ms, which is what pins it.
+
 ### 🚧 In Progress
 
 - **Network Simulation hardening**
@@ -1429,6 +1445,12 @@ Two `process.kill` details stay recorded rather than fixed: `SIGSTOP` ends it wi
 `inspector` notifications are the shape of the protocol's, not its content: `Runtime.executionContextCreated` is emitted when `Runtime` is enabled and `Runtime.consoleAPICalled` for every line the program writes, but an event carries no `timestamp` and no `stackTrace`, and the context name carries no `uniqueId`, because the values a host puts there are its pid's and its clock's.
 
 `createSign().sign` names the same type list the host does up to its tail: `ArrayBuffer` is in it now, but `KeyObject` and `CryptoKey` are not, so `sign(1)` says `ArrayBuffer, Buffer, TypedArray, or DataView` where host Node 24.15 says `ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey`.
+
+`Object.setPrototypeOf` over a non-extensible receiver is named by V8 and only typed by QuickJS: at HEAD `9376836` the container answers `TypeError: object is not extensible` for `Object.preventExtensions({})`, `[]`, `function f() {}`, `Object.seal({})` and `Object.freeze({})`, where host Node 24.15 answers `#<Object> is not extensible`, `[object Array] is not extensible`, `function f() {} is not extensible`, `#<Object> is not extensible` and `#<Object> is not extensible`. It is the engine's sentence, not this container's: the same five calls under bare QuickJS 0.32 (quickjs-emscripten 0.32.0, one fresh runtime and context, no container bootstrap) answer `object is not extensible` for all five, so no edit around the container can change it (row `owc-engine-error-message-wording`, closed stale).
+
+`owc-verifier-open-gaps` is stale as a list. At HEAD `9376836` thirteen of the fourteen API gaps it names are present in the container -- `events.on`, `events.getEventListeners`, `util.parseArgs`, `timers/promises` `setInterval` and `scheduler`, `net.BlockList`, `net.SocketAddress`, `buffer.Blob`, `buffer.transcode`, `buffer.isUtf8`, `async_hooks.AsyncLocalStorage`, `vm.Script` and `http2.connect` all answer `function` -- and a live HTTP/2 server answers its `stream` event and `respond()`s `http2-ok` byte-identically to the host. "Buffer identity across worker messages" is fixed at HEAD: a `Buffer` posted from a worker arrives as a `Uint8Array` (`Buffer.isBuffer(m)` false, `m.constructor.name` `Uint8Array`, 10 bytes, `isView` true), on all six lines the host prints. `AsyncLocalStorage` across `await` is real and is already closed stale as an engine limit under `owc-als-across-await-engine`: the store survives `setTimeout`, `nextTick`, `setImmediate` and `.then` and is lost across every `await`, because QuickJS exposes no promise/async-context hook for Node's implementation to stand on. What is left is the module export table -- five names, `register`, `stripTypeScriptTypes` and the three `enableCompileCache` / `flushCompileCache` / `getCompileCacheDir` that QuickJS has no code cache for -- and that is `owc-module-export-table-incomplete`, another shard's row.
+
+Two rows about this repository's own tooling rather than about the container, each with a fix site outside it. `.gm/exec-spool/.dispatch-ledger.json` is written in two formats by two paths of the gm runner, which is the agentplug daemon outside this repo (`/Users/dylanwong/.agentplug`): one rewrites the whole file as a single JSON array, the other appends one NDJSON object per dispatch, so a whole-file `JSON.parse` fails at exactly the array's byte length -- 336,434 bytes failing at position 206 at HEAD -- and a file-level repair is a reset rather than a fix, because nothing ever rewrites the array, only the appender runs. `.gm/prd/*.yml` was tracked in git with no ignore rule, so every pull re-materialized rows that had been closed by deleting their file; that half is fixed here by a `.gm/.gitignore` rule for `prd/` and by dropping the 46 tracked row files from the index. The same is still true of the rest of `.gm/**` (1306 tracked paths, two of gm's spool files among the largest entries in every working-tree diff), whose fix site is the root `.gitignore` and is outside this shard's grant. And `owc-store-witness-staleness` is a bookkeeping record rather than a container divergence: at HEAD `9376836` all 335 records of `.gm/prd-log.jsonl` carry `status completed` and the newest is ts `1792747250426` (2026-10-23T09:20:50Z) against a tip committed at `1792751362000` (10:29:22Z), so 0 of 335 were produced at or after the tip -- but a witness is written when its row is resolved and the commit that carries it lands afterwards, so that inequality holds at every instant while any lane is committing, and refreshing all 308 ids means re-running 291 container cases, which no single lane can do. This lane re-measured nine of them at the same HEAD (worker `Buffer` identity, the repl, canvas 95/96, node-pty 27/29, the extensibility wording, the verifier gap list, `pnpm build`'s generated-guest check, the guest turn cost and the lean gate) and every one still matches what its record says.
 
 ## The `lean-net-negative` walk gate (measured, not waived)
 

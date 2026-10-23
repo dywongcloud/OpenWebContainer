@@ -1,7 +1,0 @@
-id: owc-guest-path-binaries-absent
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931. The naming half is FIXED in packages/core/src/shell/commands/builtins.ts: `command -v` now prints the pathname or the bare name (pathOfName) and `command -V`/`type` keep the wording that describes, with describeName naming the file on PATH before the builtin of the same name; 33 of 33 `command -v` / `command -V` / `type` lines are then byte-identical to the host''s /bin/sh. The absent-file half remains: `command -v npm`, `command -v git`, `command -v grep`, `command -v sed` exit 1 where a host names a file, because no such file exists in the container -- recorded in Readme.md. See .gm/witness-out/owc-guest-path-binaries-absent.txt.'
-owner: judge-guest-6
-session_id: adv2-judge-guest-6
-subject: 'command -v answers with the describing wording instead of the path, and a utility the shell has no builtin of its own is still not on PATH'
-witness_plan: 'Run `command -v sh`, `command -v ls`, `command -v cd`, `command -v echo`, `command -v env`, `command -v cat` in the container and with /bin/sh; all six must agree with the host.'
-status: pending

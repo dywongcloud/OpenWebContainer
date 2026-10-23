@@ -1,7 +1,0 @@
-id: owc-guest-os-network-interfaces-empty
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931. Object.keys(os.networkInterfaces()).length is 0 in the container against 11 on the host (lo0, en0, and the rest), so a package that picks an address out of the map finds nothing. A browser container has no interface of its own to name, so this may stay a documented exclusion rather than a fix. Recorded in Readme.md. See .gm/witness-out/owc-guest-os-network-interfaces-empty.txt.'
-owner: judge-guest-6
-session_id: adv2-judge-guest-6
-subject: 'os.networkInterfaces() is empty in the container where a host reports one entry per interface'
-witness_plan: 'Print Object.keys(os.networkInterfaces()).length in the container and under host Node 24.15 and decide whether the container should report a loopback.'
-status: pending

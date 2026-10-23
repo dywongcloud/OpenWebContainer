@@ -1,7 +1,0 @@
-id: owc-guest-stdout-columns-tty
-description: 'Rewritten 2026-10-23 by a judge (shard guest) at HEAD f5d5931. The row''s original subject -- columns 80 and isTTY false -- is FIXED: a piped host leaves both undefined and the container now does too, so `columns || 80` falls back on both. What remains is the object itself: container stdout is an EventEmitter (proto EventEmitter>Object, own props _events _eventsCount _maxListeners cork end setEncoding uncork write) where a host''s is a SyncWriteStream or Socket on Writable>Stream>EventEmitter>Object; fd, writable, readable, destroyed, writableEnded, writableFinished, writableLength, writableCorked, writableNeedDrain, writableObjectMode, errored and writableHighWaterMark are all undefined, and typeof pipe is ''undefined'', so isStreamLike(process.stdout) is false and anything that pipes into stdout takes another branch. stdin adds ctor Readable against ReadStream, fd undefined against 0, and readableEncoding ''utf8'' against null; readableHighWaterMark 65536 agrees. Recorded in Readme.md. See .gm/witness-out/owc-guest-stdout-columns-tty.txt.'
-owner: judge-guest-6
-session_id: adv2-judge-guest-6
-subject: 'guest process.stdout is an EventEmitter with a write, not a Writable, so it has no fd, no writableHighWaterMark and no pipe'
-witness_plan: 'Print process.stdout.constructor.name, .fd, .writableHighWaterMark and typeof .pipe in the container and under host Node with stdout piped; all four must agree.'
-status: pending

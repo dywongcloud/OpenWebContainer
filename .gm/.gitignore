@@ -1,0 +1,3 @@
+# gm writes row files here as it works; a row is closed by deleting its file, so these are
+# runtime state and must never come back from the index on a pull.
+prd/

@@ -1,7 +1,0 @@
-id: owc-guest-error-host-paths
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931 and CLOSED on the part this row names. No container frame names a host path: a require failure names /app/main.js and a nested one /app/sub/mid.js, an uncaught throw names /app/main.js and owc-bootstrap.js, and a relative entry now resolves against the process cwd rather than / -- require(''./nope.js'') from /app/main.js reports "Cannot find module ''./nope.js''\nRequire stack:\n- /app/main.js". The frames'' shape and the container''s own engine frames are a different divergence, filed as owc-guest-error-stack-frame-shape. See .gm/witness-out/owc-guest-error-host-paths.txt.'
-owner: drain-corpus
-session_id: adv2-judge-guest-6
-subject: 'guest stack frames leak host repository paths, and unresolved entries are reported against / instead of the cwd'
-witness_plan: 'Run `node missing.js` and a nested require in the container and under host Node 24.15 with the same cwd; compare stderr and exit code, and check no frame names a path outside the container.'
-status: pending

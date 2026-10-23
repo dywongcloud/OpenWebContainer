@@ -1,7 +1,0 @@
-id: owc-guest-node-not-on-path
-description: 'Measured 2026-10-23 by a judge (shard guest) at HEAD f5d5931 and CLOSED. A PATH scan finds /usr/local/bin/node in the container and the nvm path on the host -- a string on both -- and /bin/sh and /bin/ls resolve on both; a binary that is not there is null on both. See .gm/witness-out/owc-guest-node-not-on-path.txt.'
-owner: drain-corpus
-session_id: adv2-judge-guest-6
-subject: 'no node binary on the guest PATH, so which(''node'') finds nothing though the container can spawn node'
-witness_plan: 'Run which.sync(''node'', {nothrow:true}) in the container and on the host; both must return a path.'
-status: pending
