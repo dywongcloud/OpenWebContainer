@@ -1,0 +1,6 @@
+id: owc-crypto-dh-degenerate-prime
+session_id: adv5-judge-crypto-4
+owner: adv5-judge-crypto-4
+classification: GUEST
+status: pending
+subject: 'crypto.diffieHellman({prime: <empty Buffer>, privateKey, publicKey}) throws ERR_CAPABILITY "Division by zero" here where host Node 24.15 throws ERR_INVALID_ARG_VALUE "The property ''options.privateKey'' is invalid. Received <Buffer 00>": Node rejects the exponent before it reaches the arithmetic, and this runtime reaches BigInt modular exponentiation with a zero-length prime. The fix site is ''crypto.dh.compute'' in packages/core/src/process/executors/node/runtime/capabilities/crypto.ts (and primeOfBits/dhFail for the prime itself), reached from diffieHellman in packages/core/src/process/executors/node/runtime/guest/misc.ts. Witness: /tmp/owc-judge-crypto-4/proj2/main.js case X3-dh-emptyprime, host vs container at HEAD 7f6881a and again after the round-4 fixes. The headline x25519/x448 gap this row grew out of is fixed: crypto.diffieHellman({privateKey, publicKey}) with two key objects now answers 4d2d6ca3aada1bc1d7f2d6fb782cb5022812b27e10d5912c51d3d098727e967d, byte-identical to host for a fixed x25519 key.'

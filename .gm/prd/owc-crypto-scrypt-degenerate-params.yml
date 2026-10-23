@@ -1,0 +1,6 @@
+id: owc-crypto-scrypt-degenerate-params
+session_id: adv5-judge-crypto-4
+owner: adv5-judge-crypto-4
+classification: GUEST
+status: pending
+subject: 'crypto.scryptSync with a degenerate parameter is refused here where host Node 24.15 derives a key: p:0 derives 086be1ce..., r:0 derives c5d06c36... and N:0 derives 7037f589... (each with N/r/p defaults otherwise and keylen 8), while this runtime throws ERR_CRYPTO_INVALID_SCRYPT_PARAMS "Invalid scrypt params" for all three. The refusal is in the guard at ''crypto.scrypt'' in packages/core/src/process/executors/node/runtime/capabilities/crypto.ts, which requires N>1, r>0 and p>0 before it calls @noble/hashes scrypt -- and @noble/hashes rejects those values too, so matching Node means computing the degenerate derivation rather than relaxing the guard. Witness: /tmp/owc-judge-crypto-4/proj2/main.js cases S1-scrypt-p0, S2-scrypt-r0, S3-scrypt-N0, host vs container at HEAD 7f6881a and again after the round-4 fixes. Not engine-limited: the N=16384 RFC 7914 vectors already derive byte-identically here in 77 ms.'
