@@ -466,12 +466,20 @@ function dirOrder(fs: Fs, path: string): string[] {
 /**
  * Walks one root. `-maxdepth` prunes the descent; the list is in pre-order, and the entries of a
  * directory come before the entries of its subdirectories.
+ *
+ * `order` picks the order the entries of a directory are taken in, and every walk but one leaves it
+ * alone: `find` sorts, so a tree is reported the same way on any file system that holds it. A
+ * recursive `chmod` does not -- it descends into the names in the order the host's own `readdir`
+ * hands them over, which is the order `ls -f` prints and the one `dirOrder` reproduces, so the
+ * lines `chmod -R 2755 d` writes for `d`, `d/s2`, `d/s2/y`, `d/a`, ... come out in the host's
+ * order rather than in a sorted one no host ever lists.
  */
 function walkRoot(
     fs: Fs,
     root: string,
     shownRoot: string,
-    maxDepth: number
+    maxDepth: number,
+    order: (fs: Fs, path: string) => string[] = dirEntries
 ): { entries: Entry[]; missing: boolean } {
     const entries: Entry[] = [];
     const first = statOf(fs, root);
@@ -492,7 +500,7 @@ function walkRoot(
             mtimeMs: stat.mtimeMs
         });
         if (stat.type !== 'dir' || node.depth >= maxDepth) continue;
-        const children = dirEntries(fs, node.path);
+        const children = order(fs, node.path);
         for (let i = children.length - 1; i >= 0; i--) {
             stack.push({
                 path: joinPath(node.path, children[i]),
@@ -3998,7 +4006,7 @@ const chmod: ShellCommand = (ctx) => {
         let entries: string[] = [root];
         const rootStat = statOf(ctx.fs, root);
         if (recursive && !here && rootStat !== undefined && rootStat.type === 'dir') {
-            entries = walkRoot(ctx.fs, root, root, Number.MAX_SAFE_INTEGER).entries.map((entry) => entry.path);
+            entries = walkRoot(ctx.fs, root, root, Number.MAX_SAFE_INTEGER, dirOrder).entries.map((entry) => entry.path);
         }
         let blocked: string | undefined;
         for (const entry of entries) {
