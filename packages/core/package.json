@@ -7,9 +7,10 @@
 	"types": "./dist/index.d.ts",
 	"scripts": {
 		"compile": "tsc --project tsconfig.json",
+		"build:napi-guest": "node scripts/build-napi-guest.mjs",
 		"build:worker": "mkdir -p src/generated && BUILD_TARGET=worker tsup",
 		"build:main": "tsup",
-		"build": "pnpm build:worker && pnpm build:main",
+		"build": "pnpm build:napi-guest && pnpm build:worker && pnpm build:main",
 		"clean": "rimraf dist",
 		"dev": "tsc --project tsconfig.json --watch",
 		"test": "jest",
