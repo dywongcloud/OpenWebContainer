@@ -101,6 +101,7 @@ export class ImageData {
 interface EncodeConfig {
     quality?: number;
     progressive?: boolean;
+    chromaSubsampling?: boolean;
     resolution?: number;
     palette?: ArrayBufferView;
     compressionLevel?: number;
@@ -127,7 +128,17 @@ export class Canvas {
     private h: number;
     /** Every 2D context handed out for this canvas, so a resize can reset them the way cairo does. */
     private contexts: CanvasRenderingContext2d[] = [];
-    readonly type = 'image';
+    /**
+     * The surface type the add-on reports back. cairo makes a PDF surface for the string 'pdf' and an
+     * SVG one for 'svg'; every other argument -- 'gif', 'bogus', 'PDF', 'image', a number, nothing at
+     * all -- is an image surface, and `type` answers 'image' for it. Measured on canvas 3.2.3.
+     *
+     * The shim draws every one of them as an image: a 'pdf' or 'svg' canvas is a surface you can draw
+     * into, and what the shim still refuses is writing one out, in encode() and streamPDFSync() --
+     * the refusal is at the encoder, which is where the add-on's own bytes would come from, not at
+     * the constructor, which the add-on never refuses.
+     */
+    readonly type: string;
 
     static readonly PNG_NO_FILTERS = 0;
     static readonly PNG_ALL_FILTERS = 248;
@@ -140,12 +151,7 @@ export class Canvas {
     private surface: Surface;
 
     constructor(width?: number, height?: number, type?: string) {
-        if (type !== undefined && type !== null && type !== 'image') {
-            throw unsupported(
-                'canvas type ' + JSON.stringify(String(type)) + ' -- the shim renders image canvases only; ' +
-                'it has no cairo PDF or SVG surface'
-            );
-        }
+        this.type = type === 'pdf' ? 'pdf' : type === 'svg' ? 'svg' : 'image';
         // Both dimensions come from numbers, and the height is only read when the width was one:
         // createCanvas() is 0x0, createCanvas('20', 30) is 0x0 and createCanvas(20, '30') is 20x0.
         let w = 0;
@@ -262,7 +268,7 @@ export class Canvas {
             if (config && config.progressive) {
                 throw unsupported('progressive JPEG output -- the shim writes baseline JPEG only');
             }
-            return encodeJPEG(this.pixels().data, this.width, this.height, quality);
+            return encodeJPEG(this.pixels().data, this.width, this.height, quality, config && config.chromaSubsampling);
         }
         if (t === 'raw') {
             const src = this.pixels().data;
@@ -307,7 +313,7 @@ export class Canvas {
             if (this.width === 0 || this.height === 0) this.empty();
             const cfg = (config && typeof config === 'object' ? config : {}) as EncodeConfig;
             if (cfg.progressive) throw unsupported('progressive JPEG output -- the shim writes baseline JPEG only');
-            bytes = encodeJPEG(this.pixels().data, this.width, this.height, typeof cfg.quality === 'number' ? cfg.quality : 0.75);
+            bytes = encodeJPEG(this.pixels().data, this.width, this.height, typeof cfg.quality === 'number' ? cfg.quality : 0.75, cfg.chromaSubsampling);
         } catch (error) {
             cb(error instanceof Error ? error : new Error(String(error)));
             return;

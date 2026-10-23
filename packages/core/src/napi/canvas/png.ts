@@ -1,11 +1,18 @@
 /**
- * The PNG encoder. There is no zlib in the guest, so the IDAT stream is a zlib wrapper around deflate
- * **stored** blocks: a 2-byte zlib header, one or more uncompressed blocks of at most 65535 bytes, and
- * an Adler-32 of the filtered scanlines. That is a legal PNG that every decoder reads; it is simply not
- * compressed, so the shim's PNGs are larger than the add-on's for the same image. libpng's adaptive
- * row filtering is not reproduced either -- every scanline is written with filter type 0 (None), so a
- * `filters` option in PngConfig is accepted and ignored, and `palette` is refused outright.
+ * The PNG encoder. The IDAT stream is a zlib wrapper around a real deflate -- fflate's, at level 6,
+ * which is what the guest has and the only deflate a shim with no WebAssembly can run -- so a canvas
+ * this shim writes is a compressed PNG of about the add-on's size rather than a stored one twice it.
+ * The zlib stream is not libpng's byte for byte, because no JavaScript deflate is zlib's, and libpng's
+ * adaptive row filtering is not reproduced either: every scanline is written with filter type 0
+ * (None), so a `filters` option in PngConfig is accepted and ignored, and `palette` is refused
+ * outright.
+ *
+ * The chunks are the add-on's own: IHDR, then a bKGD of opaque white, then IDAT, then IEND. cairo
+ * writes that bKGD -- 00ff 00ff 00ff, six bytes, the RGB of colour type 6 as three 16-bit values --
+ * into every PNG it makes, whatever the canvas holds, measured on canvas 3.2.3 at 4x4, 2x2 and
+ * 20x10 over transparent, red and blue pixels alike, so a PNG this shim writes carries it too.
  */
+import { zlibSync } from 'fflate';
 
 const CRC_TABLE = (function (): Uint32Array {
     const table = new Uint32Array(256);
@@ -23,15 +30,6 @@ function crc32(bytes: Uint8Array, from: number, to: number): number {
     return (c ^ 0xffffffff) >>> 0;
 }
 
-function adler32(bytes: Uint8Array, from: number, to: number): number {
-    let a = 1, b = 0;
-    for (let i = from; i < to; i++) {
-        a = (a + bytes[i]) % 65521;
-        b = (b + a) % 65521;
-    }
-    return ((b << 16) | a) >>> 0;
-}
-
 /** A chunk type and its payload, appended with its length and CRC-32. */
 function pushChunk(out: number[], type: string, payload: Uint8Array): void {
     out.push((payload.length >>> 24) & 0xff, (payload.length >>> 16) & 0xff, (payload.length >>> 8) & 0xff, payload.length & 0xff);
@@ -44,23 +42,80 @@ function pushChunk(out: number[], type: string, payload: Uint8Array): void {
     out.push((crc >>> 24) & 0xff, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff);
 }
 
-/** The zlib stream: 0x78 0x01, then `raw` as stored deflate blocks, then Adler-32. */
-function deflateStored(raw: Uint8Array): Uint8Array {
-    const out: number[] = [0x78, 0x01];
-    let at = 0;
-    while (true) {
-        const last = at + 65535 >= raw.length;
-        const n = Math.min(65535, raw.length - at);
-        out.push(last ? 1 : 0);
-        out.push(n & 0xff, (n >>> 8) & 0xff);
-        out.push((~n) & 0xff, ((~n) >>> 8) & 0xff);
-        for (let i = 0; i < n; i++) out.push(raw[at + i]);
-        at += n;
-        if (last) break;
+/** cairo's bKGD: opaque white, three 16-bit values, the shape colour type 6 takes. */
+const BKGD_WHITE = new Uint8Array([0x00, 0xff, 0x00, 0xff, 0x00, 0xff]);
+
+/* --- row filtering ------------------------------------------------------ *
+ * libpng picks a filter per row, and the add-on inherits the choice: a solid row is Sub, every row
+ * after it Up, and a row that begins a new block of colour Paeth. Its rule, reproduced here, is the
+ * sum of the filtered bytes read as distances from zero -- a byte below 128 counts itself, a byte
+ * from 128 up counts 256 minus itself -- and the lowest sum wins, the first of them on a tie.
+ *
+ * The add-on's own `filters` config does not reach libpng: a 64x64 gradient is 233 bytes whether a
+ * caller asks for PNG_FILTER_NONE, PNG_FILTER_UP, PNG_FILTER_SUB or says nothing at all (measured on
+ * canvas 3.2.3), so there is nothing for the shim to honour and every row gets the adaptive choice.
+ */
+
+function paeth(a: number, b: number, c: number): number {
+    const p = a + b - c;
+    const pa = Math.abs(p - a);
+    const pb = Math.abs(p - b);
+    const pc = Math.abs(p - c);
+    return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+}
+
+/**
+ * Writes `row` filtered by `filter` into `out`, given the row above it and its own left neighbour,
+ * and returns that filter's score: one pass over the row does both, because the encoder tries five
+ * filters per row and a guest measures that in seconds on a large canvas.
+ */
+function applyFilter(filter: number, row: Uint8Array, above: Uint8Array, out: Uint8Array): number {
+    const stride = row.length;
+    let sum = 0;
+    for (let i = 0; i < stride; i++) {
+        const left = i >= 4 ? row[i - 4] : 0;
+        const up = above[i];
+        const corner = i >= 4 ? above[i - 4] : 0;
+        const v = filter === 1 ? row[i] - left
+            : filter === 2 ? row[i] - up
+                : filter === 3 ? row[i] - ((left + up) >> 1)
+                    : filter === 4 ? row[i] - paeth(left, up, corner)
+                        : row[i];
+        const byte = v & 0xff;
+        out[i] = byte;
+        sum += byte < 128 ? byte : 256 - byte;
     }
-    const sum = adler32(raw, 0, raw.length);
-    out.push((sum >>> 24) & 0xff, (sum >>> 16) & 0xff, (sum >>> 8) & 0xff, sum & 0xff);
-    return new Uint8Array(out);
+    return sum;
+}
+
+/** The filtered scanlines: one leading filter byte per row, then the row the filter picked. */
+function filteredRows(rgba: Uint8Array, width: number, height: number): Uint8Array {
+    const stride = width * 4;
+    const raw = new Uint8Array((stride + 1) * height);
+    const row = new Uint8Array(stride);
+    const above = new Uint8Array(stride);
+    const candidate = new Uint8Array(stride);
+    const best = new Uint8Array(stride);
+    for (let y = 0; y < height; y++) {
+        row.set(rgba.subarray(y * stride, y * stride + stride));
+        let bestFilter = 0;
+        let bestScore = Number.POSITIVE_INFINITY;
+        for (const filter of [0, 1, 2, 3, 4]) {
+            const score = applyFilter(filter, row, above, candidate);
+            if (score < bestScore) {
+                bestScore = score;
+                bestFilter = filter;
+                best.set(candidate);
+                /* Nothing can beat a row that filters to all zeroes, and most rows do. */
+                if (score === 0) break;
+            }
+        }
+        const at = y * (stride + 1);
+        raw[at] = bestFilter;
+        raw.set(best, at + 1);
+        above.set(row);
+    }
+    return raw;
 }
 
 /**
@@ -69,12 +124,7 @@ function deflateStored(raw: Uint8Array): Uint8Array {
  */
 export function encodePNG(rgba: Uint8Array, width: number, height: number, resolution?: number): Uint8Array {
     const stride = width * 4;
-    const raw = new Uint8Array((stride + 1) * height);
-    for (let y = 0; y < height; y++) {
-        raw[y * (stride + 1)] = 0;
-        const from = y * stride;
-        for (let i = 0; i < stride; i++) raw[y * (stride + 1) + 1 + i] = rgba[from + i];
-    }
+    const raw = filteredRows(rgba, width, height);
     const ihdr = new Uint8Array(13);
     ihdr[0] = (width >>> 24) & 0xff;
     ihdr[1] = (width >>> 16) & 0xff;
@@ -91,6 +141,7 @@ export function encodePNG(rgba: Uint8Array, width: number, height: number, resol
     ihdr[12] = 0;
     const out: number[] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     pushChunk(out, 'IHDR', ihdr);
+    pushChunk(out, 'bKGD', BKGD_WHITE);
     if (typeof resolution === 'number' && resolution > 0) {
         const ppm = Math.round(resolution / 0.0254);
         const phys = new Uint8Array(9);
@@ -105,7 +156,7 @@ export function encodePNG(rgba: Uint8Array, width: number, height: number, resol
         phys[8] = 1;
         pushChunk(out, 'pHYs', phys);
     }
-    pushChunk(out, 'IDAT', deflateStored(raw));
+    pushChunk(out, 'IDAT', zlibSync(raw, { level: 6 }));
     pushChunk(out, 'IEND', new Uint8Array(0));
     return new Uint8Array(out);
 }

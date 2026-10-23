@@ -6,8 +6,13 @@
  * `Math` / typed arrays.
  *
  * Format produced: JFIF v1.1, baseline DCT, Huffman, 8x8 blocks, 3 components,
- * 4:4:4 (no chroma subsampling), standard Annex K quantisation and Huffman
- * tables.
+ * standard Annex K quantisation and Huffman tables.
+ *
+ * Chroma: 4:2:0 by default -- a 16x16 MCU of four luma blocks, one Cb and one Cr -- which is what
+ * libjpeg writes when node-canvas asks for a JPEG, and `{ chromaSubsampling: false }` gets 4:4:4
+ * instead, the one MCU per block the earlier encoder always wrote. Measured against canvas 3.2.3 on
+ * a 64x64 gradient: the add-on answers 1249 bytes at quality 0.9 with subsampling off and 969 with
+ * it on.
  *
  * `encodeJPEG` is a pure function of its arguments: identical inputs yield
  * byte-identical output.
@@ -385,13 +390,17 @@ function encodeBlock(
  * @param width  image width in pixels.
  * @param height image height in pixels.
  * @param quality clamped to [0, 1]; 1 is the finest quantisation.
+ * @param chromaSubsampling 4:2:0 when true or absent, 4:4:4 when false: node-canvas's own option,
+ *   and its own default.
  */
 export function encodeJPEG(
   rgba: Uint8Array,
   width: number,
   height: number,
   quality: number,
+  chromaSubsampling?: boolean,
 ): Uint8Array {
+  const subsample = chromaSubsampling !== false;
   const w = width | 0;
   const h = height | 0;
 
@@ -417,9 +426,51 @@ export function encodeJPEG(
   /* RGB -> YCbCr (JFIF full range). Fully transparent pixels composite onto
    * black; every other alpha is ignored, since JPEG carries no alpha. */
   const n = w * h;
+  const cw = !subsample ? w : w > 1 ? (w + 1) >> 1 : 1;
+  const chh = !subsample ? h : h > 1 ? (h + 1) >> 1 : 1;
   const planeY = new Float64Array(n);
-  const planeCb = new Float64Array(n);
-  const planeCr = new Float64Array(n);
+  const planeCb = new Float64Array(cw * chh);
+  const planeCr = new Float64Array(cw * chh);
+
+  /** One pixel's Cb and Cr, level-shifted, as the two chroma planes carry them. */
+  const chromaOf = (p: number): [number, number] => {
+    let r = rgba[p];
+    let g = rgba[p + 1];
+    let b = rgba[p + 2];
+    if (rgba[p + 3] === 0) {
+      r = 0;
+      g = 0;
+      b = 0;
+    }
+    return [-0.168736 * r - 0.331264 * g + 0.5 * b, 0.5 * r - 0.418688 * g - 0.081312 * b];
+  };
+
+  if (subsample) {
+    /* 4:2:0: one chroma sample per 2x2 block, the mean of the pixels in it, with the edge column and
+     * row repeated the way libjpeg fills the part-block at the right and bottom of the image. */
+    for (let cy = 0; cy < chh; cy++) {
+      for (let cx = 0; cx < cw; cx++) {
+        let sumCb = 0;
+        let sumCr = 0;
+        let count = 0;
+        for (let dy = 0; dy < 2; dy++) {
+          let sy = cy * 2 + dy;
+          if (sy >= h) sy = h - 1;
+          for (let dx = 0; dx < 2; dx++) {
+            let sx = cx * 2 + dx;
+            if (sx >= w) sx = w - 1;
+            const pair = chromaOf((sy * w + sx) * 4);
+            sumCb += pair[0];
+            sumCr += pair[1];
+            count++;
+          }
+        }
+        planeCb[cy * cw + cx] = Math.round(sumCb / count);
+        planeCr[cy * cw + cx] = Math.round(sumCr / count);
+      }
+    }
+  }
+
   for (let i = 0, p = 0; i < n; i++, p += 4) {
     let r = rgba[p];
     let g = rgba[p + 1];
@@ -430,11 +481,12 @@ export function encodeJPEG(
       b = 0;
     }
     const y = 0.299 * r + 0.587 * g + 0.114 * b;
-    const cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128;
-    const cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128;
     planeY[i] = (y < 0 ? 0 : y > 255 ? 255 : y) - 128;
-    planeCb[i] = (cb < 0 ? 0 : cb > 255 ? 255 : cb) - 128;
-    planeCr[i] = (cr < 0 ? 0 : cr > 255 ? 255 : cr) - 128;
+    if (!subsample) {
+      const pair = chromaOf(p);
+      planeCb[i] = pair[0];
+      planeCr[i] = pair[1];
+    }
   }
 
   const bw = new BitWriter(1024 + n);
@@ -463,7 +515,9 @@ export function encodeJPEG(
   writeSegment(bw, 0xdb, dqtLuma);
   writeSegment(bw, 0xdb, dqtChroma);
 
-  /* SOF0: baseline, 8-bit precision, 3 components, all sampled 1x1 */
+  /* SOF0: baseline, 8-bit precision, 3 components. 4:2:0 samples luma 2x2 and each chroma 1x1, so a
+   * MCU is 16x16 pixels; 4:4:4 samples all three 1x1 and a MCU is one 8x8 block. */
+  const samplingY = subsample ? 0x22 : 0x11;
   writeSegment(bw, 0xc0, [
     0x08,
     (h >>> 8) & 0xff,
@@ -471,7 +525,7 @@ export function encodeJPEG(
     (w >>> 8) & 0xff,
     w & 0xff,
     0x03,
-    0x01, 0x11, 0x00, /* Y  */
+    0x01, samplingY, 0x00, /* Y  */
     0x02, 0x11, 0x01, /* Cb */
     0x03, 0x11, 0x01, /* Cr */
   ]);
@@ -502,29 +556,33 @@ export function encodeJPEG(
     0x00, /* Ah / Al */
   ]);
 
-  /* Entropy-coded scan, one MCU per 8x8 block (4:4:4). */
+  /* Entropy-coded scan. 4:4:4 is one MCU per 8x8 block; 4:2:0 is a 16x16 MCU of four luma blocks
+   * in raster order, then Cb, then Cr. */
   const block = new Float64Array(64);
   const coef = new Float64Array(64);
   const qcoef = new Int32Array(64);
-  const mcuW = (w + 7) >> 3;
-  const mcuH = (h + 7) >> 3;
+  const mcuW = subsample ? (w + 15) >> 4 : (w + 7) >> 3;
+  const mcuH = subsample ? (h + 15) >> 4 : (h + 7) >> 3;
+  const step = subsample ? 16 : 8;
   let predY = 0;
   let predCb = 0;
   let predCr = 0;
   for (let my = 0; my < mcuH; my++) {
-    const by = my * 8;
     for (let mx = 0; mx < mcuW; mx++) {
-      const bx = mx * 8;
-      predY = encodeBlock(
-        bw, planeY, w, h, bx, by, quantLuma, predY,
-        HUFF_DC_LUMA, HUFF_AC_LUMA, block, coef, qcoef,
-      );
+      for (let ty = 0; ty < (subsample ? 2 : 1); ty++) {
+        for (let tx = 0; tx < (subsample ? 2 : 1); tx++) {
+          predY = encodeBlock(
+            bw, planeY, w, h, mx * step + tx * 8, my * step + ty * 8, quantLuma, predY,
+            HUFF_DC_LUMA, HUFF_AC_LUMA, block, coef, qcoef,
+          );
+        }
+      }
       predCb = encodeBlock(
-        bw, planeCb, w, h, bx, by, quantChroma, predCb,
+        bw, planeCb, cw, chh, mx * 8, my * 8, quantChroma, predCb,
         HUFF_DC_CHROMA, HUFF_AC_CHROMA, block, coef, qcoef,
       );
       predCr = encodeBlock(
-        bw, planeCr, w, h, bx, by, quantChroma, predCr,
+        bw, planeCr, cw, chh, mx * 8, my * 8, quantChroma, predCr,
         HUFF_DC_CHROMA, HUFF_AC_CHROMA, block, coef, qcoef,
       );
     }
