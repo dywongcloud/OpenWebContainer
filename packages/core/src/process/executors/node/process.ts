@@ -2630,9 +2630,30 @@ export class NodeProcess extends Process {
         if (rejection instanceof Promise) {
             return rejection.then((text) => {
                 if (text !== '') throw new GuestFailure(text);
+                this.throwUnreadInterruption();
             });
         }
         if (rejection !== '') throw new GuestFailure(rejection);
+        this.throwUnreadInterruption();
+    }
+
+    /**
+     * Ends the run when the runaway guard stopped this guest and nothing has reported it.
+     *
+     * A loop inside an `async` function is stopped like any other -- the interrupt handler does not
+     * care what it interrupts -- but what it leaves behind is the rejection of that function's own
+     * promise, and a promise the engine builds is one the rejection tracker never sees: the drain
+     * finds no uncaught exception and no unhandled rejection to report, and a program cut short
+     * after three seconds of spinning ends as the clean success it never was, with nothing on
+     * stderr and a status of 0. The bound that stopped it is this container's own, so it is ended
+     * the way a stopped loop anywhere else in the guest is ended: the same `vm` timeout error, and
+     * the status of a run that failed. An interruption anything has already accounted for -- the
+     * stack the guest's own formatter made, a rejection nothing handled -- is not here to read.
+     */
+    private throwUnreadInterruption(): void {
+        if (takeVmInterruption(this.capabilityContext) !== 'budget') return;
+        armVmBudget(this.capabilityContext, 0);
+        throw new GuestFailure(interruptedMessage(this.guestBudgetMs, ''));
     }
 
     /** What `drainTicks` answered: a string is the uncaught exception the guest's own formatter made. */
