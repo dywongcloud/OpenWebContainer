@@ -926,15 +926,18 @@ export class Shell implements IShell {
                            follows the link, and not the way `lstat` names the link itself. The
                            link is resolved through the table `ln` wrote, the one `chmod` and `ls`
                            already read, because this file system's own stat of a link is the link. */
-                        const operand = this.statPathSafe(resolvedThrough(this.moduleFs, path));
+                        const reached = resolvedThrough(this.moduleFs, path);
+                        const operand = this.statPathSafe(reached);
                         if (operand?.type === 'dir') {
                             errors += `cat: ${name}: Is a directory\n`;
                             continue;
                         }
                         /* A link whose target nothing holds is a name nothing holds: `ln -s nope l;
                            cat l` is `cat: l: No such file or directory` and 1 on a host, where the
-                           read of the link gave the empty string and left 0. */
-                        if (operand === undefined) {
+                           read of the link gave the empty string and left 0. Only the link itself
+                           is answered here: a name written *through* one -- `cat l/a` -- is still
+                           resolved by the read that opens it. */
+                        if (operand === undefined && reached !== path) {
                             errors += `cat: ${name}: No such file or directory\n`;
                             continue;
                         }
