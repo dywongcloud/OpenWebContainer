@@ -100,12 +100,9 @@ function cpEncode(value) {
     return { $t: 'S', v: members };
   }
   if (ArrayBuffer.isView(value)) {
-    var isBuffer = Buffer.isBuffer(value);
-    return {
-      $t: 'B',
-      c: isBuffer ? 'Buffer' : 'Uint8Array',
-      v: Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64')
-    };
+    /* Only the bytes cross: a structured clone of a Buffer is a Uint8Array, so the class the
+       view had where it was posted is not part of the clone and is not recorded. */
+    return { $t: 'B', v: Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64') };
   }
   if (value instanceof ArrayBuffer) return { $t: 'AB', v: Buffer.from(value).toString('base64') };
   if (Array.isArray(value)) {
@@ -145,8 +142,11 @@ function cpDecode(value) {
           return cpDecode(item);
         }));
       case 'B': {
+        /* A structured clone of a Buffer is a Uint8Array: host Node 24.15 answers
+           Buffer.isBuffer(m) false and m.constructor.name 'Uint8Array' for
+           parentPort.postMessage(Buffer.from('worker-buf')), so the class the value had
+           where it was posted is not part of the clone. */
         var raw = Buffer.from(value.v, 'base64');
-        if (value.c === 'Buffer') return raw;
         var bytes = new Uint8Array(raw.length);
         bytes.set(raw);
         return bytes;
