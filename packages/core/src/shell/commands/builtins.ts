@@ -21,7 +21,7 @@
 
 import type { ShellCommand, CommandContext, CommandResult } from './types';
 import { atPath, inputText } from './types';
-import { setCreationMode } from './fileutils';
+import { resolvedThrough, setCreationMode } from './fileutils';
 
 /* ================================================================== *
  * 0. Shapes
@@ -38,6 +38,12 @@ export interface ShellFs {
     deleteFile(path: string, recursive?: boolean): void;
     deleteDirectory(path: string): void;
     resolvePath(path: string, basePath?: string): string;
+    /**
+     * What a read of `path` would reach, where this file system can say: a link to a directory is
+     * the directory to a read of it, where `isDirectory` names the link. Optional because a host
+     * that keeps no stat of its own never had one to hand over.
+     */
+    statPath?(path: string): { type: string } | undefined;
 }
 
 /** What `runScript` calls for a command it does not implement: the host's own dispatch. */
@@ -325,6 +331,13 @@ export interface ShellState {
      * is `f` once, as it is on a host.
      */
     inputOffset?: { pos: number };
+    /**
+     * Whether the standard input the next command reads was opened on a directory. A host's open of
+     * one succeeds -- it is the read that fails, inside the utility, with `cat: stdin: Is a
+     * directory` -- so the shell cannot refuse it at the redirection; it leaves what it opened for
+     * the command that reads it to name.
+     */
+    inputIsDirectory?: boolean;
     /** Set by `exec`: the command that "replaced" the shell, for the host to report. */
     execTarget: string[] | null;
     /** Non-zero while evaluating a condition, a negated command or a `&&`/`||` operand. */
@@ -1328,7 +1341,10 @@ function arithDiagnostic(state: ShellState, expression: string, error: ArithErro
     const text = expression.replace(/^[ \t\n]+/, '');
     const at = label === undefined ? '' : `${label}: `;
     const token = error.token === undefined || error.token === '' ? '' : ` (error token is "${error.token}")`;
-    return `${state.shellName}: ${at}${text}: ${error.message}${token}`;
+    /* No line on the line a `sh -c` string opens on, `line N` behind it: `((1+))` is
+       `sh: ((: 1+: syntax error: operand expected (error token is "+")` and the same expression on
+       the second line of one is `sh: line 1: ((: 1+: ...`. */
+    return `${plainPrefix(state)}${at}${text}: ${error.message}${token}`;
 }
 
 /* ================================================================== *
@@ -2106,7 +2122,9 @@ class Parser {
             body += ch;
             this.pos++;
         }
-        throw new ShellSyntaxError('unexpected EOF while looking for matching `\'');
+        /* Two back-quotes, not one: a host's message is `matching ` followed by the character it was
+           looking for and then a closing `'`, which for a back-quote is ``matching ``'``. */
+        throw new ShellSyntaxError('unexpected EOF while looking for matching ``\'');
     }
 
     /**
@@ -4448,7 +4466,7 @@ function runParsed(state: ShellState, script: string): number {
         if (error instanceof BadSubstitutionError) {
             /* `${v^^}` is the text a host names and not a variable's: `$0: ${v^^}: bad substitution`,
                with the status 1 a line that will not expand leaves, and nothing behind it runs. */
-            writeErr(state, `${state.shellName}: ${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
+            writeErr(state, `${plainPrefix(state)}${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
             return 1;
         }
         /* An arithmetic error already written the way a host writes it, carrying the status a host
@@ -4679,7 +4697,7 @@ function runNode(state: ShellState, node: Node, input: string | null): number {
                    letting the error out of the pipeline ran nothing behind it. Where none does --
                    a plain `echo ${v^^}` -- the error still ends the script, as on a host. */
                 if (!(error instanceof BadSubstitutionError) || node.commands.length < 2) throw error;
-                writeErr(state, `${state.shellName}: ${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
+                writeErr(state, `${plainPrefix(state)}${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
                 status = 1;
             } finally {
                 const captured = state.io;
@@ -4754,6 +4772,7 @@ function runCompoundRedirected(state: ShellState, command: Command, input: strin
     const savedCursor = state.inputCursor;
     const given = plan.inputFd !== undefined ? readFdAt(state, plan.inputFd) : '';
     if (needsInput) {
+        if (!fromFile && (input !== null || state.openFds?.get(0)?.kind !== 'input')) state.inputIsDirectory = false;
         state.inputBuffer = fromFile
             ? (plan.inputFd !== undefined ? given : readInputFile(state, plan.inputFile as string))
             : plan.inputText ?? (input as string);
@@ -5759,11 +5778,29 @@ function planRedirects(state: ShellState, redirects: Redirect[]): RedirectPlan {
  */
 const NULL_DEVICE = '/dev/null';
 
+function opensDirectory(fs: ShellFs, path: string): boolean {
+    try {
+        /* The link is resolved through the table `ln` wrote, the one `chmod` and `ls` read: this
+           file system's own stat of a link is the link, so `cat < l` for an `l -> d` would not
+           otherwise be the directory a read of it reaches. */
+        const reached = resolvedThrough(fs as CommandContext['fs'], path);
+        const kind = fs.statPath?.(reached)?.type;
+        return kind !== undefined ? kind === 'dir' : fs.isDirectory(reached);
+    } catch {
+        return false;
+    }
+}
+
 function readInputFile(state: ShellState, file: string): string {
     const fs = state.fs;
     if (!fs) return '';
     const path = resolvePath(state, file);
     if (path === NULL_DEVICE) return '';
+    /* A directory opened for reading is one a host's open accepts and its read refuses, so it is
+       left for the command to name -- `cat < d` is `cat: stdin: Is a directory`, which is the
+       utility's own complaint and not the shell's. A link to one is the directory to a read of it,
+       so the name is asked about the way the read would reach it. */
+    state.inputIsDirectory = opensDirectory(fs, path);
     try {
         return fs.readFile(path) ?? '';
     } catch (error) {
@@ -6204,6 +6241,14 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
        it takes is taken from the shell too, which is why `read a <&3; read b <&3` is the first line
        and then the second on a host and not the first one twice. */
     const ownStdin = plan.inputFd !== undefined && plan.inputFd.file === undefined;
+    /* A command whose input is a pipe, a here-string or the shell's own is not one a `<` of its own
+       put on a file, so what an earlier command's redirection opened does not describe it. The
+       shell's own standard input is the exception: `exec 0<d` left it open on the directory, and
+       every command behind it reads that open. */
+    if (plan.inputFile === undefined && plan.inputFd === undefined
+        && (input !== null || state.openFds?.get(0)?.kind !== 'input')) {
+        state.inputIsDirectory = false;
+    }
     const commandInput = ownStdin
         ? input
         : plan.inputText !== undefined
@@ -6469,8 +6514,10 @@ function declarePrint(state: ShellState, name: string, variable: ShellVar): stri
     /* An array is printed as the one line a host prints it on -- the elements behind an `-a`,
        quoted each on its own -- and not as the variables this shell keeps them in: `declare -p`
        is a host's `declare -a v='([0]="1" [1]="2")'` and one line, where listing every element
-       as a variable of its own was two. */
-    if (isArray(state, name)) return `declare -${flags}a ${name}='${arrayLiteral(state, name)}'`;
+       as a variable of its own was two. The `a` stands in front of the other attributes a host
+       spells after it: `declare -r a=(1 2); declare -p a` is `declare -ar a=...` and not the
+       `-ra` this shell answered. */
+    if (isArray(state, name)) return `declare -a${flags} ${name}='${arrayLiteral(state, name)}'`;
     if (flags !== '') return `declare -${flags} ${name}=${quoteDouble(variable.value)}`;
     return `declare -- ${name}=${quoteDouble(variable.value)}`;
 }
@@ -7868,18 +7915,23 @@ function execBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
     if (ctx.args.length === 0) return ok();
     state.execTarget = ctx.args.slice();
-    const name = ctx.args[0];
+    /* `exec -a NAME COMMAND` names the command two words in: `-a` is an option of exec's own and not
+       the command, so `exec -a foo nosuch` is a host's `sh: line 0: exec: nosuch: not found`. */
+    const skip = ctx.args[0] === '-a' && ctx.args.length > 2 ? 2 : 0;
+    const name = ctx.args[skip];
+    if (name === undefined) return ok();
+    const args = ctx.args.slice(skip + 1);
     const entry = COMMANDS[name];
     let status: number;
     if (entry !== undefined) {
-        const inner: CommandContext = { args: ctx.args.slice(1), cwd: state.cwd, env: state.env, input: ctx.input, fs: ctx.fs };
+        const inner: CommandContext = { args, cwd: state.cwd, env: state.env, input: ctx.input, fs: ctx.fs };
         bindState(inner, state);
         const result = entry(inner);
         writeOut(state, result.stdout);
         writeErr(state, result.stderr);
         status = result.exitCode;
     } else {
-        const step = RUNNER(state, ctx.args, ctx.input);
+        const step = RUNNER(state, [name, ...args], ctx.input);
         writeOut(state, step.stdout);
         /* `exec nosuchcmd` is a host's `sh: line 0: exec: nosuchcmd: not found`: the builtin that
            failed is named, with the line a jobspec diagnostic carries, where the same name on a
@@ -7887,10 +7939,25 @@ function execBuiltin(ctx: CommandContext): CommandResult {
            bare command rather than as the `exec` that went looking for it. */
         if (step.exitCode === 127 && /: command not found\n$/.test(step.stderr)) {
             writeErr(state, `${diagnosticPrefix(state)}exec: ${name}: not found\n`);
+            status = step.exitCode;
         } else {
             writeErr(state, step.stderr);
+            /* A path exec could not run gets a second line of its own on a host, naming the builtin
+               and the reason the exec failed, and the shell ends on 126 -- the status of a file it
+               found but could not execute, where the lookup's own answer was 127 for a file that is
+               not there at all. `exec /nosuch/path` is `cannot execute: No such file or directory`;
+               a directory and a file with no execute bit are both `Undefined error: 0`. */
+            if (name.includes('/') && step.exitCode !== 0
+                && /: (No such file or directory|is a directory|Permission denied)\n$/.test(step.stderr)) {
+                const reason = /No such file or directory\n$/.test(step.stderr)
+                    ? 'No such file or directory'
+                    : 'Undefined error: 0';
+                writeErr(state, `${diagnosticPrefix(state)}exec: ${name}: cannot execute: ${reason}\n`);
+                status = 126;
+            } else {
+                status = step.exitCode;
+            }
         }
-        status = step.exitCode;
     }
     throw new ExitSignal(status);
 }
@@ -7951,7 +8018,9 @@ function readBuiltin(ctx: CommandContext): CommandResult {
         if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?$/.test(name)) continue;
         return failDiag(state, `read: \`${name}': not a valid identifier`, 1);
     }
-    if (prompt !== undefined) writeOut(state, prompt);
+    /* The prompt is shown only where the input is coming from a terminal, as a host shows it: `read
+       -p 'p:' v < /dev/null` writes nothing at all, and the same `read` at a prompt writes `p:`. */
+    if (prompt !== undefined && state.options.interactive) writeOut(state, prompt);
     let line = '';
     let hit = false;
     if (count >= 0) {
@@ -8191,6 +8260,20 @@ export function diagnosticPrefix(state: ShellState): string {
     const name = state.shellName === '' ? 'sh' : state.shellName;
     if (state.options.interactive) return `${name}: `;
     return `${name}: line ${state.line > 1 ? state.line - 1 : 0}: `;
+}
+
+/**
+ * The front of the diagnostics a host writes with no line at all on the line the string `sh -c` was
+ * given opens on and with `line N` on every later one: `command not found`, an arithmetic error and
+ * `bad substitution` are all `sh: nosuchcmd: command not found` on that first line and
+ * `sh: line 2: nosuchcmd: command not found` two lines down, where a builtin's own complaint names
+ * `line 0` even there. Measured against this machine's /bin/sh (bash 3.2.57).
+ */
+export function plainPrefix(state: ShellState): string {
+    const name = state.shellName === '' ? 'sh' : state.shellName;
+    if (state.options.interactive) return `${name}: `;
+    const line = state.line > 1 ? state.line - 1 : 0;
+    return line === 0 ? `${name}: ` : `${name}: line ${line}: `;
 }
 
 /** Drops the jobs that have run out of the table: a shell lists a job only while it has one to run. */

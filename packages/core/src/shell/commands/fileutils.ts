@@ -286,6 +286,35 @@ export function readable(fs: CommandContext['fs'], path: string): boolean {
     return (modeOf(fs, target, isDir(fs, target)) & 0o400) !== 0;
 }
 
+/**
+ * Whether the mode recorded for a path lets its owner execute it, and `undefined` where no mode
+ * was ever recorded for it.
+ *
+ * A file copied into the container is its bytes and no more -- the bits a host had on it do not
+ * come with it -- so a name nobody set a mode on here is not one this file system can refuse to
+ * run, and the answer is `undefined` rather than a `false` that would make every copied script
+ * unexecutable. Where a mode *was* recorded, by `chmod` or by the shell that made the name, it is
+ * the one `ls -l` prints, and a script it leaves without an execute bit is one a host refuses with
+ * 126 and `Permission denied` instead of running.
+ */
+export function recordedExecutable(fs: CommandContext['fs'], path: string): boolean | undefined {
+    const target = linkDestination(fs, path) ?? path;
+    const stored = metaOf(fs as Fs).modes.get(clean(target));
+    if (stored === undefined) return undefined;
+    return (stored & 0o111) !== 0;
+}
+
+/**
+ * The path a name reaches: the directory or file a link names, where the name is a link.
+ *
+ * A read of a link is a read of what it names, and the file system this container keeps does not
+ * always say so itself -- its `stat` of a link is the link. The table `ln` wrote is what `chmod`
+ * and `ls` already resolve through, so a command that asks what an operand is asks through it too.
+ */
+export function resolvedThrough(fs: CommandContext['fs'], path: string): string {
+    return linkDestination(fs, path) ?? path;
+}
+
 function inodeOf(fs: Fs, path: string): number {
     const meta = metaOf(fs);
     const key = clean(path);

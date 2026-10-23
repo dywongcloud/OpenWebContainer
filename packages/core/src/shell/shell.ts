@@ -9,7 +9,7 @@ import { WgetCommand } from './commands/wget';
 import { Process } from '../process';
 import { CONTAINER_WORKDIR } from '../process/executors/default-env';
 import { COMMANDS as TEXT_UTILS } from './commands/textutils';
-import { COMMANDS as FILE_UTILS, readable, setCreationMode, setMode, setUmask } from './commands/fileutils';
+import { COMMANDS as FILE_UTILS, readable, recordedExecutable, resolvedThrough, setCreationMode, setMode, setUmask } from './commands/fileutils';
 import { COMMANDS as ARCHIVES } from './commands/archives';
 import { COMMANDS as PROC_INFO } from './commands/procinfo';
 import {
@@ -25,6 +25,7 @@ import {
     echoWords,
     formatJobText,
     getRunner,
+    plainPrefix,
     runPendingJobs,
     runScript,
     setRunner
@@ -99,6 +100,19 @@ function isCompoundLine(line: string): boolean {
         if (ch === '$' && line[i + 1] === '(') return true;
     }
     return false;
+}
+
+/**
+ * True when a file's text is a script the shell can read it as: a program's own bytes are not one,
+ * and a host's exec of them would have succeeded where reading them as a script cannot.
+ */
+function isScriptText(text: string): boolean {
+    for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        if (code === 9 || code === 10 || code === 13) continue;
+        if (code < 32 || code === 0xfffd) return false;
+    }
+    return true;
 }
 
 export class Shell implements IShell {
@@ -696,15 +710,31 @@ export class Shell implements IShell {
                 if (named.type === 'dir') {
                     return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: is a directory\n`, exitCode: 126 };
                 }
-                if (named.mode !== undefined && (named.mode & 0o111) === 0) {
+                /* The bit that makes a file runnable is the one `chmod` recorded, where it recorded
+                   one; a file copied in carries no mode with it, so the mode the file system itself
+                   reports is the only one there is to go on, and it is read the same way. */
+                const executable = recordedExecutable(this.moduleFs, this.at(command));
+                const denied = executable === false
+                    || (executable === undefined && named.mode !== undefined && (named.mode & 0o111) === 0);
+                if (denied) {
                     return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: Permission denied\n`, exitCode: 126 };
+                }
+                /* A file with the execute bit and no shebang is one a host still runs: its exec is
+                   answered ENOEXEC and the shell reads the file as a script of its own, so `echo hi`
+                   in a 755 file prints `hi` there. The bytes of a program are no script, so only a
+                   file of text is read that way. A copied file carries no mode with it, so nothing
+                   is run on that say-so either -- `false` here is not `undefined`. */
+                if (executable === true && named.type === 'file') {
+                    let text: string | undefined;
+                    try { text = this.fileSystem.readFile(this.at(command)); } catch { text = undefined; }
+                    if (text !== undefined && isScriptText(text)) return this.runScriptText(command, args, text);
                 }
             }
             /* A path no file answers to is not a name nothing answers to, and a host does not say
                `command not found` for it: `/nosuch/dir/cmd` and `./nope` are both `No such file or
                directory` with 127, the status of a command the shell could not run. */
             if (named === undefined) {
-                return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: No such file or directory\n`, exitCode: 127 };
+                return { stdout: '', stderr: `${plainPrefix(this.shellState)}${command}: No such file or directory\n`, exitCode: 127 };
             }
         }
 
@@ -714,7 +744,10 @@ export class Shell implements IShell {
            belongs in the middle of. It ends in the newline every diagnostic of a host's ends in,
            which is what the one the script engine fell back on was missing, so the text a line
            wrote after it ran on into it. */
-        return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: command not found\n`, exitCode: 127 };
+        /* No line on the line a `sh -c` string opens on, `line N` behind it: `nosuchcmd` is
+           `sh: nosuchcmd: command not found` there and `sh: line 2: nosuchcmd: command not found`
+           on the third line of one. */
+        return { stdout: '', stderr: `${plainPrefix(this.shellState)}${command}: command not found\n`, exitCode: 127 };
     };
 
     /** The status and message of a command this shell cannot run inside the script engine. */
@@ -758,6 +791,13 @@ export class Shell implements IShell {
         let stat: PathStat | undefined;
         try { stat = this.fileSystem.statPath(path); } catch { stat = undefined; }
         if (stat === undefined || stat.type === 'dir') return undefined;
+        /* The mode `chmod` left on the file is what makes it one a host runs: a script without an
+           execute bit is `sh: ./s: Permission denied` and 126 there, however well-formed its
+           shebang is. A file copied in carries no mode of its own, so nothing is refused on the
+           say-so of a mode this file system never held. */
+        if (recordedExecutable(this.moduleFs, path) === false) {
+            return { stdout: '', stderr: `${this.shellState.shellName}: ${command}: Permission denied\n`, exitCode: 126 };
+        }
         let content: string | undefined;
         try { content = this.fileSystem.readFile(path); } catch { content = undefined; }
         if (content === undefined) return undefined;
@@ -770,6 +810,15 @@ export class Shell implements IShell {
         /* The shebang's own line is no part of the script: no shell runs it. */
         const end = content.indexOf('\n');
         const body = end === -1 ? '' : content.slice(end + 1);
+        return this.runScriptText(command, args, body);
+    }
+
+    /**
+     * The lines of `body` run as a script of its own: a fresh child state over this shell's
+     * directory and exported variables, `$0` the path it was named by and `$1` on the words behind
+     * it, and its stdout, stderr and status as the command's.
+     */
+    private runScriptText(command: string, args: string[], body: string): CommandResult {
         const child = createShellState(Object.fromEntries(this.env), this.shellState.cwd, this.moduleFs, this.process.pid);
         child.shellName = command;
         child.positional = args;
@@ -836,7 +885,16 @@ export class Shell implements IShell {
                         return lines.map((line, index) => `${String(index + 1).padStart(6, ' ')}\t${line}\n`).join('');
                     };
                     // no argument reads the standard input, as it does in a shell
-                    if (operands.length === 0) return ok(numbered(input ?? ''));
+                    if (operands.length === 0) {
+                        /* A directory put on the standard input is the directory to a read of it,
+                           and a host's `cat` names it `stdin`: `mkdir d; cat < d` is `cat: stdin:
+                           Is a directory` and 1, where the shell had already read the directory
+                           into the input and this printed the `{}` that read leaves, with 0. */
+                        if (this.shellState.inputIsDirectory === true) {
+                            return { stdout: '', stderr: 'cat: stdin: Is a directory\n', exitCode: 1 };
+                        }
+                        return ok(numbered(input ?? ''));
+                    }
                     let joined = '';
                     let errors = '';
                     for (const name of operands) {
@@ -862,9 +920,22 @@ export class Shell implements IShell {
                         const path = at(name);
                         /* A directory is named and passed over, not read as if it were a file:
                            `mkdir sd; cat sd` is `cat: sd: Is a directory` on a host, with the
-                           status 1, where reading it wrote `{}` and left 0. */
-                        if (this.isDirectorySafe(path)) {
+                           status 1, where reading it wrote `{}` and left 0. A link to one is that
+                           same directory -- `ln -s d l; cat l` says `Is a directory` as `cat d`
+                           does -- so the name is asked about the way a read of it would go, which
+                           follows the link, and not the way `lstat` names the link itself. The
+                           link is resolved through the table `ln` wrote, the one `chmod` and `ls`
+                           already read, because this file system's own stat of a link is the link. */
+                        const operand = this.statPathSafe(resolvedThrough(this.moduleFs, path));
+                        if (operand?.type === 'dir') {
                             errors += `cat: ${name}: Is a directory\n`;
+                            continue;
+                        }
+                        /* A link whose target nothing holds is a name nothing holds: `ln -s nope l;
+                           cat l` is `cat: l: No such file or directory` and 1 on a host, where the
+                           read of the link gave the empty string and left 0. */
+                        if (operand === undefined) {
+                            errors += `cat: ${name}: No such file or directory\n`;
                             continue;
                         }
                         /* The mode `chmod` set is honoured here: a file whose owner cannot read it
@@ -1058,6 +1129,15 @@ export class Shell implements IShell {
             return this.fileSystem.isDirectory(path);
         } catch {
             return false;
+        }
+    }
+
+    /** `statPath` as a question: what a read of `path` would reach, so a link is what it names. */
+    private statPathSafe(path: string): PathStat | undefined {
+        try {
+            return this.fileSystem.statPath(path);
+        } catch {
+            return undefined;
         }
     }
 
