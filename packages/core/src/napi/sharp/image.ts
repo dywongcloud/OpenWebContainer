@@ -115,6 +115,16 @@ export function kernelNames(): string[] {
 const RESIZE_GAP = 2;
 
 /**
+ * How many output rows a vips_reducev strip holds. libvips generates a reduced image in strips,
+ * and vips_reducev_gen restarts its running sum at the top of each one, so the vertical position
+ * is not one sum over the whole height the way the horizontal one is. Measured against sharp
+ * 0.33.5 on a 64x64 -> 60x60 nearest reduction: strip heights of 4, 8 and 16 all reproduce the
+ * source row every output row takes, and 1, 2, 32 and 64 do not; 16 is the one that leaves the
+ * fewest differing images over a 3658-case sweep of sizes, fits and kernels.
+ */
+const REDUCEV_STRIP = 16;
+
+/**
  * libvips' vips_shrinkh / vips_shrinkv: blocks of `n` pixels averaged into one. The output is sized
  * with ceil, the edge pixel is copied in so the last block is a full one, and the average is the
  * integer one C computes: (sum + n / 2) / n, truncated.
@@ -242,13 +252,26 @@ function reduceAxis(image: Image, dstSize: number, shrink: number, extra: number
     const offset = (1 + extra) / 2 - 1;
     /* Where vips_embed puts the source inside the padded image it interpolates from. */
     const pad = Math.ceil(n / 2) - 1;
-    /* libvips walks the output with `X += hshrink` from this start rather than multiplying, and the
-       last bit of that sum is which pixel a window lands on: at 16 -> 6 nearest the fourth output
-       falls on 11.999999999999998 and so on pixel 11, where (d + 0.5) * shrink says 12. Every
-       output row starts again from the same place. */
+    /*
+     * vips_reduceh walks the output with `X += hshrink` rather than multiplying, and the last bit
+     * of that sum is which pixel a window lands on: at 16 -> 6 nearest the fourth output falls on
+     * 11.999999999999998 and so on pixel 11, where (d + 0.5) * shrink says 12. Every output row
+     * starts again from the same place.
+     *
+     * vips_reducev says the same, but its output is generated in strips, so the sum restarts at
+     * `(top + 0.5) * shrink - 0.5 - offset` at the top of each strip instead of running the whole
+     * height: a 64 -> 60 nearest reduction takes source row 24 for output row 22 -- 22.5 * 64/60
+     * is 24 -- while a sum that runs from the top of the image reaches 23.999999999999996 and
+     * takes 23, which is what its columns do.
+     */
+    const atOf = (d: number): number =>
+        horizontal ? 0 : (Math.floor(d / REDUCEV_STRIP) * REDUCEV_STRIP + 0.5) * shrink - 0.5 - offset;
     for (let o = 0; o < other; o++) {
         let at = 0.5 * shrink - 0.5 - offset;
         for (let d = 0; d < dstSize; d++) {
+            if (!horizontal) {
+                at = d % REDUCEV_STRIP === 0 ? atOf(d) : at + shrink;
+            }
             const start = Math.trunc(at);
             const phase = Math.trunc(at * TRANSFORM_SCALE * 2) & (TRANSFORM_SCALE * 2 - 1);
             const coef = table[(phase + 1) >> 1];
@@ -264,56 +287,7 @@ function reduceAxis(image: Image, dstSize: number, shrink: number, extra: number
                 const j = horizontal ? (o * dstSize + d) * ch + c : (d * other + o) * ch + c;
                 out.data[j] = v < 0 ? 0 : v > 255 ? 255 : v;
             }
-            at += shrink;
-        }
-    }
-    return out;
-}
-
-function kernelPass(image: Image, dstSize: number, horizontal: boolean, kernel: Kernel, scale: number): Image {
-    const srcSize = horizontal ? image.width : image.height;
-    const other = horizontal ? image.height : image.width;
-    const ch = image.channels;
-    const out = createImage(horizontal ? dstSize : other, horizontal ? other : dstSize, ch);
-    /**
-     * Where output pixel `d` samples the source, in source pixels.
-     *
-     * A reduction and an enlargement are not the same mapping, and mixing them up shifts every
-     * upscaled image by half a source pixel. Measured against sharp 0.33.5 on a 64x64 ramp whose red
-     * channel is 4*x (lanczos3 reproduces a ramp exactly, so out/4 reads the sampled position back):
-     * shrinking 64->32/48/24 lands on (d + 0.5) * scale - 0.5, while enlarging 64->128/256 lands on
-     * d * scale - 0.5 and 64->96/192/80/100 within one byte of it.
-     */
-    const centreOf = (d: number): number => (d + (scale >= 1 ? 0.5 : 0)) * scale - 0.5;
-    const support = kernel.support * Math.max(1, scale);
-    for (let o = 0; o < other; o++) {
-        for (let d = 0; d < dstSize; d++) {
-            const center = centreOf(d);
-            const lo = Math.ceil(center - support);
-            const hi = Math.floor(center + support);
-            let wsum = 0;
-            const weights: number[] = [];
-            for (let s = lo; s <= hi; s++) {
-                const w = kernel.weight((s - center) / Math.max(1, scale));
-                if (w === 0) continue;
-                weights.push(w);
-                wsum += w;
-            }
-            if (wsum === 0) wsum = 1;
-            for (let c = 0; c < ch; c++) {
-                let acc = 0;
-                let k = 0;
-                for (let s = lo; s <= hi; s++) {
-                    const w = kernel.weight((s - center) / Math.max(1, scale));
-                    if (w === 0) continue;
-                    const si = s < 0 ? 0 : s >= srcSize ? srcSize - 1 : s;
-                    const i = horizontal ? (o * srcSize + si) * ch + c : (si * other + o) * ch + c;
-                    acc += image.data[i] * w;
-                    k++;
-                }
-                const j = horizontal ? (o * dstSize + d) * ch + c : (d * other + o) * ch + c;
-                out.data[j] = Math.max(0, Math.min(255, Math.round(acc / wsum)));
-            }
+            if (horizontal) at += shrink;
         }
     }
     return out;
@@ -324,15 +298,163 @@ function roundU(x: number): number {
     return x > 0 ? Math.floor(x + 0.5) : -Math.floor(-x + 0.5);
 }
 
+/**
+ * libvips' vips_zoom: every pixel becomes an `hn` x `vn` block of itself. vips_resize takes this
+ * path for a NEAREST enlargement by a whole number on both axes, which is why a 2x nearest
+ * upsize is exact pixel doubling and not a resample at all.
+ */
+function zoomImage(image: Image, hn: number, vn: number): Image {
+    const ch = image.channels;
+    const out = createImage(image.width * hn, image.height * vn, ch);
+    for (let y = 0; y < out.height; y++) {
+        const sy = Math.floor(y / vn);
+        for (let x = 0; x < out.width; x++) {
+            const from = (sy * image.width + Math.floor(x / hn)) * ch;
+            const to = (y * out.width + x) * ch;
+            for (let c = 0; c < ch; c++) out.data[to + c] = image.data[from + c];
+        }
+    }
+    return out;
+}
+
+/**
+ * libvips' `calculate_coefficients_catmull` (resample/templates.h): the four Catmull-Rom
+ * coefficients for a position `x` of the way from one pixel to the next, for the taps one before
+ * the position, at it, one after it and two after it.
+ */
+function catmullCoefficients(x: number): number[] {
+    const cr1 = 1 - x;
+    const cr2 = -0.5 * x;
+    const cr3 = cr1 * cr2;
+    const cone = cr1 * cr3;
+    const cfou = x * cr3;
+    const cr4 = cfou - cone;
+    return [cone, cr1 - cone + cr4, x - cfou - cr4, cfou];
+}
+
+/**
+ * libvips' `vips_bicubic_matrixi`: the same coefficients as fixed-point integers for each of the
+ * 65 phases, truncated the way C truncates a double into an int. Built once, as it is at class
+ * init in bicubic.cpp.
+ */
+const BICUBIC_TABLE: number[][] = ((): number[][] => {
+    const table: number[][] = [];
+    for (let phase = 0; phase <= TRANSFORM_SCALE; phase++) {
+        table.push(catmullCoefficients(phase / TRANSFORM_SCALE).map((v) => Math.trunc(v * INTERPOLATE_SCALE)));
+    }
+    return table;
+})();
+
+/** libvips' `unsigned_fixed_round`: add half of the coefficient scale, then shift it off. */
+function fixedRound(v: number): number {
+    return (v + (INTERPOLATE_SCALE >> 1)) >> INTERPOLATE_SHIFT;
+}
+
+/** The phase libvips picks a row of coefficients by: the fractional part at 1/64, rounded. */
+function coefficientIndex(at: number): number {
+    const s = Math.trunc(at * TRANSFORM_SCALE * 2);
+    return ((s & (TRANSFORM_SCALE * 2 - 1)) + 1) >> 1;
+}
+
+/**
+ * libvips' vips_affine as vips_resize drives it (resample/resize.c). Three things about it are
+ * not what a resize by a kernel suggests:
+ *
+ * The interpolator is not the kernel. `vips_resize_interpolate` answers "nearest" for NEAREST,
+ * "bilinear" for LINEAR and "bicubic" for everything else -- CUBIC, MITCHELL, LANCZOS2 and
+ * LANCZOS3 all upsize with the same Catmull-Rom cubic, which is why a 2x enlargement of one
+ * image is byte-identical under all four. Only a reduction tells them apart.
+ *
+ * Output pixel (x, y) samples the input at `x / hscale - id`, `id` 0.5 for centre convention and
+ * 0 for NEAREST, which libvips notes "is always centre"; and the horizontal position is built by
+ * adding the inverse scale once per pixel the way affine.c does, never by multiplying, so the
+ * last bit of that sum is which pixel a position lands on. It is added to the coordinate inside
+ * the border affine.c embeds, which is where that last bit comes from: a 32 -> 48 enlargement
+ * lands on 3.5 source pixels at output 6 when the position is built outside the border.
+ *
+ * And the arithmetic is fixed-point, at 12 bits for the coefficients, so a bilinear value is a
+ * sum of four integer coefficients scaled by 1/4096 and a bicubic one is a row of four such sums
+ * rounded to integers before the column pass -- not one floating-point sum rounded at the end.
+ */
+function affineImage(image: Image, hscale: number, vscale: number, kernelName: string): Image {
+    const ch = image.channels;
+    const out = createImage(roundU(image.width * hscale), roundU(image.height * vscale), ch);
+    const nearest = kernelName === 'nearest';
+    const bilinear = kernelName === 'linear';
+    /* window_offset + 1: affine.c embeds the input in a border that wide so the stencil can hang
+       off the edge, and hands the interpolator a coordinate inside it. */
+    const pad = nearest || bilinear ? 1 : 2;
+    const id = nearest ? 0 : 0.5;
+    const iax = 1 / hscale;
+    const iay = 1 / vscale;
+    const clamp = (i: number, size: number): number => (i < 0 ? 0 : i >= size ? size - 1 : i);
+    for (let dy = 0; dy < out.height; dy++) {
+        const y = dy * iay - id + pad;
+        const iy = Math.trunc(y);
+        const cy = bilinear || nearest ? BICUBIC_TABLE[0] : BICUBIC_TABLE[coefficientIndex(y)];
+        const Y = Math.trunc((y - iy) * INTERPOLATE_SCALE);
+        const Yd = INTERPOLATE_SCALE - Y;
+        /* The rows of the stencil, in source pixels: one for nearest, two for bilinear, four. */
+        const rows = nearest
+            ? [clamp(iy - 1, image.height)]
+            : bilinear
+                ? [clamp(iy - 1, image.height), clamp(iy, image.height)]
+                : [0, 1, 2, 3].map((j) => clamp(iy - 3 + j, image.height));
+        let at = pad - id;
+        for (let dx = 0; dx < out.width; dx++) {
+            const ix = Math.trunc(at);
+            const cx = bilinear || nearest ? BICUBIC_TABLE[0] : BICUBIC_TABLE[coefficientIndex(at)];
+            const X = Math.trunc((at - ix) * INTERPOLATE_SCALE);
+            const cols = nearest
+                ? [clamp(ix - 1, image.width)]
+                : bilinear
+                    ? [clamp(ix - 1, image.width), clamp(ix, image.width)]
+                    : [0, 1, 2, 3].map((i) => clamp(ix - 3 + i, image.width));
+            const c4 = (Y * X) >> INTERPOLATE_SHIFT;
+            const c2 = (Yd * X) >> INTERPOLATE_SHIFT;
+            const c3 = Y - c4;
+            const c1 = Yd - c2;
+            for (let c = 0; c < ch; c++) {
+                let v: number;
+                if (nearest) {
+                    v = image.data[(rows[0] * image.width + cols[0]) * ch + c];
+                } else if (bilinear) {
+                    const p1 = image.data[(rows[0] * image.width + cols[0]) * ch + c];
+                    const p2 = image.data[(rows[0] * image.width + cols[1]) * ch + c];
+                    const p3 = image.data[(rows[1] * image.width + cols[0]) * ch + c];
+                    const p4 = image.data[(rows[1] * image.width + cols[1]) * ch + c];
+                    v = (c1 * p1 + c2 * p2 + c3 * p3 + c4 * p4 + (INTERPOLATE_SCALE >> 1)) >> INTERPOLATE_SHIFT;
+                } else {
+                    /* Rows first, each rounded to an integer, then the column pass over those:
+                       bicubic.cpp's bicubic_unsigned_int, which is not one sum of sixteen taps. */
+                    const rowAt = (j: number): number => {
+                        const row = rows[j] * image.width * ch + c;
+                        return fixedRound(
+                            cx[0] * image.data[row + cols[0] * ch] +
+                            cx[1] * image.data[row + cols[1] * ch] +
+                            cx[2] * image.data[row + cols[2] * ch] +
+                            cx[3] * image.data[row + cols[3] * ch]
+                        );
+                    };
+                    v = fixedRound(cy[0] * rowAt(0) + cy[1] * rowAt(1) + cy[2] * rowAt(2) + cy[3] * rowAt(3));
+                }
+                out.data[(dy * out.width + dx) * ch + c] = v < 0 ? 0 : v > 255 ? 255 : v;
+            }
+            at += iax;
+        }
+    }
+    return out;
+}
+
+/**
+ * One axis of a reduction: the integer part of the shrink, then the residual through the kernel.
+ * Returns the image unchanged when the axis is not a reduction -- an enlargement is not a
+ * resample of one axis, it is the affine above, which runs after both reductions.
+ */
 function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelName: string): Image {
     const srcSize = horizontal ? image.width : image.height;
     const dstSize = roundU(srcSize / shrink);
-    if (dstSize === srcSize) return image;
-    const kernel = KERNELS[kernelName] ?? KERNELS.lanczos3;
-    if (dstSize > srcSize) {
-        /* An enlargement is libvips' vips_affine with the interpolator the kernel names. */
-        return kernelPass(image, dstSize, horizontal, kernel, shrink);
-    }
+    if (dstSize >= srcSize) return image;
     /*
      * vips_resize's `gap` of 2: the integer part of the shrink, as far as it goes with a gap of two
      * still to run, is taken before the kernel sees the image -- a vips_shrink box average for the
@@ -341,14 +463,26 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
      * part at all, which is why a 3x reduction is a pure reduce and a 4x one is not.
      */
     const block = Math.max(1, Math.floor(srcSize / dstSize / RESIZE_GAP));
-    const extra = (dstSize * shrink - srcSize) / block;
     let work = image;
     let residual = shrink;
+    let extra = dstSize * shrink - srcSize;
     if (block > 1) {
-        work = kernelName === 'nearest'
-            ? subsampleAxis(image, block, horizontal)
-            : boxShrink(image, block, horizontal);
-        residual = shrink / block;
+        if (kernelName === 'nearest') {
+            /*
+             * NEAREST is the one kernel vips_resize subsamples itself (resample/resize.c) before it
+             * calls vips_reduce, so the reduce is handed the subsampled image and counts its own
+             * unused pixels off that width -- not off the width before the subsample, and not
+             * divided by the subsample. 32 -> 5 nearest lands on source pixels 0, 6, 15, 21, 27 by
+             * this arithmetic and on 3, 9, 15, 21, 27 by the other.
+             */
+            work = subsampleAxis(image, block, horizontal);
+            residual = shrink / block;
+            extra = dstSize * residual - (horizontal ? work.width : work.height);
+        } else {
+            work = boxShrink(image, block, horizontal);
+            residual = shrink / block;
+            extra = extra / block;
+        }
     }
     const workSize = horizontal ? work.width : work.height;
     if (dstSize === workSize) return work;
@@ -356,15 +490,32 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
 }
 
 /**
- * A two-axis resample, as libvips' vips_resize orders it: the vertical reduce first, then the
- * horizontal one. Each takes the shrink it was asked for and rounds its own output size off it, so
- * an axis that is only along for the ride -- `cover` with an auto height -- is still reduced at the
- * other axis' factor.
+ * A two-axis resize the way vips_resize orders it: the vertical reduce, then the horizontal one,
+ * then whatever is left as a vips_affine. Each reduce takes the shrink it was asked for and
+ * rounds its own output size off it, so an axis that is only along for the ride -- `cover` with
+ * an auto height -- is still reduced at the other axis' factor.
  */
 export function resample(image: Image, hshrink: number, vshrink: number, kernel: string): Image {
-    let out = resampleAxis(image, vshrink, false, kernel);
-    out = resampleAxis(out, hshrink, true, kernel);
-    return out;
+    let work = image;
+    if (vshrink > 1) work = resampleAxis(work, vshrink, false, kernel);
+    if (hshrink > 1) work = resampleAxis(work, hshrink, true, kernel);
+    const hscale = 1 / hshrink;
+    const vscale = 1 / vshrink;
+    if (hscale <= 1 && vscale <= 1) return work;
+    /*
+     * The affine gets 1.0 for an axis that is not being enlarged, not that axis' own scale: the
+     * reduce above has already taken it, so handing it to the affine as well would shrink the
+     * image twice. resize.c's branches say the same -- the horizontal-only one passes 1.0 as
+     * `vscale` and the vertical-only one passes 1.0 as `hscale`. A 40x30 -> 5x200 fill is 5 wide
+     * after the reduce, and 1 wide if the affine is given the 0.125 again.
+     */
+    const ah = hscale > 1 ? hscale : 1;
+    const av = vscale > 1 ? vscale : 1;
+    /* A whole-number NEAREST enlargement is vips_zoom, not an affine at all. */
+    if (kernel === 'nearest' && ah === Math.floor(ah) && av === Math.floor(av)) {
+        return zoomImage(work, Math.round(ah), Math.round(av));
+    }
+    return affineImage(work, ah, av, kernel);
 }
 
 /* -------------------------------------------------------------------- resize */
@@ -622,6 +773,39 @@ export function flopImage(image: Image): Image {
     return out;
 }
 
+/**
+ * sharp's pipeline ends in sRGB -- `colourspace` is 'srgb' and `colourspacePipeline` 'last' from
+ * lib/constructor.js, and an option the shim does not implement is refused rather than honoured --
+ * so an image of fewer than three bands is promoted before it reaches an encoder: one band becomes
+ * three with the same value in each, and two become four with the second band as alpha.
+ *
+ * Measured against sharp 0.33.5: an 8x8x1 raw buffer gives 192 bytes of raw output (8*8*3), not
+ * 64, and an 8x8x2 one 256, while three and four bands are unchanged; the same promotion reaches
+ * the PNG (colour type 2 for one band, 6 for two) and the JPEG (three components either way), and
+ * `info.channels` reports it. Only `metadata()`, which reads the input, still says one band and
+ * `b-w`.
+ */
+export function toSrgb(image: Image): Image {
+    if (image.channels >= 3) return image;
+    const out = createImage(image.width, image.height, image.channels === 1 ? 3 : 4);
+    const n = image.width * image.height;
+    for (let i = 0; i < n; i++) {
+        const s = i * image.channels;
+        const g = image.data[s];
+        if (out.channels === 3) {
+            out.data[i * 3] = g;
+            out.data[i * 3 + 1] = g;
+            out.data[i * 3 + 2] = g;
+        } else {
+            out.data[i * 4] = g;
+            out.data[i * 4 + 1] = g;
+            out.data[i * 4 + 2] = g;
+            out.data[i * 4 + 3] = image.data[s + 1];
+        }
+    }
+    return out;
+}
+
 /** Drop or add an alpha channel, and go to or from grey, so an encoder gets the bands it needs. */
 export function toChannels(image: Image, channels: ChannelCount): Image {
     if (channels === image.channels) return image;
@@ -640,16 +824,38 @@ export function toChannels(image: Image, channels: ChannelCount): Image {
                 out.data[d] = image.data[s];
                 out.data[d + 1] = image.data[s + 1];
                 out.data[d + 2] = image.data[s + 2];
-            } else {
+            } else if (image.channels === 3) {
                 out.data[d] = image.data[s];
-                out.data[d + 1] = image.data[s + 1] ?? image.data[s];
-                out.data[d + 2] = image.data[s + 2] ?? image.data[s];
+                out.data[d + 1] = image.data[s + 1];
+                out.data[d + 2] = image.data[s + 2];
+            } else {
+                /* One band, or two: there is no second or third band to read, so a grey pixel is
+                   that value in each of the three -- not the next pixel along, which is what
+                   reading `s + 1` out of a one-band image would give. */
+                const g = image.data[s];
+                out.data[d] = g;
+                out.data[d + 1] = g;
+                out.data[d + 2] = g;
             }
         } else {
-            out.data[d] = image.channels === 3 ? image.data[s] : image.data[s];
-            out.data[d + 1] = image.channels === 3 ? image.data[s + 1] : image.data[s];
-            out.data[d + 2] = image.channels === 3 ? image.data[s + 2] : image.data[s];
-            out.data[d + 3] = image.channels === 2 ? image.data[s + 1] : 255;
+            if (image.channels === 3) {
+                out.data[d] = image.data[s];
+                out.data[d + 1] = image.data[s + 1];
+                out.data[d + 2] = image.data[s + 2];
+                out.data[d + 3] = 255;
+            } else if (image.channels === 2) {
+                const g = image.data[s];
+                out.data[d] = g;
+                out.data[d + 1] = g;
+                out.data[d + 2] = g;
+                out.data[d + 3] = image.data[s + 1];
+            } else {
+                const g = image.data[s];
+                out.data[d] = g;
+                out.data[d + 1] = g;
+                out.data[d + 2] = g;
+                out.data[d + 3] = 255;
+            }
         }
     }
     return out;
