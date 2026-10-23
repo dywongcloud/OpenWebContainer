@@ -167,8 +167,10 @@ export class VirtualNetwork {
         const protocol = request.protocol;
         const address = this.hubAddress(request.address);
         /* A caller that names no family is binding by address, so the family follows the address:
-           '::1' is an IPv6 bind. (net.listen passes no family; dgram's does.) */
-        const family = request.family ?? hubFamilyOf(address);
+           '::1' is an IPv6 bind. Both wildcards fold to '', so the family is read from the address
+           the caller named, before the fold: a bind on '::' is dual-stack and takes an IPv4 client,
+           where one on '0.0.0.0' takes none. (net.listen passes no family; dgram's does.) */
+        const family = request.family ?? hubFamilyOf(request.address ?? '');
         if (!this.isLocal(address)) {
             throw new VirtualNetworkError('EADDRNOTAVAIL', `address not available ${displayAddress(address)}`);
         }
@@ -242,13 +244,18 @@ export class VirtualNetwork {
             if (this.connections.get(client.id) === client) client.connectPending = false;
         });
         /* A wildcard listener accepts on the address the client dialled, so an IPv6 client is accepted
-           on '::1' where an IPv4 one is accepted on 127.0.0.1, as a dual-stack host reports it. */
-        const acceptedAddress = listener.address === '' ? localAddress : listener.address;
+           on '::1' where an IPv4 one is accepted on 127.0.0.1, as a dual-stack host reports it. The
+           IPv6 wildcard '::' is dual-stack, so its IPv4 client is accepted on the v4-mapped
+           '::ffff:127.0.0.1' -- that is the address the host's accepted socket reports for the
+           connection, on both of its ends. */
+        const acceptedAddress = listener.address === ''
+            ? (listener.family === 'IPv6' && family === 'IPv4' ? '::ffff:' + localAddress : localAddress)
+            : listener.address;
         this.offer(server, listener, {
             connectionId: server.id,
             localAddress: displayAddress(acceptedAddress),
             localPort: listener.port,
-            remoteAddress: localAddress,
+            remoteAddress: displayAddress(acceptedAddress),
             remotePort: localPort,
         });
         return {
@@ -476,7 +483,11 @@ export class VirtualNetwork {
         let wildcard: Listener | undefined;
         for (const candidate of table.values()) {
             if (candidate.port !== port) continue;
-            if (protocol === 'udp' && candidate.family !== family) continue;
+            if (protocol === 'udp') {
+                if (candidate.family !== family) continue;
+            } else if (candidate.address === '' && !wildcardTakes(candidate, family)) {
+                continue;
+            }
             if (candidate.address === address) return candidate;
             if (candidate.address === '') wildcard = candidate;
         }
@@ -540,6 +551,15 @@ export class VirtualNetwork {
 
 function displayAddress(address: string): string {
     return address === '' ? '0.0.0.0' : address;
+}
+
+/**
+ * True when a TCP wildcard binding takes a connection of this family: '::' is dual-stack and takes an
+ * IPv4 client as well as an IPv6 one, where '0.0.0.0' takes no IPv6 client -- a host binds the IPv6
+ * wildcard without IPV6_V6ONLY, and the IPv4 wildcard has no IPv6 address to answer on.
+ */
+function wildcardTakes(candidate: Listener, family: VirtualFamily): boolean {
+    return candidate.family === family || (candidate.family === 'IPv6' && family === 'IPv4');
 }
 
 /** The family an address belongs to. The wildcard is IPv4 (it is the address displayed as 0.0.0.0);
