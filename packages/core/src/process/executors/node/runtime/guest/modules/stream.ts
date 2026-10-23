@@ -868,6 +868,12 @@ function owcBuildStreamCore() {
       } else {
         state.reading = false;
         if (state.decoder && !encoding) {
+          /* A decoder is handed bytes: a host's StringDecoder refuses anything else with its own
+             ERR_INVALID_ARG_TYPE, so a Readable built with an encoding rejects an object pushed
+             into it instead of failing deeper in with a message of its own. */
+          if (typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)) {
+            throw argTypeError('buf', 'an instance of Buffer, TypedArray, or DataView', chunk);
+          }
           chunk = state.decoder.write(chunk);
           if (state.objectMode || chunk.length !== 0) addChunk(stream, state, chunk, false);
           else maybeReadMore(stream, state);
@@ -2960,6 +2966,9 @@ function owcBuildStreamCore() {
   function streamIsFinished(stream) {
     var r = stream._readableState;
     var w = stream._writableState;
+    /* Something with neither state is not finished, as a host reads it: destroy({ a: 1 }) therefore
+       goes on to build the AbortError it emits on the value it cannot destroy. */
+    if (r === undefined && w === undefined) return false;
     return (r ? r.endEmitted : true) && (w ? w.finished : true);
   }
 
@@ -2971,7 +2980,11 @@ function owcBuildStreamCore() {
     return !!((w && w.destroyed) || (r && r.destroyed));
   }
 
+  /* A web ReadableStream carries no 'readable' boolean, but a host's isReadable answers true for
+     one all the same: its class is marked readable, so isReadable(new Blob(['ab']).stream()) is
+     true where any unmarked object is null. */
   function streamIsReadable(stream) {
+    if (isWebReadable(stream)) return true;
     if (!stream || typeof stream !== 'object' || typeof stream.readable !== 'boolean') return null;
     if (streamIsDestroyed(stream)) return false;
     var r = stream._readableState;
@@ -2979,6 +2992,7 @@ function owcBuildStreamCore() {
   }
 
   function streamIsWritable(stream) {
+    if (isWebWritable(stream)) return true;
     if (!stream || typeof stream !== 'object' || typeof stream.writable !== 'boolean') return null;
     if (streamIsDestroyed(stream)) return false;
     var w = stream._writableState;
@@ -3242,7 +3256,21 @@ function owcBuildStreamCore() {
     /* A caller who destroys a stream that has not finished gets an AbortError whether or not one was
        asked for: on a host, stream.destroy(s) on a fresh PassThrough errors with ABORT_ERR. */
     if (!err && !streamIsFinished(stream)) err = new AbortError();
-    if (typeof stream.destroy !== 'function') return;
+    /* A value that is not a stream at all is not silently skipped: Node falls back to its close,
+       and then to emitting on it, so destroy({ a: 1 }) throws 'stream.emit is not a function' on
+       the next tick, where this one used to answer nothing at all. */
+    if (typeof stream.destroy !== 'function') {
+      if (typeof stream.close === 'function') stream.close();
+      else if (err) process.nextTick(function () {
+        /* V8 names the call it could not make and this runtime says only 'not a function', so the
+           throw a host's own emit gives is written out in the words a host reads. */
+        if (typeof stream.emit !== 'function') throw new TypeError('stream.emit is not a function');
+        stream.emit('error', err);
+        process.nextTick(function () { stream.emit('close'); });
+      });
+      else process.nextTick(function () { stream.emit('close'); });
+      return;
+    }
     stream.destroy(err);
   };
   Stream.compose = compose;
@@ -3492,11 +3520,10 @@ function owcBuildStreamCore() {
       history: givenHistory === undefined ? [] : givenHistory
     };
   }
-  ReplHistory.prototype.initialize = function (history) {
-    var bag = this[kHistory];
-    bag.history = Array.isArray(history) ? history : [];
-    bag.index = -1;
-  };
+  /* A host's initialize reads the history file, asynchronously and well out of this runtime's
+     reach: it never seeds the array from the value it was handed, so initialize(['p', 'q']) leaves
+     the history it found in place, as a host's does. */
+  ReplHistory.prototype.initialize = function () {};
   ReplHistory.prototype.addHistory = function () {
     var bag = this[kHistory];
     var line = bag.iface.line === undefined ? '' : bag.iface.line;
@@ -3509,7 +3536,8 @@ function owcBuildStreamCore() {
     return line;
   };
   ReplHistory.prototype.canNavigateToNext = function () {
-    return this[kHistory].index > -1;
+    var bag = this[kHistory];
+    return bag.index > -1 && bag.history.length > 0;
   };
   ReplHistory.prototype.navigateToNext = function () {
     var bag = this[kHistory];
@@ -3519,12 +3547,19 @@ function owcBuildStreamCore() {
   };
   ReplHistory.prototype.canNavigateToPrevious = function () {
     var bag = this[kHistory];
-    return bag.index < bag.history.length - 1;
+    return bag.history.length !== bag.index && bag.history.length > 0;
   };
+  /* The next line back: one past the index being navigated, skipping any entry the line already
+     reads, and the empty string once the index has run off the end -- which is where a host's
+     fourth up-arrow over a three-entry history lands, with the index left at the length. */
   ReplHistory.prototype.navigateToPrevious = function () {
     var bag = this[kHistory];
-    bag.index++;
-    return bag.history[bag.index];
+    if (!this.canNavigateToPrevious()) return null;
+    var line = bag.iface === null || bag.iface === undefined || bag.iface.line === undefined ? '' : bag.iface.line;
+    var index = bag.index + 1;
+    while (index < bag.history.length && bag.history[index] === line) index++;
+    bag.index = index;
+    return index === bag.history.length ? '' : bag.history[index];
   };
   Object.defineProperty(ReplHistory.prototype, 'size', {
     get: function () { return this[kHistory].size; },
@@ -3568,10 +3603,28 @@ function owcBuildStreamCore() {
      options.history / options.size are read off it and only options.onHistoryFileLoaded seeds the
      array, so setupHistoryManager(['a', 'b'], 5) on a host leaves an empty history and a size of 30. */
   OwcRlBase.prototype.setupHistoryManager = function (options) {
-    this.historyManager = new ReplHistory(this, options);
-    if (options !== null && options !== undefined && options.onHistoryFileLoaded) {
-      this.historyManager.initialize(options.onHistoryFileLoaded);
+    /* A host reads options.history and options.size off the bag before it validates either one, so
+       a bag that is not there is a TypeError about reading 'history' of it -- 'of undefined' for
+       setupHistoryManager(), 'of null' for setupHistoryManager(null) -- and a value that is there
+       but of the wrong kind is the ERR_INVALID_ARG_TYPE that value's own validator gives. Neither
+       one seeds the array: options.onHistoryFileLoaded is the callback a history file is read for,
+       and a host's array stays empty until that file is read. */
+    var history = null;
+    var size = null;
+    /* The bag is read before it is validated, and a missing one is V8's own words for the read. */
+    if (options === null || options === undefined) {
+      throw new TypeError("Cannot read properties of " + (options === undefined ? 'undefined' : 'null') +
+        " (reading 'history')");
     }
+    history = options.history;
+    size = options.size;
+    if (history !== undefined && !Array.isArray(history)) {
+      throw argTypeError('history', 'an instance of Array', history);
+    }
+    if (size !== undefined && typeof size !== 'number') {
+      throw argTypeError('size', 'of type number', size);
+    }
+    this.historyManager = new ReplHistory(this, options);
   };
 
   /* Node defines history, historyIndex, historySize and isFlushing as own enumerable accessors that
@@ -3822,13 +3875,24 @@ function owcBuildStreamCore() {
     return self.line;
   }
 
+  /* A completion or a plain keystroke: what is inserted is echoed as the characters it added, and
+     the whole line is redrawn only when the insert lands inside the line or crosses onto a new row. */
   Interface.prototype._insertString = function (c) {
     var line = rlLine(this);
     var at = rlCursor(this);
-    if (at < line.length) this.line = line.slice(0, at) + c + line.slice(at);
-    else this.line = line + c;
+    if (at < line.length) {
+      this.line = line.slice(0, at) + c + line.slice(at);
+      this.cursor = at + c.length;
+      this._refreshLine();
+      return;
+    }
+    /* Appended at the end: Node echoes only the characters it added, and redraws the whole line
+       only when the cursor crossed onto another row. */
+    var oldPos = this.getCursorPos();
+    this.line = line + c;
     this.cursor = at + c.length;
-    if (this.terminal) this._refreshLine();
+    if (oldPos.rows < this.getCursorPos().rows) this._refreshLine();
+    else writeOutput(this, c);
   };
 
   /* A character left of the cursor is one UTF-16 unit, or two when it is half of a surrogate pair. */
@@ -3938,7 +4002,6 @@ function owcBuildStreamCore() {
     if (at < 0) at = 0;
     else if (at > line.length) at = line.length;
     this.cursor = at;
-    if (!this.terminal) return;
     var newPos = this.getCursorPos();
     if (oldPos.rows === newPos.rows) moveCursor(this.output, newPos.cols - oldPos.cols, 0);
     else this._refreshLine();
@@ -4032,15 +4095,76 @@ function owcBuildStreamCore() {
         self._writeToOutput('Tab completion error: ' + String(err));
         return;
       }
-      var hits = Array.isArray(value) ? value[0] : null;
-      if (hits === null || hits === undefined || hits.length === 0) {
-        if (lastKeypressWasTab === true) self._writeToOutput('\x07');
+      /* Node destructures the answer as { 0: completions, 1: completeOn }, so a value that is not
+         an object at all is refused by the destructuring itself, in its own words, and a string
+         answers its characters: a completer that returns 'ab' completes with 'a' over 'b'. */
+      if (value === null || value === undefined) {
+        throw new TypeError("Cannot destructure property '0' of " +
+          (value === null ? "'object null' as it is null." : "'undefined' as it is undefined."));
+      }
+      var completions = value[0];
+      var completeOn = value[1];
+      if (!completions || completions.length === 0) return;
+      /* The common prefix of the matches that are not empty: the entries a host's own filter leaves,
+         which for a string completion is each of its characters. */
+      var kept = [];
+      for (var i = 0; i < completions.length; i++) {
+        if (completions[i] !== '') kept.push(completions[i]);
+      }
+      var prefix = kept.length === 0 ? '' : commonPrefixOf(kept);
+      if (prefix.indexOf(completeOn) === 0 && prefix.length > completeOn.length) {
+        self._insertString(prefix.slice(completeOn.length));
         return;
       }
-      var on = typeof value[1] === 'string' ? value[1] : string;
-      var prefix = commonPrefixOf(hits);
-      if (prefix.length > on.length) self._insertString(prefix.slice(on.length));
-      else if (lastKeypressWasTab === true && hits.length > 1) self._writeToOutput('\r\n' + hits.join('  ') + '\r\n');
+      /* A host asks whether the answer starts with the prefix by calling startsWith on it, so an
+         answer that gave no completion-on at all is refused there, in V8's own words. */
+      if (completeOn === null || completeOn === undefined) {
+        throw new TypeError('String.prototype.startsWith called on null or undefined');
+      }
+      if (completeOn.indexOf(prefix) !== 0) {
+        var at = rlCursor(self);
+        var whole = rlLine(self);
+        self.line = whole.slice(0, at - completeOn.length) + prefix + whole.slice(at);
+        self.cursor = at - completeOn.length + prefix.length;
+        self._refreshLine();
+        return;
+      }
+      if (!lastKeypressWasTab) return;
+      /* The list: every match in a column one widest match plus two spaces across, and the prompt
+         and the line redrawn under it, as Node's does. */
+      var widths = [];
+      var widest = 0;
+      for (var j = 0; j < completions.length; j++) {
+        var w = String(completions[j]).length;
+        widths.push(w);
+        if (w > widest) widest = w;
+      }
+      var width = widest + 2;
+      var maxColumns = Math.floor(self.columns / width) || 1;
+      if (maxColumns === Infinity) maxColumns = 1;
+      var output = '\r\n';
+      var lineIndex = 0;
+      var whitespace = 0;
+      for (var k = 0; k < completions.length; k++) {
+        var completion = String(completions[k]);
+        if (completion === '' || lineIndex === maxColumns) {
+          output += '\r\n';
+          lineIndex = 0;
+          whitespace = 0;
+        } else {
+          output += new Array(whitespace + 1).join(' ');
+        }
+        if (completion !== '') {
+          output += completion;
+          whitespace = width - widths[k];
+          lineIndex++;
+        } else {
+          output += '\r\n';
+        }
+      }
+      if (lineIndex !== 0) output += '\r\n\r\n';
+      self._writeToOutput(output);
+      self._refreshLine();
     });
   };
 
@@ -4098,14 +4222,15 @@ function owcBuildStreamCore() {
       this._moveCursor(1);
       return;
     }
+    /* Home and End are a cursor move that runs off the end of the line, as Node's are: the editor
+       clamps it and, because the row never changes, writes one relative jump -- '\x1b[6D' for a
+       Home over six columns -- and not the redraw a whole-line refresh would give. */
     if (name === 'home' || (ctrl && name === 'a')) {
-      this.cursor = 0;
-      if (this.terminal) this._refreshLine();
+      this._moveCursor(-Infinity);
       return;
     }
     if (name === 'end' || (ctrl && name === 'e')) {
-      this.cursor = rlLine(this).length;
-      if (this.terminal) this._refreshLine();
+      this._moveCursor(Infinity);
       return;
     }
     if (ctrl && name === 'u') {
@@ -4123,9 +4248,16 @@ function owcBuildStreamCore() {
     if (s.length > 0) this._insertString(s);
   };
 
+  /* A control or meta key handed to write() is the line editor's, as it is on a host: rl.write('f',
+     { ctrl: true, name: 'u' }) kills the line it was given and leaves nothing behind. Text without
+     such a key stays on the path that echoes what the call brought in. */
   OwcRlBase.prototype.write = function (data, key) {
     if (this.closed) throw errUseAfterClose();
     if (this.paused) this.resume();
+    if (this.terminal && key !== null && key !== undefined && (!!key.ctrl || !!key.meta)) {
+      this._ttyWrite(data, key);
+      return;
+    }
     normalWrite(this, data, key);
   };
 
@@ -4159,6 +4291,11 @@ function owcBuildStreamCore() {
   };
 
   function writeEscape(stream, data, callback) {
+    /* All four of the cursor helpers check the callback a caller handed them, as Node's do: it is
+       the one argument they will not pass on to stream.write as an encoding. */
+    if (callback !== undefined) {
+      if (typeof callback !== 'function') throw argTypeError('callback', 'of type function', callback);
+    }
     if (stream === null || stream === undefined) {
       if (typeof callback === 'function') process.nextTick(callback, null);
       return true;
@@ -4189,7 +4326,10 @@ function owcBuildStreamCore() {
       if (typeof callback === 'function') process.nextTick(callback, null);
       return true;
     }
-    if (typeof x !== 'number') throw owcErr(Error, 'ERR_INVALID_CURSOR_POS', 'Cannot set cursor position without setting columns and rows');
+    /* Node's own words for a row asked for without a column, from its ERR_INVALID_CURSOR_POS. */
+    if (typeof x !== 'number') {
+      throw owcErr(TypeError, 'ERR_INVALID_CURSOR_POS', 'Cannot set cursor row without setting its column');
+    }
     var code = typeof y !== 'number' ? '\x1b[' + (x + 1) + 'G' : '\x1b[' + (y + 1) + ';' + (x + 1) + 'H';
     return writeEscape(stream, code, callback);
   }
@@ -4238,7 +4378,7 @@ function owcBuildStreamCore() {
     if (text === '\x1b') return undefined;
     if (text.charAt(0) !== '\x1b') {
       var plain = keypressName(text);
-      return { str: text, key: { name: plain.name, ctrl: plain.ctrl, meta: false, shift: plain.shift, sequence: text } };
+      return { str: text, key: { sequence: text, name: plain.name, ctrl: plain.ctrl, meta: false, shift: plain.shift } };
     }
     var csi = CSI_KEY.exec(text);
     if (csi !== null) {
@@ -4251,18 +4391,18 @@ function owcBuildStreamCore() {
         name = CSI_LETTERS[last];
         if (last === 'Z') mods.shift = true;
       }
-      return { str: undefined, key: { name: name === undefined ? 'undefined' : name, ctrl: mods.ctrl, meta: mods.meta, shift: mods.shift, sequence: text, code: code } };
+      return { str: undefined, key: { sequence: text, name: name === undefined ? 'undefined' : name, ctrl: mods.ctrl, meta: mods.meta, shift: mods.shift, code: code } };
     }
     var ss3 = SS3_KEY.exec(text);
     if (ss3 !== null) {
-      return { str: undefined, key: { name: SS3_LETTERS[ss3[1]], ctrl: false, meta: false, shift: false, sequence: text, code: 'O' + ss3[1] } };
+      return { str: undefined, key: { sequence: text, name: SS3_LETTERS[ss3[1]], ctrl: false, meta: false, shift: false, code: 'O' + ss3[1] } };
     }
     // O and [ open a longer sequence, so an escape followed by one of them is not a key yet
     if (text.length === 2 && (text.charAt(1) === '[' || text.charAt(1) === 'O')) return undefined;
     var meta = META_KEY.exec(text);
     if (meta !== null) {
       var named = keypressName(meta[1]);
-      return { str: undefined, key: { name: named.name, ctrl: named.ctrl, meta: true, shift: named.shift, sequence: text } };
+      return { str: undefined, key: { sequence: text, name: named.name, ctrl: named.ctrl, meta: true, shift: named.shift } };
     }
     return undefined;
   }
