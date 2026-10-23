@@ -36,6 +36,13 @@ interface VmHost {
     realmValues: QuickJSHandle[];
     /** Rebuilds the value a promise settles with, once per binding: see {@link promiseOf}. */
     rehomeFn?: QuickJSHandle;
+    /**
+     * A `WeakMap` of the guest realm: the value a `vm` context handed back -> the twin it was
+     * rebuilt as, so that what the context hands back twice comes back as one object.
+     */
+    twins?: QuickJSHandle;
+    /** The pairs behind {@link VmHost.twins}, oldest first: the source, and the twin beside it. */
+    memo: { src: QuickJSHandle; twin: QuickJSHandle }[];
     /** `Array.isArray`, `Object.prototype.toString`, `Object.keys` and `Object.prototype`, once. */
     probes?: VmProbes;
     /** The standard globals of the guest realm beside their namesakes in the second realm, once. */
@@ -88,6 +95,26 @@ const REALM_MAX_DEPTH = 64;
 const REALM_MAX_VALUES = 16384;
 
 /**
+ * How many values a process remembers the twin of: past this the oldest half is forgotten, and a
+ * value the context hands back after that is rebuilt again rather than recognized.
+ *
+ * Recognising a value is what gives a context back its identity -- host Node hands the very object
+ * the context made to the caller every time, so `vm.runInContext('h.o', ctx)` twice is one object
+ * -- and the memory is a `WeakMap`, so an entry whose source the guest has dropped goes with it.
+ */
+const REALM_MAX_REMEMBERED = 4096;
+
+/**
+ * The `Object.prototype.toString` tags a function crosses under, and the typed array names, whose
+ * rebuild is a copy of the bytes: everything else is left to the walk of an ordinary object.
+ */
+const REALM_FUNCTION_TAGS = ['[object Function]', '[object AsyncFunction]', '[object GeneratorFunction]',
+    '[object AsyncGeneratorFunction]'];
+
+const REALM_TYPED_ARRAYS = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
+    'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array'];
+
+/**
  * The standard globals whose namesake in the second realm replaces the guest realm's when one of
  * them is what crosses out of a `vm` context: `runInContext('Array')` is the context's own `Array`,
  * not the caller's, which is why host Node reports `false` for `runInContext('Array') === Array`.
@@ -124,6 +151,7 @@ export function bindVmRuntime(owner: CapabilityContext, runtime: QuickJSRuntime,
         context,
         api,
         realmValues: [],
+        memo: [],
         deadline: 0,
         fired: false,
         cancelled: false,
@@ -192,6 +220,27 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
         }
     }
     host.realmValues = [];
+    for (const pair of host.memo) {
+        try {
+            pair.src.dispose();
+        } catch {
+            // a handle already gone is nothing to report
+        }
+        try {
+            pair.twin.dispose();
+        } catch {
+            // as above
+        }
+    }
+    host.memo = [];
+    if (host.twins !== undefined) {
+        try {
+            host.twins.dispose();
+        } catch {
+            // as above
+        }
+        host.twins = undefined;
+    }
     if (host.builtins !== undefined) {
         for (const handle of [...host.builtins.from, ...host.builtins.to]) {
             try {
@@ -275,6 +324,80 @@ function realmOf(host: VmHost): QuickJSContext | undefined {
     }
 }
 
+/**
+ * The twin `value` was rebuilt as the last time this context handed it back, or undefined the first
+ * time -- and undefined again once the pair has been forgotten, or the value cannot be a `WeakMap`
+ * key at all (a primitive, or one the guest has already dropped).
+ *
+ * This is what gives a `vm` context back the identity a rebuild costs it: host Node hands the caller
+ * the very object the context made, so `vm.runInContext('h.o', ctx)` twice is one object there, a
+ * `set(3,4)` on one seen by the other, and one twin for both runs is the same answer. Only the value
+ * a run hands back whole is remembered -- the walk of one value still keeps its own `seen`/`twins`
+ * guard, so a cycle or a value reached twice inside one rebuild is one twin there as it was.
+ */
+function twinOf(host: VmHost, value: QuickJSHandle): QuickJSHandle | undefined {
+    const twins = twinsOf(host);
+    if (twins === undefined) return undefined;
+    try {
+        const result = host.context.callMethod(twins, 'get', [value]);
+        if (result.error) {
+            result.error.dispose();
+            return undefined;
+        }
+        const got = result.value;
+        if (host.context.typeof(got) === 'undefined') {
+            got.dispose();
+            return undefined;
+        }
+        return got;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Remembers the twin `value` was rebuilt as, forgetting the oldest half once the cap is reached. */
+function remember(host: VmHost, value: QuickJSHandle, twin: QuickJSHandle): void {
+    const twins = twinsOf(host);
+    if (twins === undefined) return;
+    try {
+        const result = host.context.callMethod(twins, 'set', [value, twin]);
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+        host.memo.push({ src: value.dup(), twin: twin.dup() });
+    } catch {
+        return;
+    }
+    if (host.memo.length < REALM_MAX_REMEMBERED) return;
+    for (const old of host.memo.splice(0, Math.floor(REALM_MAX_REMEMBERED / 2))) {
+        try {
+            old.src.dispose();
+        } catch {
+            // a handle already gone is nothing to report
+        }
+        try {
+            old.twin.dispose();
+        } catch {
+            // as above
+        }
+    }
+}
+
+/** A `WeakMap` of the guest realm the twins are remembered in, made once, or undefined if it cannot be. */
+function twinsOf(host: VmHost): QuickJSHandle | undefined {
+    if (host.twins !== undefined) return host.twins;
+    try {
+        const built = host.context.evalCode('new WeakMap()');
+        if (built.error) {
+            built.error.dispose();
+            return undefined;
+        }
+        host.twins = host.context.unwrapResult(built);
+        return host.twins;
+    } catch {
+        return undefined;
+    }
+}
+
 /** `Array.isArray`, `Object.prototype.toString` and `Object.prototype` of the guest realm, once. */
 function probesOf(host: VmHost): VmProbes {
     if (host.probes !== undefined) return host.probes;
@@ -349,12 +472,10 @@ function methodDump(host: VmHost, value: QuickJSHandle, name: string): unknown {
  * true, `Object.prototype.toString.call` still `[object Array]`, which is what host Node 24.15
  * reports for the same probe.
  *
- * Arrays, plain objects, `Date`s, `RegExp`s, errors, `Map`s, `Set`s and promises are rebuilt.
- * Everything else -- a function, a class instance, a `WeakMap` -- crosses as it is: a function's body
- * belongs to the realm it was compiled in and cannot be recompiled into another, and the keys of a
- * `WeakMap` are the one part of a collection no walk can read, so a copy of one would come back
- * empty. A value too deep, a cycle, or one past the cap on rebuilt values also crosses as it is, so
- * nothing here can grow without bound or loop.
+ * Arrays, plain objects, `Date`s, `RegExp`s, errors, `Map`s, `Set`s, promises, `WeakMap`s,
+ * `WeakSet`s, `ArrayBuffer`s, typed arrays and functions are rebuilt. A class instance keeps the
+ * name of its constructor. Everything else crosses as it is. A value too deep, a cycle, or one past
+ * the cap on rebuilt values also crosses as it is, so nothing here can grow without bound or loop.
  */
 function rehomeInto(
     host: VmHost,
@@ -369,7 +490,10 @@ function rehomeInto(
     if (host.realmValues.length >= REALM_MAX_VALUES) return value;
     const builtin = builtinOf(host, realm, value);
     if (builtin !== undefined) return builtin;
-    if (context.typeof(value) !== 'object') return value;
+    /* A function is an object to every probe below but not to `typeof`, and it is the one object a
+       context hands back whose rebuild has to keep working rather than only reading. */
+    const kind = context.typeof(value);
+    if (kind !== 'object' && kind !== 'function') return value;
     if (depth >= REALM_MAX_DEPTH) return value;
     for (let i = 0; i < seen.length; i++) {
         if (context.eq(seen[i], value)) return twins[i];
@@ -384,6 +508,13 @@ function rehomeInto(
             made = realm.newArray();
         } else if (tag === '[object Object]') {
             made = realm.newObject();
+            /* A class instance: `class C {}` out of a context still answers `C` to
+               `o.constructor.name` on host Node 24.15, which a bare object of the second realm would
+               answer `Object` to. The class itself is the one thing that cannot cross -- its body was
+               compiled in the context's realm -- so the rebuild is given a constructor of that name,
+               the way an `Error` subclass already was, and keeps the class's own properties. */
+            const ctor = ctorNameOf(host, value);
+            if (ctor !== undefined && ctor !== 'Object') nameAfter(host, realm, made, ctor);
         } else if (tag === '[object Date]') {
             const ms = Number(methodDump(host, value, 'getTime'));
             return pin(host, context.unwrapResult(realm.evalCode(`new Date(${Number.isFinite(ms) ? ms : 0})`)));
@@ -416,6 +547,55 @@ function rehomeInto(
             const empty = emptyOf(host, realm, tag === '[object Map]' ? 'Map' : 'Set');
             if (empty === undefined) return value;
             made = empty;
+        } else if (tag === '[object WeakMap]' || tag === '[object WeakSet]') {
+            /* The keys of a weak collection are the one part of a collection no walk can read, so a
+               copy of one comes back empty -- which is still the realm the host hands one back from:
+               `vm.runInNewContext('new WeakMap()') instanceof WeakMap` is false on host Node 24.15,
+               and true while the caller's own realm is what a context's objects are of. */
+            const empty = emptyOf(host, realm, tag === '[object WeakMap]' ? 'WeakMap' : 'WeakSet');
+            if (empty === undefined) return value;
+            return pin(host, empty);
+        } else if (tag === '[object ArrayBuffer]') {
+            const bytes = bytesOf(host, value);
+            if (bytes === undefined) return value;
+            return pin(host, realm.newArrayBuffer(bytes.buffer as ArrayBuffer));
+        } else if (REALM_TYPED_ARRAYS.indexOf(tag.slice(8, -1)) >= 0) {
+            /* A typed array is its bytes and the name of its class: rebuilt in the second realm over
+               a copy of them, so `new Uint8Array(2)` out of a context answers false to
+               `instanceof Uint8Array`, 2 to `length` and `[object Uint8Array]` to the tag, as on the
+               host. `DataView` is left to cross as it is -- byte order aside, it is a view of a
+               buffer the caller has no other way to reach, and no probe asks for it. */
+            const bytes = bytesOf(host, value);
+            const name = tag.slice(8, -1);
+            if (bytes === undefined || bytes.length === 0) {
+                const empty = emptyOf(host, realm, name);
+                if (empty === undefined) return value;
+                return pin(host, empty);
+            }
+            const built = realm.evalCode(`(function (ab) { return new ${name}(ab); })`);
+            if (built.error) {
+                built.error.dispose();
+                return value;
+            }
+            const bridge = context.unwrapResult(built);
+            const buffer = realm.newArrayBuffer(bytes.buffer as ArrayBuffer);
+            const result = realm.callFunction(bridge, realm.undefined, [buffer]);
+            bridge.dispose();
+            buffer.dispose();
+            if (result.error) {
+                result.error.dispose();
+                return value;
+            }
+            return pin(host, context.unwrapResult(result));
+        } else if (REALM_FUNCTION_TAGS.indexOf(tag) >= 0) {
+            /* A function's body belongs to the realm it was compiled in and cannot be recompiled into
+               another, so the rebuild is a function of the second realm that calls the original:
+               `typeof` still reads `function`, a call still reaches the body -- `this` and arguments
+               and all -- while `instanceof Function` reads false, as it does on host Node 24.15 for
+               the function a context hands back. */
+            const fn = fnOf(host, realm, value);
+            if (fn === undefined) return value;
+            return pin(host, fn);
         } else {
             return value;
         }
@@ -447,6 +627,103 @@ function rehomeInto(
         // a value whose own names cannot be read crosses as the empty shell it is so far
     }
     return made;
+}
+
+/**
+ * The bytes `value` holds: the whole of an `ArrayBuffer`, or the window of one a typed array views.
+ *
+ * A copy, because the bytes the host reads are a view into the engine's own memory, which the next
+ * call into it overwrites, and the rebuild is a buffer of the second realm holding its own.
+ */
+function bytesOf(host: VmHost, value: QuickJSHandle): Uint8Array | undefined {
+    const { context } = host;
+    let buffer: QuickJSHandle | undefined;
+    try {
+        buffer = context.getProp(value, 'buffer');
+        const isView = context.typeof(buffer) === 'object';
+        const offset = isView ? Number(propDump(host, value, 'byteOffset')) : 0;
+        const length = isView ? Number(propDump(host, value, 'byteLength')) : -1;
+        const held = context.getArrayBuffer(isView ? buffer : value);
+        try {
+            const all = new Uint8Array(held.value);
+            if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 0
+                || offset + length > all.length) {
+                return all;
+            }
+            return all.slice(offset, offset + length);
+        } finally {
+            held.dispose();
+        }
+    } catch {
+        return undefined;
+    } finally {
+        if (buffer !== undefined) {
+            try {
+                buffer.dispose();
+            } catch {
+                // a handle already gone is nothing to report
+            }
+        }
+    }
+}
+
+/**
+ * A function of the second realm that calls `value`, or undefined when it cannot be built.
+ *
+ * The wrapper is an ordinary function of the realm it was written in -- so `typeof` reads `function`
+ * and `instanceof Function` reads false -- and everything a call makes of it is the original's:
+ * `this`, the arguments, the value it returns, and a throw, which crosses the way any value the
+ * context throws out does. Its own properties are not copied: `length` and `name` are the wrapper's,
+ * and a class instance's fields are the walk of an object, not of a function.
+ */
+function fnOf(host: VmHost, realm: QuickJSContext, value: QuickJSHandle): QuickJSHandle | undefined {
+    try {
+        const built = realm.evalCode('(function (f) { return function () { return f.apply(this, arguments); }; })');
+        if (built.error) {
+            built.error.dispose();
+            return undefined;
+        }
+        const bridge = host.context.unwrapResult(built);
+        const result = realm.callFunction(bridge, realm.undefined, [value]);
+        bridge.dispose();
+        if (result.error) {
+            result.error.dispose();
+            return undefined;
+        }
+        return host.context.unwrapResult(result);
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Gives `made` a constructor named `name`, so a class instance out of a context keeps the name of its
+ * class: an object of the second realm set under a fresh prototype whose constructor wears it.
+ */
+function nameAfter(host: VmHost, realm: QuickJSContext, made: QuickJSHandle, name: string): void {
+    try {
+        const built = realm.evalCode(
+            '(function (o, n) {' +
+            'var S = function () {};' +
+            'try { Object.defineProperty(S, "name", { value: n, configurable: true }); } catch (x) {}' +
+            'S.prototype.constructor = S;' +
+            'Object.setPrototypeOf(o, S.prototype);' +
+            'return o; })'
+        );
+        if (built.error) {
+            built.error.dispose();
+            return;
+        }
+        const bridge = host.context.unwrapResult(built);
+        const named = realm.newString(name);
+        const result = realm.callFunction(bridge, realm.undefined, [made, named]);
+        named.dispose();
+        bridge.dispose();
+        if (result.error) result.error.dispose();
+        else result.value.dispose();
+    } catch {
+        // an object whose constructor will not wear the name crosses as the plain object it is
+    }
 }
 
 /** `new Map()` or `new Set()` of the second realm, or undefined when it cannot be built. */
@@ -775,19 +1052,36 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
         /* Own handles read off the value on the way down, freed once the rebuild is over: they are
            what the cycle guard compares against while it still runs. */
         const kept: QuickJSHandle[] = [];
+        let rebuilt: QuickJSHandle | undefined;
         try {
             if (context.typeof(value) !== 'object' && context.typeof(value) !== 'function') return { rebuilt: false };
             const realm = realmOf(host);
             if (realm === undefined) return { rebuilt: false };
+            /* The whole value a run handed back: recognized before it is rebuilt, so a value the
+               context has handed back before comes back as the one object it came back as then, the
+               way host Node hands the very object the context made to the caller every time. */
+            rebuilt = twinOf(host, value);
+            if (rebuilt !== undefined) {
+                context.setProp(host.api, 'vmBack', rebuilt);
+                return { rebuilt: true };
+            }
             retire(host);
-            const rebuilt = rehomeInto(host, realm, value, 0, [], [], kept);
+            rebuilt = rehomeInto(host, realm, value, 0, [], [], kept);
             if (rebuilt === value) return { rebuilt: false };
+            remember(host, value, rebuilt);
             context.setProp(host.api, 'vmBack', rebuilt);
             return { rebuilt: true };
         } catch {
             return { rebuilt: false };
         } finally {
             value.dispose();
+            if (rebuilt !== undefined) {
+                try {
+                    rebuilt.dispose();
+                } catch {
+                    // a handle already gone is nothing to report
+                }
+            }
             for (const own of kept) {
                 try { own.dispose(); } catch { /* already gone with its context */ }
             }
