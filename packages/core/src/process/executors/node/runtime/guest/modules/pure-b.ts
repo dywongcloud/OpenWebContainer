@@ -1423,6 +1423,52 @@ export const SRC = String.raw`
     Security: true, ServiceWorker: true, Storage: true, SystemInfo: true, Target: true, Tethering: true,
     Tracing: true, WebAudio: true, WebAuthn: true
   };
+  /* The commands the protocol defines for the six domains a caller asks about here. A command a
+     domain does not define is not an unimplemented one, and a host says so with the protocol's own
+     'wasn't found' rather than with the answer it gives for a command it has and cannot run:
+     Runtime.noSuchMethod is -32601 on a host, and so is Bogus.method, while Debugger.enable is a
+     real command this runtime has no debugger for. Only a domain named here has a list to check a
+     method against; a method of any other domain is answered as it always was.
+     row owc-inspector-returnbyvalue-notifications. */
+  var PROTOCOL_METHODS = {
+    Runtime: ['addBinding', 'awaitPromise', 'callFunctionOn', 'compileScript', 'disable',
+      'discardConsoleEntries', 'enable', 'evaluate', 'getExceptionDetails', 'getHeapUsage',
+      'getIsolateId', 'getProperties', 'globalLexicalScopeNames', 'queryObjects', 'releaseObject',
+      'releaseObjectGroup', 'removeBinding', 'runIfWaitingForDebugger', 'runScript',
+      'setAsyncCallStackDepth', 'setCustomObjectFormatterEnabled', 'setMaxCallStackSizeToCapture',
+      'terminateExecution'],
+    Debugger: ['continueToLocation', 'enable', 'disable', 'evaluateOnCallFrame', 'getPossibleBreakpoints',
+      'getScriptSource', 'getStackTrace', 'pause', 'removeBreakpoint', 'restartFrame', 'resume',
+      'searchInContent', 'setAsyncCallStackDepth', 'setBlackboxedRanges', 'setBlackboxPatterns',
+      'setBreakpoint', 'setBreakpointByUrl', 'setBreakpointsActive', 'setBreakpointOnFunctionCall',
+      'setInstrumentationBreakpoint', 'setPauseOnExceptions', 'setReturnValue', 'setScriptSource',
+      'setSkipAllPauses', 'setVariableValue', 'stepInto', 'stepOut', 'stepOver'],
+    Profiler: ['disable', 'disableCounters', 'disableRuntimeCallStats', 'enable', 'enableCounters',
+      'enableRuntimeCallStats', 'getBestEffortCoverage', 'setCounterSamplingInterval',
+      'setSamplingInterval', 'start', 'startPreciseCoverage', 'startTypeProfile', 'stop',
+      'stopPreciseCoverage', 'stopTypeProfile', 'takePreciseCoverage', 'takeTypeProfile'],
+    HeapProfiler: ['addInspectedHeapObject', 'collectGarbage', 'disable', 'enable', 'getHeapObjectId',
+      'getObjectByHeapObjectId', 'getSamplingProfile', 'startSampling', 'startTrackingHeapObjects',
+      'stopSampling', 'stopTrackingHeapObjects', 'takeHeapSnapshot'],
+    Network: ['addBlockedURL', 'canClearBrowserCache', 'canClearBrowserCookies', 'canEmulateNetworkConditions',
+      'clearBrowserCache', 'clearBrowserCookies', 'continueInterceptedRequest', 'deleteCookies', 'disable',
+      'emulateNetworkConditions', 'enable', 'enableReportingApi', 'getAllCookies', 'getCertificate',
+      'getCookies', 'getRequestPostData', 'getResponseBody', 'getSecurityIsolationStatus',
+      'loadNetworkResource', 'replayXHR', 'removeBlockedURL', 'requestPostData', 'searchInResponseBody',
+      'setAcceptedEncodings', 'setAttachDebugStack', 'setBlockedURLs', 'setBypassServiceWorker',
+      'setCacheDisabled', 'setCookie', 'setCookieControlsEnabled', 'setExtraHTTPHeaders',
+      'setMonitoringXHR', 'setRequestInterception', 'setUserAgentOverride', 'streamResource'],
+    NodeRuntime: ['awaitAllPromise', 'cancelWaitForWorkerShutdown', 'getArgs', 'getEnv',
+      'notifyWhenWaitingForDisconnect', 'startAsyncInstrumentation', 'stopAsyncInstrumentation',
+      'waitForWorkerShutdown']
+  };
+  var PROTOCOL_METHOD_SETS = Object.create(null);
+  Object.keys(PROTOCOL_METHODS).forEach(function (domain) {
+    var set = Object.create(null);
+    var list = PROTOCOL_METHODS[domain];
+    for (var at = 0; at < list.length; at++) set[list[at]] = true;
+    PROTOCOL_METHOD_SETS[domain] = set;
+  });
 
   // ---- inspector ----
 
@@ -1631,6 +1677,46 @@ export const SRC = String.raw`
       return described;
     }
 
+    /* A value with a cycle in it has no JSON form at all, and a host refuses to hand one back by
+       value rather than answering with a description of it: -32000, 'Object reference chain is too
+       long', and no result. The cycle is found by walking the value with the objects already on the
+       path held beside it, and not by letting JSON.stringify throw, because a value that fails to
+       serialise for any other reason still comes back described -- a getter that throws, say -- and
+       a host answers that one with the described form.
+       row owc-inspector-returnbyvalue-notifications. */
+    function hasCycleOf(value) {
+      var path = [];
+      function walk(inner) {
+        if (inner === null || typeof inner !== 'object') return false;
+        if (path.indexOf(inner) >= 0) return true;
+        path.push(inner);
+        var names;
+        try {
+          names = Object.getOwnPropertyNames(inner);
+        } catch (errNames) {
+          names = [];
+        }
+        for (var i = 0; i < names.length; i++) {
+          var described;
+          try {
+            described = Object.getOwnPropertyDescriptor(inner, names[i]);
+          } catch (errDescriptor) {
+            described = undefined;
+          }
+          if (described === undefined || described.get !== undefined) continue;
+          if (walk(described.value)) return true;
+        }
+        path.pop();
+        return false;
+      }
+      return walk(value);
+    }
+    function cycleErrorOf(value, byValue) {
+      if (byValue !== true || !hasCycleOf(value)) return undefined;
+      return nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+        'Inspector error -32000: Object reference chain is too long');
+    }
+
     /*
      * The same object under returnByValue, which the protocol answers with the value itself rather
      * than with a description of it: a host hands back the value of ({a:1}) with the flag and its
@@ -1762,6 +1848,11 @@ export const SRC = String.raw`
         return { protocolError: nodeError(Error, 'ERR_INSPECTOR_COMMAND',
           'Inspector error -32000: Object couldn\'t be returned by value') };
       }
+      /* A cyclic value under returnByValue: a host refuses it with -32000 rather than answering a
+         description of it. Checked before the promise is awaited and again when it settles, since
+         what has to have no cycle in it is the value the caller is handed. */
+      var cyclic = cycleErrorOf(evaluated, byValue);
+      if (cyclic !== undefined) return { protocolError: cyclic };
       /* awaitPromise: a host settles the promise before it answers, so the result is the value the
          promise resolves to -- or the exceptionDetails of the value it rejects with -- and the
          answer waits for it, the one case in which post cannot call back synchronously. */
@@ -1812,6 +1903,8 @@ export const SRC = String.raw`
         });
         return;
       }
+      var settledCycle = cycleErrorOf(value, request.byValue);
+      if (settledCycle !== undefined) return deliver(done, settledCycle, undefined);
       deliver(done, null, { result: remoteResultOf(value, request.byValue, request.preview) });
     }
 
@@ -1878,11 +1971,115 @@ export const SRC = String.raw`
         deliver(callback, null, {});
         return undefined;
       }
+      /* Runtime.callFunctionOn: the declaration is compiled and called here, in the realm the
+         program runs in, against the object the objectId names -- or with no receiver when the
+         caller gave none -- and what comes back is the value it returned, described the way a
+         Runtime.evaluate result is. A declaration that is not a function at all, or that throws
+         when it is called, is answered the way a host answers it: -32602 for the one, and the
+         exceptionDetails plus the thrown value for the other.
+         row owc-inspector-returnbyvalue-notifications. */
+      if (method === 'Runtime.callFunctionOn') {
+        var declaration = params !== undefined && params !== null && typeof params.functionDeclaration === 'string'
+          ? params.functionDeclaration : undefined;
+        if (declaration === undefined) {
+          deliver(callback, nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+            'Inspector error -32602: Invalid parameters'), undefined);
+          return undefined;
+        }
+        var called;
+        try {
+          called = (0, eval)('(' + declaration + ')');
+        } catch (errCompiling) {
+          called = undefined;
+        }
+        if (typeof called !== 'function') {
+          deliver(callback, nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+            'Inspector error -32602: Invalid parameters'), undefined);
+          return undefined;
+        }
+        var receiver = params.objectId !== undefined ? objectForId(params.objectId) : undefined;
+        var applied = [];
+        var givenArgs = params.arguments;
+        if (Array.isArray(givenArgs)) {
+          for (var argAt = 0; argAt < givenArgs.length; argAt++) {
+            var one = givenArgs[argAt];
+            if (one !== null && typeof one === 'object' && one.objectId !== undefined) applied.push(objectForId(one.objectId));
+            else if (one !== null && typeof one === 'object' && typeof one.unserializableValue === 'string') {
+              applied.push(one.unserializableValue === 'NaN' ? NaN
+                : one.unserializableValue === 'Infinity' ? Infinity
+                  : one.unserializableValue === '-Infinity' ? -Infinity
+                    : one.unserializableValue === '-0' ? -0 : undefined);
+            } else applied.push(one === null || one === undefined ? undefined : one.value);
+          }
+        }
+        var returned;
+        try {
+          returned = called.apply(receiver, applied);
+        } catch (errCall) {
+          deliver(callback, null, {
+            result: remoteObjectOf(errCall),
+            exceptionDetails: {
+              exception: remoteObjectOf(errCall),
+              text: 'Uncaught',
+              lineNumber: 0,
+              columnNumber: 0,
+              exceptionId: nextExceptionId(),
+              scriptId: nextScriptId()
+            }
+          });
+          return undefined;
+        }
+        var functionCycle = cycleErrorOf(returned, params.returnByValue === true);
+        if (functionCycle !== undefined) {
+          deliver(callback, functionCycle, undefined);
+          return undefined;
+        }
+        deliver(callback, null, { result: remoteResultOf(returned, params.returnByValue === true,
+          params.generatePreview === true) });
+        return undefined;
+      }
+      /* Debugger.enable is a host's answer to a frontend attaching, and the id it hands back is the
+         debugger's own, opaque to whoever reads it. This runtime has no debugger, so no id of its
+         own is one a host's ever is; what is reproduced is the answer's shape, a pair of numbers.
+         Debugger.getScriptSource names a script the debugger knows, and there is none here: a
+         scriptId this runtime hands out on Runtime.evaluate is its own serial and not a script the
+         Debugger domain has, so every id is answered as a host answers one it does not know --
+         -32000, naming the id. row owc-inspector-returnbyvalue-notifications. */
+      if (method === 'Debugger.enable') {
+        deliver(callback, null, { debuggerId: '1.1' });
+        return undefined;
+      }
+      if (method === 'Debugger.getScriptSource') {
+        var wanted = params !== undefined && params !== null && params.scriptId !== undefined
+          ? String(params.scriptId) : '';
+        deliver(callback, nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+          'Inspector error -32000: No script for id: ' + wanted), undefined);
+        return undefined;
+      }
+      /* The three enable commands a host answers with nothing at all -- turning a domain on is not
+         a question about the program -- and NodeRuntime.notifyWhenWaitingForDisconnect, which asks
+         for one notification when the process is about to exit and needs no debugger to promise.
+         row owc-inspector-returnbyvalue-notifications. */
+      if (method === 'Profiler.enable' || method === 'HeapProfiler.enable' || method === 'Network.enable'
+        || method === 'NodeRuntime.notifyWhenWaitingForDisconnect') {
+        deliver(callback, null, {});
+        return undefined;
+      }
       /* A method of a domain the protocol has never heard of is not an unimplemented one, and a
          host says so with the protocol's own error: -32601, and the name of the method. */
       var dot = method.indexOf('.');
       var domain = dot > 0 ? method.slice(0, dot) : method;
       if (PROTOCOL_DOMAINS[domain] !== true) {
+        deliver(callback, nodeError(Error, 'ERR_INSPECTOR_COMMAND',
+          'Inspector error -32601: \'' + method + '\' wasn\'t found'), undefined);
+        return undefined;
+      }
+      /* A domain the protocol has, but a command it does not define: 'wasn't found' is the answer
+         for that one too, and not 'not available', which is what a command the protocol defines
+         and this runtime cannot run gets. A domain with no list here is left as it was.
+         row owc-inspector-returnbyvalue-notifications. */
+      var known = PROTOCOL_METHOD_SETS[domain];
+      if (known !== undefined && known[method.slice(dot + 1)] !== true) {
         deliver(callback, nodeError(Error, 'ERR_INSPECTOR_COMMAND',
           'Inspector error -32601: \'' + method + '\' wasn\'t found'), undefined);
         return undefined;
@@ -2380,6 +2577,388 @@ export const SRC = String.raw`
       return /\bawait\b/.test(code) === true && scriptParses('(async()=>{\n' + code + '\n})');
     };
     return exp;
+  };
+
+  // ---- the private modules node's own builtinModules list names ---------------------------
+
+  /*
+   * builtinModules is node's list of everything its binary carries, and isBuiltin answers for the
+   * same list, so a name the list holds and BF does not is a module node has and this runtime
+   * does not: require says MODULE_NOT_FOUND for a name isBuiltin has just called a built-in. These
+   * are the private ones -- the underscore names, which in node are the pieces http, stream and
+   * tls are built out of rather than modules of their own -- and the four the list writes with its
+   * own node: prefix. Each is assembled from the module it is a piece of, so a class a caller gets
+   * from '_stream_readable' is the very class 'stream' hands out and not a copy of one.
+   * row owc-module-export-table-incomplete.
+   */
+  var PRIVATE_STREAM_PARTS = [
+    ['_stream_readable', 'Readable'], ['_stream_writable', 'Writable'], ['_stream_duplex', 'Duplex'],
+    ['_stream_transform', 'Transform'], ['_stream_passthrough', 'PassThrough']
+  ];
+  for (var privateStreamAt = 0; privateStreamAt < PRIVATE_STREAM_PARTS.length; privateStreamAt++) {
+    (function (pair) {
+      BF[pair[0]] = function () { return requireBuiltin('stream')[pair[1]]; };
+    })(PRIVATE_STREAM_PARTS[privateStreamAt]);
+  }
+
+  /* _tls_wrap is tls as http2 and https reach it: the socket, the server and the two calls that
+     build them. _tls_common is what a secure context is made of. */
+  BF['_tls_wrap'] = function () {
+    var tls = requireBuiltin('tls');
+    return { TLSSocket: tls.TLSSocket, Server: tls.Server, createServer: tls.createServer, connect: tls.connect };
+  };
+  BF['_tls_common'] = function () {
+    var tls = requireBuiltin('tls');
+    return {
+      SecureContext: tls.SecureContext,
+      createSecureContext: tls.createSecureContext,
+      /* translatePeerCertificate turns the object the peer's certificate parses into the object
+         getPeerCertificate hands a caller: subject and issuer split into their fields, the
+         validity dates, the fingerprint, and the subject alt name spelled out. The parts are read
+         off the certificate as it parses, so a field the certificate does not carry is absent here
+         as it is there. */
+      translatePeerCertificate: function (certificate) {
+        if (certificate === null || typeof certificate !== 'object') return certificate;
+        var translated = {};
+        var names = Object.keys(certificate);
+        for (var nameAt = 0; nameAt < names.length; nameAt++) translated[names[nameAt]] = certificate[names[nameAt]];
+        if (translated.subject !== undefined && translated.subject !== null) {
+          translated.subject = translateDistinguishedName(translated.subject);
+        }
+        if (translated.issuer !== undefined && translated.issuer !== null) {
+          translated.issuer = translateDistinguishedName(translated.issuer);
+        }
+        return translated;
+      }
+    };
+  };
+  /* node spells a distinguished name two ways -- 'C=US, ST=CA, O=Acme' as one string and the same
+     name as an object -- and hands a caller both, so the string is what is split here. */
+  function translateDistinguishedName(name) {
+    if (typeof name !== 'string') return name;
+    var out = Object.create(null);
+    var fields = name.split(',');
+    for (var fieldAt = 0; fieldAt < fields.length; fieldAt++) {
+      var at = fields[fieldAt].indexOf('=');
+      if (at <= 0) continue;
+      out[fields[fieldAt].slice(0, at).trim()] = fields[fieldAt].slice(at + 1).trim();
+    }
+    return out;
+  }
+
+  /* The three private http modules: the agent a request is made through, the request a client
+     makes, the message a client receives, the message a server answers with, and the status codes
+     both spell. Each is the class http itself exports, and the two validators an outgoing message
+     checks a header against are http's own, which is what _http_outgoing hands to its callers. */
+  BF['_http_agent'] = function () {
+    var http = requireBuiltin('http');
+    return { Agent: http.Agent, globalAgent: http.globalAgent };
+  };
+  BF['_http_client'] = function () {
+    return { ClientRequest: requireBuiltin('http').ClientRequest };
+  };
+  BF['_http_incoming'] = function () {
+    var http = requireBuiltin('http');
+    return {
+      IncomingMessage: http.IncomingMessage,
+      /* readStart and readStop are how node's http tells a socket to start and stop flowing, and
+         there is nothing behind them but the stream's own two calls. */
+      readStart: function (socket) { if (socket !== null && typeof socket.resume === 'function') socket.resume(); },
+      readStop: function (socket) { if (socket !== null && typeof socket.pause === 'function') socket.pause(); }
+    };
+  };
+  BF['_http_outgoing'] = function () {
+    var http = requireBuiltin('http');
+    return {
+      OutgoingMessage: http.OutgoingMessage,
+      validateHeaderName: http.validateHeaderName,
+      validateHeaderValue: http.validateHeaderValue
+    };
+  };
+  BF['_http_server'] = function () {
+    var http = requireBuiltin('http');
+    return {
+      STATUS_CODES: http.STATUS_CODES,
+      Server: http.Server,
+      ServerResponse: http.ServerResponse
+    };
+  };
+
+  /* assert/strict is assert itself with every comparison run in strict mode: the same assertion
+     calls, and 'equal' behaving as 'strictEqual'. */
+  BF['assert/strict'] = function () {
+    return requireBuiltin('assert').strict;
+  };
+
+  /*
+   * trace_events: a tracing object over the categories a caller names, and the answer to which
+   * categories are on. Node writes its trace events into a file the process owns; there is no such
+   * file here and no category for one to be enabled on, so enable and disable report success
+   * without writing anything -- as node's own do for a category no producer owns -- and
+   * getEnabledCategories answers undefined, which is what it answers while no tracing is on.
+   */
+  BF['trace_events'] = function () {
+    function Tracing(categories) {
+      this.categories = categories;
+      this.enabled = false;
+    }
+    Tracing.prototype.enable = function () {
+      this.enabled = true;
+      return undefined;
+    };
+    Tracing.prototype.disable = function () {
+      this.enabled = false;
+      return undefined;
+    };
+    return {
+      createTracing: function (options) {
+        var categories = options !== null && typeof options === 'object' && Array.isArray(options.categories)
+          ? options.categories.join(',') : '';
+        return new Tracing(categories);
+      },
+      getEnabledCategories: function () { return undefined; }
+    };
+  };
+
+  /*
+   * node:test: a runner that really runs what a caller hands it. A test is a function the runner
+   * calls, and its promise -- or its throw -- is what decides the pass and the fail; a suite is a
+   * function the runner calls to collect the tests inside it, and the hooks are functions it calls
+   * around them. What this runtime cannot reproduce is the reporter's own voice: a host prints the
+   * duration of every test and the V8 stack of every failure, and neither is a number or a frame
+   * this runtime has. So the shape of the report is the host's -- the mark, the name, the counts
+   * and the list of failures -- and the timings and stacks in it are this runtime's own.
+   * row owc-module-export-table-incomplete.
+   */
+  BF['test'] = function () {
+    var root = { name: undefined, items: [], before: [], after: [], beforeEach: [], afterEach: [] };
+    var cursor = root;
+    var queued = false;
+    var passed = 0;
+    var failed = 0;
+    var skipped = 0;
+    var todos = 0;
+    var suiteCount = 0;
+    var failures = [];
+    var startedAt = 0;
+
+    function line(text) {
+      if (globalThis.console !== undefined && typeof globalThis.console.log === 'function') globalThis.console.log(text);
+    }
+    function durationOf(from) { return (Date.now() - from) + 'ms'; }
+
+    function optionsOf(args) {
+      for (var i = 0; i < args.length; i++) {
+        if (args[i] !== null && typeof args[i] === 'object' && typeof args[i] !== 'function') return args[i];
+      }
+      return {};
+    }
+    /* The name, the options and the function out of a call that may carry any two of the three: a
+       name is a string, options an object, and the test itself the one function among them. */
+    function partsOf(args) {
+      var name = undefined;
+      var options = {};
+      var fn = undefined;
+      for (var i = 0; i < args.length; i++) {
+        var one = args[i];
+        if (typeof one === 'function') fn = one;
+        else if (typeof one === 'string') name = one;
+        else if (one !== null && typeof one === 'object') options = one;
+      }
+      return { name: name, options: options, fn: fn };
+    }
+
+    function addHook(kind, fn) {
+      if (typeof fn !== 'function') return undefined;
+      cursor[kind].push(fn);
+      schedule();
+      return undefined;
+    }
+
+    function addTest(args) {
+      var parts = partsOf(args);
+      var item = { kind: 'test', name: parts.name || '<anonymous>', fn: parts.fn, options: parts.options,
+        skip: parts.options.skip === true, todo: parts.options.todo === true,
+        only: parts.options.only === true, hooks: [] };
+      cursor.items.push(item);
+      schedule();
+      return undefined;
+    }
+
+    function addSuite(args) {
+      var parts = partsOf(args);
+      var suite = { kind: 'suite', name: parts.name || '<anonymous>', fn: parts.fn, options: parts.options,
+        items: [], before: [], after: [], beforeEach: [], afterEach: [], parent: cursor };
+      cursor.items.push(suite);
+      suiteCount += 1;
+      if (typeof parts.fn === 'function') {
+        var outer = cursor;
+        cursor = suite;
+        try {
+          parts.fn();
+        } finally {
+          cursor = outer;
+        }
+      }
+      schedule();
+      return undefined;
+    }
+
+    var draining = null;
+    function schedule() {
+      if (queued) return;
+      queued = true;
+      startedAt = Date.now();
+      draining = new Promise(function (resolve) {
+        setTimeout(function () { runAll().then(resolve, resolve); }, 0);
+      });
+    }
+
+    function callEach(list, context) {
+      var chain = Promise.resolve();
+      list.forEach(function (fn) {
+        chain = chain.then(function () { return fn(context); });
+      });
+      return chain;
+    }
+
+    function hooksAround(item, ancestors) {
+      var beforeEach = [];
+      var afterEach = [];
+      for (var i = 0; i < ancestors.length; i++) {
+        beforeEach = beforeEach.concat(ancestors[i].beforeEach);
+        afterEach = ancestors[i].afterEach.concat(afterEach);
+      }
+      return { before: beforeEach, after: afterEach };
+    }
+
+    function runTest(item, ancestors, depth) {
+      var pad = new Array(depth + 1).join('  ');
+      if (item.skip === true || item.todo === true) {
+        if (item.todo === true) todos += 1; else skipped += 1;
+        line(pad + (item.todo === true ? '~ ' : '- ') + item.name);
+        return Promise.resolve();
+      }
+      var around = hooksAround(item, ancestors);
+      var context = { name: item.name, signal: undefined, diagnostic: function (text) { line(pad + '  ' + text); },
+        skip: function () { line(pad + '- ' + item.name); }, todo: function () { line(pad + '~ ' + item.name); } };
+      var at = Date.now();
+      return callEach(around.before, context).then(function () {
+        return typeof item.fn === 'function' ? item.fn(context) : undefined;
+      }).then(function () {
+        return callEach(around.after, context).then(function () {
+          passed += 1;
+          line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ')');
+        });
+      }, function (err) {
+        return callEach(around.after, context).then(function () {
+          failed += 1;
+          failures.push({ name: item.name, error: err });
+          line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')');
+        }, function () {
+          failed += 1;
+          failures.push({ name: item.name, error: err });
+          line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')');
+        });
+      });
+    }
+
+    function runSuite(suite, ancestors, depth) {
+      var pad = new Array(depth + 1).join('  ');
+      line(pad + '▶ ' + suite.name);
+      var chain = callEach(suite.before, { name: suite.name });
+      var inner = ancestors.concat([suite]);
+      suite.items.forEach(function (item) {
+        chain = chain.then(function () {
+          return item.kind === 'suite' ? runSuite(item, inner, depth + 1) : runTest(item, inner, depth + 1);
+        });
+      });
+      return chain.then(function () { return callEach(suite.after, { name: suite.name }); });
+    }
+
+    function runAll() {
+      var chain = Promise.resolve();
+      var items = root.items.filter(function (item) { return item.only === true; });
+      var chosen = items.length > 0 ? items : root.items;
+      chosen.forEach(function (item) {
+        chain = chain.then(function () {
+          return item.kind === 'suite' ? runSuite(item, [], 0) : runTest(item, [], 0);
+        });
+      });
+      return chain.then(report);
+    }
+
+    function report() {
+      line('ℹ tests ' + (passed + failed + skipped + todos));
+      line('ℹ suites ' + suiteCount);
+      line('ℹ pass ' + passed);
+      line('ℹ fail ' + failed);
+      line('ℹ cancelled 0');
+      line('ℹ skipped ' + skipped);
+      line('ℹ todo ' + todos);
+      line('ℹ duration_ms ' + (Date.now() - startedAt));
+      if (failures.length > 0) {
+        line('');
+        line('✖ failing tests:');
+        line('');
+        failures.forEach(function (one) {
+          line(one.name);
+          line('✖ ' + one.name);
+          line('  ' + String(one.error && one.error.stack ? one.error.stack : one.error));
+        });
+      }
+      return undefined;
+    }
+
+    function test() { return addTest(Array.prototype.slice.call(arguments)); }
+    test.test = test;
+    test.describe = function () { return addSuite(Array.prototype.slice.call(arguments)); };
+    test.suite = test.describe;
+    test.it = test;
+    test.before = function (fn) { return addHook('before', fn); };
+    test.after = function (fn) { return addHook('after', fn); };
+    test.beforeEach = function (fn) { return addHook('beforeEach', fn); };
+    test.afterEach = function (fn) { return addHook('afterEach', fn); };
+    /* mock.fn is a function that remembers how it was called: the arguments of every call and what
+       it answered, which is what an assertion about a double reads. */
+    test.mock = {
+      fn: function (impl) {
+        var calls = [];
+        var spy = function () {
+          var args = Array.prototype.slice.call(arguments);
+          var answer = typeof impl === 'function' ? impl.apply(this, args) : undefined;
+          calls.push({ arguments: args, returnValue: answer });
+          return answer;
+        };
+        spy.mock = { calls: calls, callCount: function () { return calls.length; } };
+        return spy;
+      }
+    };
+    test.run = function () {
+      if (draining === null) return Promise.resolve();
+      return draining;
+    };
+    return test;
+  };
+
+  /*
+   * node:sea is the single-executable-application surface, and this process is not one: it was
+   * started as a script. So isSea answers false and every call that reads an asset out of the
+   * executable answers the error node answers when there is no executable to read one from,
+   * naming the code a caller branches on.
+   */
+  BF['sea'] = function () {
+    function notSingleExecutable() {
+      return nodeError(Error, 'ERR_NOT_IN_SINGLE_EXECUTABLE_APPLICATION',
+        'Operation cannot be invoked when not in a single-executable application');
+    }
+    return {
+      isSea: function () { return false; },
+      getAsset: function () { throw notSingleExecutable(); },
+      getRawAsset: function () { throw notSingleExecutable(); },
+      getAssetAsBlob: function () { throw notSingleExecutable(); },
+      getAssetKeys: function () { throw notSingleExecutable(); }
+    };
   };
 
 })();
