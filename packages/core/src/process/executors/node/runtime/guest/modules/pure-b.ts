@@ -651,8 +651,12 @@ export const SRC = String.raw`
      * A promise reaction registered while a domain is active runs inside it, as it does in Node.
      * Node binds promises through the promise hooks of async_hooks; this is the same binding at
      * the one place a reaction is registered, so domain.active -- and process.domain, which
-     * follows it -- is the domain inside a then, catch or finally callback, and an error thrown
-     * there reaches the domain's 'error' listeners instead of escaping as an uncaught exception.
+     * follows it -- is the domain inside a then, catch or finally callback. What a throw out of one
+     * does is not decided here: bind() does not catch, so the throw becomes a rejection of the
+     * promise then returned, and the domain's 'error' listeners see it only when nothing handled
+     * that rejection -- measured on host node 24.15, where a reaction whose derived promise has a
+     * handler prints 'rejected' and never reaches the domain, and one with no handler prints the
+     * domain's error and no unhandled-rejection warning.
      * The patch is installed on the first domain, so a program that never builds one keeps the
      * engine's own then.
      */
@@ -733,37 +737,15 @@ export const SRC = String.raw`
     };
 
     /*
-     * An error a bound callback throws with no caller left to receive it is what node's fatal
-     * exception path hands to the domain, so this is the shape the timer, tick and promise-reaction
-     * bindings call: the throw is emitted as 'error' when the domain has listeners, else rethrown.
-     */
-    function invokeInDomain(self, fn, thisArg, args) {
-      self.enter();
-      var ret;
-      try {
-        ret = fn.apply(thisArg, args);
-      } catch (err) {
-        self.exit();
-        if (self.listenerCount('error') > 0) {
-          if (isObjectLike(err)) {
-            Object.defineProperty(err, 'domain', { value: self, writable: true, configurable: true });
-            err.domainThrown = true;
-          }
-          self.emit('error', err);
-          return undefined;
-        }
-        throw err;
-      }
-      self.exit();
-      return ret;
-    }
-
-    /*
-     * run() is the one entry node leaves unguarded: it enters, calls and exits with no catch, so a
-     * synchronous throw propagates out of run() to the caller, and -- the exit not being in a
-     * finally -- leaves the domain entered, which is what node 24.15 does too. Emitting it as
-     * 'error' here was the divergence: node routes an error no caller catches, not one the caller
-     * of run() is standing right next to.
+     * run() and the bound callback bind() builds are both node's unguarded entry: enter, call, exit,
+     * with no catch. A synchronous throw therefore propagates out of them to whoever called -- the
+     * caller of run(), or the caller of the bound function -- and, the exit not being in a finally,
+     * leaves the domain entered. Emitting it as 'error' here was the divergence: node routes an
+     * error *no* caller catches, not one the caller is standing right next to. Measured on host node
+     * 24.15, d.bind(() => { throw }) called inside a try prints the caller's catch and carries on,
+     * while the same call with no try prints the domain's 'error' handler and never reaches the
+     * statement after it, because the throw went out through the fatal path to the domain that was
+     * still entered.
      */
     function runInDomain(self, fn, thisArg, args) {
       self.enter();
@@ -783,9 +765,9 @@ export const SRC = String.raw`
      * domain and domainThrown true, as on a host.
      *
      * False when no domain in the chain has an 'error' listener: node falls through to the process
-     * then, so a domain entered with no listener of its own -- and no enclosing one that has one --
-     * prints the 'uncaughtException' handler instead, and one with no handler at all ends the
-     * process.
+     * then, leaving the domain first, so a domain entered with no listener of its own -- and no
+     * enclosing one that has one -- prints the 'uncaughtException' handler outside the domain
+     * instead, and one with no handler at all ends the process.
      */
     function uncaughtInDomain(self, err) {
       /*
@@ -812,6 +794,18 @@ export const SRC = String.raw`
         dom.emit('error', err);
         return true;
       }
+      /*
+       * Nothing in the chain listens, so the process gets the error -- but it gets it with every
+       * domain this error was thrown inside already left. Measured on host node 24.15: a timer bound
+       * to a domain that has no 'error' listener, throwing with an 'uncaughtException' listener
+       * registered, prints that handler with domain._stack at 0, process.domain not the domain and
+       * hasUncaughtExceptionCaptureCallback() false, and a timer that fires afterwards runs outside
+       * the domain. Node leaves the domain before it falls through, so this does too.
+       */
+      if (index !== -1) {
+        stack.splice(index);
+        setActive(index === 0 ? undefined : stack[index - 1]);
+      }
       return false;
     }
     /* the loader asks for this on process.domain: the one place an uncaught error is routed */
@@ -835,7 +829,7 @@ export const SRC = String.raw`
       var self = this;
       installDomainPromiseHook();
       function runBound() {
-        return invokeInDomain(self, cb, this, Array.prototype.slice.call(arguments));
+        return runInDomain(self, cb, this, Array.prototype.slice.call(arguments));
       }
       Object.defineProperty(runBound, 'domain', { value: this, writable: true, configurable: true });
       return runBound;
@@ -853,7 +847,7 @@ export const SRC = String.raw`
           self.emit('error', er);
           return undefined;
         }
-        return invokeInDomain(self, cb, this, args.slice(1));
+        return runInDomain(self, cb, this, args.slice(1));
       }
       return runIntercepted;
     };
