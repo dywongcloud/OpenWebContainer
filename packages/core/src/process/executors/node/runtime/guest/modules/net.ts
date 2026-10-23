@@ -1780,6 +1780,16 @@ BF['net'] = function () {
     return groups.length === 8 ? groups : null;
   }
 
+  /* The eight groups of an IPv4-mapped address ('::ffff:123.123.123.123') as the dotted IPv4 text
+     the kernel renders it in, or null for any other address. inet_ntop writes the mapped form this
+     way, and so does host Node 24.15 in a BlockList rule and in a SocketAddress's own address. */
+  function netMappedIPv4Text(groups) {
+    if (groups[0] !== 0 || groups[1] !== 0 || groups[2] !== 0 || groups[3] !== 0
+      || groups[4] !== 0 || groups[5] !== 0xffff) return null;
+    return '::ffff:' + ((groups[6] >> 8) & 255) + '.' + (groups[6] & 255)
+      + '.' + ((groups[7] >> 8) & 255) + '.' + (groups[7] & 255);
+  }
+
   /* RFC 5952 text: lower case, the first longest run of two or more zero groups compressed */
   function netFormatIPv6(groups) {
     var bestStart = -1;
@@ -1800,6 +1810,8 @@ BF['net'] = function () {
     }
     var hex = [];
     for (i = 0; i < 8; i++) hex.push(groups[i].toString(16));
+    var mapped = netMappedIPv4Text(groups);
+    if (mapped !== null) return mapped;
     if (bestStart < 0) return hex.join(':');
     return hex.slice(0, bestStart).join(':') + '::' + hex.slice(bestStart + bestLength).join(':');
   }
@@ -1818,14 +1830,73 @@ BF['net'] = function () {
     return parsed.family === 'IPv4' ? parsed.units.join('.') : netFormatIPv6(parsed.units);
   }
 
-  /* The type argument of the BlockList methods: 'ipv4' unless told otherwise, as Node defaults it */
-  function netFamilyKind(type) {
-    if (type === undefined || type === null) return 'ipv4';
-    var kind = String(type).toLowerCase();
+  /**
+   * The type argument of the BlockList methods: 'ipv4' unless told otherwise, as Node defaults it.
+   * One that is not a string at all -- a number, or null -- is the type error Node reports for it,
+   * and a string naming no family is an invalid value whose text calls the argument 'options.family',
+   * which is Node's own wording for what the receiver called 'type'.
+   */
+  function netBlockFamily(type) {
+    if (type === undefined) return 'ipv4';
+    if (typeof type !== 'string') {
+      throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "family" argument must be of type string. Received ' + netDescribe(type));
+    }
+    var kind = type.toLowerCase();
     if (kind !== 'ipv4' && kind !== 'ipv6') {
-      throw netError(TypeError, 'ERR_INVALID_ARG_VALUE', "The argument 'type' must be one of: 'ipv4', 'ipv6'. Received " + netDescribe(type));
+      throw netError(TypeError, 'ERR_INVALID_ARG_VALUE',
+        "The property 'options.family' is invalid. Received " + netInspectValue(type));
     }
     return kind;
+  }
+
+  /** An address argument of a BlockList method: Node refuses one that is not a string by type. */
+  function netBlockAddress(value, name) {
+    if (typeof value !== 'string') {
+      throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "' + name + '" argument must be of type string. Received ' + netDescribe(value));
+    }
+    return value;
+  }
+
+  /**
+   * The prefix of a subnet rule: a number, an integer, and within the width of the family it names
+   * -- 32 bits for IPv4, 128 for IPv6 -- with each band answered the way Node 24.15 answers it.
+   */
+  function netBlockPrefix(prefix, total) {
+    if (typeof prefix !== 'number') {
+      throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "prefix" argument must be of type number. Received ' + netDescribe(prefix));
+    }
+    if (!Number.isInteger(prefix)) {
+      throw netError(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "prefix" is out of range. It must be an integer. Received ' + String(prefix));
+    }
+    if (prefix < 0 || prefix > total) {
+      throw netError(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "prefix" is out of range. It must be >= 0 && <= ' + total + '. Received ' + String(prefix));
+    }
+  }
+
+  /**
+   * The flow label of a SocketAddress: a number inside the 32 bits the field holds, and carried only
+   * by an IPv6 address -- IPv4 has no such field, so host Node 24.15 answers 0 whatever it was given.
+   */
+  function netSocketFlowlabel(value, family) {
+    if (value === undefined) return 0;
+    if (typeof value !== 'number') {
+      throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "options.flowlabel" property must be of type number. Received ' + netDescribe(value));
+    }
+    if (!Number.isInteger(value)) {
+      throw netError(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "options.flowlabel" is out of range. It must be an integer. Received ' + String(value));
+    }
+    if (value < 0 || value > 4294967295) {
+      throw netError(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "options.flowlabel" is out of range. It must be >= 0 && <= 4294967295. Received ' + String(value));
+    }
+    return family === 'ipv6' ? value : 0;
   }
 
   function netCompareUnits(a, b) {
@@ -1854,33 +1925,39 @@ BF['net'] = function () {
     }
 
     addAddress(address, type) {
-      var parsed = netAddressOf(String(address), netFamilyKind(type));
-      if (parsed === null) throw netError(TypeError, 'ERR_INVALID_IP_ADDRESS', 'Invalid IP address: ' + String(address));
+      var text = netBlockAddress(address, 'address');
+      var parsed = netAddressOf(text, netBlockFamily(type));
+      if (parsed === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
       this._rules.push({ kind: 'Address', family: parsed.family, units: parsed.units, bits: parsed.bits, text: netTextOf(parsed) });
     }
 
     addRange(start, end, type) {
-      var kind = netFamilyKind(type);
-      var first = netAddressOf(String(start), kind);
-      var last = netAddressOf(String(end), kind);
-      if (first === null || last === null) throw netError(TypeError, 'ERR_INVALID_IP_ADDRESS', 'Invalid IP address');
+      var firstText = netBlockAddress(start, 'start');
+      var lastText = netBlockAddress(end, 'end');
+      var kind = netBlockFamily(type);
+      var first = netAddressOf(firstText, kind);
+      var last = netAddressOf(lastText, kind);
+      if (first === null || last === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
       if (netCompareUnits(first.units, last.units) > 0) {
-        throw netError(RangeError, 'ERR_INVALID_ARG_VALUE', "The argument 'end' must be greater than or equal to 'start'");
+        /* Node names the start it was handed as a SocketAddress, the way inspect prints one. */
+        throw netError(TypeError, 'ERR_INVALID_ARG_VALUE',
+          "The argument 'start' must come before end. Received SocketAddress { address: '"
+          + netTextOf(first) + "', port: 0, family: '" + kind + "', flowlabel: 0 }");
       }
       this._rules.push({ kind: 'Range', family: first.family, units: first.units, end: last.units, bits: first.bits, text: netTextOf(first) + '-' + netTextOf(last) });
     }
 
     addSubnet(network, prefix, type) {
-      var parsed = netAddressOf(String(network), netFamilyKind(type));
-      if (parsed === null) throw netError(TypeError, 'ERR_INVALID_IP_ADDRESS', 'Invalid IP address: ' + String(network));
-      if (typeof prefix !== 'number' || !Number.isInteger(prefix) || prefix < 0 || prefix > parsed.total) {
-        throw netError(RangeError, 'ERR_INVALID_ARG_VALUE', "The argument 'prefix' must be a valid prefix");
-      }
+      var text = netBlockAddress(network, 'network');
+      var parsed = netAddressOf(text, netBlockFamily(type));
+      if (parsed === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
+      netBlockPrefix(prefix, parsed.total);
       this._rules.push({ kind: 'Subnet', family: parsed.family, units: parsed.units, bits: parsed.bits, prefix: prefix, text: netTextOf(parsed) + '/' + prefix });
     }
 
     check(address, type) {
-      var parsed = netAddressOf(String(address), netFamilyKind(type));
+      var text = netBlockAddress(address, 'address');
+      var parsed = netAddressOf(text, netBlockFamily(type));
       if (parsed === null) return false;
       for (var i = 0; i < this._rules.length; i++) {
         var rule = this._rules[i];
@@ -1912,14 +1989,26 @@ BF['net'] = function () {
       var opts = options || {};
       var family = opts.family === undefined ? 'ipv4' : String(opts.family).toLowerCase();
       if (family !== 'ipv4' && family !== 'ipv6') {
-        throw netError(TypeError, 'ERR_INVALID_ARG_VALUE', "The argument 'options.family' must be one of: 'ipv4', 'ipv6'");
+        throw netError(TypeError, 'ERR_INVALID_ARG_VALUE',
+          "The property 'options.family' is invalid. Received " + netInspectValue(opts.family));
       }
-      var address = opts.address === undefined ? (family === 'ipv6' ? '::1' : '127.0.0.1') : String(opts.address);
-      if (netAddressOf(address, family) === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address: ' + address);
-      this._address = address;
+      /* The address of an IPv6 socket with none named is the unspecified '::', not '::1': the
+         SocketAddress host Node 24.15 builds with no address carries the family's own wildcard. */
+      var address = opts.address === undefined ? (family === 'ipv6' ? '::' : '127.0.0.1') : opts.address;
+      if (typeof address !== 'string') {
+        throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+          'The "options.address" property must be of type string. Received ' + netDescribe(address));
+      }
+      var parsed = netAddressOf(address, family);
+      if (parsed === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
+      /* The address a SocketAddress keeps is the one the kernel renders, not the one it was handed:
+         lower case, its longest run of zero groups compressed, a v4-mapped one written in dotted
+         IPv4 -- '2001:DB8::1' is kept as '2001:db8::1' and '::FFFF:7B7B:7B7B' as
+         '::ffff:123.123.123.123'. */
+      this._address = netTextOf(parsed);
       this._family = family;
-      this._port = opts.port === undefined ? 0 : netPortOf(opts.port);
-      this._flowlabel = opts.flowlabel === undefined ? 0 : Number(opts.flowlabel);
+      this._port = opts.port === undefined ? 0 : netPortOf(opts.port, true);
+      this._flowlabel = netSocketFlowlabel(opts.flowlabel, family);
     }
 
     get address() {
@@ -1938,14 +2027,43 @@ BF['net'] = function () {
       return this._flowlabel;
     }
 
+    /** The address as JSON: address, port, family and flow label, in Node's own order. */
+    toJSON() {
+      return { address: this._address, port: this._port, family: this._family, flowlabel: this._flowlabel };
+    }
+
+    /**
+     * An 'address:port' or '[address]:port' string as a SocketAddress, or undefined for one that is
+     * neither. The port is validated but not carried: host Node 24.15 answers 0 for every input,
+     * including '127.0.0.1:80', and undefined for one whose port is outside the 16-bit range.
+     */
     static parse(input) {
-      var text = String(input);
-      var v4 = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)$/.exec(text);
-      if (v4 && netIsIPv4(v4[1])) return new SocketAddress({ address: v4[1], family: 'ipv4', port: Number(v4[2]) });
-      var v6 = /^\[([^\]]+)\]:(\d+)$/.exec(text);
-      if (v6 && netIsIPv6(v6[1])) return new SocketAddress({ address: v6[1], family: 'ipv6', port: Number(v6[2]) });
+      var text = typeof input === 'string' ? input : String(input);
+      var v4 = /^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?$/.exec(text);
+      if (v4 && netIsIPv4(v4[1])) {
+        if (v4[2] !== undefined && Number(v4[2]) > 65535) return undefined;
+        return new SocketAddress({ address: v4[1], family: 'ipv4', port: 0 });
+      }
+      var v6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(text);
+      if (v6 && netIsIPv6(v6[1])) {
+        if (v6[2] !== undefined && Number(v6[2]) > 65535) return undefined;
+        return new SocketAddress({ address: v6[1], family: 'ipv6', port: 0 });
+      }
       return undefined;
     }
+  }
+
+  /* What Node prints for one: its four fields in the order it lists them, not the fields this
+     implementation keeps them in. */
+  var SOCKET_ADDRESS_INSPECT = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
+  if (SOCKET_ADDRESS_INSPECT !== undefined) {
+    Object.defineProperty(SocketAddress.prototype, SOCKET_ADDRESS_INSPECT, {
+      value: function () {
+        return 'SocketAddress { address: ' + netInspectValue(this._address) + ', port: ' + this._port
+          + ', family: ' + netInspectValue(this._family) + ', flowlabel: ' + this._flowlabel + ' }';
+      },
+      writable: true, configurable: true
+    });
   }
 
   function netConnect() {
