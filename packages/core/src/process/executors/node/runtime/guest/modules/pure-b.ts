@@ -131,6 +131,13 @@ export const SRC = String.raw`
     var n = src.length;
     var i = 0;
     var depth = 0;
+    /* Two more depths beside the one the braces give: pd counts the round and the square brackets
+       as well, so a comma inside them is not the comma between two declarators, and fn counts only
+       the braces that open a body -- a function's, a method's, a class's or an object's -- which
+       is the one an await inside is not a top-level await for. */
+    var pd = 0;
+    var fnDepth = 0;
+    var fnStack = [];
     var unterminated = false;
     var last = null;
     while (i < n) {
@@ -185,13 +192,57 @@ export const SRC = String.raw`
       }
       tok.pos = start;
       tok.end = i;
-      if (tok.t === 'punct' && ch === '}') depth--;
+      if (tok.t === 'punct' && ch === '}') {
+        depth--;
+        if (fnStack.pop() === false) fnDepth--;
+      }
+      if (tok.t === 'punct' && (ch === ')' || ch === ']')) pd--;
       tok.depth = depth;
-      if (tok.t === 'punct' && ch === '{') depth++;
+      tok.pd = pd;
+      tok.fn = fnDepth;
+      if (tok.t === 'punct' && ch === '{') {
+        fnStack.push(opensBlock(toks, toks.length));
+        if (fnStack[fnStack.length - 1] === false) fnDepth++;
+        depth++;
+      }
+      if (tok.t === 'punct' && (ch === '(' || ch === '[')) pd++;
       toks.push(tok);
       last = tok;
     }
     return { toks: toks, unterminated: unterminated };
+  }
+
+  /* The words a '{' can stand after that make it a block and not a body: the ones an await inside
+     is still a top-level await for, being a statement of the line rather than of a function. */
+  var BLOCK_OPENERS = { if: true, for: true, while: true, do: true, switch: true, try: true,
+    catch: true, finally: true, else: true, with: true };
+
+  /* Whether the brace being opened at index b of toks is one of those: a ')' before it is the
+     header of an 'if', a 'for' or a 'catch' -- a block -- or of a function or a method -- a body;
+     '=>' opens an arrow's body; and a bare brace, one after a ';', a '{' or a '}', is a block. */
+  function opensBlock(toks, b) {
+    var prev = toks[b - 1];
+    if (prev === undefined) return true;
+    if (prev.t === 'punct') {
+      if (prev.v === '=>') return false;
+      if (prev.v === ';' || prev.v === '{' || prev.v === '}') return true;
+      if (prev.v !== ')') return false;
+      var d = 0;
+      for (var p = b - 1; p >= 0; p--) {
+        if (toks[p].t !== 'punct') continue;
+        if (toks[p].v === ')') d++;
+        else if (toks[p].v === '(') {
+          d--;
+          if (d === 0) {
+            var head = toks[p - 1];
+            return head !== undefined && head.t === 'id' && BLOCK_OPENERS[head.v] === true;
+          }
+        }
+      }
+      return false;
+    }
+    if (prev.t === 'id') return BLOCK_OPENERS[prev.v] === true;
+    return true;
   }
 
   // Names declared by top-level function declarations (depth 0, not property accesses).
@@ -217,9 +268,19 @@ export const SRC = String.raw`
     var cursor = 0;
     for (var k = 0; k < toks.length; k++) {
       var t = toks[k];
-      if (t.t !== 'id' || t.depth !== 0 || (t.v !== 'let' && t.v !== 'const')) continue;
+      if (t.t !== 'id' || t.depth !== 0 || (t.v !== 'let' && t.v !== 'const' && t.v !== 'class')) continue;
       var prev = toks[k - 1];
       if (prev && !(prev.t === 'punct' && (prev.v === ';' || prev.v === '}'))) continue;
+      /* A class binds its name the way a let does, and so loses it at the end of the line here,
+         where Node's context keeps it: written as the var assignment it is -- 'class A {}' as
+         'var A = class A {}' -- the name reaches the next line the way a function's does. */
+      if (t.v === 'class') {
+        var cname = toks[k + 1];
+        if (cname === undefined || cname.t !== 'id') continue;
+        out += src.slice(cursor, t.pos) + 'var ' + cname.v + ' = ';
+        cursor = t.pos;
+        continue;
+      }
       out += src.slice(cursor, t.pos) + 'var';
       cursor = t.end;
     }
@@ -504,13 +565,18 @@ export const SRC = String.raw`
     var toks = vmLex(src).toks;
     var awaited = false;
     for (var q = 0; q < toks.length; q++) {
-      if (toks[q].t !== 'id' || toks[q].v !== 'await' || toks[q].depth !== 0) continue;
+      /* Any await the line carries and no function owns, so one inside the braces of an 'if', a
+         'for' or a 'try' is in: it is a statement of the line still. One inside a function or a
+         class body is not, and is left to fail as the syntax error it is. */
+      if (toks[q].t !== 'id' || toks[q].v !== 'await' || toks[q].fn !== 0) continue;
       var before = toks[q - 1];
       if (before !== undefined && before.t === 'punct' && before.v === '.') continue;
       awaited = true;
       break;
     }
+    if (awaited !== true && templateHasAwait(src) === true) awaited = true;
     if (awaited !== true) return null;
+    function noWrap() { return { awaited: true, code: null }; }
 
     /* The statements of the line, split where a semicolon stands at the top level. */
     var edges = [0];
@@ -542,7 +608,9 @@ export const SRC = String.raw`
       if (first !== null && first.t === 'id' && first.depth === 0 && first.v === 'var') {
         var cuts = [first.end];
         for (var c = 0; c < toks.length; c++) {
-          if (toks[c].t !== 'punct' || toks[c].v !== ',' || toks[c].depth !== 0) continue;
+          /* not a comma a bracket of its own holds: the one in 'var a = await [1, 2]' is
+             inside the array, and splitting on it would leave two declarators that are not */
+          if (toks[c].t !== 'punct' || toks[c].v !== ',' || toks[c].depth !== 0 || toks[c].pd !== 0) continue;
           if (toks[c].pos <= first.end || toks[c].pos >= to) continue;
           cuts.push(toks[c].pos, toks[c].end);
         }
@@ -550,11 +618,11 @@ export const SRC = String.raw`
         var assigned = [];
         for (var d = 0; d + 1 < cuts.length; d += 2) {
           var lead = firstTokenIn(cuts[d], cuts[d + 1]);
-          if (lead === null || lead.t !== 'id') return null;
+          if (lead === null || lead.t !== 'id') return noWrap();
           var rest = src.slice(lead.end, cuts[d + 1]).replace(/^\s+/, '');
           var init = 'undefined';
           if (rest.charAt(0) === '=') init = rest.slice(1);
-          else if (rest !== '') return null;
+          else if (rest !== '') return noWrap();
           hoisted.push(lead.v);
           assigned.push(lead.v + ' = ' + init);
         }
@@ -584,8 +652,8 @@ export const SRC = String.raw`
           }
           if (toks[b].t === 'punct' && toks[b].v === '}' && toks[b].depth === 0) { closed = b; break; }
         }
-        if (named === null || closed < 0) return null;
-        if (src.slice(toks[closed].end, to).replace(/\s+/g, '') !== '') return null;
+        if (named === null || closed < 0) return noWrap();
+        if (src.slice(toks[closed].end, to).replace(/\s+/g, '') !== '') return noWrap();
         hoisted.push(named.v);
         parts.push(named.v + ' = ' + bare);
         continue;
@@ -605,7 +673,66 @@ export const SRC = String.raw`
 
     var wrapper = (hoisted.length === 0 ? '' : 'var ' + hoisted.join(', ') + '; ')
       + '(async function () {\n' + parts.join(';\n') + '\n})()';
-    return compiles(wrapper) ? wrapper : null;
+    /* The line carries an await whether or not the wrapper compiles: it is what decides how a
+       syntax error out of the line is reported, even when the line is left to run as it stands. */
+    return { awaited: true, code: compiles(wrapper) ? wrapper : null };
+  }
+
+  /* The spans a template's substitutions hold -- a dollar and a brace, written apart because this
+     whole module is one template literal. The lexer keeps a whole template as one token, so an
+     await inside one of them is no token at all and has to be looked for where it stands. */
+  function templateHoles(src, start) {
+    var out = [];
+    var n = src.length;
+    var i = start + 1;
+    while (i < n) {
+      var c = src.charAt(i);
+      if (c === '\\') { i += 2; continue; }
+      if (c === '\x60') break;
+      if (c === '$' && src.charAt(i + 1) === '{') {
+        var from = i + 2;
+        var to = skipTemplateExpr(src, from);
+        if (to < 0) break;
+        out.push([from, to - 1]);
+        i = to;
+        continue;
+      }
+      i++;
+    }
+    return out;
+  }
+
+  /* Whether any hole of any template in the line awaits. The word is what decides and nothing
+     else -- a property named await is not one, being preceded by a dot, and a longer name that
+     begins with the word is not either. */
+  function templateHasAwait(src) {
+    var n = src.length;
+    var i = 0;
+    while (i < n) {
+      var c = src.charAt(i);
+      if (c === '\x60') {
+        var holes = templateHoles(src, i);
+        var past = skipTemplate(src, i + 1);
+        i = past < 0 ? n : past;
+        for (var h = 0; h < holes.length; h++) {
+          if (/(^|[^\w$.])await(?![\w$])/.test(src.slice(holes[h][0], holes[h][1]))) return true;
+        }
+        continue;
+      }
+      if (c === '"' || c === "'") { i = skipQuoted(src, i, c); continue; }
+      if (c === '/' && src.charAt(i + 1) === '/') {
+        var nl = src.indexOf('\n', i);
+        i = nl < 0 ? n : nl + 1;
+        continue;
+      }
+      if (c === '/' && src.charAt(i + 1) === '*') {
+        var close = src.indexOf('*/', i + 2);
+        i = close < 0 ? n : close + 2;
+        continue;
+      }
+      i++;
+    }
+    return false;
   }
 
   /* What the wrapper above handed back, with the one key of its own taken off: an object the line
@@ -653,6 +780,20 @@ export const SRC = String.raw`
       return String(err.name) + (err.message ? ': ' + err.message : '');
     }
     return inspectValue(err);
+  }
+
+  /* The two halves of that header, for the one shape that prints them apart: a syntax error out of
+     a line that awaits names the error above the frame and says what is wrong below it. */
+  function replErrorName(err) {
+    if (isObjectLike(err) && typeof err.name === 'string') return String(err.name);
+    return inspectValue(err);
+  }
+
+  function replErrorMessage(err) {
+    if (isObjectLike(err) && err.message !== undefined && err.message !== null && err.message !== '') {
+      return String(err.message);
+    }
+    return replErrorName(err);
   }
 
   function replWriter(value) {
@@ -1421,15 +1562,23 @@ export const SRC = String.raw`
 
     REPLServer.prototype._run = function (src) {
       var code = src;
+      this._awaited = false;
+      this._awaitValue = false;
       if (/^\s*\{/.test(src) && compiles('(' + src + '\n)')) code = '(' + src + '\n)';
       code = rewriteTopLexical(code);
       /* A line with a top-level await runs inside the wrapper instead, and says so: the value the
          promise it hands back resolves to is what the session sees, and the prompt waits for it. */
       var wrapped = replTopLevelAwait(code);
-      this._awaitValue = wrapped !== null;
-      if (this._awaitValue === true) code = wrapped;
-      /* The source the engine was handed, kept for the frame a syntax error is reported with. */
+      /* Whether the line is one Node would have wrapped, which is not whether this one was: Node
+         looks no further than the six letters, so 'var awaited = ;' and an await inside a string
+         are as much an awaiting line to it as one that awaits, and a syntax error out of any of
+         them is worded the way an awaiting line's is. */
+      this._awaited = code.indexOf('await') >= 0;
+      this._awaitValue = wrapped !== null && wrapped.code !== null;
+      /* The source the engine was handed, kept for the frame a syntax error is reported with: the
+         line as it was written, and not the wrapper, which is what Node underlines too. */
       this._code = code;
+      if (this._awaitValue === true) code = wrapped.code;
       if (this.useGlobal) return (0, eval)(code);
       return vm.runInContext(code, this.context);
     };
@@ -1447,8 +1596,16 @@ export const SRC = String.raw`
       try {
         result = this._run(src);
       } catch (err) {
-        this._writeOut(replErrorFrame(this._code === undefined ? src : this._code, err) +
-          'Uncaught ' + replErrorHeader(err) + '\n');
+        /* A line that carries an await is compiled inside the wrapper, and Node reports the
+           syntax error out of that compile with the header first and the message last: 'Uncaught
+           SyntaxError: ', then the offending line and the caret, then the words. Any other line
+           is the other way round -- the frame first, and then 'Uncaught' and the words. */
+        var frame = replErrorFrame(this._code === undefined ? src : this._code, err);
+        if (this._awaited === true && isObjectLike(err) && err.name === 'SyntaxError') {
+          this._writeOut('Uncaught ' + replErrorName(err) + ': \n' + frame + replErrorMessage(err) + '\n');
+          return false;
+        }
+        this._writeOut(frame + 'Uncaught ' + replErrorHeader(err) + '\n');
         return false;
       }
       if (this._awaitValue === true && isObjectLike(result) && typeof result.then === 'function') {
