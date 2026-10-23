@@ -2762,16 +2762,34 @@ function owcBuildStreamCore() {
   /* Node calls a function that takes no argument at once and takes what it answers as the next link
      in the chain; one that takes the source is a generator over it, and what it answers is read as
      an iterable even when it is a stream. */
+  /* An async function body has to answer null or undefined: anything else is an unhandled
+     ERR_INVALID_RETURN_VALUE on the host, thrown out of the promise's own reaction and not out of
+     the duplex, and it is that rejection -- not the stream -- that ends the process. */
+  function nullyBodyError(val) {
+    return owcErr(TypeError, 'ERR_INVALID_RETURN_VALUE',
+      'Expected nully to be returned from the "body" function but got ' + describeReceived(val).replace(/^ Received /, '') + '.');
+  }
+
+  function checkAsyncBody(answered) {
+    if (answered === null || typeof answered !== 'object') return;
+    if (typeof answered.next === 'function' || typeof answered.then !== 'function') return;
+    answered.then(function (val) {
+      if (val !== null && val !== undefined) throw nullyBodyError(val);
+    });
+  }
+
   function funcToDuplex(fn) {
     if (typeof fn !== 'function') return fn;
     if (fn.length === 0) {
       var made = fn();
+      checkAsyncBody(made);
       if (made === null || typeof made !== 'object') return bodyValue(made);
       if (typeof made.next === 'function') return iteratorToDuplex(made, new PassThrough({ objectMode: true }));
       return bodyValue(made);
     }
     var source = new PassThrough({ objectMode: true });
     var iterator = fn(source);
+    checkAsyncBody(iterator);
     if (iterator === null || typeof iterator !== 'object') return bodyValue(iterator);
     if (typeof iterator.next !== 'function') {
       /* A string or a Buffer answered by a body of one argument is one chunk, as Node reads it, and
