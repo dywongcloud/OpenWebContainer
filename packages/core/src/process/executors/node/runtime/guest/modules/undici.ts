@@ -816,16 +816,21 @@ function boundaryOf(headers) {
 function splitMultipart(bytes, boundary) {
   var text = bytes.toString('latin1');
   var delimiter = '--' + boundary;
-  var parts = text.split('\r\n' + delimiter);
+  /* Split on the delimiter itself rather than on a line break in front of it: the opening
+     delimiter stands at the very start of the body, with no line break before it, so a split that
+     demanded one left the first part looking like the closing delimiter and dropped every part. */
+  var parts = text.split(delimiter);
   var out = [];
-  for (var i = 0; i < parts.length; i++) {
+  /* From the first part on: what precedes the opening delimiter is the preamble, which is no part. */
+  for (var i = 1; i < parts.length; i++) {
     var chunk = parts[i];
-    if (i > 0) chunk = chunk.replace(/^[^\S\r\n]*\r\n/, '');
+    /* The closing delimiter is the one two more dashes follow; what is after it is the epilogue. */
+    if (chunk.slice(0, 2) === '--') break;
+    chunk = chunk.replace(/^[^\S\r\n]*\r\n/, '');
     var head = chunk.indexOf('\r\n\r\n');
     if (head < 0) continue;
     var headerText = chunk.slice(0, head);
     if (headerText.indexOf(':') < 0) continue;
-    if (chunk.slice(0, 2) === '--') break;
     out.push({ headers: headerText, body: chunk.slice(head + 4).replace(/\r\n$/, '') });
   }
   return out;

@@ -862,17 +862,56 @@ BF.events = function () {
   EventEmitter.listenerCount = function (emitter, type) {
     return emitter.listenerCount(type);
   };
-  /* events.once: resolves with the argument array; the error listener it added is removed once the event arrives */
-  EventEmitter.once = function (emitter, name) {
+  /*
+   * events.once: resolves with the argument array; the error listener it added is removed once the
+   * event arrives. options.signal settles the promise the moment it aborts -- Node rejects it with
+   * an AbortError and takes both listeners off the emitter, so a caller awaiting a signal that
+   * never comes takes its error path instead of hanging for as long as the process runs.
+   */
+  function receivedAs(value) {
+    if (value === undefined) return 'undefined';
+    if (value === null) return 'null';
+    return 'type ' + typeof value + ' (' + String(value) + ')';
+  }
+  function abortErrorFor(signal) {
+    var err = new Error('The operation was aborted');
+    err.name = 'AbortError';
+    err.code = 'ABORT_ERR';
+    try {
+      var reason = signal === undefined || signal === null ? undefined : signal.reason;
+      if (reason !== undefined) err.cause = reason;
+    } catch (e) { /* a reason getter that throws is not the error's business */ }
+    return err;
+  }
+  EventEmitter.once = function (emitter, name, options) {
+    var signal = options === undefined || options === null ? undefined : options.signal;
     return new Promise(function (resolve, reject) {
+      if (signal !== undefined && signal !== null && signal.aborted) {
+        reject(abortErrorFor(signal));
+        return;
+      }
+      var onAbort = undefined;
+      function detach() {
+        if (onAbort !== undefined) { signal.removeEventListener('abort', onAbort); onAbort = undefined; }
+      }
       var onEvent = function () {
+        detach();
         if (name !== 'error') emitter.removeListener('error', onError);
         resolve(Array.prototype.slice.call(arguments));
       };
       var onError = function (err) {
+        detach();
         emitter.removeListener(name, onEvent);
         reject(err);
       };
+      if (signal !== undefined && signal !== null) {
+        onAbort = function () {
+          emitter.removeListener(name, onEvent);
+          if (name !== 'error') emitter.removeListener('error', onError);
+          reject(abortErrorFor(signal));
+        };
+        signal.addEventListener('abort', onAbort);
+      }
       emitter.once(name, onEvent);
       if (name !== 'error') emitter.once('error', onError);
     });
@@ -947,6 +986,77 @@ BF.events = function () {
       for (var i = 0; i < targets.length; i++) targets[i].setMaxListeners(limit);
     }
   };
+  /*
+   * The three names Node's events module carries that this one did not: usingDomains (false, since
+   * this runtime has no domain module), addAbortListener (an abort listener plus a disposable that
+   * takes it off again), and EventEmitterAsyncResource -- an EventEmitter whose listeners run
+   * inside an AsyncResource of its own, so async context survives an emit the way it does on a host.
+   */
+  EventEmitter.usingDomains = false;
+  EventEmitter.addAbortListener = function (signal, listener) {
+    if (signal === undefined || signal === null || typeof signal.addEventListener !== 'function') {
+      var bad = new TypeError('The "signal" argument must be an instance of AbortSignal. Received ' + receivedAs(signal));
+      bad.code = 'ERR_INVALID_ARG_TYPE';
+      throw bad;
+    }
+    if (typeof listener !== 'function') {
+      var badListener = new TypeError('The "listener" argument must be of type function. Received ' + receivedAs(listener));
+      badListener.code = 'ERR_INVALID_ARG_TYPE';
+      throw badListener;
+    }
+    var remove = function () { signal.removeEventListener('abort', listener); };
+    if (signal.aborted) {
+      remove = function () { /* an aborted signal never fires again, so there is nothing to take off */ };
+    } else {
+      signal.addEventListener('abort', listener);
+    }
+    var disposable = {};
+    disposable[Symbol.dispose] = remove;
+    return disposable;
+  };
+
+  var EE_AR_RESOURCE = typeof Symbol === 'function' ? Symbol('kEventEmitterAsyncResource') : '__eeAsyncResource';
+  function EventEmitterAsyncResource(options) {
+    var opts = options;
+    if (typeof opts === 'string') opts = { name: opts };
+    var name = opts === undefined || opts === null ? undefined : opts.name;
+    if (typeof name !== 'string') {
+      var err = new TypeError('The "options.name" property must be of type string. Received ' + receivedAs(name));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    EventEmitter.call(this, opts);
+    var hooks = requireBuiltin('async_hooks');
+    var resource = new hooks.AsyncResource(name, {
+      triggerAsyncId: opts.triggerAsyncId,
+      executionAsyncResource: opts.executionAsyncResource
+    });
+    Object.defineProperty(this, EE_AR_RESOURCE, { value: resource, writable: true, configurable: true });
+  }
+  EventEmitterAsyncResource.prototype = Object.create(EventEmitter.prototype);
+  Object.defineProperty(EventEmitterAsyncResource.prototype, 'constructor', {
+    value: EventEmitterAsyncResource, writable: true, configurable: true
+  });
+  /* Every listener runs inside the resource's scope: the emit is the async frame a listener sees. */
+  EventEmitterAsyncResource.prototype.emit = function () {
+    var resource = this[EE_AR_RESOURCE];
+    var args = Array.prototype.slice.call(arguments);
+    args.unshift(EventEmitter.prototype.emit, this);
+    return resource.runInAsyncScope.apply(resource, args);
+  };
+  EventEmitterAsyncResource.prototype.emitDestroy = function () {
+    this[EE_AR_RESOURCE].emitDestroy();
+  };
+  Object.defineProperty(EventEmitterAsyncResource.prototype, 'asyncId', {
+    get: function () { return this[EE_AR_RESOURCE].asyncId(); }, configurable: true
+  });
+  Object.defineProperty(EventEmitterAsyncResource.prototype, 'triggerAsyncId', {
+    get: function () { return this[EE_AR_RESOURCE].triggerAsyncId(); }, configurable: true
+  });
+  Object.defineProperty(EventEmitterAsyncResource.prototype, 'asyncResource', {
+    get: function () { return this[EE_AR_RESOURCE]; }, configurable: true
+  });
+  EventEmitter.EventEmitterAsyncResource = EventEmitterAsyncResource;
   return EventEmitter;
 };
 `;
