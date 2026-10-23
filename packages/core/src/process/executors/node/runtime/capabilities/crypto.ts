@@ -342,7 +342,8 @@ type CipherMode =
     | 'wrap'
     | 'wrappad'
     | 'ccm'
-    | 'ocb';
+    | 'ocb'
+    | 'cmswrap';
 
 interface CipherSpec {
     mode: CipherMode;
@@ -524,8 +525,8 @@ function addAlias(name: string, spec: CipherSpec): void {
     addCipher('des-ede3-ecb', { mode: 'ecb', keyLength: 24, blockSize: 8, ivLength: 0, blockBytes: 8, aead: false, primitive: 'des3' });
     addCipher('des-ede3-ofb', { mode: 'ofb', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
     addCipher('des3', { mode: 'cbc', keyLength: 24, blockSize: 8, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
-    addCipher('des3-wrap', { mode: 'wrap', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
-    addCipher('id-smime-alg-CMS3DESwrap', { mode: 'wrap', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des3-wrap', { mode: 'cmswrap', keyLength: 24, blockSize: 1, ivLength: 0, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('id-smime-alg-CMS3DESwrap', { mode: 'cmswrap', keyLength: 24, blockSize: 1, ivLength: 0, blockBytes: 8, aead: false, primitive: 'des3' });
     addCipher('sm4', { mode: 'cbc', keyLength: 16, blockSize: 16, ivLength: 16, aead: false, primitive: 'sm4' });
     addCipher('sm4-cbc', { mode: 'cbc', keyLength: 16, blockSize: 16, ivLength: 16, aead: false, primitive: 'sm4' });
     addCipher('sm4-cfb', { mode: 'cfb', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'sm4' });
@@ -1827,6 +1828,54 @@ function aesWrapPad(p: BlockPrimitive, key: Uint8Array, aiv: Uint8Array, data: U
     return aesWrap(p, key, a, padded);
 }
 
+/* The CMS 3DES key wrap (RFC 3217): an eight-byte integrity check value ahead of the content,
+ * the whole sealed in CBC, and then the blocks written back to front with the IV the wrap started
+ * from. OpenSSL draws that IV afresh for every call, so what a caller gets differs each time and
+ * only the width is fixed: sixteen bytes more than went in. */
+
+function cmsBlocks(data: Uint8Array): Uint8Array[] {
+    const blocks: Uint8Array[] = [];
+    for (let at = 0; at < data.length; at += 8) blocks.push(data.subarray(at, at + 8));
+    return blocks;
+}
+
+function cmsReverse(data: Uint8Array): Uint8Array {
+    const out = new Uint8Array(data.length);
+    const blocks = cmsBlocks(data);
+    for (let i = 0; i < blocks.length; i++) out.set(blocks[i], (blocks.length - 1 - i) * 8);
+    return out;
+}
+
+function cmsCbc(state: CipherState, iv: Uint8Array, data: Uint8Array, decrypt: boolean): Uint8Array {
+    const p = primitiveOf(state.spec);
+    const block = (bytes: Uint8Array): Uint8Array => decrypt ? p.decrypt(state.key, bytes) : p.encrypt(state.key, bytes);
+    const out = new Uint8Array(data.length);
+    let chain = Uint8Array.from(iv);
+    for (let at = 0; at < data.length; at += 8) {
+        const source = data.subarray(at, at + 8);
+        const opened = decrypt ? block(source) : block(xorInto(source, chain));
+        for (let i = 0; i < 8; i++) out[at + i] = decrypt ? opened[i] ^ chain[i] : opened[i];
+        chain = decrypt ? Uint8Array.from(source) : Uint8Array.from(out.subarray(at, at + 8));
+    }
+    return out;
+}
+
+function cmsWrap(state: CipherState, data: Uint8Array): Uint8Array {
+    const iv = randomOf(8);
+    const icv = sha1(data).subarray(0, 8);
+    return concatBytes(iv, cmsReverse(cmsCbc(state, iv, concatBytes(icv, data), false)));
+}
+
+function cmsUnwrap(state: CipherState, data: Uint8Array): Uint8Array {
+    if (data.length < 24 || data.length % 8 !== 0) throw wrapIntegrity();
+    const iv = data.subarray(0, 8);
+    const opened = cmsCbc(state, iv, cmsReverse(data.subarray(8)), true);
+    const content = opened.subarray(8);
+    const icv = sha1(content).subarray(0, 8);
+    for (let i = 0; i < 8; i++) if (icv[i] !== opened[i]) throw wrapIntegrity();
+    return content;
+}
+
 /** A wrap whose integrity check fails: the words OpenSSL uses for a wrap it cannot unwrap. */
 function wrapIntegrity(): never {
     return cipherFail(null, 'Trying to add data in unsupported state');
@@ -1896,6 +1945,10 @@ function cipherUpdate(state: CipherState, input: Uint8Array): Uint8Array {
        are two wraps, not one of thirty-two. RFC 3394 wraps two blocks or more and nothing between,
        so a length that is not a whole number of blocks, or is shorter than two, is refused rather
        than wrapped as far as it goes; empty input wraps nothing and leaves the cipher open. */
+    if (state.spec.mode === 'cmswrap') {
+        if (input.length === 0) return new Uint8Array(0);
+        return state.direction === 'encrypt' ? cmsWrap(state, input) : cmsUnwrap(state, input);
+    }
     if (state.spec.mode === 'wrap' || state.spec.mode === 'wrappad') {
         const encrypt = state.direction === 'encrypt';
         if (input.length === 0) return new Uint8Array(0);
