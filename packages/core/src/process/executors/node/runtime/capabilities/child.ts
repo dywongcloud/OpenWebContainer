@@ -85,6 +85,8 @@ interface ChildRecord {
     queue: unknown[];
     exited: boolean;
     killSignal?: string;
+    /** Set when the spawn's own `timeout` is what ended the child, which is what `killed` reports. */
+    timedOut?: boolean;
 }
 
 interface Registry {
@@ -191,7 +193,7 @@ function attachChildListeners(record: ChildRecord, child: Process): void {
         registryByPidOf(record).delete(child.pid);
         const signal = record.killSignal ?? null;
         const code = signal === null ? (data.exitCode ?? 0) : null;
-        later(() => record.parent.deliver(record.target, 'ev', { k: 'exit', code, signal }));
+        later(() => record.parent.deliver(record.target, 'ev', { k: 'exit', code, signal, timedOut: record.timedOut === true }));
     });
 }
 
@@ -214,6 +216,8 @@ const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
     /* A node child whose stdin is a pipe keeps process.stdin open until the parent ends it, as Node
        does: the guest reads OWC_STDIN at bootstrap and drops it from the environment before user code. */
     if (modeOf(stdio[0]) === 'pipe' && (file === 'node' || file.endsWith('.js'))) env.OWC_STDIN = 'pipe';
+    const timeoutMs = Number(args.timeout) > 0 ? Number(args.timeout) : 0;
+    const killSignal = typeof args.killSignal === 'string' ? args.killSignal : 'SIGTERM';
     const record: ChildRecord = {
         token: String(args.token),
         kind: String(args.kind),
@@ -242,6 +246,16 @@ const spawnChildAsync: CapabilityHandler = async (args, ctx) => {
                 registry.pending.delete(record.token);
                 registry.byPid.set(started.pid, record);
                 attachChildListeners(record, started);
+                /* `timeout`: the caller's own timer cannot end a child that holds the host thread, so
+                   the bound is put on the child itself -- see armKillDeadline in node/process.ts. The
+                   callback marks the record with the signal, which is what the parent reports. */
+                if (timeoutMs > 0) {
+                    const arm = (started as { armKillDeadline?: (ms: number, signal: string, onFire: () => void) => void }).armKillDeadline;
+                    if (typeof arm === 'function') arm.call(started, timeoutMs, killSignal, () => {
+                        record.killSignal = killSignal;
+                        record.timedOut = true;
+                    });
+                }
             }
         })
         .catch((error: unknown) => {
@@ -427,6 +441,13 @@ function executableOf(file: string): string {
  * it was required.
  */
 function spawnExecutableOf(ctx: CapabilityContext, file: string, env: Record<string, string>, cwd: string): string {
+    /* The path the container's own shell is known by -- `/bin/sh`, the path a host's node runs an
+       `exec` through and the one a program that shells out by absolute path names. It is the shell
+       itself on a host, so here it names the executor and not a file: see `shellPathOf`. The path is
+       kept as it was given and not rewritten to the bare name, because it is also the name the shell
+       is started under -- the `$0` a host's `exec('echo $0')` answers with `/bin/sh` where a
+       `spawn('sh', ...)` answers `sh`, and the prefix of every diagnostic the shell writes. */
+    if (shellPathOf(ctx, file, env, cwd)) return file;
     /* `sh` and `node` are the container's own executors and are named as they are, never by a path;
        `npm` and `npx` are the npm process, which PATH also has an entry for and which has to stay
        that process -- a spawn of it as a file would run the shell's npm, which refuses everywhere
@@ -440,6 +461,42 @@ function spawnExecutableOf(ctx: CapabilityContext, file: string, env: Record<str
     const interpreter = shebangInterpreter(ctx.fileSystem, found);
     return interpreter === 'node' || interpreter === 'sh' || interpreter === 'bash' ? found : file;
 }
+
+/**
+ * True when `file` is a path this container's own shell stands at, so the path names the shell and
+ * not a file to run.
+ *
+ * The file system keeps a stand-in at /bin/sh: a file whose whole content is a shebang naming the
+ * shell. A spawn of that path ran the stand-in *as a script* -- `sh /bin/sh -c <line>` runs no
+ * command at all -- so the child closed 0 with empty stdout, empty stderr and no error, and every
+ * `exec()` silently succeeded while `execSync`, which names the shell to the dispatcher, ran its
+ * line. The shell is not a file a host reads there: it *is* the shell, which is what the path has
+ * to mean. `/bin/ls` is a stand-in of the same shape with `ls "$@"` behind its shebang and stays a
+ * script; only a file with nothing behind the shebang is the shell.
+ */
+function shellPathOf(ctx: CapabilityContext, file: string, env: Record<string, string>, cwd: string): boolean {
+    if (!file.startsWith('/') || file.split('/').pop() !== 'sh') return false;
+    if (!SHELL_DIRECTORIES.some((directory) => file === `${directory}/sh`)
+        && resolveOnPath({ ctx, cwd, env, input: null, lastStatus: 0 }, 'sh') !== file) {
+        return false;
+    }
+    let content: string | undefined;
+    try {
+        content = ctx.fileSystem.readFile(ctx.fileSystem.normalizePath(file));
+    } catch {
+        return false;
+    }
+    if (content === undefined) return false;
+    const line = content.split('\n')[0] ?? '';
+    if (content.slice(line.length).trim() !== '') return false;
+    const shebang = /^#!(.*)/.exec(line);
+    if (shebang === null) return false;
+    const interpreter = shebang[1].trim().split(/\s+/).filter((token) => token !== '')[0];
+    return interpreter !== undefined && interpreter.split('/').pop() === 'sh';
+}
+
+/** The directories a host's `sh` stands in, whichever of them this container's PATH happens to hold. */
+export const SHELL_DIRECTORIES = ['/bin', '/usr/bin', '/sbin', '/usr/sbin'];
 
 /** The names the container runs itself, so a spawn of one is never rewritten into a file on PATH. */
 const CONTAINER_EXECUTABLES = new Set(['node', 'npm', 'npx', 'sh', 'bash']);

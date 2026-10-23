@@ -4,12 +4,19 @@ import { ShellProcess } from './process';
 import { ChildProcessPayload, Process } from '../../base';
 import type { NetworkHandle } from '../../../shell/commands/types';
 import { containerEnv } from '../default-env';
+import { SHELL_DIRECTORIES } from '../node/runtime/capabilities/child';
 
 export class ShellProcessExecutor implements ProcessExecutor {
     constructor(private fileSystem: IFileSystem, private network?: NetworkHandle) { }
 
+    /**
+     * `sh` is the bare name a spawn of this container's shell is given, and `/bin/sh` and the rest
+     * are the paths it stands at -- the one a host's `exec` runs it through. Both name the shell,
+     * and which one it was started under is what `$0` answers and what a diagnostic is prefixed
+     * with, so the path is kept and recognised here rather than rewritten to the bare name.
+     */
     canExecute(executable: string): boolean {
-        return executable === 'sh';
+        return executable === 'sh' || SHELL_DIRECTORIES.some((directory) => executable === `${directory}/sh`);
     }
 
     async execute(payload: ChildProcessPayload, pid: number, parantPid?: number): Promise<Process> {
