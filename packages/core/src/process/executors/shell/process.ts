@@ -764,9 +764,14 @@ export class ShellProcess extends Process {
         if (this.shell.isCompound(commandLine)) {
             const steps = splitCompoundLine(commandLine);
             /* The bound the caller put on this spawn is only honoured between the steps of the line:
-               a step that holds the host thread holds the timer too. Without a bound there is no
-               reason to take the line apart, and the engine runs it whole, as it always has. */
-            if (steps !== null && (this.killDeadlineAt > 0 && steps.length > 1
+               a step that holds the host thread holds the timer too. A caller's own line is taken
+               apart for the other reason there is: a host's `sh -c <line>` writes what a command
+               wrote as that command runs, so `echo A; sleep 2` reaches its caller at once and not
+               two seconds later, and collecting every step's output to write it once the line ends
+               is what puts it after that moment -- which is also the moment a `timeout` ends the
+               line, and then the caller gets nothing at all. A line typed into the loop below is
+               a screen that loop redraws, and has no caller waiting on a pipe. */
+            if (steps !== null && (steps.length > 1 && (this.streamsSteps() || this.killDeadlineAt > 0)
                 || steps.some((step) => this.shell.isSpawnedCommand(spawnedAs(firstWordOf(step.text)))))) {
                 const run = await this.executeSteps(steps);
                 if (this.shell.stopped) {
@@ -883,12 +888,15 @@ export class ShellProcess extends Process {
      * under the caller's `timeout` would sit out the whole sleep and never see the bound. A bounded
      * line therefore waits on a timer instead, and only until the bound runs out: the thread is
      * free meanwhile, the bound fires, and the line stops where it stands, as a host's `sh` does.
-     * With no bound there is nothing to interrupt, and the engine runs the step as it always has.
+     * A line with no bound waits on that timer too, for the sleep's own whole wait: the thread a
+     * blocked one takes is what keeps what a step before it wrote from reaching the caller until
+     * the line ends -- `sh -c 'echo A; sleep 2'` gave its caller 'A\n' two seconds late, where a
+     * host gives it at once.
      */
     private async runEngineLine(text: string, input: string | null): Promise<ShellCommandResult> {
-        const ms = this.killDeadlineAt > 0 ? sleepMsOf(text) : null;
+        const ms = sleepMsOf(text);
         if (ms === null) return this.shell.executeLine(text, input);
-        const left = this.killDeadlineAt - Date.now();
+        const left = this.killDeadlineAt > 0 ? this.killDeadlineAt - Date.now() : ms;
         if (left > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(ms, left)));
         /* An `exec` that was given its whole wait replaced the shell with the command it named, the
            way it does on a host, so the rest of the line stands behind a command that is no longer

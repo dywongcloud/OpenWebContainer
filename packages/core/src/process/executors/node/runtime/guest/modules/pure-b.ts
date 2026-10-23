@@ -297,21 +297,98 @@ export const SRC = String.raw`
      inside its parens and one a block keeps inside its braces are at a depth that is not 0, and
      a name that is not an identifier -- a destructuring pattern, a generator's star -- is left
      out rather than guessed at. */
+  /* The names one declarator binds: the identifier itself, or every binding position of a
+     destructuring pattern -- 'let [w] = [1]' binds w, 'const { a: b } = x' binds b and not the
+     key a, 'let { c } = x' binds c, and a default value or a computed key of a pattern is read
+     and not bound. */
+  /* The index of the token that closes the bracket opened at 'from', or the last index there is. */
+  function replSkipGroup(toks, from) {
+    var open = toks[from];
+    var close = open.v === '(' ? ')' : (open.v === '[' ? ']' : '}');
+    var level = open.pd;
+    for (var k = from + 1; k < toks.length; k++) {
+      var p = toks[k];
+      if (p.t === 'punct' && p.v === close && p.pd === level) return k;
+    }
+    return toks.length - 1;
+  }
+
+  function replDeclNames(toks, from) {
+    var names = [];
+    var open = toks[from];
+    if (open === undefined) return names;
+    if (open.t === 'id') { names.push(open.v); return names; }
+    if (open.t !== 'punct' || (open.v !== '[' && open.v !== '{')) return names;
+    var obj = open.v === '{';
+    var level = open.pd;
+    var k = from + 1;
+    while (k < toks.length) {
+      var p = toks[k];
+      if (p.t === 'punct') {
+        /* The closer of the pattern itself: nothing after it belongs to it. */
+        if ((p.v === ']' || p.v === '}') && p.pd === level) break;
+        /* A computed key's expression: read, never bound. */
+        if (p.v === '[' || p.v === '(') { k = replSkipGroup(toks, k) + 1; continue; }
+        /* A default value: 'let { a = b }' binds a and only reads b. */
+        if (p.v === '=') {
+          k++;
+          while (k < toks.length) {
+            var s = toks[k];
+            if (s.t === 'punct' && (s.v === ',' ? s.pd === level + 1
+                : ((s.v === '}' || s.v === ']') && s.pd === level))) break;
+            k++;
+          }
+          continue;
+        }
+        k++;
+        continue;
+      }
+      var nx = toks[k + 1];
+      /* '{ a: b }': the name in front of the colon is the key the pattern reads, not one it binds. */
+      if (p.t === 'id' && !(obj && nx !== undefined && nx.t === 'punct' && nx.v === ':')) names.push(p.v);
+      k++;
+    }
+    return names;
+  }
+
   function replTopDecls(src) {
     var toks = vmLex(src).toks;
     var lexical = [];
     var loose = [];
     for (var k = 0; k < toks.length; k++) {
       var t = toks[k];
-      if (t.t !== 'id' || t.depth !== 0) continue;
+      if (t.t !== 'id' || t.depth !== 0 || t.pd !== 0) continue;
       var lexicalKind = t.v === 'let' || t.v === 'const' || t.v === 'class';
       if (lexicalKind !== true && t.v !== 'var' && t.v !== 'function') continue;
       var prev = toks[k - 1];
-      if (prev && !(prev.t === 'punct' && (prev.v === ';' || prev.v === '}'))) continue;
-      var nx = toks[k + 1];
-      if (nx === undefined || nx.t !== 'id') continue;
-      if (lexicalKind) lexical.push(nx.v);
-      else loose.push(nx.v);
+      var starts = prev === undefined || (prev.t === 'punct' && (prev.v === ';' || prev.v === '}'));
+      /* 'async function f(){}' opens with the word in front of 'function', which is itself at the
+         start of a declaration and not, say, the tail of 'x = async function'. */
+      if (starts !== true && prev !== undefined && prev.t === 'id' && prev.v === 'async') {
+        var pre = toks[k - 2];
+        starts = pre === undefined || (pre.t === 'punct' && (pre.v === ';' || pre.v === '}'));
+      }
+      if (starts !== true) continue;
+      /* Every declarator of the declaration, not only the first: 'let p = 1, q = 2' binds q too.
+         A comma of a declarator list is at the depth and the bracket level the keyword is; one of
+         an initialiser, of an argument list or of a pattern's own group is not. */
+      var c = k + 1;
+      for (;;) {
+        var one = replDeclNames(toks, c);
+        for (var j = 0; j < one.length; j++) {
+          if (lexicalKind === true) lexical.push(one[j]);
+          else loose.push(one[j]);
+        }
+        var next = -1;
+        for (var m = c; m < toks.length; m++) {
+          var s = toks[m];
+          if (s.t !== 'punct' || s.depth !== t.depth || s.pd !== 0) continue;
+          if (s.v === ',') { next = m + 1; break; }
+          if (s.v === ';' || s.v === '}') { m = toks.length; break; }
+        }
+        if (next < 0) break;
+        c = next;
+      }
     }
     return { lexical: lexical, loose: loose };
   }
@@ -367,6 +444,35 @@ export const SRC = String.raw`
     } catch (e) {
       return false;
     }
+  }
+
+  /* A 'throw 1;' put in front of the line throws before the first statement of the line can, so
+     nothing of the line runs whether it parses or not -- which is what lets the parse be tried at
+     all. A function body is not a script: '{ return 1 }' is one a 'new Function' takes and a
+     script does not, so 'compiles' answers true for a line no script will run. */
+  var SCRIPT_PROBE = 'throw 1;';
+
+  function scriptParses(code) {
+    try {
+      (0, eval)(SCRIPT_PROBE + code);
+    } catch (e) {
+      return !(isObjectLike(e) && e.name === 'SyntaxError');
+    }
+    return true;
+  }
+
+  /* Whether node would call the line syntactically valid, which is what it asks before it wraps a
+     line that opens with a brace: the line parses, or it parses with its 'await's taken out, the
+     way node's own isValidSyntax asks -- '{ await 3 }' becomes '{  3 }' and is wrapped, while
+     '{ yield 3 }' and '{ return 1 }' parse neither way and are left as they were written. */
+  function replIsValidSyntax(code) {
+    /* Node asks twice: does the line parse as it stands, and does it parse where an expression is
+       wanted -- '{ "a": 1 }' is not a program and is an object, so the second reading is the one
+       that makes it a line worth wrapping. */
+    if (scriptParses(code) || scriptParses('_=' + code)) return true;
+    var noAwait = String(code).replace(/\bawait\b/g, '');
+    if (noAwait === code) return false;
+    return scriptParses(noAwait) || scriptParses('_=' + noAwait);
   }
 
   // ---- contexts ----
@@ -917,13 +1023,19 @@ export const SRC = String.raw`
      compile is handed to that compile, so nothing that reaches it can run. */
   function replErrorFrame(code, err) {
     if (!isObjectLike(err) || err.name !== 'SyntaxError') return '';
-    if (compiles(code)) return '';
     var pos = null;
     try {
-      (0, eval)(code);
+      (0, eval)(SCRIPT_PROBE + code);
     } catch (inner) {
-      var at = /<input>:(\d+):(\d+)/.exec(String(inner && inner.stack));
-      if (at !== null) pos = { line: Number(at[1]), col: Number(at[2]) };
+      /* Only a line the script itself refused has a position to show: a SyntaxError a line threw
+         as it ran has none, and re-running a line that ran is not a thing this may do. */
+      if (isObjectLike(inner) && inner.name === 'SyntaxError') {
+        var at = /<input>:(\d+):(\d+)/.exec(String(inner && inner.stack));
+        if (at !== null) {
+          var atLine = Number(at[1]);
+          pos = { line: atLine, col: Number(at[2]) - (atLine === 1 ? SCRIPT_PROBE.length : 0) };
+        }
+      }
     }
     if (pos === null) return '';
     var text = String(code).split('\n')[pos.line - 1];
@@ -2498,31 +2610,42 @@ export const SRC = String.raw`
       this._awaited = false;
       this._awaitValue = false;
       /* A line that opens with a brace: node wraps it in one pair of parens so it reads as an
-         object literal and not as a block, and decides by trying both readings. The wrapped one
-         wins whenever it compiles -- '{ a: 1 }' is an object and not a block, and '{ "a": 1 }'
-         compiles only wrapped. When it does not, the unwrapped one wins if it compiles: '{ 1 }',
-         '{ let x = 1 }' and '{ a: 1 } // c', whose comment would eat the closing paren. When
-         neither compiles it is still the wrapped form node reports, which is why '{ await 3 }'
-         is shown and caret'd as '({ await 3 })' and not as it was written. Measured against host
-         node 24.15 over ten brace shapes; the message the engine words is its own either way. */
-      if (/^\s*\{/.test(src)) {
-        var braced = '(' + src + ')';
-        var bracedAwaits = replTopLevelAwait(src);
-        if (compiles(braced)) code = braced;
-        else if (!compiles(src) && (bracedAwaits === null || bracedAwaits.code === null)) code = braced;
+         object literal and not as a block, and decides without ever trying the wrapped form --
+         a line that opens with a brace and does not end in a semicolon is wrapped whenever the
+         line *as written* parses, with its 'await's taken out when only those stop it. So
+         '{ await 3 }' is wrapped and is reported wrapped even though neither reading runs, while
+         '{ yield 3 }' and '{ return 1 }' parse neither way and are left as they were written.
+         The wrap is undone again when only the wrapped form is the one that does not parse --
+         '{ 1 }', '{ let x = 1 }' and '{ a: 1 } // c', whose comment would eat the closing paren.
+         Measured against host node 24.15 over twelve brace shapes; the message the engine words
+         is its own either way. */
+      if (/^\s*\{/.test(src) && !/;\s*$/.test(src) && replIsValidSyntax(src)) {
+        var braced = '(' + src.replace(/^\s+/, '').replace(/\s+$/, '') + ')\n';
+        code = scriptParses(braced) === false && scriptParses(src) === true ? src : braced;
       }
-      /* Read before the rewrite below, which turns a let, a const and a class into a var and so
-         would leave nothing to tell one from another. */
+      /* The source the engine is handed, kept for the frame a syntax error is reported with: the
+         line as it was written, and not the wrapper, which is what Node underlines too. Read
+         before the rewrite below, which turns a let, a const and a class into a var and so would
+         leave nothing to tell one from another. */
+      this._code = code;
       var decls = replTopDecls(code);
+      /* A name the line binds twice is refused by node's own context, which sees the whole line at
+         once: 'let s = 1; let s = 2' and 'var s = 1; let s = 2' are both one name declared twice.
+         A var and a function declared again in one line are not, and nor is one of each. */
+      var lineNames = Object.create(null);
       for (var dl = 0; dl < decls.lexical.length; dl++) {
-        if (this._bound[decls.lexical[dl]] === true) {
-          throw new SyntaxError("Identifier '" + decls.lexical[dl] + "' has already been declared");
+        var ln = decls.lexical[dl];
+        if (this._bound[ln] === true || lineNames[ln] !== undefined) {
+          throw new SyntaxError("Identifier '" + ln + "' has already been declared");
         }
+        lineNames[ln] = 'lexical';
       }
       for (var dd = 0; dd < decls.loose.length; dd++) {
-        if (this._lexical[decls.loose[dd]] === true) {
-          throw new SyntaxError("Identifier '" + decls.loose[dd] + "' has already been declared");
+        var dn0 = decls.loose[dd];
+        if (this._lexical[dn0] === true || lineNames[dn0] === 'lexical') {
+          throw new SyntaxError("Identifier '" + dn0 + "' has already been declared");
         }
+        lineNames[dn0] = 'loose';
       }
       code = rewriteTopLexical(code);
       /* A line with a top-level await runs inside the wrapper instead, and says so: the value the
@@ -2534,19 +2657,29 @@ export const SRC = String.raw`
          them is worded the way an awaiting line's is. */
       this._awaited = code.indexOf('await') >= 0;
       this._awaitValue = wrapped !== null && wrapped.code !== null;
-      /* The source the engine was handed, kept for the frame a syntax error is reported with: the
-         line as it was written, and not the wrapper, which is what Node underlines too. */
-      this._code = code;
       if (this._awaitValue === true) code = wrapped.code;
-      var value = this.useGlobal ? (0, eval)(code) : vm.runInContext(code, this.context);
+      var value;
+      var thrown = null;
+      try {
+        value = this.useGlobal ? (0, eval)(code) : vm.runInContext(code, this.context);
+      } catch (fail) {
+        thrown = fail;
+      }
       /* A binding that survived the line is one the next line cannot make again: the rewrite
          above turns a let, a const and a class into a var, so the context they run in never sees
-         the name twice and would never refuse it. Node's does, so the names are kept here. */
-      for (var dn = 0; dn < decls.lexical.length; dn++) {
-        this._lexical[decls.lexical[dn]] = true;
-        this._bound[decls.lexical[dn]] = true;
+         the name twice and would never refuse it. Node's does, so the names are kept here.
+         A line that bound a name and then threw keeps the binding all the same -- 'let t = 1;
+         throw new Error("x")' leaves t at 1 on a host, and a second 'let t' is refused there --
+         because the names of a script are made before its statements run. A line the engine
+         could not compile made none, which is what a SyntaxError out of the compile means. */
+      if (thrown === null || !(isObjectLike(thrown) && thrown.name === 'SyntaxError')) {
+        for (var dn = 0; dn < decls.lexical.length; dn++) {
+          this._lexical[decls.lexical[dn]] = true;
+          this._bound[decls.lexical[dn]] = true;
+        }
+        for (var dv = 0; dv < decls.loose.length; dv++) this._bound[decls.loose[dv]] = true;
       }
-      for (var dv = 0; dv < decls.loose.length; dv++) this._bound[decls.loose[dv]] = true;
+      if (thrown !== null) throw thrown;
       return value;
     };
 

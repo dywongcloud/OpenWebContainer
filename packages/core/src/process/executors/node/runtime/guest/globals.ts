@@ -446,6 +446,14 @@ function nameOfSignal(signal) {
 function unknownSignalFor(signal) {
   var bad = new TypeError('Unknown signal: ' + String(signal));
   bad.code = 'ERR_UNKNOWN_SIGNAL';
+  /* Node carries the code in the words it writes for the error as well as in 'code': 'TypeError
+     [ERR_UNKNOWN_SIGNAL]: Unknown signal: NOPE', where the name it reads back is still the plain
+     'TypeError'. The two words are what 'String' of it answers, and only there -- a trace this
+     engine wrote keeps the name it was given when it wrote it, and rewriting a trace to match a
+     host's is not what this does. */
+  bad.toString = function () {
+    return 'TypeError [ERR_UNKNOWN_SIGNAL]: ' + String(this.message);
+  };
   return bad;
 }
 /* Node's own refusal of a pid it cannot signal, out of its argument checker: the words are the

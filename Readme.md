@@ -457,6 +457,13 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   directory the walk has no read bit for is still descended: `chmod -R 000 d; cat d/c` is `Permission denied`
   on the host and prints the file here, though `chmod -R 000 d` itself now reports the same
   `chmod: d: Permission denied` and status 1 on both.
+- **A `sh -c` line writes what a command of it wrote as that command runs, the way a host's does.**
+  `spawn('sh', ['-c', 'echo A; sleep 2'])` hands its caller `A\n` at 6 ms on host node 24.15 and at 6 ms
+  here, and `echo A; sleep 1; echo B; sleep 1; echo C` arrives at 5/1007/2019 ms there and at
+  7/1010/2013 ms here, against one chunk at 2013 ms before: a caller's line is taken apart step by step
+  now and not only when a bound or a spawnable command forced it, and a step that is a `sleep` waits on a
+  host timer instead of blocking the thread the whole of its wait, which is what used to hold everything a
+  step before it had already written until the line ended.
 - **A `sh -c` line the caller's `timeout` ended closes as soon as it exits, where a host's `close` waits for
   the grandchild that outlived the shell.** `spawn('sh', ['-c', 'echo A; sleep 3; echo B'], { timeout: 400,
   killSignal: 'SIGKILL' })` exits at 405 ms here with `A\n`, as host node 24.15 exits at 406 ms, and closes
@@ -474,7 +481,17 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   `sh -c 'trap "echo TRAPPED" TERM; kill -TERM $$; echo after'` answers `TRAPPED\nafter\n` with status 0
   on the host and nothing at all with status -1 here, while `trap ... EXIT` agrees on both (`X\nBYE\n`,
   0). A `TERM` trap is registered and never run -- `runTrap` in
-  `packages/core/src/shell/commands/builtins.ts` is exported for `EXIT`, `ERR` and `DEBUG` only.
+  `packages/core/src/shell/commands/builtins.ts` is exported for `EXIT`, `ERR` and `DEBUG` only. Of the
+  three it *is* called for, `DEBUG` is broken the other way: `sh -c "trap 'echo T' DEBUG; echo X"`
+  answers `T\nX\n` on a host and 604 `T`s followed by `X` here, and `true` in place of `echo X` the same
+  604, because the call at `builtins.ts:6576` sits inside `runSimple`, so the trap's own action runs
+  through it and re-enters the trap -- a host does not run a `DEBUG` trap from inside a trap's action.
+  Both are call sites of one function, in a file this wave does not own.
+- **A backgrounded job holds the shell until it ends, where a host's `sh -c` exits at once.**
+  `spawn('sh', ['-c', '(sleep 3 &); echo A'])` with no `timeout` exits at 7 ms on host node 24.15 and
+  closes at 3018 ms, the `sleep` holding the pipe, while here both happen at 3009 ms and `A` arrives with
+  them: the step is `(sleep 3 &)`, a subshell whose background job the engine waits for, so what diverges
+  is the engine's job handling and not the pipe.
 - **A `timeout` on a `sh -c` line ends the line's own child as well.** `spawn('sh', ['-c', 'echo shell; node
   busy.js'], { timeout: 400, killSignal: 'SIGKILL' })` closes at 408 ms here with `shell`, where host node
   24.15 closes at 5033 ms with `shell` and `BUSY-DONE`: the host kills only the `sh` it spawned, and the
@@ -741,10 +758,30 @@ stay the engine's (`expecting '}'`) where V8's are `Cannot use 'await' as identi
 function`. And a second declaration of a name the session already bound is refused as the host refuses
 it: `const c1` twice, `let l1` twice, `class C1` twice, `var m1` then `let m1`, `let n1` then `var n1`,
 and `function n3` then `const n3` each answer
-`Uncaught SyntaxError: Identifier 'c1' has already been declared`, twelve of twelve shapes
-byte-identical on both sides. The names are kept on the session rather than left to the context, because
+`Uncaught SyntaxError: Identifier 'c1' has already been declared`, and that now covers every declarator
+of the line and every binding position of a pattern -- `let p = 1, q = 2` then `let q = 3`,
+`let [w] = [1]` then `let w = 2`, `const { w } = { w: 1 }` then `let w = 2`, `async function a(){}` then
+`let a = 1`, a line that binds a name and then throws (`let t = 1; throw new Error('x')` keeps `t`, as it
+does on a host), and two declarators of one line (`let s = 1; let s = 2`, `var s = 1; let s = 2`) -- and
+the form the brace is reported in is node's own test and not a guess: a line that opens with a brace and
+does not end in a semicolon is paren-wrapped when the line *as written* parses, with its `await`s taken
+out when only those stop it, and unwrapped again when only the wrapped form is the one that will not
+parse. Eleven of twelve brace shapes now agree on what is reported; the words under the caret stay the
+engine's (`expecting ';'`, `return not in a function`) where V8's are `Unexpected number` and
+`Illegal return statement`. The names are kept on the session rather than left to the context, because
 the rewrite that carries a `let` across lines turns it into a `var` and the context would never see the
 name twice.
+
+Two shapes of that surface do not close. `{ function f(){} }` is `[Function: f]` on host node 24.15 and
+`undefined` here: the value of a block holding a function declaration is that function in V8 and empty in
+this engine, and bare QuickJS 0.32 with no container in the way answers `undefined` for
+`eval('{ function f(){} }')` too -- so it is the engine's completion value and not the wrapper's. And an
+uncaught error a guest raises with a node `code` names the code above the trace on a host and not here:
+`process.kill(process.pid, 'sigterm')` answers `TypeError [ERR_UNKNOWN_SIGNAL]: Unknown signal: sigterm`
+from `String(e)`, with `e.code` `ERR_UNKNOWN_SIGNAL` and `e.name` `TypeError`, on both sides, while the
+uncaught print reads `e.stack`, and a trace keeps the name it was written with -- so it says `TypeError:`
+here. The site is the error factories of `runtime/guest/globals.ts`, which set `code` and leave `name`
+alone; the one for `ERR_UNKNOWN_SIGNAL` now carries the words in `String(e)` as well.
 
 ### ⚠️ Old toolchains that call Node internals: `npx create-react-app my-app`
 
