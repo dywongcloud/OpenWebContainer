@@ -1,0 +1,12 @@
+id: owc-sharp-libc-getconf-versions
+session_id: adv5-judge-napi-vm-9
+owner: adv5-judge-napi-vm-9
+status: pending
+classification: GUEST
+measured_at: ebdf467 (local main)
+title: 'sharp.versions lists 2 keys because the container reports no libc, not because the versions file is missing'
+subject: '`sharp.versions` has 2 dependency keys where host sharp 0.33.5 reports 29. The recorded cause was wrong: `require.resolve(''@img/sharp-libvips-linux-x64/versions'')` DOES resolve in the container, to `/app/node_modules/@img/sharp-libvips-linux-x64/versions.json` (28 keys). What fails is the platform: the container has no `getconf` (`sh: getconf: command not found`) and no `ldd`, so detect-libc''s `familySync()` answers `null` and `isNonGlibcLinuxSync()` answers `true`, sharp''s `runtimePlatformArch()` (lib/libvips.js) is `linuxnull-x64`, and it tries `@img/sharp-linuxnull-x64/versions` and `@img/sharp-libvips-linuxnull-x64/versions` -- neither of which exists -- before falling back to `{ vips, sharp }`. Fix site is libc/getconf reporting (the shell''s utility set, which already implements POSIX utilities, or the platform string the guest reports), NOT the npm installer and NOT packages/core/src/napi/**. packages/core/src/napi/registry.ts:102-107 already documents `linuxnull-x64` but only works around it for the add-on binary name. Measured in one container boot: has.getconf "no", has.ldd "no", detectLibc.familySync "null", detectLibc.isNonGlibcLinuxSync "true", runtimePlatformArch "linuxnull-x64", resolve of the linux-x64 versions file OK.'
+acceptance_criteria:
+- sharp.versions lists the same 29 dependency keys host sharp 0.33.5 reports
+- require('sharp') still succeeds afterwards, so the resize measurements in owc-napi-sharp-resample-fidelity do not regress
+witness_plan: One container boot, `npm install --no-audit --no-fund sharp@0.33.5` on its own `sh -c` line followed by `node /app/main.js`, via /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core. Already witnessed at /tmp/owc-j9-napivm/cases/s3-sharp/cases.json and s3-sharp.ct.out.

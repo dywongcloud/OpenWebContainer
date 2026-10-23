@@ -81,11 +81,12 @@ const REALM_BUILTINS = ['AggregateError', 'Array', 'ArrayBuffer', 'Atomics', 'Bi
     'Uint16Array', 'Uint32Array', 'Uint8Array', 'Uint8ClampedArray', 'URIError', 'WeakMap',
     'WeakRef', 'WeakSet'];
 
-/** `Array.isArray`, `Object.prototype.toString`, `Object.keys` and `Object.prototype`, once. */
+/** `Array.isArray`, `Object.prototype.toString`, `Object.getOwnPropertyNames` and `Object.prototype`, once. */
 interface VmProbes {
-    /** `Object` itself, the `this` of `Object.keys`. */
+    /** `Object` itself, the `this` of `Object.getOwnPropertyNames`. */
     object: QuickJSHandle;
-    keys: QuickJSHandle;
+    /** `Object.getOwnPropertyNames`: every own string key, enumerable or not. */
+    names: QuickJSHandle;
     isArray: QuickJSHandle;
     tag: QuickJSHandle;
     objectProto: QuickJSHandle;
@@ -183,7 +184,7 @@ export function unbindVmRuntime(owner: CapabilityContext): void {
         host.builtins = undefined;
     }
     if (host.probes !== undefined) {
-        for (const handle of [host.probes.object, host.probes.keys, host.probes.isArray, host.probes.tag, host.probes.objectProto]) {
+        for (const handle of [host.probes.object, host.probes.names, host.probes.isArray, host.probes.tag, host.probes.objectProto]) {
             try {
                 handle.dispose();
             } catch {
@@ -257,7 +258,7 @@ function probesOf(host: VmHost): VmProbes {
     const objectProto = context.getProp(object, 'prototype');
     const probes: VmProbes = {
         object,
-        keys: context.getProp(object, 'keys'),
+        names: context.getProp(object, 'getOwnPropertyNames'),
         isArray: context.getProp(array, 'isArray'),
         tag: context.getProp(objectProto, 'toString'),
         objectProto
@@ -333,7 +334,8 @@ function rehomeInto(
     value: QuickJSHandle,
     depth: number,
     seen: QuickJSHandle[],
-    twins: QuickJSHandle[]
+    twins: QuickJSHandle[],
+    kept: QuickJSHandle[]
 ): QuickJSHandle {
     const { context } = host;
     if (host.realmValues.length >= REALM_MAX_VALUES) return value;
@@ -387,11 +389,16 @@ function rehomeInto(
         const keys = ownKeysOf(host, value);
         for (const key of keys) {
             const own = context.getProp(value, key);
-            try {
-                realm.setProp(made, key, rehomeInto(host, realm, own, depth + 1, seen, twins));
-            } finally {
-                own.dispose();
-            }
+            /*
+             * Not disposed here: a value rebuilt below is remembered in `seen` so that a cycle or a
+             * value the context hands back twice becomes one twin, and that entry has to outlive the
+             * rebuild of the value it names. Disposing it here left the walk of a second such key
+             * comparing against a dead handle, which aborted the walk: a value with two object-valued
+             * keys crossed as only its first (`({a:{z:1},b:{y:2}})` lost `b`, `[{a:1},{b:2}]` lost
+             * its second element). `kept` frees them once the whole rebuild is done instead.
+             */
+            kept.push(own);
+            realm.setProp(made, key, rehomeInto(host, realm, own, depth + 1, seen, twins, kept));
         }
     } catch {
         // a value whose own names cannot be read crosses as the empty shell it is so far
@@ -400,14 +407,16 @@ function rehomeInto(
 }
 
 /**
- * The own enumerable string keys of `value`, read as `Object.keys` reads them.
+ * The own string keys of `value`, read as `Object.getOwnPropertyNames` reads them.
  *
- * `Object.keys` rather than the engine's own property enumeration: that call traps in the build the
- * container runs, and enumerable string keys are the ones a program can see anyway. Symbols and
- * non-enumerable properties do not cross, and are named in the Readme.
+ * All of them, not only the enumerable ones: the properties that make an error what it is --
+ * `message`, `stack`, `cause`, an `AggregateError`'s `errors` -- are own and non-enumerable, so an
+ * enumerable-only walk handed back an error with none of them, which is not what host Node 24.15
+ * does: it hands back the very object the context made, non-enumerable properties and all. Symbols
+ * still do not cross, and are named in the Readme.
  */
 function ownKeysOf(host: VmHost, value: QuickJSHandle): string[] {
-    const result = host.context.callFunction(host.probes!.keys, host.probes!.object, [value]);
+    const result = host.context.callFunction(host.probes!.names, host.probes!.object, [value]);
     if (result.error) {
         result.error.dispose();
         return [];
@@ -448,12 +457,32 @@ const REALM_ERRORS = ['AggregateError', 'Error', 'EvalError', 'RangeError', 'Ref
 function errorOf(host: VmHost, realm: QuickJSContext, name: string, message: string): QuickJSHandle | undefined {
     try {
         const ctor = REALM_ERRORS.indexOf(name) >= 0 ? name : 'Error';
+        /* `AggregateError` takes its errors first and its message second, so a message alone would
+           be read as the iterable of errors: `new AggregateError('m')` came out with one error --
+           the string's one character -- and an empty message. Its `errors` are copied by the walk. */
+        const args = ctor === 'AggregateError' ? `[], ${JSON.stringify(message)}` : JSON.stringify(message);
         const built = realm.evalCode(
             `(function () {` +
-            `var C = globalThis[${JSON.stringify(ctor)}];` +
+            `var n = ${JSON.stringify(name)};` +
             `var m = ${JSON.stringify(message)};` +
-            `var e = typeof C === 'function' ? new C(m) : new Error(m);` +
-            `if (e.name !== ${JSON.stringify(name)}) e.name = ${JSON.stringify(name)};` +
+            `var C = globalThis[${JSON.stringify(ctor)}];` +
+            `var e = typeof C === 'function' ? new C(${args}) : new Error(m);` +
+            `if (e.name !== n) e.name = n;` +
+            /* A class the second realm has never heard of: an `Error` wearing its name still answers
+               `Error` to `constructor.name`, where host Node hands back the context's own object and
+               so reads the class. Give the rebuild a constructor of that name instead. */
+            `var p = Object.getPrototypeOf(e);` +
+            `if (!(p && p.constructor && p.constructor.name === n)) {` +
+            `var S = function (mm) {` +
+            `var o = new Error(mm);` +
+            `Object.setPrototypeOf(o, S.prototype);` +
+            `o.name = n;` +
+            `return o; };` +
+            `Object.setPrototypeOf(S.prototype, p || Error.prototype);` +
+            `S.prototype.constructor = S;` +
+            `try { Object.defineProperty(S, 'name', { value: n, configurable: true }); } catch (x) {}` +
+            `e = S(m);` +
+            `}` +
             `return e; })()`
         );
         if (built.error) {
@@ -524,11 +553,14 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
         if (!host) return { unbound: true };
         const { context } = host;
         const value = context.getProp(host.api, 'vmValue');
+        /* Own handles read off the value on the way down, freed once the rebuild is over: they are
+           what the cycle guard compares against while it still runs. */
+        const kept: QuickJSHandle[] = [];
         try {
             if (context.typeof(value) !== 'object' && context.typeof(value) !== 'function') return { rebuilt: false };
             const realm = realmOf(host);
             if (realm === undefined) return { rebuilt: false };
-            const rebuilt = rehomeInto(host, realm, value, 0, [], []);
+            const rebuilt = rehomeInto(host, realm, value, 0, [], [], kept);
             if (rebuilt === value) return { rebuilt: false };
             context.setProp(host.api, 'vmBack', rebuilt);
             return { rebuilt: true };
@@ -536,6 +568,9 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
             return { rebuilt: false };
         } finally {
             value.dispose();
+            for (const own of kept) {
+                try { own.dispose(); } catch { /* already gone with its context */ }
+            }
         }
     }
 };
