@@ -1283,8 +1283,45 @@ export const SRC = String.raw`
      * engine's own then.
      */
     var domainThen = null;
+    /*
+     * A promise reaction a domain owns runs inside it, and host node 24.15 takes it out again even
+     * when the reaction failed: every PROMISE resource made while process.domain is a domain is
+     * paired with it in async_hooks' init, entered in before and *left* in after, and the after
+     * runs for a reaction that threw as well. d.bind() has no finally -- node's Domain.prototype.run
+     * is enter, call, exit -- so a throw out of the reaction skipped the leave and the process ran
+     * the rest of its life inside the domain. Measured on host node 24.15 against this container
+     * (adv12): a reaction that throws leaves domain._stack at 0 and process.domain at undefined
+     * inside the 'error' handler and at every timer after it (h4, h5, h8), and the same is true of
+     * one whose rejection is caught by its own .catch or by a later one, where no route runs at all
+     * (h6, h7) -- against later-stack 1 and later-pd the domain here. The leave is the reaction's
+     * own and not the route's, so it is made here: an ordinary exit(), which is what after() calls.
+     *
+     * It is owed at the throw and spent once the rejection has been recorded, because that is the
+     * order host node 24.15 has them in: the promise's rejection is recorded -- with the domain the
+     * reaction ran in -- as the job fails, and the after() that leaves the domain runs after it.
+     * Leaving first lost the domain the rejection belongs to and ended the process at exit 1 where
+     * host node 24.15 prints the domain's handler. The tracker spends it (see
+     * _owcLeaveReactionDomain, and the call to it in the rejection tracker in node/process.ts).
+     */
+    var owedLeave = null;
+    function spendOwedLeave() {
+      var dom = owedLeave;
+      owedLeave = null;
+      if (dom === null) return;
+      try { dom.exit(); } catch (inner) { /* a leave that cannot be made is not a new error */ }
+    }
+    /* A bind() made for a promise reaction and not for a caller: the marker is read while the bound
+       function is built and kept in its closure, so neither the function nor its stack carries it. */
+    var bindingReaction = false;
     function bindInDomain(dom, cb) {
-      return typeof cb === 'function' ? dom.bind(cb) : cb;
+      if (typeof cb !== 'function') return cb;
+      var prior = bindingReaction;
+      bindingReaction = true;
+      try {
+        return dom.bind(cb);
+      } finally {
+        bindingReaction = prior;
+      }
     }
     function installDomainPromiseHook() {
       if (domainThen !== null) return;
@@ -1342,6 +1379,38 @@ export const SRC = String.raw`
     }
     if (typeof process === 'object' && process !== null && typeof process._owcSetDomainContext !== 'function') {
       Object.defineProperty(process, '_owcSetDomainContext', { value: setDomainContext, writable: true, configurable: true });
+    }
+    /* the leave a promise reaction that threw owes the domain it ran in: see bindInDomain above, and
+       the rejection tracker that spends it in node/process.ts */
+    if (typeof process === 'object' && process !== null && typeof process._owcLeaveReactionDomain !== 'function') {
+      Object.defineProperty(process, '_owcLeaveReactionDomain', { value: spendOwedLeave, writable: true, configurable: true });
+    }
+
+    /*
+     * The listener host node 24.15 puts first on every process 'uncaughtException' list while the
+     * domain module is loaded (lib/domain.js): it empties the stack and puts process.domain back to
+     * null, which is why a handler that receives an error reads null and not the undefined an
+     * ordinary leave writes. It is added on 'newListener' and dropped on 'removeListener', so it is
+     * never the only listener and never last. Measured on host node 24.15 (adv12): a rejection a
+     * silent domain owns while that domain is entered falls through to an 'uncaughtException'
+     * listener, and there process.domain is null, the stack 0 and a later timer null too, where
+     * this container left the domain entered (h3); the same fall-through after the domain was
+     * already left read null on the host and undefined here (f06, f10).
+     */
+    if (typeof process === 'object' && process !== null
+      && typeof process.on === 'function' && typeof process.prependListener === 'function'
+      && typeof process.removeListener === 'function') {
+      var clearOnProcess = function () { clearDomains(); };
+      process.on('newListener', function (name, listener) {
+        if (name !== 'uncaughtException' || listener === clearOnProcess) return;
+        process.removeListener(name, clearOnProcess);
+        process.prependListener(name, clearOnProcess);
+      });
+      process.on('removeListener', function (name, listener) {
+        if (name !== 'uncaughtException' || listener === clearOnProcess) return;
+        var left = typeof process.listeners === 'function' ? process.listeners(name) : [];
+        if (left.length === 1 && left[0] === clearOnProcess) process.removeListener(name, clearOnProcess);
+      });
     }
 
     /* what the capture callback above would do with an error no caller is going to receive */
@@ -1577,8 +1646,17 @@ export const SRC = String.raw`
     Domain.prototype.bind = function (cb) {
       var self = this;
       installDomainPromiseHook();
+      var isReaction = bindingReaction;
       function runBound() {
-        return runInDomain(self, cb, this, Array.prototype.slice.call(arguments));
+        if (!isReaction) return runInDomain(self, cb, this, Array.prototype.slice.call(arguments));
+        spendOwedLeave();
+        try {
+          return runInDomain(self, cb, this, Array.prototype.slice.call(arguments));
+        } catch (err) {
+          /* the leave a reaction that threw owes is spent by the rejection tracker: see bindInDomain */
+          owedLeave = self;
+          throw err;
+        }
       }
       Object.defineProperty(runBound, 'domain', { value: this, writable: true, configurable: true });
       return runBound;

@@ -730,6 +730,16 @@ const REJECTION_TRACKER_SRC = String.raw`
           cell.domain = at !== undefined && at !== null && at.domain !== undefined && at.domain !== null
             ? at.domain
             : null;
+          /*
+           * The rejection now carries the domain it belongs to, so a reaction that raised it may
+           * leave that domain: host node 24.15 records the rejection as the job fails and runs the
+           * async_hooks after() -- an ordinary domain leave -- once it is over. Spending it here and
+           * not before is what keeps a reaction's own throw owned by the domain it ran in; see
+           * bindInDomain in modules/pure-b.ts.
+           */
+          if (at !== undefined && at !== null && typeof at._owcLeaveReactionDomain === 'function') {
+            at._owcLeaveReactionDomain();
+          }
           WATCHED.push(cell);
           reject(reason);
         };
