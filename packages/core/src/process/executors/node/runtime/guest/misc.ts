@@ -5132,6 +5132,17 @@ BF.module = function () {
     }
     var filename = host.resolve(entry, host.cwd(), 'require');
     if (!filename) throw moduleNotFound(entry);
+    /* The key node's own bootstrap leaves in Module._pathCache: it runs the entry through
+       Module._load, and so through _resolveFilename and _findPath, and the file it found is
+       cached under the request and the paths it was looked for in -- [''] for a path that is
+       absolute, so the key is the path, a NUL and nothing after it. The loader here is asked for
+       the entry directly, so the key is written from the same argument and the same paths. */
+    var entryPaths;
+    if (entry.charAt(0) === '/') entryPaths = [''];
+    else if (entry.charAt(0) === '.' && (entry.length === 1 || entry.charAt(1) === '.'
+      || entry.charAt(1) === '/')) entryPaths = ['.'];
+    else entryPaths = Module.globalPaths;
+    Module._pathCache[entry + PATH_CACHE_SEP + entryPaths.join(PATH_CACHE_SEP)] = filename;
     loadCJS(filename, undefined, true);
   };
   /* Node 24 exports no createRequireFromPath: the deprecated alias went with DEP0131, and a
@@ -5482,6 +5493,192 @@ BF.module = function () {
   };
   return ModuleOf;
 };
+
+/*
+ * The two halves of a resolution the loader keeps apart -- the name it answers and the file it
+ * finds -- on the three shapes where they had drifted from node's own.
+ */
+
+/* The separator node joins the lookup paths with inside a path-cache key: a NUL, built this way
+   because this source is a raw string and an escape written in it would reach the engine as six
+   characters of its own. */
+var PATH_CACHE_SEP = String.fromCharCode(0);
+
+/* The file a request resolves to under one of the given directories, or false, and the cache node
+   keeps of every resolution it has made: the key is the request, a NUL and the lookup paths joined
+   with a NUL, and it is written only for a request that resolved -- a request that found nothing is
+   not cached, and a later one asking for the same thing is answered from the cache without asking
+   again. An absolute request is looked for in [''] alone whatever it was asked for in, which is why
+   the entry's own key is its path with a NUL and nothing after it. Node validates the request here,
+   so a caller handing it a number sees ERR_INVALID_ARG_TYPE naming "path" -- the argument its own
+   path.isAbsolute refuses -- rather than the false a request that is merely unresolvable gets. */
+function findPathCached(request, paths) {
+  if (typeof request !== 'string') {
+    var badPath = new TypeError('The "path" argument must be of type string. Received '
+      + receivedTypeOf(request));
+    badPath.code = 'ERR_INVALID_ARG_TYPE';
+    throw badPath;
+  }
+  var list = paths;
+  if (request.charAt(0) === '/') list = [''];
+  else if (!list || list.length === 0) return false;
+  var cacheKey = request + PATH_CACHE_SEP + list.join(PATH_CACHE_SEP);
+  var cached = Module._pathCache[cacheKey];
+  if (cached) return cached;
+  for (var findAt = 0; findAt < list.length; findAt++) {
+    var found = host.resolve(request, list[findAt] === '' ? '/' : list[findAt], 'require');
+    if (found) {
+      Module._pathCache[cacheKey] = found;
+      return found;
+    }
+  }
+  return false;
+}
+
+/* Module._resolveFilename: node answers a built-in with the request it was given -- 'node:fs' for
+   'node:fs', not the bare name the prefix was stripped to -- and reads that request as a string
+   before it does anything else, because its own BuiltinModule.normalizeRequirableId asks
+   String.prototype.startsWith about it. That read is what refuses a null, an undefined and a
+   symbol, with node's own two messages and no code on either; every other shape reaches the
+   resolver, which is the one that names "path" and carries ERR_INVALID_ARG_TYPE. */
+Module._resolveFilename = function _resolveFilename(request, parent, isMain, options) {
+  if (request === null || request === undefined) {
+    throw new TypeError('String.prototype.startsWith called on null or undefined');
+  }
+  if (typeof request === 'symbol') {
+    throw new TypeError('Cannot convert a Symbol value to a string');
+  }
+  if (isBuiltinName(request)) return String(request);
+  var paths = Module._resolveLookupPaths(request, parent);
+  var filename = findPathCached(request, paths);
+  if (filename) return filename;
+  throw notFoundError(String(request), parent && parent.path ? parent.path : host.cwd(), parent);
+};
+
+/* Module.prototype.require: node's own is anonymous -- String() of it reads 'function(id)' and not
+   a name -- and carries the entry's module as an own 'main' after 'prototype'. Node's is a value,
+   written once the entry has been loaded; this one is read off the loader's main until it is asked
+   for, and becomes the value it read from on that first read, so that what a caller sees is the
+   same writable, enumerable, configurable data property a host has. */
+Module.prototype.require = function (request) {
+  return requireFrom(this, request);
+};
+Object.defineProperty(Module.prototype.require, 'main', {
+  get: function getMainOfRequire() {
+    var mainOfEntry = mainModule;
+    if (mainOfEntry !== undefined) {
+      Object.defineProperty(this, 'main',
+        { value: mainOfEntry, writable: true, enumerable: true, configurable: true });
+    }
+    return mainOfEntry;
+  },
+  set: function setMainOfRequire(value) {
+    mainModule = value;
+    Object.defineProperty(this, 'main',
+      { value: value, writable: true, enumerable: true, configurable: true });
+  },
+  enumerable: true,
+  configurable: true
+});
+
+/* The require every CommonJS module is handed: the loader's own builds a resolve.paths whose
+   refusal of a request that is not a string names only the typeof it was given and carries no
+   code, where node's names the value the way every other argument error of its does and sets
+   ERR_INVALID_ARG_TYPE. Only that one key is replaced -- the rest of the require is the loader's,
+   and a request that is a string is answered by the same lookup paths it always was. */
+var makeRequireOfLoader = makeRequire;
+makeRequire = function makeRequire(mod) {
+  var req = makeRequireOfLoader(mod);
+  /* The main module is known by the time any module's body runs -- the loader names it before it
+     compiles the entry -- so the value node writes once is written here, and a descriptor a caller
+     reads off Module.prototype.require is the data property it is there rather than the accessor
+     that waited for the entry. */
+  if (mainModule !== undefined) {
+    var mainOfPrototype = Object.getOwnPropertyDescriptor(Module.prototype.require, 'main');
+    if (mainOfPrototype !== undefined && mainOfPrototype.get !== undefined) {
+      Object.defineProperty(Module.prototype.require, 'main',
+        { value: mainModule, writable: true, enumerable: true, configurable: true });
+    }
+  }
+  req.resolve.paths = function paths(request) {
+    if (typeof request !== 'string') {
+      var badRequest = new TypeError('The "request" argument must be of type string. Received '
+        + receivedTypeOf(request));
+      badRequest.code = 'ERR_INVALID_ARG_TYPE';
+      throw badRequest;
+    }
+    return Module._resolveLookupPaths(request, mod);
+  };
+  return req;
+};
+
+/* A request written with the 'node:' scheme and no built-in behind it is not a missing module in
+   node but an unknown one: ERR_UNKNOWN_BUILTIN_MODULE, naming the request it was given. A bare
+   name it does not know stays a missing module, and the validation of the request itself comes
+   first in both, which is the loader's own order. */
+var requireFromOfLoader = requireFrom;
+requireFrom = function requireFrom(parent, id) {
+  if (typeof id === 'string' && id.indexOf('node:') === 0 && !isBuiltinName(id)) {
+    var unknownBuiltin = new Error('No such built-in module: ' + id);
+    unknownBuiltin.code = 'ERR_UNKNOWN_BUILTIN_MODULE';
+    throw unknownBuiltin;
+  }
+  return requireFromOfLoader(parent, id);
+};
+
+/* The entry's own key in that cache. Node runs the entry through Module._load -- Module.runMain
+   asks for argv[1] and the resolver answers -- so the file it found is cached under the request
+   and the paths it was looked for in before a line of the program has run: [''] for a request
+   that is absolute, [''] or the global folders for one that is not. The loader here is handed the
+   file itself, so the key is written from argv[1] and the same paths, with the file as its value. */
+var loadCJSOfLoader = loadCJS;
+loadCJS = function loadCJS(filename, parent, isMain) {
+  if (isMain) {
+    var procOfEntry = requireBuiltin('process');
+    var request = procOfEntry && typeof procOfEntry.argv[1] === 'string' ? procOfEntry.argv[1] : filename;
+    var entryPaths;
+    if (request.charAt(0) === '/') entryPaths = [''];
+    else if (request.charAt(0) === '.' && (request.length === 1 || request.charAt(1) === '.'
+      || request.charAt(1) === '/')) entryPaths = ['.'];
+    else entryPaths = Module.globalPaths;
+    Module._pathCache[request + PATH_CACHE_SEP + entryPaths.join(PATH_CACHE_SEP)] = filename;
+  }
+  return loadCJSOfLoader(filename, parent, isMain);
+};
+
+/* Which names the registry answers a require for. Node's list is the authority for both
+   directions: a factory registered for a name node has no built-in for -- undici, served here as
+   though it were built in -- is not a built-in name, so require('undici') and require('node:undici')
+   find nothing as they do there, while the factory itself stays where a fetch can reach it; and the
+   four names the list writes with their 'node:' prefix are requirable with it and not without, so
+   require('node:sea') answers and require('sea') does not. The two prefixes this container's own
+   internals are registered under are the one exception, being no name node's list was ever asked
+   about. */
+var SCHEME_ONLY_NAMES = Object.create(null);
+for (var schemeAt = 0; schemeAt < NODE_BUILTIN_NAMES.length; schemeAt++) {
+  if (NODE_BUILTIN_NAMES[schemeAt].indexOf('node:') === 0) {
+    SCHEME_ONLY_NAMES[NODE_BUILTIN_NAMES[schemeAt].slice(5)] = true;
+  }
+}
+function isOwcInternalName(name) {
+  return name.indexOf('owc:internal/') === 0 || name.indexOf('webstream/') === 0;
+}
+isBuiltinName = function isBuiltinName(name) {
+  if (typeof name !== 'string') return false;
+  var withScheme = name.indexOf('node:') === 0;
+  var rest = withScheme ? name.slice(5) : name;
+  /* One 'node:' and no more, as Module.isBuiltin reads it. */
+  if (withScheme && rest.indexOf('node:') === 0) return false;
+  if (!Object.prototype.hasOwnProperty.call(BF, rest)) return false;
+  if (isOwcInternalName(rest)) return true;
+  if (withScheme) {
+    return Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, name)
+      || Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, rest);
+  }
+  if (Object.prototype.hasOwnProperty.call(SCHEME_ONLY_NAMES, rest)) return false;
+  return Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, rest);
+};
+
 
 /* node:sys is util under another name: node's own sys module is a deprecation shim over it, so the
    two are the same object there and are the same object here -- requireBuiltin caches under the
