@@ -1193,9 +1193,30 @@ export const SRC = String.raw`
     function Domain() {
       EventEmitter.call(this);
       this.members = [];
+      /*
+       * The two hooks the loader asks a domain for, as own non-enumerable properties of the
+       * instance and not as names on Domain.prototype: host node 24.15's Domain.prototype carries
+       * exactly _errorHandler, add, bind, constructor, enter, exit, intercept, members, remove and
+       * run (measured), so anything this container adds of its own has to live somewhere a program
+       * reading the prototype cannot see it.
+       */
+      var self = this;
+      /* node's own shape for a fresh domain: a non-enumerable, writable domain of null */
+      Object.defineProperty(this, 'domain', { value: null, writable: true, enumerable: false, configurable: true });
+      Object.defineProperty(this, '_owcUncaught', {
+        value: function (err) { return uncaughtInDomain(self, err); },
+        writable: true,
+        configurable: true
+      });
+      Object.defineProperty(this, '_owcEntered', {
+        get: function () { return stack.lastIndexOf(self) !== -1; },
+        configurable: true
+      });
     }
     Domain.prototype = Object.create(EventEmitter.prototype);
     Object.defineProperty(Domain.prototype, 'constructor', { value: Domain, writable: true, configurable: true });
+    /* node's own shape: an enumerable, writable, configurable members with no value yet, shadowed by every instance */
+    Domain.prototype.members = undefined;
 
     Domain.prototype.enter = function () {
       stack.push(this);
@@ -1301,17 +1322,7 @@ export const SRC = String.raw`
       clearDomains();
       return false;
     }
-    /* the loader asks for this on process.domain: the one place an uncaught error is routed */
-    Object.defineProperty(Domain.prototype, '_owcUncaught', {
-      value: function (err) { return uncaughtInDomain(this, err); },
-      writable: true,
-      configurable: true
-    });
-    /* whether this domain is on the enter/exit stack, which is what routes a fatal throw */
-    Object.defineProperty(Domain.prototype, '_owcEntered', {
-      get: function () { return stack.lastIndexOf(this) !== -1; },
-      configurable: true
-    });
+    /* the two hooks above are defined on the instance, in Domain(), not here */
 
     Domain.prototype.run = function (fn) {
       installDomainPromiseHook();
@@ -1363,7 +1374,13 @@ export const SRC = String.raw`
       if (index !== -1) this.members.splice(index, 1);
     };
 
-    Domain.prototype.dispose = function () {};
+    /*
+     * The route an error with no caller takes, under the name host node 24.15 gives it: lib/domain.js
+     * puts _errorHandler on Domain.prototype and reaches it from process._fatalException. Host node
+     * 24.15 has no Domain.prototype.dispose at all -- it was removed -- and this container's own
+     * machinery is on the instance, so the prototype's own names are node's ten.
+     */
+    Domain.prototype._errorHandler = function (er) { return uncaughtInDomain(this, er); };
 
     // Emitters bound with add() route unhandled 'error' events to their domain.
     var eeEmit = EventEmitter.prototype.emit;
