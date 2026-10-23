@@ -105,6 +105,10 @@ function inspectValue(value, opts) {
      Cleared for every walk, so the count starts again and '<ref *1>' belongs to this value. */
   var REF_IDS = new WeakMap();
   var REF_NEXT = 1;
+  /* The deepest level the walk has reached inside the value it is printing now, which node's
+     'compact' is measured against. Raised by every value as it is printed and restored as the walk
+     comes back out of it, so the difference at the top of a value is how far it nests. */
+  var SUB_MAX = 0;
 
   function fmt(v, depth, indent) {
     if (v === null) return 'null';
@@ -116,10 +120,23 @@ function inspectValue(value, opts) {
     if (t === 'function') {
       var name = v.name ? v.name : '';
       if (/^class[\s{]/.test(Function.prototype.toString.call(v))) return '[class ' + (name || '(anonymous)') + ']';
+      /* The three families node names by what they are: '[AsyncFunction: foo]',
+         '[GeneratorFunction: foo]' and '[AsyncGeneratorFunction: foo]', where a plain function is
+         '[Function: foo]'. The value's own prototype is what says which of the four it is -- its
+         '.constructor' is the AsyncFunction or the GeneratorFunction itself -- and a function out of
+         a 'vm' context carries the prototype of its own realm, which names it the same way. */
+      var fnProto = Object.getPrototypeOf(v);
+      var fnKind = 'Function';
+      if (fnProto !== null && fnProto !== undefined && fnProto.constructor &&
+          typeof fnProto.constructor.name === 'string') {
+        var fnCtorName = fnProto.constructor.name;
+        if (fnCtorName === 'AsyncFunction' || fnCtorName === 'GeneratorFunction' ||
+            fnCtorName === 'AsyncGeneratorFunction') fnKind = fnCtorName;
+      }
       /* A function with no name is '[Function (anonymous)]' and not '[Function: (anonymous)]':
          the colon belongs to the name that follows it, and node writes none when there is no name
          to write -- which is what 'util.inspect(function () {})' prints on host node 24.15. */
-      return name ? '[Function: ' + name + ']' : '[Function (anonymous)]';
+      return name ? '[' + fnKind + ': ' + name + ']' : '[' + fnKind + ' (anonymous)]';
     }
     /* A value the walk is already inside. Node numbers the objects a '[Circular *n]' marker points
        back at -- in the order it meets them, from 1 -- and writes '<ref *n> ' in front of the one
@@ -136,7 +153,7 @@ function inspectValue(value, opts) {
        out of a context print 'Error {}' where the host prints 'Error: boom', and a promise
        'Promise {}' where the host prints 'Promise { 1 }'. */
     var vTag = utilTag(v);
-    if (vTag === 'Error') return formatErrorStack(v);
+    if (vTag === 'Error') return errorInspectOf(v, fmt, depth, indent, opts);
     if (vTag === 'Date') return isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
     if (vTag === 'RegExp') return String(v);
     if (vTag === 'Promise') return promiseInspectOf(v, depth, indent);
@@ -179,9 +196,19 @@ function inspectValue(value, opts) {
        The tag is what names them, so one a 'vm' context handed out prints the way host Node 24.15
        prints it and not as a typed array of no length at all. */
     if (vTag === 'ArrayBuffer' || vTag === 'SharedArrayBuffer') return bufferInspectOf(v, indent, opts);
-    if (vTag === 'DataView') return dataViewInspectOf(v, depth, indent, opts);
+    if (vTag === 'DataView') {
+      /* The buffer it views is one level down, and it is the deepest thing a DataView holds. */
+      if (depth + 1 > SUB_MAX) SUB_MAX = depth + 1;
+      return dataViewInspectOf(v, depth, indent, opts);
+    }
 
     stack.push(v);
+    /* How deep the walk goes below this value, which is the other half of what 'compact' is
+       measured against: node lines the entries up only while the deepest value nested in this one
+       is fewer levels down than 'compact' allows. Every child raises SUB_MAX as it is printed, so
+       the difference is read after the walk of them and not before. */
+    var savedMax = SUB_MAX;
+    SUB_MAX = depth;
     var entries = [];
     var open = '{';
     var close = '}';
@@ -199,6 +226,10 @@ function inspectValue(value, opts) {
       close = ']';
       prefix = ctor + '(' + v.length + ') ';
       for (i = 0; i < v.length && i < 100; i++) entries.push(String(v[i]));
+      /* What is left over past the hundred node prints of a typed array is said in the same words
+         it says the items of an ordinary array in: '... 1 more item', singular, and '... 2 more
+         items' past that. */
+      if (v.length > 100) entries.push('... ' + (v.length - 100) + ' more item' + (v.length - 100 > 1 ? 's' : ''));
     } else if (utilBrandCheck(Map.prototype.has, v)) {
       prefix = 'Map(' + v.size + ') ';
       v.forEach(function (val, key) {
@@ -214,23 +245,37 @@ function inspectValue(value, opts) {
       else if (ctor && ctor !== 'Object') prefix = ctor + ' ';
     }
 
-    var keys = Object.keys(v);
-    for (var k = 0; k < keys.length; k++) {
-      if (isArr && /^\d+$/.test(keys[k])) continue;
-      if (isTyped && /^\d+$/.test(keys[k])) continue;
-      var keyText = isIdentifierKey(keys[k]) ? keys[k] : quoteStringLiteral(keys[k]);
-      entries.push(keyText + ': ' + fmt(v[keys[k]], depth + 1, indent + 2));
+    /* The keys node reads: every own property name and every own symbol under 'showHidden', and
+       only the enumerable ones without it. That is the whole of the distance between '{ [nh]: 1 }'
+       -- bracketed, because the key is not enumerable -- and '{}': a key the default options do not
+       read is one the walk never sees, so it prints nothing at all rather than a value. */
+    var showHidden = !!(opts && opts.showHidden);
+    var keys = showHidden ? Object.getOwnPropertyNames(v) : Object.keys(v);
+    var syms = showHidden && typeof Object.getOwnPropertySymbols === 'function'
+      ? Object.getOwnPropertySymbols(v)
+      : utilEnumerableSymbols(v);
+    for (i = 0; i < keys.length; i++) {
+      if (isArr && /^\d+$/.test(keys[i])) continue;
+      if (isTyped && /^\d+$/.test(keys[i])) continue;
+      entries.push(inspectEntryOf(fmt, v, keys[i], depth + 1, indent + 2));
     }
-    /* The enumerable own SYMBOL keys, after the string ones and in the order they were put on.
-       Node writes one where a string key goes, as 'Symbol(k): 1' -- no brackets and no quotes --
-       for an ordinary object, for an array and for a Map alike, and it writes none of the ones
-       that are not enumerable, which is why a symbol put on with 'enumerable: false' prints
-       nothing at all and 'showHidden' does not change that. */
-    var syms = utilEnumerableSymbols(v);
+    /* The own SYMBOL keys, after the string ones and in the order they were put on. Node writes one
+       where a string key goes, as 'Symbol(k): 1' -- no brackets and no quotes -- for an ordinary
+       object, for an array and for a Map alike, and it brackets the ones that are not enumerable,
+       which is what 'showHidden' asks for. */
     for (var si = 0; si < syms.length; si++) {
-      entries.push(String(syms[si]) + ': ' + fmt(v[syms[si]], depth + 1, indent + 2));
+      entries.push(inspectEntryOf(fmt, v, syms[si], depth + 1, indent + 2));
     }
+    var subDepth = SUB_MAX - depth;
+    SUB_MAX = savedMax > SUB_MAX ? savedMax : SUB_MAX;
     stack.pop();
+
+    /* 'sorted: true' puts the entries in the order the default string sort gives, and a function
+       given for the option is the comparator. Node sorts an array's extra keys alone and every other
+       value's whole output, so an array of indices is left in the order it was written in. */
+    if (opts && opts.sorted && !isArr && !isTyped) {
+      entries.sort(typeof opts.sorted === 'function' ? opts.sorted : undefined);
+    }
 
     /* Read after the walk of the children and not before: a value is only a '<ref *n>' once a
        circular reference inside it has been met, which happens while its entries are printed. */
@@ -260,8 +305,10 @@ function inspectValue(value, opts) {
     var start = entries.length + indent + open.length + prefix.length + 10;
     var totalLength = entries.length + start;
     /* 'compact: false' is one entry per line and never a fit test: node's own inspect writes
-       '[1,2,3,4,5,6,7,8]' on one line by default and one number to a line under that option. */
-    var fits = !multiline && !packed && compactOf(opts) !== false && totalLength + entries.length <= 80;
+       '[1,2,3,4,5,6,7,8]' on one line by default and one number to a line under that option. So is
+       a 'compact' below one, and so is a value that nests as deep as a number 'compact' lower than
+       that: '{ a: { b: 1 } }' is one line at the default 3 and three lines at 'compact: 1'. */
+    var fits = !multiline && !packed && compactAllowsOneLine(opts, subDepth) && totalLength + entries.length <= 80;
     for (var s = 0; fits && s < entries.length; s++) {
       totalLength += entries[s].length;
       if (totalLength > 80) fits = false;
@@ -971,21 +1018,106 @@ function fmtPromiseValue(value, depth, indent) {
   return INSPECT_FMT(value, depth, indent);
 }
 
+/* One entry of an object-like value's output, in the terms node writes it. A key that is not
+   enumerable is written in brackets -- '[nh]: 1' for a string key and '[Symbol(ne)]: 1' for a
+   symbol -- and one that is an ACCESSOR is written as the descriptor it is and not as the value
+   reading it would produce: node asks the descriptor before it reads, so '{ get a() { return 1 } }'
+   is '{ a: [Getter] }' under the default options and not '{ a: 1 }', a setter alone is '[Setter]'
+   and the pair is '[Getter/Setter]'. Only a plain data property is printed as its value. */
+function inspectEntryOf(fmt, value, key, depth, indent) {
+  var desc = undefined;
+  try { desc = Object.getOwnPropertyDescriptor(value, key); } catch (e) { desc = undefined; }
+  var text;
+  if (desc !== undefined && (desc.get !== undefined || desc.set !== undefined)) {
+    text = desc.get !== undefined ? (desc.set !== undefined ? '[Getter/Setter]' : '[Getter]') : '[Setter]';
+  } else if (desc !== undefined && 'value' in desc) {
+    text = fmt(desc.value, depth, indent);
+  } else {
+    text = fmt(value[key], depth, indent);
+  }
+  var name;
+  if (typeof key === 'symbol') name = String(key);
+  else name = isIdentifierKey(key) ? key : quoteStringLiteral(key);
+  if (desc === undefined || desc.enumerable === false) name = '[' + name + ']';
+  return name + ': ' + text;
+}
+
 /* The entries of an object-like value, one line when node's own fit test lets them be and one per
    line when it does not: the test the walk above uses, '{' and '}' for the braces, and two spaces
-   of indent in front of every entry past the fit. */
-function joinInspectEntries(prefix, entries, indent, opts) {
+   of indent in front of every entry past the fit. 'subDepth' is how deep this value nests below
+   the one being printed -- nothing for an ArrayBuffer, one buffer for a DataView -- and 'compact'
+   is what it is measured against. */
+function joinInspectEntries(prefix, entries, indent, opts, subDepth) {
   if (entries.length === 0) return prefix + '{}';
   var width = opts && typeof opts.breakLength === 'number' ? opts.breakLength : 80;
   var totalLength = entries.length + (entries.length + indent + 1 + prefix.length + 10);
-  var fits = true;
+  var fits = compactAllowsOneLine(opts, subDepth);
   for (var i = 0; fits && i < entries.length; i++) {
     totalLength += entries[i].length;
     if (totalLength > width) fits = false;
   }
+  /* A prefix that already carries a line break -- the stack of an error, which is where its own
+     properties hang -- never lets the entries line up behind it: node's own test asks the same, and
+     that is why an error with a stack of two lines prints them and then '{\n  [stack]: ...\n}'. */
+  if (fits && prefix.indexOf('\n') >= 0) fits = false;
   if (fits) return prefix + '{ ' + entries.join(', ') + ' }';
   var pad = ' '.repeat(indent + 2);
   return prefix + '{\n' + entries.map(function (entry) { return pad + entry; }).join(',\n') + '\n' + ' '.repeat(indent) + '}';
+}
+
+/* Whether node's 'compact' lets these entries go on one line at all. 'compact: false' is one entry
+   per line and no fit test, and so is any 'compact' below one -- 0 included -- because node's own
+   test is only reached for a number of at least one. A number that big still prints one entry per
+   line for a value that nests as deep as that number, which is why an ArrayBuffer, with nothing
+   nested in it, is one line at 'compact: 1' while a DataView, with a buffer nested in it, is not. */
+function compactAllowsOneLine(opts, subDepth) {
+  var compact = compactOf(opts);
+  /* 'compact: true' is the one value that is not a number, and node's test is reached for it too --
+     it is the option that asks for the tightest output there is, which is why
+     'util.inspect({ a: { b: { c: 1 } } }, { compact: true })' stays on one line. */
+  if (compact === true) return true;
+  if (compact === false) return false;
+  if (typeof compact !== 'number') return false;
+  if (!(compact >= 1)) return false;
+  return subDepth < compact;
+}
+
+/* What 'util.inspect' writes for an error: the report -- the header and the frames, or the
+   bracketed stack -- and then the own properties node keeps for one, which are not the ones the
+   report is made of. Without 'showHidden' the 'stack', and a 'message' or a 'name' the stack
+   already carries, are left out; 'cause' goes in, and so do the 'errors' of an AggregateError,
+   both bracketed because neither is enumerable. That is why an error carrying 'e.code = "ENOENT"'
+   prints "[S] { code: 'ENOENT' }" and not "[S]". */
+function errorInspectOf(err, fmt, depth, indent, opts) {
+  var head = formatErrorStack(err);
+  var showHidden = !!(opts && opts.showHidden);
+  var keys = showHidden ? Object.getOwnPropertyNames(err) : Object.keys(err);
+  if (!showHidden) {
+    var stack = '';
+    var message = undefined;
+    var name = undefined;
+    try { stack = err.stack === undefined || err.stack === null ? '' : String(err.stack); } catch (e) { stack = ''; }
+    try { message = err.message; } catch (e) { message = undefined; }
+    try { name = err.name; } catch (e) { name = undefined; }
+    keys = keys.filter(function (k) {
+      if (k === 'stack') return false;
+      if (k === 'message') return !(typeof message === 'string' && stack.indexOf(message) >= 0);
+      if (k === 'name') return !(typeof name === 'string' && stack.indexOf(name) >= 0);
+      return true;
+    });
+  }
+  if (Object.prototype.hasOwnProperty.call(err, 'cause') && keys.indexOf('cause') < 0) keys.push('cause');
+  try {
+    if (Array.isArray(err.errors) && Object.prototype.hasOwnProperty.call(err, 'errors') &&
+        keys.indexOf('errors') < 0) keys.push('errors');
+  } catch (e) { /* 'errors' is a getter that throws, and node ignores it too */ }
+  if (keys.length === 0) return head;
+  var entries = [];
+  for (var i = 0; i < keys.length; i++) {
+    entries.push(inspectEntryOf(fmt, err, keys[i], depth + 1, indent + 2));
+  }
+  if (opts && opts.sorted) entries.sort(typeof opts.sorted === 'function' ? opts.sorted : undefined);
+  return joinInspectEntries(head + ' ', entries, indent, opts, 0);
 }
 
 /* The bytes a buffer prints: every one of them up to 'maxArrayLength' -- a hundred, node's default
@@ -1005,7 +1137,14 @@ function bufferBytesText(value, opts) {
     for (var i = 0; i < shown; i++) bytes.push(hexByte(view[i]));
   } catch (e) { /* detached */ }
   var text = bytes.join(' ');
-  if (bytes.length < total) text += (text === '' ? '' : ' ') + '... ' + (total - bytes.length) + ' more bytes';
+  /* The space in front of the ellipsis is node's and it is written whether or not any byte was
+     printed, so a buffer under '{ maxArrayLength: 0 }' opens '< ... 4 more bytes>' and not
+     '<... 4 more bytes>', and one byte left over is '... 1 more byte' -- singular, as node writes
+     it -- where two are '... 2 more bytes'. */
+  if (bytes.length < total) {
+    var rest = total - bytes.length;
+    text += ' ... ' + rest + ' more byte' + (rest === 1 ? '' : 's');
+  }
   return '<' + text + '>';
 }
 
@@ -1014,7 +1153,8 @@ function bufferInspectOf(v, indent, opts) {
   var prefix = (constructorNameOf(v) || utilTag(v)) + ' ';
   var length = 0;
   try { length = v.byteLength; } catch (e) { /* detached */ }
-  return joinInspectEntries(prefix, ['[Uint8Contents]: ' + bufferBytesText(v, opts), '[byteLength]: ' + length], indent, opts);
+  /* Nothing nests inside a buffer, so 'compact' is measured against a depth of 0. */
+  return joinInspectEntries(prefix, ['[Uint8Contents]: ' + bufferBytesText(v, opts), '[byteLength]: ' + length], indent, opts, 0);
 }
 
 /* What 'util.inspect' writes for a DataView: the three things about it, the buffer it views last
@@ -1029,7 +1169,8 @@ function dataViewInspectOf(v, depth, indent, opts) {
   try {
     buffer = INSPECT_FMT === null ? '[ArrayBuffer]' : INSPECT_FMT(v.buffer, depth + 1, indent + 2);
   } catch (e) { /* detached */ }
-  return joinInspectEntries(prefix, ['[byteLength]: ' + length, '[byteOffset]: ' + offset, '[buffer]: ' + buffer], indent, opts);
+  /* The buffer it views is one level of nesting, so 'compact' is measured against a depth of 1. */
+  return joinInspectEntries(prefix, ['[byteLength]: ' + length, '[byteOffset]: ' + offset, '[buffer]: ' + buffer], indent, opts, 1);
 }
 
 /* the element type name of a typed array (Uint8Array and the rest), or undefined for any other value */
