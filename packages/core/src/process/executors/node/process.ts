@@ -750,9 +750,9 @@ const REJECTION_TRACKER_SRC = String.raw`
     return 0;
   }
 
-  /* A rejection nothing handled goes to the domain that owns the promise first, then to an
-     unhandledRejection listener on process, and only then ends the process: the formatted reason
-     of the first one that reaches that point, or '' when none does. */
+  /* A rejection nothing handled goes to the domain that owns the promise, and only when no domain
+     owns it to an unhandledRejection listener on process, and only then ends the process: the
+     formatted reason of the first one that reaches that point, or '' when none does. */
   api.takeUnhandledRejection = function () {
     var found = [];
     for (var i = 0; i < WATCHED.length; i++) {
@@ -763,14 +763,20 @@ const REJECTION_TRACKER_SRC = String.raw`
     var proc = globalThis.process;
     for (var j = 0; j < found.length; j++) {
       var cell = found[j];
+      /*
+       * Node's emitUnhandledRejection (lib/internal/process/promises.js) is one line -- the
+       * domain that owns the promise gets the reason as an 'error' event, and only a rejection no
+       * domain owns goes to process as 'unhandledRejection' -- so a domain is not asked whether it
+       * listens: emitting 'error' on one that does not is the fatal "Unhandled 'error' event on
+       * Domain instance", exit 1 with nothing on stdout, and a process 'unhandledRejection'
+       * listener never hears the rejection at all. Measured on host node 24.15 (r03, r10):
+       * preferring the process listener instead printed UNHANDLED and kept running, exit 0.
+       * Nothing here annotates the reason either -- host node 24.15 reads err.domain undefined and
+       * err.domainThrown undefined in the handler a rejection reaches, which is the one route that
+       * does not go through Domain.prototype._errorHandler.
+       */
       var dom = cell.domain;
-      if (listenerCountOf(dom, 'error') > 0) {
-        if (cell.reason !== null && typeof cell.reason === 'object') {
-          try {
-            Object.defineProperty(cell.reason, 'domain', { value: dom, writable: true, configurable: true });
-            cell.reason.domainThrown = false;
-          } catch (e) { /* a frozen reason keeps the properties it already has */ }
-        }
+      if (dom !== null && dom !== undefined) {
         dom.emit('error', cell.reason);
         continue;
       }
@@ -2080,6 +2086,51 @@ export class NodeProcess extends Process {
      */
     private requireFailureOf(error: QuickJSHandle, publishedCode = ''): string {
         const context = this.context!;
+        /* A module that threw a value that is not an Error -- `throw 'plain string'`, `throw null`,
+           `throw undefined` -- threw that value, and Node hands the caller that value and not an
+           Error built out of nothing. The engine has already rebuilt an object it threw as a plain
+           Error, so only a primitive can be carried as itself: its kind, and the text it is. */
+        const kind = context.typeof(error);
+        if (kind !== 'object' && kind !== 'function') {
+            const description = (): string => {
+                const handle = context.getProp(error, 'description');
+                try {
+                    return context.typeof(handle) === 'string' ? context.getString(handle) : '';
+                } finally {
+                    handle.dispose();
+                }
+            };
+            const record: { thrown: { kind: string; text?: string } } = { thrown: { kind } };
+            if (kind === 'string') record.thrown.text = context.getString(error);
+            else if (kind === 'number' || kind === 'boolean') record.thrown.text = String(context.dump(error));
+            else if (kind === 'symbol') record.thrown.text = description();
+            return JSON.stringify(record);
+        }
+        /* null reaches the loader as an object the engine has no property to read from, which is how
+           it is told from an Error: node hands a caller the null the module threw. A value dump
+           cannot carry -- one holding a getter that throws -- keeps the error path it had. */
+        let dumped: unknown;
+        try {
+            dumped = context.dump(error);
+        } catch {
+            dumped = undefined;
+        }
+        if (dumped === null) return JSON.stringify({ thrown: { kind: 'null' } });
+        /* An object the module threw that carries neither a message nor a name is not an Error at
+           all -- `throw { a: 1 }` -- and node hands the caller that object as it stands. Anything
+           larger than a record can carry, or a value JSON cannot write, keeps the error it had. */
+        const asRecord = dumped as Record<string, unknown> | undefined;
+        if (typeof asRecord === 'object' && asRecord !== null
+            && !('message' in asRecord) && !('name' in asRecord)) {
+            try {
+                const json = JSON.stringify(dumped);
+                if (typeof json === 'string' && json.length <= 8192) {
+                    return JSON.stringify({ thrown: { kind: 'object', json } });
+                }
+            } catch {
+                // not a value JSON can write: the error path it had
+            }
+        }
         let name = '';
         let message = '';
         let code = '';
@@ -2095,7 +2146,30 @@ export class NodeProcess extends Process {
                 handle.dispose();
             }
         }
-        return JSON.stringify({ name: name === '' ? 'Error' : name, message, code: code === '' ? publishedCode : code });
+        /* An Error of a class this container has no constructor for -- a subclass the module itself
+           declared -- is rebuilt by name, so the record carries the name of the class as well as the
+           name on the error: node hands a caller an object whose constructor is `My` and whose
+           `name` is `MyErr`. */
+        let ctorName = '';
+        const ctor = context.getProp(error, 'constructor');
+        try {
+            if (context.typeof(ctor) === 'function') {
+                const label = context.getProp(ctor, 'name');
+                try {
+                    if (context.typeof(label) === 'string') ctorName = context.getString(label);
+                } finally {
+                    label.dispose();
+                }
+            }
+        } finally {
+            ctor.dispose();
+        }
+        return JSON.stringify({
+            name: name === '' ? 'Error' : name,
+            message,
+            code: code === '' ? publishedCode : code,
+            ctorName: ctorName === '' ? undefined : ctorName,
+        });
     }
 
     /** The code the last failed import published on the guest, cleared as it is read. */
@@ -2823,10 +2897,20 @@ export class NodeProcess extends Process {
         }
         const duplicate = duplicateModuleBinding(text);
         if (duplicate !== undefined) {
-            throw new GuestFailure(esmCompileFailureText(
-                text, file, duplicate.line, duplicate.column,
-                `Identifier '${duplicate.name}' has already been declared`, isMain, duplicate.span
-            ), true);
+            /* The same shape as a `.ts` Node refuses to strip: the importer of such a file is handed
+               the SyntaxError itself, and only an entry -- which has no importer to catch anything --
+               is the report. A dependency therefore evaluates to a module that throws the error and
+               carries the report beside it for an uncaught one to be written as. */
+            const info = {
+                ctor: 'SyntaxError' as const,
+                message: `Identifier '${duplicate.name}' has already been declared`,
+                whole: esmCompileFailureText(
+                    text, file, duplicate.line, duplicate.column,
+                    `Identifier '${duplicate.name}' has already been declared`, isMain, duplicate.span
+                ),
+            };
+            if (isMain) throw new GuestFailure(info.whole, true);
+            return errorModuleSource(ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify(info)));
         }
         const prepared = prepareEsmSource(text, file, isMain, urlSuffix, (spec) => {
             const found = this.resolver.resolve(spec, dirnameOf(file), 'import');
@@ -2900,6 +2984,17 @@ export class NodeProcess extends Process {
         if (spec.startsWith(ERROR_MODULE_PREFIX)) return spec;
         const bare = spec.startsWith('node:') ? spec.slice('node:'.length) : spec;
         if (this.builtinNames.has(bare)) return `builtin:${bare}`;
+        /* A `node:` name no builtin answers is not a package Node looked for and failed to find: it
+           is a built-in module it has never heard of, which is ERR_UNKNOWN_BUILTIN_MODULE and not
+           ERR_MODULE_NOT_FOUND, and the whole specifier is named -- `node:fs/nope` included. */
+        if (spec.startsWith('node:')) {
+            this.setImportFailureCode('ERR_UNKNOWN_BUILTIN_MODULE');
+            return ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
+                code: 'ERR_UNKNOWN_BUILTIN_MODULE',
+                ctor: 'Error',
+                message: `No such built-in module: ${spec}`,
+            }));
+        }
         /* A data URL is its own module: the source is in the specifier, so nothing is resolved. One
            Node cannot read becomes a module that throws the error Node throws, so a rejected import
            carries the code user code branches on. */
@@ -2980,11 +3075,16 @@ export class NodeProcess extends Process {
             const named = scheme === undefined && directory === undefined && detail.target === 'package'
                 ? `Cannot find package '${detail.name ?? target}'`
                 : `Cannot find module '${detail.file ?? target}'`;
+            /* The scheme list Node reads aloud is not one sentence for every scheme: a network
+               scheme -- `http:` and `https:` alone, the two network imports once carried behind a
+               flag -- is told that file and data are supported, with no mention of node, while
+               every other scheme is told about file, data and node. */
+            const network = scheme === 'http:' || scheme === 'https:';
             const message = directory !== undefined
                 ? `Directory import '${directory}' is not supported resolving ES modules imported from ${baseName}`
                 : scheme === undefined
                     ? `${named}${baseName ? ` imported from ${baseName}` : ''}`
-                    : `Only URLs with a scheme in: file, data, and node are supported by the default ESM loader. Received protocol '${scheme}'`;
+                    : `Only URLs with a scheme in: ${network ? 'file and data' : 'file, data, and node'} are supported by the default ESM loader. Received protocol '${scheme}'`;
             this.setImportFailureCode(code);
             return { error: this.resolveErrorHandle(message, code) };
         }
@@ -4604,8 +4704,12 @@ function errorModuleSource(name: string): string {
     /* The report Node writes when nothing catches the error, and the stack Node gives it, both of
        which a module that is only loaded still has to carry: an importer that catches reads the
        error, and one that does not is written as the report, not as a header and a stack. */
-    const marked = `Object.assign(${built}, { code: ${JSON.stringify(info.code)}`
-        + (info.whole === undefined ? ' }' : `, __owcWhole: ${JSON.stringify(info.whole)} }`) + ')';
+    /* An error Node raises with no code -- a module that does not compile -- carries none, so the
+       property is left off it entirely rather than put there holding undefined. */
+    const extras: string[] = [];
+    if (info.code !== undefined && info.code !== '') extras.push(`code: ${JSON.stringify(info.code)}`);
+    if (info.whole !== undefined) extras.push(`__owcWhole: ${JSON.stringify(info.whole)}`);
+    const marked = extras.length === 0 ? built : `Object.assign(${built}, { ${extras.join(', ')} })`;
     const stacked = info.stack === undefined ? marked
         : `(function (e) { try { Object.defineProperty(e, 'stack',`
             + ` { value: ${JSON.stringify(info.stack)}, configurable: true }); } catch (x) {} return e; }(${marked}))`;

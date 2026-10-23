@@ -559,7 +559,14 @@ function compileCjsWrapper(src, filename) {
 
 function loadCJS(filename, parent, isMain) {
   var cached = MODULE_CACHE[filename];
-  if (cached) return cached;
+  if (cached) {
+    /* A require() that reaches an ES module still being required is a cycle Node refuses rather
+       than a module it hands back half-built: the module is in the cache already, so the check is
+       made here, where the cache answers. */
+    var cycle = requireCycleOf(filename);
+    if (cycle !== undefined) throw cycle;
+    return cached;
+  }
   var mod = new Module(filename, parent);
   /* Node's process.mainModule is the module the entry was loaded as, and it is there only for an
      entry the CommonJS loader loaded: an ES module entry leaves the name off process entirely,
@@ -606,6 +613,27 @@ var nextEsmToken = 1;
 var REQUIRE_ASYNC_MESSAGE = 'require() cannot be used on an ESM graph with top-level await. Use import() instead.' +
   ' To see where the top-level await comes from, use --experimental-print-required-tla.';
 
+/* The ES modules a require() is loading right now, innermost last. An entry is the file together
+   with the module whose require() began loading it, which is the one Node names after "in a
+   cycle". */
+var ESM_REQUIRE_STACK = [];
+
+function requireCycleErrorOf(filename, from) {
+  var err = new Error('Cannot require() ES Module ' + filename + ' in a cycle.' +
+    (typeof from === 'string' && from !== '' ? ' (from ' + from + ')' : ''));
+  err.code = 'ERR_REQUIRE_CYCLE_MODULE';
+  return err;
+}
+
+function requireCycleOf(filename) {
+  for (var i = ESM_REQUIRE_STACK.length - 1; i >= 0; i--) {
+    if (ESM_REQUIRE_STACK[i].file === filename) {
+      return requireCycleErrorOf(filename, ESM_REQUIRE_STACK[i].from);
+    }
+  }
+  return undefined;
+}
+
 function requireAsyncContext(mod, filename) {
   var from = mod && mod.parent ? mod.parent.filename : undefined;
   var text = '';
@@ -628,7 +656,13 @@ function requireAsyncErrorOf(err, mod, filename) {
    Only a failure the host cannot describe is left as ERR_REQUIRE_ESM. */
 function loadEsmFromRequire(filename, mod) {
   var token = nextEsmToken++;
-  var failure = host.esmLoad(filename, token);
+  ESM_REQUIRE_STACK.push({ file: filename, from: mod && mod.parent ? mod.parent.filename : undefined });
+  var failure;
+  try {
+    failure = host.esmLoad(filename, token);
+  } finally {
+    ESM_REQUIRE_STACK.pop();
+  }
   if (failure) throw requireAsyncErrorOf(requireEsmFailureOf(failure), mod, filename);
   var registry = globalThis.__owc_esm_registry || {};
   var namespace = registry[token];
@@ -712,6 +746,15 @@ var MODULE_TRAPS = {
   },
   deleteProperty: function (target, key) {
     throw new TypeError("Cannot delete property '" + moduleKeyText(key) + "' of [object Module]");
+  },
+  /* A namespace's prototype is null and the object cannot be extended, so Node refuses a
+     setPrototypeOf that asks for any other one -- with the words it uses for a namespace, and not
+     the engine's own for a bad prototype. The set that asks for the prototype it already has
+     changes nothing and is granted, as it is in Node. Object.setPrototypeOf throws in a sloppy
+     body too, so both views answer this the same way. */
+  setPrototypeOf: function (target, proto) {
+    if (proto === Object.getPrototypeOf(target)) return true;
+    throw new TypeError('[object Module] is not extensible');
   }
 };
 
@@ -729,7 +772,8 @@ var SLOPPY_MODULE_TRAPS = {
   defineProperty: MODULE_TRAPS.defineProperty,
   deleteProperty: function (target, key) {
     return false;
-  }
+  },
+  setPrototypeOf: MODULE_TRAPS.setPrototypeOf
 };
 
 /* The same three refusals read through Reflect.*, which reports one as false instead of throwing:
@@ -819,20 +863,97 @@ function markedNamespace(namespace) {
     /* the three ways of changing one, answered the way Node answers them */
     set: MODULE_TRAPS.set,
     defineProperty: MODULE_TRAPS.defineProperty,
-    deleteProperty: MODULE_TRAPS.deleteProperty
+    deleteProperty: MODULE_TRAPS.deleteProperty,
+    setPrototypeOf: MODULE_TRAPS.setPrototypeOf
   });
+}
+
+/* A module that threw a value that is not an Error threw *that value*: Node hands the caller the
+   string, the number, the undefined or the null the module threw, and not an Error built out of a
+   record that has neither name nor message. The host carries such a value as its kind and its text
+   because a value that is not an object cannot be rebuilt from a name. */
+/* The one thing Node writes to stderr when a require()d ES module throws a value that is not an
+   object: a code frame with no header, naming the line of its own loader the evaluation happened
+   on. It is written once however many such requires there are and whatever the program does with
+   the error, and never for an object -- a real Error among them -- so it is written here and
+   nowhere else. */
+var REQUIRE_THROWN_FRAME_WRITTEN = false;
+
+function noteRequireThrownFrame() {
+  if (REQUIRE_THROWN_FRAME_WRITTEN) return;
+  REQUIRE_THROWN_FRAME_WRITTEN = true;
+  try {
+    host.stderr('\nnode:internal/modules/esm/module_job:541\n' +
+      '      const namespace = this.module.evaluateSync(filename, parentFilename);\n' +
+      ' '.repeat(36) + '^\n');
+  } catch (e) { /* a guest with nowhere left to write keeps quiet */ }
+}
+
+function thrownValueOf(thrown) {
+  if (thrown === null || typeof thrown !== 'object') return undefined;
+  switch (thrown.kind) {
+    case 'undefined': return undefined;
+    case 'null': return null;
+    case 'string': return String(thrown.text);
+    case 'number': return Number(thrown.text);
+    case 'boolean': return thrown.text === 'true';
+    case 'symbol': return typeof Symbol === 'function' ? Symbol(thrown.text) : undefined;
+    case 'object':
+      try { return JSON.parse(String(thrown.json)); } catch (e) { return undefined; }
+    default: return undefined;
+  }
+}
+
+/* An Error of a class the guest has no constructor for -- one the module declared itself -- built
+   so that err.constructor.name is the class's name and 'instanceof Error' still holds, which is
+   what a caller reads of an error node rebuilt from a class it never had. */
+function errorOfClassName(ctorName, message) {
+  var Ctor = function (m) {
+    var err = new Error(m);
+    Object.setPrototypeOf(err, Ctor.prototype);
+    return err;
+  };
+  try { Object.defineProperty(Ctor, 'name', { value: ctorName, configurable: true }); } catch (e) { /* a name that will not take stays */ }
+  var proto = Object.create(Error.prototype);
+  proto.constructor = Ctor;
+  Ctor.prototype = proto;
+  return Ctor(message);
 }
 
 function requireEsmFailureOf(failure) {
   var info = null;
   try { info = JSON.parse(failure); } catch (e) { info = null; }
-  if (info === null || typeof info !== 'object' || typeof info.name !== 'string') {
+  if (info === null || typeof info !== 'object') {
     var plain = new Error(failure);
     plain.code = 'ERR_REQUIRE_ESM';
     return plain;
   }
+  /* A value that is not an object cannot be rebuilt from a name, so the host carries it as its own
+     kind and text and require() throws it as it stands -- a string, a number, a symbol, an
+     undefined or a null, exactly what the module threw. */
+  if (typeof info.thrown === 'object' && info.thrown !== null && typeof info.thrown.kind === 'string') {
+    noteRequireThrownFrame();
+    return thrownValueOf(info.thrown);
+  }
+  if (typeof info.name !== 'string') {
+    var unnamed = new Error(failure);
+    unnamed.code = 'ERR_REQUIRE_ESM';
+    return unnamed;
+  }
   var Ctor = globalThis[info.name];
-  var err = typeof Ctor === 'function' ? new Ctor(info.message) : new Error(info.message);
+  /* A class the guest has no global for -- an Error subclass the module declared -- is rebuilt by
+     its name, because err.constructor.name is what a caller reads of such an error; a name the
+     guest does have is the constructor it has always been built with. */
+  var err = typeof Ctor === 'function'
+    ? new Ctor(info.message)
+    : typeof info.ctorName === 'string' && info.ctorName !== '' && typeof globalThis[info.ctorName] !== 'function'
+      ? errorOfClassName(info.ctorName, info.message)
+      : new Error(info.message);
+  /* The name on the error is its own and not always its class's: MyErr on an object whose
+     constructor is My, which is the one thing a rebuilt class cannot know. */
+  if (typeof info.name === 'string' && info.name !== '') {
+    try { if (err.name !== info.name) err.name = info.name; } catch (e) { /* a frozen error keeps the name it has */ }
+  }
   if (typeof info.code === 'string' && info.code !== '') {
     try { err.code = info.code; } catch (e) { /* a frozen error keeps the message it has */ }
   }
