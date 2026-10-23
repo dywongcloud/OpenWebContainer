@@ -1885,10 +1885,26 @@ BF.crypto = function () {
     return err;
   }
 
+  /* Node renders the value with util.inspect, so a Buffer shows as <Buffer 00> -- and an empty
+     one as '<Buffer >', with the gap where its hex would have been. */
+  function shownOf(value) {
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'string') return "'" + value + "'";
+    if (value !== null && typeof value === 'object') {
+      if (Buf.isBuffer(value)) {
+        var parts = [];
+        for (var i = 0; i < value.length && i < 50; i++) parts.push(('00' + value[i].toString(16)).slice(-2));
+        var more = value.length > 50 ? ' ... ' + (value.length - 50) + ' more bytes' : '';
+        return '<Buffer' + (parts.length ? ' ' + parts.join(' ') : ' ') + more + '>';
+      }
+      return requireBuiltin('util').inspect(value);
+    }
+    return String(value);
+  }
+
   /* Node's ERR_INVALID_ARG_VALUE: "The property 'a.b' is invalid. Received x", with an optional reason. */
   function invalidArgValue(name, value, reason) {
-    var shown = typeof value === 'string' ? "'" + value + "'" : value === undefined ? 'undefined' : String(value);
-    var err = new RangeError("The property '" + name + "' " + (reason === undefined ? 'is invalid' : reason) + '. Received ' + shown);
+    var err = new RangeError("The property '" + name + "' " + (reason === undefined ? 'is invalid' : reason) + '. Received ' + shownOf(value));
     err.code = 'ERR_INVALID_ARG_VALUE';
     return err;
   }
@@ -2040,7 +2056,14 @@ BF.crypto = function () {
     var state = keyStateOf(key, 'key');
     if (state === undefined) throw invalidArgType('key', 'an instance of KeyObject', key);
     if (state.id === undefined) return { asymmetricKeyType: undefined, asymmetricKeyDetails: undefined };
-    if (state.info === undefined) state.info = callCap('crypto.key.info', { id: state.id });
+    if (state.info === undefined) {
+      state.info = callCap('crypto.key.info', { id: state.id });
+      /* Node answers an RSA publicExponent as a BigInt, which no capability argument can carry. */
+      var details = state.info.asymmetricKeyDetails;
+      if (details !== undefined && details !== null && typeof details.publicExponent === 'string') {
+        details.publicExponent = BigInt(details.publicExponent);
+      }
+    }
     return state.info;
   }
 
@@ -2226,6 +2249,10 @@ BF.crypto = function () {
     if (options.modulusLength !== undefined) out.modulusLength = options.modulusLength;
     if (options.publicExponent !== undefined) out.publicExponent = options.publicExponent;
     if (options.paramType !== undefined) out.paramType = options.paramType;
+    /* DSA names the width of its subprime, and DH the width of its prime, each in its own option. */
+    if (options.divisorLength !== undefined) out.divisorLength = options.divisorLength;
+    if (options.primeLength !== undefined) out.primeLength = options.primeLength;
+    if (options.generator !== undefined) out.generator = options.generator;
     return out;
   }
 
@@ -2249,7 +2276,9 @@ BF.crypto = function () {
       id: keyIdOf(privateKey, 'private'),
       algorithm: this._algorithm,
       data: Buf.concat(this._chunks).toString('base64'),
-      dsaEncoding: privateKey !== null && typeof privateKey === 'object' ? privateKey.dsaEncoding : undefined
+      dsaEncoding: privateKey !== null && typeof privateKey === 'object' ? privateKey.dsaEncoding : undefined,
+      padding: privateKey !== null && typeof privateKey === 'object' ? privateKey.padding : undefined,
+      saltLength: privateKey !== null && typeof privateKey === 'object' ? privateKey.saltLength : undefined
     });
     return outputOf(Buf.from(signature, 'base64'), encoding);
   };
@@ -2269,7 +2298,10 @@ BF.crypto = function () {
       id: keyIdOf(publicKey, 'public'),
       algorithm: this._algorithm,
       data: Buf.concat(this._chunks).toString('base64'),
-      signature: toBytes(signature, encoding, 'signature').toString('base64')
+      signature: toBytes(signature, encoding, 'signature').toString('base64'),
+      dsaEncoding: publicKey !== null && typeof publicKey === 'object' ? publicKey.dsaEncoding : undefined,
+      padding: publicKey !== null && typeof publicKey === 'object' ? publicKey.padding : undefined,
+      saltLength: publicKey !== null && typeof publicKey === 'object' ? publicKey.saltLength : undefined
     }) === true;
   };
   Verify.prototype.end = function () { return this; };
@@ -2288,7 +2320,9 @@ BF.crypto = function () {
       id: keyIdOf(key, 'private'),
       algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
       data: toBytes(data, undefined, 'data').toString('base64'),
-      dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined
+      dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined,
+      padding: key !== null && typeof key === 'object' ? key.padding : undefined,
+      saltLength: key !== null && typeof key === 'object' ? key.saltLength : undefined
     }), 'base64');
     if (typeof callback === 'function') {
       queueMicrotask(function () { callback(null, signature); });
@@ -2302,7 +2336,10 @@ BF.crypto = function () {
       id: keyIdOf(key, 'public'),
       algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
       data: toBytes(data, undefined, 'data').toString('base64'),
-      signature: toBytes(signature, undefined, 'signature').toString('base64')
+      signature: toBytes(signature, undefined, 'signature').toString('base64'),
+      dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined,
+      padding: key !== null && typeof key === 'object' ? key.padding : undefined,
+      saltLength: key !== null && typeof key === 'object' ? key.saltLength : undefined
     }) === true;
     if (typeof callback === 'function') {
       queueMicrotask(function () { callback(null, answer); });
@@ -2399,24 +2436,18 @@ BF.crypto = function () {
     return new DiffieHellman(callCap('crypto.dh.group', { name: String(name) }).id);
   }
 
-  /* diffieHellman({prime, privateKey, publicKey}): the shared secret with no object to keep. */
+  /*
+   * diffieHellman({privateKey, publicKey}): the shared secret with no object to keep. Node takes two
+   * KeyObjects and nothing else -- a prime belongs to createDiffieHellman, not here -- so anything
+   * else in either slot is an invalid value rather than key material to import.
+   */
   function diffieHellman(options) {
     var opts = options === undefined || options === null ? {} : options;
-    /*
-     * Two key objects mean ECDH -- X25519, X448 or an EC curve -- which has no prime at all; the
-     * classic form takes a prime and two raw exponents.
-     */
-    var privState = keyStateOf(opts.privateKey, 'key');
-    var pubState = keyStateOf(opts.publicKey, 'key');
-    if (privState !== undefined || pubState !== undefined) {
-      var privId = privState === undefined ? keyIdOf(opts.privateKey, 'private') : privState.id;
-      var pubId = pubState === undefined ? keyIdOf(opts.publicKey, 'public') : pubState.id;
-      return Buf.from(callCap('crypto.dh.ecdh', { private: privId, public: pubId }), 'base64');
-    }
-    return Buf.from(callCap('crypto.dh.compute', {
-      prime: toBytes(opts.prime, opts.primeEncoding, 'prime').toString('base64'),
-      private: toBytes(opts.privateKey, opts.privateKeyEncoding, 'privateKey').toString('base64'),
-      public: toBytes(opts.publicKey, opts.publicKeyEncoding, 'publicKey').toString('base64')
+    if (!isKeyObject(opts.privateKey)) throw invalidArgValue('options.privateKey', opts.privateKey);
+    if (!isKeyObject(opts.publicKey)) throw invalidArgValue('options.publicKey', opts.publicKey);
+    return Buf.from(callCap('crypto.dh.ecdh', {
+      private: keyIdOf(opts.privateKey, 'private'),
+      public: keyIdOf(opts.publicKey, 'public')
     }), 'base64');
   }
 

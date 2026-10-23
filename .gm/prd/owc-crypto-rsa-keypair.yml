@@ -1,6 +1,29 @@
 id: owc-crypto-rsa-keypair
+title: 'RESOLVED: generateKeyPairSync for rsa, rsa-pss, dsa and dh now answers real keys, with sign, verify, export, import and agreement'
 classification: GUEST
 owner: adv5-exec-crypto
 session_id: adv5-exec-crypto
-status: pending
+status: completed
 subject: 'crypto.generateKeyPairSync(''rsa'', { modulusLength: 2048 }) throws ERR_CRYPTO_UNSUPPORTED_OPERATION here (''rsa key generation is not available: this runtime has no large-prime search'') where host Node 24.15 answers a key pair whose publicKey.asymmetricKeyType is ''rsa''. Ed25519, X25519, Ed448, X448 and the four EC curves (prime256v1, secp384r1, secp521r1, secp256k1) generate, import, export and sign correctly as of owc-crypto-asymmetric-and-hashes; RSA, DSA and the ''dh'' key type do not, because generating one needs a search for two large random primes (a 2048-bit key needs two 1024-bit probable primes, which a Miller-Rabin search in BigInt reaches only in seconds) plus PKCS#1 padding for sign/verify and privateEncrypt/publicDecrypt. ADJUDICATED adv5-judge-crypto-4: a speed gap and an unimplemented surface, NOT an engine limit -- bare QuickJS 0.32 with no container does a 1024-bit BigInt modPow with an all-ones exponent in 22.3 ms against V8''s 4.5 ms, same result b2bffc4a, so the search is reachable at roughly 5x slower. The row covers DSA and DH too: generateKeyPairSync(''dsa'', {modulusLength:1024}) and generateKeyPairSync(''dh'', {primeLength:1024}) throw that same error here and answer keys on host. The fix site is generatePair in packages/core/src/process/executors/node/runtime/capabilities/crypto.ts, and the guest''s KeyObject in packages/core/src/process/executors/node/runtime/guest/misc.ts.'
+resolved_at: 4c63457fec2d62658bc765b0ac1a4289e8af1cd9 + the fix below (local main)
+body: |-
+  RESOLVED (adv5-fix-crypto-4) at local main 4c63457fec2d62658bc765b0ac1a4289e8af1cd9 + the fix below. Diff case for case against host
+  node v24.15.0, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, the
+  same 31-case script on both sides (/tmp/owc-fix-crypto-4/full/main.js):
+    - generateKeyPairSync('rsa', { modulusLength: 2048 }) answers publicKey.asymmetricKeyType
+      'rsa' and asymmetricKeyDetails { modulusLength: 2048, publicExponent: 65537n }, the host's
+      own two fields; 'rsa-pss' answers 'rsa-pss', 'dsa' answers
+      { modulusLength: 1024, divisorLength: 224 } and 'dh' answers {}, all four as on the host.
+    - Cross-verified, not just self-consistent: the container exports its SPKI and PKCS#8 PEM, host
+      Node 24.15 imports both and reports the same type and details; host verifies the container's
+      RSA PKCS#1 v1.5 signature and its RSA-PSS signature (and rejects the PSS one as v1.5), and
+      verifies the container's DSA signature; host imports the container's DH pair and performs the
+      exchange. The other direction holds too: a host-generated RSA, DSA and DH key imports here and
+      its signatures verify here.
+    - Cost, which is the speed gap the judge named and not an engine limit: 2048-bit RSA 0.1-0.6 s,
+      DSA-1024 0.04-0.25 s, DH-1024 0.5-5 s (host OpenSSL 0.05/0.05/0.7 s). The search sieves an
+      arithmetic progression against the 6542 odd primes below 2^16 before it runs Miller-Rabin, so
+      about one candidate in twenty is exponentiated instead of one in one; a DH 'dh' key asks for a
+      safe prime p = 2q+1 as OpenSSL does, which is ~500x rarer than a plain prime and is what the
+      seconds go on. Diffie-Hellman group agreement over two 'dh' keys with different parameters
+      throws ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS, as the host does.
