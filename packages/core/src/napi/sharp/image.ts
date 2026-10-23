@@ -247,8 +247,28 @@ function reduceTable(kernel: Kernel, n: number, shrink: number): number[][] {
  * `extra` is how many source pixels the rounding of the output size leaves unused, before the box
  * shrink below has had its share of them; libvips moves the origin inside the source by half what
  * is left so they are discarded equally from both ends.
+ *
+ * `clock` is the row the vertical reduce is first asked for, and it is not always 0: vips_reducev
+ * generates on demand and clocks its running sum to `r->top`, the top of the region it has been
+ * asked to fill, so a request that starts part-way down the image restarts the sum there. The
+ * last bit of that sum is which source row an output row lands on, so the same output row takes a
+ * different source row depending on where the request began. A crop is what makes the request
+ * start part-way down: sharp crops after it resizes, and libvips hands the reduce only the strip
+ * of rows the crop keeps. Measured against sharp 0.33.5 on 64x64 -> cover 40xH nearest: the
+ * reduce's row 7 is source row 11 when the crop starts at row 2 and source row 12 when it starts
+ * at row 3, the two sums reaching 11.999999999999998 and 12.0 respectively. A horizontal reduce
+ * has no such clock -- vips_reduceh generates whole rows, so its sum always starts at the left.
  */
-function reduceAxis(image: Image, dstSize: number, shrink: number, extra: number, horizontal: boolean, kernelName: string): Image {
+function reduceAxis(
+    image: Image,
+    dstSize: number,
+    shrink: number,
+    extra: number,
+    horizontal: boolean,
+    kernelName: string,
+    clock = 0,
+    strip = REDUCEV_STRIP
+): Image {
     const srcSize = horizontal ? image.width : image.height;
     const other = horizontal ? image.height : image.width;
     const ch = image.channels;
@@ -274,12 +294,16 @@ function reduceAxis(image: Image, dstSize: number, shrink: number, extra: number
      * takes 23, which is what its columns do.
      */
     const atOf = (d: number): number =>
-        horizontal ? 0 : (Math.floor(d / REDUCEV_STRIP) * REDUCEV_STRIP + 0.5) * shrink - 0.5 - offset;
+        horizontal ? 0 : (stripStart(d) + 0.5) * shrink - 0.5 - offset;
+    /* The top of the strip `d` falls in, never above the first row asked for. */
+    const stripStart = (d: number): number =>
+        strip <= 0 || d <= clock ? clock : clock + Math.floor((d - clock) / strip) * strip;
+    const freshStrip = (d: number): boolean => strip > 0 && (d === clock || (d > clock && (d - clock) % strip === 0));
     for (let o = 0; o < other; o++) {
         let at = 0.5 * shrink - 0.5 - offset;
         for (let d = 0; d < dstSize; d++) {
             if (!horizontal) {
-                at = d % REDUCEV_STRIP === 0 ? atOf(d) : at + shrink;
+                at = freshStrip(d) ? atOf(d) : at + shrink;
             }
             const start = Math.trunc(at);
             const phase = Math.trunc(at * TRANSFORM_SCALE * 2) & (TRANSFORM_SCALE * 2 - 1);
@@ -476,7 +500,7 @@ function affineImage(image: Image, hscale: number, vscale: number, kernelName: s
  * Returns the image unchanged when the axis is not a reduction -- an enlargement is not a
  * resample of one axis, it is the affine above, which runs after both reductions.
  */
-function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelName: string): Image {
+function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelName: string, clock = 0, strip = REDUCEV_STRIP): Image {
     const srcSize = horizontal ? image.width : image.height;
     const dstSize = roundU(srcSize / shrink);
     if (dstSize >= srcSize) return image;
@@ -511,7 +535,7 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
     }
     const workSize = horizontal ? work.width : work.height;
     if (dstSize === workSize) return work;
-    return reduceAxis(work, dstSize, residual, extra, horizontal, kernelName);
+    return reduceAxis(work, dstSize, residual, extra, horizontal, kernelName, clock, strip);
 }
 
 /**
@@ -520,9 +544,9 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
  * rounds its own output size off it, so an axis that is only along for the ride -- `cover` with
  * an auto height -- is still reduced at the other axis' factor.
  */
-export function resample(image: Image, hshrink: number, vshrink: number, kernel: string): Image {
+export function resample(image: Image, hshrink: number, vshrink: number, kernel: string, vclock = 0): Image {
     let work = image;
-    if (vshrink > 1) work = resampleAxis(work, vshrink, false, kernel);
+    if (vshrink > 1) work = resampleAxis(work, vshrink, false, kernel, vclock);
     if (hshrink > 1) work = resampleAxis(work, hshrink, true, kernel);
     /* Whether either axis actually ran a reduce: see the zoom branch below. */
     const reduced = work !== image;
@@ -571,6 +595,15 @@ export interface ResizeSpec {
     /** 0 centre, 1 north, 2 east, 3 south, 4 west, 5 north-east, 6 south-east, 7 south-west, 8 north-west. */
     position: number;
     background: number[];
+    /**
+     * Whether the rows are reversed between the resample and the crop: a flip(), or a rotate(180).
+     * The crop that finishes the resize then reads the reduce's rows from the other end, so the
+     * first row it asks for is not the first row of the reduce. A rotate(90) or rotate(270) turns
+     * the reduce's rows into the crop's columns, which vips_reduceh never clocks, so the clock
+     * stays 0; `transposed` says so.
+     */
+    flipRows?: boolean;
+    transposed?: boolean;
 }
 
 /**
@@ -681,10 +714,77 @@ export function resizeImage(image: Image, spec: ResizeSpec): { image: Image; res
     );
     const sw = roundU(W / hshrink);
     const sh = roundU(H / vshrink);
+    if (sw === W && sh === H) return { image, resized: hshrink !== 1 || vshrink !== 1 };
+    /*
+     * sharp premultiplies an image that has an alpha band before it resamples it and
+     * unpremultiplies afterwards (src/pipeline.cc), which is why a resize of an image whose alpha
+     * is not 255 is not the same pixels as a resize of its bands. It is the resample alone that
+     * runs on the premultiplied bands: the crop or embed that finishes the resize, and the flip,
+     * flop and rotation, all still see unpremultiplied pixels, so the two live here and not in
+     * applyOperations.
+     */
+    const alpha = image.channels === 2 || image.channels === 4;
+    const src = alpha ? premultiplyImage(image) : image;
+    const out = resample(src, hshrink, vshrink, spec.kernel, verticalClock(spec, sh));
     return {
-        image: sw === W && sh === H ? image : resample(image, hshrink, vshrink, spec.kernel),
+        image: alpha ? unpremultiplyImage(out) : out,
         resized: hshrink !== 1 || vshrink !== 1
     };
+}
+
+/**
+ * libvips' vips_premultiply: every band but the last is scaled by the last one. Measured against
+ * sharp 0.33.5 over 143 (colour, alpha) pairs: the scale is `floor(band * alpha / 255)`, a plain
+ * truncation, and not the `+ 128` a round-to-nearest would add -- a colour of 200 on an alpha of
+ * 200 comes back as 198, which only truncation gives.
+ */
+export function premultiplyImage(image: Image): Image {
+    if (image.channels !== 2 && image.channels !== 4) return image;
+    const ch = image.channels;
+    const out = cloneImage(image);
+    const data = image.data;
+    for (let i = 0; i < out.data.length; i += ch) {
+        const a = data[i + ch - 1];
+        for (let c = 0; c < ch - 1; c++) out.data[i + c] = Math.floor((data[i + c] * a) / 255);
+    }
+    return out;
+}
+
+/**
+ * libvips' vips_unpremultiply: the inverse, and zero wherever the alpha is. Same measurement, and
+ * the same truncation -- a colour of 128 on an alpha of 200 comes back as 127, so `floor` and not
+ * a round-to-nearest that would send the exact 127.5 up to 128.
+ *
+ * The value can come out above 255 once a kernel with negative lobes has run, since the bands and
+ * the alpha are resampled independently and the two no longer agree; the extra is clipped away,
+ * which is what writing it into an 8-bit band does.
+ */
+export function unpremultiplyImage(image: Image): Image {
+    if (image.channels !== 2 && image.channels !== 4) return image;
+    const ch = image.channels;
+    const out = cloneImage(image);
+    const data = image.data;
+    for (let i = 0; i < out.data.length; i += ch) {
+        const a = data[i + ch - 1];
+        for (let c = 0; c < ch - 1; c++) {
+            const v = a === 0 ? 0 : Math.floor((data[i + c] * 255) / a);
+            out.data[i + c] = v > 255 ? 255 : v;
+        }
+    }
+    return out;
+}
+
+/**
+ * The row of the reduce's output the crop that follows will ask for first, or 0 when the crop reads
+ * from row 0 or does not crop the height at all. vips_reducev clocks its running sum to the top of
+ * the region it is asked to fill, so this is the row its sum restarts at -- see reduceAxis.
+ */
+function verticalClock(spec: ResizeSpec, sh: number): number {
+    if (spec.canvas !== 'crop' || spec.transposed === true) return 0;
+    const ch = Math.min(spec.height > 0 ? spec.height : sh, sh);
+    if (ch >= sh) return 0;
+    const top = offsetOf(spec.position, sh, ch, true);
+    return spec.flipRows === true ? sh - top - ch : top;
 }
 
 /**

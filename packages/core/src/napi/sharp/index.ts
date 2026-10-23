@@ -99,6 +99,12 @@ function bufferOf(host: SharpAddonHost | undefined, bytes: Uint8Array): Uint8Arr
     return ctor.from(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
 }
 
+/** sharp's angle, as the quarter turns rotateQuarters takes: to nearest, wrapped into 0..3. */
+function quartersOf(angle: number): number {
+    if (angle % 360 === 0) return 0;
+    return ((Math.round(angle / 90) % 4) + 4) % 4;
+}
+
 function numberOption(options: Record<string, unknown>, key: string, fallback: number): number {
     const value = options[key];
     return typeof value === 'number' && isFinite(value) ? value : fallback;
@@ -286,7 +292,11 @@ function applyOperations(image: Image, options: Record<string, unknown>): { imag
         fastShrinkOnLoad: options.fastShrinkOnLoad !== false,
         kernel: String(options.kernel ?? 'lanczos3'),
         position: numberOption(options, 'position', 0),
-        background: arrayOption(options, 'resizeBackground', [0, 0, 0, 255])
+        background: arrayOption(options, 'resizeBackground', [0, 0, 0, 255]),
+        /* How the flip, flop and rotation below leave the rows the crop will read, so the vertical
+           reduce can clock its sum where the crop starts asking. */
+        flipRows: (options.flip === true) !== (quartersOf(numberOption(options, 'angle', 0)) === 2),
+        transposed: quartersOf(numberOption(options, 'angle', 0)) === 1 || quartersOf(numberOption(options, 'angle', 0)) === 3
     };
     if (rotationFirst) orient();
     if (numberOption(options, 'widthPre', -1) >= 0 || numberOption(options, 'heightPre', -1) >= 0) {
