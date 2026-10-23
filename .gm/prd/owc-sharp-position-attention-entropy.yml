@@ -1,0 +1,13 @@
+id: owc-sharp-position-attention-entropy
+session_id: adv6-judge-sharp-8
+owner: adv6-judge-sharp-8
+status: pending
+classification: GUEST
+measured_at: de4f90d (local main)
+title: position 'attention' and 'entropy' are refused where host runs vips_smartcrop
+subject: 'A resize with position 17 (attention) or 16 (entropy) throws "sharp: unsupported operation: option position=17 is not implemented by the pure-JavaScript sharp shim". Host sharp 0.33.5 runs libvips vips_smartcrop and returns bytes: 40x30 -> 20x10 cover attention is 600 bytes hashing 3258133504 with cropOffsetLeft 0 and cropOffsetTop 0, and 40x30 -> 100x10 entropy is 3000 bytes hashing 3554635574 with cropOffsetTop -36. The nine gravity positions and the numeric 0-8 all agree, so only the two strategies are missing. Confirmed by adv6-judge-sharp-8 in isolation on a quiet machine (load 11, 8.5 GB free), two container boots byte-identical. sharp sets hasCropOffset only inside this branch (src/pipeline.cc), which is also why a gravity crop must report no cropOffset at all.'
+acceptance_criteria:
+- sharp(40x30x3 raw).resize({width:20,height:10,fit:'cover',position:'attention'}).raw() is 600 bytes hashing 3258133504, as under host sharp 0.33.5
+- sharp(40x30x3 raw).resize({width:100,height:10,position:'entropy'}).raw() is 3000 bytes hashing 3554635574
+- the same two report cropOffsetLeft/cropOffsetTop the way host does
+witness_plan: One container boot per side, `npm install --no-audit --no-fund sharp@0.33.5` on its own `sh -c` line followed by `node /app/main.js`, against host node v24.15.0 with sharp 0.33.5 at /tmp/owc-r5-napivm/oracle. Witnessed in the R6.* keys of /tmp/owc-judge-sharp-8/case/main.js (host1.json against guest6.json).
