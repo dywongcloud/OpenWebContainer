@@ -352,7 +352,9 @@ BF['net'] = function () {
       this._flowing = undefined;
       this._encoding = null;
       this._carry = null;
-      this._idleMs = 0;
+      /* Undefined, not 0: socket.timeout is undefined until a setTimeout sets it, and a socket with
+         no timeout must not look like one carrying a zero timeout. */
+      this._idleMs = undefined;
       this._idleTimer = null;
       this._readTimer = null;
       this._serverRef = undefined;
@@ -398,8 +400,17 @@ BF['net'] = function () {
       return 'closed';
     }
 
+    /* Node reports a socket that has no connection behind it -- one never asked to connect, one still
+       connecting, or one destroyed -- and stops reporting it once the connection is there. The hub id
+       alone is not enough: it is assigned when the connect starts, so a socket mid-connect would read
+       as settled. */
     get pending() {
-      return this._hubId === undefined;
+      return this._dead || this.connecting || this._hubId === undefined;
+    }
+
+    /** The idle timeout in milliseconds, or undefined while none has been set, as Node reports it. */
+    get timeout() {
+      return this._idleMs;
     }
 
     /** Bytes written but not yet acknowledged, the way Node counts a socket's unsent queue. */
@@ -552,17 +563,36 @@ BF['net'] = function () {
       var self = this;
       var parts = [];
       var used = 0;
+      var pushed = false;
       function flush() {
         if (parts.length === 0) return;
         self.push(parts.length === 1 ? parts[0] : Buffer.concat(parts));
         parts = [];
         used = 0;
+        pushed = true;
       }
       while (!this._dead && this._readQueue.length > 0) {
         var item = this._readQueue[0];
         if (item.end) {
           this._readQueue.shift();
           flush();
+          /* Node reads a peer's last byte and its FIN on two turns, so 'end' never lands in the pass
+             that emitted the final 'data'. Both arrive batched in one read here, and pushing EOF
+             straight after that data emits 'end' before a consumer who awaited the 'data' can listen
+             for it -- an await on 'data' followed by one on 'end' then never settles. Pushing EOF one
+             macrotask later puts the two events on the two turns Node's consumer sees. */
+          if (pushed) {
+            this._endPending = true;
+            setTimeout(function () {
+              self._endPending = false;
+              if (!self._dead) {
+                self.push(null);
+                // As Node does at EOF: an empty buffer ends the stream even when nothing is reading it.
+                self.read(0);
+              }
+            }, 0);
+            return;
+          }
           this.push(null);
           // As Node does at EOF: an empty buffer ends the stream even when nothing is reading it.
           this.read(0);
@@ -590,10 +620,26 @@ BF['net'] = function () {
     }
 
     _flushReadable() {
+      var emittedData = false;
       while (!this._dead && this._readQueue.length > 0) {
         if (this._readQueue[0].end) {
           // An end with nothing buffered ahead of it ends the stream even while paused, as Node does.
           this._readQueue.shift();
+          /* Node reads a peer's last byte and its FIN in two turns, so 'end' never lands in the pass
+             that emitted the final 'data'. Here both can arrive batched in one read, and emitting
+             them together loses any 'end' listener the consumer attaches after awaiting that 'data'
+             -- an await on 'data' followed by one on 'end' never settles. Deferring the end one
+             macrotask puts the two events on the two turns Node's consumer sees. */
+          if (emittedData) {
+            var self = this;
+            this._endPending = true;
+            setTimeout(function () {
+              self._endPending = false;
+              if (!self._dead) self._emitEnd();
+              self._finishClose();
+            }, 0);
+            break;
+          }
           this._emitEnd();
           continue;
         }
@@ -613,9 +659,14 @@ BF['net'] = function () {
           used += take;
         }
         var out = this._decode(parts.length === 1 ? parts[0] : Buffer.concat(parts));
-        if (out !== null) this.emit('data', out);
+        if (out !== null) { this.emit('data', out); emittedData = true; }
       }
-      if (!this._dead && this._closePending && this._readQueue.length === 0) {
+      this._finishClose();
+    }
+
+    /** Runs the queued close that was waiting on the consumer to read the peer's end. */
+    _finishClose() {
+      if (!this._dead && this._closePending && !this._endPending && this._readQueue.length === 0) {
         this._closePending = false;
         this.destroy();
       }
@@ -1199,6 +1250,25 @@ BF['net'] = function () {
         }
         return;
       }
+      /* Node refuses an accept past maxConnections: it never reaches a 'connection' handler or the
+         connection count, so the client's connect completes and then its socket is closed, and the
+         server emits 'drop' with the addresses it refused. */
+      if (this.maxConnections > 0 && this._connections >= this.maxConnections) {
+        try {
+          callCap('net.destroy', { connectionId: payload.connectionId });
+        } catch (cause) {
+          // Already gone.
+        }
+        this.emit('drop', {
+          localAddress: payload.localAddress,
+          localPort: payload.localPort,
+          localFamily: netFamilyName(payload.localAddress),
+          remoteAddress: payload.remoteAddress,
+          remotePort: payload.remotePort,
+          remoteFamily: netFamilyName(payload.remoteAddress),
+        });
+        return;
+      }
       var socket = this._makeSocket();
       socket._adopt(payload);
       try {
@@ -1571,6 +1641,16 @@ BF['dgram'] = function () {
         if (failure) {
           if (typeof callback === 'function') netDefer(function () { callback(failure); });
           else self.emit('error', failure);
+          return;
+        }
+        /* A datagram addressed to the other family is refused by the send itself, the way
+           uv_udp_send answers it, rather than dropped without a word. */
+        if ((netIsIP(resolved) === 6) !== (self._family === 'IPv6')) {
+          var mismatch = netError(Error, 'EINVAL', 'send EINVAL ' + resolved + ':' + port);
+          mismatch.errno = -22;
+          mismatch.syscall = 'send';
+          if (typeof callback === 'function') netDefer(function () { callback(mismatch); });
+          else self.emit('error', mismatch);
           return;
         }
         if (self._hubId !== undefined) {
