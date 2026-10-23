@@ -358,7 +358,52 @@ interface CipherSpec {
      *  never passes: Node's own default here is to throw, so these two are listed and no more. */
     needsAuthTagLength?: boolean;
     aead: boolean;
+    /** The block cipher behind the name, where it is not the AES @noble carries: 'des2' and
+     *  'des3' are DES's two-key and three-key ladders, and the rest name their own cipher. */
+    primitive?: string;
+    /** 8 for the DES ladders, whose block is half AES's; 16 for everything else. */
+    blockBytes?: number;
 }
+
+/**
+ * The names OpenSSL's object database still resolves but its default provider refuses: BF, DES,
+ * SEED, IDEA, RC2, RC4, CAST5 and DESX. Node answers one of these with OpenSSL's own message
+ * rather than 'Unknown cipher', and getCipherInfo still describes it, so both are carried here.
+ */
+const LEGACY_CIPHER_INFO: Record<string, [number, string, string, number, number, number]> = {
+    'bf-cbc': [91, 'cbc', 'bf-cbc', 8, 8, 16],
+    'bf-cfb': [93, 'cfb', 'bf-cfb', 1, 8, 16],
+    'bf-ecb': [92, 'ecb', 'bf-ecb', 8, 0, 16],
+    'bf-ofb': [94, 'ofb', 'bf-ofb', 1, 8, 16],
+    'cast5-cbc': [108, 'cbc', 'cast5-cbc', 8, 8, 16],
+    'cast5-cfb': [110, 'cfb', 'cast5-cfb', 1, 8, 16],
+    'cast5-ecb': [109, 'ecb', 'cast5-ecb', 8, 0, 16],
+    'cast5-ofb': [111, 'ofb', 'cast5-ofb', 1, 8, 16],
+    'des-cbc': [31, 'cbc', 'des-cbc', 8, 8, 8],
+    'des-cfb': [30, 'cfb', 'des-cfb', 1, 8, 8],
+    'des-cfb1': [656, 'cfb', 'des-cfb1', 1, 8, 8],
+    'des-cfb8': [657, 'cfb', 'des-cfb8', 1, 8, 8],
+    'des-ecb': [29, 'ecb', 'des-ecb', 8, 0, 8],
+    'des-ofb': [45, 'ofb', 'des-ofb', 1, 8, 8],
+    'desx-cbc': [80, 'cbc', 'desx-cbc', 8, 8, 24],
+    'idea-cbc': [34, 'cbc', 'idea-cbc', 8, 8, 16],
+    'idea-cfb': [35, 'cfb', 'idea-cfb', 1, 8, 16],
+    'idea-ecb': [36, 'ecb', 'idea-ecb', 8, 0, 16],
+    'idea-ofb': [46, 'ofb', 'idea-ofb', 1, 8, 16],
+    'rc2-40-cbc': [98, 'cbc', 'rc2-40-cbc', 8, 8, 5],
+    'rc2-64-cbc': [166, 'cbc', 'rc2-64-cbc', 8, 8, 8],
+    'rc2-cbc': [37, 'cbc', 'rc2-cbc', 8, 8, 16],
+    'rc2-cfb': [39, 'cfb', 'rc2-cfb', 1, 8, 16],
+    'rc2-ecb': [38, 'ecb', 'rc2-ecb', 8, 0, 16],
+    'rc2-ofb': [40, 'ofb', 'rc2-ofb', 1, 8, 16],
+    'rc4': [5, 'stream', 'rc4', 0, 0, 16],
+    'rc4-40': [97, 'stream', 'rc4-40', 0, 0, 5],
+    'rc4-hmac-md5': [915, 'stream', 'rc4-hmac-md5', 0, 0, 16],
+    'seed-cbc': [777, 'cbc', 'seed-cbc', 16, 16, 16],
+    'seed-cfb': [779, 'cfb', 'seed-cfb', 1, 16, 16],
+    'seed-ecb': [776, 'ecb', 'seed-ecb', 16, 0, 16],
+    'seed-ofb': [778, 'ofb', 'seed-ofb', 1, 16, 16],
+};
 
 const CIPHER_SPECS: Record<string, CipherSpec> = {};
 /** The names getCiphers() answers, spelled as OpenSSL spells them. Lookup is case-insensitive. */
@@ -408,6 +453,85 @@ for (const bits of [128, 192, 256]) {
 function addAlias(name: string, spec: CipherSpec): void {
     CIPHER_SPECS[name.toLowerCase()] = spec;
 }
+
+/* Node's OpenSSL carries four block ciphers AES is not: DES in its two-key and three-key
+   ladders (des-ede, des-ede3), ARIA, SM4 and Camellia. Each is registered in every mode Node
+   answers for it, with the block width OpenSSL pads to and the primitive that runs it. */
+    addCipher('aria-128-cbc', { mode: 'cbc', keyLength: 16, blockSize: 16, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-128-ccm', { mode: 'ccm', keyLength: 16, blockSize: 1, ivLength: -2, ivMin: 7, ivMax: 13, needsAuthTagLength: true, aead: true, primitive: 'aria' });
+    addCipher('aria-128-cfb', { mode: 'cfb', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-128-cfb1', { mode: 'cfb1', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-128-cfb8', { mode: 'cfb8', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-128-ctr', { mode: 'ctr', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-128-ecb', { mode: 'ecb', keyLength: 16, blockSize: 16, ivLength: 0, aead: false, primitive: 'aria' });
+    addCipher('aria-128-gcm', { mode: 'gcm', keyLength: 16, blockSize: 1, ivLength: 12, aead: true, primitive: 'aria' });
+    addCipher('aria-128-ofb', { mode: 'ofb', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-192-cbc', { mode: 'cbc', keyLength: 24, blockSize: 16, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-192-ccm', { mode: 'ccm', keyLength: 24, blockSize: 1, ivLength: -2, ivMin: 7, ivMax: 13, needsAuthTagLength: true, aead: true, primitive: 'aria' });
+    addCipher('aria-192-cfb', { mode: 'cfb', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-192-cfb1', { mode: 'cfb1', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-192-cfb8', { mode: 'cfb8', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-192-ctr', { mode: 'ctr', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-192-ecb', { mode: 'ecb', keyLength: 24, blockSize: 16, ivLength: 0, aead: false, primitive: 'aria' });
+    addCipher('aria-192-gcm', { mode: 'gcm', keyLength: 24, blockSize: 1, ivLength: 12, aead: true, primitive: 'aria' });
+    addCipher('aria-192-ofb', { mode: 'ofb', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-256-cbc', { mode: 'cbc', keyLength: 32, blockSize: 16, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-256-ccm', { mode: 'ccm', keyLength: 32, blockSize: 1, ivLength: -2, ivMin: 7, ivMax: 13, needsAuthTagLength: true, aead: true, primitive: 'aria' });
+    addCipher('aria-256-cfb', { mode: 'cfb', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-256-cfb1', { mode: 'cfb1', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-256-cfb8', { mode: 'cfb8', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-256-ctr', { mode: 'ctr', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria-256-ecb', { mode: 'ecb', keyLength: 32, blockSize: 16, ivLength: 0, aead: false, primitive: 'aria' });
+    addCipher('aria-256-gcm', { mode: 'gcm', keyLength: 32, blockSize: 1, ivLength: 12, aead: true, primitive: 'aria' });
+    addCipher('aria-256-ofb', { mode: 'ofb', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria128', { mode: 'cbc', keyLength: 16, blockSize: 16, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria192', { mode: 'cbc', keyLength: 24, blockSize: 16, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('aria256', { mode: 'cbc', keyLength: 32, blockSize: 16, ivLength: 16, aead: false, primitive: 'aria' });
+    addCipher('camellia-128-cbc', { mode: 'cbc', keyLength: 16, blockSize: 16, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-128-cfb', { mode: 'cfb', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-128-cfb1', { mode: 'cfb1', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-128-cfb8', { mode: 'cfb8', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-128-ctr', { mode: 'ctr', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-128-ecb', { mode: 'ecb', keyLength: 16, blockSize: 16, ivLength: 0, aead: false, primitive: 'camellia' });
+    addCipher('camellia-128-ofb', { mode: 'ofb', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-192-cbc', { mode: 'cbc', keyLength: 24, blockSize: 16, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-192-cfb', { mode: 'cfb', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-192-cfb1', { mode: 'cfb1', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-192-cfb8', { mode: 'cfb8', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-192-ctr', { mode: 'ctr', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-192-ecb', { mode: 'ecb', keyLength: 24, blockSize: 16, ivLength: 0, aead: false, primitive: 'camellia' });
+    addCipher('camellia-192-ofb', { mode: 'ofb', keyLength: 24, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-256-cbc', { mode: 'cbc', keyLength: 32, blockSize: 16, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-256-cfb', { mode: 'cfb', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-256-cfb1', { mode: 'cfb1', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-256-cfb8', { mode: 'cfb8', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-256-ctr', { mode: 'ctr', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia-256-ecb', { mode: 'ecb', keyLength: 32, blockSize: 16, ivLength: 0, aead: false, primitive: 'camellia' });
+    addCipher('camellia-256-ofb', { mode: 'ofb', keyLength: 32, blockSize: 1, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia128', { mode: 'cbc', keyLength: 16, blockSize: 16, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia192', { mode: 'cbc', keyLength: 24, blockSize: 16, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('camellia256', { mode: 'cbc', keyLength: 32, blockSize: 16, ivLength: 16, aead: false, primitive: 'camellia' });
+    addCipher('des-ede', { mode: 'ecb', keyLength: 16, blockSize: 8, ivLength: 0, blockBytes: 8, aead: false, primitive: 'des2' });
+    addCipher('des-ede-cbc', { mode: 'cbc', keyLength: 16, blockSize: 8, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des2' });
+    addCipher('des-ede-cfb', { mode: 'cfb', keyLength: 16, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des2' });
+    addCipher('des-ede-ecb', { mode: 'ecb', keyLength: 16, blockSize: 8, ivLength: 0, blockBytes: 8, aead: false, primitive: 'des2' });
+    addCipher('des-ede-ofb', { mode: 'ofb', keyLength: 16, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des2' });
+    addCipher('des-ede3', { mode: 'ecb', keyLength: 24, blockSize: 8, ivLength: 0, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des-ede3-cbc', { mode: 'cbc', keyLength: 24, blockSize: 8, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des-ede3-cfb', { mode: 'cfb', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des-ede3-cfb1', { mode: 'cfb1', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des-ede3-cfb8', { mode: 'cfb8', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des-ede3-ecb', { mode: 'ecb', keyLength: 24, blockSize: 8, ivLength: 0, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des-ede3-ofb', { mode: 'ofb', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des3', { mode: 'cbc', keyLength: 24, blockSize: 8, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('des3-wrap', { mode: 'wrap', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('id-smime-alg-CMS3DESwrap', { mode: 'wrap', keyLength: 24, blockSize: 1, ivLength: 8, blockBytes: 8, aead: false, primitive: 'des3' });
+    addCipher('sm4', { mode: 'cbc', keyLength: 16, blockSize: 16, ivLength: 16, aead: false, primitive: 'sm4' });
+    addCipher('sm4-cbc', { mode: 'cbc', keyLength: 16, blockSize: 16, ivLength: 16, aead: false, primitive: 'sm4' });
+    addCipher('sm4-cfb', { mode: 'cfb', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'sm4' });
+    addCipher('sm4-ctr', { mode: 'ctr', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'sm4' });
+    addCipher('sm4-ecb', { mode: 'ecb', keyLength: 16, blockSize: 16, ivLength: 0, aead: false, primitive: 'sm4' });
+    addCipher('sm4-ofb', { mode: 'ofb', keyLength: 16, blockSize: 1, ivLength: 16, aead: false, primitive: 'sm4' });
 
 for (const bits of [128, 192, 256]) {
     const keyLength = bits / 8;
@@ -481,9 +605,851 @@ const CIPHER_INFO: Record<string, [number, string, string, number, number]> = {
     'aes-192-wrap-pad': [900, 'wrap', 'id-aes192-wrap-pad', 8, 4],
     'aes-256-wrap': [790, 'wrap', 'id-aes256-wrap', 8, 8],
     'aes-256-wrap-pad': [903, 'wrap', 'id-aes256-wrap-pad', 8, 4],
+    'aria-128-cbc': [1066, 'cbc', 'aria-128-cbc', 16, 16],
+    'aria-128-ccm': [1120, 'ccm', 'aria-128-ccm', 1, 12],
+    'aria-128-cfb': [1067, 'cfb', 'aria-128-cfb', 1, 16],
+    'aria-128-cfb1': [1080, 'cfb', 'aria-128-cfb1', 1, 16],
+    'aria-128-cfb8': [1083, 'cfb', 'aria-128-cfb8', 1, 16],
+    'aria-128-ctr': [1069, 'ctr', 'aria-128-ctr', 1, 16],
+    'aria-128-ecb': [1065, 'ecb', 'aria-128-ecb', 16, 0],
+    'aria-128-gcm': [1123, 'gcm', 'aria-128-gcm', 1, 12],
+    'aria-128-ofb': [1068, 'ofb', 'aria-128-ofb', 1, 16],
+    'aria-192-cbc': [1071, 'cbc', 'aria-192-cbc', 16, 16],
+    'aria-192-ccm': [1121, 'ccm', 'aria-192-ccm', 1, 12],
+    'aria-192-cfb': [1072, 'cfb', 'aria-192-cfb', 1, 16],
+    'aria-192-cfb1': [1081, 'cfb', 'aria-192-cfb1', 1, 16],
+    'aria-192-cfb8': [1084, 'cfb', 'aria-192-cfb8', 1, 16],
+    'aria-192-ctr': [1074, 'ctr', 'aria-192-ctr', 1, 16],
+    'aria-192-ecb': [1070, 'ecb', 'aria-192-ecb', 16, 0],
+    'aria-192-gcm': [1124, 'gcm', 'aria-192-gcm', 1, 12],
+    'aria-192-ofb': [1073, 'ofb', 'aria-192-ofb', 1, 16],
+    'aria-256-cbc': [1076, 'cbc', 'aria-256-cbc', 16, 16],
+    'aria-256-ccm': [1122, 'ccm', 'aria-256-ccm', 1, 12],
+    'aria-256-cfb': [1077, 'cfb', 'aria-256-cfb', 1, 16],
+    'aria-256-cfb1': [1082, 'cfb', 'aria-256-cfb1', 1, 16],
+    'aria-256-cfb8': [1085, 'cfb', 'aria-256-cfb8', 1, 16],
+    'aria-256-ctr': [1079, 'ctr', 'aria-256-ctr', 1, 16],
+    'aria-256-ecb': [1075, 'ecb', 'aria-256-ecb', 16, 0],
+    'aria-256-gcm': [1125, 'gcm', 'aria-256-gcm', 1, 12],
+    'aria-256-ofb': [1078, 'ofb', 'aria-256-ofb', 1, 16],
+    'aria128': [1066, 'cbc', 'aria-128-cbc', 16, 16],
+    'aria192': [1071, 'cbc', 'aria-192-cbc', 16, 16],
+    'aria256': [1076, 'cbc', 'aria-256-cbc', 16, 16],
+    'camellia-128-cbc': [751, 'cbc', 'camellia-128-cbc', 16, 16],
+    'camellia-128-cfb': [757, 'cfb', 'camellia-128-cfb', 1, 16],
+    'camellia-128-cfb1': [760, 'cfb', 'camellia-128-cfb1', 1, 16],
+    'camellia-128-cfb8': [763, 'cfb', 'camellia-128-cfb8', 1, 16],
+    'camellia-128-ctr': [963, 'ctr', 'camellia-128-ctr', 1, 16],
+    'camellia-128-ecb': [754, 'ecb', 'camellia-128-ecb', 16, 0],
+    'camellia-128-ofb': [766, 'ofb', 'camellia-128-ofb', 1, 16],
+    'camellia-192-cbc': [752, 'cbc', 'camellia-192-cbc', 16, 16],
+    'camellia-192-cfb': [758, 'cfb', 'camellia-192-cfb', 1, 16],
+    'camellia-192-cfb1': [761, 'cfb', 'camellia-192-cfb1', 1, 16],
+    'camellia-192-cfb8': [764, 'cfb', 'camellia-192-cfb8', 1, 16],
+    'camellia-192-ctr': [967, 'ctr', 'camellia-192-ctr', 1, 16],
+    'camellia-192-ecb': [755, 'ecb', 'camellia-192-ecb', 16, 0],
+    'camellia-192-ofb': [767, 'ofb', 'camellia-192-ofb', 1, 16],
+    'camellia-256-cbc': [753, 'cbc', 'camellia-256-cbc', 16, 16],
+    'camellia-256-cfb': [759, 'cfb', 'camellia-256-cfb', 1, 16],
+    'camellia-256-cfb1': [762, 'cfb', 'camellia-256-cfb1', 1, 16],
+    'camellia-256-cfb8': [765, 'cfb', 'camellia-256-cfb8', 1, 16],
+    'camellia-256-ctr': [971, 'ctr', 'camellia-256-ctr', 1, 16],
+    'camellia-256-ecb': [756, 'ecb', 'camellia-256-ecb', 16, 0],
+    'camellia-256-ofb': [768, 'ofb', 'camellia-256-ofb', 1, 16],
+    'camellia128': [751, 'cbc', 'camellia-128-cbc', 16, 16],
+    'camellia192': [752, 'cbc', 'camellia-192-cbc', 16, 16],
+    'camellia256': [753, 'cbc', 'camellia-256-cbc', 16, 16],
+    'des-ede': [32, 'ecb', 'des-ede', 8, 0],
+    'des-ede-cbc': [43, 'cbc', 'des-ede-cbc', 8, 8],
+    'des-ede-cfb': [60, 'cfb', 'des-ede-cfb', 1, 8],
+    'des-ede-ecb': [32, 'ecb', 'des-ede', 8, 0],
+    'des-ede-ofb': [62, 'ofb', 'des-ede-ofb', 1, 8],
+    'des-ede3': [33, 'ecb', 'des-ede3', 8, 0],
+    'des-ede3-cbc': [44, 'cbc', 'des-ede3-cbc', 8, 8],
+    'des-ede3-cfb': [61, 'cfb', 'des-ede3-cfb', 1, 8],
+    'des-ede3-cfb1': [658, 'cfb', 'des-ede3-cfb1', 1, 8],
+    'des-ede3-cfb8': [659, 'cfb', 'des-ede3-cfb8', 1, 8],
+    'des-ede3-ecb': [33, 'ecb', 'des-ede3', 8, 0],
+    'des-ede3-ofb': [63, 'ofb', 'des-ede3-ofb', 1, 8],
+    'des3': [44, 'cbc', 'des-ede3-cbc', 8, 8],
+    'des3-wrap': [246, 'wrap', 'id-smime-alg-cms3deswrap', 8, 0],
+    'id-smime-alg-cms3deswrap': [246, 'wrap', 'id-smime-alg-cms3deswrap', 8, 0],
+    'sm4': [1134, 'cbc', 'sm4-cbc', 16, 16],
+    'sm4-cbc': [1134, 'cbc', 'sm4-cbc', 16, 16],
+    'sm4-cfb': [1137, 'cfb', 'sm4-cfb', 1, 16],
+    'sm4-ctr': [1139, 'ctr', 'sm4-ctr', 1, 16],
+    'sm4-ecb': [1133, 'ecb', 'sm4-ecb', 16, 0],
+    'sm4-ofb': [1135, 'ofb', 'sm4-ofb', 1, 16],
     'chacha20': [1019, 'stream', 'chacha20', 0, 16],
     'chacha20-poly1305': [1018, 'stream', 'chacha20-poly1305', 0, 12]
 };
+
+/** SM4's S-box (GB/T 32907), as OpenSSL carries it. */
+const SM4_S = new Uint8Array([
+    0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7, 0x16, 0xb6, 0x14, 0xc2,
+    0x28, 0xfb, 0x2c, 0x05, 0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3,
+    0xaa, 0x44, 0x13, 0x26, 0x49, 0x86, 0x06, 0x99, 0x9c, 0x42, 0x50, 0xf4,
+    0x91, 0xef, 0x98, 0x7a, 0x33, 0x54, 0x0b, 0x43, 0xed, 0xcf, 0xac, 0x62,
+    0xe4, 0xb3, 0x1c, 0xa9, 0xc9, 0x08, 0xe8, 0x95, 0x80, 0xdf, 0x94, 0xfa,
+    0x75, 0x8f, 0x3f, 0xa6, 0x47, 0x07, 0xa7, 0xfc, 0xf3, 0x73, 0x17, 0xba,
+    0x83, 0x59, 0x3c, 0x19, 0xe6, 0x85, 0x4f, 0xa8, 0x68, 0x6b, 0x81, 0xb2,
+    0x71, 0x64, 0xda, 0x8b, 0xf8, 0xeb, 0x0f, 0x4b, 0x70, 0x56, 0x9d, 0x35,
+    0x1e, 0x24, 0x0e, 0x5e, 0x63, 0x58, 0xd1, 0xa2, 0x25, 0x22, 0x7c, 0x3b,
+    0x01, 0x21, 0x78, 0x87, 0xd4, 0x00, 0x46, 0x57, 0x9f, 0xd3, 0x27, 0x52,
+    0x4c, 0x36, 0x02, 0xe7, 0xa0, 0xc4, 0xc8, 0x9e, 0xea, 0xbf, 0x8a, 0xd2,
+    0x40, 0xc7, 0x38, 0xb5, 0xa3, 0xf7, 0xf2, 0xce, 0xf9, 0x61, 0x15, 0xa1,
+    0xe0, 0xae, 0x5d, 0xa4, 0x9b, 0x34, 0x1a, 0x55, 0xad, 0x93, 0x32, 0x30,
+    0xf5, 0x8c, 0xb1, 0xe3, 0x1d, 0xf6, 0xe2, 0x2e, 0x82, 0x66, 0xca, 0x60,
+    0xc0, 0x29, 0x23, 0xab, 0x0d, 0x53, 0x4e, 0x6f, 0xd5, 0xdb, 0x37, 0x45,
+    0xde, 0xfd, 0x8e, 0x2f, 0x03, 0xff, 0x6a, 0x72, 0x6d, 0x6c, 0x5b, 0x51,
+    0x8d, 0x1b, 0xaf, 0x92, 0xbb, 0xdd, 0xbc, 0x7f, 0x11, 0xd9, 0x5c, 0x41,
+    0x1f, 0x10, 0x5a, 0xd8, 0x0a, 0xc1, 0x31, 0x88, 0xa5, 0xcd, 0x7b, 0xbd,
+    0x2d, 0x74, 0xd0, 0x12, 0xb8, 0xe5, 0xb4, 0xb0, 0x89, 0x69, 0x97, 0x4a,
+    0x0c, 0x96, 0x77, 0x7e, 0x65, 0xb9, 0xf1, 0x09, 0xc5, 0x6e, 0xc6, 0x84,
+    0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20, 0x79, 0xee, 0x5f, 0x3e,
+    0xd7, 0xcb, 0x39, 0x48,
+]);
+/** SM4's family key and the thirty-two round constants it xors into the schedule. */
+const SM4_FK = new Uint32Array([
+    0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc,
+]);
+const SM4_CK = new Uint32Array([
+    0x00070e15, 0x1c232a31, 0x383f464d, 0x545b6269, 0x70777e85, 0x8c939aa1,
+    0xa8afb6bd, 0xc4cbd2d9, 0xe0e7eef5, 0xfc030a11, 0x181f262d, 0x343b4249,
+    0x50575e65, 0x6c737a81, 0x888f969d, 0xa4abb2b9, 0xc0c7ced5, 0xdce3eaf1,
+    0xf8ff060d, 0x141b2229, 0x30373e45, 0x4c535a61, 0x686f767d, 0x848b9299,
+    0xa0a7aeb5, 0xbcc3cad1, 0xd8dfe6ed, 0xf4fb0209, 0x10171e25, 0x2c333a41,
+    0x484f565d, 0x646b7279,
+]);
+/** Camellia's first S-box (RFC 3657); the other three are rotations of it. */
+const CAMELLIA_S1 = new Uint8Array([
+    0x70, 0x82, 0x2c, 0xec, 0xb3, 0x27, 0xc0, 0xe5, 0xe4, 0x85, 0x57, 0x35,
+    0xea, 0x0c, 0xae, 0x41, 0x23, 0xef, 0x6b, 0x93, 0x45, 0x19, 0xa5, 0x21,
+    0xed, 0x0e, 0x4f, 0x4e, 0x1d, 0x65, 0x92, 0xbd, 0x86, 0xb8, 0xaf, 0x8f,
+    0x7c, 0xeb, 0x1f, 0xce, 0x3e, 0x30, 0xdc, 0x5f, 0x5e, 0xc5, 0x0b, 0x1a,
+    0xa6, 0xe1, 0x39, 0xca, 0xd5, 0x47, 0x5d, 0x3d, 0xd9, 0x01, 0x5a, 0xd6,
+    0x51, 0x56, 0x6c, 0x4d, 0x8b, 0x0d, 0x9a, 0x66, 0xfb, 0xcc, 0xb0, 0x2d,
+    0x74, 0x12, 0x2b, 0x20, 0xf0, 0xb1, 0x84, 0x99, 0xdf, 0x4c, 0xcb, 0xc2,
+    0x34, 0x7e, 0x76, 0x05, 0x6d, 0xb7, 0xa9, 0x31, 0xd1, 0x17, 0x04, 0xd7,
+    0x14, 0x58, 0x3a, 0x61, 0xde, 0x1b, 0x11, 0x1c, 0x32, 0x0f, 0x9c, 0x16,
+    0x53, 0x18, 0xf2, 0x22, 0xfe, 0x44, 0xcf, 0xb2, 0xc3, 0xb5, 0x7a, 0x91,
+    0x24, 0x08, 0xe8, 0xa8, 0x60, 0xfc, 0x69, 0x50, 0xaa, 0xd0, 0xa0, 0x7d,
+    0xa1, 0x89, 0x62, 0x97, 0x54, 0x5b, 0x1e, 0x95, 0xe0, 0xff, 0x64, 0xd2,
+    0x10, 0xc4, 0x00, 0x48, 0xa3, 0xf7, 0x75, 0xdb, 0x8a, 0x03, 0xe6, 0xda,
+    0x09, 0x3f, 0xdd, 0x94, 0x87, 0x5c, 0x83, 0x02, 0xcd, 0x4a, 0x90, 0x33,
+    0x73, 0x67, 0xf6, 0xf3, 0x9d, 0x7f, 0xbf, 0xe2, 0x52, 0x9b, 0xd8, 0x26,
+    0xc8, 0x37, 0xc6, 0x3b, 0x81, 0x96, 0x6f, 0x4b, 0x13, 0xbe, 0x63, 0x2e,
+    0xe9, 0x79, 0xa7, 0x8c, 0x9f, 0x6e, 0xbc, 0x8e, 0x29, 0xf5, 0xf9, 0xb6,
+    0x2f, 0xfd, 0xb4, 0x59, 0x78, 0x98, 0x06, 0x6a, 0xe7, 0x46, 0x71, 0xba,
+    0xd4, 0x25, 0xab, 0x42, 0x88, 0xa2, 0x8d, 0xfa, 0x72, 0x07, 0xb9, 0x55,
+    0xf8, 0xee, 0xac, 0x0a, 0x36, 0x49, 0x2a, 0x68, 0x3c, 0x38, 0xf1, 0xa4,
+    0x40, 0x28, 0xd3, 0x7b, 0xbb, 0xc9, 0x43, 0xc1, 0x15, 0xe3, 0xad, 0xf4,
+    0x77, 0xc7, 0x80, 0x9e,
+]);
+/** ARIA's S-box 1 (RFC 5794): the first is AES's own. */
+const ARIA_SB1 = new Uint8Array([
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b,
+    0xfe, 0xd7, 0xab, 0x76, 0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
+    0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0, 0xb7, 0xfd, 0x93, 0x26,
+    0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2,
+    0xeb, 0x27, 0xb2, 0x75, 0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0,
+    0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84, 0x53, 0xd1, 0x00, 0xed,
+    0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f,
+    0x50, 0x3c, 0x9f, 0xa8, 0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5,
+    0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2, 0xcd, 0x0c, 0x13, 0xec,
+    0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14,
+    0xde, 0x5e, 0x0b, 0xdb, 0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c,
+    0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79, 0xe7, 0xc8, 0x37, 0x6d,
+    0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f,
+    0x4b, 0xbd, 0x8b, 0x8a, 0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e,
+    0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e, 0xe1, 0xf8, 0x98, 0x11,
+    0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f,
+    0xb0, 0x54, 0xbb, 0x16,
+]);
+/** ARIA's S-box 2 (RFC 5794): the first is AES's own. */
+const ARIA_SB2 = new Uint8Array([
+    0xe2, 0x4e, 0x54, 0xfc, 0x94, 0xc2, 0x4a, 0xcc, 0x62, 0x0d, 0x6a, 0x46,
+    0x3c, 0x4d, 0x8b, 0xd1, 0x5e, 0xfa, 0x64, 0xcb, 0xb4, 0x97, 0xbe, 0x2b,
+    0xbc, 0x77, 0x2e, 0x03, 0xd3, 0x19, 0x59, 0xc1, 0x1d, 0x06, 0x41, 0x6b,
+    0x55, 0xf0, 0x99, 0x69, 0xea, 0x9c, 0x18, 0xae, 0x63, 0xdf, 0xe7, 0xbb,
+    0x00, 0x73, 0x66, 0xfb, 0x96, 0x4c, 0x85, 0xe4, 0x3a, 0x09, 0x45, 0xaa,
+    0x0f, 0xee, 0x10, 0xeb, 0x2d, 0x7f, 0xf4, 0x29, 0xac, 0xcf, 0xad, 0x91,
+    0x8d, 0x78, 0xc8, 0x95, 0xf9, 0x2f, 0xce, 0xcd, 0x08, 0x7a, 0x88, 0x38,
+    0x5c, 0x83, 0x2a, 0x28, 0x47, 0xdb, 0xb8, 0xc7, 0x93, 0xa4, 0x12, 0x53,
+    0xff, 0x87, 0x0e, 0x31, 0x36, 0x21, 0x58, 0x48, 0x01, 0x8e, 0x37, 0x74,
+    0x32, 0xca, 0xe9, 0xb1, 0xb7, 0xab, 0x0c, 0xd7, 0xc4, 0x56, 0x42, 0x26,
+    0x07, 0x98, 0x60, 0xd9, 0xb6, 0xb9, 0x11, 0x40, 0xec, 0x20, 0x8c, 0xbd,
+    0xa0, 0xc9, 0x84, 0x04, 0x49, 0x23, 0xf1, 0x4f, 0x50, 0x1f, 0x13, 0xdc,
+    0xd8, 0xc0, 0x9e, 0x57, 0xe3, 0xc3, 0x7b, 0x65, 0x3b, 0x02, 0x8f, 0x3e,
+    0xe8, 0x25, 0x92, 0xe5, 0x15, 0xdd, 0xfd, 0x17, 0xa9, 0xbf, 0xd4, 0x9a,
+    0x7e, 0xc5, 0x39, 0x67, 0xfe, 0x76, 0x9d, 0x43, 0xa7, 0xe1, 0xd0, 0xf5,
+    0x68, 0xf2, 0x1b, 0x34, 0x70, 0x05, 0xa3, 0x8a, 0xd5, 0x79, 0x86, 0xa8,
+    0x30, 0xc6, 0x51, 0x4b, 0x1e, 0xa6, 0x27, 0xf6, 0x35, 0xd2, 0x6e, 0x24,
+    0x16, 0x82, 0x5f, 0xda, 0xe6, 0x75, 0xa2, 0xef, 0x2c, 0xb2, 0x1c, 0x9f,
+    0x5d, 0x6f, 0x80, 0x0a, 0x72, 0x44, 0x9b, 0x6c, 0x90, 0x0b, 0x5b, 0x33,
+    0x7d, 0x5a, 0x52, 0xf3, 0x61, 0xa1, 0xf7, 0xb0, 0xd6, 0x3f, 0x7c, 0x6d,
+    0xed, 0x14, 0xe0, 0xa5, 0x3d, 0x22, 0xb3, 0xf8, 0x89, 0xde, 0x71, 0x1a,
+    0xaf, 0xba, 0xb5, 0x81,
+]);
+/** ARIA's S-box 3 (RFC 5794): the first is AES's own. */
+const ARIA_SB3 = new Uint8Array([
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e,
+    0x81, 0xf3, 0xd7, 0xfb, 0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87,
+    0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb, 0x54, 0x7b, 0x94, 0x32,
+    0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49,
+    0x6d, 0x8b, 0xd1, 0x25, 0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16,
+    0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92, 0x6c, 0x70, 0x48, 0x50,
+    0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05,
+    0xb8, 0xb3, 0x45, 0x06, 0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02,
+    0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b, 0x3a, 0x91, 0x11, 0x41,
+    0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8,
+    0x1c, 0x75, 0xdf, 0x6e, 0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89,
+    0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b, 0xfc, 0x56, 0x3e, 0x4b,
+    0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59,
+    0x27, 0x80, 0xec, 0x5f, 0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d,
+    0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef, 0xa0, 0xe0, 0x3b, 0x4d,
+    0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63,
+    0x55, 0x21, 0x0c, 0x7d,
+]);
+/** ARIA's S-box 4 (RFC 5794): the first is AES's own. */
+const ARIA_SB4 = new Uint8Array([
+    0x30, 0x68, 0x99, 0x1b, 0x87, 0xb9, 0x21, 0x78, 0x50, 0x39, 0xdb, 0xe1,
+    0x72, 0x09, 0x62, 0x3c, 0x3e, 0x7e, 0x5e, 0x8e, 0xf1, 0xa0, 0xcc, 0xa3,
+    0x2a, 0x1d, 0xfb, 0xb6, 0xd6, 0x20, 0xc4, 0x8d, 0x81, 0x65, 0xf5, 0x89,
+    0xcb, 0x9d, 0x77, 0xc6, 0x57, 0x43, 0x56, 0x17, 0xd4, 0x40, 0x1a, 0x4d,
+    0xc0, 0x63, 0x6c, 0xe3, 0xb7, 0xc8, 0x64, 0x6a, 0x53, 0xaa, 0x38, 0x98,
+    0x0c, 0xf4, 0x9b, 0xed, 0x7f, 0x22, 0x76, 0xaf, 0xdd, 0x3a, 0x0b, 0x58,
+    0x67, 0x88, 0x06, 0xc3, 0x35, 0x0d, 0x01, 0x8b, 0x8c, 0xc2, 0xe6, 0x5f,
+    0x02, 0x24, 0x75, 0x93, 0x66, 0x1e, 0xe5, 0xe2, 0x54, 0xd8, 0x10, 0xce,
+    0x7a, 0xe8, 0x08, 0x2c, 0x12, 0x97, 0x32, 0xab, 0xb4, 0x27, 0x0a, 0x23,
+    0xdf, 0xef, 0xca, 0xd9, 0xb8, 0xfa, 0xdc, 0x31, 0x6b, 0xd1, 0xad, 0x19,
+    0x49, 0xbd, 0x51, 0x96, 0xee, 0xe4, 0xa8, 0x41, 0xda, 0xff, 0xcd, 0x55,
+    0x86, 0x36, 0xbe, 0x61, 0x52, 0xf8, 0xbb, 0x0e, 0x82, 0x48, 0x69, 0x9a,
+    0xe0, 0x47, 0x9e, 0x5c, 0x04, 0x4b, 0x34, 0x15, 0x79, 0x26, 0xa7, 0xde,
+    0x29, 0xae, 0x92, 0xd7, 0x84, 0xe9, 0xd2, 0xba, 0x5d, 0xf3, 0xc5, 0xb0,
+    0xbf, 0xa4, 0x3b, 0x71, 0x44, 0x46, 0x2b, 0xfc, 0xeb, 0x6f, 0xd5, 0xf6,
+    0x14, 0xfe, 0x7c, 0x70, 0x5a, 0x7d, 0xfd, 0x2f, 0x18, 0x83, 0x16, 0xa5,
+    0x91, 0x1f, 0x05, 0x95, 0x74, 0xa9, 0xc1, 0x5b, 0x4a, 0x85, 0x6d, 0x13,
+    0x07, 0x4f, 0x4e, 0x45, 0xb2, 0x0f, 0xc9, 0x1c, 0xa6, 0xbc, 0xec, 0x73,
+    0x90, 0x7b, 0xcf, 0x59, 0x8f, 0xa1, 0xf9, 0x2d, 0xf2, 0xb1, 0x00, 0x94,
+    0x37, 0x9f, 0xd0, 0x2e, 0x9c, 0x6e, 0x28, 0x3f, 0x80, 0xf0, 0x3d, 0xd3,
+    0x25, 0x8a, 0xb5, 0xe7, 0x42, 0xb3, 0xc7, 0xea, 0xf7, 0x4c, 0x11, 0x33,
+    0x03, 0xa2, 0xac, 0x60,
+]);
+/** ARIA's key-schedule constant 1. */
+const ARIA_C1 = new Uint8Array([
+    0x51, 0x7c, 0xc1, 0xb7, 0x27, 0x22, 0x0a, 0x94, 0xfe, 0x13, 0xab, 0xe8,
+    0xfa, 0x9a, 0x6e, 0xe0,
+]);
+/** ARIA's key-schedule constant 2. */
+const ARIA_C2 = new Uint8Array([
+    0x6d, 0xb1, 0x4a, 0xcc, 0x9e, 0x21, 0xc8, 0x20, 0xff, 0x28, 0xb1, 0xd5,
+    0xef, 0x5d, 0xe2, 0xb0,
+]);
+/** ARIA's key-schedule constant 3. */
+const ARIA_C3 = new Uint8Array([
+    0xdb, 0x92, 0x37, 0x1d, 0x21, 0x26, 0xe9, 0x70, 0x03, 0x24, 0x97, 0x75,
+    0x04, 0xe8, 0xc9, 0x0e,
+]);
+
+/* ---------------------------------------------------------------------------------------------
+ * The block ciphers behind the names Node's OpenSSL answers that AES is not: DES in its two-key
+ * and three-key ladders, ARIA, SM4 and Camellia. @noble carries AES alone, so these are written
+ * here against FIPS 46-3, RFC 5794, GB/T 32907 and RFC 3657, and each one is witnessed against
+ * host Node 24.15 over every mode it can be opened in.
+ * ------------------------------------------------------------------------------------------ */
+
+/** A block cipher's own encryption and decryption of one block, and the block's width in bytes. */
+interface BlockPrimitive {
+    size: number;
+    encrypt(key: Uint8Array, block: Uint8Array): Uint8Array;
+    decrypt(key: Uint8Array, block: Uint8Array): Uint8Array;
+}
+
+/** DES (FIPS 46-3): the initial and final permutations, the expansion, the P permutation, the two
+ *  key permutations, the sixteen shifts, and the eight S-boxes. */
+const DES_IP = new Uint8Array([
+    58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4,
+    62, 54, 46, 38, 30, 22, 14, 6, 64, 56, 48, 40, 32, 24, 16, 8,
+    57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11, 3,
+    61, 53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7
+]);
+const DES_FP = new Uint8Array([
+    40, 8, 48, 16, 56, 24, 64, 32, 39, 7, 47, 15, 55, 23, 63, 31,
+    38, 6, 46, 14, 54, 22, 62, 30, 37, 5, 45, 13, 53, 21, 61, 29,
+    36, 4, 44, 12, 52, 20, 60, 28, 35, 3, 43, 11, 51, 19, 59, 27,
+    34, 2, 42, 10, 50, 18, 58, 26, 33, 1, 41, 9, 49, 17, 57, 25
+]);
+const DES_E = new Uint8Array([
+    32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11,
+    12, 13, 12, 13, 14, 15, 16, 17, 16, 17, 18, 19, 20, 21,
+    20, 21, 22, 23, 24, 25, 24, 25, 26, 27, 28, 29, 28, 29, 30, 31, 32, 1
+]);
+const DES_P = new Uint8Array([
+    16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10,
+    2, 8, 24, 14, 32, 27, 3, 9, 19, 13, 30, 6, 22, 11, 4, 25
+]);
+const DES_PC1 = new Uint8Array([
+    57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18,
+    10, 2, 59, 51, 43, 35, 27, 19, 11, 3, 60, 52, 44, 36,
+    63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22,
+    14, 6, 61, 53, 45, 37, 29, 21, 13, 5, 28, 20, 12, 4
+]);
+const DES_PC2 = new Uint8Array([
+    14, 17, 11, 24, 1, 5, 3, 28, 15, 6, 21, 10,
+    23, 19, 12, 4, 26, 8, 16, 7, 27, 20, 13, 2,
+    41, 52, 31, 37, 47, 55, 30, 40, 51, 45, 33, 48,
+    44, 49, 39, 56, 34, 53, 46, 42, 50, 36, 29, 32
+]);
+const DES_SHIFTS = new Uint8Array([1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1]);
+const DES_SBOX = [
+    new Uint8Array([
+        14, 4, 13, 1, 2, 15, 11, 8, 3, 10, 6, 12, 5, 9, 0, 7,
+        0, 15, 7, 4, 14, 2, 13, 1, 10, 6, 12, 11, 9, 5, 3, 8,
+        4, 1, 14, 8, 13, 6, 2, 11, 15, 12, 9, 7, 3, 10, 5, 0,
+        15, 12, 8, 2, 4, 9, 1, 7, 5, 11, 3, 14, 10, 0, 6, 13
+    ]),
+    new Uint8Array([
+        15, 1, 8, 14, 6, 11, 3, 4, 9, 7, 2, 13, 12, 0, 5, 10,
+        3, 13, 4, 7, 15, 2, 8, 14, 12, 0, 1, 10, 6, 9, 11, 5,
+        0, 14, 7, 11, 10, 4, 13, 1, 5, 8, 12, 6, 9, 3, 2, 15,
+        13, 8, 10, 1, 3, 15, 4, 2, 11, 6, 7, 12, 0, 5, 14, 9
+    ]),
+    new Uint8Array([
+        10, 0, 9, 14, 6, 3, 15, 5, 1, 13, 12, 7, 11, 4, 2, 8,
+        13, 7, 0, 9, 3, 4, 6, 10, 2, 8, 5, 14, 12, 11, 15, 1,
+        13, 6, 4, 9, 8, 15, 3, 0, 11, 1, 2, 12, 5, 10, 14, 7,
+        1, 10, 13, 0, 6, 9, 8, 7, 4, 15, 14, 3, 11, 5, 2, 12
+    ]),
+    new Uint8Array([
+        7, 13, 14, 3, 0, 6, 9, 10, 1, 2, 8, 5, 11, 12, 4, 15,
+        13, 8, 11, 5, 6, 15, 0, 3, 4, 7, 2, 12, 1, 10, 14, 9,
+        10, 6, 9, 0, 12, 11, 7, 13, 15, 1, 3, 14, 5, 2, 8, 4,
+        3, 15, 0, 6, 10, 1, 13, 8, 9, 4, 5, 11, 12, 7, 2, 14
+    ]),
+    new Uint8Array([
+        2, 12, 4, 1, 7, 10, 11, 6, 8, 5, 3, 15, 13, 0, 14, 9,
+        14, 11, 2, 12, 4, 7, 13, 1, 5, 0, 15, 10, 3, 9, 8, 6,
+        4, 2, 1, 11, 10, 13, 7, 8, 15, 9, 12, 5, 6, 3, 0, 14,
+        11, 8, 12, 7, 1, 14, 2, 13, 6, 15, 0, 9, 10, 4, 5, 3
+    ]),
+    new Uint8Array([
+        12, 1, 10, 15, 9, 2, 6, 8, 0, 13, 3, 4, 14, 7, 5, 11,
+        10, 15, 4, 2, 7, 12, 9, 5, 6, 1, 13, 14, 0, 11, 3, 8,
+        9, 14, 15, 5, 2, 8, 12, 3, 7, 0, 4, 10, 1, 13, 11, 6,
+        4, 3, 2, 12, 9, 5, 15, 10, 11, 14, 1, 7, 6, 0, 8, 13
+    ]),
+    new Uint8Array([
+        4, 11, 2, 14, 15, 0, 8, 13, 3, 12, 9, 7, 5, 10, 6, 1,
+        13, 0, 11, 7, 4, 9, 1, 10, 14, 3, 5, 12, 2, 15, 8, 6,
+        1, 4, 11, 13, 12, 3, 7, 14, 10, 15, 6, 8, 0, 5, 9, 2,
+        6, 11, 13, 8, 1, 4, 10, 7, 9, 5, 0, 15, 14, 2, 3, 12
+    ]),
+    new Uint8Array([
+        13, 2, 8, 4, 6, 15, 11, 1, 10, 9, 3, 14, 5, 0, 12, 7,
+        1, 15, 13, 8, 10, 3, 7, 4, 12, 5, 6, 11, 0, 14, 9, 2,
+        7, 11, 4, 1, 9, 12, 14, 2, 0, 6, 10, 13, 15, 3, 5, 8,
+        2, 1, 14, 7, 4, 10, 8, 13, 15, 12, 9, 0, 3, 5, 6, 11
+    ])
+];
+
+/** Bit `i` of a big-endian byte string, counted from the most significant bit of byte 0. */
+function bitAt(bytes: Uint8Array, i: number): number {
+    return (bytes[i >> 3] >> (7 - (i & 7))) & 1;
+}
+
+/** The bits of `table` read out of `bytes`: one output byte per eight bits, most significant first. */
+function permuteBits(bytes: Uint8Array, table: Uint8Array): Uint8Array {
+    const out = new Uint8Array(Math.ceil(table.length / 8));
+    for (let i = 0; i < table.length; i++) out[i >> 3] |= bitAt(bytes, table[i] - 1) << (7 - (i & 7));
+    return out;
+}
+
+/** DES's sixteen 48-bit round keys, in the order encryption walks them. */
+function desRoundKeys(key: Uint8Array): Uint8Array[] {
+    const cd = new Uint8Array(56);
+    for (let i = 0; i < 56; i++) cd[i] = bitAt(key, DES_PC1[i] - 1);
+    let c = cd.subarray(0, 28);
+    let d = cd.subarray(28, 56);
+    const keys: Uint8Array[] = [];
+    for (let round = 0; round < 16; round++) {
+        const shift = DES_SHIFTS[round];
+        const nc = new Uint8Array(28);
+        const nd = new Uint8Array(28);
+        for (let i = 0; i < 28; i++) { nc[i] = c[(i + shift) % 28]; nd[i] = d[(i + shift) % 28]; }
+        c = nc;
+        d = nd;
+        const k = new Uint8Array(48);
+        for (let i = 0; i < 48; i++) k[i] = DES_PC2[i] - 1 < 28 ? c[DES_PC2[i] - 1] : d[DES_PC2[i] - 29];
+        const packed = new Uint8Array(6);
+        for (let i = 0; i < 48; i++) packed[i >> 3] |= k[i] << (7 - (i & 7));
+        keys.push(packed);
+    }
+    return keys;
+}
+
+/** DES's F function: expand, xor the round key, eight S-boxes, then P. */
+function desFeistel(r: Uint8Array, k: Uint8Array): Uint8Array {
+    const expanded = new Uint8Array(48);
+    for (let i = 0; i < 48; i++) expanded[i] = bitAt(r, DES_E[i] - 1);
+    const keyed = new Uint8Array(48);
+    for (let i = 0; i < 48; i++) keyed[i] = expanded[i] ^ ((k[i >> 3] >> (7 - (i & 7))) & 1);
+    const substituted = new Uint8Array(32);
+    for (let s = 0; s < 8; s++) {
+        const row = keyed[s * 6] * 2 + keyed[s * 6 + 5];
+        const col = keyed[s * 6 + 1] * 8 + keyed[s * 6 + 2] * 4 + keyed[s * 6 + 3] * 2 + keyed[s * 6 + 4];
+        const value = DES_SBOX[s][row * 16 + col];
+        for (let b = 0; b < 4; b++) substituted[s * 4 + b] = (value >> (3 - b)) & 1;
+    }
+    const out = new Uint8Array(4);
+    for (let i = 0; i < 32; i++) out[i >> 3] |= substituted[DES_P[i] - 1] << (7 - (i & 7));
+    return out;
+}
+
+/** One DES block. The key is eight bytes, of which the parity bits are ignored as OpenSSL ignores
+ *  them, and the sixteen round keys are walked backwards to decrypt. */
+function desBlock(key: Uint8Array, block: Uint8Array, direction: 'encrypt' | 'decrypt'): Uint8Array {
+    const keys = desRoundKeys(key);
+    const ip = permuteBits(block, DES_IP);
+    let left = ip.subarray(0, 4);
+    let right = ip.subarray(4, 8);
+    for (let round = 0; round < 16; round++) {
+        const k = keys[direction === 'encrypt' ? round : 15 - round];
+        const f = desFeistel(right, k);
+        const next = new Uint8Array(4);
+        for (let i = 0; i < 4; i++) next[i] = left[i] ^ f[i];
+        left = right;
+        right = next;
+    }
+    return permuteBits(concatBytes(right, left), DES_FP);
+}
+
+/** DES's EDE ladders: three-key with K3 = K1 for the two-key spelling. Encrypt is E-D-E, so
+ *  decrypt is the same three calls in the other order with the other operations. */
+function desEdeBlock(key: Uint8Array, block: Uint8Array, direction: 'encrypt' | 'decrypt'): Uint8Array {
+    const k1 = key.subarray(0, 8);
+    const k2 = key.subarray(8, 16);
+    const k3 = key.length >= 24 ? key.subarray(16, 24) : key.subarray(0, 8);
+    if (direction === 'encrypt') {
+        return desBlock(k3, desBlock(k2, desBlock(k1, block, 'encrypt'), 'decrypt'), 'encrypt');
+    }
+    return desBlock(k1, desBlock(k2, desBlock(k3, block, 'decrypt'), 'encrypt'), 'decrypt');
+}
+
+const rotl8 = (x: number, n: number): number => ((x << n) | (x >>> (8 - n))) & 0xff;
+
+/* ------------------------------------------ ARIA (RFC 5794) ------------------------------------------ */
+
+/** ARIA's diffusion layer: every output byte is the xor of seven input bytes. */
+const ARIA_A: number[][] = [
+    [3, 4, 6, 8, 9, 13, 14], [2, 5, 7, 8, 9, 12, 15], [1, 4, 6, 10, 11, 12, 15], [0, 5, 7, 10, 11, 13, 14],
+    [0, 2, 5, 8, 11, 14, 15], [1, 3, 4, 9, 10, 14, 15], [0, 2, 7, 9, 10, 12, 13], [1, 3, 6, 8, 11, 12, 13],
+    [0, 1, 4, 7, 10, 13, 15], [0, 1, 5, 6, 11, 12, 14], [2, 3, 5, 6, 8, 13, 15], [2, 3, 4, 7, 9, 12, 14],
+    [1, 2, 6, 7, 9, 11, 12], [0, 3, 6, 7, 8, 10, 13], [0, 3, 4, 5, 9, 11, 14], [1, 2, 4, 5, 8, 10, 15]
+];
+
+function ariaA(out: Uint8Array, x: Uint8Array): void {
+    for (let i = 0; i < 16; i++) {
+        let v = 0;
+        for (const j of ARIA_A[i]) v ^= x[j];
+        out[i] = v;
+    }
+}
+
+/** The odd and even substitution layers: each xors the round key in and then maps the bytes. */
+function ariaSl1(out: Uint8Array, x: Uint8Array, rk: Uint8Array): void {
+    for (let i = 0; i < 16; i += 4) {
+        out[i] = ARIA_SB1[x[i] ^ rk[i]];
+        out[i + 1] = ARIA_SB2[x[i + 1] ^ rk[i + 1]];
+        out[i + 2] = ARIA_SB3[x[i + 2] ^ rk[i + 2]];
+        out[i + 3] = ARIA_SB4[x[i + 3] ^ rk[i + 3]];
+    }
+}
+
+function ariaSl2(out: Uint8Array, x: Uint8Array, rk: Uint8Array): void {
+    for (let i = 0; i < 16; i += 4) {
+        out[i] = ARIA_SB3[x[i] ^ rk[i]];
+        out[i + 1] = ARIA_SB4[x[i + 1] ^ rk[i + 1]];
+        out[i + 2] = ARIA_SB1[x[i + 2] ^ rk[i + 2]];
+        out[i + 3] = ARIA_SB2[x[i + 3] ^ rk[i + 3]];
+    }
+}
+
+function ariaFO(out: Uint8Array, d: Uint8Array, rk: Uint8Array): void {
+    const y = new Uint8Array(16);
+    ariaSl1(y, d, rk);
+    ariaA(out, y);
+}
+
+function ariaFE(out: Uint8Array, d: Uint8Array, rk: Uint8Array): void {
+    const y = new Uint8Array(16);
+    ariaSl2(y, d, rk);
+    ariaA(out, y);
+}
+
+/** A right rotation of a 128-bit value by `n` bits, xored with `with`, as OpenSSL's key schedule
+ *  builds its round keys. */
+function ariaRotate(out: Uint8Array, n: number, z: Uint8Array, withBytes: Uint8Array): void {
+    const bytes = Math.floor(n / 8);
+    const bits = n % 8;
+    const t = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) t[(i + bytes) % 16] = z[i];
+    for (let i = 0; i < 16; i++) {
+        out[i] = (((t[i] >> bits) | ((t[i === 0 ? 15 : i - 1] << (8 - bits)) & 0xff)) & 0xff) ^ withBytes[i];
+    }
+}
+
+/** ARIA's key schedule: twelve rounds for a 128-bit key, fourteen for 192 and sixteen for 256. */
+function ariaSchedule(key: Uint8Array, direction: 'encrypt' | 'decrypt'): Uint8Array[] {
+    const bits = key.length * 8;
+    const rounds = bits === 128 ? 12 : bits === 192 ? 14 : 16;
+    const ck1 = bits === 128 ? ARIA_C1 : bits === 192 ? ARIA_C2 : ARIA_C3;
+    const ck2 = bits === 128 ? ARIA_C2 : bits === 192 ? ARIA_C3 : ARIA_C1;
+    const ck3 = bits === 128 ? ARIA_C3 : bits === 192 ? ARIA_C1 : ARIA_C2;
+    const kr = new Uint8Array(16);
+    if (bits === 192) kr.set(key.subarray(16, 24), 0);
+    else if (bits === 256) kr.set(key.subarray(16, 32), 0);
+    const w0 = Uint8Array.from(key.subarray(0, 16));
+    const w1 = new Uint8Array(16);
+    const w2 = new Uint8Array(16);
+    const w3 = new Uint8Array(16);
+    const t = new Uint8Array(16);
+    ariaFO(w3, w0, ck1);
+    for (let i = 0; i < 16; i++) w1[i] = w3[i] ^ kr[i];
+    ariaFE(w3, w1, ck2);
+    for (let i = 0; i < 16; i++) w2[i] = w3[i] ^ w0[i];
+    ariaFO(t, w2, ck3);
+    for (let i = 0; i < 16; i++) w3[i] = t[i] ^ w1[i];
+    const ek: Uint8Array[] = [];
+    for (let i = 0; i < 17; i++) ek.push(new Uint8Array(16));
+    /* OpenSSL's rotnr(o, xor, z) is o = rotr(z, n) xor xor: the value rotated is the second of the
+       pair and the one xored in is the first, which is the order the schedule names them in. */
+    ariaRotate(ek[0], 19, w1, w0);
+    ariaRotate(ek[1], 19, w2, w1);
+    ariaRotate(ek[2], 19, w3, w2);
+    ariaRotate(ek[3], 19, w0, w3);
+    ariaRotate(ek[4], 31, w1, w0);
+    ariaRotate(ek[5], 31, w2, w1);
+    ariaRotate(ek[6], 31, w3, w2);
+    ariaRotate(ek[7], 31, w0, w3);
+    ariaRotate(ek[8], 67, w1, w0);
+    ariaRotate(ek[9], 67, w2, w1);
+    ariaRotate(ek[10], 67, w3, w2);
+    ariaRotate(ek[11], 67, w0, w3);
+    ariaRotate(ek[12], 97, w1, w0);
+    if (rounds > 12) {
+        ariaRotate(ek[13], 97, w2, w1);
+        ariaRotate(ek[14], 97, w3, w2);
+        if (rounds > 14) {
+            ariaRotate(ek[15], 97, w0, w3);
+            ariaRotate(ek[16], 109, w1, w0);
+        }
+    }
+    if (direction === 'encrypt') return ek;
+    /* Decryption walks the same rounds backwards, with the diffusion layer over each inner key. */
+    const dk: Uint8Array[] = [];
+    for (let i = 0; i < 17; i++) dk.push(new Uint8Array(16));
+    dk[0] = ek[rounds];
+    for (let i = 1; i < rounds; i++) ariaA(dk[i], ek[rounds - i]);
+    dk[rounds] = ek[0];
+    return dk;
+}
+
+function ariaBlock(key: Uint8Array, block: Uint8Array, direction: 'encrypt' | 'decrypt'): Uint8Array {
+    const rounds = key.length === 16 ? 12 : key.length === 24 ? 14 : 16;
+    const keys = ariaSchedule(key, direction);
+    const p = Uint8Array.from(block.subarray(0, 16));
+    for (let i = 0; i < rounds - 2; i += 2) {
+        ariaFO(p, p, keys[i]);
+        ariaFE(p, p, keys[i + 1]);
+    }
+    ariaFO(p, p, keys[rounds - 2]);
+    const out = new Uint8Array(16);
+    ariaSl2(out, p, keys[rounds - 1]);
+    for (let i = 0; i < 16; i++) out[i] ^= keys[rounds][i];
+    return out;
+}
+
+/* ------------------------------------------ SM4 (GB/T 32907) ------------------------------------------ */
+
+function readWord(bytes: Uint8Array, at: number): number {
+    return ((bytes[at * 4] * 16777216) + (bytes[at * 4 + 1] << 16) + (bytes[at * 4 + 2] << 8) + bytes[at * 4 + 3]) >>> 0;
+}
+
+function writeWord(bytes: Uint8Array, at: number, value: number): void {
+    bytes[at * 4] = (value >>> 24) & 0xff;
+    bytes[at * 4 + 1] = (value >>> 16) & 0xff;
+    bytes[at * 4 + 2] = (value >>> 8) & 0xff;
+    bytes[at * 4 + 3] = value & 0xff;
+}
+
+const sm4Rotate = (x: number, n: number): number => ((x << n) | (x >>> (32 - n))) >>> 0;
+
+/** tau and the two linear maps built on it: L for the rounds, L' for the schedule. */
+function sm4Tau(x: number): number {
+    return ((SM4_S[(x >>> 24) & 0xff] << 24) | (SM4_S[(x >>> 16) & 0xff] << 16) | (SM4_S[(x >>> 8) & 0xff] << 8) | SM4_S[x & 0xff]) >>> 0;
+}
+
+function sm4L(x: number): number {
+    const b = sm4Tau(x);
+    return (b ^ sm4Rotate(b, 2) ^ sm4Rotate(b, 10) ^ sm4Rotate(b, 18) ^ sm4Rotate(b, 24)) >>> 0;
+}
+
+function sm4LKey(x: number): number {
+    const b = sm4Tau(x);
+    return (b ^ sm4Rotate(b, 13) ^ sm4Rotate(b, 23)) >>> 0;
+}
+
+function sm4Block(key: Uint8Array, block: Uint8Array, direction: 'encrypt' | 'decrypt'): Uint8Array {
+    const k = new Uint32Array(4);
+    for (let i = 0; i < 4; i++) k[i] = readWord(key, i) ^ SM4_FK[i];
+    const rk = new Uint32Array(32);
+    for (let i = 0; i < 32; i++) {
+        rk[i] = k[0] ^ sm4LKey(k[1] ^ k[2] ^ k[3] ^ SM4_CK[i]);
+        k[0] = k[1];
+        k[1] = k[2];
+        k[2] = k[3];
+        k[3] = rk[i];
+    }
+    const x = new Uint32Array(36);
+    for (let i = 0; i < 4; i++) x[i] = readWord(block, i);
+    for (let i = 0; i < 32; i++) {
+        const roundKey = rk[direction === 'encrypt' ? i : 31 - i];
+        x[i + 4] = (x[i] ^ sm4L(x[i + 1] ^ x[i + 2] ^ x[i + 3] ^ roundKey)) >>> 0;
+    }
+    const out = new Uint8Array(16);
+    for (let i = 0; i < 4; i++) writeWord(out, i, x[35 - i]);
+    return out;
+}
+
+/* ------------------------------------------ Camellia (RFC 3657) ------------------------------------------ */
+
+const U64_MASK = (1n << 64n) - 1n;
+
+function bytesToU64(bytes: Uint8Array, at: number): bigint {
+    let v = 0n;
+    for (let i = 0; i < 8; i++) v = (v << 8n) | BigInt(bytes[at + i]);
+    return v;
+}
+
+function u64ToBytes(value: bigint, out: Uint8Array, at: number): void {
+    let v = value & U64_MASK;
+    for (let i = 7; i >= 0; i--) {
+        out[at + i] = Number(v & 0xffn);
+        v >>= 8n;
+    }
+}
+
+/** The eight masks the P function multiplies a substituted byte by; they are sparse enough that no
+ *  carry ever crosses a byte, so the product is the byte broadcast across its lanes. */
+const CAMELLIA_M = [
+    0x0101010001000001n, 0x0001010101010000n, 0x0100010100010100n, 0x0101000100000101n,
+    0x0001010100010101n, 0x0100010101000101n, 0x0101000101010001n, 0x0101010001010100n
+];
+
+/** Camellia's F function: the four S-boxes, the second and third of which are rotations of the
+ *  first, and then P over the eight bytes they answer. */
+function camelliaF(v: bigint, k: bigint): bigint {
+    const x = (v ^ k) & U64_MASK;
+    const b: number[] = [];
+    for (let i = 0; i < 8; i++) b.push(Number((x >> BigInt(56 - 8 * i)) & 0xffn));
+    const z = [
+        CAMELLIA_S1[b[0]],
+        rotl8(CAMELLIA_S1[b[1]], 1),
+        rotl8(CAMELLIA_S1[b[2]], 7),
+        CAMELLIA_S1[rotl8(b[3], 1)],
+        rotl8(CAMELLIA_S1[b[4]], 1),
+        rotl8(CAMELLIA_S1[b[5]], 7),
+        CAMELLIA_S1[rotl8(b[6], 1)],
+        CAMELLIA_S1[b[7]]
+    ];
+    let r = 0n;
+    for (let i = 0; i < 8; i++) r = (r ^ (CAMELLIA_M[i] * BigInt(z[i]))) & U64_MASK;
+    return r;
+}
+
+const rotl32 = (x: number, n: number): number => ((x << n) | (x >>> (32 - n))) >>> 0;
+
+function camelliaFL(v: bigint, k: bigint): bigint {
+    let x1 = Number((v >> 32n) & 0xffffffffn);
+    let x2 = Number(v & 0xffffffffn);
+    const k1 = Number((k >> 32n) & 0xffffffffn);
+    const k2 = Number(k & 0xffffffffn);
+    x2 = (x2 ^ rotl32(x1 & k1, 1)) >>> 0;
+    x1 = (x1 ^ (x2 | k2)) >>> 0;
+    return (BigInt(x1) << 32n) | BigInt(x2);
+}
+
+function camelliaFLInv(v: bigint, k: bigint): bigint {
+    let x1 = Number((v >> 32n) & 0xffffffffn);
+    let x2 = Number(v & 0xffffffffn);
+    const k1 = Number((k >> 32n) & 0xffffffffn);
+    const k2 = Number(k & 0xffffffffn);
+    x1 = (x1 ^ (x2 | k2)) >>> 0;
+    x2 = (x2 ^ rotl32(x1 & k1, 1)) >>> 0;
+    return (BigInt(x1) << 32n) | BigInt(x2);
+}
+
+/** The high and low halves of a 128-bit value rotated left, as the key schedule names them. */
+function rotate128(hi: bigint, lo: bigint, shift: number): [bigint, bigint] {
+    const s = shift >= 64 ? shift - 64 : shift;
+    return [
+        ((hi << BigInt(s)) | (lo >> BigInt(64 - s))) & U64_MASK,
+        ((hi >> BigInt(64 - s)) | (lo << BigInt(s))) & U64_MASK
+    ];
+}
+
+/** Camellia's subkeys: KL and KR from the key, and KA and KB derived from them under the six
+ *  sigma constants, then the rotations the rounds walk. */
+function camelliaSchedule(key: Uint8Array): bigint[] {
+    const klH = bytesToU64(key, 0);
+    const klL = bytesToU64(key, 8);
+    const krH = key.length >= 24 ? bytesToU64(key, 16) : 0n;
+    const krL = key.length === 32 ? bytesToU64(key, 24) : key.length === 24 ? (~krH) & U64_MASK : 0n;
+    const sigma = [0xA09E667F3BCC908Bn, 0xB67AE8584CAA73B2n, 0xC6EF372FE94F82BEn,
+        0x54FF53A5F1D36F1Cn, 0x10E527FADE682D1Dn, 0xB05688C2B3E6C1FDn];
+    let d1 = klH ^ krH;
+    let d2 = klL ^ krL;
+    d2 ^= camelliaF(d1, sigma[0]);
+    d1 ^= camelliaF(d2, sigma[1]);
+    d1 ^= klH;
+    d2 ^= klL;
+    d2 ^= camelliaF(d1, sigma[2]);
+    d1 ^= camelliaF(d2, sigma[3]);
+    const kaH = d1 & U64_MASK;
+    const kaL = d2 & U64_MASK;
+    d1 = kaH ^ krH;
+    d2 = kaL ^ krL;
+    d2 ^= camelliaF(d1, sigma[4]);
+    d1 ^= camelliaF(d2, sigma[5]);
+    const kbH = d1 & U64_MASK;
+    const kbL = d2 & U64_MASK;
+    const sk: bigint[] = [];
+    const push = (h: bigint, l: bigint, shift: number, swapped: boolean): void => {
+        const [hi, lo] = rotate128(h, l, shift);
+        if (swapped) { sk.push(lo); sk.push(hi); } else { sk.push(hi); sk.push(lo); }
+    };
+    if (key.length === 16) {
+        /* The 128-bit schedule is not a list of matched pairs: KA's 45-bit rotation is followed by
+           KL's 60-bit low half, and everything from 77 bits on is written low half first. */
+        const hi = (h: bigint, l: bigint, shift: number): bigint => rotate128(h, l, shift)[0];
+        const lo = (h: bigint, l: bigint, shift: number): bigint => rotate128(h, l, shift)[1];
+        sk.push(klH, klL, kaH, kaL,
+            hi(klH, klL, 15), lo(klH, klL, 15),
+            hi(kaH, kaL, 15), lo(kaH, kaL, 15),
+            hi(kaH, kaL, 30), lo(kaH, kaL, 30),
+            hi(klH, klL, 45), lo(klH, klL, 45),
+            hi(kaH, kaL, 45), lo(klH, klL, 60),
+            hi(kaH, kaL, 60), lo(kaH, kaL, 60),
+            lo(klH, klL, 77), hi(klH, klL, 77),
+            lo(klH, klL, 94), hi(klH, klL, 94),
+            lo(kaH, kaL, 94), hi(kaH, kaL, 94),
+            lo(klH, klL, 111), hi(klH, klL, 111),
+            lo(kaH, kaL, 111), hi(kaH, kaL, 111));
+    } else {
+        sk.push(klH, klL, kbH, kbL);
+        push(krH, krL, 15, false);
+        push(kaH, kaL, 15, false);
+        push(krH, krL, 30, false);
+        push(kbH, kbL, 30, false);
+        push(klH, klL, 45, false);
+        push(kaH, kaL, 45, false);
+        push(klH, klL, 60, false);
+        push(krH, krL, 60, false);
+        push(kbH, kbL, 60, false);
+        push(klH, klL, 77, true);
+        push(kaH, kaL, 77, true);
+        push(krH, krL, 94, true);
+        push(kaH, kaL, 94, true);
+        push(klH, klL, 111, true);
+        push(kbH, kbL, 111, true);
+    }
+    return sk;
+}
+
+function camelliaBlock(key: Uint8Array, block: Uint8Array, direction: 'encrypt' | 'decrypt'): Uint8Array {
+    const sk = camelliaSchedule(key);
+    const rounds = key.length === 16 ? 9 : 12;
+    const out = new Uint8Array(16);
+    let d1 = bytesToU64(block, 0);
+    let d2 = bytesToU64(block, 8);
+    if (direction === 'encrypt') {
+        let at = 0;
+        d1 ^= sk[at++];
+        d2 ^= sk[at++];
+        d2 ^= camelliaF(d1, sk[at++]);
+        d1 ^= camelliaF(d2, sk[at++]);
+        for (let r = 1; r !== rounds - 1; r++) {
+            if (r % 3 === 0) {
+                d1 = camelliaFL(d1, sk[at++]);
+                d2 = camelliaFLInv(d2, sk[at++]);
+            }
+            d2 ^= camelliaF(d1, sk[at++]);
+            d1 ^= camelliaF(d2, sk[at++]);
+        }
+        d2 ^= camelliaF(d1, sk[at++]);
+        d1 ^= camelliaF(d2, sk[at++]);
+        d2 ^= sk[at++];
+        d1 ^= sk[at++];
+    } else {
+        let at = sk.length - 1;
+        d2 ^= sk[at--];
+        d1 ^= sk[at--];
+        d2 ^= camelliaF(d1, sk[at--]);
+        d1 ^= camelliaF(d2, sk[at--]);
+        for (let r = 1; r !== rounds - 1; r++) {
+            if (r % 3 === 0) {
+                d1 = camelliaFL(d1, sk[at--]);
+                d2 = camelliaFLInv(d2, sk[at--]);
+            }
+            d2 ^= camelliaF(d1, sk[at--]);
+            d1 ^= camelliaF(d2, sk[at--]);
+        }
+        d2 ^= camelliaF(d1, sk[at--]);
+        d1 ^= camelliaF(d2, sk[at--]);
+        d1 ^= sk[at--];
+        d2 ^= sk[at];
+    }
+    u64ToBytes(d2, out, 0);
+    u64ToBytes(d1, out, 8);
+    return out;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+const AES_PRIMITIVE: BlockPrimitive = {
+    /* 16 as a literal: BLOCK is declared below, and this one runs when the module loads. */
+    size: 16,
+    encrypt: (key, block) => ecb(key, { disablePadding: true }).encrypt(block),
+    decrypt: (key, block) => ecb(key, { disablePadding: true }).decrypt(block)
+};
+
+const BLOCK_PRIMITIVES: Record<string, BlockPrimitive> = {
+    des2: { size: 8, encrypt: (key, block) => desEdeBlock(key, block, 'encrypt'), decrypt: (key, block) => desEdeBlock(key, block, 'decrypt') },
+    des3: { size: 8, encrypt: (key, block) => desEdeBlock(key, block, 'encrypt'), decrypt: (key, block) => desEdeBlock(key, block, 'decrypt') },
+    aria: { size: 16, encrypt: (key, block) => ariaBlock(key, block, 'encrypt'), decrypt: (key, block) => ariaBlock(key, block, 'decrypt') },
+    sm4: { size: 16, encrypt: (key, block) => sm4Block(key, block, 'encrypt'), decrypt: (key, block) => sm4Block(key, block, 'decrypt') },
+    camellia: { size: 16, encrypt: (key, block) => camelliaBlock(key, block, 'encrypt'), decrypt: (key, block) => camelliaBlock(key, block, 'decrypt') }
+};
+
+function primitiveOf(spec: CipherSpec): BlockPrimitive {
+    return spec.primitive === undefined ? AES_PRIMITIVE : BLOCK_PRIMITIVES[spec.primitive];
+}
+
+/** The width a cipher pads to: 8 for the DES ladders, 16 everywhere else. */
+function blockBytesOf(spec: CipherSpec): number {
+    return spec.blockBytes ?? BLOCK;
+}
 
 /**
  * Node's getCipherInfo: undefined for a name no cipher here carries, and for one whose keyLength or
@@ -496,7 +1462,16 @@ function cipherInfo(nameOrNid: unknown, options: any): Record<string, unknown> |
     if (key === undefined) return undefined;
     const entry = CIPHER_INFO[key];
     const spec = CIPHER_SPECS[key];
-    if (spec === undefined) return undefined;
+    if (entry === undefined || spec === undefined) {
+        /* A legacy name answers what OpenSSL's object database says about it. */
+        const legacy = LEGACY_CIPHER_INFO[key];
+        if (legacy === undefined) return undefined;
+        if (options !== undefined && options !== null) {
+            if (options.keyLength !== undefined && options.keyLength !== null && Number(options.keyLength) !== legacy[5]) return undefined;
+            if (options.ivLength !== undefined && options.ivLength !== null && Number(options.ivLength) !== legacy[4]) return undefined;
+        }
+        return cipherInfoFields(legacy[0], legacy[1], legacy[2], legacy[3], legacy[4], legacy[5]);
+    }
     const keyLength = spec.keyLength;
     const ivLength = entry[4];
     if (options !== undefined && options !== null) {
@@ -504,8 +1479,14 @@ function cipherInfo(nameOrNid: unknown, options: any): Record<string, unknown> |
         if (options.ivLength !== undefined && options.ivLength !== null && Number(options.ivLength) !== ivLength) return undefined;
     }
     /* The field order is the one host Node 24.15's JSON answers with. */
-    const info: Record<string, unknown> = { mode: entry[1], name: entry[2], nid: entry[0] };
-    if (entry[3] !== 0) info.blockSize = entry[3];
+    return cipherInfoFields(entry[0], entry[1], entry[2], entry[3], ivLength, keyLength);
+}
+
+/** Node's answer as a caller reads it: a field is left out where OpenSSL carries none. */
+function cipherInfoFields(nid: number, mode: string, name: string, blockSize: number, ivLength: number, keyLength: number)
+    : Record<string, unknown> {
+    const info: Record<string, unknown> = { mode, name, nid };
+    if (blockSize !== 0) info.blockSize = blockSize;
     if (ivLength !== 0) info.ivLength = ivLength;
     info.keyLength = keyLength;
     return info;
@@ -588,6 +1569,8 @@ function transformBlocks(state: CipherState, bytes: Uint8Array): Uint8Array {
     const { spec, key } = state;
     const encrypt = state.direction === 'encrypt';
     if (bytes.length === 0) return new Uint8Array(0);
+    /* DES, ARIA, SM4 and Camellia run their own modes here; AES keeps the @noble path below. */
+    if (spec.primitive !== undefined) return genericBlocks(state, bytes);
     if (spec.mode === 'ofb' || spec.mode === 'cfb8' || spec.mode === 'cfb1' || spec.mode === 'cc20') {
         return streamBytes(state, bytes);
     }
@@ -655,6 +1638,7 @@ function streamBytes(state: CipherState, bytes: Uint8Array): Uint8Array {
     const key = state.key;
     const encrypt = state.direction === 'encrypt';
     const out = new Uint8Array(bytes.length);
+    if (state.spec.primitive !== undefined) return genericBlocks(state, bytes);
     switch (state.spec.mode) {
         case 'ofb': {
             for (let i = 0; i < bytes.length; i++) {
@@ -798,14 +1782,14 @@ function xorInto(a: Uint8Array, b: Uint8Array): Uint8Array {
 
 /** RFC 3394, with the caller's IV as the starting value rather than the A6A6... default: OpenSSL
  *  answers the wrap ciphers with whatever IV it was handed, and a caller sees that. */
-function aesWrap(key: Uint8Array, iv: Uint8Array, data: Uint8Array): Uint8Array {
+function aesWrap(p: BlockPrimitive, key: Uint8Array, iv: Uint8Array, data: Uint8Array): Uint8Array {
     const n = Math.floor(data.length / 8);
     let a = Uint8Array.from(iv);
     const blocks: Uint8Array[] = [];
     for (let i = 0; i < n; i++) blocks.push(data.subarray(i * 8, i * 8 + 8));
     for (let j = 0; j < 6; j++) {
         for (let i = 0; i < n; i++) {
-            const b = ecb(key, { disablePadding: true }).encrypt(concatBytes(a, blocks[i]));
+            const b = p.encrypt(key, concatBytes(a, blocks[i]));
             a = xorInto(b.subarray(0, 8), wrapCounter(n * j + i + 1));
             blocks[i] = b.subarray(8);
         }
@@ -816,14 +1800,14 @@ function aesWrap(key: Uint8Array, iv: Uint8Array, data: Uint8Array): Uint8Array 
 }
 
 /** The unwrapped bytes and the starting value they authenticate, which RFC 5649 keeps the length in. */
-function aesUnwrap(key: Uint8Array, data: Uint8Array): { a: Uint8Array; plain: Uint8Array } {
+function aesUnwrap(p: BlockPrimitive, key: Uint8Array, data: Uint8Array): { a: Uint8Array; plain: Uint8Array } {
     const n = Math.floor(data.length / 8) - 1;
     let a = Uint8Array.from(data.subarray(0, 8));
     const blocks: Uint8Array[] = [];
     for (let i = 0; i < n; i++) blocks.push(data.subarray(8 + i * 8, 16 + i * 8));
     for (let j = 5; j >= 0; j--) {
         for (let i = n - 1; i >= 0; i--) {
-            const b = ecb(key, { disablePadding: true }).decrypt(concatBytes(xorInto(a, wrapCounter(n * j + i + 1)), blocks[i]));
+            const b = p.decrypt(key, concatBytes(xorInto(a, wrapCounter(n * j + i + 1)), blocks[i]));
             a = b.subarray(0, 8);
             blocks[i] = b.subarray(8);
         }
@@ -834,13 +1818,13 @@ function aesUnwrap(key: Uint8Array, data: Uint8Array): { a: Uint8Array; plain: U
 }
 
 /** RFC 5649: a four-byte alternative IV and the plaintext's own length ahead of the padded data. */
-function aesWrapPad(key: Uint8Array, aiv: Uint8Array, data: Uint8Array): Uint8Array {
+function aesWrapPad(p: BlockPrimitive, key: Uint8Array, aiv: Uint8Array, data: Uint8Array): Uint8Array {
     const padded = new Uint8Array(Math.max(8, Math.ceil(data.length / 8) * 8));
     padded.set(data, 0);
     const len = data.length;
     const a = concatBytes(aiv, new Uint8Array([(len >>> 24) & 0xff, (len >>> 16) & 0xff, (len >>> 8) & 0xff, len & 0xff]));
-    if (padded.length === 8) return ecb(key, { disablePadding: true }).encrypt(concatBytes(a, padded));
-    return aesWrap(key, a, padded);
+    if (padded.length === 8) return p.encrypt(key, concatBytes(a, padded));
+    return aesWrap(p, key, a, padded);
 }
 
 /** A wrap whose integrity check fails: the words OpenSSL uses for a wrap it cannot unwrap. */
@@ -848,18 +1832,18 @@ function wrapIntegrity(): never {
     return cipherFail(null, 'Trying to add data in unsupported state');
 }
 
-function aesUnwrapPad(key: Uint8Array, aiv: Uint8Array, data: Uint8Array): Uint8Array {
+function aesUnwrapPad(p: BlockPrimitive, key: Uint8Array, aiv: Uint8Array, data: Uint8Array): Uint8Array {
     /* RFC 5649 keeps the AIV's first half for the IV it was wrapped with and puts the plaintext's
        own length in the second, so both come back: a length the padded data cannot hold, or an IV
        that is not the one given, is a wrap this key and IV never produced. */
     if (data.length === 16) {
-        const b = ecb(key, { disablePadding: true }).decrypt(data);
+        const b = p.decrypt(key, data);
         const len = readWrapLength(b, 4);
         if (len > 8) throw wrapIntegrity();
         for (let i = 0; i < 4; i++) if (b[i] !== aiv[i]) throw wrapIntegrity();
         return b.subarray(8, 8 + len);
     }
-    const { a, plain } = aesUnwrap(key, data);
+    const { a, plain } = aesUnwrap(p, key, data);
     const len = readWrapLength(a, 4);
     if (len > plain.length) throw wrapIntegrity();
     for (let i = 0; i < 4; i++) if (a[i] !== aiv[i]) throw wrapIntegrity();
@@ -890,9 +1874,9 @@ function aeadXor(state: CipherState, bytes: Uint8Array): Uint8Array {
 }
 
 /** PKCS#7 removal: a padding byte outside 1..16, or a block that does not end in it, is a bad decrypt. */
-function unpad(bytes: Uint8Array): Uint8Array {
+function unpad(bytes: Uint8Array, width: number = BLOCK): Uint8Array {
     const pad = bytes[bytes.length - 1];
-    if (pad < 1 || pad > BLOCK || pad > bytes.length) throw badDecrypt();
+    if (pad < 1 || pad > width || pad > bytes.length) throw badDecrypt();
     for (let i = bytes.length - pad; i < bytes.length; i++) if (bytes[i] !== pad) throw badDecrypt();
     return bytes.subarray(0, bytes.length - pad);
 }
@@ -924,7 +1908,7 @@ function cipherUpdate(state: CipherState, input: Uint8Array): Uint8Array {
         }
         if (state.spec.mode === 'wrap') {
             if (!encrypt) {
-                const unwrapped = aesUnwrap(state.key, input);
+                const unwrapped = aesUnwrap(primitiveOf(state.spec), state.key, input);
                 /* RFC 3394's integrity check: the alternative IV the wrap was made with comes back,
                    and one that does not is a wrap this key and IV never produced. */
                 for (let i = 0; i < state.iv.length; i++) {
@@ -932,11 +1916,16 @@ function cipherUpdate(state: CipherState, input: Uint8Array): Uint8Array {
                 }
                 return unwrapped.plain;
             }
-            return aesWrap(state.key, state.iv, input);
+            return aesWrap(primitiveOf(state.spec), state.key, state.iv, input);
         }
-        return encrypt ? aesWrapPad(state.key, state.iv, input) : aesUnwrapPad(state.key, state.iv, input);
+        return encrypt ? aesWrapPad(primitiveOf(state.spec), state.key, state.iv, input) : aesUnwrapPad(primitiveOf(state.spec), state.key, state.iv, input);
     }
     if (state.spec.aead) {
+        /* CCM needs the message's whole length before it can seal any of it, so Node answers a
+           second update with the state OpenSSL's own CCM leaves. */
+        if (state.spec.mode === 'ccm' && input.length > 0 && state.aeadEmitted + state.pending.length > 0) {
+            throw cipherFail(null, 'Trying to add data in unsupported state');
+        }
         /*
          * An AEAD emits as it goes, the way OpenSSL's does: every byte a caller hands in comes
          * back from the update that carried it, and only the tag waits for final(). Both of these
@@ -944,17 +1933,21 @@ function cipherUpdate(state: CipherState, input: Uint8Array): Uint8Array {
          * and is the same stream however the input was split across calls.
          */
         state.pending = concatBytes(state.pending, input);
-        const out = aeadXor(state, state.pending);
-        const fresh = out.subarray(state.aeadEmitted);
-        state.aeadEmitted = out.length;
+        const out = aeadData(state, state.pending);
+        /* OCB seals a block only once it is whole: the bytes a partial block becomes depend on
+           where the message ends, so they are held back rather than answered early and wrong. */
+        const emit = state.spec.mode === 'ocb' ? Math.floor(out.length / BLOCK) * BLOCK : out.length;
+        const fresh = out.subarray(state.aeadEmitted, emit);
+        state.aeadEmitted = emit;
         return fresh;
     }
     const total = concatBytes(state.pending, input);
     const block = state.spec.blockSize;
+    const width = blockBytesOf(state.spec);
     let emit = Math.floor(total.length / block) * block;
     /* A decrypting block cipher with padding keeps its last whole block: it may hold the padding. */
-    if (block === BLOCK && state.direction === 'decrypt' && state.autoPadding && total.length >= BLOCK && total.length % BLOCK === 0) {
-        emit -= BLOCK;
+    if (block > 1 && state.direction === 'decrypt' && state.autoPadding && total.length >= width && total.length % width === 0) {
+        emit -= width;
     }
     const out = transformBlocks(state, total.subarray(0, emit));
     state.pending = total.subarray(emit);
@@ -965,44 +1958,445 @@ function cipherFinal(state: CipherState): { data: Uint8Array; tag?: Uint8Array }
     const rest = state.pending;
     state.pending = new Uint8Array(0);
     if (state.spec.aead) {
+        const run = aeadRun(state, rest);
         if (state.direction === 'encrypt') {
             /* The tag is taken over the whole plaintext, not over the part this call emits, so it
                is the seal of everything that went in. */
-            const sealed = aeadCipher(state).encrypt(rest);
-            const at = sealed.length - TAG_LENGTH;
             return {
-                data: aeadXor(state, rest).subarray(state.aeadEmitted),
-                tag: sealed.subarray(at, at + state.tagLength)
+                data: run.data.subarray(state.aeadEmitted),
+                tag: run.tag.subarray(0, state.tagLength)
             };
         }
         if (state.tag === undefined) throw authFailure();
         /*
          * A caller who asked for a tag shorter than the sixteen the AEAD computes is checking the
-         * leading bytes of it, and the library will only ever compare all sixteen: sealing the
-         * recovered plaintext answers the whole tag, and the leading bytes are the ones to compare.
+         * leading bytes of it, and CCM's and OCB's own tags are already the length asked for.
          */
-        const plain = aeadXor(state, rest);
-        const full = aeadCipher(state).encrypt(plain);
-        const tag = full.subarray(full.length - TAG_LENGTH);
-        for (let i = 0; i < state.tagLength; i++) if (tag[i] !== state.tag[i]) throw authFailure();
-        return { data: plain.subarray(state.aeadEmitted) };
+        for (let i = 0; i < state.tagLength; i++) if (run.tag[i] !== state.tag[i]) throw authFailure();
+        return { data: run.data.subarray(state.aeadEmitted) };
     }
-    if (state.spec.blockSize === BLOCK) {
+    const width = blockBytesOf(state.spec);
+    if (state.spec.blockSize > 1) {
         if (state.autoPadding) {
             if (state.direction === 'encrypt') {
-                const pad = BLOCK - (rest.length % BLOCK);
+                const pad = width - (rest.length % width);
                 const block = new Uint8Array(rest.length + pad);
                 block.set(rest, 0);
                 block.fill(pad, rest.length);
                 return { data: transformBlocks(state, block) };
             }
-            if (rest.length === 0 || rest.length % BLOCK !== 0) throw wrongFinalBlock();
-            return { data: unpad(transformBlocks(state, rest)) };
+            if (rest.length === 0 || rest.length % width !== 0) throw wrongFinalBlock();
+            return { data: unpad(transformBlocks(state, rest), width) };
         }
-        if (rest.length % BLOCK !== 0) throw wrongFinalBlock();
+        if (rest.length % width !== 0) throw wrongFinalBlock();
         return { data: rest.length === 0 ? rest : transformBlocks(state, rest) };
     }
     return { data: new Uint8Array(0) };
+}
+
+/**
+ * The modes over a block cipher this file carries itself: everything OpenSSL opens DES, ARIA, SM4
+ * and Camellia in. The state fields are the ones the AES path keeps — the chaining value or
+ * register in `iv`, how much of the current block is spent in `counterOffset` — so a call split
+ * across two updates behaves the way it does for AES.
+ */
+function genericBlocks(state: CipherState, bytes: Uint8Array): Uint8Array {
+    const p = primitiveOf(state.spec);
+    const n = p.size;
+    const encrypt = state.direction === 'encrypt';
+    const E = (block: Uint8Array): Uint8Array => p.encrypt(state.key, block);
+    const D = (block: Uint8Array): Uint8Array => p.decrypt(state.key, block);
+    const out = new Uint8Array(bytes.length);
+    switch (state.spec.mode) {
+        case 'ecb': {
+            for (let at = 0; at < bytes.length; at += n) {
+                const block = bytes.subarray(at, at + n);
+                out.set(encrypt ? E(block) : D(block), at);
+            }
+            return out;
+        }
+        case 'cbc': {
+            for (let at = 0; at < bytes.length; at += n) {
+                const block = bytes.subarray(at, at + n);
+                if (encrypt) {
+                    const sealed = E(xorInto(block, state.iv));
+                    out.set(sealed, at);
+                    state.iv = Uint8Array.from(sealed);
+                } else {
+                    const opened = D(block);
+                    for (let j = 0; j < n; j++) out[at + j] = opened[j] ^ state.iv[j];
+                    state.iv = Uint8Array.from(block);
+                }
+            }
+            return out;
+        }
+        case 'cfb': {
+            let at = 0;
+            while (at < bytes.length) {
+                if (state.keystream === null) state.keystream = E(state.iv);
+                const take = Math.min(n - state.counterOffset, bytes.length - at);
+                for (let j = 0; j < take; j++) {
+                    const produced = bytes[at + j] ^ state.keystream![state.counterOffset + j];
+                    out[at + j] = produced;
+                    state.chainBuf[state.counterOffset + j] = encrypt ? produced : bytes[at + j];
+                }
+                state.counterOffset += take;
+                at += take;
+                if (state.counterOffset === n) {
+                    state.iv = state.chainBuf.slice(0, n);
+                    state.counterOffset = 0;
+                    state.keystream = null;
+                }
+            }
+            return out;
+        }
+        case 'cfb8': {
+            const reg = Uint8Array.from(state.iv);
+            for (let i = 0; i < bytes.length; i++) {
+                const produced = bytes[i] ^ E(reg)[0];
+                out[i] = produced;
+                reg.copyWithin(0, 1);
+                reg[n - 1] = encrypt ? produced : bytes[i];
+            }
+            state.iv = reg;
+            return out;
+        }
+        case 'cfb1': {
+            const reg = Uint8Array.from(state.iv);
+            for (let i = 0; i < bytes.length; i++) {
+                let byte = 0;
+                for (let b = 7; b >= 0; b--) {
+                    const bit = ((bytes[i] >> b) & 1) ^ ((E(reg)[0] >> 7) & 1);
+                    byte = (byte << 1) | bit;
+                    for (let j = 0; j < n - 1; j++) reg[j] = ((reg[j] << 1) | ((reg[j + 1] >> 7) & 1)) & 0xff;
+                    reg[n - 1] = ((reg[n - 1] << 1) | (encrypt ? bit : (bytes[i] >> b) & 1)) & 0xff;
+                }
+                out[i] = byte;
+            }
+            state.iv = reg;
+            return out;
+        }
+        case 'ofb': {
+            for (let i = 0; i < bytes.length; i++) {
+                if (state.counterOffset === 0) {
+                    state.keystream = E(state.iv);
+                    state.iv = Uint8Array.from(state.keystream);
+                }
+                out[i] = bytes[i] ^ state.keystream![state.counterOffset];
+                state.counterOffset = (state.counterOffset + 1) % n;
+            }
+            return out;
+        }
+        default: {
+            /* CTR: the whole counter block is the register, and each block advances it by one. */
+            const blocks = Math.ceil((state.counterOffset + bytes.length) / n);
+            const stream = new Uint8Array(blocks * n);
+            const counter = Uint8Array.from(state.iv);
+            for (let b = 0; b < blocks; b++) {
+                stream.set(E(counter), b * n);
+                for (let i = n - 1; i >= 0; i--) {
+                    counter[i] = (counter[i] + 1) & 0xff;
+                    if (counter[i] !== 0) break;
+                }
+            }
+            for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ stream[state.counterOffset + i];
+            state.counterOffset = (state.counterOffset + bytes.length) % n;
+            return out;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * CCM (SP800-38C) and OCB3 (RFC 7253), the two AEADs OpenSSL answers that @noble does not carry.
+ * CCM seals a CBC-MAC over a length-prefixed header and the message and masks it with the
+ * keystream block the zero counter gives; OCB3 masks each block with an offset chained by
+ * doublings in GF(2^128) and seals a checksum of the blocks it saw.
+ * ------------------------------------------------------------------------------------------ */
+
+function padToBlockSize(bytes: Uint8Array, size: number): Uint8Array {
+    if (bytes.length % size === 0) return bytes;
+    const out = new Uint8Array(Math.ceil(bytes.length / size) * size);
+    out.set(bytes, 0);
+    return out;
+}
+
+/** The last `width` bytes of a big-endian counter block, as CCM lays them out. */
+function ccmCounterBlock(base: Uint8Array, width: number, value: number): Uint8Array {
+    const block = Uint8Array.from(base);
+    let rest = value;
+    for (let i = block.length - 1; i >= block.length - width; i--) {
+        block[i] = rest % 256;
+        rest = Math.floor(rest / 256);
+    }
+    return block;
+}
+
+/** CCM's counter-mode keystream over `message`: the same stream either way round. */
+function ccmCounter(state: CipherState, message: Uint8Array): Uint8Array {
+    const p = primitiveOf(state.spec);
+    const width = 15 - state.iv.length;
+    const a0 = new Uint8Array(p.size);
+    a0[0] = width - 1;
+    a0.set(state.iv, 1);
+    const out = new Uint8Array(message.length);
+    for (let at = 0, counter = 1; at < message.length; at += p.size, counter++) {
+        const stream = p.encrypt(state.key, ccmCounterBlock(a0, width, counter));
+        const take = Math.min(p.size, message.length - at);
+        for (let j = 0; j < take; j++) out[at + j] = message[at + j] ^ stream[j];
+    }
+    return out;
+}
+
+function ccmRun(state: CipherState, message: Uint8Array): { data: Uint8Array; tag: Uint8Array } {
+    const p = primitiveOf(state.spec);
+    const width = 15 - state.iv.length;
+    const tagLength = state.tagLength;
+    /* The MAC is taken over the plaintext in both directions, so a decryption unseals first. */
+    const plain = state.direction === 'encrypt' ? message : ccmCounter(state, message);
+    const b0 = new Uint8Array(p.size);
+    b0[0] = (state.aad.length > 0 ? 64 : 0) + 8 * Math.floor((tagLength - 2) / 2) + (width - 1);
+    b0.set(state.iv, 1);
+    const sized = ccmCounterBlock(b0, width, plain.length);
+    let mac = p.encrypt(state.key, sized);
+    if (state.aad.length > 0) {
+        const header = padToBlockSize(
+            concatBytes(new Uint8Array([(state.aad.length >>> 8) & 0xff, state.aad.length & 0xff]), state.aad), p.size);
+        for (let at = 0; at < header.length; at += p.size) mac = p.encrypt(state.key, xorInto(mac, header.subarray(at, at + p.size)));
+    }
+    const padded = padToBlockSize(plain, p.size);
+    for (let at = 0; at < padded.length; at += p.size) mac = p.encrypt(state.key, xorInto(mac, padded.subarray(at, at + p.size)));
+    const a0 = new Uint8Array(p.size);
+    a0[0] = width - 1;
+    a0.set(state.iv, 1);
+    const mask = p.encrypt(state.key, a0);
+    const tag = new Uint8Array(tagLength);
+    for (let i = 0; i < tagLength; i++) tag[i] = mac[i] ^ mask[i];
+    return { data: state.direction === 'encrypt' ? ccmCounter(state, message) : plain, tag };
+}
+
+/** Doubling in GF(2^128) under x^128 + x^7 + x^2 + x + 1, the step OCB chains its offsets by. */
+function ocbDouble(block: Uint8Array): Uint8Array {
+    const out = new Uint8Array(BLOCK);
+    const carry = (block[0] >> 7) & 1;
+    /* Each byte takes the top bit of the one after it, so the block shifts towards its most
+       significant end, and a bit carried off that end subtracts the field's polynomial. */
+    for (let i = 0; i < BLOCK - 1; i++) out[i] = ((block[i] << 1) | (block[i + 1] >> 7)) & 0xff;
+    out[BLOCK - 1] = ((block[BLOCK - 1] << 1) ^ (carry === 1 ? 0x87 : 0)) & 0xff;
+    return out;
+}
+
+/** How many of the low bits of `i` are zero: OCB masks block i with the ntz(i)-th doubling. */
+function ocbTrailingZeros(i: number): number {
+    let n = 0;
+    while (i % 2 === 0) {
+        n++;
+        i /= 2;
+    }
+    return n;
+}
+
+/** L_* , L_$ and the doublings L_0.. : OCB's key-dependent values. */
+function ocbLValues(state: CipherState, count: number): { star: Uint8Array; dollar: Uint8Array; doublings: Uint8Array[] } {
+    const p = primitiveOf(state.spec);
+    const star = p.encrypt(state.key, new Uint8Array(BLOCK));
+    const dollar = ocbDouble(star);
+    const doublings: Uint8Array[] = [ocbDouble(dollar)];
+    for (let i = 1; i <= count; i++) doublings.push(ocbDouble(doublings[i - 1]));
+    return { star, dollar, doublings };
+}
+
+/** The offset OCB starts from: the nonce padded the way RFC 7253 pads it, sealed, stretched to
+ * 192 bits and then read from the bit the nonce's own low six bits name. */
+function ocbOffset(state: CipherState, tagLength: number): Uint8Array {
+    const p = primitiveOf(state.spec);
+    const nonce = new Uint8Array(BLOCK);
+    nonce[0] = ((tagLength * 8) % 128) << 1;
+    nonce[3] = 0x01;
+    nonce.set(state.iv, 4);
+    const bottom = state.iv[state.iv.length - 1] & 0x3f;
+    const ktopInput = Uint8Array.from(nonce);
+    ktopInput[BLOCK - 1] &= 0xc0;
+    const ktop = p.encrypt(state.key, ktopInput);
+    let stretch = 0n;
+    for (let i = 0; i < 24; i++) {
+        const byte = i < BLOCK ? ktop[i] : ktop[i - BLOCK] ^ ktop[i - BLOCK + 1];
+        stretch = (stretch << 8n) | BigInt(byte);
+    }
+    const window = (stretch >> BigInt(64 - bottom)) & ((1n << 128n) - 1n);
+    const out = new Uint8Array(BLOCK);
+    let rest = window;
+    for (let i = BLOCK - 1; i >= 0; i--) {
+        out[i] = Number(rest & 0xffn);
+        rest >>= 8n;
+    }
+    return out;
+}
+
+/** OCB's PMAC over the associated data: zeros(128) when there is none, as the RFC promises. */
+function ocbHash(state: CipherState): Uint8Array {
+    const p = primitiveOf(state.spec);
+    const { star, doublings } = ocbLValues(state, Math.ceil(state.aad.length / BLOCK) + 1);
+    const whole = Math.floor(state.aad.length / BLOCK);
+    const tail = state.aad.length - whole * BLOCK;
+    let sum = new Uint8Array(BLOCK);
+    let offset = new Uint8Array(BLOCK);
+    for (let i = 1; i <= whole; i++) {
+        offset = xorInto(offset, doublings[ocbTrailingZeros(i)]);
+        sum = xorInto(sum, p.encrypt(state.key, xorInto(state.aad.subarray((i - 1) * BLOCK, i * BLOCK), offset)));
+    }
+    if (tail > 0) {
+        const offsetStar = xorInto(offset, star);
+        const padded = new Uint8Array(BLOCK);
+        padded.set(state.aad.subarray(whole * BLOCK), 0);
+        padded[tail] = 0x80;
+        sum = xorInto(sum, p.encrypt(state.key, xorInto(padded, offsetStar)));
+    }
+    return sum;
+}
+
+function ocbRun(state: CipherState, message: Uint8Array): { data: Uint8Array; tag: Uint8Array } {
+    const p = primitiveOf(state.spec);
+    const tagLength = state.tagLength;
+    const { star, dollar, doublings } = ocbLValues(state, Math.ceil(message.length / BLOCK) + 1);
+    let offset = ocbOffset(state, tagLength);
+    const whole = Math.floor(message.length / BLOCK);
+    const tail = message.length - whole * BLOCK;
+    const encrypt = state.direction === 'encrypt';
+    const data = new Uint8Array(message.length);
+    let checksum = new Uint8Array(BLOCK);
+    for (let i = 1; i <= whole; i++) {
+        offset = xorInto(offset, doublings[ocbTrailingZeros(i)]);
+        const block = message.subarray((i - 1) * BLOCK, i * BLOCK);
+        /* Sealing encrypts the block under its offset and xors the offset back; opening decrypts
+           it and does the same. Both name the plaintext block, which is what the checksum and the
+           tag are taken over, and the ciphertext block, which is what comes out. */
+        const plain = encrypt ? block : xorInto(p.decrypt(state.key, xorInto(block, offset)), offset);
+        const sealed = encrypt ? xorInto(p.encrypt(state.key, xorInto(block, offset)), offset) : block;
+        data.set(encrypt ? sealed : plain, (i - 1) * BLOCK);
+        checksum = xorInto(checksum, plain);
+    }
+    let offsetStar = offset;
+    if (tail > 0) {
+        offsetStar = xorInto(offset, star);
+        const pad = p.encrypt(state.key, offsetStar);
+        const at = whole * BLOCK;
+        const part = message.subarray(at);
+        const outPart = new Uint8Array(tail);
+        for (let i = 0; i < tail; i++) outPart[i] = part[i] ^ pad[i];
+        data.set(outPart, at);
+        const padded = new Uint8Array(BLOCK);
+        padded.set(encrypt ? part : outPart, 0);
+        padded[tail] = 0x80;
+        checksum = xorInto(checksum, padded);
+    }
+    const raw = p.encrypt(state.key, xorInto(xorInto(checksum, offsetStar), dollar));
+    return { data, tag: xorInto(raw.subarray(0, tagLength), ocbHash(state).subarray(0, tagLength)) };
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * GCM (SP800-38D) over a block cipher @noble does not carry: GHASH in GF(2^128) and the counter
+ * mode it seals with. The AES names keep @noble's own GCM; ARIA's has no other way in.
+ * ------------------------------------------------------------------------------------------ */
+
+/** One multiplication in GF(2^128) under x^128 + x^7 + x^2 + x + 1, bit by bit from the top. */
+function ghashMultiply(x: Uint8Array, y: Uint8Array): Uint8Array {
+    const out = new Uint8Array(BLOCK);
+    const v = Uint8Array.from(y);
+    for (let i = 0; i < 128; i++) {
+        if (((x[i >> 3] >> (7 - (i & 7))) & 1) === 1) for (let j = 0; j < BLOCK; j++) out[j] ^= v[j];
+        const low = v[BLOCK - 1] & 1;
+        let carry = 0;
+        for (let j = 0; j < BLOCK; j++) {
+            const next = (v[j] >> 1) | carry;
+            carry = (v[j] & 1) === 1 ? 0x80 : 0;
+            v[j] = next;
+        }
+        if (low === 1) v[0] ^= 0xe1;
+    }
+    return out;
+}
+
+function ghash(h: Uint8Array, blocks: Uint8Array): Uint8Array {
+    let y = new Uint8Array(BLOCK);
+    for (let at = 0; at < blocks.length; at += BLOCK) {
+        const block = padToBlockSize(blocks.subarray(at, at + BLOCK), BLOCK);
+        for (let j = 0; j < BLOCK; j++) y[j] ^= block[j];
+        y = ghashMultiply(y, h);
+    }
+    return y;
+}
+
+/** GCM counts in the counter block's last 32 bits. */
+function gcmIncrement(counter: Uint8Array): void {
+    for (let i = BLOCK - 1; i >= BLOCK - 4; i--) {
+        counter[i] = (counter[i] + 1) & 0xff;
+        if (counter[i] !== 0) break;
+    }
+}
+
+function gcmRun(state: CipherState, bytes: Uint8Array): { data: Uint8Array; tag: Uint8Array } {
+    const p = primitiveOf(state.spec);
+    const E = (block: Uint8Array): Uint8Array => p.encrypt(state.key, block);
+    const h = E(new Uint8Array(BLOCK));
+    const j0 = new Uint8Array(BLOCK);
+    if (state.iv.length === 12) {
+        j0.set(state.iv, 0);
+        j0[BLOCK - 1] = 1;
+    } else {
+        /* A nonce of any other length is hashed with its own bit length beside it. */
+        const tail = new Uint8Array(BLOCK);
+        let nonceBits = BigInt(state.iv.length) * 8n;
+        for (let i = BLOCK - 1; i >= BLOCK - 8; i--) { tail[i] = Number(nonceBits & 0xffn); nonceBits >>= 8n; }
+        j0.set(ghash(h, concatBytes(padToBlockSize(state.iv, BLOCK), tail)), 0);
+    }
+    const gctr = (start: Uint8Array, data: Uint8Array): Uint8Array => {
+        const counter = Uint8Array.from(start);
+        const out = new Uint8Array(data.length);
+        for (let at = 0; at < data.length; at += BLOCK) {
+            const stream = E(counter);
+            const take = Math.min(BLOCK, data.length - at);
+            for (let i = 0; i < take; i++) out[at + i] = data[at + i] ^ stream[i];
+            gcmIncrement(counter);
+        }
+        return out;
+    };
+    const counter0 = Uint8Array.from(j0);
+    gcmIncrement(counter0);
+    const plain = state.direction === 'encrypt' ? bytes : gctr(counter0, bytes);
+    const cipher = state.direction === 'encrypt' ? gctr(counter0, bytes) : bytes;
+    const lengths = new Uint8Array(BLOCK);
+    let bits = BigInt(state.aad.length) * 8n;
+    for (let i = 7; i >= 0; i--) { lengths[i] = Number(bits & 0xffn); bits >>= 8n; }
+    bits = BigInt(cipher.length) * 8n;
+    for (let i = BLOCK - 1; i >= BLOCK - 8; i--) { lengths[i] = Number(bits & 0xffn); bits >>= 8n; }
+    const s = ghash(h, concatBytes(concatBytes(padToBlockSize(state.aad, BLOCK), padToBlockSize(cipher, BLOCK)), lengths));
+    const mask = E(j0);
+    const tag = new Uint8Array(TAG_LENGTH);
+    for (let i = 0; i < TAG_LENGTH; i++) tag[i] = s[i] ^ mask[i];
+    return { data: state.direction === 'encrypt' ? cipher : plain, tag };
+}
+
+/** The bytes an AEAD hands back for `bytes` of input: the whole plaintext or ciphertext so far,
+ *  which for a caller who split a message across updates is what the tail of it asks for. */
+function aeadData(state: CipherState, bytes: Uint8Array): Uint8Array {
+    if (state.spec.mode === 'ccm') return ccmRun(state, bytes).data;
+    if (state.spec.mode === 'ocb') return ocbRun(state, bytes).data;
+    if (state.spec.mode === 'gcm' && state.spec.primitive !== undefined) return gcmRun(state, bytes).data;
+    return aeadXor(state, bytes);
+}
+
+/** That answer and the tag that goes with it, which for GCM and ChaCha20-Poly1305 is the seal of
+ *  the plaintext, and for CCM and OCB is the mode's own. */
+function aeadRun(state: CipherState, bytes: Uint8Array): { data: Uint8Array; tag: Uint8Array } {
+    if (state.spec.mode === 'ccm') return ccmRun(state, bytes);
+    if (state.spec.mode === 'ocb') return ocbRun(state, bytes);
+    if (state.spec.primitive !== undefined && state.spec.mode === 'gcm') return gcmRun(state, bytes);
+    const data = aeadXor(state, bytes);
+    /* The tag seals the plaintext, never the ciphertext: encrypting, that is what came in;
+       decrypting, it is what the keystream just recovered. */
+    const plain = state.direction === 'encrypt' ? bytes : data;
+    const sealed = aeadCipher(state).encrypt(plain);
+    return { data, tag: sealed.subarray(sealed.length - TAG_LENGTH) };
 }
 
 function stateFor(id: unknown, op: string): CipherState {
@@ -1014,7 +2408,14 @@ function stateFor(id: unknown, op: string): CipherState {
 function openCipher(args: any): { id: number; aead: boolean } {
     const algorithm = String(args?.algorithm ?? '');
     const spec = CIPHER_SPECS[algorithm.toLowerCase()];
-    if (spec === undefined) throw cipherFail('ERR_CRYPTO_UNKNOWN_CIPHER', 'Unknown cipher');
+    if (spec === undefined) {
+        /* A name OpenSSL's object database knows but its default provider no longer carries: Node
+           answers with OpenSSL's own refusal, not with an unknown cipher. */
+        if (LEGACY_CIPHER_INFO[algorithm.toLowerCase()] !== undefined) {
+            throw cipherFail('ERR_OSSL_EVP_UNSUPPORTED', 'error:0308010C:digital envelope routines::unsupported');
+        }
+        throw cipherFail('ERR_CRYPTO_UNKNOWN_CIPHER', 'Unknown cipher');
+    }
     /* Node reports a bad IV before a bad key, and an unknown cipher before either. */
     const iv = typeof args?.iv === 'string' ? base64ToBytes(args.iv) : new Uint8Array(0);
     if (spec.ivLength === 0) {
@@ -1026,15 +2427,15 @@ function openCipher(args: any): { id: number; aead: boolean } {
     } else if (iv.length < (spec.ivMin ?? 0) || iv.length > (spec.ivMax ?? 0)) {
         throw invalidIv();
     }
-    /* CCM and OCB answer no tag length of their own, so Node refuses them outright and names the
-       cipher it refused. The guest passes no options, so the refusal is unconditional here. */
-    if (spec.needsAuthTagLength === true) {
+    /* CCM and OCB answer no tag length of their own: Node refuses them outright unless a caller
+       names one, and honours the one it is given for the rest. */
+    const wanted = args?.options?.authTagLength;
+    if (spec.needsAuthTagLength === true && (wanted === undefined || wanted === null)) {
         throw cipherFail('ERR_CRYPTO_INVALID_AUTH_TAG', `authTagLength required for ${algorithm}`, 'TypeError');
     }
     /* Node takes an authTagLength of 4 to 16 for GCM and for chacha20-poly1305 and refuses any
        other, before it looks at the key; a cipher that seals nothing ignores the option. */
     let tagLength = TAG_LENGTH;
-    const wanted = args?.options?.authTagLength;
     if (spec.aead && wanted !== undefined && wanted !== null) {
         tagLength = Number(wanted);
         if (tagLength < 4 || tagLength > TAG_LENGTH) {
@@ -2692,7 +4093,7 @@ const DH_GROUP_NAMES: Record<string, number> = {
     modp18: 8192
 };
 
-const DH_STATE = new Map<number, { prime: bigint; generator: bigint; size: number; privateKey?: bigint; publicKey?: bigint }>();
+const DH_STATE = new Map<number, { prime: bigint; generator: bigint; size: number; privateKey?: bigint; publicKey?: bigint; generated?: boolean }>();
 let nextDhId = 1;
 const OPEN_DH_LIMIT = 64;
 
@@ -2735,7 +4136,9 @@ function dhVerifyError(prime: bigint, generator: bigint): number {
     return code;
 }
 
-function storeDh(state: { prime: bigint; generator: bigint; size: number }): number {
+/** `generated`: whether OpenSSL made these parameters, which is when it also fixes the width of
+ *  the private exponent. A prime a caller hands in, or a named MODP group, has no such width. */
+function storeDh(state: { prime: bigint; generator: bigint; size: number; generated?: boolean }): number {
     if (DH_STATE.size >= OPEN_DH_LIMIT) {
         const oldest = DH_STATE.keys().next().value;
         if (oldest !== undefined) DH_STATE.delete(oldest);
@@ -2777,19 +4180,27 @@ function modPow(base: bigint, exponent: bigint, modulus: bigint): bigint {
 /*
  * The width OpenSSL gives a fresh DH private exponent: twice the finite-field security strength
  * of the prime, with its top bit set, so a 2048-bit group answers a 29-byte exponent rather than
- * a full-width one. Primes of 1024 bits and below get the whole width instead.
+ * a full-width one. Measured against host Node 24.15 by generateKeys() on createDiffieHellman(L)
+ * for L from 512 to 2560: the exponent is 125 bits at 512, 150 from 600, 175 from 950, 200 from
+ * 1150, 225 from 1700 and 250 from 2560, and the same size always answers the same width, so the
+ * top bit really is forced rather than left to the draw.
  */
 const DH_EXPONENT_BITS: ReadonlyArray<readonly [number, number]> = [
-    [8192, 400], [6144, 376], [4096, 320], [3072, 280], [2048, 232], [1536, 200]
+    [8192, 400], [6144, 376], [4096, 320], [3072, 280], [2560, 250], [2048, 225],
+    [1700, 225], [1536, 200], [1150, 200], [950, 175], [600, 150], [512, 125]
 ];
 
-function randomExponent(prime: bigint): bigint {
+function randomExponent(prime: bigint, generated: boolean): bigint {
     const primeBits = prime.toString(2).length;
     let bits = primeBits - 1;
-    for (const [at, width] of DH_EXPONENT_BITS) {
-        if (primeBits >= at) {
-            bits = Math.min(width, primeBits - 1);
-            break;
+    /* Only a group OpenSSL generated carries the shorter exponent: a prime a caller named, or a
+       standard MODP group, gets one drawn over the prime's whole width. */
+    if (generated) {
+        for (const [at, width] of DH_EXPONENT_BITS) {
+            if (primeBits >= at) {
+                bits = Math.min(width, primeBits - 1);
+                break;
+            }
         }
     }
     if (bits < 2) bits = 2;
@@ -2969,6 +4380,11 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     'crypto.cipher.setAAD': (args) => {
         const state = stateFor(args?.id, 'setAAD');
         if (!state.spec.aead || state.updated) invalidState('setAAD');
+        /* Node refuses associated data for CCM outright: it asks for a plaintextLength it has no
+           way to supply from here, so the message is the one OpenSSL's CCM cannot take. */
+        if (state.spec.mode === 'ccm') {
+            throw cipherFail('ERR_MISSING_ARGS', 'options.plaintextLength required for CCM mode with AAD', 'TypeError');
+        }
         state.aad = bytesArg(args?.aad);
         return true;
     },
@@ -3122,14 +4538,14 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         if (prime < 3n) throw dhFail('ERR_CRYPTO_INVALID_DH_PARAMETERS', 'Invalid prime');
         const generator = generatorOf(args?.generator, args?.generatorIsNumber);
         const size = Math.ceil(prime.toString(16).length / 2);
-        return { id: storeDh({ prime, generator, size }) };
+        return { id: storeDh({ prime, generator, size, generated: args?.prime === undefined || args?.prime === null }) };
     },
     /** Args {name}: a standard MODP group by name; returns a handle. */
     'crypto.dh.group': (args) => {
         const bits = DH_GROUP_NAMES[String(args?.name ?? '')];
         if (bits === undefined) throw dhFail('ERR_CRYPTO_UNKNOWN_DH_GROUP', 'Unknown DH group');
         const prime = BigInt('0x' + MODP_GROUPS[bits]);
-        return { id: storeDh({ prime, generator: 2n, size: Math.ceil(prime.toString(16).length / 2) }) };
+        return { id: storeDh({ prime, generator: 2n, size: Math.ceil(prime.toString(16).length / 2), generated: false }) };
     },
     /** Args {id}: the prime and generator, as base64, with the byte size both are padded to. */
     'crypto.dh.info': (args) => {
@@ -3152,7 +4568,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         /* The public half is always derived from the private one: Node's generateKeys() computes
            g^private mod p even when a public key was set by hand beforehand, so a caller who set
            one and then asked for a pair gets the one that belongs to the private key it chose. */
-        if (state.privateKey === undefined) state.privateKey = randomExponent(state.prime);
+        if (state.privateKey === undefined) state.privateKey = randomExponent(state.prime, state.generated === true);
         state.publicKey = modPow(state.generator, state.privateKey, state.prime);
         return {
             /* Node pads a prime and a public key to the prime's width but leaves a private
