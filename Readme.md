@@ -444,6 +444,28 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   on the host and prints the file here, though `chmod -R 000 d` itself now reports the same
   `chmod: d: Permission denied` and status 1 on both.
 
+- **A `sh -c` line the caller's `timeout` ended closes as soon as it exits, where a host's `close` waits for
+  the grandchild that outlived the shell.** `spawn('sh', ['-c', 'echo A; sleep 3; echo B'], { timeout: 400,
+  killSignal: 'SIGKILL' })` exits at 405 ms here with `A\n`, as host node 24.15 exits at 406 ms, and closes
+  at 406 ms here against 3015 ms there: the `sleep` the host's `sh` had started was never signalled, ran its
+  3 s out and held the stdout pipe open until then. A killed child's `close` follows its `exit` at once in
+  this container -- the piped streams are ended at the exit -- so there is nothing here to hold a pipe the way
+  an orphaned process holds one on a host.
+- **A `trap ... TERM` in a `sh -c` line never runs when the caller's `timeout` ends the line.** Host node
+  24.15 hands its `killSignal` to the `sh` it spawned and lets the shell decide what a signal means:
+  `spawn('sh', ['-c', 'trap "echo TRAPPED" TERM; echo A; sleep 2; echo B'], { timeout: 400, killSignal:
+  'SIGTERM' })` prints `A`, `TRAPPED`, `B` and exits 0 at 2010 ms there, and prints `A` with signal SIGTERM
+  and no status at 404 ms here. The caller's timer terminates the shell process rather than delivering the
+  signal into it, and the exit the caller is given is the kill's, not the line's.
+- **A `timeout` on a `sh -c` line ends the line's own child as well.** `spawn('sh', ['-c', 'echo shell; node
+  busy.js'], { timeout: 400, killSignal: 'SIGKILL' })` closes at 408 ms here with `shell`, where host node
+  24.15 closes at 5033 ms with `shell` and `BUSY-DONE`: the host kills only the `sh` it spawned, and the
+  `node` that `sh` started runs its 5 s out. The bound has to travel to that child here, because a guest
+  busy-looping holds the host thread and bare QuickJS 0.32 owns no timer of its own -- `typeof os`, `typeof
+  setTimeout` and `typeof setInterval` are all `undefined` there, and a host timer armed for 400 ms before a
+  synchronous 3 s wait inside that engine fires at 3001 ms -- and what would keep the pipe open afterwards is
+  the missing orphan of the bullet above.
+
 ### ⚠️ Guest `fs` and `process` divergences from the host that are recorded rather than fixed
 
 Each of these was measured by running the same script under host Node 24.15 and in the container and

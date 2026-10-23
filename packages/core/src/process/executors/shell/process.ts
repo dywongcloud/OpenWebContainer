@@ -805,13 +805,24 @@ export class ShellProcess extends Process {
             if (step.op === '&&' && exitCode !== 0) continue;
             if (step.op === '||' && exitCode === 0) continue;
             const stage = await this.runStep(step.text, step.op === '|' ? piped : (i === 0 ? this.lineInput : null));
-            stderr += stage.stderr;
             exitCode = stage.exitCode;
             const next = steps[i + 1];
             if (next !== undefined && next.op === '|') {
                 piped = stage.stdout;
+                stderr += stage.stderr;
+            } else if (this.streamsSteps()) {
+                /* A host's `sh -c <line>` writes what a command wrote as that command runs, so a
+                   caller has it before the moment its `timeout` ends the line. Collecting every
+                   step's output and writing it once the line ends puts it after that moment, and
+                   the kill takes it: `spawn('sh', ['-c', 'echo A; sleep 3; echo B'], { timeout:
+                   400, killSignal: 'SIGKILL' })` gave a caller nothing at all when the kill was the
+                   first of the two to be serviced, where host node 24.15 gives it 'A\n'. */
+                if (stage.stdout) this.emitOutput(stage.stdout);
+                if (stage.stderr) this.emitError(stage.stderr);
+                piped = '';
             } else {
                 stdout += stage.stdout;
+                stderr += stage.stderr;
                 piped = '';
             }
             if (this.shell.stopped) break;
@@ -821,6 +832,16 @@ export class ShellProcess extends Process {
             if (this.deadlineReached()) break;
         }
         return { stdout, stderr, exitCode };
+    }
+
+    /**
+     * True when this shell was given the line it runs -- `sh -c <line>`, or the name of a script --
+     * and not the terminal the interactive loop below reads. A caller's line writes into a pipe the
+     * caller holds, so it is written as each command of the line runs; a terminal is a screen the
+     * loop redraws, and the loop is what puts there what a line it took wrote.
+     */
+    private streamsSteps(): boolean {
+        return this.filteredArgs.length > 0;
     }
 
     /**
