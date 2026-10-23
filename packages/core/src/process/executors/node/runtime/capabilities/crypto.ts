@@ -153,6 +153,22 @@ const DIGEST_SPECS: Record<string, DigestSpec> = {
 
 /** Every name in Node 24's getHashes() that is not already a canonical digest name, lowercased. */
 const DIGEST_ALIASES: Record<string, string> = {
+    /*
+     * The hyphenated and 'sha2-' spellings OpenSSL's own name table answers. They are absent from
+     * getHashes(), which lists canonical names only, but a createHash, an hmac, an hkdf and a
+     * sign all reach the digest through this table and so accept them.
+     */
+    'sha-1': 'sha1',
+    'sha-224': 'sha224',
+    'sha-256': 'sha256',
+    'sha-384': 'sha384',
+    'sha-512': 'sha512',
+    'sha-512/224': 'sha512-224',
+    'sha-512/256': 'sha512-256',
+    'sha2-224': 'sha224',
+    'sha2-256': 'sha256',
+    'sha2-384': 'sha384',
+    'sha2-512': 'sha512',
     'rsa-md5': 'md5',
     'rsa-ripemd160': 'ripemd160',
     'rsa-sha1': 'sha1',
@@ -208,6 +224,21 @@ function digestFor(name: unknown): DigestSpec {
     const spec = DIGEST_ALIASES[key] !== undefined ? DIGEST_SPECS[DIGEST_ALIASES[key]] : DIGEST_SPECS[key];
     if (spec === undefined) {
         throw Object.assign(new Error('Digest method not supported'), { code: 'ERR_OSSL_EVP_UNSUPPORTED' });
+    }
+    return spec;
+}
+
+/**
+ * The digest an hkdf call names. Node's hkdf resolves the name through the same table a createHash
+ * does -- 'sha-256' derives exactly what 'sha256' does -- but it reports an unresolvable one as
+ * ERR_CRYPTO_INVALID_DIGEST naming the value, where a createHash of that name answers the bare
+ * 'Digest method not supported'.
+ */
+function hkdfDigestFor(name: unknown): DigestSpec {
+    const key = String(name ?? '').toLowerCase();
+    const spec = DIGEST_SPECS[DIGEST_ALIASES[key] ?? key];
+    if (spec === undefined) {
+        throw Object.assign(new TypeError('Invalid digest: ' + String(name ?? '')), { code: 'ERR_CRYPTO_INVALID_DIGEST' });
     }
     return spec;
 }
@@ -504,6 +535,9 @@ interface CipherState {
     updated: boolean;
     /** XTS and the two key wraps answer once and refuse a second update, as OpenSSL does. */
     emitted: boolean;
+    /** AEAD only: how many bytes of output earlier update() calls have already handed back, so
+     *  each one emits just the bytes its own input produced, as an OpenSSL AEAD does. */
+    aeadEmitted: number;
     aad: Uint8Array;
     tag?: Uint8Array;
     /** 16 unless createCipheriv was given an authTagLength, which Node honours for GCM and for
@@ -844,6 +878,17 @@ function aeadCipher(state: CipherState) {
         : chacha20poly1305(state.key, state.iv, aad);
 }
 
+/** The bytes an AEAD hands back for `bytes` of input: the seal of that many zeros is the keystream
+ *  itself, and both of these seal by XOR, so the stream is the same in either direction and does
+ *  not depend on what is being sealed. */
+function aeadXor(state: CipherState, bytes: Uint8Array): Uint8Array {
+    if (bytes.length === 0) return new Uint8Array(0);
+    const stream = aeadCipher(state).encrypt(new Uint8Array(bytes.length));
+    const out = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ stream[i];
+    return out;
+}
+
 /** PKCS#7 removal: a padding byte outside 1..16, or a block that does not end in it, is a bad decrypt. */
 function unpad(bytes: Uint8Array): Uint8Array {
     const pad = bytes[bytes.length - 1];
@@ -892,8 +937,17 @@ function cipherUpdate(state: CipherState, input: Uint8Array): Uint8Array {
         return encrypt ? aesWrapPad(state.key, state.iv, input) : aesUnwrapPad(state.key, state.iv, input);
     }
     if (state.spec.aead) {
+        /*
+         * An AEAD emits as it goes, the way OpenSSL's does: every byte a caller hands in comes
+         * back from the update that carried it, and only the tag waits for final(). Both of these
+         * seal by XOR, so the keystream over the bytes so far is the seal of that many zero bytes
+         * and is the same stream however the input was split across calls.
+         */
         state.pending = concatBytes(state.pending, input);
-        return new Uint8Array(0);
+        const out = aeadXor(state, state.pending);
+        const fresh = out.subarray(state.aeadEmitted);
+        state.aeadEmitted = out.length;
+        return fresh;
     }
     const total = concatBytes(state.pending, input);
     const block = state.spec.blockSize;
@@ -912,34 +966,26 @@ function cipherFinal(state: CipherState): { data: Uint8Array; tag?: Uint8Array }
     state.pending = new Uint8Array(0);
     if (state.spec.aead) {
         if (state.direction === 'encrypt') {
+            /* The tag is taken over the whole plaintext, not over the part this call emits, so it
+               is the seal of everything that went in. */
             const sealed = aeadCipher(state).encrypt(rest);
             const at = sealed.length - TAG_LENGTH;
             return {
-                data: sealed.subarray(0, at),
+                data: aeadXor(state, rest).subarray(state.aeadEmitted),
                 tag: sealed.subarray(at, at + state.tagLength)
             };
         }
         if (state.tag === undefined) throw authFailure();
         /*
          * A caller who asked for a tag shorter than the sixteen the AEAD computes is checking the
-         * leading bytes of it, and the library will only ever compare all sixteen. Both of these
-         * AEADs seal by XOR, so the keystream does not depend on the plaintext: sealing as many
-         * zero bytes unseals the bytes in hand, and sealing those back answers the whole tag.
+         * leading bytes of it, and the library will only ever compare all sixteen: sealing the
+         * recovered plaintext answers the whole tag, and the leading bytes are the ones to compare.
          */
-        if (state.tagLength !== TAG_LENGTH) {
-            const sealed = aeadCipher(state).encrypt(new Uint8Array(rest.length));
-            const plain = new Uint8Array(rest.length);
-            for (let i = 0; i < rest.length; i++) plain[i] = rest[i] ^ sealed[i];
-            const full = aeadCipher(state).encrypt(plain);
-            const tag = full.subarray(full.length - TAG_LENGTH);
-            for (let i = 0; i < state.tagLength; i++) if (tag[i] !== state.tag[i]) throw authFailure();
-            return { data: plain };
-        }
-        try {
-            return { data: aeadCipher(state).decrypt(concatBytes(rest, state.tag)) };
-        } catch {
-            throw authFailure();
-        }
+        const plain = aeadXor(state, rest);
+        const full = aeadCipher(state).encrypt(plain);
+        const tag = full.subarray(full.length - TAG_LENGTH);
+        for (let i = 0; i < state.tagLength; i++) if (tag[i] !== state.tag[i]) throw authFailure();
+        return { data: plain.subarray(state.aeadEmitted) };
     }
     if (state.spec.blockSize === BLOCK) {
         if (state.autoPadding) {
@@ -1028,6 +1074,7 @@ function openCipher(args: any): { id: number; aead: boolean } {
         autoPadding: true,
         updated: false,
         emitted: false,
+        aeadEmitted: 0,
         aad: new Uint8Array(0),
         tagLength
     });
@@ -1455,7 +1502,7 @@ function curveFor(name: unknown): EcCurve {
     const asked = String(name ?? '').toLowerCase();
     const node = EC_CURVE_ALIASES[String(name ?? '')] ?? asked;
     const curve = EC_CURVES[node];
-    if (curve === undefined) throw keyFail('ERR_CRYPTO_INVALID_CURVE', 'Invalid EC curve name');
+    if (curve === undefined) throw keyFail('ERR_CRYPTO_INVALID_CURVE', 'Invalid EC curve name', 'TypeError');
     return curve;
 }
 
@@ -2202,8 +2249,24 @@ function importJwk(jwk: any, want: 'public' | 'private'): KeyRecord {
     throw keyFail('ERR_CRYPTO_INVALID_JWK', 'Unsupported JWK key type: ' + String(jwk.kty));
 }
 
+/**
+ * The signature encoding a caller asked for. Node names 'der' and 'ieee-p1363' and refuses every
+ * other value before it looks at the key at all -- even an Edwards key, which hashes and signs in
+ * one step and never reaches an encoding -- and it prints the value the way util.inspect does.
+ */
+function dsaEncodingFor(value: unknown): 'der' | 'ieee-p1363' {
+    if (value === undefined || value === null) return 'der';
+    const name = typeof value === 'string' ? value : String(value);
+    if (name !== 'der' && name !== 'ieee-p1363') {
+        const shown = typeof value === 'string' ? "'" + name + "'" : typeof value === 'object' && value !== null ? JSON.stringify(value) : name;
+        throw keyFail('ERR_INVALID_ARG_VALUE', "The property 'options.dsaEncoding' is invalid. Received " + shown, 'TypeError');
+    }
+    return name;
+}
+
 function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown): Uint8Array {
-    if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type public, expected private.');
+    const encoding = dsaEncodingFor(dsaEncoding);
+    if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type ' + key.type + ', expected private.', 'TypeError');
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
         const name = digestNameFor(algorithm);
         const spec = digestFor(name);
@@ -2240,10 +2303,11 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncod
     const digest = digestFor(algorithm).fn(data, 0);
     const signed = curve.curve.sign(digest, key.privateBytes as Uint8Array, { lowS: true, prehash: false, extraEntropy: randomOf(32) });
     /* 'ieee-p1363' is r||s; Node's default is the DER SEQUENCE of the two. */
-    return signed.toBytes(dsaEncoding === 'ieee-p1363' ? 'compact' : 'der');
+    return signed.toBytes(encoding === 'ieee-p1363' ? 'compact' : 'der');
 }
 
 function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signature: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown): boolean {
+    const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'public' && key.type !== 'private') return false;
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
         const name = digestNameFor(algorithm);
@@ -2262,7 +2326,14 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
     const spec = EDWARDS[key.kind];
     if (spec !== undefined) {
         if (spec.verify === undefined) return false;
-        if (algorithm !== undefined && algorithm !== null) return false;
+        /*
+         * An Edwards key is pure: it hashes and signs in one step and names no digest, so a
+         * signature that asks for one is refused rather than answered false. The one-shot
+         * crypto.verify reaches the digest check and names it; the record is Node's own.
+         */
+        if (algorithm !== undefined && algorithm !== null) {
+            throw keyFail('ERR_OSSL_INVALID_DIGEST', 'error:1C80007A:Provider routines::invalid digest');
+        }
         try {
             return spec.verify(signature, data, key.publicBytes as Uint8Array);
         } catch {
@@ -2278,7 +2349,7 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
          * so naming the format keeps a compact signature false under the 'der' default the way
          * it is on the host instead of letting the auto-detecting parse pass it.
          */
-        const format = dsaEncoding === 'ieee-p1363' ? 'compact' : 'der';
+        const format = encoding === 'ieee-p1363' ? 'compact' : 'der';
         /* Node accepts a high-S signature, so verification must too; signing still emits a low one. */
         return curve.curve.verify(signature, digest, key.publicBytes as Uint8Array, { lowS: false, prehash: false, format });
     } catch {
@@ -2440,11 +2511,19 @@ function randomPrime(bits: number): bigint {
     return searchPrime(bits);
 }
 
-/** The prime for a size: the standard group when there is one, a fresh probable prime otherwise. */
+/** The prime for a size: a fresh probable prime of exactly that width, which is what Node's own
+ *  generator answers. Node never falls back to a standard group here, however closely one matches
+ *  the size asked for, and a width the generator refuses is an argument error rather than a
+ *  fallback. The search is the sieved one, so a 1024-bit prime takes a second, not a minute. */
 function primeOfBits(bits: number): bigint {
-    const standard = MODP_GROUPS[bits];
-    if (standard !== undefined) return BigInt('0x' + standard);
-    if (!Number.isInteger(bits) || bits < 8 || bits > 4096) {
+    if (!Number.isInteger(bits)) {
+        throw dhFail('ERR_OUT_OF_RANGE', 'The value of "sizeOrKey" is out of range. It must be an integer. Received ' + String(bits), 'RangeError');
+    }
+    /* Two bits or fewer is no modulus at all, and OpenSSL names that before it generates. */
+    if (bits <= 1) throw dhFail('ERR_OSSL_DH_MODULUS_TOO_SMALL', 'error:0280007E:Diffie-Hellman routines::modulus too small');
+    /* Below OpenSSL's own 512-bit floor for a generated modulus, generation fails outright. */
+    if (bits < 512) throw dhFail('ERR_INVALID_ARG_VALUE', 'Invalid DH parameters', 'TypeError');
+    if (bits > 4096) {
         throw dhFail('ERR_OUT_OF_RANGE', 'The value of "primeLength" is out of range. It must be >= 8 && <= 4096. Received ' + String(bits), 'RangeError');
     }
     return randomPrime(bits);
@@ -2511,7 +2590,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     },
     /** Args {algorithm, ikm, salt, info, keylen}: the HKDF output; returns base64. */
     'crypto.hkdf': (args) => {
-        const spec = digestFor(args?.algorithm);
+        const spec = hkdfDigestFor(args?.algorithm);
         const keylen = Number(args?.keylen);
         if (!Number.isInteger(keylen) || keylen <= 0 || keylen > 255 * spec.out) {
             throw Object.assign(
