@@ -2827,7 +2827,7 @@ export const SRC = String.raw`
       var parts = partsOf(args);
       var item = { kind: 'test', name: parts.name || '<anonymous>', fn: parts.fn, options: parts.options,
         skip: parts.options.skip === true, todo: parts.options.todo === true,
-        only: parts.options.only === true, hooks: [] };
+        only: parts.options.only === true, expectFailure: parts.options.expectFailure === true, hooks: [] };
       cursor.items.push(item);
       schedule();
       return undefined;
@@ -2891,15 +2891,30 @@ export const SRC = String.raw`
       var context = { name: item.name, signal: undefined, diagnostic: function (text) { line(pad + '  ' + text); },
         skip: function () { line(pad + '- ' + item.name); }, todo: function () { line(pad + '~ ' + item.name); } };
       var at = Date.now();
+      /* A test marked expectFailure is one its author says must not pass, so the verdict is
+         inverted: a throw is the pass and a clean run is the failure. That is the whole meaning of
+         the keyword, and it is decided here where the two outcomes already part. */
+      var expectFail = item.expectFailure === true;
       return callEach(around.before, context).then(function () {
         return typeof item.fn === 'function' ? item.fn(context) : undefined;
       }).then(function () {
         return callEach(around.after, context).then(function () {
+          if (expectFail) {
+            failed += 1;
+            failures.push({ name: item.name, error: new Error('Expected the test to fail, but it passed') });
+            line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')');
+            return undefined;
+          }
           passed += 1;
           line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ')');
         });
       }, function (err) {
         return callEach(around.after, context).then(function () {
+          if (expectFail) {
+            passed += 1;
+            line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ')');
+            return undefined;
+          }
           failed += 1;
           failures.push({ name: item.name, error: err });
           line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')');
@@ -2958,10 +2973,16 @@ export const SRC = String.raw`
       return undefined;
     }
 
-    function test() { return addTest(Array.prototype.slice.call(arguments)); }
+    /* Three parameters, as node's own test is: a call may carry any two of a name, an options
+       object and the test, and .length is what a caller that inspects the function reads. */
+    function test(name, options, fn) { return addTest(Array.prototype.slice.call(arguments)); }
     test.test = test;
-    test.describe = function () { return addSuite(Array.prototype.slice.call(arguments)); };
-    test.suite = test.describe;
+    /* describe is node's suite, and it is the same function under a second name there -- its .name
+       reads 'test', not 'describe' -- so the name is put on it rather than inferred. */
+    var addSuiteFn = function (name, options, fn) { return addSuite(Array.prototype.slice.call(arguments)); };
+    try { Object.defineProperty(addSuiteFn, 'name', { value: 'test', configurable: true }); } catch (e) { /* a name that will not take stays */ }
+    test.describe = addSuiteFn;
+    test.suite = addSuiteFn;
     test.it = test;
     test.before = function (fn) { return addHook('before', fn); };
     test.after = function (fn) { return addHook('after', fn); };
@@ -2985,6 +3006,64 @@ export const SRC = String.raw`
     test.run = function () {
       if (draining === null) return Promise.resolve();
       return draining;
+    };
+    /*
+     * The four keywords node:test exports beside the test itself -- only, skip, todo and
+     * expectFailure -- each register a test carrying the flag its name is, and change nothing else
+     * about it: the runner reads the first three off the item already, and expectFailure inverts the
+     * verdict there. The options a caller passed are copied rather than written into, because they
+     * are the caller's object. Each is node's own shape -- an anonymous function of three
+     * parameters, as a call may carry any two of a name, an options object and the test -- which is
+     * why each is handed back by a factory: a function expression assigned to a property would
+     * take that property's name.
+     */
+    function keywordTest(keyword) {
+      return function (name, options, fn) {
+        var parts = partsOf(Array.prototype.slice.call(arguments));
+        var overridden = {};
+        var keys = Object.keys(parts.options);
+        for (var i = 0; i < keys.length; i++) overridden[keys[i]] = parts.options[keys[i]];
+        overridden[keyword] = true;
+        return addTest([parts.name, overridden, parts.fn]);
+      };
+    }
+    test.only = keywordTest('only');
+    test.skip = keywordTest('skip');
+    test.todo = keywordTest('todo');
+    test.expectFailure = keywordTest('expectFailure');
+    /*
+     * The assertion surface node:test hangs off the module: one name, register, on an object with no
+     * prototype, which is what node's own is. A registered assertion is reachable by the name it was
+     * given and is not one of the object's own names, so the surface stays node's single key, as it
+     * does there after a register.
+     */
+    var ASSERTIONS = Object.create(null);
+    test.assert = Object.create(null);
+    test.assert.register = function (name, fn) {
+      if (typeof name !== 'string') throw argError('name', 'of type string', name);
+      if (typeof fn !== 'function') throw argError('fn', 'of type function', fn);
+      ASSERTIONS[name] = fn;
+    };
+    /*
+     * Snapshot testing's two settings: the serializers a snapshot is written with, and the function
+     * that names the file it is written to. Both are kept, and neither has a reader yet -- a
+     * snapshot is a file and this runner writes none -- so what is answered here is node's own two
+     * names and node's own refusal of a wrong argument.
+     */
+    var SNAPSHOT_SERIALIZERS = [];
+    var SNAPSHOT_RESOLVER = undefined;
+    test.snapshot = {
+      setDefaultSnapshotSerializers: function (serializers) {
+        if (!Array.isArray(serializers)) throw argError('serializers', 'an instance of Array', serializers);
+        for (var i = 0; i < serializers.length; i++) {
+          if (typeof serializers[i] !== 'function') throw argError('serializers[' + i + ']', 'of type function', serializers[i]);
+        }
+        SNAPSHOT_SERIALIZERS = serializers.slice();
+      },
+      setResolveSnapshotPath: function (fn) {
+        if (typeof fn !== 'function') throw argError('fn', 'of type function', fn);
+        SNAPSHOT_RESOLVER = fn;
+      }
     };
     return test;
   };
