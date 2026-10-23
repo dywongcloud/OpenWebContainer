@@ -310,10 +310,13 @@ export class VirtualNetwork {
         });
         return {
             id: client.id,
-            /* The mapped spelling is what the client's own socket reports for itself. */
+            /* The mapped spelling is what the client's own socket reports for itself, and for the peer
+               it reached: Node's remoteAddress is the address that was dialled, so a socket that
+               dialled '::ffff:127.0.0.1' reports it at both of its ends -- its own local address and
+               the remote one -- not the plain IPv4 address the hub routed the dial to. */
             localAddress: mapped === null ? localAddress : request.address,
             localPort,
-            remoteAddress: displayAddress(destination),
+            remoteAddress: mapped === null ? displayAddress(destination) : request.address,
             remotePort: request.port,
         };
     }
