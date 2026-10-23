@@ -29,12 +29,15 @@ import {
     ResizeSpec,
     createImage,
     embedImage,
+    ensureAlphaImage,
     extractImage,
     flipImage,
     flopImage,
+    negateImage,
     padBackground,
     canvasImage,
     premultiplyImage,
+    removeAlphaImage,
     resizeImage,
     smartcropEntropy,
     rotateQuarters,
@@ -453,6 +456,17 @@ function applyOperations(
             numberOption(options, 'heightPost', out.height)
         );
     }
+    /*
+     * The three band operations, in the order src/pipeline.cc applies them: they come after the crop
+     * and the post-extract, so a resize still sees the bands it was measured against, and ensureAlpha
+     * runs before negate -- which is what makes `ensureAlpha(0.5)` then `negate()` an alpha of 128 on
+     * sharp 0.33.5 rather than the 127 the bandjoin wrote.
+     */
+    if (options.removeAlpha === true) out = removeAlphaImage(out);
+    if (typeof options.ensureAlpha === 'number' && options.ensureAlpha >= 0) {
+        out = ensureAlphaImage(out, options.ensureAlpha);
+    }
+    if (options.negate === true) out = negateImage(out, options.negateAlpha !== false);
     return { image: out, resized, cropOffsetLeft, cropOffsetTop };
 }
 

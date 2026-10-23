@@ -1015,6 +1015,58 @@ export function unpremultiplyImage(image: Image): Image {
 }
 
 /**
+ * sharp's `removeAlpha()` (src/pipeline.cc): `vips_extract_band` of every band but the last, and only
+ * for an image that has an alpha band to take away. A 3-band sRGB input comes back with 3 channels on
+ * sharp 0.33.5, not 2, so the band count is what decides whether the operation runs at all.
+ */
+export function removeAlphaImage(image: Image): Image {
+    if (image.channels !== 2 && image.channels !== 4) return image;
+    return toChannels(image, (image.channels - 1) as ChannelCount);
+}
+
+/**
+ * sharp's `ensureAlpha(alpha)`: `vips_bandjoin_const1` of `alpha * 255`, only for an image with no
+ * alpha band -- a 2-band grey-and-alpha input already has one, and reports 4 channels after the sRGB
+ * conversion on sharp 0.33.5 rather than a second alpha. The option's default of -1 means the call was
+ * never made; sharp's own `ensureAlpha()` sends 1, so the band it joins is 255. The band is uchar and
+ * the product is not rounded: `ensureAlpha(0.5)` joins 127 and not 128.
+ */
+export function ensureAlphaImage(image: Image, alpha: number): Image {
+    if (image.channels === 2 || image.channels === 4) return image;
+    const joined = Math.floor(alpha * 255);
+    const value = joined < 0 ? 0 : joined > 255 ? 255 : joined;
+    const out = createImage(image.width, image.height, (image.channels + 1) as ChannelCount);
+    const n = image.width * image.height;
+    const ch = image.channels;
+    for (let i = 0; i < n; i++) {
+        const s = i * ch;
+        const d = i * out.channels;
+        for (let c = 0; c < ch; c++) out.data[d + c] = image.data[s + c];
+        out.data[d + ch] = value;
+    }
+    return out;
+}
+
+/**
+ * libvips' `vips_invert`: 255 minus every band, alpha included. sharp's `negate({ alpha: false })`
+ * leaves the last band of a 2- or 4-band image alone, which is the `negateAlpha` option; a 1- or
+ * 3-band image has no alpha band to spare either way.
+ *
+ * It runs after the crop and after ensureAlpha, which is the order src/pipeline.cc applies them in:
+ * `ensureAlpha(0.5)` then `negate()` on sharp 0.33.5 gives an alpha of 128 -- the 127 the bandjoin
+ * wrote, inverted -- where a negate that ran first would have left the joined 127 untouched.
+ */
+export function negateImage(image: Image, withAlpha: boolean): Image {
+    const ch = image.channels;
+    const bands = withAlpha || (ch !== 2 && ch !== 4) ? ch : ch - 1;
+    const out = cloneImage(image);
+    for (let i = 0; i < out.data.length; i += ch) {
+        for (let c = 0; c < bands; c++) out.data[i + c] = 255 - out.data[i + c];
+    }
+    return out;
+}
+
+/**
  * The row of the reduce's output the crop that follows will ask for first, or 0 when the crop reads
  * from row 0 or does not crop the height at all. vips_reducev clocks its running sum to the top of
  * the region it is asked to fill, so this is the row its sum restarts at -- see reduceAxis.

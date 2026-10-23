@@ -199,6 +199,8 @@ export const IMPLEMENTED_OPTIONS: readonly string[] = [
     // level back as a silently different file instead of a refusal -- which is what pngPalette, and
     // every other option with no effect here, already gives.
     'pngEffort', 'pngQuality', 'pngDither', 'pngBitdepth',
+    // greyscale stays refused: it is a luminance in libvips' own colour pipeline, not a band count.
+    'negate', 'negateAlpha', 'removeAlpha', 'ensureAlpha',
     'jpegOptimiseCoding', 'jpegOptimiseScans', 'jpegOvershootDeringing', 'jpegTrellisQuantisation',
     'jpegQuantisationTable'
 ];
