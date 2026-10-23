@@ -3037,10 +3037,358 @@ BF.crypto = function () {
   };
 };
 
-/* require('module') is the Module class the loader builds modules with, carrying Node's statics;
-   builtinModules is filled in here, where every builtin factory has registered itself. */
+/*
+ * Node's own list of built-in names, in the order node sorts it. It is deliberately not the list of
+ * factories registered in BF: node's list names every module its binary carries -- the private ones
+ * with an underscore in front, which here are parts of http, of stream and of tls rather than
+ * modules in their own right; the submodules with a slash, each registered in BF under that very
+ * name; the aliases sys and wasi; and node:sea, node:sqlite and node:test. A name that is here and
+ * not in node -- undici above all, a package this container serves as if it were built in -- is left
+ * out of the list, and isBuiltin answers for the same list, so the two agree as they do in node.
+ */
+var NODE_BUILTIN_NAMES = [
+  '_http_agent', '_http_client', '_http_common', '_http_incoming', '_http_outgoing', '_http_server',
+  '_stream_duplex', '_stream_passthrough', '_stream_readable', '_stream_transform', '_stream_wrap',
+  '_stream_writable', '_tls_common', '_tls_wrap', 'assert', 'assert/strict', 'async_hooks',
+  'buffer', 'child_process', 'cluster', 'console', 'constants', 'crypto', 'dgram',
+  'diagnostics_channel', 'dns', 'dns/promises', 'domain', 'events', 'fs', 'fs/promises', 'http',
+  'http2', 'https', 'inspector', 'inspector/promises', 'module', 'net', 'os', 'path', 'path/posix',
+  'path/win32', 'perf_hooks', 'process', 'punycode', 'querystring', 'readline', 'readline/promises',
+  'repl', 'stream', 'stream/consumers', 'stream/promises', 'stream/web', 'string_decoder', 'sys',
+  'timers', 'timers/promises', 'tls', 'trace_events', 'tty', 'url', 'util', 'util/types', 'v8',
+  'vm', 'wasi', 'worker_threads', 'zlib',
+  /* The four names node writes with its own prefix stand at the end of the list, after every bare
+     name and not where a sort would put one: node appends them to the sorted bare names. */
+  'node:sea', 'node:sqlite', 'node:test', 'node:test/reporters'
+];
+var BUILTIN_NAME_SET = Object.create(null);
+for (var builtinNameIndex = 0; builtinNameIndex < NODE_BUILTIN_NAMES.length; builtinNameIndex++) {
+  BUILTIN_NAME_SET[NODE_BUILTIN_NAMES[builtinNameIndex]] = true;
+}
+
+/*
+ * A source map v3 payload, read the way node reads one: the mappings string decoded as base64 VLQ
+ * into one entry per generated segment -- generated line and column, source, original line and
+ * column, name -- sorted by position, and findEntry/findOrigin over them. Nothing in this container
+ * writes a source map, so findSourceMap has none to hand back; the class is node's for a caller
+ * that built a payload itself.
+ */
+var VLQ_DIGITS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+var VLQ_BASE_MASK = 31;
+var VLQ_CONTINUATION_MASK = 32;
+var VLQ_BASE_SHIFT = 5;
+
+function vlqDecode(iterator) {
+  var result = 0;
+  var shift = 0;
+  var digit = 0;
+  var continuation = false;
+  do {
+    var at = VLQ_DIGITS.indexOf(iterator.next());
+    /* A digit the iterator has no character for -- the end of the mappings, which node's own
+       base64Map answers undefined for -- adds nothing and does not continue. */
+    if (at < 0) { digit = 0; continuation = false; } else {
+      digit = at & VLQ_BASE_MASK;
+      continuation = (at & VLQ_CONTINUATION_MASK) !== 0;
+    }
+    result += digit << shift;
+    shift += VLQ_BASE_SHIFT;
+  } while (continuation);
+  var negative = result & 1;
+  result >>= 1;
+  return negative ? -result : result;
+}
+
+function parseSourceMapInto(mappings, map, lineNumber, columnNumber) {
+  var sourceIndex = 0;
+  var sourceLineNumber = 0;
+  var sourceColumnNumber = 0;
+  var nameIndex = 0;
+  var sources = [];
+  var i;
+  for (i = 0; i < map.sources.length; i++) sources.push(String(map.sources[i]));
+  var text = String(map.mappings);
+  var names = map.names;
+  var cursor = 0;
+  var sourceURL = sources[sourceIndex];
+  var iterator = {
+    next: function () { var ch = cursor < text.length ? text.charAt(cursor) : ''; cursor++; return ch; },
+    peek: function () { return cursor < text.length ? text.charAt(cursor) : ''; }
+  };
+  while (true) {
+    if (iterator.peek() === ',') iterator.next();
+    else {
+      while (iterator.peek() === ';') {
+        lineNumber += 1;
+        columnNumber = 0;
+        iterator.next();
+      }
+      if (cursor >= text.length) break;
+    }
+    columnNumber += vlqDecode(iterator);
+    if (iterator.peek() === ',' || iterator.peek() === ';') {
+      mappings.push([lineNumber, columnNumber]);
+      continue;
+    }
+    var sourceIndexDelta = vlqDecode(iterator);
+    if (sourceIndexDelta) {
+      sourceIndex += sourceIndexDelta;
+      sourceURL = sources[sourceIndex];
+    }
+    sourceLineNumber += vlqDecode(iterator);
+    sourceColumnNumber += vlqDecode(iterator);
+    var name;
+    if (iterator.peek() !== ',' && iterator.peek() !== ';') {
+      nameIndex += vlqDecode(iterator);
+      name = names ? names[nameIndex] : undefined;
+    }
+    mappings.push([lineNumber, columnNumber, sourceURL, sourceLineNumber, sourceColumnNumber, name]);
+  }
+}
+
+function compareSourceMapEntry(a, b) {
+  if (a[0] > b[0]) return 1;
+  if (a[0] < b[0]) return -1;
+  return a[1] > b[1] ? 1 : (a[1] < b[1] ? -1 : 0);
+}
+
+function SourceMap(payload, options) {
+  if (payload === null || typeof payload !== 'object') {
+    throw new TypeError('The "payload" argument must be of type object. Received ' + (payload === null ? 'null' : typeof payload));
+  }
+  this._payload = payload;
+  this._mappings = [];
+  this._lineLengths = undefined;
+  if (payload.sections) {
+    for (var i = 0; i < payload.sections.length; i++) {
+      var section = payload.sections[i];
+      parseSourceMapInto(this._mappings, section.map, section.offset.line, section.offset.column);
+    }
+  } else {
+    parseSourceMapInto(this._mappings, payload, 0, 0);
+  }
+  this._mappings.sort(compareSourceMapEntry);
+  if (options && options.lineLengths && options.lineLengths.length > 0) {
+    this._lineLengths = options.lineLengths.slice();
+  }
+}
+Object.defineProperty(SourceMap.prototype, 'payload', {
+  get: function () { return this._payload; },
+  configurable: true
+});
+Object.defineProperty(SourceMap.prototype, 'lineLengths', {
+  get: function () { return this._lineLengths ? this._lineLengths.slice() : undefined; },
+  configurable: true
+});
+/* The entry covering a 0-indexed generated position: the last one at or before it in the sorted
+   list, or an empty object when the position stands before every entry. */
+SourceMap.prototype.findEntry = function findEntry(lineOffset, columnOffset) {
+  var first = 0;
+  var count = this._mappings.length;
+  while (count > 1) {
+    var step = count >> 1;
+    var middle = first + step;
+    var mapping = this._mappings[middle];
+    if (lineOffset < mapping[0] || (lineOffset === mapping[0] && columnOffset < mapping[1])) count = step;
+    else { first = middle; count -= step; }
+  }
+  var entry = this._mappings[first];
+  if (!first && entry && (lineOffset < entry[0] || (lineOffset === entry[0] && columnOffset < entry[1]))) return {};
+  if (!entry) return {};
+  return {
+    generatedLine: entry[0],
+    generatedColumn: entry[1],
+    originalSource: entry[2],
+    originalLine: entry[3],
+    originalColumn: entry[4],
+    name: entry[5]
+  };
+};
+SourceMap.prototype.findOrigin = function findOrigin(lineNumber, columnNumber) {
+  var range = this.findEntry(lineNumber - 1, columnNumber - 1);
+  if (range.originalSource === undefined || range.originalLine === undefined
+    || range.originalColumn === undefined || range.generatedLine === undefined
+    || range.generatedColumn === undefined) return {};
+  var lineOffset = lineNumber - range.generatedLine;
+  var columnOffset = columnNumber - range.generatedColumn;
+  return {
+    name: range.name,
+    fileName: range.originalSource,
+    lineNumber: range.originalLine + lineOffset,
+    columnNumber: range.originalColumn + columnOffset
+  };
+};
+
+/* How node names the value it refused: 'undefined', 'null', 'an instance of Object', or 'type
+   number (1)' -- the words its own validators put after 'must be of type'. */
+function receivedTypeOf(value) {
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  if (typeof value === 'object') {
+    var ctor = value.constructor;
+    return 'an instance of ' + (ctor && typeof ctor.name === 'string' && ctor.name !== '' ? ctor.name : 'Object');
+  }
+  if (typeof value === 'function') return 'an instance of Function';
+  if (typeof value === 'symbol') return 'type symbol (' + String(value) + ')';
+  return 'type ' + typeof value + ' (' + String(value) + ')';
+}
+
+/* require('module') is the Module class the loader builds modules with, carrying Node's statics.
+   They are filled in here rather than where the class is built, so that the ones which read the
+   builtin registry, the file system or the loader's own tables see them once they are real. */
 BF.module = function () {
-  Module.builtinModules = Object.keys(BF).filter(function (n) { return n.indexOf('/') < 0; }).sort();
+  Module.builtinModules = NODE_BUILTIN_NAMES.slice();
+  Module.isBuiltin = function isBuiltin(name) {
+    var id = typeof name === 'string' ? name : '';
+    return Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, id)
+      || Object.prototype.hasOwnProperty.call(BUILTIN_NAME_SET, stripNodePrefix(id));
+  };
+  /* The table of extension handlers: var hoisting made the assignment where the class is built run
+     before the table's own initialiser, so the static was undefined while require.extensions -- the
+     same object, handed out to every module later -- was not. */
+  Module._extensions = EXTENSIONS;
+  Module.constants = {
+    compileCacheStatus: { FAILED: 0, ENABLED: 1, ALREADY_ENABLED: 2, DISABLED: 3 }
+  };
+  Module.SourceMap = SourceMap;
+  /* Deprecated in node to the point of doing nothing: it prints no warning there and returns
+     undefined, and so does this. */
+  Module._debug = function _debug() { return undefined; };
+  /* internalModuleStat's own answer: 0 for a file, 1 for a directory and the negated errno for a
+     path that is not there, which is what a caller of _stat compares against. */
+  Module._stat = function _stat(filename) {
+    try {
+      var st = requireBuiltin('fs').statSync(String(filename));
+      return st.isDirectory() ? 1 : 0;
+    } catch (e) {
+      return e && typeof e.errno === 'number' && e.errno > 0 ? -e.errno : -2;
+    }
+  };
+  /* The file a request resolves to under one of the given directories, or false: node's own
+     extension search, which the host resolver does, asked directory by directory. */
+  Module._findPath = function _findPath(request, paths, isMain) {
+    if (typeof request !== 'string') return false;
+    var list = paths;
+    if (request.charAt(0) === '/') list = [''];
+    else if (!list || list.length === 0) return false;
+    for (var i = 0; i < list.length; i++) {
+      var found = host.resolve(request, list[i] === '' ? '/' : list[i], 'require');
+      if (found) return found;
+    }
+    return false;
+  };
+  /* The package.json of a directory, as node's reader gives it: the few fields it reads out of the
+     file -- name, main, type, exports and imports, in that order, with 'none' where the file names
+     no type -- followed by exists and pjsonPath. A directory with no package.json is the record of
+     the file that is not there: type 'none' and exists false, and no field besides. */
+  Module._readPackage = function _readPackage(requestPath) {
+    var pjsonPath = requireBuiltin('path').resolve(String(requestPath), 'package.json');
+    var text = host.readText(pjsonPath);
+    if (text === null) return { type: 'none', exists: false, pjsonPath: pjsonPath };
+    var parsed = JSON.parse(text);
+    if (parsed === null || typeof parsed !== 'object') parsed = {};
+    var out = {};
+    if (typeof parsed.name === 'string') out.name = parsed.name;
+    if (typeof parsed.main === 'string') out.main = parsed.main;
+    out.type = typeof parsed.type === 'string' ? parsed.type : 'none';
+    if (parsed.exports !== undefined) out.exports = parsed.exports;
+    if (parsed.imports !== undefined) out.imports = parsed.imports;
+    out.exists = true;
+    out.pjsonPath = pjsonPath;
+    return out;
+  };
+  /* Where a request is looked for: nothing at all for a built-in, the parent's node_modules paths
+     ahead of the global ones for a bare name, and the parent's own directory for a relative one --
+     '.' when there is no parent file, as in the REPL. */
+  Module._resolveLookupPaths = function _resolveLookupPaths(request, parent) {
+    if (typeof request !== 'string' || request === '') return null;
+    if (Module.isBuiltin(request)) return null;
+    /* Relative is what node calls a request beginning with '.' that a bare name does not hide
+       behind: './x', '../x' and '.' are relative, '.hidden' is not, and neither is '/x', which
+       node sends to the node_modules branch with every other bare name. */
+    var relative = request.charAt(0) === '.'
+      && (request.length === 1 || request.charAt(1) === '.' || request.charAt(1) === '/');
+    if (relative) {
+      if (!parent || !parent.id || !parent.filename) return ['.'];
+      return [dirnameOf(parent.filename)];
+    }
+    var paths = Module.globalPaths.slice();
+    if (parent && parent.paths && parent.paths.length > 0) {
+      paths = parent.paths.slice().concat(paths);
+    }
+    return paths.length > 0 ? paths : null;
+  };
+  /* The package.json of the package a specifier names, as a path: the specifier is resolved as a
+     module and the walk goes up from what it found to the nearest package.json carrying that name,
+     the way node's own reader goes from a resolved package to its manifest. */
+  Module.findPackageJSON = function findPackageJSON(specifier, base) {
+    if (arguments.length === 0) {
+      throw new TypeError('The "specifier" argument must be specified');
+    }
+    var name = String(specifier);
+    var from = base === undefined || base === null ? host.cwd() : String(base);
+    if (from.indexOf('file://') === 0) from = from.slice(7);
+    /* Node resolves from the file it is handed, and the default base is argv[1], so a file is what
+       this is usually given; the host resolver reads a package.json out of the directory it takes,
+       and handing it a file makes it read that file as one, so the file is walked up to the
+       directory holding it first. */
+    if (Module._stat(from) !== 1) from = dirnameOf(from);
+    var found = host.resolve(name, from, 'require') || host.resolve(name, from, 'import');
+    if (!found) {
+      var err = new Error("Cannot find package '" + name + "' imported from " + from);
+      err.code = 'ERR_MODULE_NOT_FOUND';
+      throw err;
+    }
+    var dir = dirnameOf(found);
+    while (true) {
+      var pjsonPath = dir + '/package.json';
+      var text = host.readText(pjsonPath);
+      if (text !== null) {
+        try {
+          var parsed = JSON.parse(text);
+          if (parsed && parsed.name === name) return pjsonPath;
+        } catch (e) { /* a package.json that does not parse is not the one being looked for */ }
+      }
+      var up = dirnameOf(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+    return undefined;
+  };
+  /* Nothing here writes a source map, so there is never one to find: node answers undefined for a
+     builtin, for a file under node_modules while that support is off, and for any file it holds no
+     map for, which is every file here. */
+  Module.findSourceMap = function findSourceMap(sourceURL) {
+    if (typeof sourceURL !== 'string') return undefined;
+    return undefined;
+  };
+  var sourceMapsEnabled = false;
+  Module.getSourceMapsSupport = function getSourceMapsSupport() {
+    return { enabled: sourceMapsEnabled, nodeModules: false, generatedCode: false };
+  };
+  Module.setSourceMapsSupport = function setSourceMapsSupport(enabled) {
+    if (typeof enabled !== 'boolean') {
+      var err = new TypeError('The "enabled" argument must be of type boolean. Received '
+        + receivedTypeOf(enabled));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    sourceMapsEnabled = enabled;
+  };
+  /* Node's entry point runner: the file named, or argv[1], resolved and loaded as the main module.
+     Node hands an entry that is one to the ESM loader, and loadCJS does the same here. */
+  Module.runMain = function runMain(main) {
+    var entry = main === undefined ? requireBuiltin('process').argv[1] : main;
+    if (typeof entry !== 'string') {
+      throw new TypeError('The "main" argument must be of type string. Received ' + typeof entry);
+    }
+    var filename = host.resolve(entry, host.cwd(), 'require');
+    if (!filename) throw moduleNotFound(entry);
+    loadCJS(filename, undefined, true);
+  };
+  /* Node 24 exports no createRequireFromPath: the deprecated alias went with DEP0131, and a
+     package asking for it here must see the same undefined it sees there. */
+  delete Module.createRequireFromPath;
   return Module;
 };
 
