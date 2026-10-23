@@ -2465,6 +2465,210 @@ function circularStructureText(value, replacer) {
   try { delete globalThis.InternalError; } catch (ignored) { /* an engine that will not give it up */ }
 
   /*
+   * 'Atomics', the one name the host's own list carried and this container's did not. This *engine*
+   * has none: bare QuickJS 0.32 answers 'typeof Atomics' with 'undefined' while it answers
+   * 'typeof SharedArrayBuffer' with 'function'. But node's is a namespace object holding fourteen
+   * static functions over an integer typed array and nothing else, and this engine runs one agent
+   * and no worker, so a read-modify-write cannot interleave with anything and 'notify' has no
+   * waiter to wake -- which is to say an atomic here is plain indexed access, and that is what it
+   * is built out of. Where node's 'wait' would block until another agent notifies, nothing ever
+   * can, so it blocks for its timeout and answers 'timed-out', and with no timeout it blocks as
+   * node's does, because there is nothing here that could end the wait either.
+   */
+  (function installAtomics() {
+    /* [constructor, signed, bits, bigint] -- Uint8ClampedArray is not an integer kind, as in V8. */
+    var KINDS = [
+      [Int8Array, true, 8, false],
+      [Uint8Array, false, 8, false],
+      [Int16Array, true, 16, false],
+      [Uint16Array, false, 16, false],
+      [Int32Array, true, 32, false],
+      [Uint32Array, false, 32, false],
+      [BigInt64Array, true, 64, true],
+      [BigUint64Array, false, 64, true]
+    ];
+    function kindOf(array) {
+      if (array === null || typeof array !== 'object') return null;
+      for (var i = 0; i < KINDS.length; i++) {
+        if (array instanceof KINDS[i][0]) return KINDS[i];
+      }
+      return null;
+    }
+    /* How node names the value it was handed: an array and a typed array by the tag
+       'Object.prototype.toString' gives them, and anything else -- a plain object, a DataView, a
+       class instance -- as '#<' + the constructor's name + '>', which is V8's own wording. */
+    var TYPED_NAMES = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
+      'Int32Array', 'Uint32Array', 'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array',
+      'BigUint64Array'];
+    function typeName(value) {
+      if (value === undefined) return 'undefined';
+      if (value === null) return 'null';
+      if (typeof value !== 'object') return String(value);
+      var i;
+      if (Array.isArray(value)) return '[object Array]';
+      for (i = 0; i < TYPED_NAMES.length; i++) {
+        var Ctor = globalThis[TYPED_NAMES[i]];
+        if (typeof Ctor === 'function' && value instanceof Ctor) return '[object ' + TYPED_NAMES[i] + ']';
+      }
+      var ctor = value.constructor;
+      var name = typeof ctor === 'function' && typeof ctor.name === 'string' && ctor.name ? ctor.name : 'Object';
+      return '#<' + name + '>';
+    }
+    function integerArray(array) {
+      var kind = kindOf(array);
+      if (kind === null) throw new TypeError(typeName(array) + ' is not an integer typed array.');
+      return kind;
+    }
+    /* Only an Int32Array or a BigInt64Array can be waited on, which is checked before the index
+       and before whether the buffer is shared, the order node's own checks run in. */
+    function waitableArray(array) {
+      var kind = kindOf(array);
+      if (kind === null || (kind[0] !== Int32Array && kind[0] !== BigInt64Array)) {
+        throw new TypeError(typeName(array) + ' is not an int32 or BigInt64 typed array.');
+      }
+      return kind;
+    }
+    function sharedArray(array) {
+      if (typeof SharedArrayBuffer !== 'function' || !(array.buffer instanceof SharedArrayBuffer)) {
+        throw new TypeError(typeName(array) + ' is not a shared typed array.');
+      }
+    }
+    function atomicIndex(array, index) {
+      var at = Number(index);
+      if (at !== at) at = 0;
+      else if (at !== Infinity && at !== -Infinity) at = at < 0 ? -Math.floor(-at) : Math.floor(at);
+      if (!(at >= 0) || at > 9007199254740991 || at >= array.length) {
+        throw new RangeError('Invalid atomic access index');
+      }
+      return at;
+    }
+    function toIntegerValue(value) {
+      if (typeof value === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
+      var n = Number(value);
+      if (n !== n) return 0;
+      if (n === Infinity || n === -Infinity) return n;
+      return n < 0 ? -Math.floor(-n) : Math.floor(n);
+    }
+    function toBigIntValue(value) {
+      if (typeof value === 'number') throw new TypeError('Cannot convert ' + String(value) + ' to a BigInt');
+      return typeof value === 'bigint' ? value : BigInt(value);
+    }
+    function valueOf(kind, value) {
+      return kind[3] ? toBigIntValue(value) : toIntegerValue(value);
+    }
+    function wrap(kind, value) {
+      if (kind[3]) {
+        var mod = BigInt(1) << BigInt(kind[2]);
+        var big = value % mod;
+        if (big < BigInt(0)) big += mod;
+        if (kind[1] && big >= mod >> BigInt(1)) big -= mod;
+        return big;
+      }
+      if (value !== value || value === Infinity || value === -Infinity) return 0;
+      var size = Math.pow(2, kind[2]);
+      var at = value % size;
+      if (at < 0) at += size;
+      if (kind[1] && at >= size / 2) at -= size;
+      return at;
+    }
+    /* Every read-modify-write answers with the value that was there before, as node's does. */
+    function readModifyWrite(array, index, value, op) {
+      var kind = integerArray(array);
+      var at = atomicIndex(array, index);
+      var with_ = valueOf(kind, value);
+      var before = array[at];
+      array[at] = wrap(kind, op(before, with_));
+      return before;
+    }
+    var Atomics = {};
+    function def(name, fn) {
+      Object.defineProperty(Atomics, name, { value: fn, writable: true, enumerable: false, configurable: true });
+    }
+    def('load', function load(array, index) {
+      integerArray(array);
+      return array[atomicIndex(array, index)];
+    });
+    def('store', function store(array, index, value) {
+      var kind = integerArray(array);
+      var at = atomicIndex(array, index);
+      var v = valueOf(kind, value);
+      array[at] = wrap(kind, v);
+      return v;
+    });
+    def('add', function add(array, index, value) {
+      return readModifyWrite(array, index, value, function (a, b) { return a + b; });
+    });
+    def('sub', function sub(array, index, value) {
+      return readModifyWrite(array, index, value, function (a, b) { return a - b; });
+    });
+    def('and', function and(array, index, value) {
+      return readModifyWrite(array, index, value, function (a, b) { return a & b; });
+    });
+    def('or', function or(array, index, value) {
+      return readModifyWrite(array, index, value, function (a, b) { return a | b; });
+    });
+    def('xor', function xor(array, index, value) {
+      return readModifyWrite(array, index, value, function (a, b) { return a ^ b; });
+    });
+    def('exchange', function exchange(array, index, value) {
+      var kind = integerArray(array);
+      var at = atomicIndex(array, index);
+      var v = valueOf(kind, value);
+      var before = array[at];
+      array[at] = wrap(kind, v);
+      return before;
+    });
+    def('compareExchange', function compareExchange(array, index, expected, replacement) {
+      var kind = integerArray(array);
+      var at = atomicIndex(array, index);
+      var seen = valueOf(kind, expected);
+      var next = valueOf(kind, replacement);
+      var before = array[at];
+      if (before === seen) array[at] = wrap(kind, next);
+      return before;
+    });
+    def('isLockFree', function isLockFree(size) {
+      var n = Number(size);
+      return n === 1 || n === 2 || n === 4 || n === 8;
+    });
+    def('notify', function notify(array, index, count) {
+      waitableArray(array);
+      atomicIndex(array, index);
+      return 0; /* no agent is waiting, so none is woken */
+    });
+    def('wait', function wait(array, index, expected, timeout) {
+      var kind = waitableArray(array);
+      sharedArray(array);
+      var at = atomicIndex(array, index);
+      var seen = valueOf(kind, expected);
+      var ms = timeout === undefined ? Infinity : Number(timeout);
+      if (ms !== ms) ms = 0;
+      if (array[at] !== seen) return 'not-equal';
+      var deadline = host.now() + ms;
+      while (host.now() < deadline) { /* only this agent runs, and it is the one waiting */ }
+      return 'timed-out';
+    });
+    def('waitAsync', function waitAsync(array, index, expected, timeout) {
+      var kind = waitableArray(array);
+      sharedArray(array);
+      var at = atomicIndex(array, index);
+      var seen = valueOf(kind, expected);
+      var ms = timeout === undefined ? Infinity : Number(timeout);
+      if (ms !== ms) ms = 0;
+      if (array[at] !== seen) return { async: false, value: 'not-equal' };
+      var result = { async: true, value: undefined };
+      result.value = new Promise(function (resolve) {
+        if (ms === Infinity) return; /* nothing can notify and no timeout was asked for */
+        setTimeout(function () { resolve('timed-out'); }, ms);
+      });
+      return result;
+    });
+    def('pause', function pause() { /* no agent here spins waiting for another, so there is no hint to give */ });
+    Object.defineProperty(Atomics, Symbol.toStringTag, { value: 'Atomics', configurable: true });
+    Object.defineProperty(globalThis, 'Atomics', { value: Atomics, writable: true, enumerable: false, configurable: true });
+  })();
+
+  /*
    * 'navigator': node 24's own, which is a 'Navigator' answering four questions -- how many cores,
    * which language, which platform, and what it calls itself -- and nothing else. There is no
    * 'onLine', no 'clipboard', no 'geolocation' and no 'userAgentData' in node's, so there is none
