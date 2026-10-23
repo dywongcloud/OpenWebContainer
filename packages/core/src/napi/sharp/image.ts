@@ -130,8 +130,28 @@ const RESIZE_GAP = 2;
  * 0.33.5 on a 64x64 -> 60x60 nearest reduction: strip heights of 4, 8 and 16 all reproduce the
  * source row every output row takes, and 1, 2, 32 and 64 do not; 16 is the one that leaves the
  * fewest differing images over a 3658-case sweep of sizes, fits and kernels.
+ *
+ * 16 is the strip of an image the caller handed in as pixels -- a raw buffer or a `create` -- which
+ * is what the sweep above measured. An image a loader decoded is walked in shorter strips, see
+ * REDUCEV_STRIP_DECODED.
  */
 const REDUCEV_STRIP = 16;
+
+/**
+ * The same strip for an image sharp decoded out of a file, which is not the strip of the same pixels
+ * handed in raw: the two differ by one source row at some output rows, and only under `nearest`,
+ * whose single tap turns the last bit of the sum into a whole pixel. Measured against sharp 0.33.5
+ * over a 64x64 png, a 64x64 jpeg and the same pixels as raw, reduced to n x n for every n from 8 to
+ * 64: the decoded image's output rows are the ones a sum restarted every 10 rows takes (0 of 57
+ * widths wrong, where 16 leaves 17 and every other height from 1 to 80 leaves at least 9), and the
+ * raw one's are the ones a sum restarted every 16 takes (0 of 57). The same 10 holds at 32x32,
+ * 48x48, 96x96 and 128x128 (0 of 25, 41, 89 and 121 widths), for 1-, 3- and 4-channel sources, for
+ * `fill`, `contain` and a pre-extract, for a jpeg decoded at 1/2 as well as at 1/1, and at every
+ * `sharp.concurrency()`; it does not depend on the output format either. What separates the two is
+ * the input: a memory image and a loaded one do not hand the reduce the same strips. It is only
+ * taken where the reduce's sum starts at its own row 0 -- see where it is chosen in resizeImage.
+ */
+const REDUCEV_STRIP_DECODED = 10;
 
 /**
  * libvips' vips_shrinkh / vips_shrinkv: blocks of `n` pixels averaged into one. The output is sized
@@ -267,7 +287,8 @@ function reduceAxis(
     horizontal: boolean,
     kernelName: string,
     clock = 0,
-    strip = REDUCEV_STRIP
+    strip = REDUCEV_STRIP,
+    phase = clock
 ): Image {
     const srcSize = horizontal ? image.width : image.height;
     const other = horizontal ? image.height : image.width;
@@ -303,12 +324,22 @@ function reduceAxis(
      * The pixels before the clock are not part of what was asked for -- a crop has already thrown
      * them away -- so they are walked backwards from the clock with the same step, which is the
      * only thing that keeps the row continuous for a caller that reads all of it.
+     *
+     * `phase` is which of those requests the first row of the image falls in, and it is not always
+     * the clock: a crop is asked for the rows it keeps, so its strips start at the crop's own top
+     * and run every `strip` rows from there, while an embed is asked for the canvas from row 0 and
+     * reaches the image `top` rows later, so the rows the reduce is asked to refill are the ones
+     * `strip` apart MINUS the embed's offset. Measured against sharp 0.33.5 on a 48x32 -> contain
+     * 40xH nearest resize, whose vertical reduce is the same 32 -> 27 one at every H: the host's
+     * output row 16 is source row 15 at H = 27, 16 at H = 33, 21 at H = 30, 22 at H = 55 and 28 at
+     * H = 45, which is a sum restarted at rows 16, 13, 15, 18 and 7/23 -- 16 - 0, 16 - 3, 16 - 1,
+     * 32 - 14 and 16 - 9 / 32 - 9 for the five, the embed's own top being 0, 3, 1, 14 and 9.
      */
     const first = Math.min(Math.max(clock, 0), dstSize - 1);
     const sp = strip > 0 ? strip : Number.MAX_SAFE_INTEGER;
     const pos: number[] = new Array(dstSize);
     for (let d = first; d < dstSize; d++) {
-        pos[d] = d === first || (d - first) % sp === 0
+        pos[d] = d === first || (d - phase) % sp === 0
             ? (d + 0.5) * shrink - 0.5 - offset
             : pos[d - 1] + shrink;
     }
@@ -418,10 +449,20 @@ function coefficientIndex(at: number): number {
  * And the arithmetic is fixed-point, at 12 bits for the coefficients, so a bilinear value is a
  * sum of four integer coefficients scaled by 1/4096 and a bicubic one is a row of four such sums
  * rounded to integers before the column pass -- not one floating-point sum rounded at the end.
+ *
+ * `left` is the column the crop that follows this will ask for first, and the horizontal position
+ * is built by accumulating the inverse scale from there rather than from column 0, which is the
+ * same thing in exact arithmetic and not the same two doubles. Measured against sharp 0.33.5 on
+ * 16x8 -> cover 40x30 nearest -- a 60x30 enlargement cropped to 40 -- the enlargement on its own
+ * (16x8 -> outside 60x30) agrees byte for byte at every column, and only column 5 of the crop does
+ * not: the host reads source column 4 there and a sum built from column 0 reads 3. 16x8 -> cover
+ * 17x63 differs the same way at its column 8, and 40x30 -> cover Wx200 nearest at one column for
+ * W of 67, 74, 109, 116 and 151; with the sum started where the crop starts, all of them agree.
  */
-function affineImage(image: Image, hscale: number, vscale: number, kernelName: string): Image {
+function affineImage(image: Image, hscale: number, vscale: number, kernelName: string, left = 0): Image {
     const ch = image.channels;
     const out = createImage(roundU(image.width * hscale), roundU(image.height * vscale), ch);
+    const lfirst = Math.min(Math.max(Math.trunc(left), 0), out.width - 1);
     const nearest = kernelName === 'nearest';
     const bilinear = kernelName === 'linear';
     /* window_offset + 1: affine.c embeds the input in a border that wide so the stencil can hang
@@ -459,8 +500,13 @@ function affineImage(image: Image, hscale: number, vscale: number, kernelName: s
             : bilinear
                 ? [clamp(iy - 1, image.height), clamp(iy, image.height)]
                 : [0, 1, 2, 3].map((j) => clamp(iy - 3 + j, image.height));
-        let at = pad - id;
+        const ats: number[] = new Array(out.width);
+        for (let dx = lfirst; dx < out.width; dx++) {
+            ats[dx] = dx === lfirst ? (pad - id) + lfirst * iax : ats[dx - 1] + iax;
+        }
+        for (let dx = lfirst - 1; dx >= 0; dx--) ats[dx] = ats[dx + 1] - iax;
         for (let dx = 0; dx < out.width; dx++) {
+            const at = ats[dx];
             const ix = Math.trunc(at);
             const cx = bilinear || nearest ? BICUBIC_TABLE[0] : BICUBIC_TABLE[coefficientIndex(at)];
             const X = Math.trunc((at - ix) * INTERPOLATE_SCALE);
@@ -499,7 +545,6 @@ function affineImage(image: Image, hscale: number, vscale: number, kernelName: s
                 }
                 out.data[(dy * out.width + dx) * ch + c] = v < 0 ? 0 : v > 255 ? 255 : v;
             }
-            at += iax;
         }
     }
     return out;
@@ -510,7 +555,7 @@ function affineImage(image: Image, hscale: number, vscale: number, kernelName: s
  * Returns the image unchanged when the axis is not a reduction -- an enlargement is not a
  * resample of one axis, it is the affine above, which runs after both reductions.
  */
-function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelName: string, clock = 0, strip = REDUCEV_STRIP): Image {
+function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelName: string, clock = 0, strip = REDUCEV_STRIP, phase = clock): Image {
     const srcSize = horizontal ? image.width : image.height;
     /*
      * sharp hands vips_resize `scale`, the reciprocal of the shrink, and every number below comes
@@ -554,7 +599,7 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
         const workSize = horizontal ? work.width : work.height;
         const dstSize = roundU(workSize / residual);
         if (dstSize >= workSize) return work;
-        return reduceAxis(work, dstSize, residual, dstSize * residual - workSize, horizontal, kernelName, clock, sp);
+        return reduceAxis(work, dstSize, residual, dstSize * residual - workSize, horizontal, kernelName, clock, sp, phase);
     }
     const dstSize = roundU(srcSize / reciprocal);
     if (dstSize >= srcSize) return image;
@@ -566,7 +611,7 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
     if (dstSize === workSize) return work;
     /* The unused pixels are the ones the box shrink did not take: vips_reduceh divides them by the
        integer part it has just applied (resample/reduceh.cpp, vips_reduceh_build). */
-    return reduceAxis(work, dstSize, residual, extra / block, horizontal, kernelName, clock, sp);
+    return reduceAxis(work, dstSize, residual, extra / block, horizontal, kernelName, clock, sp, phase);
 }
 
 /**
@@ -575,7 +620,7 @@ function resampleAxis(image: Image, shrink: number, horizontal: boolean, kernelN
  * rounds its own output size off it, so an axis that is only along for the ride -- `cover` with
  * an auto height -- is still reduced at the other axis' factor.
  */
-export function resample(image: Image, hshrink: number, vshrink: number, kernel: string, vclock = 0, strip = REDUCEV_STRIP, hclock = 0): Image {
+export function resample(image: Image, hshrink: number, vshrink: number, kernel: string, vclock = 0, strip = REDUCEV_STRIP, hclock = 0, vphase = vclock): Image {
     let work = image;
     /*
      * Whether a vips_affine will run after the reduces. When one does, it is the last operation in
@@ -590,7 +635,7 @@ export function resample(image: Image, hshrink: number, vshrink: number, kernel:
      */
     const affine = 1 / hshrink > 1 || 1 / vshrink > 1;
     if (vshrink > 1) {
-        work = resampleAxis(work, vshrink, false, kernel, affine ? 0 : vclock, affine ? Number.MAX_SAFE_INTEGER : strip);
+        work = resampleAxis(work, vshrink, false, kernel, affine ? 0 : vclock, affine ? Number.MAX_SAFE_INTEGER : strip, vphase);
     }
     if (hshrink > 1) work = resampleAxis(work, hshrink, true, kernel, hclock);
     /* Whether either axis actually ran a reduce: see the zoom branch below. */
@@ -618,7 +663,7 @@ export function resample(image: Image, hshrink: number, vshrink: number, kernel:
     if (kernel === 'nearest' && !reduced && ah === Math.floor(ah) && av === Math.floor(av)) {
         return zoomImage(work, Math.round(ah), Math.round(av));
     }
-    return affineImage(work, ah, av, kernel);
+    return affineImage(work, ah, av, kernel, hclock);
 }
 
 /* -------------------------------------------------------------------- resize */
@@ -660,6 +705,13 @@ export interface ResizeSpec {
      * A flop() and a rotate(180) leave the rows the reduce walks in order and keep the strips.
      */
     wholeTile?: boolean;
+    /**
+     * Whether the image was decoded out of a file rather than handed in as pixels: a png or a jpeg
+     * against a raw buffer or a `create`. The vertical reduce walks the two in strips of different
+     * heights, so the row an output row lands on is not always the same one -- see
+     * REDUCEV_STRIP_DECODED.
+     */
+    decoded?: boolean;
 }
 
 /**
@@ -837,14 +889,38 @@ export function resizeImage(image: Image, spec: ResizeSpec): { image: Image; res
      * nearest cases, so the strips stay.
      */
     const follower = tile || 1 / hshrink > 1 || 1 / vshrink > 1;
+    const clock = follower ? 0 : verticalClock(spec, sh);
+    /*
+     * Which row of the reduce's output the operation after it asks to have refilled first, and so
+     * which rows its running sum restarts at. A crop asks for the rows it keeps, so the sum restarts
+     * at the crop's own top and every `strip` rows from there; an embed is asked for the canvas from
+     * row 0 and reaches the image `top` rows into it, so the rows it refills are the ones `strip`
+     * apart MINUS that offset, and a resize with nothing after it is asked from row 0. See the
+     * measurement on `phase` in reduceAxis.
+     */
+    const phase = spec.canvas === 'embed' && spec.height > 0
+        ? -offsetOf(spec.position, spec.height, sh, false)
+        : clock;
+    /*
+     * A decoded image takes the shorter strip only where the reduce's sum is not being clocked to
+     * somewhere other than its own row 0. Where it is -- a crop that keeps the middle or the bottom
+     * of a taller reduction -- the two strips were measured against each other over 57 widths each
+     * and 16 is the one that leaves fewer wrong (a 64x64 png -> n x n/2 cover nearest: 12 of 57 at
+     * 16 against 16 of 57 at 10), and neither is right, so the clocked case keeps the strip it had.
+     * Measured against sharp 0.33.5, a 64x64 png -> n x n/2 cover nearest from the top is 0 of 57
+     * wrong at 10 and a 48x32 raw one 0 of 57 at 16, so it is the clock and not the crop that
+     * decides.
+     */
+    const strip = spec.decoded === true && clock === 0 ? REDUCEV_STRIP_DECODED : REDUCEV_STRIP;
     const out = resample(
         src,
         hshrink,
         vshrink,
         spec.kernel,
-        follower ? 0 : verticalClock(spec, sh),
-        follower ? Number.MAX_SAFE_INTEGER : REDUCEV_STRIP,
-        spec.canvas === 'crop' ? horizontalClock(spec, sw) : 0
+        clock,
+        follower ? Number.MAX_SAFE_INTEGER : strip,
+        spec.canvas === 'crop' ? horizontalClock(spec, sw) : 0,
+        phase
     );
     return {
         image: alpha ? unpremultiplyImage(out) : out,
@@ -943,7 +1019,7 @@ function verticalClock(spec: ResizeSpec, sh: number): number {
  * same two doubles. Measured against sharp 0.33.5 over 210 entropy crops, the two decide every
  * slice the same way except in two: 80x50 -> 50x50 cover and 100x60 -> 100x10 cover, where the
  * image is a wrapped gradient whose two ends are within an ulp of each other and the host keeps
- * the crop at 0.
+ * the crop at 0 -- see the note on the sum below, which is what makes those tie.
  */
 function histEntropy(image: Image, left: number, top: number, width: number, height: number): number {
     const bins = new Int32Array(256 * image.channels);
@@ -955,15 +1031,43 @@ function histEntropy(image: Image, left: number, top: number, width: number, hei
             i += ch;
         }
     }
+    /*
+     * The sum is taken over the COUNT VALUES and not over the bins: `-sum(p * log2(p))` is
+     * `log2(N) - (1 / N) * sum(count * log2(count))`, and grouping the bins that hold the same
+     * count leaves one term per count instead of one per bin. In exact arithmetic the two are the
+     * same number either way; in floating point they are not, because a sum of the same terms in a
+     * different order is a different double -- and that is what decides a crop that walks over an
+     * image whose slices tie.
+     *
+     * A wrapped gradient is every one of those: shifting a slice along the wrap rotates which bin
+     * each value fell into without changing how many bins hold each count, so two slices have the
+     * same entropy exactly and libvips keeps the crop at 0, the end its `>` falls through to on a
+     * tie. Summed bin by bin, the rotation moves the additions around and the two slices come out
+     * an ulp apart, which is enough to walk the crop somewhere else entirely -- a 100x100 wrapped
+     * gradient cropped to 40x100 is `cropOffsetLeft` 0 on host and -8 by the bin-order sum.
+     * Measured against sharp 0.33.5 over 420 entropy crops of six wrapped gradients at seven
+     * sizes: grouping by count leaves 1 of 420 walking to a different end and summing by bin
+     * leaves 50 of them.
+     *
+     * `Math.log2` and not `Math.log(v) / Math.log(2)`: the two are not the same double, and
+     * `Math.log` is not even the same double in the guest as it is on the host -- QuickJS 0.32 and
+     * V8 answer 5.170483995038151 and 5.170483995038152 for log(176), and 176, 185, 196 and 220 of
+     * the first 256 integers differ by an ulp -- while `Math.log2` answers the same for all 4202
+     * values measured. A slice's tie is one ulp wide, so the log has to be the host's own.
+     */
     let entropy = 0;
+    const total = width * height;
     for (let c = 0; c < ch; c++) {
-        const total = width * height;
+        const tally = new Map<number, number>();
         for (let b = 0; b < 256; b++) {
             const count = bins[b + c * 256];
-            if (count === 0) continue;
-            const p = count / total;
-            entropy -= p * (Math.log(p) / Math.log(2));
+            if (count > 0) tally.set(count, (tally.get(count) ?? 0) + 1);
         }
+        let sum = 0;
+        for (const [count, howMany] of [...tally.entries()].sort((a, b) => a[0] - b[0])) {
+            sum += howMany * count * Math.log2(count);
+        }
+        entropy += Math.log2(total) - sum / total;
     }
     return entropy;
 }

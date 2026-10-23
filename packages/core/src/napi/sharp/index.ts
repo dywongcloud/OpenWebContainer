@@ -316,7 +316,14 @@ function decodeInput(
  */
 function applyOperations(
     image: Image,
-    options: Record<string, unknown>
+    options: Record<string, unknown>,
+    /**
+     * Whether `image` came out of a decoder rather than out of the caller's own pixels: the vertical
+     * reduce walks the two in strips of different heights, so this is what picks the height -- see
+     * REDUCEV_STRIP_DECODED in image.ts. sharp's own pre-resize extract cuts the tie the same way
+     * libvips does, since a crop of a loaded image is still generated, not memory.
+     */
+    decoded = false
 ): { image: Image; resized: boolean; cropOffsetLeft?: number; cropOffsetTop?: number } {
     let out = image;
     const rotationFirst = options.rotateBeforePreExtract === true;
@@ -348,7 +355,8 @@ function applyOperations(
            reduce can clock its sum where the crop starts asking. */
         flipRows: (options.flip === true) !== (quarters === 2),
         transposed: quarters === 1 || quarters === 3,
-        wholeTile: options.flip === true || quarters === 1 || quarters === 3
+        wholeTile: options.flip === true || quarters === 1 || quarters === 3,
+        decoded
     };
     if (rotationFirst) orient();
     if (numberOption(options, 'widthPre', -1) >= 0 || numberOption(options, 'heightPre', -1) >= 0) {
@@ -617,7 +625,7 @@ export function createAddon(host: SharpAddonHost = {}): object {
             if (limit > 0 && decoded.image.width * decoded.image.height > limit) {
                 throw pixelLimit(decoded.image.width, decoded.image.height, limit);
             }
-            const step = applyOperations(decoded.image, opts);
+            const step = applyOperations(decoded.image, opts, decoded.format !== 'raw');
             const { image: worked, resized } = step;
             // The pipeline ends in sRGB, so one band comes out as three and two as four: this is
             // what makes an 8x8x1 raw input 48 bytes of 4x4 raw output and not 16.
