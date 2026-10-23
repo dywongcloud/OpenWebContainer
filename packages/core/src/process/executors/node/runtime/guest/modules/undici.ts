@@ -957,11 +957,14 @@ Response.json = function json(data, init = {}) {
   if (text === undefined) throw new TypeError('Value is not JSON serializable');
   return new Response(text, initWithContentType(init, 'application/json'));
 };
-var REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+/* A list here and not a second declaration of the set further down: two vars of one name are one
+   var in this scope, and the later one wins -- which is why Response.redirect threw "not a
+   function" at REDIRECT_STATUSES.indexOf, the set having replaced the list by the time it ran. */
+var REDIRECT_STATUS_LIST = [301, 302, 303, 307, 308];
 Response.redirect = function redirect(url, status = 302) {
   if (arguments.length < 1) throw new TypeError('Response.redirect: 1 argument required, but 0 found.');
   var code = status === undefined ? 302 : Number(status);
-  if (REDIRECT_STATUSES.indexOf(code) < 0) throw new RangeError('Invalid status code ' + String(status));
+  if (REDIRECT_STATUS_LIST.indexOf(code) < 0) throw new RangeError('Invalid status code ' + String(status));
   var parsed = requestableUrl(url);
   if (parsed === null) throw unparseableUrl(url);
   return new Response(null, { status: code, headers: { location: parsed.href } });

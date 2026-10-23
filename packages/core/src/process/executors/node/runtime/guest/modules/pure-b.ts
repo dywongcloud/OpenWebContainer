@@ -478,6 +478,143 @@ export const SRC = String.raw`
     return false;
   }
 
+  /* Words a statement can open with that has no value of its own: the last statement of a line is
+     the line's value only when it opens with something else. */
+  var REPL_NO_VALUE = { if: true, for: true, while: true, do: true, switch: true, try: true,
+    catch: true, finally: true, else: true, throw: true, return: true, break: true, continue: true,
+    with: true, var: true, function: true, class: true, debugger: true };
+
+  /*
+   * A line carrying a top-level await, which no engine will run as a script: outside an async
+   * function await is only an identifier, so "var c = await 9" is two primary expressions in a
+   * row and the line is refused. Node's repl answers by hoisting the declarations the line makes
+   * out of an async wrapper and running the rest inside it -- "var c = await 9" becomes
+   * "var c; (async () => { void (c = await 9) })()" -- so the binding outlives the await and the
+   * completion value is still the one the line would have had: undefined for a declaration, which
+   * is why each is wrapped in void, and the value of the last expression otherwise, which is why
+   * that one is wrapped in a return of the value under the key unwrapAwait looks for.
+   *
+   * The same shape here, with the wrapper a function expression so nothing depends on the this of
+   * a script. A line this engine accepts as it stands -- "await (x)", which it reads as a call of
+   * an identifier named await where Node reads an await of x -- is rewritten too, because the
+   * token is what decides and not the engine's reading of it; and a rewrite that does not itself
+   * compile is thrown away, leaving the line to run or to fail exactly as it does now.
+   */
+  function replTopLevelAwait(src) {
+    var toks = vmLex(src).toks;
+    var awaited = false;
+    for (var q = 0; q < toks.length; q++) {
+      if (toks[q].t !== 'id' || toks[q].v !== 'await' || toks[q].depth !== 0) continue;
+      var before = toks[q - 1];
+      if (before !== undefined && before.t === 'punct' && before.v === '.') continue;
+      awaited = true;
+      break;
+    }
+    if (awaited !== true) return null;
+
+    /* The statements of the line, split where a semicolon stands at the top level. */
+    var edges = [0];
+    for (var e = 0; e < toks.length; e++) {
+      if (toks[e].t === 'punct' && toks[e].v === ';' && toks[e].depth === 0) {
+        edges.push(toks[e].pos, toks[e].end);
+      }
+    }
+    edges.push(src.length);
+
+    function firstTokenIn(from, to) {
+      for (var i = 0; i < toks.length; i++) {
+        if (toks[i].pos >= from && toks[i].pos < to) return toks[i];
+      }
+      return null;
+    }
+
+    var hoisted = [];
+    var parts = [];
+    for (var s = 0; s + 1 < edges.length; s += 2) {
+      var from = edges[s];
+      var to = edges[s + 1];
+      var text = src.slice(from, to);
+      var bare = text.replace(/^\s+/, '');
+      if (bare === '') continue;
+      var first = firstTokenIn(from, to);
+      var last = s + 2 >= edges.length;
+
+      if (first !== null && first.t === 'id' && first.depth === 0 && first.v === 'var') {
+        var cuts = [first.end];
+        for (var c = 0; c < toks.length; c++) {
+          if (toks[c].t !== 'punct' || toks[c].v !== ',' || toks[c].depth !== 0) continue;
+          if (toks[c].pos <= first.end || toks[c].pos >= to) continue;
+          cuts.push(toks[c].pos, toks[c].end);
+        }
+        cuts.push(to);
+        var assigned = [];
+        for (var d = 0; d + 1 < cuts.length; d += 2) {
+          var lead = firstTokenIn(cuts[d], cuts[d + 1]);
+          if (lead === null || lead.t !== 'id') return null;
+          var rest = src.slice(lead.end, cuts[d + 1]).replace(/^\s+/, '');
+          var init = 'undefined';
+          if (rest.charAt(0) === '=') init = rest.slice(1);
+          else if (rest !== '') return null;
+          hoisted.push(lead.v);
+          assigned.push(lead.v + ' = ' + init);
+        }
+        parts.push('void (' + assigned.join(', ') + ')');
+        continue;
+      }
+
+      /* A function or a class becomes an assignment to the name hoisted above, which is how the
+         binding reaches the session. Only when the declaration is the whole statement: a line that
+         goes on to do something else after the closing brace is left alone rather than split. */
+      if (first !== null && first.t === 'id' && first.depth === 0
+          && (first.v === 'function' || first.v === 'class')) {
+        var named = null;
+        for (var n = 0; n < toks.length; n++) {
+          if (toks[n].pos < first.end || toks[n].pos >= to) continue;
+          if (toks[n].t === 'id') { named = toks[n]; break; }
+          if (toks[n].t === 'punct' && toks[n].v === '*') continue;
+          break;
+        }
+        var opened = -1;
+        var closed = -1;
+        for (var b = 0; b < toks.length; b++) {
+          if (toks[b].pos < first.pos || toks[b].pos >= to) continue;
+          if (opened < 0) {
+            if (toks[b].t === 'punct' && toks[b].v === '{' && toks[b].depth === 0) opened = b;
+            continue;
+          }
+          if (toks[b].t === 'punct' && toks[b].v === '}' && toks[b].depth === 0) { closed = b; break; }
+        }
+        if (named === null || closed < 0) return null;
+        if (src.slice(toks[closed].end, to).replace(/\s+/g, '') !== '') return null;
+        hoisted.push(named.v);
+        parts.push(named.v + ' = ' + bare);
+        continue;
+      }
+
+      /* The value of the line, when it has one: an expression, handed back in a wrapper of its
+         own so that awaiting an object which happens to carry the same key still answers the
+         object. Only a word that opens a control statement, or a label, or a declaration has no
+         value, and anything else -- a literal, an operator, a bracket -- opens an expression. */
+      if (last && (first === null || first.t !== 'id' || (REPL_NO_VALUE[first.v] !== true
+          && !/^[A-Za-z_$][\w$]*\s*:/.test(bare)))) {
+        parts.push('return { __owcReplValue: (' + bare + ') }');
+        continue;
+      }
+      parts.push(text);
+    }
+
+    var wrapper = (hoisted.length === 0 ? '' : 'var ' + hoisted.join(', ') + '; ')
+      + '(async function () {\n' + parts.join(';\n') + '\n})()';
+    return compiles(wrapper) ? wrapper : null;
+  }
+
+  /* What the wrapper above handed back, with the one key of its own taken off: an object the line
+     awaited is nested one level deeper and so comes back out as the object it is. */
+  function replUnwrapAwait(value) {
+    if (isObjectLike(value) && '__owcReplValue' in value) return value.__owcReplValue;
+    return value;
+  }
+
   /* The offending line and a caret under it, the way V8 carries them above a syntax error: a buffer
      of 'var y = {' then '2+2' answers "2+2\n ^\n\n". QuickJS words the error its own way and shows
      no source of its own, but it does put the position in the stack of a compile it did itself, and
@@ -1266,12 +1403,25 @@ export const SRC = String.raw`
       var code = src;
       if (/^\s*\{/.test(src) && compiles('(' + src + '\n)')) code = '(' + src + '\n)';
       code = rewriteTopLexical(code);
+      /* A line with a top-level await runs inside the wrapper instead, and says so: the value the
+         promise it hands back resolves to is what the session sees, and the prompt waits for it. */
+      var wrapped = replTopLevelAwait(code);
+      this._awaitValue = wrapped !== null;
+      if (this._awaitValue === true) code = wrapped;
       /* The source the engine was handed, kept for the frame a syntax error is reported with. */
       this._code = code;
       if (this.useGlobal) return (0, eval)(code);
       return vm.runInContext(code, this.context);
     };
 
+    REPLServer.prototype._showResult = function (value) {
+      this.context._ = value;
+      if (value === undefined && this.ignoreUndefined) return;
+      this._writeOut(String(this.writer(value)) + '\n');
+    };
+
+    /* True when the prompt is this call's to print: a line that awaits prints nothing until the
+       promise settles, so the prompt has to come after it and not now. */
     REPLServer.prototype._evaluate = function (src) {
       var result;
       try {
@@ -1279,11 +1429,22 @@ export const SRC = String.raw`
       } catch (err) {
         this._writeOut(replErrorFrame(this._code === undefined ? src : this._code, err) +
           'Uncaught ' + replErrorHeader(err) + '\n');
-        return;
+        return false;
       }
-      this.context._ = result;
-      if (result === undefined && this.ignoreUndefined) return;
-      this._writeOut(String(this.writer(result)) + '\n');
+      if (this._awaitValue === true && isObjectLike(result) && typeof result.then === 'function') {
+        var repl = this;
+        this._awaitValue = false;
+        result.then(function (value) {
+          repl._showResult(replUnwrapAwait(value));
+          repl.displayPrompt();
+        }, function (err) {
+          repl._writeOut('Uncaught ' + replErrorHeader(err) + '\n');
+          repl.displayPrompt();
+        });
+        return true;
+      }
+      this._showResult(result);
+      return false;
     };
 
     REPLServer.prototype._onLine = function (line) {
@@ -1309,7 +1470,7 @@ export const SRC = String.raw`
       }
       var src = this._buffer;
       this._buffer = '';
-      if (src.replace(/\s+/g, '') !== '') this._evaluate(src);
+      if (src.replace(/\s+/g, '') !== '' && this._evaluate(src) === true) return;
       this.displayPrompt();
     };
 
