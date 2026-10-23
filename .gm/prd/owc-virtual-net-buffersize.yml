@@ -1,0 +1,30 @@
+id: owc-virtual-net-buffersize
+session_id: adv5-judge-http2-net-5
+status: pending
+classification: GUEST
+measured_at: bc261b63d1de325d13a96e3ab29e41aaace0ca13
+subject: 'socket.bufferSize stays 0 while write() is returning false. 200x64 KiB into a server socket the server paused: host Node 24.15 writeReturnedFalse=true bufferSizeGrew=true maxBufferSize=12582912, container writeReturnedFalse=true bufferSizeGrew=false maxBufferSize=0.'
+body: |-
+  OPEN, FILED BY THE JUDGE (adv5-judge-http2-net-5), not fixed: a faithful bufferSize needs a send
+  queue the guest can see, and this runtime has none. Recorded in Readme.md under "Virtual net".
+
+  The getter (net.ts:406) sums _writeCbs plus writableLength. _writeCbs only holds a write larger
+  than NET_SNDBUF (262144, net.ts:698), so a 64 KiB write never lands there, and _sendChunk
+  (net.ts:653-669) hands each 64 KiB piece straight to the hub, which delivers it to the peer
+  immediately (hub.ts:279-285), so writableLength never grows either. What host Node counts there is
+  the kernel send queue filling because the peer stopped reading; the equivalent here would be the
+  bytes this socket has handed to the hub that the peer has not consumed, and nothing on this side
+  of the bridge keeps that count. Making one up would mean either the hub reporting the peer's
+  undelivered byte count (a hub.ts change this shard does not own) or holding writes back in the
+  guest instead of sending them, which would be a throughput change, not a counters fix.
+
+  Differential, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of
+  packages/core, stdout, stderr and exit captured separately. Also checked: a fresh unconnected
+  socket's bufferSize is undefined on both sides, so only the under-backpressure case diverges.
+
+      const chunk = Buffer.alloc(65536, 9);
+      for (let i = 0; i < 200; i++) { const r = c.write(chunk); if (r === false) sawFalse = true;
+                                      if (c.bufferSize > 0) grew = true; }
+
+      host node 24.15:         writeReturnedFalse=true bufferSizeGrew=true maxBufferSize=12582912
+      container (HEAD bc261b6): writeReturnedFalse=true bufferSizeGrew=false maxBufferSize=0

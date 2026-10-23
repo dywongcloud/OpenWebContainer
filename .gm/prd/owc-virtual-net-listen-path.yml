@@ -1,0 +1,25 @@
+id: owc-virtual-net-listen-path
+session_id: adv5-judge-http2-net-5
+status: pending
+classification: GUEST
+measured_at: bc261b63d1de325d13a96e3ab29e41aaace0ca13
+subject: 'server.listen(''/tmp/x'') refuses with ERR_SOCKET_BAD_PORT ("Port should be >= 0 and < 65536. Received type string") where host Node 24.15 binds a unix socket at that path, reports listening and answers no error. Container: listening=no code=THREW ERR_SOCKET_BAD_PORT. Host: listening=yes code=none.'
+body: |-
+  OPEN, FILED BY THE JUDGE (adv5-judge-http2-net-5), not fixed: closing it means implementing unix
+  domain sockets, which this runtime does not have and which no shard of this run owns. Recorded in
+  Readme.md under "Virtual net". Note the asymmetry already in the tree: netConnectArgs (net.ts:283)
+  refuses a string connect with ERR_NOT_SUPPORTED "Unix domain sockets are not supported by this
+  runtime", while listen takes the same string through netPortOf and reports ERR_SOCKET_BAD_PORT,
+  so the two entry points name two different faults for one absent feature.
+
+  Differential, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of
+  packages/core, stdout, stderr and exit captured separately:
+
+      const server = net.createServer(() => {});
+      let code = 'none'; let listening = 'no';
+      server.on('error', (e) => { code = e.code || e.message; });
+      server.on('listening', () => { listening = 'yes'; });
+      server.listen('/tmp/owc-judge-hn5-not-a-real-socket-path', fin);
+
+      host node 24.15:        listen(path) listening=yes code=none
+      container (HEAD bc261b6): listen(path) listening=no code=THREW ERR_SOCKET_BAD_PORT

@@ -1,0 +1,34 @@
+id: owc-virtual-net-ipv6-family
+session_id: adv5-judge-http2-net-5
+status: pending
+classification: GUEST
+measured_at: bc261b63d1de325d13a96e3ab29e41aaace0ca13
+subject: 'A TCP client connected to a server bound on ::1 mis-reports its family: container remoteFamily=IPv4 localFamily=IPv4 remoteAddress=127.0.0.1, host Node 24.15 remoteFamily=IPv6 localFamily=IPv6 remoteAddress=::1. Both sides agree the listening address is ::1 / family IPv6, so only the client end is wrong.'
+body: |-
+  OPEN, FILED BY THE JUDGE (adv5-judge-http2-net-5), not fixed: the fix site is
+  packages/core/src/network/virtual/hub.ts, which this shard does not own and which every protocol
+  here goes through, so it is named and not edited.
+
+  The cause is in the hub, not in net.ts. hubAddress() folds every loopback name to '127.0.0.1'
+  (hub.ts:511-519), hubDestination() does the same for a connect (hub.ts:521-524), hub.connect()
+  hardcodes the client's local address as '127.0.0.1' and the server's remoteAddress as '127.0.0.1'
+  (hub.ts:240-249) and searches with findEndpoint('tcp', 'IPv4', ...) (hub.ts:204), and hub.listen()
+  defaults family to 'IPv4' because the 'net.listen' capability (capabilities/net.ts:86-93) passes
+  no family at all. net.ts then derives the family from the address string it is handed
+  (netFamilyName, net.ts:104), so it can only report what the hub admitted. Faithful families need
+  the family carried from net.listen/net.connect through the capability into hub.listen/hub.connect,
+  isLocal() widened to accept '::1', and the client's own local address picked per family.
+
+  Differential, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of
+  packages/core, stdout, stderr and exit captured separately:
+
+      const server = net.createServer((sock) => { say('srv remoteFamily=' + sock.remoteFamily); sock.end(); });
+      server.listen(0, '::1');
+      const c = net.connect({ port: addr.port, host: '::1', family: 6 });
+      await once(c, 'connect');
+      say('cli remoteFamily=' + c.remoteFamily + ' localFamily=' + c.localFamily + ' remoteAddress=' + c.remoteAddress);
+
+      host node 24.15:         listen family=IPv6 address=::1
+                               cli remoteFamily=IPv6 localFamily=IPv6 remoteAddress=::1
+      container (HEAD bc261b6): listen family=IPv6 address=::1
+                               cli remoteFamily=IPv4 localFamily=IPv4 remoteAddress=127.0.0.1
