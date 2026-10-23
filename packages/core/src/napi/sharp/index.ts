@@ -34,6 +34,7 @@ import {
     flopImage,
     padBackground,
     canvasImage,
+    premultiplyImage,
     resizeImage,
     smartcropEntropy,
     rotateQuarters,
@@ -379,7 +380,19 @@ function applyOperations(
             if (cw === out.width && ch === out.height) {
                 out = canvasImage(out, spec);
             } else {
-                const crop = smartcropEntropy(out, cw, ch);
+                /*
+                 * vips_smartcrop scores the image sharp hands it, and sharp hands it the
+                 * premultiplied one: `shouldPremultiplyAlpha` is set before the resize and the
+                 * unpremultiply is not until after the crop (src/pipeline.cc), so an alpha band
+                 * that is not flat rescales the bands the histogram is taken over. Scoring the
+                 * unpremultiplied pixels instead is only the same thing when the alpha is a
+                 * constant -- a 16x16 RGBA whose alpha ramps 0 to 255 walks to a different row
+                 * than the host's on sharp 0.33.5, while the same source at alpha 255 or 0 agrees.
+                 */
+                const scored = resized && (out.channels === 2 || out.channels === 4)
+                    ? premultiplyImage(out)
+                    : out;
+                const crop = smartcropEntropy(scored, cw, ch);
                 out = extractImage(out, crop.left, crop.top, cw, ch);
                 /*
                  * sharp reports these off the xoffset/yoffset the extract hands back, which for
