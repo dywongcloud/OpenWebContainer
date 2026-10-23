@@ -1,0 +1,6 @@
+id: owc-crypto-verify-dsaencoding-permissive
+session_id: adv5-judge-crypto-4
+owner: adv5-judge-crypto-4
+classification: GUEST
+status: pending
+subject: 'crypto.verify / createVerify().verify() accept an ''ieee-p1363'' (r||s) ECDSA signature when dsaEncoding is left at its ''der'' default, where host Node 24.15 answers false: a 64-byte compact signature verified against P-256 with no dsaEncoding gives false on the host and true here. @noble/curves auto-detects both encodings in verify, so the check passes either way. Signing is exact in both directions since round 4 -- crypto.sign(..., {key, dsaEncoding:''ieee-p1363''}) emits 64 bytes matching host -- and verify with a matching dsaEncoding also agrees; only the default-mode mismatch is loose. The fix site is verifyWith in packages/core/src/process/executors/node/runtime/capabilities/crypto.ts, which would need the caller''s dsaEncoding and an explicit Signature.fromDER / fromCompact parse instead of the auto-detecting verify. Witness: /tmp/owc-judge-crypto-4/proj/main.js case F8-sign-ieee-then-der-verify, host {raw:64, der:70, rawOk:false, derOk:true} vs container {raw:64, der:70, rawOk:true, derOk:true}.'

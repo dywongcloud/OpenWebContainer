@@ -74,6 +74,9 @@ const CPU_COUNT: number = (() => {
     return typeof n === 'number' && n > 0 && isFinite(n) ? Math.floor(n) : 1;
 })();
 
+/** getRandomValues will not fill more than this in one call; a bigger ask is chunked. */
+const RANDOM_CHUNK = 65536;
+
 /**
  * Builds the `host` object the guest bootstrap receives. Every function returns a
  * fresh handle (quickjs-emscripten disposes returned handles) and reports fs
@@ -221,8 +224,12 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
     define('now', () => context.newNumber(deps.now()));
     define('cpuCount', () => context.newNumber(CPU_COUNT));
     define('randomBase64', (size) => {
-        const bytes = new Uint8Array(context.getNumber(size));
-        crypto.getRandomValues(bytes);
+        /* getRandomValues refuses more than 64 KiB at a call, so a larger ask is filled in pieces. */
+        const total = context.getNumber(size);
+        const bytes = new Uint8Array(total);
+        for (let at = 0; at < total; at += RANDOM_CHUNK) {
+            crypto.getRandomValues(bytes.subarray(at, Math.min(at + RANDOM_CHUNK, total)));
+        }
         return context.newString(bytesToBase64(bytes));
     });
     define('stdout', (chunk) => {

@@ -1,6 +1,7 @@
 import { blake2b, blake2s } from '@noble/hashes/blake2';
 import { md5 } from '@noble/hashes/legacy';
 import { ripemd160 } from '@noble/hashes/ripemd160';
+import { pbkdf2 } from '@noble/hashes/pbkdf2';
 import { scrypt } from '@noble/hashes/scrypt';
 import { sha1 } from '@noble/hashes/sha1';
 import { sha224, sha256 } from '@noble/hashes/sha256';
@@ -221,7 +222,7 @@ function outputLengthFor(spec: DigestSpec, requested: unknown): number {
             { code: 'ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH' }
         );
     }
-    if (!Number.isInteger(n) || n <= 0) {
+    if (!Number.isInteger(n) || n < 0) {
         throw Object.assign(new Error('Invalid XOF output length'), { code: 'ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH' });
     }
     return n;
@@ -739,11 +740,13 @@ const EDWARDS: Record<string, {
     randomPrivateKey: () => Uint8Array;
     sign?: (msg: Uint8Array, priv: Uint8Array) => Uint8Array;
     verify?: (sig: Uint8Array, msg: Uint8Array, pub: Uint8Array) => boolean;
+    /** Key agreement: absent on the two signature curves, which have no ECDH. */
+    getSharedSecret?: (priv: Uint8Array, pub: Uint8Array) => Uint8Array;
 }> = {
     ed25519: { kind: 'ed25519', oid: '1.3.101.112', jwk: 'Ed25519', seed: 32, size: 32, getPublicKey: (p) => nobleEd25519.getPublicKey(p), randomPrivateKey: () => nobleEd25519.utils.randomPrivateKey(), sign: (m, p) => nobleEd25519.sign(m, p), verify: (s, m, p) => nobleEd25519.verify(s, m, p) },
-    x25519: { kind: 'x25519', oid: '1.3.101.110', jwk: 'X25519', seed: 32, size: 32, getPublicKey: (p) => nobleX25519.getPublicKey(p), randomPrivateKey: () => nobleX25519.utils.randomPrivateKey() },
+    x25519: { kind: 'x25519', oid: '1.3.101.110', jwk: 'X25519', seed: 32, size: 32, getPublicKey: (p) => nobleX25519.getPublicKey(p), randomPrivateKey: () => nobleX25519.utils.randomPrivateKey(), getSharedSecret: (a, b) => nobleX25519.getSharedSecret(a, b) },
     ed448: { kind: 'ed448', oid: '1.3.101.113', jwk: 'Ed448', seed: 57, size: 57, getPublicKey: (p) => nobleEd448.getPublicKey(p), randomPrivateKey: () => nobleEd448.utils.randomPrivateKey(), sign: (m, p) => nobleEd448.sign(m, p), verify: (s, m, p) => nobleEd448.verify(s, m, p) },
-    x448: { kind: 'x448', oid: '1.3.101.111', jwk: 'X448', seed: 56, size: 56, getPublicKey: (p) => nobleX448.getPublicKey(p), randomPrivateKey: () => nobleX448.utils.randomPrivateKey() }
+    x448: { kind: 'x448', oid: '1.3.101.111', jwk: 'X448', seed: 56, size: 56, getPublicKey: (p) => nobleX448.getPublicKey(p), randomPrivateKey: () => nobleX448.utils.randomPrivateKey(), getSharedSecret: (a, b) => nobleX448.getSharedSecret(a, b) }
 };
 
 interface KeyRecord {
@@ -763,6 +766,71 @@ const OPEN_KEY_LIMIT = 256;
 function keyFail(code: string, message: string, kind: 'Error' | 'RangeError' | 'TypeError' = 'Error'): never {
     const Ctor = kind === 'RangeError' ? RangeError : kind === 'TypeError' ? TypeError : Error;
     throw Object.assign(new Ctor(message), { code, owcErrorClass: kind });
+}
+
+/** PBES2 (RFC 8018): the KDF, the PRFs it may name, and the ciphers a PKCS#8 key is sealed with. */
+const OID_PBES2 = '1.2.840.113549.1.5.13';
+const OID_PBKDF2 = '1.2.840.113549.1.5.12';
+const SEAL_PRFS: Record<string, Parameters<typeof pbkdf2>[0]> = {
+    '1.2.840.113549.2.7': sha1,
+    '1.2.840.113549.2.8': sha224,
+    '1.2.840.113549.2.9': sha256,
+    '1.2.840.113549.2.10': sha384,
+    '1.2.840.113549.2.11': sha512
+};
+const SEAL_CIPHERS: Record<string, { keyLength: number; cipher: (key: Uint8Array, iv: Uint8Array) => { decrypt: (data: Uint8Array) => Uint8Array } }> = {
+    '2.16.840.1.101.3.4.1.2': { keyLength: 16, cipher: (key, iv) => cbc(key, iv, { disablePadding: true }) },
+    '2.16.840.1.101.3.4.1.22': { keyLength: 24, cipher: (key, iv) => cbc(key, iv, { disablePadding: true }) },
+    '2.16.840.1.101.3.4.1.42': { keyLength: 32, cipher: (key, iv) => cbc(key, iv, { disablePadding: true }) }
+};
+
+/**
+ * EncryptedPrivateKeyInfo: the PKCS#8 body sealed by PBES2 over PBKDF2, which is what Node writes
+ * when a caller hands `privateKeyEncoding` a passphrase. Unsealing it is the only way such a key
+ * can be loaded at all.
+ */
+function decryptPkcs8(bytes: Uint8Array, passphrase: unknown): Uint8Array {
+    const secret = typeof passphrase === 'string'
+        ? new TextEncoder().encode(passphrase)
+        : passphrase instanceof Uint8Array ? passphrase : undefined;
+    /* Node asks the caller for a passphrase when the key is sealed, and fails oddly without one. */
+    if (secret === undefined) {
+        throw keyFail('ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED', 'error:07880109:common libcrypto routines::interrupted or cancelled');
+    }
+    const root = derRead(bytes);
+    const [algorithm, sealed] = root.children;
+    if (root.tag !== DER_SEQUENCE || algorithm === undefined || algorithm.tag !== DER_SEQUENCE || sealed === undefined || sealed.tag !== DER_OCTET_STRING) {
+        throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid encrypted PKCS#8');
+    }
+    if (oidOf(algorithm.children[0]) !== OID_PBES2) {
+        throw keyFail('ERR_OSSL_UNSUPPORTED', 'error:1E08010C:DECODER routines::unsupported');
+    }
+    const [kdf, scheme] = algorithm.children[1].children;
+    if (kdf === undefined || scheme === undefined) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid PBES2 parameters');
+    if (oidOf(kdf.children[0]) !== OID_PBKDF2) {
+        throw keyFail('ERR_OSSL_UNSUPPORTED', 'error:1E08010C:DECODER routines::unsupported');
+    }
+    const kdfParams = kdf.children[1].children;
+    const salt = kdfParams[0].content;
+    const iterations = Number(bigOf(kdfParams[1].content));
+    /* The PRF is optional and defaults to HMAC-SHA1, the way it does in RFC 8018. */
+    const prf = kdfParams[2] === undefined ? SEAL_PRFS['1.2.840.113549.2.7'] : SEAL_PRFS[oidOf(kdfParams[2].children[0])];
+    if (prf === undefined) throw keyFail('ERR_OSSL_UNSUPPORTED', 'error:1E08010C:DECODER routines::unsupported');
+    const seal = SEAL_CIPHERS[oidOf(scheme.children[0])];
+    if (seal === undefined) throw keyFail('ERR_OSSL_UNSUPPORTED', 'error:1E08010C:DECODER routines::unsupported');
+    const iv = scheme.children[1].content;
+    const key = pbkdf2(prf, secret, salt, { c: iterations, dkLen: seal.keyLength });
+    /* A wrong passphrase decrypts to bytes that are almost never valid PKCS#7 padding. */
+    return unpad(seal.cipher(key, iv).decrypt(sealed.content));
+}
+
+/** The export shape a bare PEM asks for by its label, the way Node reads it. */
+function pemKindOf(text: string): string {
+    const label = /-----BEGIN ([A-Z0-9 ]*)-----/.exec(text);
+    if (label === null) return 'pkcs8';
+    if (label[1] === 'EC PRIVATE KEY') return 'sec1';
+    if (label[1] === 'PUBLIC KEY') return 'spki';
+    return 'pkcs8';
 }
 
 function keyFor(id: unknown, op: string): KeyRecord {
@@ -833,22 +901,22 @@ function exportJwk(key: KeyRecord): Record<string, unknown> {
     if (key.kind === 'ec') {
         const curve = key.curve as EcCurve;
         const point = key.publicBytes as Uint8Array;
+        /* Node emits EC as kty, x, y, crv, d -- and OKP as crv, d, x, kty -- and a caller that
+           JSON.stringify's the export sees that order, so the keys are written in it here. */
         const jwk: Record<string, unknown> = {
             kty: 'EC',
-            crv: curve.jwk,
             x: base64url(point.subarray(1, 1 + curve.size)),
-            y: base64url(point.subarray(1 + curve.size, 1 + 2 * curve.size))
+            y: base64url(point.subarray(1 + curve.size, 1 + 2 * curve.size)),
+            crv: curve.jwk
         };
         if (key.type === 'private') jwk.d = base64url(paddedScalar(key.privateBytes as Uint8Array, curve.size));
         return jwk;
     }
     const spec = EDWARDS[key.kind];
-    const jwk: Record<string, unknown> = {
-        kty: 'OKP',
-        crv: spec.jwk,
-        x: base64url(key.publicBytes as Uint8Array)
-    };
+    const jwk: Record<string, unknown> = { crv: spec.jwk };
     if (key.type === 'private') jwk.d = base64url(key.privateBytes as Uint8Array);
+    jwk.x = base64url(key.publicBytes as Uint8Array);
+    jwk.kty = 'OKP';
     return jwk;
 }
 
@@ -857,7 +925,7 @@ function curveFor(name: unknown): EcCurve {
     const asked = String(name ?? '').toLowerCase();
     const node = EC_CURVE_ALIASES[String(name ?? '')] ?? asked;
     const curve = EC_CURVES[node];
-    if (curve === undefined) throw keyFail('ERR_CRYPTO_INVALID_CURVE', 'Invalid EC curve name: ' + String(name));
+    if (curve === undefined) throw keyFail('ERR_CRYPTO_INVALID_CURVE', 'Invalid EC curve name');
     return curve;
 }
 
@@ -887,7 +955,7 @@ function generatePair(type: unknown, options: any): { public: number; private: n
             private: storeKey({ type: 'private', kind: 'ec', curve, publicBytes: pub, privateBytes: priv })
         };
     }
-    throw keyFail('ERR_CRYPTO_INVALID_KEY_TYPE', 'Unknown key type: ' + String(type));
+    throw keyFail('ERR_INVALID_ARG_VALUE', "The argument 'type' must be a supported key type. Received '" + String(type) + "'");
 }
 
 /** The kind of a key from the algorithm OID in its SPKI or PKCS#8 header. */
@@ -1015,7 +1083,7 @@ function importJwk(jwk: any, want: 'public' | 'private'): KeyRecord {
     throw keyFail('ERR_CRYPTO_INVALID_JWK', 'Unsupported JWK key type: ' + String(jwk.kty));
 }
 
-function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array): Uint8Array {
+function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown): Uint8Array {
     if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type public, expected private.');
     const spec = EDWARDS[key.kind];
     if (spec !== undefined) {
@@ -1039,7 +1107,8 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array): Uint8Ar
      */
     const digest = digestFor(algorithm).fn(data, 0);
     const signed = curve.curve.sign(digest, key.privateBytes as Uint8Array, { lowS: true, prehash: false, extraEntropy: randomOf(32) });
-    return signed.toBytes('der');
+    /* 'ieee-p1363' is r||s; Node's default is the DER SEQUENCE of the two. */
+    return signed.toBytes(dsaEncoding === 'ieee-p1363' ? 'compact' : 'der');
 }
 
 function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signature: Uint8Array): boolean {
@@ -1270,8 +1339,15 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
          * Node rejects a parameter set before it derives anything: N must be a power of two above
          * one, r and p must be positive, and the whole 128*N*r working set must fit in maxmem.
          */
-        if (!(N > 1) || (N & (N - 1)) !== 0 || !(r > 0) || !(p > 0) || 128 * N * r > maxmem) {
+        if (!(N > 1) || (N & (N - 1)) !== 0 || !(r > 0) || !(p > 0)) {
             throw Object.assign(new Error('Invalid scrypt params'), { code: 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS' });
+        }
+        /* A working set that will not fit is the one failure Node names a cause for. */
+        if (128 * N * r > maxmem) {
+            throw Object.assign(
+                new Error('Invalid scrypt params: error:030000AC:digital envelope routines::memory limit exceeded'),
+                { code: 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS' }
+            );
         }
         const keylen = Number(args?.keylen);
         if (!Number.isInteger(keylen) || keylen < 0) {
@@ -1378,11 +1454,16 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             return { id: storeKey(importJwk(args?.jwk, want === 'private' ? 'private' : 'public')) };
         }
         const bytes = bytesArg(args?.bytes);
-        const kind = String(args?.type ?? (want === 'private' ? 'pkcs8' : 'spki')).toLowerCase();
-        /* A PEM body is base64 text inside BEGIN/END lines; DER is the raw bytes. */
         const text = new TextDecoder().decode(bytes);
-        if (kind === 'spki') return { id: storeKey(importSpki(text.includes('-----BEGIN') ? pemDecode(text, 'PUBLIC KEY') : bytes)) };
-        if (kind === 'pkcs8') return { id: storeKey(importPkcs8(text.includes('-----BEGIN') ? pemDecode(text, 'PRIVATE KEY') : bytes)) };
+        const pem = text.includes('-----BEGIN');
+        /* Node reads the label when the caller names no format, so an EC PRIVATE KEY imports as sec1. */
+        const kind = String(args?.type ?? (pem ? pemKindOf(text) : (want === 'private' ? 'pkcs8' : 'spki'))).toLowerCase();
+        const sealed = pem && /-----BEGIN ENCRYPTED PRIVATE KEY-----/.test(text);
+        if (kind === 'spki') return { id: storeKey(importSpki(pem ? pemDecode(text, 'PUBLIC KEY') : bytes)) };
+        if (kind === 'pkcs8') {
+            const plain = sealed ? decryptPkcs8(pemDecode(text, 'ENCRYPTED PRIVATE KEY'), args?.passphrase) : pem ? pemDecode(text, 'PRIVATE KEY') : bytes;
+            return { id: storeKey(importPkcs8(plain)) };
+        }
         if (kind === 'sec1') {
             const der = text.includes('-----BEGIN') ? pemDecode(text, 'EC PRIVATE KEY') : bytes;
             const root = derRead(der);
@@ -1404,9 +1485,44 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return false;
         return true;
     },
-    /** Args {id, algorithm, data}: the signature of a digest or message; returns base64. */
-    'crypto.key.sign': (args) => bytesToBase64(signWith(keyFor(args?.id, 'key.sign'), args?.algorithm, bytesArg(args?.data))),
-    /** Args {id, algorithm, data, signature}: whether the signature checks out. */
+    /** Args {id}: the public half of a private key handle, as a public handle of its own. */
+    'crypto.key.public': (args) => {
+        const key = keyFor(args?.id, 'key.public');
+        if (key.type !== 'private') {
+            throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', `Invalid key object type ${key.type}, expected private.`);
+        }
+        if (key.publicBytes === undefined) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Key has no public half');
+        return { id: storeKey({ type: 'public', kind: key.kind, curve: key.curve, publicBytes: Uint8Array.from(key.publicBytes) }) };
+    },
+    /** Args {id, algorithm, data, dsaEncoding}: the signature of a digest or message; returns base64. */
+    'crypto.key.sign': (args) => bytesToBase64(signWith(keyFor(args?.id, 'key.sign'), args?.algorithm, bytesArg(args?.data), args?.dsaEncoding)),
+    /*
+     * Primality. Node answers checkPrime from a Miller-Rabin search with `checks` witnesses, and
+     * generatePrime by drawing odd candidates of the width asked for until one passes; a safe prime
+     * also needs (p-1)/2 prime. The search is BigInt arithmetic, so it is quick for the widths a
+     * caller probes with and slow for the 1024-bit halves an RSA key would need.
+     */
+    /** Args {value, valueIsBigInt, checks}: whether the candidate is a probable prime. */
+    'crypto.checkPrime': (args) => {
+        const value = args?.valueIsBigInt === true ? BigInt(String(args?.value ?? '0')) : bigOf(bytesArg(args?.value));
+        const checks = args?.checks === undefined ? 32 : Number(args?.checks);
+        if (value < 2n) return { prime: false };
+        return { prime: isProbablePrime(value, checks < 1 ? 1 : checks) };
+    },
+    /** Args {bits, safe, bigint}: a fresh probable prime of that width, as base64 and as text. */
+    'crypto.generatePrime': (args) => {
+        const bits = Number(args?.bits);
+        if (!Number.isInteger(bits) || bits < 2) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "primeLength" is out of range. It must be >= 2. Received ' + String(args?.bits), 'RangeError');
+        }
+        const safe = args?.safe === true;
+        for (let attempt = 0; attempt < 100000; attempt++) {
+            const candidate = randomPrime(bits);
+            if (safe && !isProbablePrime((candidate - 1n) / 2n, 8)) continue;
+            return { bytes: bytesToBase64(bytesOf(candidate, Math.ceil(bits / 8))), value: candidate.toString() };
+        }
+        throw keyFail('ERR_CRYPTO_INVALID_STATE', 'Could not find a prime of ' + bits + ' bits');
+    },    /** Args {id, algorithm, data, signature}: whether the signature checks out. */
     'crypto.key.verify': (args) => verifyWith(keyFor(args?.id, 'key.verify'), args?.algorithm, bytesArg(args?.data), bytesArg(args?.signature)),
 
     /* -----------------------------------------------------------------------------------------
@@ -1475,6 +1591,30 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         return bytesToBase64(bytesOf(modPow(other, state.privateKey, state.prime), state.size));
     },
     /** Args {prime, private, public}: the low-level shared secret Node's diffieHellman() answers. */
+    /*
+     * ECDH: the shared secret of a private key and a peer's public key, over X25519, X448 or an
+     * EC curve. Node's diffieHellman takes key objects for these and a prime for the classic
+     * finite-field form, and the exponentiation here is the curve's own.
+     */
+    /** Args {private, public}: two key handles; returns base64. */
+    'crypto.dh.ecdh': (args) => {
+        const priv = keyFor(args?.private, 'dh.ecdh');
+        const pub = keyFor(args?.public, 'dh.ecdh');
+        if (priv.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type public, expected private.');
+        if (pub.kind !== priv.kind) throw keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Incompatible key types');
+        if (priv.kind === 'ec') {
+            const curve = priv.curve as EcCurve;
+            if (curve !== (pub.curve as EcCurve)) throw keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Incompatible curves');
+            /* Node hands back the x-coordinate alone, which is what follows the 0x04 point header. */
+            const point = curve.curve.getSharedSecret(priv.privateBytes as Uint8Array, pub.publicBytes as Uint8Array, false);
+            return bytesToBase64(point.subarray(1, 1 + curve.size));
+        }
+        const spec = EDWARDS[priv.kind];
+        if (spec === undefined || spec.getSharedSecret === undefined) {
+            throw keyFail('ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE', 'error:03000096:digital envelope routines::operation not supported for this keytype');
+        }
+        return bytesToBase64(spec.getSharedSecret(priv.privateBytes as Uint8Array, pub.publicBytes as Uint8Array));
+    },
     'crypto.dh.compute': (args) => {
         const prime = bigOf(bytesArg(args?.prime));
         const priv = bigOf(bytesArg(args?.private));

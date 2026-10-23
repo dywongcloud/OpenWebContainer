@@ -1878,6 +1878,21 @@ BF.crypto = function () {
     return err;
   }
 
+  /* Node's ERR_CRYPTO_INVALID_DIGEST: createSign names no digest in the message, pbkdf2 does. */
+  function invalidDigest(name) {
+    var err = new Error('Invalid digest' + (name === undefined ? '' : ': ' + String(name)));
+    err.code = 'ERR_CRYPTO_INVALID_DIGEST';
+    return err;
+  }
+
+  /* Node's ERR_INVALID_ARG_VALUE: "The property 'a.b' is invalid. Received x", with an optional reason. */
+  function invalidArgValue(name, value, reason) {
+    var shown = typeof value === 'string' ? "'" + value + "'" : value === undefined ? 'undefined' : String(value);
+    var err = new RangeError("The property '" + name + "' " + (reason === undefined ? 'is invalid' : reason) + '. Received ' + shown);
+    err.code = 'ERR_INVALID_ARG_VALUE';
+    return err;
+  }
+
   /* exports this runtime does not implement (Diffie-Hellman, key generation): present so modules load, and they fail clearly when called */
   function featureUnavailable(name) {
     var err = new Error(name + ' is not available in this runtime');
@@ -1898,6 +1913,9 @@ BF.crypto = function () {
   }
 
   function randomBytes(size, callback) {
+    if (typeof size !== 'number') throw invalidArgType('size', 'of type number', size);
+    /* Node bounds size before it allocates: a negative length is a range error, not a typed-array one. */
+    if (!(size >= 0 && size <= 2147483647)) throw outOfRange('size', '>= 0 && <= 2147483647', size);
     var bytes = Buf.from(decodeBase64(host.randomBase64(size)));
     if (typeof callback === 'function') {
       queueMicrotask(function () { callback(null, bytes); });
@@ -2028,19 +2046,29 @@ BF.crypto = function () {
 
   KeyObject.prototype.export = function (options) {
     var state = keyStateOf(this, 'key');
-    /* Node asks for the encoding every time: export() with no options is an argument error. */
-    if (options === undefined || options === null) throw invalidArgType('options', 'of type object', options);
     if (state.type === 'secret') {
-      if (options !== undefined && options !== null && options.format === 'jwk') {
-        return { kty: 'oct', k: base64url(state.bytes) };
+      /* Node lets a secret key be exported with no options at all; only 'buffer' and 'jwk' are shapes. */
+      if (options !== undefined && options !== null) {
+        if (options === null || typeof options !== 'object') throw invalidArgType('options', 'of type object', options);
+        if (options.format !== undefined && options.format !== 'buffer' && options.format !== 'jwk') {
+          throw invalidArgValue('options.format', options.format, "must be one of: undefined, 'buffer', 'jwk'");
+        }
+        if (options.format === 'jwk') return { kty: 'oct', k: base64url(state.bytes) };
       }
       return Buf.from(state.bytes);
     }
-    var opts = options === undefined || options === null ? {} : options;
-    var format = opts.format === 'jwk' ? 'jwk' : opts.format === 'der' ? 'der' : 'pem';
+    if (options === undefined || options === null) throw invalidArgType('options', 'of type object', options);
+    if (typeof options !== 'object') throw invalidArgType('options', 'of type object', options);
+    if (options.format !== 'pem' && options.format !== 'der' && options.format !== 'jwk') {
+      throw invalidArgValue('options.format', options.format);
+    }
+    var opts = options;
+    var format = opts.format;
     var result = callCap('crypto.key.export', { id: state.id, format: format, type: opts.type });
-    if (result.jwk !== undefined) return result.jwk;
-    return Buf.from(result.bytes, 'base64');
+    if (format === 'jwk') return result.jwk;
+    /* A PEM export is text on Node, and a DER one is bytes: only the latter comes back as a Buffer. */
+    var bytes = Buf.from(result.bytes, 'base64');
+    return format === 'pem' ? bytes.toString('utf8') : bytes;
   };
 
   KeyObject.prototype.equals = function (other) {
@@ -2062,24 +2090,82 @@ BF.crypto = function () {
 
   /*
    * createPublicKey and createPrivateKey. The key a caller hands in is PEM or DER text, a Buffer
-   * holding either, or a JWK; the host parses it and answers with a handle.
+   * holding either, a JWK, or -- for createPublicKey -- a private KeyObject whose public half is
+   * what the caller wants back.
    */
+  function isKeyObject(value) {
+    var state = value !== null && typeof value === 'object' ? KEY_STATE.get(value) : undefined;
+    return state !== undefined && state.kind === 'key';
+  }
+
+  /* Node names the class in the message for a key object: "Received an instance of PrivateKeyObject". */
+  function asReceived(key) {
+    var state = key !== null && typeof key === 'object' ? KEY_STATE.get(key) : undefined;
+    if (state === undefined || state.kind !== 'key') return typeof key;
+    if (state.type === 'secret') return 'an instance of SecretKeyObject';
+    return state.type === 'public' ? 'an instance of PublicKeyObject' : 'an instance of PrivateKeyObject';
+  }
+
   function importKey(want) {
     return function (key) {
       if (key === undefined || key === null) throw invalidArgType('key', 'a string, Buffer, TypedArray, DataView or JsonWebKey', key);
+      /* A {key, format, type, passphrase} wrapper: Node's own callers pass the material inside it. */
+      var given = key;
+      var type = undefined;
+      var passphrase = undefined;
+      if (typeof key === 'object' && key !== null && Object.prototype.hasOwnProperty.call(key, 'key')) {
+        given = key.key;
+        type = key.type;
+        passphrase = key.passphrase;
+      } else if (typeof key === 'object' && key !== null && key.format === 'jwk' && key.key !== undefined) {
+        given = key.key;
+      }
+      /* A KeyObject is accepted only as the source of a public key: Node derives the public half. */
+      if (isKeyObject(given)) {
+        var state = keyStateOf(given, 'key');
+        if (want !== 'public') {
+          var err = new TypeError('The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' + asReceived(given));
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+        if (state.type !== 'private') {
+          var wrong = new Error('Invalid key object type ' + state.type + ', expected private.');
+          wrong.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
+          throw wrong;
+        }
+        return new KeyObject('public', undefined, callCap('crypto.key.public', { id: state.id }).id);
+      }
       var jwk = undefined;
       var bytes = undefined;
-      /* A JWK reaches this either bare or as the {key, format} wrapper Node's own callers use. */
-      var given = key !== null && typeof key === 'object' && key.format === 'jwk' ? key.key : key;
       if (given !== null && typeof given === 'object' && !(given instanceof Buf) && !ArrayBuffer.isView(given) && !(given instanceof ArrayBuffer)) {
         if (typeof given.kty !== 'string') throw invalidArgType('key', 'a string, Buffer, TypedArray, DataView or JsonWebKey', key);
         jwk = given;
       } else {
         bytes = toBytes(given, undefined, 'key').toString('base64');
       }
-      var opened = callCap('crypto.key.import', { want: want, jwk: jwk, bytes: bytes });
+      var opened = callCap('crypto.key.import', { want: want, jwk: jwk, bytes: bytes, type: type, passphrase: passphrase === undefined ? undefined : String(passphrase) });
       return new KeyObject(want, undefined, opened.id);
     };
+  }
+
+  /* Any key form -- KeyObject, PEM, DER, JWK or a {key, ...} wrapper -- as a handle the host signs with. */
+  function keyIdOf(key, want) {
+    /* A {key, dsaEncoding} wrapper around a KeyObject: the encoding rides along, the key is inside. */
+    if (key !== null && typeof key === 'object' && !isKeyObject(key) && Object.prototype.hasOwnProperty.call(key, 'key')) {
+      var inner = keyStateOf(key.key, 'key');
+      if (inner !== undefined) {
+        if (inner.id === undefined) throw invalidArgType('key', 'an instance of KeyObject', key.key);
+        if (want === 'public' && inner.type === 'private') return callCap('crypto.key.public', { id: inner.id }).id;
+        return inner.id;
+      }
+    }
+    var state = keyStateOf(key, 'key');
+    if (state !== undefined) {
+      if (state.id === undefined) throw invalidArgType('key', 'an instance of KeyObject', key);
+      if (want === 'public' && state.type === 'private') return callCap('crypto.key.public', { id: state.id }).id;
+      return state.id;
+    }
+    return keyStateOf(importKey(want)(key), 'key').id;
   }
 
   var createPublicKey = importKey('public');
@@ -2150,6 +2236,7 @@ BF.crypto = function () {
   function Sign(algorithm) {
     /* createSign names a digest: Node rejects null, which is what crypto.sign() takes instead. */
     if (typeof algorithm !== 'string') throw invalidArgType('algorithm', 'of type string', algorithm);
+    if (!digestKnown(algorithm)) throw invalidDigest(undefined);
     this._algorithm = String(algorithm);
     this._chunks = [];
   }
@@ -2158,14 +2245,11 @@ BF.crypto = function () {
     return this;
   };
   Sign.prototype.sign = function (privateKey, encoding) {
-    var state = keyStateOf(privateKey, 'key');
-    if (state === undefined || state.id === undefined) {
-      throw invalidArgType('privateKey', 'an instance of KeyObject', privateKey);
-    }
     var signature = callCap('crypto.key.sign', {
-      id: state.id,
+      id: keyIdOf(privateKey, 'private'),
       algorithm: this._algorithm,
-      data: Buf.concat(this._chunks).toString('base64')
+      data: Buf.concat(this._chunks).toString('base64'),
+      dsaEncoding: privateKey !== null && typeof privateKey === 'object' ? privateKey.dsaEncoding : undefined
     });
     return outputOf(Buf.from(signature, 'base64'), encoding);
   };
@@ -2181,12 +2265,8 @@ BF.crypto = function () {
     return this;
   };
   Verify.prototype.verify = function (publicKey, signature, encoding) {
-    var state = keyStateOf(publicKey, 'key');
-    if (state === undefined || state.id === undefined) {
-      throw invalidArgType('publicKey', 'an instance of KeyObject', publicKey);
-    }
     return callCap('crypto.key.verify', {
-      id: state.id,
+      id: keyIdOf(publicKey, 'public'),
       algorithm: this._algorithm,
       data: Buf.concat(this._chunks).toString('base64'),
       signature: toBytes(signature, encoding, 'signature').toString('base64')
@@ -2204,12 +2284,11 @@ BF.crypto = function () {
 
   /* sign and verify without a streaming object: one call over the same capability. */
   function signOne(algorithm, data, key, callback) {
-    var state = keyStateOf(key, 'key');
-    if (state === undefined) throw invalidArgType('key', 'an instance of KeyObject', key);
     var signature = Buf.from(callCap('crypto.key.sign', {
-      id: state.id,
+      id: keyIdOf(key, 'private'),
       algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
-      data: toBytes(data, undefined, 'data').toString('base64')
+      data: toBytes(data, undefined, 'data').toString('base64'),
+      dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined
     }), 'base64');
     if (typeof callback === 'function') {
       queueMicrotask(function () { callback(null, signature); });
@@ -2219,10 +2298,8 @@ BF.crypto = function () {
   }
 
   function verifyOne(algorithm, data, key, signature, callback) {
-    var state = keyStateOf(key, 'key');
-    if (state === undefined) throw invalidArgType('key', 'an instance of KeyObject', key);
     var answer = callCap('crypto.key.verify', {
-      id: state.id,
+      id: keyIdOf(key, 'public'),
       algorithm: algorithm === undefined || algorithm === null ? null : String(algorithm),
       data: toBytes(data, undefined, 'data').toString('base64'),
       signature: toBytes(signature, undefined, 'signature').toString('base64')
@@ -2325,6 +2402,17 @@ BF.crypto = function () {
   /* diffieHellman({prime, privateKey, publicKey}): the shared secret with no object to keep. */
   function diffieHellman(options) {
     var opts = options === undefined || options === null ? {} : options;
+    /*
+     * Two key objects mean ECDH -- X25519, X448 or an EC curve -- which has no prime at all; the
+     * classic form takes a prime and two raw exponents.
+     */
+    var privState = keyStateOf(opts.privateKey, 'key');
+    var pubState = keyStateOf(opts.publicKey, 'key');
+    if (privState !== undefined || pubState !== undefined) {
+      var privId = privState === undefined ? keyIdOf(opts.privateKey, 'private') : privState.id;
+      var pubId = pubState === undefined ? keyIdOf(opts.publicKey, 'public') : pubState.id;
+      return Buf.from(callCap('crypto.dh.ecdh', { private: privId, public: pubId }), 'base64');
+    }
     return Buf.from(callCap('crypto.dh.compute', {
       prime: toBytes(opts.prime, opts.primeEncoding, 'prime').toString('base64'),
       private: toBytes(opts.privateKey, opts.privateKeyEncoding, 'privateKey').toString('base64'),
@@ -2353,11 +2441,21 @@ BF.crypto = function () {
       sealed.code = 'ERR_CRYPTO_HASH_FINALIZED';
       throw sealed;
     }
-    this._chunks.push(toBytes(data, encoding, 'data'));
+    /* Node reads an encoding it does not know as utf8 rather than refusing it. */
+    var bytes;
+    try {
+      bytes = toBytes(data, encoding, 'data');
+    } catch (unknown) {
+      if (typeof encoding !== 'string' || String(unknown && unknown.message).indexOf('Unknown encoding') !== 0) throw unknown;
+      bytes = toBytes(data, 'utf8', 'data');
+    }
+    this._chunks.push(bytes);
     return this;
   };
   Hash.prototype.digest = function (encoding) {
     if (this._finished) {
+      /* Node's Hmac answers empty on a second digest where a Hash refuses: the two really differ. */
+      if (this._key !== undefined) return outputOf(Buf.alloc(0), encoding);
       var again = new Error('Digest already called');
       again.code = 'ERR_CRYPTO_HASH_FINALIZED';
       throw again;
@@ -2375,11 +2473,20 @@ BF.crypto = function () {
     return copy;
   };
 
-  /* Only shake128 and shake256 read outputLength: they are the two extensible-output digests. */
+  /*
+   * Only shake128 and shake256 read outputLength: they are the two extensible-output digests.
+   * Node bounds it the same way it bounds any length, and accepts 0, which digests to nothing.
+   */
   function outputLengthOf(options) {
-    return options !== undefined && options !== null && options.outputLength !== undefined
-      ? Number(options.outputLength)
-      : undefined;
+    var given = options === undefined || options === null ? undefined : options.outputLength;
+    if (given === undefined) return undefined;
+    if (typeof given !== 'number') {
+      var bad = new TypeError('The "options.outputLength" property must be of type number. Received type ' + typeof given + " ('" + String(given) + "')");
+      bad.code = 'ERR_INVALID_ARG_TYPE';
+      throw bad;
+    }
+    if (!(given >= 0 && given <= 4294967295)) throw outOfRange('options.outputLength', '>= 0 && <= 4294967295', given);
+    return given;
   }
 
   function createHash(algorithm, options) {
@@ -2403,12 +2510,24 @@ BF.crypto = function () {
   }
 
   function pbkdf2Sync(password, salt, iterations, keylen, digest) {
+    /* Node names the digest every time: there is no default, and an iteration count starts at 1. */
+    if (typeof digest !== 'string') throw invalidArgType('digest', 'of type string', digest);
+    if (!digestKnown(digest)) throw invalidDigest(digest);
+    if (typeof iterations !== 'number') throw invalidArgType('iterations', 'of type number', iterations);
+    if (typeof keylen !== 'number') throw invalidArgType('keylen', 'of type number', keylen);
+    if (!(iterations >= 1 && iterations <= 2147483647)) {
+      throw outOfRange('iterations', '>= 1 && <= 2147483647', iterations);
+    }
+    var len = keylen;
+    if (!(len >= 0 && len <= 2147483647)) throw outOfRange('keylen', '>= 0 && <= 2147483647', keylen);
+    /* A zero-length derivation is in range but produces nothing, which OpenSSL reports as a failure. */
+    if (len === 0) throw new Error('Deriving bits failed');
     var out = callCap('crypto.pbkdf2', {
-      digest: digest === undefined ? 'sha1' : String(digest),
+      digest: String(digest),
       password: toBytes(password, undefined, 'password').toString('base64'),
       salt: toBytes(salt, undefined, 'salt').toString('base64'),
-      iterations: Number(iterations),
-      keylen: Number(keylen)
+      iterations: iterations,
+      keylen: len
     });
     return Buf.from(out, 'base64');
   }
@@ -2454,16 +2573,46 @@ BF.crypto = function () {
   }
 
   /*
+   * getCurves is the curve directory OpenSSL ships, not the set this runtime can use: Node answers
+   * all 82 names and then fails when a caller asks for a curve it has no arithmetic for, and so does
+   * this. Only the four under EC_CURVES (plus ed25519/ed448/x25519/x448) actually generate or sign.
+   */
+  var CURVE_NAMES = [
+        'Oakley-EC2N-3', 'Oakley-EC2N-4', 'SM2', 'brainpoolP160r1', 'brainpoolP160t1',
+        'brainpoolP192r1', 'brainpoolP192t1', 'brainpoolP224r1', 'brainpoolP224t1', 'brainpoolP256r1',
+        'brainpoolP256t1', 'brainpoolP320r1', 'brainpoolP320t1', 'brainpoolP384r1', 'brainpoolP384t1',
+        'brainpoolP512r1', 'brainpoolP512t1', 'c2pnb163v1', 'c2pnb163v2', 'c2pnb163v3', 'c2pnb176v1',
+        'c2pnb208w1', 'c2pnb272w1', 'c2pnb304w1', 'c2pnb368w1', 'c2tnb191v1', 'c2tnb191v2',
+        'c2tnb191v3', 'c2tnb239v1', 'c2tnb239v2', 'c2tnb239v3', 'c2tnb359v1', 'c2tnb431r1',
+        'prime192v1', 'prime192v2', 'prime192v3', 'prime239v1', 'prime239v2', 'prime239v3',
+        'prime256v1', 'secp112r1', 'secp112r2', 'secp128r1', 'secp128r2', 'secp160k1', 'secp160r1',
+        'secp160r2', 'secp192k1', 'secp224k1', 'secp224r1', 'secp256k1', 'secp384r1', 'secp521r1',
+        'sect113r1', 'sect113r2', 'sect131r1', 'sect131r2', 'sect163k1', 'sect163r1', 'sect163r2',
+        'sect193r1', 'sect193r2', 'sect233k1', 'sect233r1', 'sect239k1', 'sect283k1', 'sect283r1',
+        'sect409k1', 'sect409r1', 'sect571k1', 'sect571r1', 'wap-wsg-idm-ecid-wtls1',
+        'wap-wsg-idm-ecid-wtls10', 'wap-wsg-idm-ecid-wtls11', 'wap-wsg-idm-ecid-wtls12',
+        'wap-wsg-idm-ecid-wtls3', 'wap-wsg-idm-ecid-wtls4', 'wap-wsg-idm-ecid-wtls5',
+        'wap-wsg-idm-ecid-wtls6', 'wap-wsg-idm-ecid-wtls7', 'wap-wsg-idm-ecid-wtls8',
+        'wap-wsg-idm-ecid-wtls9'
+  ];
+
+  function getCurves() {
+    return CURVE_NAMES.slice();
+  }
+
+  /*
    * scrypt. Node derives on its thread pool and hands the key to a callback; here the derivation
    * is one synchronous host call and the callback still runs on a later microtask, so a caller
    * that awaits it behaves the same either way.
    */
   function scryptSync(password, salt, keylen, options) {
     var opts = options === undefined || options === null ? {} : options;
+    var len = Number(keylen);
+    if (!(len >= 0 && len <= 2147483647)) throw outOfRange('keylen', '>= 0 && <= 2147483647', keylen);
     var out = callCap('crypto.scrypt', {
       password: toBytes(password, undefined, 'password').toString('base64'),
       salt: toBytes(salt, undefined, 'salt').toString('base64'),
-      keylen: Number(keylen),
+      keylen: len,
       N: opts.N === undefined ? undefined : Number(opts.N),
       r: opts.r === undefined ? undefined : Number(opts.r),
       p: opts.p === undefined ? undefined : Number(opts.p),
@@ -2489,10 +2638,20 @@ BF.crypto = function () {
    * so the bytes the host answers with are copied into one here.
    */
   function hkdfSync(digest, key, salt, info, keylen) {
+    /* Node requires a salt and bounds the key length by the hash's own block budget. */
+    if (salt === undefined || salt === null) {
+      throw invalidArgType('salt', 'of type string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer', salt);
+    }
+    if (!(Number(keylen) >= 1 && Number(keylen) <= 8160)) {
+      if (Number(keylen) === 0) throw new Error('Deriving bits failed');
+      var long = new Error('Invalid key length');
+      long.code = 'ERR_CRYPTO_INVALID_KEYLEN';
+      throw long;
+    }
     var out = callCap('crypto.hkdf', {
       algorithm: String(digest),
       ikm: toBytes(key, undefined, 'key').toString('base64'),
-      salt: salt === undefined || salt === null ? undefined : toBytes(salt, undefined, 'salt').toString('base64'),
+      salt: toBytes(salt, undefined, 'salt').toString('base64'),
       info: info === undefined || info === null ? undefined : toBytes(info, undefined, 'info').toString('base64'),
       keylen: Number(keylen)
     });
@@ -2736,6 +2895,57 @@ BF.crypto = function () {
     };
   }
 
+  /*
+   * Primality. A candidate is a Buffer, a TypedArray or a BigInt, and Node answers a Buffer from
+   * generatePrime unless the caller asks for the BigInt it searched with.
+   */
+  function checkPrimeSync(candidate, options) {
+    var isBig = typeof candidate === 'bigint';
+    return callCap('crypto.checkPrime', {
+      value: isBig ? String(candidate) : toBytes(candidate, undefined, 'candidate').toString('base64'),
+      valueIsBigInt: isBig,
+      checks: options === undefined || options === null ? undefined : Number(options.checks)
+    }).prime;
+  }
+
+  function checkPrime(candidate, options, callback) {
+    var done = callback;
+    var opts = options;
+    if (typeof options === 'function') {
+      done = options;
+      opts = undefined;
+    }
+    if (typeof done !== 'function') throw invalidArgType('callback', 'of type function', done);
+    var answer = checkPrimeSync(candidate, opts);
+    queueMicrotask(function () { done(null, answer); });
+  }
+
+  function generatePrimeSync(primeLength, options) {
+    var result = callCap('crypto.generatePrime', {
+      bits: Number(primeLength),
+      safe: options !== undefined && options !== null && options.safe === true,
+      bigint: options !== undefined && options !== null && options.bigint === true
+    });
+    if (options !== undefined && options !== null && options.bigint === true) return BigInt(result.value);
+    /* Node answers an ArrayBuffer, the way hkdf does: a prime is bytes, not text. */
+    var bytes = Buf.from(result.bytes, 'base64');
+    var buffer = new ArrayBuffer(bytes.length);
+    new Uint8Array(buffer).set(bytes);
+    return buffer;
+  }
+
+  function generatePrime(primeLength, options, callback) {
+    var done = callback;
+    var opts = options;
+    if (typeof options === 'function') {
+      done = options;
+      opts = undefined;
+    }
+    if (typeof done !== 'function') throw invalidArgType('callback', 'of type function', done);
+    var prime = generatePrimeSync(primeLength, opts);
+    queueMicrotask(function () { done(null, prime); });
+  }
+
   return {
     randomBytes: randomBytes,
     randomUUID: randomUUID,
@@ -2754,6 +2964,7 @@ BF.crypto = function () {
     hkdfSync: hkdfSync,
     timingSafeEqual: timingSafeEqual,
     getHashes: getHashes,
+    getCurves: getCurves,
     KeyObject: KeyObject,
     createSecretKey: createSecretKey,
     createPublicKey: createPublicKey,
@@ -2788,10 +2999,10 @@ BF.crypto = function () {
     publicEncrypt: unavailable('publicEncrypt'),
     privateEncrypt: unavailable('privateEncrypt'),
     publicDecrypt: unavailable('publicDecrypt'),
-    checkPrime: unavailable('checkPrime'),
-    checkPrimeSync: unavailable('checkPrimeSync'),
-    generatePrime: unavailable('generatePrime'),
-    generatePrimeSync: unavailable('generatePrimeSync')
+    checkPrime: checkPrime,
+    checkPrimeSync: checkPrimeSync,
+    generatePrime: generatePrime,
+    generatePrimeSync: generatePrimeSync
   };
 };
 
