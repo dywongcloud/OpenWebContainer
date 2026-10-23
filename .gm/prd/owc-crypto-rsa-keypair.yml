@@ -1,5 +1,5 @@
 id: owc-crypto-rsa-keypair
-title: 'RESOLVED: generateKeyPairSync('rsa'|'rsa-pss'|'dsa'|'dh') now answers real keys here, with sign, verify, export, import and agreement'
+title: 'RESOLVED: generateKeyPairSync for rsa, rsa-pss, dsa and dh now answers real keys, with sign, verify, export, import and agreement'
 classification: GUEST
 owner: adv5-exec-crypto
 session_id: adv5-exec-crypto

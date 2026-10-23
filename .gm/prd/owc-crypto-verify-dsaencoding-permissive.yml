@@ -1,5 +1,5 @@
 id: owc-crypto-verify-dsaencoding-permissive
-title: 'RESOLVED: verify with the default 'der' dsaEncoding now rejects an ieee-p1363 signature'
+title: 'RESOLVED: verify with the default der dsaEncoding now rejects an ieee-p1363 signature'
 session_id: adv5-judge-crypto-4
 owner: adv5-judge-crypto-4
 classification: GUEST
