@@ -4166,8 +4166,18 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
     /* The digest is taken outside the catch: an XOF has no width to sign or check against, and
        that is a refusal Node raises -- 'invalid digest' -- not a signature that fails to check. */
     const digest = noDigestBytes(data, algorithm);
+    /*
+     * A Verify object parses the signature in the encoding it was asked for, and a pair that is
+     * not exactly two coordinates wide is not an 'ieee-p1363' pair at all, so Node refuses it
+     * with 'Malformed signature' instead of answering false -- the one throw in a verify that
+     * otherwise only ever answers a boolean. The one-shot crypto.verify answers false for the
+     * very same pair, which is the asymmetry the fromVerify flag exists to carry, and a 'der'
+     * parse is never malformed: an unparseable SEQUENCE is simply false.
+     */
+    if (fromVerify === true && encoding === 'ieee-p1363' && signature.length !== curve.size * 2) {
+        throw keyFail('ERR_CRYPTO_OPERATION_FAILED', 'Malformed signature');
+    }
     try {
-        const digest = noDigestBytes(data, algorithm);
         /*
          * Node parses the signature in the encoding it was asked for, and @noble would accept
          * either: a 64-byte r||s pair is not a DER SEQUENCE and a DER SEQUENCE is not 64 bytes,

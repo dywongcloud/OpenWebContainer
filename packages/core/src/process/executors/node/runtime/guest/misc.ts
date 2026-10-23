@@ -3093,13 +3093,21 @@ BF.crypto = function () {
     /*
      * A secret key is a KeyObject with no asymmetric half in it, and it has no id to reach the
      * host with, so Node's own answer -- it names the type it wanted -- is given here rather
-     * than the 'must be an instance of KeyObject' a missing id would otherwise produce.
+     * than the 'must be an instance of KeyObject' a missing id would otherwise produce. Node
+     * reads the private key first and asks it for the one type it accepts; the public slot takes
+     * either asymmetric type, and says so.
      */
     var privateState = keyStateOf(opts.privateKey, 'key');
     if (privateState !== undefined && privateState.type === 'secret') {
       var wrong = new TypeError('Invalid key object type secret, expected private.');
       wrong.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
       throw wrong;
+    }
+    var publicState = keyStateOf(opts.publicKey, 'key');
+    if (publicState !== undefined && publicState.type === 'secret') {
+      var bad = new TypeError('Invalid key object type secret, expected private or public.');
+      bad.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
+      throw bad;
     }
     return Buf.from(cryptoCap('crypto.dh.ecdh', {
       private: keyIdOf(opts.privateKey, 'private'),
