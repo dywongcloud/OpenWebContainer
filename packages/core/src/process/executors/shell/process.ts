@@ -224,10 +224,14 @@ const SCRIPT_FIRST_COMMANDS = new Set(['awk', 'egrep', 'fgrep', 'grep', 'sed']);
  */
 function sleepMsOf(text: string): number | null {
     const words = splitCommandLine(text);
-    if (words.length < 2 || words[0] !== 'sleep') return null;
+    /* `exec` runs the command behind it in the shell's own place, so the wait is the shell's --
+       `exec sleep 3` under a caller's `timeout` is ended by that bound on a host, where the command
+       is the process the bound kills, and not by a sleep that outruns it. */
+    const command = words[0] === 'exec' ? words.slice(1) : words;
+    if (command.length < 2 || command[0] !== 'sleep') return null;
     const units: Record<string, number> = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
     let total = 0;
-    for (const word of words.slice(1)) {
+    for (const word of command.slice(1)) {
         const match = /^([+]?[0-9]*\.?[0-9]+)([smhd]?)$/.exec(word);
         if (match === null) return null;
         const value = Number(match[1]);
@@ -886,6 +890,15 @@ export class ShellProcess extends Process {
         if (ms === null) return this.shell.executeLine(text, input);
         const left = this.killDeadlineAt - Date.now();
         if (left > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(ms, left)));
+        /* An `exec` that was given its whole wait replaced the shell with the command it named, the
+           way it does on a host, so the rest of the line stands behind a command that is no longer
+           there: `sh -c 'exec sleep 1; echo AFTER'` under a `timeout` of 4 s prints nothing and
+           exits 0 at 1 s. A wait the bound cut short is the other case, and there the bound is what
+           ends the line -- and the process -- rather than an `exec` that never ran out. */
+        if (ms <= left && firstWordOf(text) === 'exec') {
+            this.shell.stopped = true;
+            this.shell.stoppedCode = 0;
+        }
         return { stdout: '', stderr: '', exitCode: 0 };
     }
 

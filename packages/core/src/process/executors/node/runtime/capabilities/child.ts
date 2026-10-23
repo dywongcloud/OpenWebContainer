@@ -3492,10 +3492,16 @@ function ended(stderr: string): string {
  * to the utility, which is what prints its own diagnostic for it.
  */
 function sleepMsOfWords(words: string[]): number | null {
-    if (words.length < 2 || words[0] !== 'sleep') return null;
+    /* `exec` runs the command behind it in the shell's own place, so the wait is the shell's: an
+       `exec sleep 3` a caller bounded at 400 ms has to be ended by that bound and not sit out the
+       whole three seconds, which is what a host does -- its `sh` is replaced by `sleep`, and that
+       is the process the bound kills. A wait that fits inside the bound is left to the utility,
+       which is what carries `exec`'s own ending of the line. */
+    const command = words[0] === 'exec' ? words.slice(1) : words;
+    if (command.length < 2 || command[0] !== 'sleep') return null;
     const units: Record<string, number> = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
     let total = 0;
-    for (const word of words.slice(1)) {
+    for (const word of command.slice(1)) {
         const match = /^([+]?[0-9]*\.?[0-9]+)([smhd]?)$/.exec(word);
         if (match === null) return null;
         const value = Number(match[1]);
