@@ -394,8 +394,24 @@ function affineImage(image: Image, hscale: number, vscale: number, kernelName: s
        off the edge, and hands the interpolator a coordinate inside it. */
     const pad = nearest || bilinear ? 1 : 2;
     const id = nearest ? 0 : 0.5;
-    const iax = 1 / hscale;
-    const iay = 1 / vscale;
+    /*
+     * The inverse of the scale matrix, the way libvips inverts it. vips__transform_calc_inverse
+     * (resample/transform.c) does not take 1/hscale and 1/vscale: it takes the determinant of
+     * [[hscale, 0], [0, vscale]], inverts that, and multiplies the adjugate by it, so
+     *
+     *     ia = (1 / (hscale * vscale)) * vscale        id = (1 / (hscale * vscale)) * hscale
+     *
+     * and the last bit of those two products is not the last bit of 1/hscale and 1/vscale. Which
+     * pixel a position lands on turns on exactly that bit, and the two axes are not independent:
+     * a 40x30 -> 200x200 `fill` (scale 5 x 6.6667) and a `cover` (6.6667 x 6.6667) shrink their
+     * rows by the same 0.15 in exact arithmetic but not in this one -- measured against sharp
+     * 0.33.5, source row 3 starts at output row 20 under `fill` and 21 under `cover`, and 1.0/0.15
+     * gives 21 for both.
+     */
+    const det = hscale * vscale;
+    const inverse = 1 / det;
+    const iax = inverse * vscale;
+    const iay = inverse * hscale;
     const clamp = (i: number, size: number): number => (i < 0 ? 0 : i >= size ? size - 1 : i);
     for (let dy = 0; dy < out.height; dy++) {
         const y = dy * iay - id + pad;

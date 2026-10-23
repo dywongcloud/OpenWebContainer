@@ -80,8 +80,8 @@ function dct1d(
   }
 }
 
-/* one dimensional inverse DCT (A is not symmetric, so this is A transposed):
- *   dst[dstOff + x*dstStep] = sum_u A[u][x] * src[srcOff + u*srcStep]      */
+/* one dimensional inverse DCT, kept only for the doc note above: the decoder
+ * runs libjpeg's jpeg_idct_islow (further down), not this. */
 function idct1d(
   src: Float32Array,
   srcOff: number,
@@ -94,6 +94,241 @@ function idct1d(
     let s = 0;
     for (let u = 0; u < 8; u++) s += DCT_A[u * 8 + x] * src[srcOff + u * srcStep];
     dst[dstOff + x * dstStep] = s;
+  }
+}
+
+/* ------------------------------------------------------------------ libjpeg's jpeg_idct_islow
+ *
+ * The decoder above inverts the DCT in floating point; libjpeg does not. Its
+ * baseline decoder runs jidctint.c's `jpeg_idct_islow`, the scaled fixed-point
+ * Loeffler-Ligtenberg-Moschytz IDCT: CONST_BITS 13 for the fractional constants,
+ * PASS1_BITS 2 for the intermediate, a descaling right shift with half a step
+ * added for rounding, and the sample range limit table that both clamps and puts
+ * the 128 level shift back. Every one of those is a different rounding from the
+ * float transform's, which is why a decoded jpeg's pixels came out a count off
+ * libjpeg's -- 474 of 12288 bytes on a 64x64 RGB jpeg, each by 1 or 2.
+ *
+ * The constants are the precalculated FIX() values at CONST_BITS == 13, so this
+ * is the C, arithmetic for arithmetic, not an approximation of it.
+ */
+const CONST_BITS = 13;
+const PASS1_BITS = 2;
+const FIX_0_298631336 = 2446;
+const FIX_0_390180644 = 3196;
+const FIX_0_541196100 = 4433;
+const FIX_0_765366865 = 6270;
+const FIX_0_899976223 = 7373;
+const FIX_1_175875602 = 9633;
+const FIX_1_501321110 = 12299;
+const FIX_1_847759065 = 15137;
+const FIX_1_961570560 = 16069;
+const FIX_2_053119869 = 16819;
+const FIX_2_562915447 = 20995;
+const FIX_3_072711026 = 25172;
+const IDCT_WS = new Int32Array(64);
+
+/* libjpeg's DESCALE: add half a step, then shift it off. The shift is C's
+   arithmetic right shift, which is a floor. */
+function descale(x: number, n: number): number {
+  return Math.floor((x + (1 << (n - 1))) / (1 << n));
+}
+
+/*
+ * libjpeg's sample_range_limit, which `IDCT_range_limit` points into at
+ * CENTERJSAMPLE: table[i] is i clamped to 0..255, and the offset puts the 128
+ * level shift back, so an index of the signed sample gives the unsigned one.
+ * The caller masks the index with RANGE_MASK (1023) first, which is what makes a
+ * very negative sample read the trailing zeros rather than the 255 plateau --
+ * but a sample that far out of range cannot come out of a valid block, so a
+ * plain clamp on the sum is the same answer over the whole reachable range.
+ */
+function rangeLimit(sample: number): number {
+  const v = sample + 128;
+  return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
+/*
+ * Dequantize and inverse DCT one 8x8 block. `coef` holds the 64 already
+ * dequantized coefficients in natural (row major) order, which is what libjpeg
+ * multiplies inside its own DEQUANTIZE; the two are the same because a
+ * quantisation table entry is never zero. `out` receives the 64 samples.
+ */
+function idctIslow(coef: Float32Array, out: Float32Array): void {
+  const ws = IDCT_WS;
+  for (let col = 0; col < 8; col++) {
+    const c0 = coef[col];
+    const c1 = coef[8 + col];
+    const c2 = coef[16 + col];
+    const c3 = coef[24 + col];
+    const c4 = coef[32 + col];
+    const c5 = coef[40 + col];
+    const c6 = coef[48 + col];
+    const c7 = coef[56 + col];
+    /* libjpeg's shortcut for a column of nothing but DC: every output is the
+       DC value, and it is not the same arithmetic the general path would run. */
+    if (c1 === 0 && c2 === 0 && c3 === 0 && c4 === 0 && c5 === 0 && c6 === 0 && c7 === 0) {
+      const dcval = c0 << PASS1_BITS;
+      ws[col] = dcval;
+      ws[8 + col] = dcval;
+      ws[16 + col] = dcval;
+      ws[24 + col] = dcval;
+      ws[32 + col] = dcval;
+      ws[40 + col] = dcval;
+      ws[48 + col] = dcval;
+      ws[56 + col] = dcval;
+      continue;
+    }
+    let z1: number;
+    let z2: number;
+    let z3: number;
+    let z4: number;
+    let z5: number;
+    let t0: number;
+    let t1: number;
+    let t2: number;
+    let t3: number;
+    let t10: number;
+    let t11: number;
+    let t12: number;
+    let t13: number;
+
+    z2 = c2;
+    z3 = c6;
+    z1 = (z2 + z3) * FIX_0_541196100;
+    t2 = z1 + z3 * -FIX_1_847759065;
+    t3 = z1 + z2 * FIX_0_765366865;
+
+    z2 = c0;
+    z3 = c4;
+    t0 = (z2 + z3) << CONST_BITS;
+    t1 = (z2 - z3) << CONST_BITS;
+
+    t10 = t0 + t3;
+    t13 = t0 - t3;
+    t11 = t1 + t2;
+    t12 = t1 - t2;
+
+    t0 = c7;
+    t1 = c5;
+    t2 = c3;
+    t3 = c1;
+
+    z1 = t0 + t3;
+    z2 = t1 + t2;
+    z3 = t0 + t2;
+    z4 = t1 + t3;
+    z5 = (z3 + z4) * FIX_1_175875602;
+
+    t0 = t0 * FIX_0_298631336;
+    t1 = t1 * FIX_2_053119869;
+    t2 = t2 * FIX_3_072711026;
+    t3 = t3 * FIX_1_501321110;
+    z1 = z1 * -FIX_0_899976223;
+    z2 = z2 * -FIX_2_562915447;
+    z3 = z3 * -FIX_1_961570560;
+    z4 = z4 * -FIX_0_390180644;
+
+    z3 += z5;
+    z4 += z5;
+
+    t0 += z1 + z3;
+    t1 += z2 + z4;
+    t2 += z2 + z3;
+    t3 += z1 + z4;
+
+    ws[col] = descale(t10 + t3, CONST_BITS - PASS1_BITS);
+    ws[56 + col] = descale(t10 - t3, CONST_BITS - PASS1_BITS);
+    ws[8 + col] = descale(t11 + t2, CONST_BITS - PASS1_BITS);
+    ws[48 + col] = descale(t11 - t2, CONST_BITS - PASS1_BITS);
+    ws[16 + col] = descale(t12 + t1, CONST_BITS - PASS1_BITS);
+    ws[40 + col] = descale(t12 - t1, CONST_BITS - PASS1_BITS);
+    ws[24 + col] = descale(t13 + t0, CONST_BITS - PASS1_BITS);
+    ws[32 + col] = descale(t13 - t0, CONST_BITS - PASS1_BITS);
+  }
+
+  for (let row = 0; row < 8; row++) {
+    const b = row * 8;
+    /* The same shortcut for a row of nothing but DC. */
+    if (
+      ws[b + 1] === 0 && ws[b + 2] === 0 && ws[b + 3] === 0 &&
+      ws[b + 4] === 0 && ws[b + 5] === 0 && ws[b + 6] === 0 && ws[b + 7] === 0
+    ) {
+      const dcval = rangeLimit(descale(ws[b], PASS1_BITS + 3));
+      out[b] = dcval;
+      out[b + 1] = dcval;
+      out[b + 2] = dcval;
+      out[b + 3] = dcval;
+      out[b + 4] = dcval;
+      out[b + 5] = dcval;
+      out[b + 6] = dcval;
+      out[b + 7] = dcval;
+      continue;
+    }
+    let z1: number;
+    let z2: number;
+    let z3: number;
+    let z4: number;
+    let z5: number;
+    let t0: number;
+    let t1: number;
+    let t2: number;
+    let t3: number;
+    let t10: number;
+    let t11: number;
+    let t12: number;
+    let t13: number;
+
+    z2 = ws[b + 2];
+    z3 = ws[b + 6];
+
+    z1 = (z2 + z3) * FIX_0_541196100;
+    t2 = z1 + z3 * -FIX_1_847759065;
+    t3 = z1 + z2 * FIX_0_765366865;
+
+    t0 = (ws[b] + ws[b + 4]) << CONST_BITS;
+    t1 = (ws[b] - ws[b + 4]) << CONST_BITS;
+
+    t10 = t0 + t3;
+    t13 = t0 - t3;
+    t11 = t1 + t2;
+    t12 = t1 - t2;
+
+    t0 = ws[b + 7];
+    t1 = ws[b + 5];
+    t2 = ws[b + 3];
+    t3 = ws[b + 1];
+
+    z1 = t0 + t3;
+    z2 = t1 + t2;
+    z3 = t0 + t2;
+    z4 = t1 + t3;
+    z5 = (z3 + z4) * FIX_1_175875602;
+
+    t0 = t0 * FIX_0_298631336;
+    t1 = t1 * FIX_2_053119869;
+    t2 = t2 * FIX_3_072711026;
+    t3 = t3 * FIX_1_501321110;
+    z1 = z1 * -FIX_0_899976223;
+    z2 = z2 * -FIX_2_562915447;
+    z3 = z3 * -FIX_1_961570560;
+    z4 = z4 * -FIX_0_390180644;
+
+    z3 += z5;
+    z4 += z5;
+
+    t0 += z1 + z3;
+    t1 += z2 + z4;
+    t2 += z2 + z3;
+    t3 += z1 + z4;
+
+    out[b] = rangeLimit(descale(t10 + t3, CONST_BITS + PASS1_BITS + 3));
+    out[b + 7] = rangeLimit(descale(t10 - t3, CONST_BITS + PASS1_BITS + 3));
+    out[b + 1] = rangeLimit(descale(t11 + t2, CONST_BITS + PASS1_BITS + 3));
+    out[b + 6] = rangeLimit(descale(t11 - t2, CONST_BITS + PASS1_BITS + 3));
+    out[b + 2] = rangeLimit(descale(t12 + t1, CONST_BITS + PASS1_BITS + 3));
+    out[b + 5] = rangeLimit(descale(t12 - t1, CONST_BITS + PASS1_BITS + 3));
+    out[b + 3] = rangeLimit(descale(t13 + t0, CONST_BITS + PASS1_BITS + 3));
+    out[b + 4] = rangeLimit(descale(t13 - t0, CONST_BITS + PASS1_BITS + 3));
   }
 }
 
@@ -839,7 +1074,6 @@ export function decodeJpeg(
 
   const br = new BitReader(bytes, scanStart);
   const coef = new Float32Array(64);
-  const tmp = new Float32Array(64);
   const outb = new Float32Array(64);
 
   let mcusDone = 0;
@@ -914,13 +1148,12 @@ export function decodeJpeg(
               k++;
             }
 
-            /* inverse DCT: coef[v*8+u] -> outb[y*8+x] */
-            for (let u = 0; u < 8; u++) {
-              idct1d(coef, u, 8, tmp, u * 8, 1);
-            }
-            for (let yy = 0; yy < 8; yy++) {
-              idct1d(tmp, yy, 8, outb, yy * 8, 1);
-            }
+            /*
+             * libjpeg's jpeg_idct_islow, not the float transform: the samples
+             * it writes are already clamped and level shifted, so the +128.5
+             * the float path needed is gone.
+             */
+            idctIslow(coef, outb);
 
             const blockX = (mx * c.h + bx) * 8;
             const blockY = (my * c.v + by) * 8;
@@ -928,8 +1161,7 @@ export function decodeJpeg(
               let o = (blockY + yy) * c.planeW + blockX;
               const src = yy * 8;
               for (let xx = 0; xx < 8; xx++) {
-                const v = outb[src + xx] + 128.5;
-                c.plane[o++] = v < 0 ? 0 : v > 255 ? 255 : v | 0;
+                c.plane[o++] = outb[src + xx];
               }
             }
           }
@@ -1008,17 +1240,16 @@ export function decodeJpeg(
     hasProfile: icc !== undefined,
   };
   /*
-   * The EXIF resolution wins over the JFIF one when the file carries both, and libvips keeps a
-   * resolution of one pixel per millimetre or better and no other -- 25.4 dpi -- so a jpeg written
-   * with a density of 25 reports no density at all on host sharp 0.33.5.
+   * The EXIF resolution wins over the JFIF one when the file carries both. A resolution too small to
+   * keep is still a resolution the file carries, so the unit goes with it even though the density
+   * does not: a jpeg written with `withMetadata({density: 25})` reports `resolutionUnit: 'inch'` and
+   * no `density` at all on host sharp 0.33.5, and the 72 dpi libvips falls back to belongs only to a
+   * jpeg that names no resolution -- measured on the same file with its EXIF and ICC stripped, which
+   * reports 72 whatever the density it was written with.
    */
   if (exifDensity !== undefined) {
     density = exifDensity;
     resolutionUnit = exifUnit;
-  }
-  if (density !== undefined && density <= 25.4) {
-    density = undefined;
-    resolutionUnit = undefined;
   }
   if (density !== undefined) info.density = density;
   if (resolutionUnit !== undefined) info.resolutionUnit = resolutionUnit;

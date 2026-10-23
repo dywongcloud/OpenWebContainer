@@ -172,16 +172,20 @@ function decodedFromPng(image: Image, info: PngInfo, size: number): Decoded {
 }
 
 /**
- * A JPEG always leaves the decoder with a resolution: libvips defaults one to 72 dpi when the JFIF
- * carries none (units 0), so sharp's metadata() always has a density for a JPEG and a PNG reports
- * one only when its pHYs says so. Measured against host sharp 0.33.5: a jpeg whose JFIF is 72 dpi
- * reports 72, while a png with no pHYs -- and one whose pHYs is libvips' own 1000 px/m default,
- * which is what sharp writes when no density is asked for -- reports no density at all.
+ * A JPEG always leaves the decoder with a resolution: libvips defaults one to 72 dpi when the file
+ * names none at all, and the shim reports that. A resolution the file DOES name is another matter --
+ * below one pixel per millimetre libvips keeps no density, though it still reports the unit the file
+ * gave. So a jpeg whose EXIF says 25 dpi (25999/1000 says 26, which is why the value is rounded the
+ * way `GetDensity` in src/common.cc rounds it) reports `resolutionUnit: 'inch'` and no density, while
+ * the same file with its EXIF and ICC stripped reports 72. Measured against host sharp 0.33.5 at 1,
+ * 20, 25, 26, 72 and 300 dpi, in the file's EXIF and with no resolution at all.
  *
- * Below one pixel per millimetre (25.4 dpi) libvips keeps no resolution, so neither does this.
+ * A PNG reports a density only when its pHYs says so, and no unit either way: the `resolutionUnit`
+ * host reports for a png comes from the resolution unit of its EXIF, never from pHYs.
  */
 function densityOf(density: number | undefined): number | undefined {
-    return typeof density === 'number' && isFinite(density) && density > 25.4 ? density : 72;
+    if (typeof density !== 'number' || !isFinite(density)) return 72;
+    return density > 25.4 ? Math.round(density) : undefined;
 }
 
 function decodedFromJpeg(image: Image, info: JpegInfo, size: number): Decoded {
@@ -513,28 +517,36 @@ export function createAddon(host: SharpAddonHost = {}): object {
             bytes = encoded.data;
             fileOut = String(opts.fileOut ?? '');
             /*
-             * No cropOffsetLeft / cropOffsetTop: sharp sets `hasCropOffset` only inside the
-             * attention/entropy branch of its crop (src/pipeline.cc), off the `xoffset`/`yoffset`
-             * vips_smartcrop hands back. A gravity crop -- which is the only crop this shim has --
-             * reports neither field on sharp 0.33.5, including a 64x64 jpeg -> 16 downsize that
-             * never crops and an enlargement that reports nothing to crop.
+             * The keys and their order are src/pipeline.cc's OnOK: format, width, height, channels,
+             * then `depth` -- but only for a raw output, where vips_enum_nick names the band format
+             * -- then premultiplied, then the crop offset and attention centre when the crop ran
+             * through vips_smartcrop, then `size` last of all. `Object.keys(info)` is observable,
+             * and sharp 0.33.5 answers in that order.
              */
             info = {
                 format: encoded.format,
-                size: bytes.length,
                 width: image.width,
                 height: image.height,
-                channels: image.channels,
-                /*
-                 * sharp's `shouldPremultiplyAlpha` (src/pipeline.cc): an image with an alpha band
-                 * that a resize actually ran on. libvips premultiplies before the resample and
-                 * unpremultiplies after it, and the flag says which of the two the pixels came out
-                 * of -- true for a 16x16x4 -> 8x8 reduction, a 48x32 RGBA png -> 24, and every
-                 * cover/contain/inside/outside resize of an image with alpha; false for a
-                 * 3-channel resize, for no operation at all, and for a rotate(90) with no resize.
-                 */
-                premultiplied: (decoded.image.channels === 2 || decoded.image.channels === 4) && resized
+                channels: image.channels
             };
+            if (encoded.format === 'raw') info.depth = 'uchar';
+            /*
+             * sharp's `shouldPremultiplyAlpha` (src/pipeline.cc): an image with an alpha band
+             * that a resize actually ran on. libvips premultiplies before the resample and
+             * unpremultiplies after it, and the flag says which of the two the pixels came out
+             * of -- true for a 16x16x4 -> 8x8 reduction, a 48x32 RGBA png -> 24, and every
+             * cover/contain/inside/outside resize of an image with alpha; false for a
+             * 3-channel resize, for no operation at all, and for a rotate(90) with no resize.
+             */
+            info.premultiplied = (decoded.image.channels === 2 || decoded.image.channels === 4) && resized;
+            /*
+             * No cropOffsetLeft / cropOffsetTop: sharp sets `hasCropOffset` only inside the
+             * attention/entropy branch of its crop (src/pipeline.cc), off the `-left`/`-top`
+             * vips_smartcrop hands back. A gravity crop -- which is the only crop this shim
+             * has -- reports neither field on sharp 0.33.5, including a 64x64 jpeg -> 16
+             * downsize that never crops and an enlargement that reports nothing to crop.
+             */
+            info.size = bytes.length;
             if (fileOut !== '') {
                 // A raw file is not a format sharp can write to disk: the extension names the format,
                 // and .raw names none, so the add-on is never reached and sharp itself refuses with
