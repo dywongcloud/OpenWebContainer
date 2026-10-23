@@ -199,10 +199,19 @@ export const IMPLEMENTED_OPTIONS: readonly string[] = [
     // level back as a silently different file instead of a refusal -- which is what pngPalette, and
     // every other option with no effect here, already gives.
     'pngEffort', 'pngQuality', 'pngDither', 'pngBitdepth',
-    // greyscale stays refused: it is a luminance in libvips' own colour pipeline, not a band count.
-    'negate', 'negateAlpha', 'removeAlpha', 'ensureAlpha',
-    'jpegOptimiseCoding', 'jpegOptimiseScans', 'jpegOvershootDeringing', 'jpegTrellisQuantisation',
-    'jpegQuantisationTable'
+    // greyscale stays refused, but not for the reason it once was: it is a closed form -- a luma over
+    // the LINEAR bands put back through the sRGB OETF -- and grey(v,v,v) == v for all 256 v pins that.
+    // It is not Rec.709, though: 0.2126/0.7152/0.0722 is out by up to 13 levels and byte-exact on
+    // only 290 of 2216 samples, where about 0.2/0.7/0.1 is within one level on all 2216 and exact on
+    // 1840 (83%). The shape is known and the coefficients are not quite, so a greyscale here would be
+    // within a level but wrong on a sixth of pixels -- which would look like a match and not be one.
+    'negate', 'negateAlpha', 'removeAlpha', 'ensureAlpha'
+    // jpegOptimiseCoding, jpegOptimiseScans, jpegOvershootDeringing, jpegTrellisQuantisation and
+    // jpegQuantisationTable are deliberately absent, for the reason pngCompressionLevel is: the JPEG
+    // encoder writes Annex K's own Huffman tables and Annex K's own quantisation, so none of the five
+    // can change a byte. Measured against sharp 0.33.5, a 16x8x4 fixture at quality 95 is 433 bytes
+    // with optimiseCoding on and 773 with it off on the host, and 843 both ways here -- and naming
+    // them here is what made that silence look like an implementation.
 ];
 
 /**

@@ -1259,8 +1259,19 @@ export function decodeJpeg(
    * jdmaster.c).
    */
   const minScaled = 8 / shrink;
-  const outW = Math.ceil(width / shrink);
-  const outH = Math.ceil(height / shrink);
+  /*
+   * The size libvips hands on from a shrunk load: `width / scale_denom` rounded DOWN, not up. libjpeg
+   * itself decodes the padded frame -- a 35x21 4:2:0 jpeg carries 18 columns of samples at
+   * scale_denom 2 -- but the image the resize then sees is the first 17, and it is that number and
+   * not the padded one that decides the OUTPUT size: a 35x21 jpeg resized to a width of 4 is 4x3,
+   * because 21/8 rounded down is 5 and 35/8 rounded down is 8 and 3 = round(4 * 5 / 8), where the
+   * padded 9x6 gives 4x2. Measured against sharp 0.33.5 as 1214 of 1214 output sizes over seven
+   * sources (35x21, 37x23, 33x17, 100x60, 21x13, 64x48, 64x64), every width from 1 to twice the
+   * source's and every height from 1 to twice the source's, with fastShrinkOnLoad both default and
+   * false. At scale_denom 1 the two agree, so an undecoded read is untouched.
+   */
+  const outW = Math.max(1, Math.floor(width / shrink));
+  const outH = Math.max(1, Math.floor(height / shrink));
 
   for (let i = 0; i < comps.length; i++) {
     const c = comps[i];

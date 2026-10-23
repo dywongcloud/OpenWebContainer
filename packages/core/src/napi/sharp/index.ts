@@ -31,6 +31,7 @@ import {
     embedImage,
     ensureAlphaImage,
     extractImage,
+    flattenImage,
     flipImage,
     flopImage,
     negateImage,
@@ -480,7 +481,16 @@ function encodeOutput(image: Image, options: Record<string, unknown>, inputForma
         const quality = Math.max(1, Math.min(100, numberOption(options, 'jpegQuality', 80)));
         const chroma = String(options.jpegChromaSubsampling ?? '4:2:0');
         if (chroma !== '4:4:4' && chroma !== '4:2:0' && chroma !== '4:2:2') throw unsupportedFormat('jpeg ' + chroma, 'output');
-        const rgb = image.channels === 4 || image.channels === 3 ? toChannels(image, 3) : toChannels(image, 1);
+        /*
+         *sharp 0.33.5 flattens over the background before it takes the alpha band away for a format
+         * that has none: `sharp(rgba).jpeg()` is byte-for-byte `sharp(rgba).flatten().jpeg()` against
+         * host, and an alpha of 0 or 0.5 gives a different file from an alpha of 1, where simply
+         * dropping the band would give the same file three times. Measured on an 8x4x3 source:
+         * ensureAlpha(0), (0.5) and (1) written as jpeg are 267, 314 and 334 bytes on host, and were
+         * one and the same 706-byte file here.
+         */
+        const flat = flattenImage(image, arrayOption(options, 'flattenBackground', [0, 0, 0]));
+        const rgb = flat.channels === 4 || flat.channels === 3 ? toChannels(flat, 3) : toChannels(flat, 1);
         // A jpeg has no alpha band, so the bands the encoder wrote -- 3, or 1 for a greyscale input --
         // are the channels sharp reports, not the bands the image had going in. Without this a
         // 16x8 RGBA png written as jpeg reports channels 4 where sharp 0.33.5 reports 3, while the
