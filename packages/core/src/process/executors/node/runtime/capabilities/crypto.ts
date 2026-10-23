@@ -693,7 +693,7 @@ function fromBase64url(text: unknown, field: string): Uint8Array {
  * search, and the caller would still be waiting for it.
  * ------------------------------------------------------------------------------------------ */
 
-type KeyKind = 'ed25519' | 'x25519' | 'ed448' | 'x448' | 'ec';
+type KeyKind = 'ed25519' | 'x25519' | 'ed448' | 'x448' | 'ec' | 'rsa' | 'rsa-pss' | 'dsa' | 'dh';
 
 interface EcCurve {
     /** Node's name for the curve, and the JWK name a caller sees. */
@@ -707,7 +707,9 @@ interface EcCurve {
         getPublicKey: (priv: Uint8Array, compressed?: boolean) => Uint8Array;
         utils: { randomPrivateKey: () => Uint8Array };
         sign: (msg: Uint8Array, priv: Uint8Array, opts: { lowS: boolean; prehash: boolean; extraEntropy?: Uint8Array }) => { toBytes: (format: string) => Uint8Array };
-        verify: (sig: Uint8Array, msg: Uint8Array, pub: Uint8Array, opts: { lowS: boolean; prehash: boolean }) => boolean;
+        verify: (sig: Uint8Array, msg: Uint8Array, pub: Uint8Array, opts: { lowS: boolean; prehash: boolean; format?: 'der' | 'compact' }) => boolean;
+        /** Key agreement over the curve, the way Node's diffieHellman over two EC keys asks for it. */
+        getSharedSecret: (priv: Uint8Array, pub: Uint8Array, compressed?: boolean) => Uint8Array;
     };
 }
 
@@ -754,6 +756,8 @@ interface KeyRecord {
     kind: KeyKind;
     /** The EC named curve, for the EC kinds only. */
     curve?: EcCurve;
+    /** The integers behind an RSA, DSA or DH key. */
+    ints?: IntKey;
     publicBytes?: Uint8Array;
     privateBytes?: Uint8Array;
 }
@@ -864,6 +868,14 @@ function paddedScalar(bytes: Uint8Array, size: number): Uint8Array {
 
 /** SubjectPublicKeyInfo, the encoding behind a public key's `spki` export. */
 function encodeSpki(key: KeyRecord): Uint8Array {
+    const ints = intAlgorithmDer(key);
+    if (ints !== undefined) {
+        /* RSA wraps a PKCS#1 RSAPublicKey; DSA and DH carry their public value as one INTEGER. */
+        const body = key.kind === 'rsa' || key.kind === 'rsa-pss'
+            ? rsaPublicDer(key.ints as IntKey)
+            : derIntegerBig((key.ints as IntKey).y as bigint);
+        return derSequence([ints, derBitString(body)]);
+    }
     const [algorithm, bits] = key.kind === 'ec'
         ? [derSequence([derOid(EC_PUBLIC_KEY_OID), derOid((key.curve as EcCurve).oid)]), (key.publicBytes as Uint8Array)]
         : [derSequence([derOid(EDWARDS[key.kind].oid)]), (key.publicBytes as Uint8Array)];
@@ -872,6 +884,14 @@ function encodeSpki(key: KeyRecord): Uint8Array {
 
 /** OneAsymmetricKey (PKCS#8), the default behind a private key's export. */
 function encodePkcs8(key: KeyRecord): Uint8Array {
+    const ints = intAlgorithmDer(key);
+    if (ints !== undefined) {
+        /* RSA wraps a PKCS#1 RSAPrivateKey; DSA and DH carry x alone, since the domain is above. */
+        const body = key.kind === 'rsa' || key.kind === 'rsa-pss'
+            ? rsaPrivateDer(key.ints as IntKey)
+            : derIntegerBig((key.ints as IntKey).x as bigint);
+        return derSequence([derIntegerFrom(0), ints, derOctetString(body)]);
+    }
     const algorithm = key.kind === 'ec'
         ? derSequence([derOid(EC_PUBLIC_KEY_OID), derOid((key.curve as EcCurve).oid)])
         : derSequence([derOid(EDWARDS[key.kind].oid)]);
@@ -898,6 +918,30 @@ function encodeEcPrivateKey(key: KeyRecord, withParameters: boolean): Uint8Array
 }
 
 function exportJwk(key: KeyRecord): Record<string, unknown> {
+    if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
+        const ints = key.ints as IntKey;
+        /* Node writes RSA as kty, n, e and then the private parts, and a caller that stringifies
+           the export sees that order, so the keys are written in it here. */
+        const jwk: Record<string, unknown> = {
+            kty: 'RSA',
+            n: base64url(bytesOf(ints.n as bigint, modulusSize(ints.n as bigint))),
+            e: base64url(minimalBytesOf(ints.e as bigint))
+        };
+        if (key.type === 'private') {
+            const size = modulusSize(ints.n as bigint);
+            jwk.d = base64url(bytesOf(ints.d as bigint, size));
+            jwk.p = base64url(bytesOf(ints.p as bigint, Math.ceil(size / 2)));
+            jwk.q = base64url(bytesOf(ints.q as bigint, Math.ceil(size / 2)));
+            jwk.dp = base64url(bytesOf(ints.dp as bigint, Math.ceil(size / 2)));
+            jwk.dq = base64url(bytesOf(ints.dq as bigint, Math.ceil(size / 2)));
+            jwk.qi = base64url(bytesOf(ints.qi as bigint, Math.ceil(size / 2)));
+        }
+        return jwk;
+    }
+    /* DSA and DH have no JWK form at all: Node answers ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE. */
+    if (key.kind === 'dsa' || key.kind === 'dh') {
+        throw keyFail('ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE', 'Unsupported JWK Key Type.');
+    }
     if (key.kind === 'ec') {
         const curve = key.curve as EcCurve;
         const point = key.publicBytes as Uint8Array;
@@ -929,13 +973,534 @@ function curveFor(name: unknown): EcCurve {
     return curve;
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * RSA, DSA and DH: the integer kinds. Generating one needs a search for large random primes, and
+ * the search is reachable here -- a Miller-Rabin round is one BigInt modular exponentiation, and
+ * sieving an arithmetic progression against the small primes leaves about one candidate in twenty
+ * to test, which is the difference between a 1024-bit search taking seconds and one taking
+ * minutes. The encodings are PKCS#1 inside SPKI and PKCS#8 for RSA, FIPS 186-4 domain parameters
+ * for DSA and PKCS#3 for DH.
+ * ------------------------------------------------------------------------------------------ */
+
+const OID_RSA = '1.2.840.113549.1.1.1';
+const OID_RSA_PSS = '1.2.840.113549.1.1.10';
+const OID_DSA = '1.2.840.10040.4.1';
+const OID_DH = '1.2.840.113549.1.3.1';
+
+/** The OID each of the integer kinds writes into its algorithm identifier. */
+const INT_KIND_OIDS: Record<string, string> = {
+    rsa: OID_RSA,
+    'rsa-pss': OID_RSA_PSS,
+    dsa: OID_DSA,
+    dh: OID_DH
+};
+
+/**
+ * The integers behind an RSA, DSA or DH key, in the spelling PKCS#1, FIPS 186-4 and PKCS#3 give
+ * them. The three kinds share the letters -- RSA's primes are p and q and so are DSA's modulus
+ * and subprime -- but no key carries both readings, so one bag of names serves all of them.
+ */
+interface IntKey {
+    /** RSA: the modulus, the public exponent and its inverse. */
+    n?: bigint; e?: bigint; d?: bigint;
+    /** RSA: prime1 and prime2, and the three CRT parts that speed a private-key operation up. */
+    p?: bigint; q?: bigint; dp?: bigint; dq?: bigint; qi?: bigint;
+    /** DSA and DH: the generator, and the public and private halves of the key. */
+    g?: bigint; y?: bigint; x?: bigint;
+}
+
+/** The canonical name of a digest, so an RSA signature can write its OID into a DigestInfo. */
+function digestNameFor(name: unknown): string {
+    const key = String(name ?? '').toLowerCase();
+    return DIGEST_ALIASES[key] ?? key;
+}
+
+/** INTEGER from a non-negative BigInt: minimal big-endian, with a 0x00 ahead of a set top bit. */
+function derIntegerBig(value: bigint): Uint8Array {
+    let width = 1;
+    while ((value >> BigInt(width * 8)) > 0n) width++;
+    const body = bytesOf(value, width);
+    return der(DER_INTEGER, body[0] > 0x7f ? concatBytes(new Uint8Array([0]), body) : body);
+}
+
+/** A DER INTEGER as a BigInt. Every integer these structures carry is non-negative. */
+const intOf = (node: DerNode): bigint => bigOf(node.content);
+
+/** The byte width of an RSA modulus: the size of its signatures, its ciphertexts and its parts. */
+const modulusSize = (n: bigint): number => Math.ceil(n.toString(2).length / 8);
+
+function gcd(a: bigint, b: bigint): bigint {
+    while (b !== 0n) {
+        const rest = a % b;
+        a = b;
+        b = rest;
+    }
+    return a < 0n ? -a : a;
+}
+
+/** The inverse of `a` modulo `m`, from the extended Euclidean algorithm. */
+function modInverse(a: bigint, m: bigint): bigint {
+    let [wasValue, nowValue] = [((a % m) + m) % m, m];
+    let [wasScale, nowScale] = [1n, 0n];
+    while (nowValue !== 0n) {
+        const times = wasValue / nowValue;
+        [wasValue, nowValue] = [nowValue, wasValue - times * nowValue];
+        [wasScale, nowScale] = [nowScale, wasScale - times * nowScale];
+    }
+    if (wasValue !== 1n) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Not invertible');
+    return ((wasScale % m) + m) % m;
+}
+
+/** The odd primes below 2^16: enough to strike nineteen in twenty candidates out of a window. */
+const SIEVE_PRIMES: number[] = (() => {
+    const limit = 65536;
+    const composite = new Uint8Array(limit);
+    const primes: number[] = [];
+    for (let at = 3; at < limit; at += 2) {
+        if (composite[at] !== 0) continue;
+        primes.push(at);
+        for (let mark = at * at; mark < limit; mark += 2 * at) composite[mark] = 1;
+    }
+    return primes;
+})();
+
+/**
+ * One window of `count` candidates `a + b*i`, with every candidate a small prime divides struck
+ * out, and Miller-Rabin on what survives. `safe` also strikes a candidate whose partner `2v + 1`
+ * a small prime divides, which is what finds a safe prime: the sieve leaves about one candidate
+ * in twenty to exponentiate, and that is the whole of what makes a 1024-bit search affordable.
+ */
+function searchProgression(a: bigint, b: bigint, count: number, safe: boolean, rounds: number, accept: (value: bigint) => boolean): bigint | undefined {
+    const struck = new Uint8Array(count);
+    for (const prime of SIEVE_PRIMES) {
+        const r = BigInt(prime);
+        const step = b % r;
+        if (step !== 0n) {
+            let at = Number((((r - (a % r)) % r) * modInverse(step, r)) % r);
+            /* A narrow window can hold the small prime itself, and that one is prime: skip it. */
+            if (a + b * BigInt(at) === r) at += prime;
+            for (let i = at; i < count; i += prime) struck[i] = 1;
+        }
+        if (!safe) continue;
+        /* The partner is 2(a + b*i) + 1, so it walks the same window at twice the step. */
+        const twin = (2n * b) % r;
+        if (twin === 0n) continue;
+        let mate = Number((((r - ((2n * a + 1n) % r)) % r) * modInverse(twin, r)) % r);
+        if (2n * (a + b * BigInt(mate)) + 1n === r) mate += prime;
+        for (let i = mate; i < count; i += prime) struck[i] = 1;
+    }
+    for (let i = 0; i < count; i++) {
+        if (struck[i] !== 0) continue;
+        const value = a + b * BigInt(i);
+        if (!isProbablePrime(value, rounds)) continue;
+        if (safe && !isProbablePrime(2n * value + 1n, rounds)) continue;
+        if (!accept(value)) continue;
+        return value;
+    }
+    return undefined;
+}
+
+/** A random odd `bits`-bit starting point with its top `topBits` bits set. */
+function primeStart(bits: number, topBits: number): bigint {
+    const free = BigInt(bits - topBits);
+    const top = ((1n << BigInt(topBits)) - 1n) << free;
+    return top | (bigOf(randomOf(Math.ceil(bits / 8))) % (1n << free)) | 1n;
+}
+
+/**
+ * A probable prime of `bits` bits. `safe` asks for a Sophie Germain prime, whose partner `2p + 1`
+ * is prime too and which is what a Diffie-Hellman group is generated from; `coprimeTo` refuses a
+ * prime whose predecessor shares a factor with an RSA exponent, since such an exponent inverts.
+ */
+function searchPrime(bits: number, options: { topBits?: number; safe?: boolean; coprimeTo?: bigint } = {}): bigint {
+    const rounds = bits >= 1024 ? 4 : 8;
+    const coprimeTo = options.coprimeTo;
+    const accept = (value: bigint): boolean => coprimeTo === undefined || gcd(coprimeTo, value - 1n) === 1n;
+    for (let window = 0; window < 4096; window++) {
+        const start = primeStart(bits, options.topBits ?? 1);
+        /* The window stops at 2^bits, so a narrow width never walks into the one above it. */
+        const span = ((1n << BigInt(bits)) + 1n - start) / 2n;
+        const count = span > 262144n ? 262144 : Number(span < 1n ? 1n : span);
+        const found = searchProgression(start, 2n, count, options.safe === true, rounds, accept);
+        if (found !== undefined) return found;
+    }
+    throw dhFail('ERR_CRYPTO_INVALID_STATE', 'Could not find a prime of ' + bits + ' bits');
+}
+
+/**
+ * FIPS 186-4 A.1: a DSA domain. The subprime q is a fresh prime of `divisorBits` bits, and the
+ * modulus p is then q*x + 1 for an even x -- which is another arithmetic progression, so the same
+ * sieve serves it -- until that is prime at the width asked for.
+ */
+function searchDsaDomain(bits: number, divisorBits: number): { p: bigint; q: bigint; g: bigint } {
+    const q = searchPrime(divisorBits);
+    const rounds = bits >= 1024 ? 4 : 8;
+    const step = 2n * q;
+    /* p = q*x + 1 has to land in [2^(bits-1), 2^bits), which bounds x on both sides. */
+    const lowest = (((1n << BigInt(bits - 1)) + q - 2n) / q) & ~1n;
+    const highest = (((1n << BigInt(bits)) - 2n) / q) & ~1n;
+    const room = (highest - lowest) / 2n;
+    if (room < 1n) throw dhFail('ERR_CRYPTO_INVALID_DH_PARAMETERS', 'Invalid DSA parameter sizes');
+    const take = room > 8192n ? 8192n : room;
+    for (let window = 0; window < 4096; window++) {
+        const offset = room > take ? bigOf(randomOf(Math.ceil(room.toString(2).length / 8))) % (room - take) : 0n;
+        const p = searchProgression(q * (lowest + 2n * offset) + 1n, step, Number(take), false, rounds, () => true);
+        if (p === undefined) continue;
+        /* g = h^((p-1)/q) mod p has order q, and lands on 1 for only one h in q. */
+        for (let attempt = 0; attempt < 1000; attempt++) {
+            const g = modPow(2n + (bigOf(randomOf(Math.ceil(bits / 8))) % (p - 3n)), (p - 1n) / q, p);
+            if (g >= 2n) return { p, q, g };
+        }
+    }
+    throw dhFail('ERR_CRYPTO_INVALID_STATE', 'Could not find DSA parameters of ' + bits + ' bits');
+}
+
+/** A fresh RSA key: two primes of half the modulus width, and the exponent pair for them. */
+function generateRsa(bits: number, exponent: bigint): IntKey {
+    /*
+     * Both primes carry their top two bits so their product fills the modulus: two numbers above
+     * 2^(h-1) can multiply to less than 2^(2h-1) and lose a bit, but two above 2^(h-0.5) never do.
+     */
+    const half = bits >> 1;
+    const p = searchPrime(half, { topBits: 2, coprimeTo: exponent });
+    let q = searchPrime(half, { topBits: 2, coprimeTo: exponent });
+    while (q === p) q = searchPrime(half, { topBits: 2, coprimeTo: exponent });
+    const n = p * q;
+    /* PKCS#1 asks for d = e^-1 mod lambda(n), lambda being the lcm of p-1 and q-1. */
+    const lambda = ((p - 1n) * (q - 1n)) / gcd(p - 1n, q - 1n);
+    const d = modInverse(exponent, lambda);
+    return {
+        n,
+        e: exponent,
+        d,
+        p,
+        q,
+        dp: ((d % (p - 1n)) + (p - 1n)) % (p - 1n),
+        dq: ((d % (q - 1n)) + (q - 1n)) % (q - 1n),
+        qi: modInverse(q, p)
+    };
+}
+
+/** A fresh DSA key: the domain, a private exponent below the subprime, and the public g^x mod p. */
+function generateDsa(bits: number, divisorBits: number): IntKey {
+    const { p, q, g } = searchDsaDomain(bits, divisorBits);
+    const x = 1n + (bigOf(randomOf(Math.ceil(divisorBits / 8))) % (q - 1n));
+    return { p, q, g, x, y: modPow(g, x, p) };
+}
+
+/** A fresh DH key: a safe prime of `bits` bits, the generator, and one exponent in that group. */
+function generateDh(bits: number, generator: bigint): IntKey {
+    /* OpenSSL generates a safe prime by default, so the subgroup a caller exchanges in is large. */
+    const p = 2n * searchPrime(bits - 1, { safe: true }) + 1n;
+    const x = 2n + (bigOf(randomOf(Math.ceil(bits / 8))) % (p - 3n));
+    return { p, g: generator, x, y: modPow(generator, x, p) };
+}
+
+/** PKCS#1 RSAPublicKey: SEQUENCE { modulus, publicExponent }, the body an SPKI wraps. */
+const rsaPublicDer = (ints: IntKey): Uint8Array =>
+    derSequence([derIntegerBig(ints.n as bigint), derIntegerBig(ints.e as bigint)]);
+
+/** PKCS#1 RSAPrivateKey: version, the modulus, both exponents, both primes and the CRT parts. */
+const rsaPrivateDer = (ints: IntKey): Uint8Array => derSequence([
+    derIntegerFrom(0),
+    derIntegerBig(ints.n as bigint),
+    derIntegerBig(ints.e as bigint),
+    derIntegerBig(ints.d as bigint),
+    derIntegerBig(ints.p as bigint),
+    derIntegerBig(ints.q as bigint),
+    derIntegerBig(ints.dp as bigint),
+    derIntegerBig(ints.dq as bigint),
+    derIntegerBig(ints.qi as bigint)
+]);
+
+/** The domain parameters an algorithm identifier carries: DSA's p, q and g, or DH's p and g. */
+function domainDer(key: KeyRecord): Uint8Array | undefined {
+    const ints = key.ints;
+    if (ints === undefined) return undefined;
+    if (key.kind === 'dsa') return derSequence([derIntegerBig(ints.p as bigint), derIntegerBig(ints.q as bigint), derIntegerBig(ints.g as bigint)]);
+    if (key.kind === 'dh') return derSequence([derIntegerBig(ints.p as bigint), derIntegerBig(ints.g as bigint)]);
+    return undefined;
+}
+
+/** The algorithm identifier an RSA, DSA or DH key writes: the OID, then NULL or the domain. */
+function intAlgorithmOid(key: KeyRecord): string | undefined {
+    if (key.kind === 'rsa') return OID_RSA;
+    if (key.kind === 'rsa-pss') return OID_RSA_PSS;
+    if (key.kind === 'dsa') return OID_DSA;
+    if (key.kind === 'dh') return OID_DH;
+    return undefined;
+}
+
+function intAlgorithmDer(key: KeyRecord): Uint8Array | undefined {
+    const oid = intAlgorithmOid(key);
+    if (oid === undefined) return undefined;
+    const domain = domainDer(key);
+    /* RSA names no parameters, so it writes NULL the way OpenSSL writes it. */
+    return derSequence([derOid(oid), domain === undefined ? der(DER_NULL, new Uint8Array(0)) : domain]);
+}
+
+/** The DigestInfo an RSA signature really signs: SEQUENCE { AlgorithmIdentifier, OCTET STRING }. */
+const DIGEST_OIDS: Record<string, string> = {
+    md5: '1.2.840.113549.2.5',
+    sha1: '1.3.14.3.2.26',
+    sha224: '2.16.840.1.101.3.4.2.4',
+    sha256: '2.16.840.1.101.3.4.2.1',
+    sha384: '2.16.840.1.101.3.4.2.2',
+    sha512: '2.16.840.1.101.3.4.2.3',
+    'sha512-224': '2.16.840.1.101.3.4.2.5',
+    'sha512-256': '2.16.840.1.101.3.4.2.6',
+    'sha3-224': '2.16.840.1.101.3.4.2.7',
+    'sha3-256': '2.16.840.1.101.3.4.2.8',
+    'sha3-384': '2.16.840.1.101.3.4.2.9',
+    'sha3-512': '2.16.840.1.101.3.4.2.10',
+    ripemd160: '1.3.36.3.2.1',
+    sm3: '1.2.156.10197.1.401',
+    blake2b512: '1.3.6.1.4.1.1722.12.2.1.16',
+    blake2s256: '1.3.6.1.4.1.1722.12.2.2.8'
+};
+
+function digestInfoDer(name: string, digest: Uint8Array): Uint8Array {
+    const oid = DIGEST_OIDS[name];
+    if (oid === undefined) throw keyFail('ERR_OSSL_INVALID_DIGEST', 'error:1C80007A:Provider routines::invalid digest');
+    return derSequence([derSequence([derOid(oid), der(DER_NULL, new Uint8Array(0))]), derOctetString(digest)]);
+}
+
+const xorBytes = (a: Uint8Array, b: Uint8Array): Uint8Array => {
+    const out = new Uint8Array(a.length);
+    for (let i = 0; i < a.length; i++) out[i] = a[i] ^ b[i];
+    return out;
+};
+
+/** MGF1 (RFC 8017 B.2): the mask is the hash of the seed with a 32-bit counter appended. */
+function mgf1(seed: Uint8Array, length: number, hash: (message: Uint8Array) => Uint8Array): Uint8Array {
+    const out = new Uint8Array(length);
+    let at = 0;
+    for (let counter = 0; at < length; counter++) {
+        const block = hash(concatBytes(seed, new Uint8Array([(counter >>> 24) & 0xff, (counter >>> 16) & 0xff, (counter >>> 8) & 0xff, counter & 0xff])));
+        for (const byte of block) {
+            if (at >= length) break;
+            out[at++] = byte;
+        }
+    }
+    return out;
+}
+
+/** RSA_PKCS1_PADDING is 1 and RSA_PKCS1_PSS_PADDING is 6, as crypto.constants names them. */
+const RSA_PKCS1_PADDING = 1;
+const RSA_PKCS1_PSS_PADDING = 6;
+
+/** EMSA-PKCS1-v1_5 (RFC 8017 9.2): 0x00 0x01, then 0xff up to the DigestInfo, then 0x00. */
+function emsaPkcs1(t: Uint8Array, size: number): Uint8Array {
+    if (t.length + 11 > size) {
+        throw keyFail('ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS', 'error:0409D06A:rsa routines::data too large for modulus');
+    }
+    const out = new Uint8Array(size);
+    out[0] = 0x00;
+    out[1] = 0x01;
+    out.fill(0xff, 2, size - t.length - 1);
+    out[size - t.length - 1] = 0x00;
+    out.set(t, size - t.length);
+    return out;
+}
+
+/** EMSA-PSS (RFC 8017 9.1): a salted hash, a masked block and a 0xbc trailer. */
+function emsaPssEncode(digest: Uint8Array, emBits: number, saltLength: number, hash: (message: Uint8Array) => Uint8Array, hLen: number): Uint8Array {
+    const emLen = Math.ceil(emBits / 8);
+    if (emLen < hLen + saltLength + 2) {
+        throw keyFail('ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS', 'error:0409D06A:rsa routines::data too large for modulus');
+    }
+    const salt = randomOf(saltLength);
+    const h = hash(concatBytes(concatBytes(new Uint8Array(8), digest), salt));
+    const block = new Uint8Array(emLen - hLen - 1);
+    block[block.length - saltLength - 1] = 0x01;
+    block.set(salt, block.length - saltLength);
+    const masked = xorBytes(block, mgf1(h, block.length, hash));
+    /* The 8*emLen - emBits bits above the modulus width are cleared before the block is signed. */
+    const spare = 8 * emLen - emBits;
+    if (spare > 0) masked[0] &= 0xff >>> spare;
+    return concatBytes(concatBytes(masked, h), new Uint8Array([0xbc]));
+}
+
+/** EMSA-PSS verification: a negative salt length is AUTO, so the separator is searched for. */
+function emsaPssVerify(digest: Uint8Array, em: Uint8Array, emBits: number, saltLength: number, hash: (message: Uint8Array) => Uint8Array, hLen: number): boolean {
+    const emLen = Math.ceil(emBits / 8);
+    const spare = 8 * emLen - emBits;
+    if (em.length < emLen || em[em.length - 1] !== 0xbc) return false;
+    if (spare > 0 && (em[0] & ((0xff << (8 - spare)) & 0xff)) !== 0) return false;
+    const masked = em.subarray(0, emLen - hLen - 1);
+    const h = em.subarray(emLen - hLen - 1, emLen - 1);
+    if (masked.length < 1) return false;
+    const block = xorBytes(masked, mgf1(h, masked.length, hash));
+    if (spare > 0) block[0] &= 0xff >>> spare;
+    let at = 0;
+    /* AUTO reads the salt length off the block: the 0x01 is the first non-zero from the left. */
+    while (at < block.length - 1 && block[at] === 0x00) at++;
+    if (block[at] !== 0x01) return false;
+    const salt = block.subarray(at + 1);
+    if (saltLength >= 0 && salt.length !== saltLength) return false;
+    const again = hash(concatBytes(concatBytes(new Uint8Array(8), digest), salt));
+    if (again.length !== h.length) return false;
+    for (let i = 0; i < again.length; i++) if (again[i] !== h[i]) return false;
+    return true;
+}
+
+/** The salt length of a PSS signature: the digest width, unless the caller names one. */
+function pssSaltLength(saltLength: unknown, hLen: number): number {
+    const asked = Number(saltLength);
+    if (saltLength === undefined || saltLength === null || !Number.isFinite(asked)) return hLen;
+    if (asked === -1) return hLen;
+    if (asked === -2) return -2;
+    return Math.trunc(asked);
+}
+
+/** Signs or verifies with an RSA key: the exponentiation is one BigInt modPow either way. */
+function rsaSignWith(ints: IntKey, digest: Uint8Array, name: string, padding: number, saltLength: number): Uint8Array {
+    const n = ints.n as bigint;
+    const size = modulusSize(n);
+    const spec = DIGEST_SPECS[name];
+    const hash = (message: Uint8Array): Uint8Array => spec.fn(message, 0);
+    const emBits = n.toString(2).length - 1;
+    const em = padding === RSA_PKCS1_PSS_PADDING
+        ? emsaPssEncode(digest, emBits, saltLength < 0 ? spec.out : saltLength, hash, spec.out)
+        : emsaPkcs1(digestInfoDer(name, digest), size);
+    const m = bigOf(em);
+    if (m >= n) throw keyFail('ERR_OSSL_RSA_DATA_TOO_LARGE', 'error:0409D06A:rsa routines::data too large for modulus');
+    return bytesOf(modPow(m, ints.d as bigint, n), size);
+}
+
+function rsaVerifyWith(ints: IntKey, digest: Uint8Array, name: string, signature: Uint8Array, padding: number, saltLength: number): boolean {
+    const n = ints.n as bigint;
+    const size = modulusSize(n);
+    /* A signature is exactly as wide as the modulus, and its value is below it. */
+    if (signature.length !== size) return false;
+    const s = bigOf(signature);
+    if (s >= n) return false;
+    const em = bytesOf(modPow(s, ints.e as bigint, n), size);
+    if (padding === RSA_PKCS1_PSS_PADDING) {
+        const spec = DIGEST_SPECS[name];
+        if (spec === undefined) return false;
+        return emsaPssVerify(digest, em, n.toString(2).length - 1, saltLength, (message) => spec.fn(message, 0), spec.out);
+    }
+    let t: Uint8Array;
+    try {
+        t = digestInfoDer(name, digest);
+    } catch {
+        return false;
+    }
+    if (em[0] !== 0x00 || em[1] !== 0x01) return false;
+    let at = 2;
+    while (at < size && em[at] === 0xff) at++;
+    if (at !== size - t.length - 1 || em[at] !== 0x00) return false;
+    for (let i = 0; i < t.length; i++) if (em[size - t.length + i] !== t[i]) return false;
+    return true;
+}
+
+/** FIPS 186-4 4.6: the leftmost `bits` of a digest, as an integer, so a short q still signs. */
+const bits2int = (digest: Uint8Array, bits: number): bigint => {
+    const excess = digest.length * 8 - bits;
+    const value = bigOf(digest);
+    return excess > 0 ? value >> BigInt(excess) : value;
+};
+
+/** DSA: r = (g^k mod p) mod q and s = k^-1 (z + x*r) mod q, written as a DER pair. */
+function dsaSignWith(ints: IntKey, digest: Uint8Array): Uint8Array {
+    const p = ints.p as bigint;
+    const q = ints.q as bigint;
+    const g = ints.g as bigint;
+    const x = ints.x as bigint;
+    const z = bits2int(digest, q.toString(2).length);
+    for (let attempt = 0; attempt < 100; attempt++) {
+        const k = 1n + (bigOf(randomOf(Math.ceil(q.toString(2).length / 8))) % (q - 1n));
+        const r = modPow(g, k, p) % q;
+        if (r === 0n) continue;
+        const s = (modInverse(k, q) * (z + x * r)) % q;
+        if (s === 0n) continue;
+        return derSequence([derIntegerBig(r), derIntegerBig(s)]);
+    }
+    throw keyFail('ERR_CRYPTO_INVALID_STATE', 'DSA signing failed');
+}
+
+function dsaVerifyWith(ints: IntKey, digest: Uint8Array, signature: Uint8Array): boolean {
+    try {
+        const root = derRead(signature);
+        if (root.tag !== DER_SEQUENCE || root.children.length !== 2) return false;
+        const r = intOf(root.children[0]);
+        const s = intOf(root.children[1]);
+        const p = ints.p as bigint;
+        const q = ints.q as bigint;
+        const y = ints.y as bigint;
+        if (r <= 0n || r >= q || s <= 0n || s >= q) return false;
+        const w = modInverse(s, q);
+        const z = bits2int(digest, q.toString(2).length);
+        const v = (modPow(ints.g as bigint, (z * w) % q, p) * modPow(y, (r * w) % q, p)) % p % q;
+        return v === r;
+    } catch {
+        return false;
+    }
+}
+
 function generatePair(type: unknown, options: any): { public: number; private: number } {
     const kind = String(type ?? '').toLowerCase();
-    if (kind === 'rsa' || kind === 'rsa-pss' || kind === 'dh' || kind === 'dsa') {
-        throw keyFail(
-            'ERR_CRYPTO_UNSUPPORTED_OPERATION',
-            `${kind} key generation is not available: this runtime has no large-prime search (RSA, DSA, DH)`
-        );
+    /*
+     * Node insists on an options object for the three kinds that take a size -- an RSA modulus, a
+     * DSA modulus and a DH prime all need a width, and there is no default to fall back on -- so
+     * a call with none is an argument error here too, the way it is on the host.
+     */
+    if (kind === 'rsa' || kind === 'rsa-pss' || kind === 'dsa' || kind === 'dh') {
+        if (options === undefined || options === null || typeof options !== 'object') {
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options" argument must be of type object. Received ' + String(options), 'TypeError');
+        }
+    }
+    if (kind === 'rsa' || kind === 'rsa-pss') {
+        if (typeof options?.modulusLength !== 'number') {
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.modulusLength" property must be of type number. Received ' + String(options?.modulusLength), 'TypeError');
+        }
+        const modulusLength = options.modulusLength;
+        if (!Number.isInteger(modulusLength) || modulusLength < 16) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.modulusLength" is out of range. It must be >= 16. Received ' + String(options?.modulusLength), 'RangeError');
+        }
+        const exponent = options?.publicExponent === undefined || options?.publicExponent === null ? 65537n : BigInt(String(options?.publicExponent));
+        if (exponent < 3n || (exponent & 1n) === 0n) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.publicExponent" is out of range. It must be an odd integer >= 3. Received ' + exponent.toString(), 'RangeError');
+        }
+        const ints = generateRsa(modulusLength, exponent);
+        const size = modulusSize(ints.n as bigint);
+        return {
+            public: storeKey({ type: 'public', kind, ints, publicBytes: bytesOf(ints.n as bigint, size) }),
+            private: storeKey({ type: 'private', kind, ints, publicBytes: bytesOf(ints.n as bigint, size), privateBytes: bytesOf(ints.d as bigint, size) })
+        };
+    }
+    if (kind === 'dsa') {
+        if (typeof options?.modulusLength !== 'number') {
+            throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.modulusLength" property must be of type number. Received ' + String(options?.modulusLength), 'TypeError');
+        }
+        const modulusLength = options.modulusLength;
+        const divisorLength = options?.divisorLength === undefined || options?.divisorLength === null ? 224 : Number(options?.divisorLength);
+        if (!Number.isInteger(modulusLength) || modulusLength < 32) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.modulusLength" is out of range. It must be >= 32. Received ' + String(options?.modulusLength), 'RangeError');
+        }
+        const ints = generateDsa(modulusLength, divisorLength);
+        const size = modulusSize(ints.p as bigint);
+        return {
+            public: storeKey({ type: 'public', kind, ints, publicBytes: bytesOf(ints.y as bigint, size) }),
+            private: storeKey({ type: 'private', kind, ints, publicBytes: bytesOf(ints.y as bigint, size), privateBytes: bytesOf(ints.x as bigint, Math.ceil(divisorLength / 8)) })
+        };
+    }
+    if (kind === 'dh') {
+        /* A group, a prime or a prime length: Node asks for one of the three before it generates. */
+        if (options?.primeLength === undefined || options?.primeLength === null) {
+            throw Object.assign(new Error('At least one of the group, prime, or primeLength options is required'), { code: 'ERR_MISSING_OPTION' });
+        }
+        const primeLength = Number(options.primeLength);
+        if (!Number.isInteger(primeLength) || primeLength < 16) {
+            throw keyFail('ERR_OUT_OF_RANGE', 'The value of "options.primeLength" is out of range. It must be >= 16. Received ' + String(options?.primeLength), 'RangeError');
+        }
+        const ints = generateDh(primeLength, options?.generator === undefined || options?.generator === null ? 2n : BigInt(String(options?.generator)));
+        const size = modulusSize(ints.p as bigint);
+        return {
+            public: storeKey({ type: 'public', kind, ints, publicBytes: bytesOf(ints.y as bigint, size) }),
+            private: storeKey({ type: 'private', kind, ints, publicBytes: bytesOf(ints.y as bigint, size), privateBytes: minimalBytesOf(ints.x as bigint) })
+        };
     }
     if (Object.prototype.hasOwnProperty.call(EDWARDS, kind)) {
         const spec = EDWARDS[kind];
@@ -966,6 +1531,10 @@ function kindFromOid(oid: string): { kind: KeyKind; curve?: EcCurve } {
     for (const name of Object.keys(EC_CURVES)) {
         if (EC_CURVES[name].oid === oid) return { kind: 'ec', curve: EC_CURVES[name] };
     }
+    /* The four OIDs with no curve behind them: RSA, RSA-PSS, DSA and DH. */
+    for (const name of Object.keys(INT_KIND_OIDS)) {
+        if (INT_KIND_OIDS[name] === oid) return { kind: name as KeyKind };
+    }
     throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Unsupported key algorithm');
 }
 
@@ -987,8 +1556,8 @@ function oidOf(node: DerNode): string {
     return parts.join('.');
 }
 
-/** Pulls an AlgorithmIdentifier apart into the algorithm OID and, for EC, the curve OID. */
-function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve } {
+/** Pulls an AlgorithmIdentifier apart into the algorithm OID, the EC curve and the DSA/DH domain. */
+function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve; domain?: DerNode } {
     const [oidNode, params] = node.children;
     if (oidNode === undefined || oidNode.tag !== DER_OID) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid key: no algorithm identifier');
     const algorithm = oidOf(oidNode);
@@ -996,7 +1565,21 @@ function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve } {
         if (params === undefined || params.tag !== DER_OID) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid EC key: no curve');
         return { kind: 'ec', curve: curveForOid(oidOf(params)) };
     }
+    /* DSA carries p, q and g and DH carries p and g, and both halves of a key need them. */
+    if (algorithm === OID_DSA || algorithm === OID_DH) {
+        if (params === undefined || params.tag !== DER_SEQUENCE) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid key: no domain parameters');
+        return { kind: algorithm === OID_DSA ? 'dsa' : 'dh', domain: params };
+    }
     return kindFromOid(algorithm);
+}
+
+/** The p, q and g of a DSA domain or the p and g of a DH one, as integers. */
+function domainOf(node: DerNode): { p: bigint; q?: bigint; g: bigint } {
+    const parts = node.children;
+    if (parts.length < 2 || parts.some((part) => part.tag !== DER_INTEGER)) {
+        throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid key: bad domain parameters');
+    }
+    return { p: intOf(parts[0]), q: parts.length > 2 ? intOf(parts[1]) : undefined, g: intOf(parts[parts.length - 1]) };
 }
 
 function curveForOid(oid: string): EcCurve {
@@ -1015,6 +1598,16 @@ function importSpki(bytes: Uint8Array): KeyRecord {
         throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid SPKI: bad public key bit string');
     }
     const found = algorithmOf(algorithm);
+    if (found.kind === 'rsa' || found.kind === 'rsa-pss') {
+        const inner = derRead(subject.content.subarray(1));
+        if (inner.tag !== DER_SEQUENCE || inner.children.length !== 2) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid RSA public key');
+        const ints: IntKey = { n: intOf(inner.children[0]), e: intOf(inner.children[1]) };
+        return { type: 'public', kind: found.kind, ints, publicBytes: bytesOf(ints.n as bigint, modulusSize(ints.n as bigint)) };
+    }
+    if (found.kind === 'dsa' || found.kind === 'dh') {
+        const ints: IntKey = { ...(domainOf(found.domain as DerNode)), y: intOf(derRead(subject.content.subarray(1))) };
+        return { type: 'public', kind: found.kind, ints, publicBytes: bytesOf(ints.y as bigint, modulusSize(ints.p as bigint)) };
+    }
     const pub = subject.content.subarray(1);
     if (found.kind === 'ec') {
         const curve = found.curve as EcCurve;
@@ -1033,6 +1626,29 @@ function importPkcs8(bytes: Uint8Array): KeyRecord {
     const found = algorithmOf(root.children[1]);
     const wrapped = root.children[2];
     if (wrapped.tag !== DER_OCTET_STRING) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid PKCS#8: private key is not an OCTET STRING');
+    if (found.kind === 'rsa' || found.kind === 'rsa-pss') {
+        const inner = derRead(wrapped.content);
+        const parts = inner.children;
+        if (inner.tag !== DER_SEQUENCE || parts.length !== 9) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid RSA private key');
+        const ints: IntKey = {
+            n: intOf(parts[1]),
+            e: intOf(parts[2]),
+            d: intOf(parts[3]),
+            p: intOf(parts[4]),
+            q: intOf(parts[5]),
+            dp: intOf(parts[6]),
+            dq: intOf(parts[7]),
+            qi: intOf(parts[8])
+        };
+        return { type: 'private', kind: found.kind, ints, publicBytes: bytesOf(ints.n as bigint, modulusSize(ints.n as bigint)), privateBytes: bytesOf(ints.d as bigint, modulusSize(ints.n as bigint)) };
+    }
+    /* Inside PKCS#8 a DSA or DH private key is the bare INTEGER x, with the domain alongside it. */
+    if (found.kind === 'dsa' || found.kind === 'dh') {
+        const x = intOf(derRead(wrapped.content));
+        const domain = domainOf(found.domain as DerNode);
+        const ints: IntKey = { ...domain, x, y: modPow(domain.g, x, domain.p) };
+        return { type: 'private', kind: found.kind, ints, publicBytes: bytesOf(ints.y as bigint, modulusSize(ints.p as bigint)), privateBytes: minimalBytesOf(x) };
+    }
     if (found.kind === 'ec') return importEcPrivateKey(wrapped.content, found.curve as EcCurve);
     /* RFC 8410: the OCTET STRING holds another OCTET STRING with the seed or scalar inside. */
     const inner = derRead(wrapped.content);
@@ -1057,6 +1673,23 @@ function importEcPrivateKey(content: Uint8Array, curve: EcCurve): KeyRecord {
 
 function importJwk(jwk: any, want: 'public' | 'private'): KeyRecord {
     if (jwk === null || typeof jwk !== 'object') throw keyFail('ERR_CRYPTO_INVALID_JWK', 'Invalid JWK');
+    if (jwk.kty === 'RSA') {
+        const n = bigOf(fromBase64url(jwk.n, 'n'));
+        const size = modulusSize(n);
+        const ints: IntKey = { n, e: bigOf(fromBase64url(jwk.e, 'e')) };
+        if (want === 'public') return { type: 'public', kind: 'rsa', ints, publicBytes: bytesOf(n, size) };
+        const d = bigOf(fromBase64url(jwk.d, 'd'));
+        ints.d = d;
+        /* The CRT parts are optional in a JWK, and a key that carries them signs the same way. */
+        if (typeof jwk.p === 'string' && typeof jwk.q === 'string') {
+            ints.p = bigOf(fromBase64url(jwk.p, 'p'));
+            ints.q = bigOf(fromBase64url(jwk.q, 'q'));
+            ints.dp = typeof jwk.dp === 'string' ? bigOf(fromBase64url(jwk.dp, 'dp')) : ints.d % (ints.p - 1n);
+            ints.dq = typeof jwk.dq === 'string' ? bigOf(fromBase64url(jwk.dq, 'dq')) : ints.d % (ints.q - 1n);
+            ints.qi = typeof jwk.qi === 'string' ? bigOf(fromBase64url(jwk.qi, 'qi')) : modInverse(ints.q, ints.p);
+        }
+        return { type: 'private', kind: 'rsa', ints, publicBytes: bytesOf(n, size), privateBytes: bytesOf(d, size) };
+    }
     if (jwk.kty === 'EC') {
         const curve = curveFor(jwk.crv);
         if (want === 'public') {
@@ -1083,8 +1716,21 @@ function importJwk(jwk: any, want: 'public' | 'private'): KeyRecord {
     throw keyFail('ERR_CRYPTO_INVALID_JWK', 'Unsupported JWK key type: ' + String(jwk.kty));
 }
 
-function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown): Uint8Array {
+function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown): Uint8Array {
     if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type public, expected private.');
+    if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
+        const name = digestNameFor(algorithm);
+        const spec = digestFor(name);
+        const mode = Number(padding) === RSA_PKCS1_PSS_PADDING ? RSA_PKCS1_PSS_PADDING : RSA_PKCS1_PADDING;
+        return rsaSignWith(key.ints as IntKey, spec.fn(data, 0), name, mode, pssSaltLength(saltLength, spec.out));
+    }
+    if (key.kind === 'dsa') {
+        const name = digestNameFor(algorithm);
+        return dsaSignWith(key.ints as IntKey, digestFor(name).fn(data, 0));
+    }
+    if (key.kind === 'dh') {
+        throw keyFail('ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE', 'error:03000096:digital envelope routines::operation not supported for this keytype');
+    }
     const spec = EDWARDS[key.kind];
     if (spec !== undefined) {
         /*
@@ -1111,8 +1757,22 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncod
     return signed.toBytes(dsaEncoding === 'ieee-p1363' ? 'compact' : 'der');
 }
 
-function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signature: Uint8Array): boolean {
+function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signature: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown): boolean {
     if (key.type !== 'public' && key.type !== 'private') return false;
+    if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
+        const name = digestNameFor(algorithm);
+        const spec = DIGEST_SPECS[name];
+        if (spec === undefined) return false;
+        const mode = Number(padding) === RSA_PKCS1_PSS_PADDING ? RSA_PKCS1_PSS_PADDING : RSA_PKCS1_PADDING;
+        /* A PSS check the caller named no salt length for is AUTO, which accepts any salt. */
+        return rsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), name, signature, mode, saltLength === undefined || saltLength === null ? -2 : pssSaltLength(saltLength, spec.out));
+    }
+    if (key.kind === 'dsa') {
+        const spec = DIGEST_SPECS[digestNameFor(algorithm)];
+        if (spec === undefined) return false;
+        return dsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), signature);
+    }
+    if (key.kind === 'dh') return false;
     const spec = EDWARDS[key.kind];
     if (spec !== undefined) {
         if (spec.verify === undefined) return false;
@@ -1126,8 +1786,15 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
     const curve = key.curve as EcCurve;
     try {
         const digest = digestFor(algorithm).fn(data, 0);
+        /*
+         * Node parses the signature in the encoding it was asked for, and @noble would accept
+         * either: a 64-byte r||s pair is not a DER SEQUENCE and a DER SEQUENCE is not 64 bytes,
+         * so naming the format keeps a compact signature false under the 'der' default the way
+         * it is on the host instead of letting the auto-detecting parse pass it.
+         */
+        const format = dsaEncoding === 'ieee-p1363' ? 'compact' : 'der';
         /* Node accepts a high-S signature, so verification must too; signing still emits a low one. */
-        return curve.curve.verify(signature, digest, key.publicBytes as Uint8Array, { lowS: false, prehash: false });
+        return curve.curve.verify(signature, digest, key.publicBytes as Uint8Array, { lowS: false, prehash: false, format });
     } catch {
         return false;
     }
@@ -1283,13 +1950,8 @@ function isProbablePrime(candidate: bigint, rounds: number): boolean {
 
 /** A random odd `bits`-bit number with its top bit set, tested until one is probably prime. */
 function randomPrime(bits: number): bigint {
-    const rounds = bits >= 1024 ? 4 : 8;
-    for (let attempt = 0; attempt < 100000; attempt++) {
-        const candidate = bigOf(randomOf(Math.ceil(bits / 8)));
-        const trimmed = (candidate % (1n << BigInt(bits - 1))) | (1n << BigInt(bits - 1)) | 1n;
-        if (isProbablePrime(trimmed, rounds)) return trimmed;
-    }
-    throw dhFail('ERR_CRYPTO_INVALID_STATE', 'Could not find a prime of ' + bits + ' bits');
+    /* The sieved search, so a 1024-bit prime for a Diffie-Hellman group takes seconds, not minutes. */
+    return searchPrime(bits);
 }
 
 /** The prime for a size: the standard group when there is one, a fresh probable prime otherwise. */
@@ -1331,10 +1993,16 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     },
     /** Args {password, salt, keylen, N, r, p, maxmem}: the scrypt derived key; returns base64. */
     'crypto.scrypt': (args) => {
-        const N = args?.N === undefined ? 16384 : Number(args?.N);
-        const r = args?.r === undefined ? 8 : Number(args?.r);
-        const p = args?.p === undefined ? 1 : Number(args?.p);
-        const maxmem = args?.maxmem === undefined ? 32 * 1024 * 1024 : Number(args?.maxmem);
+        /*
+         * Node reaches its default for a parameter it is handed as zero: N:0 derives with the
+         * default cost, r:0 with the default block size, p:0 with the default parallelism and
+         * maxmem:0 with the default budget, so a degenerate value derives a key rather than
+         * throwing -- N:16,r:1,p:0 and N:16,r:1,p:1 are the same eight bytes on the host.
+         */
+        const N = args?.N ? Number(args?.N) : 16384;
+        const r = args?.r ? Number(args?.r) : 8;
+        const p = args?.p ? Number(args?.p) : 1;
+        const maxmem = args?.maxmem ? Number(args?.maxmem) : 32 * 1024 * 1024;
         /*
          * Node rejects a parameter set before it derives anything: N must be a power of two above
          * one, r and p must be positive, and the whole 128*N*r working set must fit in maxmem.
@@ -1415,10 +2083,19 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     /** Args {id}: what the guest's KeyObject getters answer. */
     'crypto.key.info': (args) => {
         const key = keyFor(args?.id, 'key.info');
+        const ints = key.ints;
+        let details: Record<string, unknown> = {};
+        if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
+            /* Node answers publicExponent as a BigInt, so the width travels as text and the
+               guest's own BigInt is what a caller actually sees on asymmetricKeyDetails. */
+            details = { modulusLength: (ints?.n as bigint).toString(2).length, publicExponent: (ints?.e as bigint).toString() };
+        } else if (key.kind === 'dsa') {
+            details = { modulusLength: (ints?.p as bigint).toString(2).length, divisorLength: (ints?.q as bigint).toString(2).length };
+        }
         return {
             type: key.type,
             asymmetricKeyType: key.kind === 'ec' ? 'ec' : key.kind,
-            asymmetricKeyDetails: key.kind === 'ec' ? { namedCurve: (key.curve as EcCurve).node } : {}
+            asymmetricKeyDetails: key.kind === 'ec' ? { namedCurve: (key.curve as EcCurve).node } : details
         };
     },
     /** Args {id, format, type}: the exported key, as base64 (pem/der) or as a JWK object. */
@@ -1492,10 +2169,10 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', `Invalid key object type ${key.type}, expected private.`);
         }
         if (key.publicBytes === undefined) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Key has no public half');
-        return { id: storeKey({ type: 'public', kind: key.kind, curve: key.curve, publicBytes: Uint8Array.from(key.publicBytes) }) };
+        return { id: storeKey({ type: 'public', kind: key.kind, curve: key.curve, ints: key.ints, publicBytes: Uint8Array.from(key.publicBytes) }) };
     },
-    /** Args {id, algorithm, data, dsaEncoding}: the signature of a digest or message; returns base64. */
-    'crypto.key.sign': (args) => bytesToBase64(signWith(keyFor(args?.id, 'key.sign'), args?.algorithm, bytesArg(args?.data), args?.dsaEncoding)),
+    /** Args {id, algorithm, data, dsaEncoding, padding, saltLength}: the signature; returns base64. */
+    'crypto.key.sign': (args) => bytesToBase64(signWith(keyFor(args?.id, 'key.sign'), args?.algorithm, bytesArg(args?.data), args?.dsaEncoding, args?.padding, args?.saltLength)),
     /*
      * Primality. Node answers checkPrime from a Miller-Rabin search with `checks` witnesses, and
      * generatePrime by drawing odd candidates of the width asked for until one passes; a safe prime
@@ -1522,8 +2199,8 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             return { bytes: bytesToBase64(bytesOf(candidate, Math.ceil(bits / 8))), value: candidate.toString() };
         }
         throw keyFail('ERR_CRYPTO_INVALID_STATE', 'Could not find a prime of ' + bits + ' bits');
-    },    /** Args {id, algorithm, data, signature}: whether the signature checks out. */
-    'crypto.key.verify': (args) => verifyWith(keyFor(args?.id, 'key.verify'), args?.algorithm, bytesArg(args?.data), bytesArg(args?.signature)),
+    },    /** Args {id, algorithm, data, signature, dsaEncoding, padding, saltLength}: whether it checks out. */
+    'crypto.key.verify': (args) => verifyWith(keyFor(args?.id, 'key.verify'), args?.algorithm, bytesArg(args?.data), bytesArg(args?.signature), args?.dsaEncoding, args?.padding, args?.saltLength),
 
     /* -----------------------------------------------------------------------------------------
      * Diffie-Hellman.
@@ -1601,6 +2278,18 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         const priv = keyFor(args?.private, 'dh.ecdh');
         const pub = keyFor(args?.public, 'dh.ecdh');
         if (priv.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type public, expected private.');
+        /* A classic DH agreement: both sides have to share the one group, and Node says so. */
+        if (priv.kind === 'dh' || pub.kind === 'dh') {
+            if (priv.kind !== 'dh' || pub.kind !== 'dh') throw keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Incompatible key types');
+            const mine = priv.ints as IntKey;
+            const theirs = pub.ints as IntKey;
+            if (mine.p !== theirs.p || mine.g !== theirs.g) {
+                throw keyFail('ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS', 'error:1C8000CB:Provider routines::mismatching domain parameters');
+            }
+            const other = theirs.y as bigint;
+            if (other < 2n || other >= (mine.p as bigint) - 1n) throw keyFail('ERR_CRYPTO_INVALID_PUBLIC_KEY', 'Invalid public key');
+            return bytesToBase64(bytesOf(modPow(other, mine.x as bigint, mine.p as bigint), modulusSize(mine.p as bigint)));
+        }
         if (pub.kind !== priv.kind) throw keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Incompatible key types');
         if (priv.kind === 'ec') {
             const curve = priv.curve as EcCurve;
@@ -1614,12 +2303,5 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             throw keyFail('ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE', 'error:03000096:digital envelope routines::operation not supported for this keytype');
         }
         return bytesToBase64(spec.getSharedSecret(priv.privateBytes as Uint8Array, pub.publicBytes as Uint8Array));
-    },
-    'crypto.dh.compute': (args) => {
-        const prime = bigOf(bytesArg(args?.prime));
-        const priv = bigOf(bytesArg(args?.private));
-        const pub = bigOf(bytesArg(args?.public));
-        const size = Math.ceil(prime.toString(16).length / 2);
-        return bytesToBase64(bytesOf(modPow(pub, priv, prime), size));
     },
 };

@@ -1,6 +1,16 @@
 id: owc-crypto-verify-dsaencoding-permissive
+title: 'RESOLVED: verify with the default 'der' dsaEncoding now rejects an ieee-p1363 signature'
 session_id: adv5-judge-crypto-4
 owner: adv5-judge-crypto-4
 classification: GUEST
-status: pending
+status: completed
 subject: 'crypto.verify / createVerify().verify() accept an ''ieee-p1363'' (r||s) ECDSA signature when dsaEncoding is left at its ''der'' default, where host Node 24.15 answers false: a 64-byte compact signature verified against P-256 with no dsaEncoding gives false on the host and true here. @noble/curves auto-detects both encodings in verify, so the check passes either way. Signing is exact in both directions since round 4 -- crypto.sign(..., {key, dsaEncoding:''ieee-p1363''}) emits 64 bytes matching host -- and verify with a matching dsaEncoding also agrees; only the default-mode mismatch is loose. The fix site is verifyWith in packages/core/src/process/executors/node/runtime/capabilities/crypto.ts, which would need the caller''s dsaEncoding and an explicit Signature.fromDER / fromCompact parse instead of the auto-detecting verify. Witness: /tmp/owc-judge-crypto-4/proj/main.js case F8-sign-ieee-then-der-verify, host {raw:64, der:70, rawOk:false, derOk:true} vs container {raw:64, der:70, rawOk:true, derOk:true}.'
+resolved_at: 4c63457fec2d62658bc765b0ac1a4289e8af1cd9 + the fix below (local main)
+body: |-
+  RESOLVED (adv5-fix-crypto-4) at local main 4c63457fec2d62658bc765b0ac1a4289e8af1cd9 + the fix below. Host node v24.15.0 against the
+  container, /tmp/owc-fix-crypto-4/full/main.js on both sides, over P-256, P-521 and ed25519: a
+  64-byte compact signature verified with the default dsaEncoding is false on both (it was true
+  here), a DER signature is true on both, and the two swap exactly when dsaEncoding is
+  'ieee-p1363'; createVerify().verify() agrees with crypto.verify(). @noble/curves auto-detects
+  both shapes, so verifyWith now names the format -- 'compact' or 'der' -- and parses only that
+  one. Ed25519 still ignores dsaEncoding, as it does on the host.
