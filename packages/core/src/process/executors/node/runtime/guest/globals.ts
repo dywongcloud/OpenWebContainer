@@ -849,7 +849,15 @@ if (procEnv.OWC_STDIN === 'pipe') {
   delete procEnv.OWC_STDIN;
   stdinOpen = true;
 }
-globalThis.process = proc;
+/* Node's process is an accessor pair on the global object -- non-enumerable, configurable, and
+   writable through its setter -- and not a data property: the descriptor of globalThis.process
+   reads a get and a set and no value. */
+Object.defineProperty(globalThis, 'process', {
+  get: function () { return proc; },
+  set: function (value) { proc = value; },
+  enumerable: false,
+  configurable: true
+});
 BF.process = function () {
   return proc;
 };
@@ -2824,9 +2832,13 @@ function circularStructureText(value, replacer) {
    * node's gzip of the same input is -- there is no incremental deflate here to differ from.
    */
   var CODECS = null;
-  function codecOf(format) {
+  function codecOf(tag, format) {
     if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
-      throw new TypeError('The "format" argument must be one of "deflate", "deflate-raw" or "gzip"');
+      /* Node names the class it refused to build and the value it refused, which is what a caller
+         reads when it hands a format the three it accepts do not include. */
+      throw new TypeError("Failed to construct '" + tag + "': 1st argument value "
+        + (typeof format === 'string' ? "'" + format + "'" : String(format))
+        + ' is not a valid enum value of type CompressionFormat.');
     }
     if (CODECS === null) CODECS = requireBuiltin('zlib');
     return CODECS;
@@ -2854,17 +2866,31 @@ function circularStructureText(value, replacer) {
   function makeCompressionStream(Ctor, tag, run) {
     function Stream(format) {
       if (!(this instanceof Ctor)) throw new TypeError("Constructor " + tag + " requires 'new'");
-      codecOf(format);
+      codecOf(tag, format);
       var held = [];
-      var pair = new TransformStream({
-        transform: function (chunk) { held.push(bytesOfChunk(chunk)); },
-        flush: function (controller) {
+      var controller = null;
+      /* A readable and a writable of its own make, and not a TransformStream: a write to a
+         TransformStream here never settles, because its readable is not read until the writable
+         has closed, so a stream whose whole output is produced on close would hang the caller. */
+      var readable = new ReadableStream({
+        start: function (c) { controller = c; },
+        cancel: function () { held = []; }
+      });
+      var writable = new WritableStream({
+        write: function (chunk) { held.push(bytesOfChunk(chunk)); },
+        close: function () {
           var out = run(format, joinBytes(held));
+          held = [];
           if (out.length > 0) controller.enqueue(new Uint8Array(out));
+          controller.close();
+        },
+        abort: function (reason) {
+          held = [];
+          controller.error(reason === undefined ? new TypeError('The stream was aborted') : reason);
         }
       });
-      Object.defineProperty(this, 'readable', { value: pair.readable, configurable: true });
-      Object.defineProperty(this, 'writable', { value: pair.writable, configurable: true });
+      Object.defineProperty(this, 'readable', { value: readable, configurable: true });
+      Object.defineProperty(this, 'writable', { value: writable, configurable: true });
     }
     Object.defineProperty(Stream.prototype, Symbol.toStringTag, { value: tag, configurable: true });
     Object.defineProperty(Stream.prototype, 'constructor', { value: Ctor, writable: true, configurable: true });
@@ -2872,20 +2898,28 @@ function circularStructureText(value, replacer) {
   }
   function CompressionStream(format) {
     return makeCompressionStream(CompressionStream, 'CompressionStream', function (kind, bytes) {
-      var zlib = codecOf(kind);
+      var zlib = codecOf('CompressionStream', kind);
       return kind === 'gzip' ? zlib.gzipSync(bytes) : kind === 'deflate' ? zlib.deflateSync(bytes) : zlib.deflateRawSync(bytes);
     }).call(this, format) || this;
   }
   CompressionStream.prototype = makeCompressionStream(CompressionStream, 'CompressionStream', function () { return new Uint8Array(0); }).prototype;
   function DecompressionStream(format) {
     return makeCompressionStream(DecompressionStream, 'DecompressionStream', function (kind, bytes) {
-      var zlib = codecOf(kind);
+      var zlib = codecOf('DecompressionStream', kind);
       return kind === 'gzip' ? zlib.gunzipSync(bytes) : kind === 'deflate' ? zlib.inflateSync(bytes) : zlib.inflateRawSync(bytes);
     }).call(this, format) || this;
   }
   DecompressionStream.prototype = makeCompressionStream(DecompressionStream, 'DecompressionStream', function () { return new Uint8Array(0); }).prototype;
   globalThis.CompressionStream = CompressionStream;
   globalThis.DecompressionStream = DecompressionStream;
+  /* Node 24 has URLPattern on the global object too, not only on 'node:url': the very class the
+     builtin exports, and non-enumerable there as it is on the global object. */
+  var urlBuiltin = requireBuiltin('url');
+  if (typeof urlBuiltin.URLPattern === 'function') {
+    Object.defineProperty(globalThis, 'URLPattern', {
+      value: urlBuiltin.URLPattern, writable: true, enumerable: false, configurable: true
+    });
+  }
 
   /* The classes above are classes, and node's are not enumerable on the global object either. */
   ['AsyncDisposableStack', 'BroadcastChannel', 'CompressionStream', 'Crypto', 'CryptoKey',

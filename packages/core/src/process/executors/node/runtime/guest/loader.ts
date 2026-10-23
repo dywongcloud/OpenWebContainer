@@ -14,6 +14,38 @@ var timers = Object.create(null);
 var nextTimerId = 1;
 var startedAt = host.now();
 
+/*
+ * The object the host bridge's own names stand on.
+ *
+ * Node's global object carries none of them, so the global object's own names here read as Node's
+ * do, and a name the loader or a generated module reaches through globalThis would otherwise
+ * become one of them: an assignment to a name found on the prototype chain lands on the receiver,
+ * not where it was found. Each name is therefore an accessor on the bridge, whose setter keeps the
+ * value beside it, so assigning globalThis.__owc_api still reaches the bridge and still leaves the
+ * global object's own names alone.
+ *
+ * The bridge stands behind the global object rather than on it, and one object stands in front of
+ * it: the one Node has there, whose only own name is 'constructor' -- so a walk that reaches the
+ * global object's prototype finds the names Node's walk finds, and a lookup one step further finds
+ * the bridge.
+ */
+var OWC_BRIDGE_VALUES = Object.create(null);
+var OWC_BRIDGE = Object.create(Object.prototype);
+function owcBridgeName(name) {
+  Object.defineProperty(OWC_BRIDGE, name, {
+    get: function () { return OWC_BRIDGE_VALUES[name]; },
+    set: function (value) { OWC_BRIDGE_VALUES[name] = value; },
+    enumerable: false,
+    configurable: true
+  });
+}
+['__owc_api', '__owcErrname', '__owc_importArg', '__owc_importMeta', '__owc_importWrap',
+  '__owc_moduleView', '__owc_import_failure', '__owcDependencyRequire', '__owc_esm_registry'
+].forEach(owcBridgeName);
+var OWC_BRIDGE_FRONT = Object.create(OWC_BRIDGE);
+OWC_BRIDGE_FRONT.constructor = Object;
+Object.setPrototypeOf(globalThis, OWC_BRIDGE_FRONT);
+
 function stripNodePrefix(name) {
   return name.indexOf('node:') === 0 ? name.slice(5) : name;
 }
@@ -529,7 +561,10 @@ function loadCJS(filename, parent, isMain) {
   var cached = MODULE_CACHE[filename];
   if (cached) return cached;
   var mod = new Module(filename, parent);
-  if (isMain) mainModule = mod;
+  /* Node's process.mainModule is the module the entry was loaded as, and it is there only for an
+     entry the CommonJS loader loaded: an ES module entry leaves the name off process entirely,
+     which is why this is set here and not where process is built. */
+  if (isMain) { mainModule = mod; proc.mainModule = mod; }
   MODULE_CACHE[filename] = mod;
   try {
     if (filename.slice(-5) === '.json') {
@@ -1180,10 +1215,10 @@ function importWrap(promise, strict) {
   });
 }
 
-Object.defineProperty(globalThis, '__owc_importMeta', { value: importMetaOf, writable: true, configurable: true });
-Object.defineProperty(globalThis, '__owc_moduleView', { value: moduleViewOf, writable: true, configurable: true });
-Object.defineProperty(globalThis, '__owc_importArg', { value: importArgOf, writable: true, configurable: true });
-Object.defineProperty(globalThis, '__owc_importWrap', { value: importWrap, writable: true, configurable: true });
+OWC_BRIDGE.__owc_importMeta = importMetaOf;
+OWC_BRIDGE.__owc_moduleView = moduleViewOf;
+OWC_BRIDGE.__owc_importArg = importArgOf;
+OWC_BRIDGE.__owc_importWrap = importWrap;
 
 var api = {
   drainTicks: function () {
