@@ -207,6 +207,13 @@ const REALM_REJECTION_SRC = '(function (note, record) {' +
     'var CELLS = new WeakMap();' +
     'class Tracked extends Native {' +
     'constructor(executor) {' +
+    /* 'new Promise()' with no resolver, or with one that is not a function: the synchronous
+       TypeError node raises, and not a rejection. This subclass stands in for 'Promise' in the
+       realm of a context and its constructor runs before the one under it, so without this the
+       throw happened inside the 'try' below, became a rejection of a promise nobody was holding,
+       and ended the process with exit 1 where host node 24.15 throws and exits 0. */
+    'if (typeof executor !== "function") {' +
+    'throw new TypeError("Promise resolver " + String(executor) + " is not a function"); }' +
     'var cell = { reason: undefined, rejected: false, handled: false, promise: null, domain: null,' +
     ' state: 0, value: undefined };' +
     'super(function (resolve, reject) {' +
@@ -217,8 +224,26 @@ const REALM_REJECTION_SRC = '(function (note, record) {' +
        instance of the guest's constructor, which is what `instanceof Promise` asks and answers
        false for, as on the host. */
     'var onResolve = function (value) {' +
+    /* What a promise settles with is the value the settling ends at, not the thenable it starts
+       from: host node 24.15 prints 'Promise { 3 }' for 'Promise.resolve({ then: function (r)
+       { r(3); } })' and 'Promise { 5 }' for 'new Promise(function (r) { r(Promise.resolve(5)); })'.
+       A thenable is adopted by the engine alone -- it calls 'then' itself, and the value that call
+       is handed reaches no wrapper -- so what is handed on here is a stand-in thenable of our own:
+       it forwards the one call the engine makes and writes down what it was given. */
+    'var then = undefined;' +
+    'try { if (value !== null && (typeof value === "object" || typeof value === "function"))' +
+    ' then = value.then; } catch (x) { then = undefined; }' +
+    'if (typeof then !== "function") {' +
     'if (cell.state === 0) { cell.state = 1; cell.value = value; }' +
-    'resolve(value); };' +
+    'return resolve(value); }' +
+    /* A thenable leaves the promise pending until the adoption ends: host node 24.15 prints
+       'Promise { <pending> }' for 'Promise.resolve({ then: ... })' read before the microtask that
+       runs 'then', so the cell is left open here and the stand-in below closes it. */
+    'return resolve({ then: function (ok, bad) {' +
+    'var wrote = function (how) { return function (inner) {' +
+    'if (cell.state === 0 || cell.state === 1) { cell.state = how; cell.value = inner; }' +
+    'return (how === 1 ? ok : bad)(inner); }; };' +
+    'return then.call(value, wrote(1), wrote(2)); } }); };' +
     'var wrapped = function (reason) {' +
     'cell.rejected = true; cell.reason = reason;' +
     'if (cell.state === 0) { cell.state = 2; cell.value = reason; }' +
@@ -542,7 +567,7 @@ function bridgeGlobals(host: VmHost, realm: VmRealm): void {
             '}' +
             'for (var w = 0; w < whole.length; w++) {' +
             'if (src[whole[w]] === undefined) continue;' +
-            'try { Object.defineProperty(globalThis, whole[w], { value: src[whole[w]], writable: true, configurable: true }); } catch (x) { }' +
+            'try { Object.defineProperty(globalThis, whole[w], { value: src[whole[w]], writable: true, enumerable: false, configurable: true }); } catch (x) { }' +
             '}' +
             'for (var i = 0; i < names.length; i++) {' +
             'var n = names[i];' +
@@ -550,7 +575,11 @@ function bridgeGlobals(host: VmHost, realm: VmRealm): void {
             'var s = src[n];' +
             'if (s === undefined) continue;' +
             'if (!Object.prototype.hasOwnProperty.call(globalThis, n)) {' +
-            'try { globalThis[n] = s; } catch (x) { }' +
+            /* Not a plain assignment: that leaves the name enumerable, and host node 24.15 answers
+               '[]' for 'Object.keys(globalThis)' inside a context -- every global a context is
+               given beyond the ones the engine built is one Node's own global object does not
+               enumerate, so a bridged name has to carry 'enumerable: false' as it arrives. */
+            'try { Object.defineProperty(globalThis, n, { value: s, writable: true, enumerable: false, configurable: true }); } catch (x) { }' +
             'continue;' +
             '}' +
             'var d = globalThis[n];' +
@@ -1721,7 +1750,12 @@ export const VM_CAPABILITIES: Record<string, CapabilityHandler> = {
         try {
             syncIn(host, realm, sandbox);
             if (context.typeof(cons) === 'object') {
-                realm.ctx.setProp(realm.ctx.global, 'console', cons);
+                /* Not `setProp`: a property it creates is enumerable, and host node 24.15 answers
+                   '[]' for 'Object.keys(globalThis)' inside a context -- 'console' is a global a
+                   context is given and not one Node's own global object enumerates. */
+                realm.ctx.defineProp(realm.ctx.global, 'console', {
+                    value: cons, writable: true, enumerable: false, configurable: true
+                });
                 realm.injected.add('console');
             }
             const source = context.dump(code);

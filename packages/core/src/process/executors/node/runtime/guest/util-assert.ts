@@ -624,12 +624,18 @@ class TrackedPromise extends NATIVE_PROMISE {
         try {
           if (value !== null && (typeof value === 'object' || typeof value === 'function')) then = value.then;
         } catch (x) { then = undefined; }
-        if (typeof then !== 'function') return resolve(value);
+        if (typeof then !== 'function') {
+          if (cell.state === 0) { cell.state = 1; cell.value = value; }
+          return resolve(value);
+        }
+        /* A thenable leaves the promise pending until the adoption ends: host node 24.15 prints
+           'Promise { <pending> }' for 'Promise.resolve({ then: ... })' read before the microtask
+           that runs 'then', so the cell is left open here and the stand-in below closes it. */
         return resolve({
           then: function (onFulfilled, onRejected) {
             var wrote = function (how) {
               return function (inner) {
-                if (cell.state === 1) { cell.state = how; cell.value = inner; }
+                if (cell.state === 0 || cell.state === 1) { cell.state = how; cell.value = inner; }
                 return (how === 1 ? onFulfilled : onRejected)(inner);
               };
             };
@@ -639,8 +645,11 @@ class TrackedPromise extends NATIVE_PROMISE {
       };
       var took = function (how) {
         return function (value) {
-          if (cell.state === 0) { cell.state = how; cell.value = value; }
-          return how === 1 ? resolveAdopting(value) : reject(value);
+          if (how !== 1) {
+            if (cell.state === 0) { cell.state = how; cell.value = value; }
+            return reject(value);
+          }
+          return resolveAdopting(value);
         };
       };
       var onResolve = took(1);
@@ -686,8 +695,17 @@ function promiseInspectOf(v, depth, indent) {
   var head = (ctorText && ctorText !== 'Promise' && ctorText !== 'Object') ? ctorText + ' [Promise]' : 'Promise';
   var cell = PROMISE_CELLS.get(v);
   if (cell === undefined || cell.state === 0) return head + ' { <pending> }';
-  if (cell.state === 2) return head + ' { <rejected> ' + fmtPromiseValue(cell.value, depth, indent) + ' }';
-  return head + ' { ' + fmtPromiseValue(cell.value, depth, indent) + ' }';
+  var inner = fmtPromiseValue(cell.value, depth, indent);
+  var body = (cell.state === 2 ? '<rejected> ' : '') + inner;
+  /* A value that prints on more than one line -- an error, whose stack is part of what it prints --
+     opens the braces instead of sitting inside them: host node 24.15 writes
+     'Promise {\n  <rejected> Error: r\n      at ...\n}' and not one line with a stack hanging off
+     it. The rest of the value keeps its own indent, two in from the brace it is under. */
+  if (body.indexOf('\n') >= 0) {
+    var pad = ' '.repeat(indent + 2);
+    return head + ' {\n' + pad + body.split('\n').join('\n' + pad) + '\n' + ' '.repeat(indent) + '}';
+  }
+  return head + ' { ' + body + ' }';
 }
 
 /* The value inside a promise, printed at the depth the promise itself is at: Node gives the
