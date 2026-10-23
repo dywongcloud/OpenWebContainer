@@ -1,7 +1,0 @@
-id: owc-shell-exec-not-found-wording
-subject: '`exec nosuchcmd` reports the command it cannot find without naming `exec` or the line'
-description: 'Measured 2026-10-23, differential against this machine''s /bin/sh (bash 3.2.57), live container at local HEAD 91e46e7. `exec nosuchcmdxyz` is host stderr "/bin/sh: line 0: exec: nosuchcmdxyz: not found" and status 127, container stderr "sh: nosuchcmdxyz: command not found" and status 127 -- the same status, but a host names `exec` as the builtin that failed and carries the `line 0` the jobspec diagnostics carry, while the container reports it as a bare command lookup. Fix site: `execBuiltin` in packages/core/src/shell/commands/builtins.ts.'
-owner: lanmower
-session_id: adv3-judge-shell-fd-3
-witness_plan: 'Run `exec nosuchcmdxyz` on both sides; stderr must hold `sh: line 0: exec: nosuchcmdxyz: not found` and the status 127.'
-status: pending

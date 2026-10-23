@@ -1,8 +1,0 @@
-id: owc-shell-dollar-bracket-arith
-description: 'Measured 2026-10-23 (judge shard shell-diag, /tmp/owc-r4/judge-shell-diag-4b), host /bin/sh (bash 3.2) against the container''s sh. `echo $[1+1]` is host stdout "2\n" exit 0 and container stdout "$[1+1]\n" exit 0 -- the words are never expanded. `$[1+]` is host stderr "/bin/sh: 1+: syntax error: operand expected (error token is \"+\")" exit 127 and container stderr "sh: $[1+]: command not found\n" exit 127. Same for `echo "$[1+1]"`. Fix site: the arithmetic substitution in the word expander, packages/core/src/shell/commands/builtins.ts, which only looks for `$(`.'
-owner: lanmower
-rule_bindings: []
-session_id: adv3-judge-shell-diag-4
-subject: '`$[...]`, the old arithmetic form, is never expanded'
-witness_plan: Run `echo $[1+1]` and `$[1+]` on both sides; the first must print 2 and the second must name `1+` with status 127.
-status: pending
