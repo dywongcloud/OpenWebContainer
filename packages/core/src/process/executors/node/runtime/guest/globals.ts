@@ -974,6 +974,34 @@ var CJS_REQUIRE_TAIL = [
 var BOOTSTRAP_MARK = 'owc-bootstrap.js:';
 var CJS_CALL_FRAME = '    at call (native)';
 
+/*
+ * The frames host node writes behind the body of an ES module: the job that ran the module and the
+ * loader the job belongs to, then the entry that asked for the run. Captured from the build
+ * NODE_VERSION names, as the frames of a module that is not there are.
+ */
+var ESM_MAIN_TAIL = [
+  '    at ModuleJob.run (node:internal/modules/esm/module_job:437:25)',
+  '    at async node:internal/modules/esm/loader:639:26',
+  '    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)'
+];
+
+/*
+ * Every file this process compiled as an ES module, named by the host as it compiles one. Node names
+ * a frame in an ES module by the URL of its file -- file:///app/main.mjs -- and a frame in a
+ * CommonJS one by its path, so which of the two a file is decides the form its frames take, and it
+ * is the host that decides: a .js file is a module or not by the package it sits in.
+ */
+var ESM_FILES = Object.create(null);
+/* The ones the entry point ran: a module the entry imports is evaluated inside the run the entry
+   point started, and node names that run -- asyncRunEntryPointWithESMLoader -- behind a trace out
+   of such a module and behind no module a dynamic import loads once the entry has finished. */
+var ESM_ENTRY_FILES = Object.create(null);
+api.markEsmFile = function (file, inEntryRun) {
+  if (typeof file !== 'string' || file === '') return;
+  ESM_FILES[file] = true;
+  if (inEntryRun) ESM_ENTRY_FILES[file] = true;
+};
+
 /* One frame of this container's own: every frame the bootstrap puts on a stack names its file. */
 function isBootstrapFrame(text) {
   return typeof text === 'string' && text.indexOf(BOOTSTRAP_MARK) >= 0;
@@ -1017,6 +1045,34 @@ function frameColumnUnwrapped(text) {
   return parsed[1] + parsed[2] + parsed[3] + ':1:' + column + (parsed[6] === undefined ? '' : parsed[6]);
 }
 
+/* How many of node's ESM loader frames go behind this one, and 0 when none do: 3 for the top-level
+   frame of a module the entry point ran, 2 for the top-level frame of any other ES module -- a
+   dynamic import loads its module outside the run the entry point started, so node names the job
+   and the loader and stops -- and 0 for a frame that is not one, which is every frame that names
+   the function it is in. */
+function esmTailOf(text) {
+  if (/^(\s*)at [^\s()]+:\d+:\d+\s*$/.test(text) === false) return 0;
+  var where = frameLocation(text);
+  if (ESM_ENTRY_FILES[where] === true) return 3;
+  return ESM_FILES[where] === true ? 2 : 0;
+}
+
+/* The file a frame names, without the line and column behind it. */
+function frameLocation(text) {
+  var parsed = FRAME_AT_COLUMN.exec(text);
+  return parsed === null ? '' : parsed[3];
+}
+
+/* The same frame with the URL of an ES module where the engine wrote the module's path: node names
+   file:///app/main.mjs for the file this engine names /app/main.mjs, and names the path alone for a
+   file it compiled inside the CommonJS wrapper. */
+function frameFileUrl(text) {
+  var parsed = FRAME_AT_COLUMN.exec(text);
+  if (parsed === null || ESM_FILES[parsed[3]] !== true) return text;
+  return parsed[1] + parsed[2] + 'file://' + parsed[3] + ':' + parsed[4] + ':' + parsed[5] +
+    (parsed[6] === undefined ? '' : parsed[6]);
+}
+
 /*
  * A guest's frames with this container's own taken out and node's put in their place: the call into
  * a compiled CommonJS body, the loader that made it and the require or the entry behind it are one
@@ -1052,7 +1108,17 @@ function guestFramesOf(lines) {
     out.push(line);
     at++;
   }
-  for (var n = 0; n < out.length; n++) out[n] = anonymousFrameName(frameColumnUnwrapped(out[n]));
+  /* A run of frames out of an ES module ends in the module's own top-level frame -- a bare location,
+     with no function in front of it -- and node names the loader behind that one frame and no
+     other: the job it made of the module, the loader that ran the job, and, for a module the entry
+     point ran, the entry point itself. */
+  var n = 0;
+  for (; n < out.length; n++) out[n] = anonymousFrameName(frameColumnUnwrapped(out[n]));
+  var esmTail = out.length === 0 ? 0 : esmTailOf(out[out.length - 1]);
+  for (n = 0; n < out.length; n++) out[n] = frameFileUrl(out[n]);
+  if (esmTail > 0) {
+    for (var em = 0; em < esmTail && em < ESM_MAIN_TAIL.length; em++) out.push(ESM_MAIN_TAIL[em]);
+  }
   return out;
 }
 

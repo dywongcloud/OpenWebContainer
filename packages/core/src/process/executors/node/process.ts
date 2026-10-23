@@ -1063,6 +1063,12 @@ export class NodeProcess extends Process {
     private fatalError?: unknown;
     /** The last resolve failure, with the Node code the error it becomes is raised under. */
     private lastResolveError?: Error & { code?: string };
+    /**
+     * True while the entry module's own `evalCode` runs: every module the engine loads in that
+     * window belongs to the graph the entry point ran, which is what puts
+     * `asyncRunEntryPointWithESMLoader` behind a trace out of one.
+     */
+    private esmEntryLoading = false;
     private stopped = false;
     private capabilityContext: CapabilityContext;
     /** Set for a run inside a capability call (runToCompletionSync): timers and host operations are stepped there. */
@@ -2222,7 +2228,17 @@ export class NodeProcess extends Process {
         const context = this.context!;
         const raw = this.fileSystem.readFile(entryPath) ?? '';
         const source = this.esmSource(raw, entryPath, true);
-        const result = context.evalCode(source, entryPath, { type: 'module' });
+        /* The whole graph the entry imports is resolved and evaluated inside this one call, so a
+           module loaded during it is one the entry point ran -- which is what puts
+           asyncRunEntryPointWithESMLoader behind the frames of a trace out of it, and behind no
+           module a later dynamic import loads. */
+        this.esmEntryLoading = true;
+        let result;
+        try {
+            result = context.evalCode(source, entryPath, { type: 'module' });
+        } finally {
+            this.esmEntryLoading = false;
+        }
         if (result.error) {
             /* A module the engine cannot compile is reported the way node reports one -- the file,
                the line, a caret -- and not as a bare stack: see esmSyntaxFailureText. */
@@ -2748,6 +2764,11 @@ export class NodeProcess extends Process {
      * source that compiles reaches the engine unchanged.
      */
     private esmSource(source: string, file: string, isMain: boolean, urlSuffix = ''): string {
+        /* A frame the engine names in a file compiled as an ES module is one node names by the
+           file's URL and not by its path, so the guest is told which files those are as they are
+           compiled: a .js file is a module here or not by the package it sits in, which only the
+           resolver knows. */
+        this.markEsmFile(file, isMain || this.esmEntryLoading);
         /* Node 24 strips the types out of a `.ts`, `.mts` or `.cts` file before it compiles what
            is left, and so does this: see stripTsTypes. What Node refuses to strip -- an `enum`, a
            `namespace`, a parameter property -- is refused here too, in its own words. */
@@ -2809,6 +2830,26 @@ export class NodeProcess extends Process {
         } finally {
             context.dispose();
             runtime.dispose();
+        }
+    }
+
+    /**
+     * Tells the guest that `file` is compiled as an ES module, so a frame the engine names in it is
+     * rendered as node renders one -- `file:///app/main.mjs`, and with the loader's frames behind
+     * the module the entry is. A guest that has already gone has no stack left to name.
+     */
+    private markEsmFile(file: string, inEntryRun: boolean): void {
+        const context = this.context;
+        if (context === undefined || this.api === undefined || file === '') return;
+        const arg = context.newString(file);
+        const entry = context.newNumber(inEntryRun ? 1 : 0);
+        try {
+            this.callApi('markEsmFile', [arg, entry]).dispose();
+        } catch {
+            // a guest that is gone, or one that has no marker: the frame keeps the path it has
+        } finally {
+            arg.dispose();
+            entry.dispose();
         }
     }
 
