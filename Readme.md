@@ -403,8 +403,12 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   system keeps no modification time with a file.** A host comparing a file with itself answers false too --
   `[[ /bin/sh -nt /bin/sh ]]` is false there -- which is what the two agree on; `touch a; sleep 1; touch b;
   [[ b -nt a ]]` is true on the host and false here. `test -nt` reads a real `mtimeMs` where it has one and
-  is subject to the same gap. `[[ -w /bin/sh ]]` and `-x` answer from a file's *existence* inside `[[ ]]`,
-  where a host answers from its mode, so a file only its owner may write is writable here and not there.
+  is subject to the same gap. `[[ -w ]]`, `-x` and `-r` answer from a file's *mode* against the account the
+  shell runs as, as a host does: `[[ -w /bin/sh ]]` is false, that file being `-rwxr-xr-x` and owned by
+  root, while `touch f; [[ -w f ]]` is true. Who owns a name is decided the way `ls -ln` decides it -- the
+  directories the container was built with belong to root, and the tree the shell was started in, with
+  every name the shell made in it, belongs to the account it runs as -- which is the one thing a mode is
+  read against that this file system has no table of its own for.
 - **A mode `chmod` sets does not outlive the `sh -c` line that set it.** The metadata side table it writes is
   keyed by the file system object a line was handed, so `chmod 700 f` in one `sh -c` and `ls -l f` in the next
   prints `-rw-r--r--`, where a host prints `-rwx------`; within one line the mode is there. Separately, a
