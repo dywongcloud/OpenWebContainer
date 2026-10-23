@@ -73,12 +73,45 @@ function netDescribe(value) {
   return 'type ' + typeof value + ' (' + String(value) + ')';
 }
 
+/**
+ * Renders a value the way Node's inspect does it in an ERR_INVALID_ARG_VALUE message -- the whole
+ * options object is named, not just the property at fault: "The argument 'options' is invalid.
+ * Received { path: 123 }".
+ */
+function netInspectValue(value, depth) {
+  if (typeof value === 'string') return "'" + value + "'";
+  if (typeof value === 'function') return '[Function' + (value.name ? ': ' + value.name : '') + ']';
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+  if (Buffer.isBuffer(value)) {
+    var hex = [];
+    for (var b = 0; b < value.length; b++) hex.push(('0' + value[b].toString(16)).slice(-2));
+    return '<Buffer' + (hex.length > 0 ? ' ' + hex.join(' ') : '') + '>';
+  }
+  if (typeof value !== 'object') return String(value);
+  if (depth > 2) return Array.isArray(value) ? '[Array]' : '[Object]';
+  var parts = [];
+  for (var key in value) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) parts.push(key + ': ' + netInspectValue(value[key], depth + 1));
+  }
+  if (Array.isArray(value)) return '[ ' + parts.join(', ') + ' ]';
+  return parts.length === 0 ? '{}' : '{ ' + parts.join(', ') + ' }';
+}
+
 function netIsIPv4(value) {
   return typeof value === 'string' && /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(value);
 }
 
 function netIsIPv6(value) {
   if (typeof value !== 'string' || value.indexOf(':') === -1) return false;
+  /* A zone (scope) id is part of a literal, not part of a name: Node's isIPv6 answers 6 for
+     '::1%lo0' and 0 for a '%' with nothing after it, and a socket dialling the scoped literal
+     connects to the address the zone is attached to ('::1'), which is what it then reports. */
+  var zoneAt = value.indexOf('%');
+  if (zoneAt !== -1) {
+    if (zoneAt === value.length - 1) return false;
+    value = value.slice(0, zoneAt);
+  }
   var halves = value.split('::');
   if (halves.length > 2) return false;
   var groups = 0;
@@ -1249,6 +1282,38 @@ BF['net'] = function () {
     return this;
   };
 
+  /* Node tears a connection down with a reset: what the peer has not read is discarded, so the peer
+     sees ECONNRESET where a plain destroy hands it end-of-file. This hub has no RST flag of its own
+     -- a close that leaves bytes unread is what it reports as a reset -- so the socket is closed as
+     one with unread data, whatever it had actually consumed. */
+  Socket.prototype.resetAndDestroy = function () {
+    this._closeHub(1);
+    this.destroy();
+    return this;
+  };
+
+  /* The Type-of-Service (DSCP) byte a socket sends with. Node 24.15 answers 0 for a socket that has
+     never set one, and for a destroyed one too; setting it validates the number and nothing else --
+     this virtual network carries no IP header to put it in, so it is remembered for the getter and
+     is not reported to the peer. */
+  Socket.prototype.getTypeOfService = function () {
+    return this._tos === undefined ? 0 : this._tos;
+  };
+
+  Socket.prototype.setTypeOfService = function (tos) {
+    if (typeof tos !== 'number') {
+      throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "tos" argument must be of type number. Received ' + netDescribe(tos));
+    }
+    if (!Number.isInteger(tos) || tos < 0 || tos > 255) {
+      throw netError(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "tos" is out of range. It must be >= 0 && <= 255. Received ' + String(tos));
+    }
+    this._tos = tos;
+    /* Node answers with the socket, so the call chains as setNoDelay and setKeepAlive do. */
+    return this;
+  };
+
   class Server extends EventEmitter {
     constructor(options, listener) {
       super();
@@ -1280,6 +1345,18 @@ BF['net'] = function () {
       var args = netListenArgs(arguments);
       if (this._listening) {
         throw netError(Error, 'ERR_SERVER_ALREADY_LISTEN', 'Listen method has been called more than once without closing.');
+      }
+      /* Node reads the 'path' option only when the path is what is being bound: a port named
+         alongside it wins and is bound, and no property of the path is looked at then -- host Node
+         24.15 binds :8080 for {path: 123, port: 8080}. A path named alone must be a non-empty
+         string: a number, a Buffer, an object, null and '' are each ERR_INVALID_ARG_VALUE there,
+         naming the whole options object, where this runtime bound or mis-refused them. */
+      var given = arguments.length > 0 ? arguments[0] : undefined;
+      if (given !== null && typeof given === 'object'
+        && Object.prototype.hasOwnProperty.call(given, 'path') && given.port === undefined
+        && (typeof given.path !== 'string' || given.path === '')) {
+        throw netError(TypeError, 'ERR_INVALID_ARG_VALUE',
+          "The argument 'options' is invalid. Received " + netInspectValue(given, 0));
       }
       /* A 'path' option names a unix domain socket, which the virtual hub carries by path: the
          socket binds, accepts and connects as the host's does, and reports no address, because a
@@ -1316,6 +1393,10 @@ BF['net'] = function () {
         res = callCap('net.listen', { address: usePath ? path : netListenHub(shown), port: port, targetId: this._targetId });
       } catch (cause) {
         var failed = netSystemError(cause, 'listen', shown, usePath ? -1 : port);
+        /* A unix bind that failed still answers address() with the path it was asked for, as host
+           Node 24.15 does for the 105-byte path it refuses EINVAL: the server never listened, but
+           the path is the name it was given, and it is what a host's address() reports. */
+        if (usePath) this._address = path;
         var failedServer = this;
         netDefer(function () { failedServer.emit('error', failed); });
         return this;

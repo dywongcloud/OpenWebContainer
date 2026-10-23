@@ -1,0 +1,55 @@
+id: owc-virtual-net-wildcard-mapped
+session_id: adv5-fix-http2-net-5
+owner: adv5-fix-http2-net-5
+status: closed
+classification: GUEST
+measured_at: 0379fed435111b08696ea7e3caf09eb7aaf57713 + the hub fix of row owc-virtual-net-ipv6-family (local main)
+subject: A server bound to the wildcard (server.listen(0), i.e. ::) accepts an IPv4 client on ::ffff:127.0.0.1 with family IPv6 -- host Node 24.15 -- where this container reports 127.0.0.1 with family IPv4. The client's own four values (remoteAddress 127.0.0.1/IPv4, localAddress 127.0.0.1/IPv4) and the IPv6 client's four (::1/IPv6 both ends) agree with the host; only the accepted socket's view of the connection differs.
+body: |-
+  OPEN, FILED BY THE REPAIR LANE (adv5-fix-http2-net-5), not fixed: it was not one of the divergences
+  the judge confirmed, and the fix site is wider than the files this shard owns.
+
+  Found while re-witnessing row owc-virtual-net-ipv6-family at HEAD 0379fed + the hub fix, in the same
+  differential (container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, host
+  node 24.15, one process per side, stdout/stderr/exit captured separately, four runs identical):
+
+      const server = net.createServer((s) => { say(s.localAddress + '/' + s.localFamily + ' ' +
+                                               s.remoteAddress + '/' + s.remoteFamily); s.end(); });
+      server.listen(0);                      // address :: family IPv6 on both sides
+      const host = '127.0.0.1';              // and then '::1'
+      const c = net.connect({ port, host, family: host === '::1' ? 6 : 4 });
+      // c's own addresses read at 'connect'
+
+      host node 24.15:  cli 127.0.0.1 remote=127.0.0.1/IPv4 local=127.0.0.1/IPv4
+                        srv local=::ffff:127.0.0.1/IPv6 remote=::ffff:127.0.0.1/IPv6
+                        cli ::1      remote=::1/IPv6      local=::1/IPv6
+                        srv local=::1/IPv6                remote=::1/IPv6
+      container:        cli 127.0.0.1 remote=127.0.0.1/IPv4 local=127.0.0.1/IPv4      (agrees)
+                        srv local=127.0.0.1/IPv4            remote=127.0.0.1/IPv4     (differs)
+                        cli ::1      remote=::1/IPv6        local=::1/IPv6            (agrees)
+                        srv local=::1/IPv6                  remote=::1/IPv6           (agrees)
+
+  The cause: hub.listen() stores address '' for every wildcard, so it cannot tell the IPv6 wildcard
+  '::' from the IPv4 one '0.0.0.0' -- netListenHub() in guest/modules/net.ts maps both to '' before
+  the call -- and hub.connect() then reports the accepted socket's local address as the address that
+  was dialled, which is a v4-mapped IPv6 address on a dual-stack listener and a plain IPv4 address on
+  a 0.0.0.0 one. Faithful output needs the bind family carried from net.listen through the
+  'net.listen' capability (packages/core/src/process/executors/node/runtime/capabilities/net.ts, a
+  file this shard does not own) into hub.listen(), stored on the Listener, and used to map a dialled
+  IPv4 address to '::ffff:<v4>' for an IPv6 wildcard bind. Not edited: the judge confirmed no such
+  divergence and the change would move the addresses every server in this container reports.
+
+  Recorded in Readme.md under "Virtual net".
+witness_2026_10_23_adv9: 'RE-VERIFIED 2026-10-23 by the executor for shard net (session adv9-exec-net) at HEAD 1ff048b plus this pass''''s dgram mapped fix, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core against host node v24.15.0, one process per side, stdout/stderr/exit separate, load 6-10 with 2.2-2.9 GB free, probe /tmp/owc-r4/adv9-exec-net/p-wildcard, SAME on two container runs (before and after this pass''''s change). The row holds on all eleven cases: a server bound to :: accepts an IPv4 client and reports ::ffff:127.0.0.1/IPv6 at both of its ends, accepts an IPv6 client as ::1/IPv6, and accepts a dial of ::ffff:127.0.0.1 as ::ffff:127.0.0.1/IPv6; one bound to 0.0.0.0 accepts the IPv4 client as 127.0.0.1/IPv4, refuses the IPv6 client ECONNREFUSED, and answers a dial of the mapped form with 127.0.0.1/IPv4; a server on 127.0.0.1 dialled at ::ffff:127.0.0.1 reports 127.0.0.1/IPv4 at its own end; and 0.0.0.0 then :: on one port binds both while the reverse order is EADDRINUSE, as on a host. The client''''s own four values agree on both sides throughout. Nothing in this row still diverges; nothing was edited for it in this pass.'
+witness_2026_10_24_adv10_judge: 'RE-VERIFIED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36 + this pass''''s hub change, differential
+against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts
+out of packages/core, stdout/stderr/exit separate, all runs exit 0, container run twice and identical,
+load 6.9-8.9 with 3.6-3.9 GB free, probe /tmp/owc-r4/adv10-judge-net-3/j-reg. HOLDS, and it survives the
+change that lets a TCP bind take the IPv4-mapped loopback, which is the surface this row shares with
+owc-virtual-net-ipv6-family: a server on the default bind accepts an IPv4 client (::ffff:127.0.0.1/IPv6 at
+both of its ends) and an IPv6 client (::1/IPv6); one on :: does the same; one on 0.0.0.0 accepts the IPv4
+client as 127.0.0.1/IPv4, refuses the IPv6 client ECONNREFUSED and answers a dial of the mapped form with
+127.0.0.1/IPv4; a server on 127.0.0.1 answers a dial of ::ffff:127.0.0.1; ::1 dialled against 127.0.0.1 is
+ECONNREFUSED; localhost binds ::1; and 0.0.0.0:P then ::P on one port binds both while the reverse order is
+EADDRINUSE. The client''''s own four values agree throughout. All 19 rows identical to host Node 24.15 but
+for the host''''s own ephemeral ports. Nothing was edited for this row.'

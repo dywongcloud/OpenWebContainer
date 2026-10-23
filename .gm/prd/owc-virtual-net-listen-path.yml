@@ -1,0 +1,59 @@
+id: owc-virtual-net-listen-path
+session_id: adv5-judge-http2-net-5
+status: closed
+classification: GUEST
+measured_at: bc261b63d1de325d13a96e3ab29e41aaace0ca13
+subject: 'server.listen(''/tmp/x'') refuses with ERR_SOCKET_BAD_PORT ("Port should be >= 0 and < 65536. Received type string") where host Node 24.15 binds a unix socket at that path, reports listening and answers no error. Container: listening=no code=THREW ERR_SOCKET_BAD_PORT. Host: listening=yes code=none.'
+body: |-
+  OPEN, FILED BY THE JUDGE (adv5-judge-http2-net-5), not fixed: closing it means implementing unix
+  domain sockets, which this runtime does not have and which no shard of this run owns. Recorded in
+  Readme.md under "Virtual net". Note the asymmetry already in the tree: netConnectArgs (net.ts:283)
+  refuses a string connect with ERR_NOT_SUPPORTED "Unix domain sockets are not supported by this
+  runtime", while listen takes the same string through netPortOf and reports ERR_SOCKET_BAD_PORT,
+  so the two entry points name two different faults for one absent feature.
+
+  Differential, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of
+  packages/core, stdout, stderr and exit captured separately:
+
+      const server = net.createServer(() => {});
+      let code = 'none'; let listening = 'no';
+      server.on('error', (e) => { code = e.code || e.message; });
+      server.on('listening', () => { listening = 'yes'; });
+      server.listen('/tmp/owc-judge-hn5-not-a-real-socket-path', fin);
+
+      host node 24.15:        listen(path) listening=yes code=none
+      container (HEAD bc261b6): listen(path) listening=no code=THREW ERR_SOCKET_BAD_PORT
+
+  RE-MEASURED (adv5-fix-http2-net-5) at HEAD 0379fed + the hub fix of row owc-virtual-net-ipv6-family,
+  four container runs, all four identical: still listening=no code=THREW ERR_SOCKET_BAD_PORT against
+  the host's listening=yes code=none. Unfixed: closing it means implementing unix domain sockets,
+  which this runtime does not have and which no shard of this run owns. The row stays open.
+witness_2026_10_23_adv9: 'RE-VERIFIED 2026-10-23 by the executor for shard net (session adv9-exec-net) at HEAD 1ff048b plus this pass''''s dgram mapped fix, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core against host node v24.15.0, one process per side, stdout/stderr/exit separate, load 6-10 with 2.2-2.9 GB free, probe /tmp/owc-r4/adv9-exec-net/p-path. The row''''s own claim no longer holds and is refuted: server.listen(''''/tmp/x'''') and server.listen({path: ''''/tmp/x''''}) bind, report listening, answer address() with the path itself, exchange bytes in both directions over the hub, and report no address at either end (localAddress, remoteAddress, localPort, remotePort and both families undefined, address() {}), every one of them as host Node 24.15 answers it; a second bind of the path is EADDRINUSE naming the path with errno -48 and err.port -1; a 104-byte path binds and a 105-byte one is EINVAL with errno -22; a connect to a path nothing is bound at is ENOENT with errno -2; a port named alongside a path wins; and a closed unix listener keeps answering with the path where a closed TCP one answers null. What still differs is recorded in Readme.md under Virtual net and is not the bind: the binding lives in the hub alone, so no inode appears at the path (fs.stat is ENOENT), a bind under a directory that does not exist is not the host''''s EACCES, a bind of / is not the host''''s EEXIST, two paths differing only in case are two bindings here where APFS answers either spelling, and a string with no separator in it -- server.listen(''''x.sock''''), server.listen(''''localhost'''') -- is still read as a port and refused ERR_SOCKET_BAD_PORT where host Node binds a socket file of that name. That last one is the only fixable residual and it is not fixable from inside this shard: a path and a host name both reach hub.listen as an address with port 0, so the hub cannot tell them apart, and carrying the distinction needs a field on the ''''net.listen'''' payload in packages/core/src/process/executors/node/runtime/capabilities/net.ts:91, a file this shard does not own. Named and not edited. Nothing was edited for this row in this pass.'
+witness_2026_10_24_adv10_judge: 'RE-MEASURED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36: the subject stays refuted (a path binds)
+and two classes of residual were measured in isolation. Differential against host node v24.15.0, one
+process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core,
+stdout/stderr/exit separate, all runs exit 0, each probe run twice on each side, load 6.9-8.9 with
+3.6-3.9 GB free, probes /tmp/owc-r4/adv10-judge-net-3/j-path, j-pathfs, j-reg. FIXED here (j-path is now
+0 lines different from host across all seven cases, both reruns identical on each side): the `path`
+option is validated as host Node 24.15 validates it -- a number, a Buffer, an object, `null` and the empty
+string are each ERR_INVALID_ARG_VALUE, naming the whole options object (''''The argument ''''''''options'''''''' is
+invalid. Received { path: 123 }''''), where this runtime bound TCP :123 for {path:123}, bound the path for
+{path:Buffer.from(''''''''/tmp/x'''''''')}, bound an ephemeral wildcard for {path:null} and answered
+ERR_SOCKET_BAD_PORT for {path:''''''''} and {path:{}} -- and only when no port is named alongside, because a
+port wins and is bound without the path being read ({path:123, port:8080} binds :::8080 on both sides).
+A unix bind that failed now answers address() with the path, as a host''''s does for the 105-byte path it
+refuses EINVAL (it answered null here). Both are in the Server.listen path of
+runtime/guest/modules/net.ts. STALE, and recorded in Readme.md with one concrete line, because the hub
+holds no inode and cannot look at the filesystem the path names (j-pathfs, seven binds, both reruns
+identical on each side): a directory at the path is the host''''s EADDRINUSE (errno -48), a path under a
+regular file is its ENOTDIR (errno -20), a path whose parent does not exist -- including one with a
+trailing slash or a `..` segment -- is its EACCES (errno -13), and `/` is its EEXIST (errno -17); all of
+them bind here, and a host answers address() with the path in every one. Reaching them needs the container
+filesystem plumbed into the hub (packages/core/src/network/virtual/hub.ts takes only a sink), so it is
+wider than this shard''''s two files. The one residual the earlier witness named -- server.listen(''''''''x.sock'''''''')
+and server.listen(''''''''localhost'''''''') being ERR_SOCKET_BAD_PORT where host binds a socket file -- is confirmed
+and still needs a field on the ''''''''net.listen'''''''' payload
+(packages/core/src/process/executors/node/runtime/capabilities/net.ts:91), a file this shard does not own.
+No regression: j-reg''''s unix section (bind, connect, exchange, rebind EADDRINUSE, 105-byte EINVAL,
+unbound ENOENT, address after close) and its 17 TCP rows match host line for line. npx tsc --noEmit clean
+in packages/core; pnpm build succeeds.'

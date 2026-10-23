@@ -183,7 +183,12 @@ export class VirtualNetwork {
            the caller named, before the fold: a bind on '::' is dual-stack and takes an IPv4 client,
            where one on '0.0.0.0' takes none. (net.listen passes no family; dgram's does.) */
         const family = request.family ?? hubFamilyOf(request.address ?? '');
-        if (!this.isLocal(address) && !(protocol === 'udp' && mappedLoopback(address) !== null)) {
+        /* The IPv4-mapped loopback is bindable in either protocol, as it is on a host: a TCP bind of
+           '::ffff:127.0.0.1' listens on the IPv4 loopback under its IPv6 spelling, is reached by a
+           client dialling '127.0.0.1' (which it accepts as '::ffff:127.0.0.1'/IPv6) and by one
+           dialling the mapped literal, and refuses '::1'. It used to be granted to UDP alone, so a
+           TCP bind of it was EADDRNOTAVAIL where host Node 24.15 binds it. */
+        if (!this.isLocal(address) && mappedLoopback(address) === null) {
             throw new VirtualNetworkError('EADDRNOTAVAIL', `address not available ${displayAddress(address)}`);
         }
         const port = request.port || this.allocatePort(protocol, family, address);
@@ -250,8 +255,12 @@ export class VirtualNetwork {
            the kernel connects to the IPv4 address it embeds, so that is the peer the hub routes to --
            and isLocal must see it as local, or the dial is refused ENETUNREACH before a listener is
            ever looked for. The socket that dialled keeps the IPv6 text and family it was given. */
-        const mapped = v4MappedOf(request.address);
-        const destination = this.hubDestination(mapped ?? request.address);
+        /* A zone (scope) id names which interface a link-local address means, not a different host:
+           the kernel dials the address the zone is attached to, and a host's own getpeername reports
+           '::1' for a connection made to '::1%lo0'. */
+        const named = stripZone(request.address);
+        const mapped = v4MappedOf(named);
+        const destination = this.hubDestination(mapped ?? named);
         if (!this.isLocal(destination)) {
             throw new VirtualNetworkError('ENETUNREACH', `connect ENETUNREACH ${destination}:${request.port}`);
         }
@@ -671,6 +680,16 @@ export class VirtualNetwork {
         const resolved = this.hubAddress(address);
         return resolved === '' ? '127.0.0.1' : resolved;
     }
+}
+
+/**
+ * Cuts the zone (scope) id off an IPv6 literal ('::1%lo0' -> '::1'). The zone says which interface
+ * the address belongs to; the address itself is what a connection is made to and reported for.
+ */
+function stripZone(address: string | undefined): string | undefined {
+    if (typeof address !== 'string') return address;
+    const at = address.indexOf('%');
+    return at === -1 ? address : address.slice(0, at);
 }
 
 /**
