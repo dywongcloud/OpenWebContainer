@@ -41,6 +41,8 @@ function owcBuildStreamCore() {
   /* The one value a pipeline can answer: the promise the function in the destination's own place
      resolves to, which Node hands to the callback and to the promise stream/promises returns. */
   var kPipelineValue = Symbol('owcPipelineValue');
+  /* A destination function's duplex is not a pipe target: the function reads the link before it. */
+  var kDestFunc = Symbol('owcDestinationFunc');
 
   function owcErr(Ctor, code, message) {
     var err = new Ctor(message);
@@ -1582,14 +1584,34 @@ function owcBuildStreamCore() {
   /* Node's validateInteger asks Number.isInteger before it asks the range, so a value that is not a
      finite integer -- Infinity either side, and a value past MAX_SAFE_INTEGER -- answers "an
      integer" and ">= min && <= 9007199254740991" in that order and not the range alone. */
+  /* Node's ERR_OUT_OF_RANGE runs a number through addNumericalSeparator whenever it is an integer
+     past 2 ** 32, and that groups the string in threes from its right whatever the characters are,
+     so 1e30 is reported as "1e_+30" and 1e+300 as "1e+_300" while 10000000000000000 is
+     "10_000_000_000_000_000". Anything smaller, and anything that is not an integer, is reported
+     the way inspect writes it, which for these is String(). */
+  function receivedNumber(value) {
+    if (Number.isInteger(value) && Math.abs(value) > 4294967296) {
+      var str = String(value);
+      var res = '';
+      var i = str.length;
+      var start = str.charCodeAt(0) === 45 ? 1 : 0;
+      while (i >= start + 4) {
+        res = '_' + str.slice(i - 3, i) + res;
+        i -= 3;
+      }
+      return str.slice(0, i) + res;
+    }
+    return Object.is(value, -0) ? '-0' : String(value);
+  }
+
   function validateOperatorInt(value, name, min) {
     if (typeof value !== 'number' || !Number.isInteger(value)) {
       throw owcErr(RangeError, 'ERR_OUT_OF_RANGE',
-        'The value of "' + name + '" is out of range. It must be an integer. Received ' + value);
+        'The value of "' + name + '" is out of range. It must be an integer. Received ' + receivedNumber(value));
     }
     if (value < min || value > 9007199254740991) {
       throw owcErr(RangeError, 'ERR_OUT_OF_RANGE',
-        'The value of "' + name + '" is out of range. It must be >= ' + min + ' && <= 9007199254740991. Received ' + value);
+        'The value of "' + name + '" is out of range. It must be >= ' + min + ' && <= 9007199254740991. Received ' + receivedNumber(value));
     }
     return value;
   }
@@ -1629,7 +1651,7 @@ function owcBuildStreamCore() {
     }
 
     function maybeResume() {
-      if (resume === null || done || inFlight >= limits.concurrency || queue.length >= limits.highWaterMark) return;
+      if (resume === null || done || failed || inFlight >= limits.concurrency || queue.length >= limits.highWaterMark) return;
       var wake = resume;
       resume = null;
       wake();
@@ -1642,11 +1664,18 @@ function owcBuildStreamCore() {
       wake();
     }
 
+    /* Node's own onCatch: the rejection handler is what ends the pump, so the source is one pull
+       further along by the time the flag is set than it would be if the call's own throw set it. */
+    function onCatch() {
+      failed = true;
+      settled();
+    }
+
     function enqueue(promise) {
       inFlight++;
       /* The handler is what keeps a rejected call from being an unhandled rejection: the consumer
          may never reach it, and Node holds each the same way. */
-      promise.then(settled, settled);
+      promise.then(settled, onCatch);
       queue.push(promise);
       maybeAnswer();
     }
@@ -1660,18 +1689,10 @@ function owcBuildStreamCore() {
           if (step.done) break;
           var value = step.value;
           enqueue((async function () {
-            try {
-              var answer = await apply(value);
-              return answer.skip ? { skip: true } : { value: answer.value };
-            } catch (error) {
-              /* A call that threw is the last work the pump starts: Node stops pulling the source
-                 as soon as one has failed, so an error under concurrency reaches the consumer with
-                 the source no further along than the host's would be. */
-              failed = true;
-              throw error;
-            }
+            var answer = await apply(value);
+            return answer.skip ? { skip: true } : { value: answer.value };
           })());
-          if (queue.length >= limits.highWaterMark || inFlight >= limits.concurrency) {
+          if (!failed && (queue.length >= limits.highWaterMark || inFlight >= limits.concurrency)) {
             await new Promise(function (resolve) { resume = resolve; });
           }
         }
@@ -2681,8 +2702,9 @@ function owcBuildStreamCore() {
     return finishedImpl(stream, opts, cb);
   }
 
-  function linkPipe(src, dst) {
+  function linkPipe(src, dst, end) {
     src.pipe(dst, { end: false });
+    if (end === false) return;
     var endFn = function () {
       dst.end();
     };
@@ -2767,19 +2789,27 @@ function owcBuildStreamCore() {
 
     var last = streams.length - 1;
     for (var i = 0; i < streams.length; i++) {
-      (function (stream, reading, writing) {
+      /* Node ends every link but the last, and the last only when options.end is not false: a
+         pipeline asked not to end its destination leaves it open, so writableEnded stays false and
+         the caller may go on writing to it. */
+      var endLink = i < last || !(opts && opts.end === false);
+      (function (stream, reading, writing, nowait) {
         var settled = false;
-        finishedImpl(stream, { readable: reading, writable: writing }, function (err) {
-          settled = !err;
-          finishStep(err);
-        });
+        if (nowait) {
+          process.nextTick(function () { settled = true; finishStep(); });
+        } else {
+          finishedImpl(stream, { readable: reading, writable: writing }, function (err) {
+            settled = !err;
+            finishStep(err);
+          });
+        }
         destroyers.push(function (err) {
           if (settled) return;
           settled = true;
           stream.destroy(err || errDestroyed('pipe'));
         });
-      })(streams[i], i < last, i > 0);
-      if (i > 0) linkPipe(streams[i - 1], streams[i]);
+      })(streams[i], i < last, i > 0, !endLink);
+      if (i > 0 && !(streams[i] && streams[i][kDestFunc])) linkPipe(streams[i - 1], streams[i], endLink);
     }
     return streams[last];
   }
@@ -3057,32 +3087,45 @@ function owcBuildStreamCore() {
      stream that stands in the destination's place. An async iterable there is pumped instead and
      answers no value at all. */
   function destinationFuncToDuplex(fn, previous) {
-    /* Node hands the destination function the async iterable of the link before it, so the chunks it
-       sees are that link's own: a non-object-mode link coalesces what it is holding into one chunk
-       as read() does, and an object-mode one hands over each value separately. */
-    var source = new PassThrough({ objectMode: true });
-    var answered = fn(source);
+    /* Node's makeAsyncIterable hands a destination function the link before it and nothing else --
+       measured on host node v24.15.0, the value the function receives *is* that stream -- so the
+       chunks it sees are the link's own, coalesced the way that link's read() coalesces them: a
+       PassThrough written 'a','b' and ended before the function reads reaches it as one chunk 'ab',
+       the same two written a tick apart as 'a','b', and an object-mode link as 'a','b' however
+       much it holds. A proxy stream this duplex writes into cannot answer that, because a pipe
+       hands the chunks over one at a time whatever the link was holding. */
+    var answered = fn(previous);
     var finishStep = null;
     /* The pipeline's own finish waits on this: the destination's answer is not known until the
        promise has settled or the iterable has run out, and Node reports the value only once it is. */
     var finished = new Promise(function (resolve) { finishStep = resolve; });
     var duplex = new Duplexify({
       objectMode: true,
-      write: function (chunk, encoding, callback) {
-        if (source.write(chunk, encoding)) callback();
-        else source.once('drain', callback);
-      },
+      write: function (chunk, encoding, callback) { callback(); },
       final: function (callback) {
-        source.end();
         finished.then(function () { callback(); }, function () { callback(); });
       },
       read: function () { /* the answer is pushed, never pulled: nothing reads the destination */ }
     });
+    /* Nothing is ever piped into a destination function's duplex -- the function drains the link
+       before it itself -- so the writable side is ended at once and the chain's bookkeeping settles. */
+    duplex[kDestFunc] = true;
+    process.nextTick(function () { duplex.end(); });
+
+    /* A destination function is not obliged to read the link it is handed -- one that answers
+       without touching the link before it is a case Node runs -- and Node does not wait for that
+       link to end, so it is drained and discarded once the answer is known, which is what lets the
+       chain settle. */
+    function releasePrevious() {
+      if (previous && typeof previous.resume === 'function'
+        && !(previous._readableState && previous._readableState.endEmitted)) previous.resume();
+    }
 
     function endReadable(value) {
       if (value !== null && value !== undefined) duplex.push(value);
       duplex.push(null);
       finishStep();
+      releasePrevious();
     }
 
     if (answered && typeof answered.then === 'function') {
@@ -3091,6 +3134,7 @@ function owcBuildStreamCore() {
         endReadable(val);
       }, function (err) {
         finishStep();
+        releasePrevious();
         duplex.destroy(err);
       });
       return duplex;
@@ -3111,6 +3155,7 @@ function owcBuildStreamCore() {
           pumping = false;
           ended = true;
           finishStep();
+          releasePrevious();
           duplex.destroy(err);
         });
       }
