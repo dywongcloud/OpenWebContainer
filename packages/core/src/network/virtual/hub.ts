@@ -155,7 +155,7 @@ export class VirtualNetwork {
     /** Virtual name table lookup; loopback names always resolve to 127.0.0.1 (or ::1). */
     resolveHost(name: string): string | undefined {
         const key = name.toLowerCase();
-        if (LOOPBACK_NAMES.has(key)) return key === '::1' ? '::1' : '127.0.0.1';
+        if (LOOPBACK_NAMES.has(key)) return key === '127.0.0.1' ? '127.0.0.1' : '::1';
         return this.hosts.get(key);
     }
 
@@ -201,7 +201,12 @@ export class VirtualNetwork {
 
     /** Opens a loopback TCP connection to a listener; both ends receive their events asynchronously. */
     connect(request: ConnectRequest): ConnectResult {
-        const destination = this.hubDestination(request.address);
+        /* An IPv4-mapped IPv6 literal ('::ffff:127.0.0.1') is the loopback under its IPv6 spelling:
+           the kernel connects to the IPv4 address it embeds, so that is the peer the hub routes to --
+           and isLocal must see it as local, or the dial is refused ENETUNREACH before a listener is
+           ever looked for. The socket that dialled keeps the IPv6 text and family it was given. */
+        const mapped = v4MappedOf(request.address);
+        const destination = this.hubDestination(mapped ?? request.address);
         if (!this.isLocal(destination)) {
             throw new VirtualNetworkError('ENETUNREACH', `connect ENETUNREACH ${destination}:${request.port}`);
         }
@@ -260,7 +265,8 @@ export class VirtualNetwork {
         });
         return {
             id: client.id,
-            localAddress,
+            /* The mapped spelling is what the client's own socket reports for itself. */
+            localAddress: mapped === null ? localAddress : request.address,
             localPort,
             remoteAddress: displayAddress(destination),
             remotePort: request.port,
@@ -503,7 +509,11 @@ export class VirtualNetwork {
                 if (other.family !== family) continue;
                 if (other.address === address || other.address === '' || address === '') return true;
             } else if (other.address === address) {
-                // TCP: an exact duplicate conflicts; a wildcard and a specific address coexist (macOS, verified against Node 24).
+                /* TCP: an exact duplicate conflicts; a wildcard and a specific address coexist (macOS,
+                   verified against Node 24). So do the two wildcards, when the IPv6 one is bound
+                   second: this host binds '::' on a port whose '0.0.0.0' is already taken and refuses
+                   the same pair in the other order, where folding both wildcards to '' refused both. */
+                if (address === '' && other.family === 'IPv4' && family === 'IPv6') continue;
                 return true;
             }
         }
@@ -536,9 +546,11 @@ export class VirtualNetwork {
         if (WILDCARD_ADDRESSES.has(key)) return '';
         const mapped = (this.hosts.get(key) ?? address).toLowerCase();
         if (WILDCARD_ADDRESSES.has(mapped)) return '';
-        /* 'localhost' is the loopback of this host's own choosing and stays IPv4, as Node's own
-           lookup reports it here; '::1' names the IPv6 loopback and must survive as one. */
-        if (mapped !== '::1' && LOOPBACK_NAMES.has(mapped)) return '127.0.0.1';
+        /* 'localhost' resolves to this host's IPv6 loopback, which is what Node 24.15's own lookup
+           reports for the name here, so a server told to bind it binds ::1 and a client dialling it
+           reaches ::1 -- the IPv4 loopback named outright keeps its own family. */
+        if (mapped === '::1' || mapped === 'localhost') return '::1';
+        if (LOOPBACK_NAMES.has(mapped)) return '127.0.0.1';
         return mapped;
     }
 
@@ -547,6 +559,18 @@ export class VirtualNetwork {
         const resolved = this.hubAddress(address);
         return resolved === '' ? '127.0.0.1' : resolved;
     }
+}
+
+/**
+ * The IPv4 address an IPv4-mapped IPv6 literal names ('::ffff:127.0.0.1' -> '127.0.0.1'), or null for
+ * any other text. Dialling one is how an IPv6 socket reaches an IPv4 peer, and the host's kernel
+ * answers it: the mapped loopback connects to a listener on either wildcard, and to one on 127.0.0.1.
+ */
+function v4MappedOf(address: string | undefined): string | null {
+    if (typeof address !== 'string') return null;
+    const match = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(address);
+    if (match === null) return null;
+    return match[1].split('.').every((part) => Number(part) <= 255) ? match[1] : null;
 }
 
 function displayAddress(address: string): string {
