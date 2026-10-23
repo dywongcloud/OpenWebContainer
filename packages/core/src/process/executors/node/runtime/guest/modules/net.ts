@@ -153,10 +153,15 @@ function netListenDisplay(host) {
   return String(host);
 }
 
-/** Address passed to the hub: wildcards become '' (every local address). */
+/**
+ * Address passed to the hub: the IPv4 wildcard becomes '' (every local address), and the IPv6 one
+ * stays '::' -- the hub folds both to '', so its own text is the only thing that tells the two apart,
+ * and they differ in what they accept: '::' is dual-stack and takes an IPv4 client (delivered to the
+ * accepted socket as '::ffff:<v4>'), where '0.0.0.0' takes none.
+ */
 function netListenHub(host) {
   var shown = netListenDisplay(host);
-  return shown === '::' || shown === '0.0.0.0' ? '' : shown;
+  return shown === '0.0.0.0' ? '' : shown;
 }
 
 /** A Node-shaped system error: 'listen EADDRINUSE: address already in use 127.0.0.1:80', 'connect ECONNREFUSED ...'. */
@@ -278,10 +283,12 @@ function netConnectArgs(args) {
   var cb = typeof list[list.length - 1] === 'function' ? list.pop() : undefined;
   var first = list[0];
   if (first !== null && typeof first === 'object') {
-    return { port: first.port, host: first.host, family: first.family, localPort: first.localPort, lookup: first.lookup, cb: cb };
+    return { port: first.port, host: first.host, family: first.family, localPort: first.localPort, lookup: first.lookup, path: first.path, cb: cb };
   }
   if (typeof first === 'string' && !/^\d+$/.test(first)) {
-    throw netError(Error, 'ERR_NOT_SUPPORTED', 'Unix domain sockets are not supported by this runtime');
+    /* A pipe path is a destination this runtime cannot open. Node does not throw it either: the
+       socket reports the failure as an asynchronous 'error' (ENOENT), which connect() delivers. */
+    return { path: first, cb: cb };
   }
   return { port: first, host: typeof list[1] === 'string' ? list[1] : undefined, cb: cb };
 }
@@ -291,7 +298,7 @@ function netListenArgs(args) {
   var cb = typeof list[list.length - 1] === 'function' ? list.pop() : undefined;
   var first = list[0];
   if (first !== null && typeof first === 'object') {
-    return { port: first.port, host: first.host, cb: cb };
+    return { port: first.port, host: first.host, path: first.path, ipv6Only: first.ipv6Only, cb: cb };
   }
   return { port: first, host: typeof list[1] === 'string' ? list[1] : undefined, cb: cb };
 }
@@ -349,6 +356,9 @@ BF['net'] = function () {
       this._pendingWrites = [];
       this._writeCbs = [];
       this._readQueue = [];
+      /* Bytes handed to the hub and not delivered yet: what socket.bufferSize counts (see _accountSent). */
+      this._unsentBytes = 0;
+      this._unsentTimer = null;
       this._flowing = undefined;
       this._encoding = null;
       this._carry = null;
@@ -413,23 +423,61 @@ BF['net'] = function () {
       return this._idleMs;
     }
 
-    /** Bytes written but not yet acknowledged, the way Node counts a socket's unsent queue. */
+    /**
+     * Bytes written but not yet acknowledged, the way Node counts a socket's unsent queue: what this
+     * socket has handed the hub and the hub has not delivered to the peer yet, plus what a write made
+     * before the socket had a connection is still holding.
+     *
+     * The hub delivers on a later macrotask, so a burst of writes is counted in full until the turn
+     * that delivers it -- and it drains on that turn even when the peer never reads, because this
+     * virtual network has no finite send buffer to fill: the bytes reach the peer's own buffer, which
+     * is the peer's receive queue, not this socket's send queue. A host's kernel buffers fill, so its
+     * figure stalls at the amount the peer has left unread (13 MiB of the 12.5 MiB written here).
+     */
     get bufferSize() {
       if (this._hubId === undefined && !this.connecting) return undefined;
+      /* A closed socket counts nothing: Node leaves the figure undefined once the handle is gone. */
+      if (this._dead) return undefined;
+      /* One count of each byte, and never more than the socket was given. The three figures a write
+         leaves behind -- the held write callback, the stream's own buffer, and the bytes this socket
+         handed the hub -- name the SAME bytes, so summing them reported three times what was written
+         (262145 -> 786435) and, once two writes shared a turn, more than every byte the socket had
+         ever been handed (400010 written -> 1200010). What is still the socket's own is what the hub
+         has not delivered yet, plus what a write before 'connect' is still holding. */
       var queued = 0;
-      for (var i = 0; i < this._writeCbs.length; i++) queued += this._writeCbs[i].size;
-      var buffered = duplexMode && typeof this.writableLength === 'number' ? this.writableLength : 0;
-      return queued + buffered;
+      for (var i = 0; i < this._pendingWrites.length; i++) queued += this._pendingWrites[i].length;
+      return this._unsentBytes + queued;
+    }
+
+    /**
+     * Counts bytes handed to the hub as unsent, and arranges for the count to drop on the turn that
+     * delivers them: the hub schedules one delivery per chunk, all of them before this timer, which
+     * is armed after the last one, so the count is exact until every byte has reached the peer.
+     */
+    _accountSent(size) {
+      this._unsentBytes += size;
+      if (this._unsentTimer !== null) clearTimeout(this._unsentTimer);
+      var self = this;
+      this._unsentTimer = setTimeout(function () {
+        self._unsentTimer = null;
+        self._unsentBytes = 0;
+      }, 0);
     }
 
     connect() {
       var args = netConnectArgs(arguments);
-      var port = netPortOf(args.port);
       if (typeof args.cb === 'function') this.once('connect', args.cb);
       this._connectStarted = true;
       this.connecting = true;
       this._ensureTarget();
       netRefresh(this);
+      /* A pipe path names an IPC socket, which this runtime has none of: the way Node reports one it
+         could not open is an asynchronous 'error' carrying ENOENT, never a throw out of connect(). */
+      if (args.path !== undefined) {
+        this.destroy(netSystemError({ code: 'ENOENT', errno: -2 }, 'connect', String(args.path)));
+        return this;
+      }
+      var port = netPortOf(args.port);
       var self = this;
       /* A name with two addresses is tried on both, as Node's happy-eyeballs does: only the caller's
          own lookup changes that, since it is the caller who says which addresses a name has. */
@@ -707,16 +755,19 @@ BF['net'] = function () {
         return;
       }
       if (chunk.length === 0) return;
+      var handed = 0;
       try {
         var at = 0;
         while (at < chunk.length) {
           var last = at + NET_CHUNK >= chunk.length;
           callCapBytes('net.write', { connectionId: this._hubId }, last && at === 0 ? chunk : chunk.subarray(at, at + NET_CHUNK));
-          at += NET_CHUNK;
+          at = Math.min(at + NET_CHUNK, chunk.length);
+          handed = at;
         }
       } catch (cause) {
         // The connection is already gone; the peer's close finishes this side.
       }
+      if (handed > 0) this._accountSent(handed);
     }
 
     _sendEnd() {
@@ -826,6 +877,11 @@ BF['net'] = function () {
       if (this._readTimer) {
         clearTimeout(this._readTimer);
         this._readTimer = null;
+      }
+      if (this._unsentTimer !== null) {
+        clearTimeout(this._unsentTimer);
+        this._unsentTimer = null;
+        this._unsentBytes = 0;
       }
       var owner = this._serverRef;
       if (owner) {
@@ -1166,17 +1222,28 @@ BF['net'] = function () {
       if (this._listening) {
         throw netError(Error, 'ERR_SERVER_ALREADY_LISTEN', 'Listen method has been called more than once without closing.');
       }
-      var port = args.port === undefined ? 0 : netPortOf(args.port);
+      /* A 'path' option names an IPC socket, and this runtime has none: it is refused exactly as the
+         string form is, rather than being dropped -- dropping it left the port at its default 0 and
+         bound a fabricated TCP wildcard ({"address":"::","family":"IPv6","port":49152}), so a listen
+         that had no address at all reported success. */
+      var port = args.path !== undefined
+        ? netPortOf(args.path)
+        : (args.port === undefined ? 0 : netPortOf(args.port));
       if (this._targetId === undefined) {
         var target = this;
         this._targetId = createTarget(function (name, payload) {
           if (name === 'connection') target._onConnectionEvent(payload);
         });
       }
-      var shown = netListenDisplay(args.host);
+      /* A server told to bind 'localhost' binds the address this host's own lookup gives the name,
+         which is ::1 (Node 24.15, verified). dgram keeps the IPv4 answer its family asks for, so the
+         name is resolved here and not in netListenDisplay, which both bind paths share. */
+      var shown = typeof args.host === 'string' && args.host.toLowerCase() === 'localhost'
+        ? '::1'
+        : netListenDisplay(args.host);
       var res;
       try {
-        res = callCap('net.listen', { address: netListenHub(args.host), port: port, targetId: this._targetId });
+        res = callCap('net.listen', { address: netListenHub(shown), port: port, targetId: this._targetId });
       } catch (cause) {
         var failed = netSystemError(cause, 'listen', shown, port);
         var failedServer = this;
