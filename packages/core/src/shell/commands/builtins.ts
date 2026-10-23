@@ -729,9 +729,14 @@ function isSet(state: ShellState, name: string): boolean {
     return getVar(state, name) !== undefined;
 }
 
-/** Assigns to the nearest scope already holding `name`, else the innermost (`local`) scope. */
+/** Assigns to the nearest scope already holding `name`, else the outermost (global) one. */
 function setVar(state: ShellState, name: string, value: string): boolean {
-    const scope = lookupScope(state, name) ?? state.scopes[state.scopes.length - 1];
+    /* A bare assignment is one a host makes in the outermost scope and not in the function it stands
+       in: `f() { x=9; }; f; echo $x` prints `9`, and `x` is still there behind the call, where
+       making it a variable of the function's own scope left the name empty behind it. Only `local`
+       and `declare` inside a function make one of the function's own, which is why they write their
+       scope themselves rather than coming through here. */
+    const scope = lookupScope(state, name) ?? state.scopes[0];
     const existing = scope.get(name);
     if (existing?.readonly) return false;
     /* The integer attribute `declare -i` set: the value assigned is arithmetic, so `n=n+1` behind
@@ -1424,6 +1429,12 @@ class ShellSyntaxError extends Error {
      * in, which is why a freshly built one may carry none.
      */
     at: number | undefined;
+    /**
+     * The line a host names for this error where it is not the line `at` stands on. Only a report
+     * about input that ended in the middle of a construct needs one, because a host counts such a
+     * line from the construct rather than from the end of the input: see `readArithCommand`.
+     */
+    reportedLine: number | undefined;
     constructor(message: string, readonly reports: string[] = []) {
         super(message);
         this.name = 'ShellSyntaxError';
@@ -1945,6 +1956,103 @@ class Parser {
     }
 
     /**
+     * The body of an arithmetic command -- the expression between `((` and the `))` that closes it --
+     * read the way a host reads it, from the position the parser stands on to `openAt` behind it.
+     *
+     * A host nests the parentheses of the expression itself, so `(((1)))` is the expression `(1)`
+     * and `((1+(2)))` is `1+(2)`. Counting only `((` and `))`, as a delimited read does, stops at
+     * the first `))` wherever it stands: both were read as an expression that will not evaluate with
+     * a `)` left over behind it, where a host answers 0.
+     *
+     * Where the `))` never comes, a host refuses the script before any of it runs rather than
+     * evaluating what it read: `((1+)` is one `syntax error: unexpected end of file` and a status
+     * of 2, and not an expression holding a stray `)`. Which of the two reports a host writes
+     * depends on whether it ever read a `)` at all -- `((1+`, where none stands, is also an
+     * `unexpected EOF while looking for matching `)'' -- and the line it names depends on what
+     * stands behind the last `)` it read: nothing, or a newline, and it names one line more.
+     */
+    private scanArithClose(): { closeAt: number; end: number } {
+        let depth = 0;
+        let closeAt = -1;
+        let i = this.pos;
+        while (i < this.src.length) {
+            const ch = this.src[i];
+            if (ch === '\\') {
+                i += 2;
+                continue;
+            }
+            if (ch === "'") {
+                const end = this.src.indexOf("'", i + 1);
+                i = end === -1 ? this.src.length : end + 1;
+                continue;
+            }
+            if (ch === '"') {
+                i++;
+                while (i < this.src.length && this.src[i] !== '"') i += this.src[i] === '\\' ? 2 : 1;
+                i++;
+                continue;
+            }
+            if (ch === '(') {
+                depth++;
+                i++;
+                continue;
+            }
+            if (ch === ')') {
+                if (depth > 0) {
+                    depth--;
+                    i++;
+                    continue;
+                }
+                closeAt = i;
+                if (this.src[i + 1] === ')') {
+                    i += 2;
+                    break;
+                }
+                i++;
+                continue;
+            }
+            i++;
+        }
+        return { closeAt, end: i };
+    }
+
+    private readArithCommand(openAt: number): string {
+        const start = this.pos;
+        const { closeAt, end } = this.scanArithClose();
+        if (this.src[closeAt + 1] !== ')') {
+            /* Where the parser stood when it gave up, so the report names the line the `((` stands
+               on and not the one the end of the input stands on. */
+            this.pos = openAt;
+            if (closeAt === -1) throw new ShellSyntaxError("unexpected EOF while looking for matching `)'");
+            const tail = this.src.slice(closeAt + 1);
+            const error = new ShellSyntaxError('syntax error: unexpected end of file');
+            error.reportedLine = lineIndexOf(this.src, openAt) + 1 + (tail === '' || tail.includes('\n') ? 1 : 0);
+            throw error;
+        }
+        this.pos = end;
+        return this.src.slice(start, closeAt);
+    }
+
+    /**
+     * The body of an arithmetic substitution, `$(( ... ))`: as `readArithCommand` reads it, and with
+     * the same nesting, so `echo $(( (1+2)*3 ))` is `9` and `echo $((1+(2)))` is `3`.
+     *
+     * Where the `))` never comes a host refuses the script -- `echo $((1+)` is two reports, an
+     * `unexpected EOF while looking for matching `)'' and then the end of file -- where reading the
+     * expression as complete evaluated `1+)` and printed its operand error.
+     */
+    private readArithSubstitution(openAt: number): string {
+        const start = this.pos;
+        const { closeAt, end } = this.scanArithClose();
+        if (this.src[closeAt + 1] !== ')') {
+            this.pos = openAt;
+            throw new ShellSyntaxError("unexpected EOF while looking for matching `)'");
+        }
+        this.pos = end;
+        return this.src.slice(start, closeAt);
+    }
+
+    /**
      * Reads a backquoted command substitution: the body ends at the next *unescaped* backquote.
      *
      * A backquote is its own delimiter, so the one that closes the substitution is not an opener --
@@ -2105,12 +2213,13 @@ class Parser {
     }
 
     private readDollar(): Part {
+        const dollarAt = this.pos;
         const next = this.src[this.pos + 1];
         this.pos++;
         if (next === '(') {
             if (this.src[this.pos + 1] === '(') {
                 this.pos += 2;
-                return { t: 'arith', expr: this.readDelimited('$(', '))') };
+                return { t: 'arith', expr: this.readArithSubstitution(dollarAt) };
             }
             this.pos++;
             return { t: 'cmd', script: this.readCommandSubst() };
@@ -2550,8 +2659,9 @@ class Parser {
            as not found. The expression is read to the `))` that closes it, as bash reads it: even
            `((echo hi))` is an expression that will not evaluate, and not a subshell that echoes. */
         if (this.src.startsWith('((', this.pos)) {
+            const openAt = this.pos;
             this.pos += 2;
-            const expr = this.readDelimited('((', '))');
+            const expr = this.readArithCommand(openAt);
             return { t: 'arithcmd', expr, redirects: this.readRedirects(), line };
         }
         if (ch === '(') {
@@ -2920,8 +3030,9 @@ class Parser {
            are arithmetic, as they are in `$(( ))`, and every one of them may be empty: an empty test
            is true, which is what makes `for ((;;))` the loop that never ends by itself. */
         if (this.src.startsWith('((', this.pos)) {
+            const openAt = this.pos;
             this.pos += 2;
-            const expr = this.readDelimited('((', '))');
+            const expr = this.readArithCommand(openAt);
             this.skipSpace(true);
             if (this.here() === ';') this.pos++;
             const tail = this.parseForTail();
@@ -4308,7 +4419,7 @@ function runParsed(state: ShellState, script: string): number {
             const heading = (line: number): string =>
                 `${state.shellName === '' ? 'sh' : state.shellName}: -c: line ${line}: `;
             const eofLine = lineIndexOf(script, script.length) + (script.endsWith('\n') ? 0 : 1);
-            const line = error.message === 'syntax error: unexpected end of file' ? eofLine : lineIndexOf(script, at);
+            const line = error.reportedLine ?? (error.message === 'syntax error: unexpected end of file' ? eofLine : lineIndexOf(script, at));
             /* A conditional expression a host cannot read is two or three lines and not one: the
                complaint about the operator, then the token the parser gave up on -- `[[ -z ]]; echo`
                is `unexpected argument `]]' to conditional unary operator` and then
@@ -4414,6 +4525,15 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null, 
     let status = 0;
     for (let i = 0; i < nodes.length; i++) {
         const node = nodes[i];
+        /* `set -n`: a host reads the commands it is handed and runs none of them, so `set -n; echo
+           ok` is empty, and `echo a; set -n; echo b` is the `a` of the one that ran before the flag
+           was turned on -- which is why the test stands in the loop and not above it: the `set` that
+           turns it on is a command of its own and does run. */
+        if (state.options.noexec) {
+            status = 0;
+            state.lastStatus = 0;
+            continue;
+        }
         if (node.op === '&&' && status !== 0) continue;
         if (node.op === '||' && status === 0) continue;
         /* What `set -e` must not end the shell on, the way this machine's /bin/sh has it: a command
