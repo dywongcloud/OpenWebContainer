@@ -1,8 +1,45 @@
 id: owc-crypto-asymmetric-and-hashes
+title: 'RESOLVED: scrypt, hkdf, createDiffieHellman, generateKeyPairSync, createSign/createVerify and all 52 getHashes() names are host-identical'
 session_id: adv4-judge-docs-gates-goal-9
 owner: adv4-judge-docs-gates-goal-9
-status: pending
+status: completed
+resolved_by: adv7-exec-crypto
+resolved_at: 8f36844 (local main, HEAD at verification)
 classification: GUEST
-measured_at: '8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)'
-subject: |-
-  The crypto surface behind createHash/createHmac/pbkdf2 stops short of everything asymmetric: `crypto.scrypt` is `ERR not a function` here where host Node 24.15 returns a key (`c0b515908e61334cae6d6003c00be60e`), `crypto.createDiffieHellman` is `undefined` where the host has `function`, `crypto.generateKeyPairSync('ed25519')` raises `ERR not a function` where the host returns a key pair, and `crypto.createSign` raises `ERR not a function` where the host returns an object. createHash, createHmac, pbkdf2, randomBytes and randomUUID are byte-identical to the host on the same script. `getHashes()` returns 6 names where the host returns 52: sha3-256, blake2b512, shake256, sm3 and ripemd160 are all absent (md5, sha1, sha256, sha512 present). `getCiphers()` returns 16 where the host returns 130, and the gap shows in the code a caller sees: a cipher the host knows and this does not raises ERR_CRYPTO_UNKNOWN_CIPHER here where the host names the real fault -- ERR_CRYPTO_INVALID_KEYLEN for camellia/sm4/aria/cfb1/cfb8/ofb, ERR_CRYPTO_INVALID_IV for des-ede/des-ede3/aes-128-ccm/ocb/wrap, ERR_OSSL_XTS_DUPLICATED_KEYS for aes-128-xts, and bare `chacha20` works on the host and is unknown here.
+measured_at: 8938feab4b0ff4f38626e2828b2e19c32fa19c54 (local main)
+body: |-
+  VERIFIED CLOSED (adv7-exec-crypto) at local main HEAD 8f36844, no source change needed -- this row
+  was a reappearance. Host node v24.15.0 against the container, /tmp/owc-adv7-crypto/app/main.js run
+  on both sides: 121 probes, 112 identical, and the container run repeated twice byte-identically
+  (load 17-19, 172 MB free; a third run aborted on a concurrent lane mid-write in
+  guest/modules/stream.ts and was discarded, then re-run clean).
+
+  scryptSync and the scrypt callback = 45133c3dfba48c82235df51a5349924110eee893752f0d4168d2e2aee5722d82
+  (maxmem:0 the same, N:2 = 6d1bb878...); hkdfSync = fe8f9615...; pbkdf2 and hmac unchanged.
+  createDiffieHellman is 'function': an explicit modp2 prime with fixed private and public keys gives
+  the same 128-byte secret 11696e3c319d442a... and two freshly keyed objects agree (true|128).
+  generateKeyPairSync for ed25519/ed448/x25519/x448 and ec prime256v1/secp384r1/secp521r1/secp256k1
+  answers Node's key types, DER sizes and sign+verify true; from fixed PKCS#8 PEMs the ed25519
+  signature is c6c22865e1f0ec6b... and the ed448 one 67eb37248e1bb154..., byte-identical, and
+  dsaEncoding 'ieee-p1363' gives true|64. createSign/createVerify are 'object' and EC sign+verify
+  round trips are true. getHashes() is the same 52 names in the same order -- sha3-256, blake2b512,
+  shake256, sm3 and ripemd160 included -- and all 18 digests compared match.
+
+  Residual, none of it in this row's text, named for follow-up rows:
+   1. createHash('shake256').digest(32) throws 'Unknown encoding: 32' here where the host answers
+      the default 32-byte buffer (Node's digest() reads a non-string argument as 'buffer'). Site:
+      Hash.prototype.digest -> outputOf in guest/misc.ts, the throw in guest/codec.ts:274.
+   2. createSign('sha256').sign(ed25519Key) throws ERR_OSSL_INVALID_DIGEST here where the host
+      throws ERR_CRYPTO_UNSUPPORTED_OPERATION 'Unsupported crypto operation'; crypto.sign with the
+      same pair agrees on both. Both paths reach 'crypto.key.sign' with the same arguments, so
+      telling them apart needs a flag from guest/misc.ts Sign.prototype.sign plus a branch in
+      capabilities/crypto.ts (1735 and 2215) -- a cross-shard edit.
+   3. crypto.getDiffieHellman('modp2') is absent ('crypto.dh.group' exists and works); guest/misc.ts:3012
+      exports createDiffieHellmanGroup only.
+   4. createDiffieHellman(256) is accepted here where the host refuses at construction with
+      ERR_INVALID_ARG_VALUE 'Invalid DH parameters' (the boundary is exact: 511 fails, 512 works,
+      0 gives ERR_OSSL_DH_MODULUS_TOO_SMALL). Site: primeOfBits / 'crypto.dh.create'.
+   5. createDiffieHellman(1024 or any MODP size) returns the standard RFC 2409/3526 group here where
+      the host generates a fresh random prime of that size -- a deliberate trade (a fresh 8192-bit
+      prime is seconds of BigInt Miller-Rabin here), recorded rather than changed.
+subject: 'The crypto surface behind createHash/createHmac/pbkdf2 stops short of everything asymmetric: `crypto.scrypt` is `ERR not a function` here where host Node 24.15 returns a key (`c0b515908e61334cae6d6003c00be60e`), `crypto.createDiffieHellman` is `undefined` where the host has `function`, `crypto.generateKeyPairSync(''ed25519'')` raises `ERR not a function` where the host returns a key pair, and `crypto.createSign` raises `ERR not a function` where the host returns an object. createHash, createHmac, pbkdf2, randomBytes and randomUUID are byte-identical to the host on the same script. `getHashes()` returns 6 names where the host returns 52: sha3-256, blake2b512, shake256, sm3 and ripemd160 are all absent (md5, sha1, sha256, sha512 present). `getCiphers()` returns 16 where the host returns 130, and the gap shows in the code a caller sees: a cipher the host knows and this does not raises ERR_CRYPTO_UNKNOWN_CIPHER here where the host names the real fault -- ERR_CRYPTO_INVALID_KEYLEN for camellia/sm4/aria/cfb1/cfb8/ofb, ERR_CRYPTO_INVALID_IV for des-ede/des-ede3/aes-128-ccm/ocb/wrap, ERR_OSSL_XTS_DUPLICATED_KEYS for aes-128-xts, and bare `chacha20` works on the host and is unknown here.'
