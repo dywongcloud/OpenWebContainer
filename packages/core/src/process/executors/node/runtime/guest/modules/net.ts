@@ -30,6 +30,13 @@ var NET_REASON_TEXT = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'ad
 var NET_SNDBUF = 262144;
 
 /**
+ * The buffer sizes host Node 24.15 reads off a socket of this platform's that nobody has set one on:
+ * 786896 bytes to receive and 9216 to send, the same two figures on every dgram socket it opens here.
+ */
+var DGRAM_RECV_BUFFER_SIZE = 786896;
+var DGRAM_SEND_BUFFER_SIZE = 9216;
+
+/**
  * One piece of a socket write, and the most a socket delivers in one read.
  *
  * Measured over 4 KiB to 4 MiB per write, 16 MiB end to end: a write goes fastest in pieces of
@@ -171,14 +178,29 @@ function netUtf8Cut(buf) {
 }
 
 /** Checks a buffer size the way Node does: the socket must be running, the size a plain integer. */
-function netBufferSize(socket, size, syscall) {
-  if (socket._dead || !socket._bound) {
+/**
+ * The state a dgram buffer size is read or written in. Host Node 24.15 answers from two different
+ * ones: an unbound socket has no descriptor to read or set a size on, so it is EBADF, while a closed
+ * one has had its handle nulled and Node dereferences it, throwing a TypeError with V8's own text
+ * rather than the error it throws for an unbound socket.
+ */
+function netBufferState(socket, syscall) {
+  if (socket._dead) throw new TypeError("Cannot read properties of null (reading 'bufferSize')");
+  if (!socket._bound) {
     throw Object.assign(
       netError(Error, 'ERR_SOCKET_BUFFER_SIZE', 'Could not get or set buffer size: ' + syscall + ' returned EBADF (bad file descriptor)'),
       { syscall: syscall });
   }
+}
+
+/**
+ * Validates a buffer size the way Node 24.15 validates one: any integer from 0 up, with a message
+ * that names a positive integer even though 0 passes, which is the text Node itself prints for it.
+ */
+function netBufferSize(socket, size, syscall) {
+  netBufferState(socket, syscall);
   if (typeof size !== 'number' || !Number.isInteger(size) || size < 0) {
-    throw netError(RangeError, 'ERR_SOCKET_BAD_BUFFER_SIZE', 'Buffer size must be a non-negative integer. Received ' + netDescribe(size));
+    throw netError(RangeError, 'ERR_SOCKET_BAD_BUFFER_SIZE', 'Buffer size must be a positive integer');
   }
 }
 
@@ -230,6 +252,27 @@ function netSystemError(cause, syscall, address, port) {
   } else {
     err.address = address;
     if (!unnamed && port !== undefined) err.port = port;
+  }
+  return err;
+}
+
+/**
+ * The error host Node 24.15 reports for a connect a socket has already made (EISCONN) or one still in
+ * flight (EALREADY). Its text names the destination and, for an internet one, the local end the
+ * socket had already bound -- 'connect EISCONN 127.0.0.1:8080 - Local (127.0.0.1:53326)' -- while a
+ * path names itself and no local end, because a unix socket has none.
+ */
+function netConnectAgainError(socket, code, args) {
+  var path = args.path === undefined ? undefined : String(args.path);
+  var where = path !== undefined ? path : String(args.host) + ':' + netPortOf(args.port);
+  var local = path !== undefined ? '' : ' - Local (' + socket.localAddress + ':' + socket.localPort + ')';
+  var err = new Error('connect ' + code + ' ' + where + local);
+  err.errno = code === 'EALREADY' ? -37 : -56;
+  err.code = code;
+  err.syscall = 'connect';
+  if (path === undefined) {
+    err.address = String(args.host);
+    err.port = netPortOf(args.port);
   }
   return err;
 }
@@ -517,6 +560,21 @@ BF['net'] = function () {
     connect() {
       var args = netConnectArgs(arguments);
       if (typeof args.cb === 'function') this.once('connect', args.cb);
+      /* A second connect is one Node refuses: a connection this socket has already made is EISCONN,
+         one still in flight is EALREADY, and both are reported the way every connect failure is --
+         asynchronously, and by destroying the socket, which then emits 'close' too -- while connect()
+         itself still answers with the socket. The answer is read before 'connecting' is set, so a
+         connect asked for while one is in flight is the one that answers EALREADY. Two cases are not
+         refused, and both are host Node 24.15's own: a connect that names no destination dials again
+         in silence, and one on a socket already destroyed is a no-op that reports nothing. */
+      var again = this._dead ? null
+        : (this.connecting ? 'EALREADY' : (this._hubId !== undefined ? 'EISCONN' : null));
+      if (again !== null && (args.path !== undefined || typeof args.host === 'string')) {
+        var refused = netConnectAgainError(this, again, args);
+        var failing = this;
+        netDefer(function () { failing.destroy(refused); });
+        return this;
+      }
       this._connectStarted = true;
       this.connecting = true;
       this._ensureTarget();
@@ -1773,6 +1831,8 @@ BF['dgram'] = function () {
       this._refed = true;
       this._holding = false;
       this._remote = null;
+      this._recvBufferSize = undefined;
+      this._sendBufferSize = undefined;
     }
 
     _holdable() {
@@ -1995,13 +2055,29 @@ BF['dgram'] = function () {
     setMulticastInterface() {}
 
     /* Buffer sizes are a kernel setting this runtime has no kernel for: accepted and checked, then
-       dropped. An unbound or closed socket has no descriptor to set one on, as on Node. */
+       remembered for the getter, which answers with this platform's own default until one is set. A
+       size of 0 is the one value that leaves the figure alone, because that is what the host's kernel
+       does with it -- host Node 24.15 still reports 786896 after setRecvBufferSize(0). */
     setRecvBufferSize(size) {
       netBufferSize(this, size, 'uv_recv_buffer_size');
+      if (size > 0) this._recvBufferSize = size;
     }
 
     setSendBufferSize(size) {
       netBufferSize(this, size, 'uv_send_buffer_size');
+      if (size > 0) this._sendBufferSize = size;
+    }
+
+    /* The size a bound dgram socket reports: whatever a setter gave it, or the size host Node 24.15
+       reads off a socket of this platform that has never had one set. */
+    getRecvBufferSize() {
+      netBufferState(this, 'uv_recv_buffer_size');
+      return this._recvBufferSize === undefined ? DGRAM_RECV_BUFFER_SIZE : this._recvBufferSize;
+    }
+
+    getSendBufferSize() {
+      netBufferState(this, 'uv_send_buffer_size');
+      return this._sendBufferSize === undefined ? DGRAM_SEND_BUFFER_SIZE : this._sendBufferSize;
     }
 
     addMembership() {}
