@@ -480,8 +480,21 @@ function netOwnAddress(address) {
   return address === '0.0.0.0' || address.indexOf('127.') === 0;
 }
 
+/* Host node builds its resolver channel the first time anything asks the resolver for an address --
+   before it takes the IP-literal fast path, which is why a listen on '127.0.0.1' alone is enough to
+   make one -- and reports it once as a DNSCHANNEL. It is one channel for the life of the process, so
+   it is made once and never closed here: a host destroys its own at the exit of the process, and this
+   container reports nothing of that. */
+var netDnsChannelMade = false;
+function netDnsChannel() {
+  if (netDnsChannelMade) return;
+  netDnsChannelMade = true;
+  asyncOpenResource('DNSCHANNEL', {});
+}
+
 /** Resolves a host to an address: IP literals and the name table synchronously, other names via dns.lookup. */
 function netResolve(host, family, done, lookup) {
+  netDnsChannel();
   var name = host === undefined || host === null || host === '' ? 'localhost' : String(host);
   if (netIsIP(name)) {
     done(null, name);
@@ -852,6 +865,9 @@ BF['net'] = function () {
         netDefer(function () { dialler._doConnectPath(dialled); });
         return this;
       }
+      /* A host's TCP socket is one TCPWRAP: node reports it when the socket is made and destroys it
+         when the socket is destroyed. A pipe path is no TCP socket at all, so it reports none. */
+      this._owcAsync = asyncOpenResource('TCPWRAP', this);
       var port = netPortOf(args.port);
       var self = this;
       /* A name with two addresses is tried on both, as Node's happy-eyeballs does: only the caller's
@@ -1488,6 +1504,11 @@ BF['net'] = function () {
     Socket.prototype._destroy = function (error, callback) {
       var unread = this._unreadBytes();
       this._dead = true;
+      /* The handle goes with the socket, as a host's does. */
+      if (this._owcAsync) {
+        this._owcAsync();
+        this._owcAsync = null;
+      }
       this._hadError = !!error;
       this.connecting = false;
       this._readQueue = [];
@@ -1793,6 +1814,10 @@ BF['net'] = function () {
          is read as a port and refused there, which is what this runtime answered before a path
          was carried at all. */
       var usePath = path !== undefined && args.port === undefined;
+      /* A host resolves the host a listen names before it binds -- an IP literal included, which is
+         why a listen on '127.0.0.1' alone is enough to make its resolver channel. A unix path is
+         never resolved, so it makes none. */
+      if (!usePath) netDnsChannel();
       var port = usePath
         ? 0
         : netPortOf(args.port !== undefined ? args.port : (named !== undefined ? named : 0), true);
@@ -1939,7 +1964,10 @@ BF['net'] = function () {
     }
 
     _makeSocket() {
-      return new Socket({ allowHalfOpen: this._serverOpts.allowHalfOpen });
+      var made = new Socket({ allowHalfOpen: this._serverOpts.allowHalfOpen });
+      /* A connection a server accepted is a TCPWRAP of its own, made when the accept happens. */
+      made._owcAsync = asyncOpenResource('TCPWRAP', made);
+      return made;
     }
 
     _emitAccepted(socket) {

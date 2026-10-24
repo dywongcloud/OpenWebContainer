@@ -2733,6 +2733,7 @@ BF.fs = function () {
     this._owcTarget = target;
     this._owcTimer = null;
     this._owcClosed = false;
+    this._owcAsync = null;
     this._owcLast = watchSnapshotOf(target);
   }
   if (WATCH_EMITTER) {
@@ -2754,6 +2755,11 @@ BF.fs = function () {
     this._owcClosed = true;
     if (this._owcTimer !== null && typeof clearTimeout === 'function') clearTimeout(this._owcTimer);
     this._owcTimer = null;
+    /* The handle stands while the watcher stands and goes when it goes, as a host's does. */
+    if (this._owcAsync !== null) {
+      this._owcAsync();
+      this._owcAsync = null;
+    }
     this.emit('close');
   };
   FSWatcher.prototype.ref = function () { return this; };
@@ -2818,6 +2824,11 @@ BF.fs = function () {
     var cb = typeof opts === 'function' ? opts : (typeof listener === 'function' ? listener : undefined);
     var watcher = new FSWatcher(toPathString(raw));
     if (cb) watcher.on('change', cb);
+    /* A host's watcher is one FSEVENTWRAP, and node reports it the moment the watcher is made --
+       before the first poll, which is why the handle is opened here and not by start. It is null
+       while no hook is enabled, so a watch nobody is watching costs nothing. */
+    watcher._owcAsync = asyncOpenResource('FSEVENTWRAP', watcher);
+    if (watcher._owcAsync === undefined) watcher._owcAsync = null;
     watcher.start(watchIntervalOf(opts, WATCH_INTERVAL_MS));
     return watcher;
   };

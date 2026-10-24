@@ -528,6 +528,12 @@ function cpSpawnCore(child, file, argv, options, extra) {
      turn, so the pid is taken from the host now and the child is registered under it when it starts. */
   var reserved = callCap('child.reservePid', {});
   child.pid = Number(reserved.pid);
+  /* A host's spawn is one process handle and one pipe for every stdio it was asked to pipe, and node
+     reports both before spawn returns: PROCESSWRAP for the child itself, then a PIPEWRAP per pipe.
+     The pipes are numbered the way the descriptors are, so they are opened below, once the streams
+     exist. Both are null while no hook is enabled, which is what leaves an ordinary spawn as it was. */
+  child._cpAsyncProcess = asyncOpenResource('PROCESSWRAP', child);
+  child._cpAsyncPipes = [null, null, null];
   var stream = requireBuiltin('stream');
   /* A Worker reads its two streams off the prototype, so the stream is kept under a name of its own
      as well as on the child: an own property cannot shadow an accessor that has no setter. */
@@ -560,6 +566,14 @@ function cpSpawnCore(child, file, argv, options, extra) {
     });
   }
   child.stdio = [child.stdin, child.stdout, child.stderr];
+  /* The three pipes, in the order a host numbers them: fd 0, then 1, then 2. The two the child writes
+     are closed by the streams themselves, when a reader has read them to their end; the one the
+     parent writes dies with the child, as a host's does, which is cpAsyncGone below. */
+  var piped = child.stdio;
+  for (var pfd = 0; pfd < 3; pfd++) {
+    if (!piped[pfd]) continue;
+    cpOpenPipe(child, pfd, piped[pfd]);
+  }
   child._cpTarget = createTarget(function (name, payload) {
     cpOnEvent(child, payload);
   });
@@ -618,6 +632,7 @@ function cpSpawnFailed(child, error) {
   child.emit('error', error);
   proc.nextTick(function () {
     child.emit('close', errno, null);
+    cpAsyncGone(child);
   });
 }
 
@@ -651,6 +666,43 @@ function cpOnEvent(child, ev) {
       cpEmitDisconnect(child);
     }
   }
+}
+
+/* One PIPEWRAP for one pipe of a spawned child: node reports it when the pipe is made and destroys
+   it when the pipe closes. The write end (fd 0) is not one a stream closes on its own -- it goes when
+   the child goes -- so only the two read ends are tied to their stream's 'close'. */
+function cpOpenPipe(child, fd, pipe) {
+  var close = asyncOpenResource('PIPEWRAP', pipe);
+  if (close === null) return;
+  child._cpAsyncPipes[fd] = function cpClosedPipe() {
+    if (child._cpAsyncPipes[fd] === null) return;
+    child._cpAsyncPipes[fd] = null;
+    close();
+  };
+  if (fd !== 0) pipe.once('close', child._cpAsyncPipes[fd]);
+}
+
+/* The child's own handle and the pipe the parent wrote to it: both are gone once the child's 'close'
+   has been emitted, the handle first, as a host reports them. */
+function cpAsyncGone(child) {
+  if (child._cpAsyncProcess) {
+    child._cpAsyncProcess();
+    child._cpAsyncProcess = null;
+  }
+  if (!child._cpAsyncPipes) return;
+  /* What nothing read to its end goes with the child: the two read ends when no reader ever closed
+     them, and the write end last, which is the order a host destroys them in. */
+  for (var fd = 1; fd < 3; fd++) {
+    if (child._cpAsyncPipes[fd]) child._cpAsyncPipes[fd]();
+  }
+  if (child._cpAsyncPipes[0]) child._cpAsyncPipes[0]();
+}
+
+/* A host shuts the read end of each pipe it made for a child as that child goes, and node reports
+   every one of them: a SHUTDOWNWRAP, triggered by the pipe it shut, with a before and an after
+   around the shutdown and a destroy once it has settled. */
+function cpShutPipe(pipe) {
+  asyncWrapResource('SHUTDOWNWRAP', function () { pipe.push(null); }, true)();
 }
 
 function cpExit(child, code, signal, timedOut) {
@@ -689,17 +741,19 @@ function cpEmitExit(child, code, signal) {
    puts the destination's close first, as it comes first on a host. */
 function cpCloseWhenDone(child, code, signal) {
   var waiting = [];
-  var streams = [child.stdout, child.stderr];
+  /* stderr before stdout, which is the order a host shuts them in. */
+  var streams = [child.stderr, child.stdout];
   for (var i = 0; i < streams.length; i++) {
     var stream = streams[i];
     if (!stream) continue;
-    stream.push(null);
+    cpShutPipe(stream);
     if (stream.listenerCount('data') > 0 || stream.readableFlowing === true) waiting.push(stream);
   }
   if (waiting.length === 0) {
     cpEmitExit(child, code, signal);
     proc.nextTick(function () {
       child.emit('close', code, signal);
+      cpAsyncGone(child);
     });
     return;
   }
@@ -711,6 +765,7 @@ function cpCloseWhenDone(child, code, signal) {
       setImmediate(function () {
         cpEmitExit(child, code, signal);
         child.emit('close', code, signal);
+        cpAsyncGone(child);
       });
     });
   });
