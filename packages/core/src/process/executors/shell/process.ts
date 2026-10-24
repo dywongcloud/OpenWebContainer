@@ -308,6 +308,13 @@ export class ShellProcess extends Process {
      *  result's own copy of that output is not written again. */
     private liveChildOutput = false;
     /**
+     * True when the line now being run was taken apart into steps, so the script engine saw it as
+     * more than one script. The EXIT trap is the shell's own exit and not a step's, so it is held
+     * back until the line is over and run once -- `trap 'echo BYE' EXIT; echo A; echo B` is a host's
+     * `A`, `B` and then one `BYE`, where a step that ran its own EXIT trap put one behind each.
+     */
+    private exitTrapPending = false;
+    /**
      * The `timeout` of the spawn that started this shell, in milliseconds; 0 when the caller named
      * none. The bound belongs to the whole command line, not to one command of it, so it is kept as
      * the moment it runs out -- see `armKillDeadline`.
@@ -839,8 +846,25 @@ export class ShellProcess extends Process {
      * gives the child the text the step before it wrote.
      */
     private async executeCommand(commandLine: string): Promise<ShellCommandResult> {
+        const result = await this.runCommandLine(commandLine);
+        if (!this.exitTrapPending) return result;
+        this.exitTrapPending = false;
+        /* The line is over, so the shell's own EXIT trap runs now -- once, behind everything the
+           line's commands wrote, as it does on a host. An `exit` the trap ran is the shell's exit
+           and the status it named is the one the line ends with. */
+        const trap = this.shell.runExitTrap();
+        if (trap.exited) this.rememberStopped(trap.status);
+        return {
+            stdout: result.stdout + trap.stdout,
+            stderr: result.stderr + trap.stderr,
+            exitCode: trap.exited ? trap.status : result.exitCode
+        };
+    }
+
+    private async runCommandLine(commandLine: string): Promise<ShellCommandResult> {
         const processedArgs = splitCommandLine(commandLine);
         this.liveChildOutput = false;
+        this.exitTrapPending = false;
 
         if (processedArgs.length === 0) {
             return { stdout: '', stderr: '', exitCode: 0 };
@@ -861,6 +885,7 @@ export class ShellProcess extends Process {
                a screen that loop redraws, and has no caller waiting on a pipe. */
             if (steps !== null && (steps.length > 1 && (this.streamsSteps() || this.killDeadlineAt > 0)
                 || steps.some((step) => this.shell.isSpawnedCommand(spawnedAs(firstWordOf(step.text)))))) {
+                this.exitTrapPending = true;
                 const run = await this.executeSteps(steps);
                 if (this.shell.stopped) {
                     this.running = false;
@@ -965,7 +990,9 @@ export class ShellProcess extends Process {
             this.shell.noteChildStatus(run.exitCode);
             return run;
         }
-        return this.runEngineLine(text, input);
+        /* A step is a fragment of the line and not the shell's exit, so the EXIT trap is not run at
+           the end of one: see `exitTrapPending` and `executeCommand`. */
+        return this.runEngineLine(text, input, true);
     }
 
     /**
@@ -981,9 +1008,9 @@ export class ShellProcess extends Process {
      * the line ends -- `sh -c 'echo A; sleep 2'` gave its caller 'A\n' two seconds late, where a
      * host gives it at once.
      */
-    private async runEngineLine(text: string, input: string | null): Promise<ShellCommandResult> {
+    private async runEngineLine(text: string, input: string | null, fragment = false): Promise<ShellCommandResult> {
         const ms = sleepMsOf(text);
-        if (ms === null) return this.shell.executeLine(text, input);
+        if (ms === null) return fragment ? this.shell.executeFragment(text, input) : this.shell.executeLine(text, input);
         const left = this.killDeadlineAt > 0 ? this.killDeadlineAt - Date.now() : ms;
         if (left > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(ms, left)));
         /* An `exec` that was given its whole wait replaced the shell with the command it named, the

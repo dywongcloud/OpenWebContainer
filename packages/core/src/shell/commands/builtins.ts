@@ -150,6 +150,13 @@ export interface TrapSpec {
     reset: boolean;
     /** `trap '' SIGNAL`: ignore. */
     ignore: boolean;
+    /**
+     * How many function calls deep the shell stood when this trap was set. A host does not pass a
+     * DEBUG or an ERR trap into a function, so one the line set is not run for a command of a
+     * function's body -- but one the function set for itself is, which is what this depth says:
+     * `f() { trap 'echo D' DEBUG; echo body; }; f` prints `D` and then `body`.
+     */
+    functionDepth?: number;
 }
 
 export interface CallFrame {
@@ -299,6 +306,13 @@ export interface ShellState {
     /** `hash`'s remembered command paths. */
     hash: Map<string, string>;
     traps: Map<string, TrapSpec>;
+    /**
+     * Non-zero while a trap's own action is running. A command of that action is a command of the
+     * trap and not one of the line, so a DEBUG or an ERR trap is not run for it -- `trap 'echo D'
+     * DEBUG; echo A` is the one `D` a host prints, where running the action's own `echo` through
+     * the trap ran it once per level the recursion reached, hundreds deep, before `A` ever came out.
+     */
+    trapDepth?: number;
     /**
      * The descriptors `exec` opened and left open: `3` is the file `exec 3>f` named, and a later
      * `echo hi >&3` writes to it, the way it does in a shell. One `exec 3>&1` opened is the shell's
@@ -4639,6 +4653,9 @@ let substitutionStatus = 0;
 function runSubstitution(state: ShellState, script: string): string {
     const snapshot = snapshotState(state);
     const savedIo = state.io;
+    /* A substitution is a subshell of its own, so the DEBUG and ERR traps the shell behind it has
+       are not the ones it runs -- see `inheritedTraps`. */
+    state.traps = inheritedTraps(state);
     /* What the substitution captures is the standard output of the script it runs, so the script
        starts with the shell's own output target put back however `exec` had moved it: `exec >f;
        echo [$(echo hi)]` writes `[hi]` into `f`, where inheriting the target wrote `hi` to the file
@@ -4689,15 +4706,71 @@ function runSubstitution(state: ShellState, script: string): string {
     return captured.stdout.replace(/\n+$/, '');
 }
 
-function runTrap(state: ShellState, name: string): void {
+/**
+ * True when the DEBUG or the ERR trap is run for the command now being started.
+ *
+ * Neither is run for a command of a trap's own action -- see `trapDepth` -- and neither is run for
+ * a command of a function's body, because a host does not pass either into a function: `trap
+ * 'echo D' DEBUG; f() { echo body; }; f` is one `D` and then `body`. `set -T` and `set -E` are the
+ * two options that pass the one they name in, and a trap the function itself set does run there,
+ * which is what `functionDepth` is for.
+ */
+function trapRunsForCommand(state: ShellState, name: string): boolean {
     const trap = state.traps.get(name);
-    if (!trap || trap.reset || trap.ignore) return;
+    if (!trap || trap.reset || trap.ignore) return false;
+    if (state.trapDepth) return false;
+    if (state.callStack.length === 0) return true;
+    if ((trap.functionDepth ?? 0) === state.callStack.length) return true;
+    return name === 'DEBUG' ? state.options.functrace === true : state.options.errtrace === true;
+}
+
+/**
+ * The traps a command the shell forks -- a subshell, a command substitution, a background job --
+ * starts with: the shell's own, minus the DEBUG and ERR traps, which a host does not pass into one.
+ *
+ * `trap 'echo D' DEBUG; ( echo A )` is a host's `A` and no `D`, and `trap 'echo E' ERR; ( false );
+ * echo after` is its `after` and no `E`. A trap the child set for itself does run there, which is
+ * why the copy is handed over and not an empty table: `( trap 'echo D' DEBUG; echo A )` is `D` and
+ * `A`. `set -T` and `set -E` are the two options that pass the one they name into a child, so with
+ * either on the entry stays.
+ */
+function inheritedTraps(state: ShellState): Map<string, TrapSpec> {
+    const copy = new Map([...state.traps].map(([name, spec]) => [name, { ...spec }]));
+    if (state.options.functrace !== true) copy.delete('DEBUG');
+    if (state.options.errtrace !== true) copy.delete('ERR');
+    return copy;
+}
+
+/**
+ * Runs the action of one trap.
+ *
+ * `status` is the status its last command left and `exited` says an `exit` of its own ended it,
+ * which is the shell's own exit and the status the shell ends with: `trap 'echo BYE; exit 7' EXIT`
+ * prints `BYE` and ends 7, whatever the line behind it left. `{ status: -1 }` is a trap that is
+ * not set, reset or ignored -- nothing ran.
+ */
+function runTrap(state: ShellState, name: string): { status: number; exited: boolean } {
+    const trap = state.traps.get(name);
+    if (!trap || trap.reset || trap.ignore) return { status: -1, exited: false };
+    let status = -1;
+    let exited = false;
+    /* Everything the action runs is inside a trap, so no trap is run for a command of it: a DEBUG
+       trap's own `echo` reaching the trap again is what made `trap 'echo D' DEBUG; echo A` print
+       hundreds of `D` where a host prints one. */
+    state.trapDepth = (state.trapDepth ?? 0) + 1;
     try {
         const nodes = new Parser(trap.action, state).parse();
-        for (const node of nodes) runCommandList(state, [node], null);
-    } catch {
-        /* a trap does not change the shell's own status here */
+        for (const node of nodes) status = runCommandList(state, [node], null);
+    } catch (error) {
+        if (error instanceof ExitSignal) {
+            status = error.code;
+            exited = true;
+        }
+        /* anything else: a trap does not change the shell's own status here */
+    } finally {
+        state.trapDepth = (state.trapDepth ?? 1) - 1;
     }
+    return { status, exited };
 }
 
 /* ================================================================== *
@@ -4939,12 +5012,47 @@ function runParsed(state: ShellState, script: string): number {
 /** The front door: parses and runs a whole script. */
 export function runScript(state: ShellState, script: string): { stdout: string; stderr: string; exitCode: number } {
     state.io = { stdout: '', stderr: '' };
-    const exitCode = runParsed(state, script);
+    let exitCode = runParsed(state, script);
     /* The line is over, so whatever the shell was still holding goes out now: `sh -c 'echo hi >&-'`
        prints `hi`, and `sh -c 'exec >d; echo hi >&-'` leaves it in `d`. */
     flushHeld(state);
-    runTrap(state, 'EXIT');
+    const trap = runTrap(state, 'EXIT');
+    /* An `exit` the EXIT trap ran is the shell's own, and the status it named is the one the line
+       ends with: `trap 'echo BYE; exit 7' EXIT` alone prints `BYE` and ends 7. */
+    if (trap.exited) exitCode = trap.status;
     return { stdout: state.io.stdout, stderr: state.io.stderr, exitCode };
+}
+
+/**
+ * One script run as a *fragment* of a longer line: one step of a compound line the shell runs
+ * itself, step by step, because a command only a child process can run stands in it.
+ *
+ * The shell has not exited, so the EXIT trap is not run at the end of a fragment -- a host's
+ * `trap 'echo BYE' EXIT; echo A; echo B` is `A`, `B` and then one `BYE`, and not a `BYE` behind
+ * every command of the line. `runExitTrap` runs that one at the end of the line.
+ */
+export function runScriptFragment(state: ShellState, script: string): { stdout: string; stderr: string; exitCode: number } {
+    state.io = { stdout: '', stderr: '' };
+    const exitCode = runParsed(state, script);
+    flushHeld(state);
+    return { stdout: state.io.stdout, stderr: state.io.stderr, exitCode };
+}
+
+/**
+ * The shell's EXIT trap, run at the end of the line -- the moment a host runs it, and the only
+ * moment: once, and not once per command of the line.
+ *
+ * Returns what the trap wrote, whether an `exit` of its own ended it, and the status it named,
+ * which is then the status the line ends with.
+ */
+export function runExitTrap(state: ShellState): { stdout: string; stderr: string; exited: boolean; status: number } {
+    const savedIo = state.io;
+    state.io = { stdout: '', stderr: '' };
+    const trap = runTrap(state, 'EXIT');
+    flushHeld(state);
+    const out = { stdout: state.io.stdout, stderr: state.io.stderr };
+    state.io = savedIo;
+    return { stdout: out.stdout, stderr: out.stderr, exited: trap.exited, status: trap.status };
 }
 
 /**
@@ -5052,7 +5160,12 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null, 
             status = runNode(state, node, input);
             state.lastStatus = status;
             if (status !== 0 && state.protectedDepth === 0) {
-                runTrap(state, 'ERR');
+                /* A command of a trap's own action is not one of the line, so a failure inside an
+                   ERR trap does not run the trap again -- see `trapDepth`. Nor is a command of a
+                   function's body one of the line: a host does not pass the ERR trap into a function
+                   unless `set -E` asks it to, so `trap 'echo E' ERR; f() { false; }; f; echo after`
+                   is one `E` and then `after`. */
+                if (trapRunsForCommand(state, 'ERR')) runTrap(state, 'ERR');
                 if (state.options.errexit) throw new ExitSignal(status);
             }
         } catch (error) {
@@ -5810,6 +5923,9 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
         case 'subshell':
             return runCompoundRedirected(state, command, input, () => {
             const snapshot = snapshotState(state);
+            /* A subshell is a process of its own on a host, and the DEBUG and ERR traps are not the
+               ones it inherits -- see `inheritedTraps`. */
+            state.traps = inheritedTraps(state);
             const inheritedTrap = state.traps.get('EXIT');
             try {
                 return runCommandList(state, command.body, null);
@@ -6921,7 +7037,11 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
         traceWrite(state, traceWords(name, args));
     }
     if (state.options.verbose) writeErr(state, `${traceWords(name, args)}\n`);
-    runTrap(state, 'DEBUG');
+        /* A command of a trap's own action is not one of the line, so the DEBUG trap is not run for
+           it -- see `trapDepth`. A command of a function's body is not either: a host does not pass
+           the DEBUG trap into a function unless `set -T` asks it to, so `trap 'echo D' DEBUG; f() {
+           echo body; }; f` is one `D` and then `body`. */
+        if (trapRunsForCommand(state, 'DEBUG')) runTrap(state, 'DEBUG');
 
     const savedBuffer = state.inputBuffer;
     const savedCursor = state.inputCursor;
@@ -9392,6 +9512,9 @@ function runPendingJob(state: ShellState, job: ShellJob): { stdout: string; stde
     }
     const snapshot = snapshotState(state);
     const savedIo = state.io;
+    /* A job is a subshell of its own, so the DEBUG and ERR traps are not the ones it inherits --
+       see `inheritedTraps`. */
+    state.traps = inheritedTraps(state);
     try {
         /* The source the `&` was written on, not the text `jobs` prints: printing a command is what
            takes its quoting out, and a job replayed from unquoted words is a different command. */
@@ -9505,7 +9628,7 @@ function trapBuiltin(ctx: CommandContext): CommandResult {
     for (const signal of args.slice(1)) {
         const name = signal.replace(/^SIG/, '');
         if (reset) state.traps.delete(name);
-        else state.traps.set(name, { action, reset, ignore });
+        else state.traps.set(name, { action, reset, ignore, functionDepth: state.callStack.length });
     }
     return ok();
 }
@@ -9697,6 +9820,7 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
         umask: 0o022,
         hash: new Map(),
         traps: new Map(),
+        trapDepth: 0,
         openFds: new Map(),
         stdoutTarget: { kind: 'out' },
         stderrTarget: { kind: 'err' },

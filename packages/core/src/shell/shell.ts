@@ -27,8 +27,10 @@ import {
     getRunner,
     isIncompleteSource,
     plainPrefix,
+    runExitTrap as runStateExitTrap,
     runPendingJobs,
     runScript,
+    runScriptFragment,
     setRunner,
     setVar
 } from './commands/builtins';
@@ -571,6 +573,51 @@ export class Shell implements IShell {
      * one go -- `cat`, `wc`, `head` -- read, and the line leaves that buffer as it found it.
      */
     executeLine(line: string, input?: string | null): ShellCommandResult {
+        return this.runLine(line, input, false);
+    }
+
+    /**
+     * One step of a compound line the shell runs itself, step by step: the same engine, except that
+     * the shell has not exited, so the EXIT trap stays unrun until the line is over -- a host's
+     * `trap 'echo BYE' EXIT; echo A; echo B` is `A`, `B` and then one `BYE`, not one behind each
+     * command. `runExitTrap` below runs that one at the end of the line.
+     */
+    executeFragment(line: string, input?: string | null): ShellCommandResult {
+        return this.runLine(line, input, true);
+    }
+
+    /**
+     * The EXIT trap, run once at the end of a line this shell ran step by step.
+     *
+     * What it wrote comes after everything the line's own commands wrote, as it does on a host, and
+     * an `exit` of its own is the shell's exit: `trap 'echo BYE; exit 7' EXIT; echo main` prints
+     * `main`, then `BYE`, and ends 7.
+     */
+    runExitTrap(): { stdout: string; stderr: string; exited: boolean; status: number } {
+        const state = this.shellState;
+        const previous = getRunner();
+        setRunner(this.runSimpleCommand);
+        /* An `exit` ended the line, and the dispatcher refuses every command behind one -- but the
+           EXIT trap is not behind the exit, it is what the exit runs: `trap 'echo BYE' EXIT; exit 3`
+           prints `BYE` on a host. So the flag is lifted for the trap and put back as the trap left
+           it. */
+        const stopped = this.stopped;
+        this.stopped = false;
+        try {
+            const trap = runStateExitTrap(state);
+            this.stopped = trap.exited ? true : stopped;
+            if (trap.exited) {
+                this.stoppedCode = trap.status;
+                this.lastStatus = trap.status;
+                state.lastStatus = trap.status;
+            }
+            return trap;
+        } finally {
+            setRunner(previous);
+        }
+    }
+
+    private runLine(line: string, input: string | null | undefined, fragment: boolean): ShellCommandResult {
         const state = this.shellState;
         const previous = getRunner();
         const savedBuffer = state.inputBuffer;
@@ -581,7 +628,7 @@ export class Shell implements IShell {
         }
         setRunner(this.runSimpleCommand);
         try {
-            const run = runScript(state, line);
+            const run = fragment ? runScriptFragment(state, line) : runScript(state, line);
             this.lastStatus = run.exitCode;
             this.syncFromState();
             /* A job the line started and never waited for runs once the line's own commands are

@@ -509,6 +509,14 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   604, because the call at `builtins.ts:6576` sits inside `runSimple`, so the trap's own action runs
   through it and re-enters the trap -- a host does not run a `DEBUG` trap from inside a trap's action.
   Both are call sites of one function, in a file this wave does not own.
+- **Fixed at HEAD: an EXIT trap ran once per command of a `sh -c` line and a DEBUG trap once per step of one.**
+  `spawn('sh', ['-c', "trap 'echo BYE' EXIT; echo A; echo B"])` answered `BYE\nA\nBYE\nB\nBYE\n` here and
+  `A\nB\nBYE\n` on this machine's `/bin/sh`, because `ShellProcess.executeCommand` ran every step of a compound
+  line through `runScript`, which fires the shell's EXIT trap at the end of each; a step is now a fragment
+  (`runScriptFragment`) and the trap is run once, when the line is over. `sh -c "trap 'echo D' DEBUG; echo A"`
+  answered 640 `D`s and then `A`, because `runSimple` ran the DEBUG trap for the commands of the trap's own
+  action and re-entered it until the stack ran out; a DEBUG or an ERR trap is now not run for a command of a
+  trap's action, nor inside a function body or a subshell the trap was not set in (unless `set -T`/`set -E`).
 - **A backgrounded job holds the shell until it ends, where a host's `sh -c` exits at once.**
   `spawn('sh', ['-c', '(sleep 3 &); echo A'])` with no `timeout` exits at 7 ms on host node 24.15 and
   closes at 3018 ms, the `sleep` holding the pipe, while here both happen at 3009 ms and `A` arrives with
