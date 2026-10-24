@@ -368,6 +368,8 @@ BF['http'] = function () {
     Writable.call(this, options || {});
     this._hdr = Object.create(null);
     this._headSent = false;
+    this._headFlushed = false;
+    this._header = null;
     this._chunked = false;
     this._hasBody = true;
     this.socket = null;
@@ -465,7 +467,9 @@ BF['http'] = function () {
     this._commitHead(null);
     return this;
   };
-  /* Writes the status line and headers. length is the body size when known (Content-Length), null means chunked. */
+  /* Builds the status line and headers and holds them: host Node stores the head at writeHead and
+     puts it on the wire with the first body byte, so a client cannot read a head whose body does not
+     exist yet. length is the body size when known (Content-Length), null means chunked. */
   ServerResponse.prototype._commitHead = function _commitHead(length) {
     if (this._headSent) return;
     this._headSent = true;
@@ -495,22 +499,32 @@ BF['http'] = function () {
       }
     }
     this._header = lines.join('\r\n') + '\r\n\r\n';
-    this.socket.write(Buffer.from(this._header, 'latin1'));
+  };
+  /* Hands the built head over for the wire, once: null once it has gone out, so the caller can send
+     it in the same write as the chunk that forced it, the way host Node prepends it. */
+  ServerResponse.prototype._takeHead = function _takeHead() {
+    if (this._header === null) this._commitHead(null);
+    if (this._headFlushed) return null;
+    this._headFlushed = true;
+    return Buffer.from(this._header, 'latin1');
   };
   ServerResponse.prototype._write = function _write(chunk, encoding, callback) {
-    if (!this._headSent) this._commitHead(null);
+    var head = this._takeHead();
+    var body = null;
     if (this._hasBody && chunk.length > 0) {
-      if (this._chunked) {
-        this.socket.write(Buffer.concat([Buffer.from(chunk.length.toString(16) + '\r\n', 'latin1'), chunk, Buffer.from('\r\n', 'latin1')]));
-      } else {
-        this.socket.write(chunk);
-      }
+      body = this._chunked
+        ? Buffer.concat([Buffer.from(chunk.length.toString(16) + '\r\n', 'latin1'), chunk, Buffer.from('\r\n', 'latin1')])
+        : chunk;
     }
+    if (head !== null) this.socket.write(body === null ? head : Buffer.concat([head, body]));
+    else if (body !== null) this.socket.write(body);
     callback();
   };
   ServerResponse.prototype._final = function _final(callback) {
-    if (!this._headSent) this._commitHead(0);
-    if (this._chunked) this.socket.write(Buffer.from('0\r\n\r\n', 'latin1'));
+    var head = this._takeHead();
+    var tail = this._chunked ? Buffer.from('0\r\n\r\n', 'latin1') : null;
+    if (head !== null) this.socket.write(tail === null ? head : Buffer.concat([head, tail]));
+    else if (tail !== null) this.socket.write(tail);
     callback();
   };
   ServerResponse.prototype.end = function end(chunk, encoding, callback) {
@@ -526,7 +540,9 @@ BF['http'] = function () {
     return OutgoingMessage.prototype.end.call(this, chunk, encoding, callback);
   };
   ServerResponse.prototype.flushHeaders = function flushHeaders() {
-    this._commitHead(null);
+    if (this._header === null) this._commitHead(null);
+    var head = this._takeHead();
+    if (head !== null) this.socket.write(head);
   };
   ServerResponse.prototype.writeContinue = function writeContinue(callback) {
     this.socket.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1'));
