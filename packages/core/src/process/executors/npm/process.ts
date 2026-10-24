@@ -9,6 +9,7 @@ import { runOutdated } from '../../../npm/outdated';
 import { runAudit } from '../../../npm/audit';
 import { runCacheVerify } from '../../../npm/cache';
 import { findWorkspaceRoot, parseWorkspaceOptions, resolveWorkspaces } from '../../../npm/workspaces';
+import { scriptEnvironment } from '../../../npm/script-env';
 import {
     LIFECYCLE_COMMANDS,
     NPM_VERSION,
@@ -117,12 +118,12 @@ export class NpmProcess extends Process {
                 return 0;
             case 'run':
             case 'run-script':
-                return this.runScript(rest);
+                return this.runScript(rest, undefined, 'run');
             case 'test':
             case 'start':
             case 'stop':
             case 'restart':
-                return this.runScript(rest, LIFECYCLE_COMMANDS[command]);
+                return this.runScript(rest, LIFECYCLE_COMMANDS[command], command);
             case 'exec':
             case 'x':
                 return this.runExec(rest, registry, log);
@@ -281,7 +282,7 @@ export class NpmProcess extends Process {
      * node_modules/.bin in front of PATH, and the status of the script that fails is the status npm
      * exits with.
      */
-    private async runScript(args: string[], event?: string): Promise<number> {
+    private async runScript(args: string[], event?: string, command?: string): Promise<number> {
         const { options: workspaceOptions, rest } = parseWorkspaceOptions(args);
         const parsed = parseScriptArgs(rest, event);
         const projectDir = this.cwd ?? '/';
@@ -297,18 +298,23 @@ export class NpmProcess extends Process {
         if (dirs.length > 0) {
             let exitCode = 0;
             for (const dir of dirs) {
-                const code = await this.runPackageScript(dir, parsed);
+                const code = await this.runPackageScript(dir, parsed, command, true);
                 /* The first workspace that does not have the script ends the run: npm reports it and
                    exits, and the workspaces after it are not asked. */
                 if (code !== 0) return code;
             }
             return exitCode;
         }
-        return this.runPackageScript(findPackageRoot(this.fileSystem, projectDir) ?? normalizeAbsolute(projectDir), parsed);
+        return this.runPackageScript(findPackageRoot(this.fileSystem, projectDir) ?? normalizeAbsolute(projectDir), parsed, command);
     }
 
     /** The script of one package: the listing when no name was given, otherwise the events of it. */
-    private async runPackageScript(packageDir: string, parsed: ParsedScriptArgs): Promise<number> {
+    private async runPackageScript(
+        packageDir: string,
+        parsed: ParsedScriptArgs,
+        command?: string,
+        workspaces = false
+    ): Promise<number> {
         const { name, ifPresent, extra } = parsed;
         const manifest = readManifest(this.fileSystem, packageDir);
         if (manifest === undefined) {
@@ -332,16 +338,22 @@ export class NpmProcess extends Process {
         }
 
         const PATH = scriptPath(this.fileSystem, packageDir, Object.fromEntries(this.env).PATH);
+        const env = Object.fromEntries(this.env);
         for (const step of scriptEvents(name, scripts)) {
             const line = scriptCommandLine(scripts, step, name, extra);
             this.emitOutput(scriptHeader(label, step, line));
             const result = await this.spawnChild('sh', ['-c', line], {
-                ...Object.fromEntries(this.env),
+                ...env,
                 PATH,
-                npm_package_name: String(manifest.name ?? ''),
-                npm_package_version: String(manifest.version ?? ''),
-                npm_package_json: joinPaths(packageDir, 'package.json'),
-                npm_lifecycle_event: step
+                ...scriptEnvironment(this.fileSystem, this.cwd ?? '/', {
+                    command: command ?? 'run',
+                    packageDir,
+                    manifest,
+                    event: step,
+                    script: line,
+                    env,
+                    workspaces
+                })
             }, packageDir);
             const exitCode = result.exitCode ?? 1;
             /* npm reports a failing script with its status alone: the script's own output already
@@ -364,17 +376,22 @@ export class NpmProcess extends Process {
         const scripts = (manifest.scripts ?? {}) as Record<string, unknown>;
         const label = scriptLabel(manifest, packageDir);
         const PATH = scriptPath(this.fileSystem, packageDir, Object.fromEntries(this.env).PATH);
+        const env = Object.fromEntries(this.env);
         for (const event of events) {
             const command = scripts[event];
             if (typeof command !== 'string') continue;
             this.emitOutput(scriptHeader(label, event, command));
             const result = await this.spawnChild('sh', ['-c', command], {
-                ...Object.fromEntries(this.env),
+                ...env,
                 PATH,
-                npm_package_name: String(manifest.name ?? ''),
-                npm_package_version: String(manifest.version ?? ''),
-                npm_package_json: joinPaths(packageDir, 'package.json'),
-                npm_lifecycle_event: event
+                ...scriptEnvironment(this.fileSystem, this.cwd ?? '/', {
+                    command: 'install',
+                    packageDir,
+                    manifest,
+                    event,
+                    script: command,
+                    env
+                })
             }, packageDir);
             const exitCode = result.exitCode ?? 1;
             if (exitCode !== 0) return exitCode;
