@@ -26,6 +26,14 @@ export const SRC = String.raw`
 (function () {
 var NET_REASON_TEXT = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'address not available', EINVAL: 'invalid argument' };
 
+/* node's own diagnostics channels: the publish path lives in the diagnostics_channel family,
+   whose snippet is an IIFE of its own, so it reaches this one through a global name. */
+function dcPublish(name, data) {
+  var publish = globalThis.__owcDcPublish;
+  if (publish !== undefined) publish(name, data);
+}
+
+
 /** What a loopback socket absorbs before a write is still in flight when it is destroyed: Node's SO_SNDBUF. */
 var NET_SNDBUF = 262144;
 
@@ -868,6 +876,8 @@ BF['net'] = function () {
       /* A host's TCP socket is one TCPWRAP: node reports it when the socket is made and destroys it
          when the socket is destroyed. A pipe path is no TCP socket at all, so it reports none. */
       this._owcAsync = asyncOpenResource('TCPWRAP', this);
+      /* net.client.socket: the TCP socket a dial is about to be made on, once per connect. */
+      dcPublish('net.client.socket', { socket: this });
       var port = netPortOf(args.port);
       var self = this;
       /* A name with two addresses is tried on both, as Node's happy-eyeballs does: only the caller's
@@ -1974,6 +1984,8 @@ BF['net'] = function () {
       /* The server an accepted socket came from is an own property of it, as host Node 24.15
          answers it: socket.server is the listener that accepted it, enumerable on the socket. */
       socket.server = this;
+      /* net.server.socket: one publish per connection a server accepts, with the socket it made. */
+      dcPublish('net.server.socket', { socket: socket });
       this.emit('connection', socket);
     }
 

@@ -491,6 +491,13 @@ function cpEmitDisconnect(child) {
   cpClusterEmit(child, 'disconnect', []);
 }
 
+/* node's own diagnostics channels: the publish path lives in the diagnostics_channel family,
+   whose snippet is an IIFE of its own, so it reaches this one through a global name. */
+function dcPublish(name, data) {
+  var publish = globalThis.__owcDcPublish;
+  if (publish !== undefined) publish(name, data);
+}
+
 function cpSpawnCore(child, file, argv, options, extra) {
   var opts = options || {};
   var exe = String(file);
@@ -584,6 +591,9 @@ function cpSpawnCore(child, file, argv, options, extra) {
   }
   cpRefChild(child, true);
   if (ipc || extra.kind === 'worker') cpHookParentExit();
+  /* The child_process channel: one publish per child spawned -- a worker thread is not one, and
+     node names the object it hands over process, not child. */
+  if (extra.kind === 'child') dcPublish('child_process', { process: child });
   callOp('child.spawn', {
     pid: child.pid,
     file: exe,

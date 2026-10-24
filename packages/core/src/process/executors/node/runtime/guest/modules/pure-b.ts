@@ -1844,6 +1844,13 @@ export const SRC = String.raw`
     function nextExceptionId() { exceptionSerial += 1; return exceptionSerial; }
     function nextScriptId() { scriptSerial += 1; return String(scriptSerial); }
 
+    /* The uniqueId a host reports for a context is V8's own pair of numbers -- two large integers
+       joined by a dot, opaque to whoever reads it and different on every run of a host as well. */
+    function inspectorUniqueId() {
+      return String(Math.floor(Math.random() * 9e17) + 1e17)
+        + '.' + String(Math.floor(Math.random() * 9e18) + 1e18);
+    }
+
     function notify(session, method, params) {
       try {
         /* A host fires one notification on two channels: 'inspectorNotification' carries the
@@ -1851,8 +1858,15 @@ export const SRC = String.raw`
            its params -- which is the one a caller that writes
            session.on('Runtime.consoleAPICalled', fn) is listening on, and which was the only channel
            this runtime did not fire. row owc-inspector-returnbyvalue-notifications. */
-        session.emit('inspectorNotification', { method: method, params: params });
-        session.emit(method, params);
+        /* A host fires one notification on two channels, and both carry the protocol's own
+           envelope -- { method, params }, not the params alone -- which is the one a caller that
+           writes session.on('Runtime.consoleAPICalled', fn) is listening on as much as the one
+           behind 'inspectorNotification'. Host node 24.15.0, measured: it is the envelope on both,
+           and a listener written for params alone reads undefined off it and reports no event at
+           all. row owc-inspector-session-no-runtime-notifications. */
+        var message = { method: method, params: params };
+        session.emit('inspectorNotification', message);
+        session.emit(method, message);
       } catch (err) {
         // a listener that throws must not stop the program that wrote the line
       }
@@ -2295,7 +2309,13 @@ export const SRC = String.raw`
           if (enabledSessions.indexOf(this) < 0) enabledSessions.push(this);
           hookConsole();
           notify(this, 'Runtime.executionContextCreated', {
-            context: { id: 1, origin: '', name: 'node[' + globalThis.process.pid + ']', auxData: { isDefault: true } }
+            context: {
+              id: 1,
+              origin: '',
+              name: 'node[' + globalThis.process.pid + ']',
+              uniqueId: inspectorUniqueId(),
+              auxData: { isDefault: true }
+            }
           });
           /* What the console wrote while the session was connected but Runtime was not: a host
              delivers these first, in the order they were written. */
@@ -2430,9 +2450,78 @@ export const SRC = String.raw`
     };
 
     exp.Session = Session;
-    exp.open = function () {};
-    exp.close = function () {};
-    exp.url = function () { return undefined; };
+
+    /*
+     * The debugger endpoint. A host's open() binds a real TCP listener on the host it is given and
+     * answers with the ws:// url a frontend attaches to, and both halves of that are within reach
+     * here: the container has a network to bind in. What is not within reach is the protocol behind
+     * the url -- there is no debugger this side of it to speak Chrome DevTools -- so the listener
+     * is a listener, the url names it, and a connection that reaches it is dropped. A host's own
+     * open() leaves the process free to exit, and so does this one: nothing holds a ref.
+     */
+    var activeInspector = null;
+
+    /* The id a host puts after the slash is a uuid of its own making, opaque to whoever reads it. */
+    function inspectorUuid() {
+      var hex = '0123456789abcdef';
+      var groups = [8, 4, 4, 4, 12];
+      var out = '';
+      for (var g = 0; g < groups.length; g++) {
+        for (var at = 0; at < groups[g]; at++) out += hex.charAt(Math.floor(Math.random() * 16));
+        if (g < groups.length - 1) out += '-';
+      }
+      return out;
+    }
+
+    exp.open = function (port, host, wait) {
+      /* A second open while one is up is the refusal a host gives: it threw before binding
+         anything and before printing a line. row owc-inspector-open-inert. */
+      if (activeInspector !== null) {
+        throw nodeError(Error, 'ERR_INSPECTOR_ALREADY_ACTIVATED', 'Inspector is already activated');
+      }
+      /* A host's defaults: 9229 when no port is named at all, the loopback when no host is, and 0
+         for the port that asks for a free one. */
+      var wanted = arguments.length === 0 ? 9229 : Number(port);
+      if (!isFinite(wanted) || wanted < 0 || wanted > 65535) wanted = 9229;
+      var at = typeof host === 'string' && host !== '' ? host : '127.0.0.1';
+      /* Nothing speaks the protocol to a connection that arrives, so the listener's target keeps
+         none: the connection is held by the hub until the endpoint closes. */
+      var targetId = createTarget(function () { return undefined; });
+      var bound;
+      try {
+        bound = callCap('net.listen', { address: at, port: wanted, targetId: targetId });
+      } catch (cause) {
+        deleteTarget(targetId);
+        throw cause;
+      }
+      activeInspector = { id: bound.id, targetId: targetId, url: 'ws://' + at + ':' + bound.port + '/' + inspectorUuid() };
+      /* The two lines a host writes to stderr as the endpoint comes up. They are written to the
+         stream and not through console, which is itself a source of Runtime.consoleAPICalled. */
+      var proc = globalThis.process;
+      if (proc !== undefined && proc !== null && proc.stderr !== undefined && proc.stderr !== null
+        && typeof proc.stderr.write === 'function') {
+        proc.stderr.write('Debugger listening on ' + activeInspector.url + '\n');
+        proc.stderr.write('For help, see: https://nodejs.org/en/docs/inspector\n');
+      }
+      return undefined;
+    };
+
+    exp.close = function () {
+      if (activeInspector === null) return undefined;
+      var open = activeInspector;
+      activeInspector = null;
+      try {
+        callCap('net.closeListener', { id: open.id });
+      } catch (cause) {
+        // the listener is already gone
+      }
+      deleteTarget(open.targetId);
+      return undefined;
+    };
+
+    exp.url = function () {
+      return activeInspector === null ? undefined : activeInspector.url;
+    };
     exp.waitForDebugger = function () {
       throw nodeError(Error, 'ERR_INSPECTOR_NOT_ACTIVE', 'Inspector is not active');
     };

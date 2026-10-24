@@ -820,6 +820,22 @@ export const SRC = String.raw`
     return found;
   }
 
+  /*
+   * The channels node itself publishes on: http, net and child_process write to these as they run,
+   * and nothing but a subscriber ever reads them, so a run with no subscriber pays one map lookup
+   * and nothing else -- which is what node's own hasSubscribers check buys it. node names the
+   * child it publishes as process, not child, and hands http.server.* a socket and a server
+   * that http.client.* has none of.
+   */
+  function dcPublish(name, data) {
+    var found = dcChannels.get(name);
+    if (found === undefined || !found.hasSubscribers) return;
+    found.publish(data);
+  }
+  /* Every family's snippet is an IIFE of its own, so the publish path the http, net and
+     child_process families write node's own channels on is shared through one global name. */
+  globalThis.__owcDcPublish = dcPublish;
+
   var TRACE_EVENTS = ['start', 'end', 'asyncStart', 'asyncEnd', 'error'];
 
   function TracingChannel(nameOrChannels) {
