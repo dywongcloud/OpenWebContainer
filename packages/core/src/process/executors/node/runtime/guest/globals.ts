@@ -130,7 +130,11 @@ Object.keys(UV_ERRNO).forEach(function (key) {
 function uvErrname(code) {
   var at = Number(code);
   if (!Number.isInteger(at) || at >= 0) return 'UNKNOWN';
-  return UV_NAMES[at] || 'UNKNOWN';
+  /* A code the table does not hold is named the way node names it and not with libuv's 'UNKNOWN':
+     uv_err_name answers nothing for it, and node answers "Unknown system error <n>", which is what
+     'util.getSystemErrorName' and 'process.binding("uv").errname' both print on host node 24.15.
+     The one code the table does hold under that name, UV_UNKNOWN at -4094, still answers it. */
+  return UV_NAMES[at] || 'Unknown system error ' + at;
 }
 globalThis.__owcErrname = uvErrname;
 function uvBinding() {

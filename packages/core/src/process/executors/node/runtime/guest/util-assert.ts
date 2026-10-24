@@ -94,9 +94,93 @@ function nullPrototypeTagOf(obj) {
    an ordinary object of the same shape would print nothing at all. */
 var INSPECT_CUSTOM = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
 
+/* The other well-known symbol 'util' carries: the one a function puts on itself to say how it is
+   to be promisified, which 'util.promisify' reads before it builds a promisified form of its own.
+   It is a property of 'promisify' and not a value of its own so that a program can reach it the
+   one way node exposes it, 'util.promisify.custom'. */
+var PROMISIFY_CUSTOM = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.promisify.custom') : undefined;
+
 /* The 'fmt' of the 'inspectValue' walk now printing, so a value read out of a promise can be
    printed at the depth the walk is at. One walk at a time, so one is all there is to remember. */
 var INSPECT_FMT = null;
+
+/*
+ * The options that shape what a walk prints, read off the options object the way node reads them:
+ * 'maxArrayLength' (100), 'maxStringLength' (10000), 'breakLength' (80) and 'numericSeparator'
+ * (off). 'null' for either limit is no limit at all -- that is what node turns it into before the
+ * walk starts, and it is why 'maxStringLength: null' leaves a string whole -- and a limit below
+ * none is none, which is what makes 'maxArrayLength: -1' print no item at all. A limit node is
+ * handed as a string counts as the number it reads as, because node compares against it and slices
+ * with it without converting it first.
+ */
+function optNumber(opts, name, fallback) {
+  var raw = opts === undefined || opts === null ? undefined : opts[name];
+  if (raw === null) return Infinity;
+  if (raw === undefined) return fallback;
+  var n = Number(raw);
+  return n === n ? n : fallback;
+}
+
+function maxArrayLengthOf(opts) {
+  return Math.max(0, optNumber(opts, 'maxArrayLength', 100));
+}
+
+function breakLengthOf(opts) {
+  return optNumber(opts, 'breakLength', 80);
+}
+
+function numericSeparatorOf(opts) {
+  return !!(opts && opts.numericSeparator);
+}
+
+/* Node groups the digits of a number in threes outwards from the point: the integer part from the
+   right, so '123456789' is '123_456_789', and the fraction from the left, so '1.5678' is
+   '1.567_8'. A text that is not digits and one point -- an exponent, an Infinity, a NaN -- is not
+   a number whose digits can be grouped and is left as it stands. */
+function groupDigitsRight(text) {
+  var out = '';
+  var seen = 0;
+  for (var i = text.length - 1; i >= 0; i--) {
+    out = text.charAt(i) + out;
+    seen++;
+    if (seen % 3 === 0 && i !== 0) out = '_' + out;
+  }
+  return out;
+}
+
+function groupDigitsLeft(text) {
+  var out = '';
+  for (var i = 0; i < text.length; i++) {
+    out += text.charAt(i);
+    if (i % 3 === 2 && i !== text.length - 1) out += '_';
+  }
+  return out;
+}
+
+function withNumericSeparators(text) {
+  if (!/^-?\d+(\.\d+)?$/.test(text)) return text;
+  var minus = text.charAt(0) === '-';
+  if (minus) text = text.slice(1);
+  var point = text.indexOf('.');
+  var intPart = point < 0 ? text : text.slice(0, point);
+  var fracPart = point < 0 ? '' : text.slice(point + 1);
+  var out = groupDigitsRight(intPart);
+  if (point >= 0) out += '.' + groupDigitsLeft(fracPart);
+  return (minus ? '-' : '') + out;
+}
+
+/* A string longer than 'maxStringLength' is cut there, and what is left over is said in node's own
+   words BEHIND the closing quote -- "'abc'... 5 more characters", and "... 1 more character" for
+   one character left over. A key is never cut: only a value is. */
+function stringInspectText(s, opts) {
+  var max = optNumber(opts, 'maxStringLength', 10000);
+  if (!(s.length > max)) return { text: s, trailer: '' };
+  var rest = s.length - max;
+  return {
+    text: String.prototype.slice.call(s, 0, max),
+    trailer: '... ' + rest + ' more character' + (rest > 1 ? 's' : '')
+  };
+}
 
 function inspectValue(value, opts) {
   var maxDepth = opts && typeof opts.depth === 'number' ? opts.depth : 2;
@@ -113,9 +197,19 @@ function inspectValue(value, opts) {
   function fmt(v, depth, indent) {
     if (v === null) return 'null';
     var t = typeof v;
-    if (t === 'string') return quoteStringLiteral(v);
-    if (t === 'number') return Object.is(v, -0) ? '-0' : String(v);
-    if (t === 'bigint') return String(v) + 'n';
+    if (t === 'string') {
+      var asString = stringInspectText(v, opts);
+      return quoteStringLiteral(asString.text) + asString.trailer;
+    }
+    if (t === 'number') {
+      if (Object.is(v, -0)) return '-0';
+      var asNumber = String(v);
+      return numericSeparatorOf(opts) ? withNumericSeparators(asNumber) : asNumber;
+    }
+    if (t === 'bigint') {
+      var asBigInt = String(v) + 'n';
+      return numericSeparatorOf(opts) ? withNumericSeparators(String(v)) + 'n' : asBigInt;
+    }
     if (t === 'boolean' || t === 'undefined' || t === 'symbol') return String(v);
     if (t === 'function') {
       var name = v.name ? v.name : '';
@@ -213,36 +307,59 @@ function inspectValue(value, opts) {
     var open = '{';
     var close = '}';
     var prefix = '';
+    /* How many items of a collection 'maxArrayLength' lets the walk print, and the line it writes
+       for the rest -- "... 3 more items", and "... 1 more item" for one. Node measures the same
+       bound over the entries of a typed array, of a Set and of a Map as over the elements of an
+       ordinary array, which is why all four of them answer their length and then what is left. */
+    var maxArr = maxArrayLengthOf(opts);
+    var moreItems = null;
     var i;
     if (isArr) {
       open = '[';
       close = ']';
       if (ctor && ctor !== 'Array') prefix = ctor + '(' + v.length + ') ';
-      var limit = Math.min(v.length, 100);
+      var limit = Math.min(v.length, maxArr);
       for (i = 0; i < limit; i++) entries.push(fmt(v[i], depth + 1, indent + 2));
-      if (v.length > 100) entries.push('... ' + (v.length - 100) + ' more item' + (v.length - 100 > 1 ? 's' : ''));
+      if (v.length > limit) moreItems = moreItemsText(v.length - limit);
     } else if (isTyped) {
       open = '[';
       close = ']';
       prefix = ctor + '(' + v.length + ') ';
-      for (i = 0; i < v.length && i < 100; i++) entries.push(String(v[i]));
+      var typedLimit = Math.min(v.length, maxArr);
+      for (i = 0; i < typedLimit; i++) entries.push(String(v[i]));
       /* What is left over past the hundred node prints of a typed array is said in the same words
          it says the items of an ordinary array in: '... 1 more item', singular, and '... 2 more
          items' past that. */
-      if (v.length > 100) entries.push('... ' + (v.length - 100) + ' more item' + (v.length - 100 > 1 ? 's' : ''));
+      if (v.length > typedLimit) moreItems = moreItemsText(v.length - typedLimit);
     } else if (utilBrandCheck(Map.prototype.has, v)) {
       prefix = 'Map(' + v.size + ') ';
+      var mapShown = 0;
       v.forEach(function (val, key) {
+        if (mapShown >= maxArr) return;
+        mapShown++;
         entries.push(fmt(key, depth + 1, indent + 2) + ' => ' + fmt(val, depth + 1, indent + 2));
       });
+      if (v.size > mapShown) moreItems = moreItemsText(v.size - mapShown);
     } else if (utilBrandCheck(Set.prototype.has, v)) {
       prefix = 'Set(' + v.size + ') ';
+      var setShown = 0;
       v.forEach(function (val) {
+        if (setShown >= maxArr) return;
+        setShown++;
         entries.push(fmt(val, depth + 1, indent + 2));
       });
+      if (v.size > setShown) moreItems = moreItemsText(v.size - setShown);
     } else {
       if (bare) prefix = '[' + nullPrototypeTagOf(v) + ': null prototype] ';
       else if (ctor && ctor !== 'Object') prefix = ctor + ' ';
+    }
+    /* The line for what a bound left out goes behind the entries the bound let through and in front
+       of the extra keys a collection carries, and it is not one of the entries the packing groups --
+       the hundred node packs is a hundred of the items it printed. */
+    var trailerAt = -1;
+    if (moreItems !== null) {
+      entries.push(moreItems);
+      trailerAt = entries.length - 1;
     }
 
     /* The keys node reads: every own property name and every own symbol under 'showHidden', and
@@ -299,19 +416,20 @@ function inspectValue(value, opts) {
     var packed = false;
     var shown = entries;
     if ((isArr || isTyped) && entries.length > 6 && groupable(opts)) {
-      shown = groupArrayElements(entries, v, indent, compactOf(opts));
+      shown = groupArrayElements(entries, v, indent, compactOf(opts), trailerAt, breakLengthOf(opts));
       packed = shown.length !== entries.length;
     }
+    var width = breakLengthOf(opts);
     var start = entries.length + indent + open.length + prefix.length + 10;
     var totalLength = entries.length + start;
     /* 'compact: false' is one entry per line and never a fit test: node's own inspect writes
        '[1,2,3,4,5,6,7,8]' on one line by default and one number to a line under that option. So is
        a 'compact' below one, and so is a value that nests as deep as a number 'compact' lower than
        that: '{ a: { b: 1 } }' is one line at the default 3 and three lines at 'compact: 1'. */
-    var fits = !multiline && !packed && compactAllowsOneLine(opts, subDepth) && totalLength + entries.length <= 80;
+    var fits = !multiline && !packed && compactAllowsOneLine(opts, subDepth) && totalLength + entries.length <= width;
     for (var s = 0; fits && s < entries.length; s++) {
       totalLength += entries[s].length;
-      if (totalLength > 80) fits = false;
+      if (totalLength > width) fits = false;
     }
     if (fits) return prefix + open + ' ' + entries.join(', ') + ' ' + close;
     var pad = ' '.repeat(indent + 2);
@@ -340,17 +458,25 @@ function groupable(opts) {
   return compact !== true && typeof compact === 'number' && compact >= 1;
 }
 
+/* The entry a walk writes for the items 'maxArrayLength' left out of one. */
+function moreItemsText(rest) {
+  return '... ' + rest + ' more item' + (rest > 1 ? 's' : '');
+}
+
 /* How node packs the entries of an array too long for one line: the 'groupArrayElements' of its
    own inspect, ports and all, in the terms of this walk. 'output' is the entries as they print,
    'value' the array they came from -- only whether each of its items is a number or a bigint is
    asked of it, because that is what decides which way the entries are padded -- and 'indent' the
-   indent the array itself is printed at. 80 is 'breakLength' and 3 is 'compact', both node's
-   defaults, and 100 is 'maxArrayLength', whose '... n more items' is not an entry to pack. */
-function groupArrayElements(output, value, indent, compact) {
+   indent the array itself is printed at. 'trailerAt' is where the "... n more items" line sits
+   when the walk printed one, or -1 when it did not: that line is not an item and is never packed.
+   80 is 'breakLength' and 3 is 'compact', both node's defaults, and the limit that decided how
+   many items there are is 'maxArrayLength'. */
+function groupArrayElements(output, value, indent, compact, trailerAt, breakLength) {
+  if (breakLength === undefined) breakLength = 80;
+  if (trailerAt === undefined) trailerAt = -1;
   var totalLength = 0;
   var maxLength = 0;
-  var outputLength = output.length;
-  if (100 < output.length) outputLength--;
+  var outputLength = trailerAt >= 0 ? trailerAt : output.length;
   var dataLen = new Array(outputLength);
   for (var i = 0; i < outputLength; i++) {
     var len = output[i].length;
@@ -362,13 +488,13 @@ function groupArrayElements(output, value, indent, compact) {
   /* At least three entries have to fit next to each other, and an array whose entries are of very
      different lengths is left alone -- one entry longer than a fifth of all of them would leave
      an enormous gap beside the short ones. */
-  if (actualMax * 3 + indent >= 80 ||
+  if (actualMax * 3 + indent >= breakLength ||
       (totalLength / actualMax <= 5 && maxLength > 6)) return output;
   var averageBias = Math.sqrt(actualMax - totalLength / output.length);
   var biasedMax = Math.max(actualMax - 3 - averageBias, 1);
   var columns = Math.min(
     Math.round(Math.sqrt(2.5 * biasedMax * outputLength) / biasedMax),
-    Math.floor((80 - indent) / actualMax),
+    Math.floor((breakLength - indent) / actualMax),
     compact * 4,
     15
   );
@@ -402,8 +528,19 @@ function groupArrayElements(output, value, indent, compact) {
     else line += output[k];
     tmp.push(line);
   }
-  if (100 < output.length) tmp.push(output[outputLength]);
+  if (trailerAt >= 0) tmp.push(output[trailerAt]);
   return tmp;
+}
+
+/* The JSON of a value for '%j'. A structure that closes on itself is the one case node answers
+   instead of throwing, and it answers it with the word '[Circular]'. */
+function jsonTextOf(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (err) {
+    if (err && /circular/i.test(String(err.message))) return '[Circular]';
+    throw err;
+  }
 }
 
 function formatLogArgs(args) {
@@ -425,10 +562,19 @@ function formatLogArgs(args) {
         if (argIndex < args.length && 'sdifjoOc'.indexOf(spec) >= 0) {
           var a = args[argIndex++];
           j++;
-          if (spec === 's') text += typeof a === 'string' ? a : (typeof a === 'object' && a !== null ? inspectValue(a, { depth: 1 }) : String(a));
+          /* A BigInt keeps the 'n' node writes behind it for every specifier that prints one as a
+             number -- '%d', '%i' and '%s' alike -- because node asks the type before it converts:
+             'util.format("%d", 10n)' is "10n" and not "10". '%f' is the one that does not: it
+             floats the value, and a float has no 'n'. */
+          if (typeof a === 'bigint' && (spec === 'd' || spec === 'i' || spec === 's')) {
+            text += String(a) + 'n';
+          } else if (spec === 's') text += typeof a === 'string' ? a : (typeof a === 'object' && a !== null ? inspectValue(a, { depth: 1 }) : String(a));
           else if (spec === 'd' || spec === 'i') text += String(spec === 'i' ? parseInt(a, 10) : Number(a));
           else if (spec === 'f') text += String(parseFloat(a));
-          else if (spec === 'j') text += JSON.stringify(a);
+          /* '%j' of a value that cannot be written as JSON: node answers the one word it answers
+             for a structure that closes on itself, and rethrows everything else -- a BigInt's "Do
+             not know how to serialize a BigInt" reaches the caller on host node 24.15. */
+          else if (spec === 'j') text += jsonTextOf(a);
           else if (spec === 'o' || spec === 'O') text += inspectValue(a);
           continue;
         }
@@ -849,6 +995,19 @@ function utilArgError(code, message) {
   var err = new TypeError(message);
   err.code = code;
   return err;
+}
+
+/* How node names the value an argument of the wrong type received: null and undefined bare, a
+   string quoted, every other primitive as its type and its value, and anything else as an
+   instance of the constructor it came from. It is the whole of what follows 'Received type' in
+   "The "err" argument must be of type number. Received type string ('x')". */
+function utilReceivedAs(value) {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+  if (typeof value === 'string') return "string ('" + value + "')";
+  if (typeof value !== 'object' && typeof value !== 'function') return typeof value + ' (' + String(value) + ')';
+  var name = value.constructor && value.constructor.name;
+  return 'an instance of ' + (typeof name === 'string' && name !== '' ? name : 'Object');
 }
 
 function utilGetterOf(proto, name) {
@@ -1493,12 +1652,27 @@ BF.util = function () {
     inspect: function (value, opts) {
       return inspectValue(value, opts);
     },
+    /*
+     * Node's inheritance is one line and it is the prototype of the SUBCLASS's 'prototype':
+     * 'Object.setPrototypeOf(ctor.prototype, superCtor.prototype)'. It is what makes an instance
+     * answer the superclass's methods and it touches nothing else -- in particular the constructor
+     * itself stays a function whose prototype is 'Function.prototype', so no static of the
+     * superclass is reachable through the subclass and 'Object.getPrototypeOf(B) === A' is false,
+     * which is what host node 24.15 answers. Setting 'B' itself made every static of 'A' a static
+     * of 'B' and 'B instanceof A' true, which no host does.
+     */
     inherits: function (ctor, superCtor) {
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
-      Object.setPrototypeOf(ctor, superCtor);
       ctor.super_ = superCtor;
     },
     promisify: function (fn) {
+      /* A function that promisifies itself wins: node answers the value of
+         'fn[util.promisify.custom]' itself, so the promisified call is the function the author
+         wrote and not a wrapper around a callback form. */
+      if (PROMISIFY_CUSTOM !== undefined && fn !== null && fn !== undefined &&
+          typeof fn[PROMISIFY_CUSTOM] === 'function') {
+        return fn[PROMISIFY_CUSTOM];
+      }
       return function () {
         var self = this;
         var args = Array.prototype.slice.call(arguments);
@@ -1544,7 +1718,7 @@ BF.util = function () {
      */
     getSystemErrorName: function (err) {
       if (typeof err !== 'number') {
-        var typeError = new TypeError('The "err" argument must be of type number. Received type ' + typeof err);
+        var typeError = new TypeError('The "err" argument must be of type number. Received type ' + utilReceivedAs(err));
         typeError.code = 'ERR_INVALID_ARG_TYPE';
         throw typeError;
       }
@@ -1554,13 +1728,23 @@ BF.util = function () {
         throw rangeError;
       }
       var errname = globalThis.__owcErrname;
-      return typeof errname === 'function' ? errname(err) : 'UNKNOWN';
+      /* An errno the table does not hold is not named by the word libuv keeps for one it cannot
+         name: node answers the number it was asked about, "Unknown system error -4058", so a
+         caller that prints the name of an errno it has not seen still sees which one it was. */
+      var name = typeof errname === 'function' ? errname(err) : '';
+      return name === undefined || name === null || name === '' ? 'Unknown system error ' + err : name;
     },
     types: utilTypes(),
     parseArgs: parseArgsImpl,
     TextEncoder: TextEncoderImpl,
     TextDecoder: TextDecoderImpl
   };
+  /* The two well-known symbols are reachable off 'util' itself -- 'util.inspect.custom' and
+     'util.promisify.custom' -- which is the only way a program can put the hook on a value: a
+     guest that wrote '{ [util.inspect.custom]: fn }' built an object keyed "undefined" while the
+     symbol was missing, and no custom inspect was ever called. */
+  if (INSPECT_CUSTOM !== undefined) util.inspect.custom = INSPECT_CUSTOM;
+  if (PROMISIFY_CUSTOM !== undefined) util.promisify.custom = PROMISIFY_CUSTOM;
   return util;
 };
 
