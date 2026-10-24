@@ -1135,6 +1135,50 @@ BF.fs = function () {
   }
 
   /*
+   * The name a host's kernel stands in after walking the parts of a name one at a time, which is
+   * not the name that name resolves to: '..' climbs out of a directory only when that directory is
+   * really there, so 'a/../b' is nowhere at all while 'a' is missing and every call naming it is
+   * the ENOENT a host gives, where a name resolved on paper is 'b' all along and answers for the
+   * directory above the one that is missing. A part that is neither '.' nor '..' is the name it
+   * stands for, and the walk is what a recursive mkdir climbs.
+   */
+  function reachOf(name) {
+    var at = name.charAt(0) === '/' ? '/' : P.resolve('.');
+    var parts = String(name).split('/');
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      if (part === '' || part === '.') continue;
+      if (part === '..') {
+        var st = statFollowingLinks(at);
+        if (!st || st.type !== 'dir') return null;
+        at = P.dirname(at);
+        continue;
+      }
+      at = at === '/' ? '/' + part : at + '/' + part;
+    }
+    return at;
+  }
+
+  /*
+   * The names a recursive mkdir has to make, deepest first: the one it was handed, then every one
+   * above it that is not there, stopping at the first that is. The list is empty when the name it
+   * was handed is already there, which is the one recursive mkdir that makes nothing at all.
+   */
+  function namesToMake(literal) {
+    var chain = [];
+    var at = literal;
+    for (var hop = 0; hop < 64; hop++) {
+      var reached = reachOf(at);
+      if (reached !== null && statFollowingLinks(reached)) break;
+      chain.push(at);
+      var up = P.dirname(at);
+      if (up === at) break;
+      at = up;
+    }
+    return chain;
+  }
+
+  /*
    * A name is made or opened through the directory it sits in, and a host checks the bits of that
    * directory when the name is not there yet: a read or a write of a name that is there is checked
    * against the name's own bits. want is the W_OK/R_OK shape fs.constants gives -- 2 to write, 4 to
@@ -1683,18 +1727,50 @@ BF.fs = function () {
 
   fs.mkdirSync = function (p, opts) {
     var file = toPathString(p);
+    var literal = pathName(p);
     var recursive = !!(opts && typeof opts === 'object' && opts.recursive);
-    var existing = statOf(file);
-    if (existing) {
-      /* A recursive mkdir of a name that is already there is the one case that is not a failure,
-         and it is not a failure of a link to a directory either: the directory the link names is
-         the one mkdir -p was asked for. */
-      if (recursive && (existing.type === 'dir' || (statFollowingLinks(file) || {}).type === 'dir')) return undefined;
-      throw fsError('EEXIST', 'mkdir', pathName(p));
+    var mode = newMode(opts, 0o777);
+    if (!recursive) {
+      if (statOf(file)) throw fsError('EEXIST', 'mkdir', literal);
+      directoryToCreateIn(file, false, 'mkdir', literal);
+      check(host.mkdir(resolvePath(file), mode), 'mkdir', file, literal);
+      return undefined;
     }
-    directoryToCreateIn(file, recursive, 'mkdir', pathName(p));
-    check(host.mkdir(resolvePath(file), newMode(opts, 0o777)), 'mkdir', file, pathName(p));
-    return recursive ? file : undefined;
+    /*
+     * A recursive mkdir of a name that is already there is the one case that is not a failure, and
+     * it is not a failure of a link to a directory either: the directory the link names is the one
+     * mkdir -p was asked for. A name that is there and is not a directory is still EEXIST.
+     */
+    var chain = namesToMake(literal);
+    if (chain.length === 0) {
+      var seen = statFollowingLinks(reachOf(literal));
+      if (seen && seen.type === 'dir') return undefined;
+      throw fsError('EEXIST', 'mkdir', literal);
+    }
+    /*
+     * The directories are made from the shallowest of them down, the way a host makes them once it
+     * has climbed to the first one that is missing: it is the order a name with a '../' in it needs,
+     * because the parent that part climbs out of is one of the names this very call is making. A
+     * name the walk has already made on the way -- a '../' that now stands for a directory that is
+     * there -- is the EEXIST a host meets there and is passed over.
+     */
+    for (var i = chain.length - 1; i >= 0; i--) {
+      var name = chain[i];
+      var reached = reachOf(name);
+      if (reached !== null && statFollowingLinks(reached)) continue;
+      var at = toPathString(name);
+      directoryToCreateIn(at, true, 'mkdir', name);
+      check(host.mkdir(resolvePath(at), mode), 'mkdir', at, name);
+    }
+    /*
+     * What a recursive mkdir hands back is the first directory it made -- the shallowest name on the
+     * way to the one it was handed that was not there -- and it hands it back as the caller wrote
+     * it: './m3' for a mkdirSync of './m3/a-directory', relative where the call was relative and
+     * with every '.' and '..' of the name left in it, because that is the name the caller asked
+     * about and not the one it resolves to. Nothing at all comes back when it made no directory,
+     * which is what a name that was already there and a mkdir that was not recursive both are.
+     */
+    return chain[chain.length - 1];
   };
 
   /* Node refuses to rm a directory without the recursive option before it looks at what is inside
