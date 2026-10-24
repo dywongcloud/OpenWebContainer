@@ -184,6 +184,26 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         if (deps.fileSystem.statPath(file)?.type === 'dir') throw new FsCodeError('EISDIR');
         deps.fileSystem.writeBytes(file, base64ToBytes(text(data)), optionalMode(mode));
     })));
+    /*
+     * The append half of the pair: the guest sends only the bytes to add, and the file system puts
+     * them after the ones already there. Without it the guest read the file back and wrote the
+     * whole of it, so an append cost the file's whole size and a log that grows by appends took
+     * minutes where a host takes milliseconds.
+     */
+    define('appendBase64', (path, data, mode) => context.newString(guardFs(() => {
+        const file = text(path);
+        if (deps.fileSystem.statPath(file)?.type === 'dir') throw new FsCodeError('EISDIR');
+        const bytes = base64ToBytes(text(data));
+        if (deps.fileSystem.appendBytes) {
+            deps.fileSystem.appendBytes(file, bytes, optionalMode(mode));
+            return;
+        }
+        const existing = deps.fileSystem.readBytes(file) ?? new Uint8Array(0);
+        const merged = new Uint8Array(existing.length + bytes.length);
+        merged.set(existing, 0);
+        merged.set(bytes, existing.length);
+        deps.fileSystem.writeBytes(file, merged, optionalMode(mode));
+    })));
     define('mkdir', (path, mode) => context.newString(guardFs(() => {
         deps.fileSystem.createDirectory(text(path), optionalMode(mode));
     })));

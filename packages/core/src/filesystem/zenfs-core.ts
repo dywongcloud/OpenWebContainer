@@ -452,6 +452,18 @@ export class ZenFSCore implements IFileSystem {
         this.fs.writeFileSync(path, data, mode === undefined ? undefined : { mode: mode & 0o7777 });
     }
 
+    /* An append is a write at the end of what is already there. `writeBytes` hands the file system
+       a second copy of every byte, so the cost of one append grew with the file -- a 2 MiB log
+       written 5 KiB at a time took minutes where a host takes milliseconds -- and the bytes the
+       file already had were written again on every call. The size is read once and the new bytes
+       are written at it, which leaves the ones already there untouched. */
+    appendBytes(path: string, data: Uint8Array, mode?: number): void {
+        requirePathWithinLimits(path);
+        /* 'a+' is the flag an append is: it opens the name, seeks to the end of what is already
+           there and writes, so a name that is not there yet is made the way `writeBytes` makes it. */
+        this.fs.appendFileSync(path, data, mode === undefined ? undefined : { mode: mode & 0o7777 });
+    }
+
     removePath(path: string, recursive = false): void {
         this.fs.rmSync(path, { recursive, force: false });
     }

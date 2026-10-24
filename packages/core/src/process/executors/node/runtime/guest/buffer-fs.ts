@@ -1303,12 +1303,14 @@ BF.fs = function () {
     else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     else if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
     else bytes = encodeString(String(data), 'utf8');
+    /* An append puts the new bytes after the ones already there and leaves those alone. Reading
+       the file back to put it in front of them made the cost of one append grow with the file:
+       a log that grows by appends paid for every byte it had already written, again, on every
+       call, so a 2 MiB log in 512 pieces took minutes where a host takes milliseconds. The file
+       system appends, so nothing already written is read or written again. */
     if (flag.charAt(0) === 'a' && statOf(file)) {
-      var existing = readBytesOf(file);
-      var merged = new Uint8Array(existing.length + bytes.length);
-      merged.set(existing, 0);
-      merged.set(bytes, existing.length);
-      bytes = merged;
+      check(host.appendBase64(canonicalOf(file), encodeBase64(bytes)), 'open', file);
+      return;
     }
     check(host.writeBase64(canonicalOf(file), encodeBase64(bytes), mode), 'open', file);
   };
@@ -1970,15 +1972,38 @@ BF.fs = function () {
     return len;
   }
 
+  function resizedBytes(bytes, size) {
+    var next = new Uint8Array(size);
+    var keep = Math.min(size, bytes.length);
+    for (var i = 0; i < keep; i++) next[i] = bytes[i];
+    return next;
+  }
+
+  /*
+   * A truncate changes the file, not the copy of it a descriptor took when the descriptor was
+   * opened: one left open across a truncate kept reading the bytes the truncate had removed,
+   * where a host's read through the same descriptor stops at the new end of file. Every
+   * descriptor of the name is resized with it -- a grow fills with zero bytes, the way ftruncate
+   * does -- so the read that follows ends where the host's ends, and a descriptor that is dirty
+   * pushes the shortened bytes rather than the ones it held. A device has no bytes for a truncate
+   * to resize and a directory is not truncated at all, so neither is touched here.
+   */
+  function resizeDescriptors(file, size) {
+    var canonical = canonicalOf(file);
+    var fds = Object.keys(DESCRIPTORS);
+    for (var i = 0; i < fds.length; i++) {
+      var rec = DESCRIPTORS[fds[i]];
+      if (rec.isDir || rec.device || canonicalOf(rec.path) !== canonical) continue;
+      rec.bytes = resizedBytes(rec.bytes, size);
+      if (rec.position > size) rec.position = size;
+    }
+  }
+
   fs.ftruncateSync = function (fd, len) {
     var rec = descriptorOf(fd, 'ftruncate');
     if (!rec.writable) throw noPathError('EINVAL', 'ftruncate');
     var size = truncateLength(len);
-    var next = new Uint8Array(size);
-    var keep = Math.min(size, rec.bytes.length);
-    for (var i = 0; i < keep; i++) next[i] = rec.bytes[i];
-    rec.bytes = next;
-    if (rec.position > size) rec.position = size;
+    resizeDescriptors(rec.path, size);
     rec.dirty = true;
   };
 
