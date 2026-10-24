@@ -94,3 +94,17 @@ witness_2026_10_24_adv12_judge: |-
   cannot be both figures. Readme.md amended under Virtual net to say so. No source change for this
   row; the site stays packages/core/src/network/virtual/hub.ts and
   runtime/capabilities/net.ts, outside this shard's grant (runtime/guest/modules/net.ts).
+witness_2026_10_24_adv13_judge: |-
+  RE-VERIFIED BY THE JUDGE FOR SHARD NET (session adv13-judge-net-0) at HEAD cb696df, differential
+  against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately,
+  probe /tmp/owc-r4/adv13-judge-net-0/p7 run twice on each side. CLOSED STALE, and unmoved by this
+  pass, which touches neither the count nor the hub's delivery: 40x64 KiB into a peer the server paused
+  is write() true x4 then false on the host (2162688 held, 2097152 through t1500) and true x7 on its
+  second run (2359296, 2293760), against false from the first write and 2621440 at write time falling
+  to 0 by t60 here. The host's own threshold moves from run to run -- 4, 7 and 8 true writes on three
+  runs of the same probe -- so there is no figure to tune this side to, and the missing piece is the one
+  the Readme names: this virtual network has no bounded send buffer, so the hub accepts and delivers
+  every byte it is handed, and no net.* capability carries a peer's own consumption back to the hub
+  (packages/core/src/network/virtual/hub.ts and runtime/capabilities/net.ts, outside this shard's
+  grant). No source change for this row.

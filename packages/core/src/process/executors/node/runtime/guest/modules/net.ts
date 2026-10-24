@@ -86,6 +86,10 @@ function netDescribe(value) {
   if (typeof value === 'string') return "type string ('" + value + "')";
   /* A BigInt keeps the 'n' Node prints it with: 'type bigint (24n)', not 'type bigint (24)'. */
   if (typeof value === 'bigint') return 'type bigint (' + String(value) + 'n)';
+  /* A function is the one type Node names without 'type' and without a rendering: 'Received
+     function foo', and 'Received function ' for one with no name at all, trailing space included,
+     where every other type carries its own value in parentheses. */
+  if (typeof value === 'function') return 'function ' + (typeof value.name === 'string' ? value.name : '');
   return 'type ' + typeof value + ' (' + String(value) + ')';
 }
 
@@ -273,6 +277,21 @@ function netDgramArg(value, name, want) {
 /** A whole byte as libuv truncates what it was handed: 255.5 is 255, 0.5 is 0, and NaN stays NaN. */
 function netDgramByte(value) {
   return value >= 0 ? Math.floor(value) : Math.ceil(value);
+}
+
+/**
+ * A value as libuv hands it to a syscall that takes an int: ToInt32, so a value that is not finite
+ * becomes 0 and one outside the 32-bit word wraps into it -- NaN, Infinity and 2^53 are all the 0
+ * a hop count of 0 is, which is what makes setMulticastTTL(NaN) succeed where setTTL(NaN) is the
+ * EINVAL a hop count of 0 is not.
+ */
+function netDgramInt32(value) {
+  var whole = Number(value);
+  if (whole !== whole || whole === Infinity || whole === -Infinity) return 0;
+  whole = Math.trunc(whole) % 4294967296;
+  if (whole < 0) whole += 4294967296;
+  if (whole >= 2147483648) whole -= 4294967296;
+  return whole;
 }
 
 /**
@@ -564,9 +583,12 @@ BF['net'] = function () {
       this.localAddress = undefined;
       this.localPort = undefined;
       this.localFamily = undefined;
-      this.remoteAddress = undefined;
-      this.remotePort = undefined;
-      this.remoteFamily = undefined;
+      /* The peer's end is not a field of this socket but a reading of the handle, which is gone
+         once the socket is -- and host Node 24.15 keeps what a caller first read of it, so a
+         socket asked for its peer before it was destroyed still names that peer afterwards, while
+         one never asked reports undefined. The live reading and the remembered one are separate. */
+      netHide(this, '_remoteName', undefined);
+      netHide(this, '_remoteCache', undefined);
       this._hubId = undefined;
       this._targetId = undefined;
       this._dead = false;
@@ -740,9 +762,10 @@ BF['net'] = function () {
         this.localAddress = undefined;
         this.localPort = undefined;
         this.localFamily = undefined;
-        this.remoteAddress = undefined;
-        this.remotePort = undefined;
-        this.remoteFamily = undefined;
+        /* A socket reopened by connect() is a new connection, so nothing it was asked about the
+           old one is remembered. */
+        this._remoteName = undefined;
+        this._remoteCache = undefined;
       }
       /* A second connect is one Node refuses: a connection this socket has already made is EISCONN,
          one still in flight is EALREADY, and both are reported the way every connect failure is --
@@ -841,19 +864,23 @@ BF['net'] = function () {
       var failures = [];
       for (var i = 0; i < addresses.length; i++) {
         var res;
+        /* Dialling the unspecified address is dialling the loopback of its own family, as host
+           Node 24.15 does it: '::' reaches a listener on '::' or on '::1' as ::1/IPv6 at both
+           ends, and is refused by one bound to an IPv4 address, where dialling it as 127.0.0.1
+           reached listeners a host refuses. The error text still names what the caller dialled
+           ('connect ECONNREFUSED :::8080'), so only the address the hub is asked for changes. */
+        var dialled = addresses[i] === '::' ? '::1' : addresses[i];
         try {
-          res = callCap('net.connect', { address: addresses[i], port: port, targetId: this._targetId, localPort: localPort || 0 });
+          res = callCap('net.connect', { address: dialled, port: port, targetId: this._targetId, localPort: localPort || 0 });
         } catch (cause) {
           failures.push(netSystemError(cause, 'connect', addresses[i], port));
           continue;
         }
         this._hubId = res.id;
-        this.localAddress = res.localAddress;
-        this.localPort = res.localPort;
-        this.localFamily = netFamilyName(res.localAddress);
-        this.remoteAddress = res.remoteAddress;
-        this.remotePort = res.remotePort;
-        this.remoteFamily = netFamilyName(res.remoteAddress);
+        /* The name of a connection is the kernel's to give, and it has not given one yet: a host's
+           socket reads no address at either end until 'connect', so these are carried here and
+           published by _onConnectEvent. */
+        netHide(this, '_pendingPeer', res);
         netRefresh(this);
         this._flushPending();
         return;
@@ -889,9 +916,9 @@ BF['net'] = function () {
       this.localAddress = res.localAddress;
       this.localPort = res.localPort;
       this.localFamily = res.localAddress === undefined ? undefined : netFamilyName(res.localAddress);
-      this.remoteAddress = res.remoteAddress;
-      this.remotePort = res.remotePort;
-      this.remoteFamily = res.remoteAddress === undefined ? undefined : netFamilyName(res.remoteAddress);
+      this._remoteName = { address: res.remoteAddress, port: res.remotePort,
+        family: res.remoteAddress === undefined ? undefined : netFamilyName(res.remoteAddress) };
+      this._remoteCache = undefined;
       netRefresh(this);
       this._flushPending();
     }
@@ -920,6 +947,18 @@ BF['net'] = function () {
 
     _onConnectEvent() {
       if (this._dead) return;
+      /* The connection the hub made is named now, on the turn 'connect' is emitted -- not on the
+         turn it was dialled, which is what a host's own socket does. */
+      if (this._pendingPeer !== undefined) {
+        var peer = this._pendingPeer;
+        this._pendingPeer = undefined;
+        this.localAddress = peer.localAddress;
+        this.localPort = peer.localPort;
+        this.localFamily = netFamilyName(peer.localAddress);
+        this._remoteName = { address: peer.remoteAddress, port: peer.remotePort,
+          family: netFamilyName(peer.remoteAddress) };
+        this._remoteCache = undefined;
+      }
       this.connecting = false;
       netRefresh(this);
       this._armIdle();
@@ -1225,9 +1264,9 @@ BF['net'] = function () {
       this.localPort = payload.localPort;
       /* A unix connection carries no address, so it has no family to name either. */
       this.localFamily = payload.localAddress === undefined ? undefined : netFamilyName(payload.localAddress);
-      this.remoteAddress = payload.remoteAddress;
-      this.remotePort = payload.remotePort;
-      this.remoteFamily = payload.remoteAddress === undefined ? undefined : netFamilyName(payload.remoteAddress);
+      this._remoteName = { address: payload.remoteAddress, port: payload.remotePort,
+        family: payload.remoteAddress === undefined ? undefined : netFamilyName(payload.remoteAddress) };
+      this._remoteCache = undefined;
       netRefresh(this);
     }
 
@@ -1259,15 +1298,14 @@ BF['net'] = function () {
         deleteTarget(this._targetId);
         this._targetId = undefined;
       }
-      /* Node reads a socket's four addresses and both families off its handle, so once the handle is
-         gone every one of them is undefined: a destroyed socket names no address at either of its
-         ends, and address() is the empty object rather than the pair the connection was made on. */
+      /* Node reads a socket's own address and its family off its handle, so once the handle is gone
+         every one of them is undefined: a destroyed socket names no local end, and address() is the
+         empty object rather than the pair the connection was made on. The peer's end is only lost
+         to a caller who never asked for it -- what was read of it before the destroy is kept. */
       this.localAddress = undefined;
       this.localPort = undefined;
       this.localFamily = undefined;
-      this.remoteAddress = undefined;
-      this.remotePort = undefined;
-      this.remoteFamily = undefined;
+      this._remoteName = undefined;
       netRefresh(this);
     }
 
@@ -1301,11 +1339,31 @@ BF['net'] = function () {
       return this;
     }
 
+    /* The peer's end of the connection, as host Node 24.15 answers it: read off the handle while
+       there is one, and remembered from the first time a caller asked, so a socket destroyed after
+       being asked still names the peer it had, where one never asked names nothing. The local end
+       is the live reading only -- a destroyed socket's localAddress is undefined either way. */
+    get remoteAddress() {
+      return netPeerName(this).address;
+    }
+
+    get remotePort() {
+      return netPeerName(this).port;
+    }
+
+    get remoteFamily() {
+      return netPeerName(this).family;
+    }
+
     address() {
       /* A socket still dialling answers with nothing at all, as a host's does: the name of the
          connection is the kernel's to give, and it has not made one yet -- so address() is the
          empty object until 'connect', even though this socket already knows the port it took. */
       if (this.connecting || this._hubId === undefined || this._hubClosed) return {};
+      /* A unix connection has no name at either end, and host Node 24.15's address() for one is
+         the empty object: an object with no keys at all, not the three a TCP socket answers with
+         holding undefined. */
+      if (this.localAddress === undefined) return {};
       return { address: this.localAddress, family: this.localFamily, port: this.localPort };
     }
 
@@ -1608,15 +1666,29 @@ BF['net'] = function () {
         options = undefined;
       }
       var opts = options || {};
+      /* The options object itself is validated as host Node 24.15 validates it -- anything that is
+         not an object is ERR_INVALID_ARG_TYPE naming 'options', so createServer('x') and
+         createServer(7) are refused where this runtime built a server out of them -- and each
+         option it carries is validated by type in its own words. */
+      if (options !== undefined && options !== null && typeof options !== 'object') {
+        throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+          'The "options" argument must be of type object. Received ' + netDescribe(options));
+      }
+      if (opts.highWaterMark !== undefined && typeof opts.highWaterMark !== 'number') {
+        throw netError(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "options.highWaterMark" property must be of type number. Received ' + netDescribe(opts.highWaterMark));
+      }
       /* The options Node reads off a Server and keeps on it, so a caller can read them back:
          they are the socket settings its accepted connections are created with, and this runtime
-         carries them as the plain fields host Node 24.15 answers them with. */
-      this.allowHalfOpen = !!opts.allowHalfOpen;
+         carries them as the plain fields host Node 24.15 answers them with. A half-open server is
+         options.allowHalfOpen || false, which keeps the value it was given -- 1 stays 1, where
+         a Boolean() of it would answer true -- and a keep-alive delay is kept in whole seconds,
+         so 1234 ms is 1 and 999 ms is 0. */
+      this.allowHalfOpen = opts.allowHalfOpen || false;
       this.pauseOnConnect = !!opts.pauseOnConnect;
       this.noDelay = !!opts.noDelay;
       this.keepAlive = !!opts.keepAlive;
-      this.keepAliveInitialDelay = 0;
-      this.highWaterMark = NET_CHUNK;
+      this.keepAliveInitialDelay = Number(opts.keepAliveInitialDelay) > 0 ? Math.floor(Number(opts.keepAliveInitialDelay) / 1000) : 0;
+      this.highWaterMark = opts.highWaterMark === undefined ? NET_CHUNK : opts.highWaterMark;
       this._serverOpts = { allowHalfOpen: !!opts.allowHalfOpen, pauseOnConnect: !!opts.pauseOnConnect };
       this._listening = false;
       this._address = null;
@@ -1816,6 +1888,9 @@ BF['net'] = function () {
     }
 
     _emitAccepted(socket) {
+      /* The server an accepted socket came from is an own property of it, as host Node 24.15
+         answers it: socket.server is the listener that accepted it, enumerable on the socket. */
+      socket.server = this;
       this.emit('connection', socket);
     }
 
@@ -2199,6 +2274,17 @@ BF['net'] = function () {
     }
   }
 
+  /* The peer a socket reports: what the handle says while there is one, or -- once the handle is
+     gone -- what a caller last read, which is the one way a destroyed socket still names a peer. */
+  var NET_NO_PEER = { address: undefined, port: undefined, family: undefined };
+
+  function netPeerName(socket) {
+    if (socket._remoteCache === undefined && socket._remoteName !== undefined) {
+      socket._remoteCache = socket._remoteName;
+    }
+    return socket._remoteCache === undefined ? NET_NO_PEER : socket._remoteCache;
+  }
+
   /* An own field kept out of Object.keys: host Node holds a SocketAddress's and a BlockList's state
      in a native handle, so an instance of either enumerates nothing at all. */
   function netHide(target, key, value) {
@@ -2384,11 +2470,12 @@ BF['dgram'] = function () {
          source is what makes a later source-specific join of it EINVAL, as a host's kernel
          answers it, so the membership is kept to answer that. */
       this._joined = [];
+      this._sources = [];
       /* Kept out of what an instance enumerates, as a host's own state is: host Node 24.15 holds
          a dgram socket's in a native handle, so Object.keys of one is its own type and nothing
          else. This socket reads them by name, so hiding them changes nothing else. */
       var hidden = ['_family', '_hubId', '_targetId', '_bound', '_binding', '_dead', '_address',
-        '_refed', '_holding', '_remote', '_recvBufferSize', '_sendBufferSize', '_joined'];
+        '_refed', '_holding', '_remote', '_recvBufferSize', '_sendBufferSize', '_joined', '_sources'];
       for (var h = 0; h < hidden.length; h++) {
         Object.defineProperty(this, hidden[h], {
           value: this[hidden[h]], writable: true, enumerable: false, configurable: true
@@ -2561,7 +2648,9 @@ BF['dgram'] = function () {
          Node reports as EBADF from getsockname; one that was closed is no longer running at all. */
       if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
       if (!this._bound || this._address === null) {
-        throw Object.assign(netError(Error, 'EBADF', 'getsockname EBADF'), { syscall: 'getsockname' });
+        /* errno -9 is the figure host Node 24.15's own EBADF carries, and it is what a caller
+           reads off the error: the code alone does not say which descriptor failed. */
+        throw Object.assign(netError(Error, 'EBADF', 'getsockname EBADF'), { syscall: 'getsockname', errno: -9 });
       }
       return { address: this._address.address, family: this._address.family, port: this._address.port };
     }
@@ -2613,7 +2702,7 @@ BF['dgram'] = function () {
        value it hands back, and the three states a socket may be in -- closed, unbound, bound. */
     setBroadcast() {
       if (this._dead) throw netDgramGone('setBroadcast');
-      if (!this._bound && !this._binding) throw netDgramUvError('setBroadcast', 'EBADF', -9);
+      if (!this._bound) throw netDgramUvError('setBroadcast', 'EBADF', -9);
     }
 
     /* A second-to-live count of 1..255: uv truncates what it is handed, so 255.5 is 255 and 0.5
@@ -2623,7 +2712,9 @@ BF['dgram'] = function () {
       if (this._dead) throw netDgramGone('setTTL');
       var whole = netDgramByte(ttl);
       if (!(whole >= 1 && whole <= 255)) throw netDgramUvError('setTTL', 'EINVAL', -22);
-      if (!this._bound && !this._binding) throw netDgramUvError('setTTL', 'EBADF', -9);
+      /* A socket still binding has no descriptor yet, as a host's does not: uv_udp_set_ttl is
+         asked for one before 'listening' has made it, and answers EBADF. */
+      if (!this._bound) throw netDgramUvError('setTTL', 'EBADF', -9);
       return ttl;
     }
 
@@ -2632,9 +2723,12 @@ BF['dgram'] = function () {
     setMulticastTTL(ttl) {
       netDgramArg(ttl, 'ttl', 'number');
       if (this._dead) throw netDgramGone('setMulticastTTL');
-      var hops = netDgramByte(ttl);
+      /* An int, not a byte: libuv hands a hop count to the kernel as a signed 32-bit int, so
+         NaN, Infinity and 2^53 are all 0 -- a hop count the kernel accepts -- and 256 or -1 are
+         the EINVAL (-22) a socket outside 0..255 is. */
+      var hops = netDgramInt32(ttl);
       if (!(hops >= 0 && hops <= 255)) throw netDgramUvError('setMulticastTTL', 'EINVAL', -22);
-      if (!this._bound && !this._binding) throw netDgramUvError('setMulticastTTL', 'EBADF', -9);
+      if (!this._bound) throw netDgramUvError('setMulticastTTL', 'EBADF', -9);
       return ttl;
     }
 
@@ -2642,7 +2736,7 @@ BF['dgram'] = function () {
        whatever it was, as host Node 24.15 answers it. */
     setMulticastLoopback(flag) {
       if (this._dead) throw netDgramGone('setMulticastLoopback');
-      if (!this._bound && !this._binding) throw netDgramUvError('setMulticastLoopback', 'EBADF', -9);
+      if (!this._bound) throw netDgramUvError('setMulticastLoopback', 'EBADF', -9);
       return flag;
     }
 
@@ -2660,8 +2754,19 @@ BF['dgram'] = function () {
          it cannot use (EINVAL) -- host Node 24.15 answers EBADF for '::1' on an unbound udp4
          socket and EINVAL for the same address on a bound one. */
       if (family === 0) throw netDgramUvError('setMulticastInterface', 'EINVAL', -22);
-      if (!this._bound && !this._binding) throw netDgramUvError('setMulticastInterface', 'EBADF', -9);
-      if (want6 || (family === 6) !== want6) throw netDgramUvError('setMulticastInterface', 'EINVAL', -22);
+      if (!this._bound) throw netDgramUvError('setMulticastInterface', 'EBADF', -9);
+      /* On an IPv6 socket the address must carry a zone: the interface a multicast datagram goes
+         out on is named by index, and this platform's loopback has no IPv6 interface to index,
+         which is the EINVAL (-22) host Node 24.15 answers for a bare '::1'. A zoned literal --
+         '::1%lo0' -- names one, so it is accepted. On an IPv4 socket the address has to be one
+         this host owns: anything else, a multicast group among them, is EADDRNOTAVAIL (-49). */
+      if (want6) {
+        if (interfaceAddress.indexOf('%') === -1) throw netDgramUvError('setMulticastInterface', 'EINVAL', -22);
+      } else if ((family === 6) !== want6) {
+        throw netDgramUvError('setMulticastInterface', 'EINVAL', -22);
+      } else if (!netOwnAddress(interfaceAddress)) {
+        throw netDgramUvError('setMulticastInterface', 'EADDRNOTAVAIL', -49);
+      }
     }
 
     /* Buffer sizes are a kernel setting this runtime has no kernel for: accepted and checked, then
@@ -2696,8 +2801,20 @@ BF['dgram'] = function () {
        carries IPv6 multicast, so there is nothing to join it on. */
     addMembership(multicastAddress, multicastInterface) {
       if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
-      if (multicastAddress === undefined) {
+      /* A group that is not there at all -- undefined, '', 0, null or false -- is the
+         ERR_MISSING_ARGS host Node 24.15 throws, a TypeError, not the EINVAL a text no family can
+         hold would be. */
+      if (!multicastAddress) {
         throw netError(TypeError, 'ERR_MISSING_ARGS', 'The "multicastAddress" argument must be specified');
+      }
+      /* A socket that was never bound is bound by the join, as Node's is -- and it is bound in the
+         family of the group it was asked to join, so an unbound udp6 socket that joins 224.0.0.1
+         comes back an IPv4 socket on 0.0.0.0, which is the name host Node 24.15 reports for it. */
+      if (!this._bound && !this._binding) {
+        var groupFamily = netIsIP(multicastAddress);
+        if (groupFamily === 4 && this._family !== 'IPv4') this._family = 'IPv4';
+        else if (groupFamily === 6 && this._family !== 'IPv6') this._family = 'IPv6';
+        this.bind(0);
       }
       var want6 = this._family === 'IPv6';
       var fault = netDgramMulticastFault(multicastAddress, want6, false);
@@ -2706,9 +2823,13 @@ BF['dgram'] = function () {
         var ifFamily = typeof multicastInterface === 'string' ? netIsIP(multicastInterface) : 0;
         if (ifFamily === 0 || (ifFamily === 6) !== want6) throw netDgramUvError('addMembership', 'EINVAL', -22);
       }
-      if (!this._bound && !this._binding) this.bind(0);
       if (want6) throw netDgramUvError('addMembership', 'EADDRNOTAVAIL', -49);
-      if (this._joined.indexOf(multicastAddress) === -1) this._joined.push(multicastAddress);
+      /* Joining one group twice is the kernel's own EADDRINUSE (-48): the second ask is for a
+         membership this socket is already holding. */
+      if (this._joined.indexOf(multicastAddress) !== -1) {
+        throw netDgramUvError('addMembership', 'EADDRINUSE', -48);
+      }
+      this._joined.push(multicastAddress);
     }
 
     /* Leaving a group: one that is not a multicast address at all is the kernel's EINVAL, whether
@@ -2716,15 +2837,18 @@ BF['dgram'] = function () {
        interface of this host could have joined. */
     dropMembership(multicastAddress) {
       if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
-      if (multicastAddress === undefined) {
+      if (!multicastAddress) {
         throw netError(TypeError, 'ERR_MISSING_ARGS', 'The "multicastAddress" argument must be specified');
       }
       var want6 = this._family === 'IPv6';
       var fault = netDgramMulticastFault(multicastAddress, want6, true);
       if (fault !== null) throw netDgramUvError('dropMembership', fault, -22);
       if (want6) throw netDgramUvError('dropMembership', 'EADDRNOTAVAIL', -49);
+      /* Leaving a group this socket never joined is the kernel's EADDRNOTAVAIL (-49): host Node
+         24.15 answers it for 224.0.0.1 on a socket that has joined nothing. */
       var at = this._joined.indexOf(multicastAddress);
-      if (at !== -1) this._joined.splice(at, 1);
+      if (at === -1) throw netDgramUvError('dropMembership', 'EADDRNOTAVAIL', -49);
+      this._joined.splice(at, 1);
     }
 
     /* A source-specific join names the source a group is joined for, so both are read as strings
@@ -2744,6 +2868,13 @@ BF['dgram'] = function () {
       if (this._joined.indexOf(groupAddress) !== -1) {
         throw netDgramUvError('addSourceSpecificMembership', 'EINVAL', -22);
       }
+      /* Joining the same source and group twice is the kernel's EADDRNOTAVAIL (-49), the way a
+         second plain join of one group is its EADDRINUSE. */
+      var key = sourceAddress + '|' + groupAddress;
+      if (this._sources.indexOf(key) !== -1) {
+        throw netDgramUvError('addSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
+      }
+      this._sources.push(key);
     }
 
     /* Leaving one: a group this socket never joined that way is the kernel's EADDRNOTAVAIL. */
@@ -2759,9 +2890,12 @@ BF['dgram'] = function () {
         throw netDgramUvError('dropSourceSpecificMembership', 'EINVAL', -22);
       }
       /* Leaving a group this socket is not a source-specific member of is the kernel's
-         EADDRNOTAVAIL (-49) on a host, whatever the join before it answered: this platform
-         answers the join and the leave out of two different tables. */
-      throw netDgramUvError('dropSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
+         EADDRNOTAVAIL (-49) on a host, whatever the join before it answered; one it joined that
+         way leaves, so the pair a host answers -- join then leave -- is answered here as there. */
+      var key = sourceAddress + '|' + groupAddress;
+      var at = this._sources.indexOf(key);
+      if (at === -1) throw netDgramUvError('dropSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
+      this._sources.splice(at, 1);
     }
 
     /* Nothing is ever queued: a datagram this socket hands the hub is delivered on the next

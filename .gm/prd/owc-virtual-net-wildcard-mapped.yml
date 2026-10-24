@@ -77,3 +77,19 @@ witness_2026_10_24_adv12_judge: |-
   of the nineteen bind/dial pairs or the seven UDP scenes moved. The only line anywhere near this row
   that differs is U7, a udp6 socket bound on '::1%lo0', and that is fixed in this pass and recorded
   under row owc-virtual-net-ipv6-family, whose UDP surface it belongs to.
+witness_2026_10_24_adv13_judge: |-
+  RE-MEASURED BY THE JUDGE FOR SHARD NET (session adv13-judge-net-0) at HEAD cb696df plus this pass's
+  net.ts change, differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately,
+  every probe run twice on each side. Probe /tmp/owc-r4/adv13-judge-net-0/p6 (seven binds, each dialled
+  by a fresh client, with the accepted socket's own four values compared too).
+  THE HALF OF THIS ROW THAT IS A DIAL IS FIXED IN THIS PASS: dialling '::' used to reach a listener on
+  0.0.0.0, on ::ffff:127.0.0.1 and on 127.0.0.1 -- the three host Node 24.15 refuses ECONNREFUSED --
+  and to report 127.0.0.1/IPv4 at both of its ends for the binds it should reach; it now dials ::1 and
+  agrees with the host on all seven binds, the accepted socket's family included. The change is in
+  _doConnect in runtime/guest/modules/net.ts and is recorded at length under row
+  owc-virtual-net-ipv6-family, whose dial surface it shares.
+  WHAT REMAINS IS THE BIND AND IS NOT THIS SHARD'S: '::ffff:0.0.0.0' is EADDRNOTAVAIL (-49) here where
+  host Node 24.15 binds it and answers address() '::'/IPv6. That is
+  packages/core/src/network/virtual/hub.ts, outside this shard's grant
+  (runtime/guest/modules/net.ts). npx tsc --noEmit clean in packages/core; pnpm build succeeds.

@@ -107,3 +107,25 @@ witness_2026_10_24_adv12_judge: |-
   fixed under row owc-virtual-net in the same pass, where the value-type surface lives. The two
   dns.lookup divergences the row records stay outside the grant
   (runtime/guest/modules/dns.ts). npx tsc --noEmit clean in packages/core; pnpm build succeeds.
+witness_2026_10_24_adv13_judge: |-
+  RE-MEASURED BY THE JUDGE FOR SHARD NET (session adv13-judge-net-0) at HEAD cb696df plus this pass's
+  net.ts change, differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately,
+  every probe run twice on each side. Probes /tmp/owc-r4/adv13-judge-net-0/{p6,p10}.
+  ONE OF THE THREE SYMPTOMS IS FIXED: dialling the unspecified IPv6 address. net.connect({host:'::'})
+  reaches a listener on '::', on '::1' and on the default bind as ::1/IPv6 at both of its own ends --
+  client and accepted socket alike -- and is refused ECONNREFUSED by one on 0.0.0.0, on
+  ::ffff:127.0.0.1 and on 127.0.0.1, every field as host Node 24.15 reports it; it used to dial
+  127.0.0.1 and reach the three listeners a host refuses. The change is in _doConnect in
+  runtime/guest/modules/net.ts: the unspecified address of a family is that family's loopback, and
+  only the address the hub is asked for changes, so the error text still names what the caller dialled
+  ('connect ECONNREFUSED :::8080'). The adversary's j-fam was re-run and is unchanged by it.
+  TWO STILL DIVERGE, both in the hub and outside this shard's grant
+  (packages/core/src/network/virtual/hub.ts and runtime/capabilities/net.ts, against this shard's
+  runtime/guest/modules/net.ts), re-measured in isolation and byte-identical across runs: binding the
+  mapped IPv4 wildcard '::ffff:0.0.0.0' is EADDRNOTAVAIL (-49) here, where host Node 24.15 binds it,
+  answers address() '::'/IPv6 and refuses a '::' dial with ECONNREFUSED; and a udp6 socket bound to an
+  IPv4 literal ('127.0.0.1', '0.0.0.0') is the host's EINVAL (-22) and is bound here, reporting family
+  IPv6 for an IPv4 address. A third belongs to this row's UDP surface and is recorded with it: a
+  datagram sent to the unspecified address (0.0.0.0 for udp4, :: for udp6) is EHOSTUNREACH (-65) on a
+  host and is delivered here. npx tsc --noEmit clean in packages/core; pnpm build succeeds.

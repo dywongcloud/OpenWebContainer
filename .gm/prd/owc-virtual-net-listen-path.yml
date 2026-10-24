@@ -83,3 +83,19 @@ witness_2026_10_24_adv12_judge: |-
   at the path in the filesystem and none of the host's filesystem errnos exist here. The site is
   packages/core/src/network/virtual/hub.ts, outside this shard's grant
   (runtime/guest/modules/net.ts). No source change for this row.
+witness_2026_10_24_adv13_judge: |-
+  RE-VERIFIED BY THE JUDGE FOR SHARD NET (session adv13-judge-net-0) at HEAD cb696df, differential
+  against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately,
+  probe /tmp/owc-r4/adv13-judge-net-0/p8 (eight paths) run twice on each side, and the prior wave's
+  j-pathfs re-run as a regression check. CLOSED STALE on the residual the row has always named, every
+  case still reproducing byte-identically: '/' is the host's EEXIST (-17) and binds here; a path under a
+  directory that does not exist is its EACCES (-13) and binds here; a trailing slash is its EACCES and
+  binds here; a '..' segment whose parent does not exist is its EACCES and binds here; a regular file
+  already at the path is its EADDRINUSE (-48) and binds here, as a directory at the path does; '/tmp'
+  itself is its EADDRINUSE and binds here; and a path under a regular file is its ENOTDIR (-20) and
+  binds here. j-path, which is the path surface that does not touch the filesystem, is still identical
+  to the host. The named missing subsystem is accurate and is the whole of it: the binding lives in the
+  hub alone, so no inode exists at the path and none of the host's filesystem errnos has anything to
+  read -- a hub-side filesystem, packages/core/src/network/virtual/hub.ts, outside this shard's grant
+  (runtime/guest/modules/net.ts). No source change for this row.

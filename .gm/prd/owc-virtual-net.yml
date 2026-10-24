@@ -136,3 +136,57 @@ witness_2026_10_24_adv12_judge: |-
   is the same one-scheduling-model difference the row already carries rather than one small change.
   One concrete line for it, and one for the whole value-type surface, added to Readme.md under
   Virtual net. npx tsc --noEmit clean in packages/core; pnpm build succeeds.
+witness_request:
+  ts_ms: 1792803111313
+  requested_by: adv13-exec-net-[object Object]
+witness_2026_10_24_adv13_judge: |-
+  RE-MEASURED BY THE JUDGE FOR SHARD NET (session adv13-judge-net-0) at HEAD cb696df plus this pass's
+  net.ts change, differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately,
+  every probe run at least twice on each side. Probes written for this pass, none copied from the
+  adversary: /tmp/owc-r4/adv13-judge-net-0/{p1,p2,p3,p4,p5,p10}. The prior waves' own j-reg, j-net,
+  j-net2, j-path and j-tls were re-run afterwards as a regression check and none of them moved.
+  FIXED, each case re-run IN ISOLATION and each one DIVERGING before the change: (1) in the window
+  between dgram bind() and 'listening' host Node 24.15 raises EBADF (-9) for setTTL, setBroadcast,
+  setMulticastLoopback and setMulticastInterface, and this runtime answered them -- setTTL(64) 64,
+  setMulticastLoopback(true) true, and on udp6 setMulticastInterface EINVAL instead of EBADF; the five
+  sites now ask only whether the socket is bound, as the buffer-size getters already did. (2) An
+  unbound address() is EBADF on both sides but this side's carried no errno, against the host's -9.
+  (3) setMulticastTTL is the int libuv hands the kernel, not a byte: NaN, Infinity, -Infinity and
+  9007199254740992 are all the hop count 0 a kernel accepts on a host, and this side refused all four
+  EINVAL. (4) Membership is now kept: a second addMembership of one group is the host's EADDRINUSE
+  (-48), a dropMembership of a group never joined is its EADDRNOTAVAIL (-49), a second
+  addSourceSpecificMembership of one source and group is EADDRNOTAVAIL, and the dropSourceSpecificMembership
+  that follows a join succeeds where it used to be refused unconditionally. (5) A group that is not
+  there at all -- '', 0, null and false as well as undefined -- is the host's ERR_MISSING_ARGS, not
+  EINVAL. (6) setMulticastInterface of an address this host does not own -- 8.8.8.8, and a multicast
+  group such as 224.0.0.1 -- is EADDRNOTAVAIL (-49) where this side accepted it, and a zoned literal on
+  a bound udp6 socket ('::1%lo0', 'fe80::1%lo0', '::%lo0') is accepted as on a host, where this side
+  refused it EINVAL. (7) A socket never bound is bound by the join in the family of the group: a udp6
+  socket that addMemberships 224.0.0.1 comes back 0.0.0.0/IPv4, as host Node 24.15 does, where this
+  side refused the join EINVAL. (8) The options a Server keeps are the caller's: createServer('x') and
+  createServer(7) are ERR_INVALID_ARG_TYPE 'The "options" argument must be of type object' and
+  {highWaterMark:'16'} the same TypeError naming the property, where this runtime built a server out of
+  all three; highWaterMark is honoured (100, 0 and 1048576 read back as given, against the constant
+  65536), keepAliveInitialDelay is kept in whole seconds (1234 is 1, 999 is 0) and allowHalfOpen keeps
+  the value it was handed (1 stays 1, where Boolean of it answered true). (9) An accepted socket carries
+  the listener that accepted it as its own 'server' property, as a host's does. (10) A unix connection's
+  address() is the empty object -- Object.keys [] -- and not the three undefined-valued keys of an
+  address it has none of. (11) A socket names no address at either end until 'connect': the six fields
+  used to be filled on the turn the dial was made, where host Node 24.15 leaves them undefined through
+  the dial. (12) A socket destroyed after its peer was asked for still names that peer: host Node 24.15
+  remembers what a caller first read of remoteAddress, remotePort and remoteFamily, so only a caller who
+  never asked finds them undefined, while the local end is a live reading of the handle and is undefined
+  either way -- this side nulled all six unconditionally. (13) A function argument prints as Node prints
+  one: 'Received function foo', and 'Received function ' for one with no name, not 'Received type
+  function (function () {})'. p1, p2 and p3 now come back with zero differing lines apart from the
+  ephemeral port the kernel picks and this hub does not.
+  STILL DIVERGING, and recorded rather than fixed: Object.keys(server) and getOwnPropertyNames of
+  net.Server.prototype and of net.Socket.prototype name this runtime's own fields and methods and not
+  Node's internals (_handle, _usingWorkers, _workers, _listeningId, _listen2, _getpeername,
+  _getsockname) -- no pass will put those on an object that has no libuv handle behind them. The host's
+  own ephemeral port comes from the kernel's window (50220, 53836, 54829 on three runs) and
+  this hub answers its own (49152 upward), so every line that prints a port was compared on the code,
+  the family and the shape and not on the number. npx tsc --noEmit clean in
+  packages/core; pnpm build succeeds. All of the above is in
+  packages/core/src/process/executors/node/runtime/guest/modules/net.ts, inside this shard's grant.
