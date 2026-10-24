@@ -309,7 +309,8 @@ proc.execPath = '/usr/local/bin/node';
 proc.argv0 = proc.execPath.slice(proc.execPath.lastIndexOf('/') + 1);
 proc.execArgv = [];
 proc.env = procEnv;
-proc.exitCode = undefined;
+/* Defined as an accessor below, beside the exit path that owns it: node validates and coerces what
+   a status is written as, and a plain data property cannot. */
 proc.cwd = function () {
   return host.cwd();
 };
@@ -335,24 +336,137 @@ proc.cwd = function () {
     throw error;
   };
 /*
- * The first process.exit decides the status, and nothing runs after it -- exactly as in Node. The
- * host keeps the first code it was asked to leave with; this guard keeps the guest's own record in
- * step with it, so a callback still queued behind the exit (a rejection handler, an exit listener
- * that exits again) cannot overwrite the status the process already left with.
+ * The status a process leaves with, as host node 24.15 reads it: an integer, or a string that is
+ * one, and nothing else. A fraction, a NaN, an infinity, a boolean and an object are each an
+ * error, with the message and the 'code' node raises -- measured on host node v24.15.0 over
+ * undefined, null, '7', '7.5', 'abc', '', ' 7 ', 1.7, -3, 256, NaN, Infinity, true, false, 0,
+ * '0x10' and [7]. A status written as a string is a number once it has been read back, which is
+ * what makes 'process.exitCode = '7'' leave 7 behind, and undefined is what a process that never
+ * named one carries.
  */
+var EXIT_CODE_ARG_TYPE = 'The "code" argument must be of type number. Received ';
+function specificTypeOf(value) {
+  if (value === null || value === undefined) return String(value);
+  if (typeof value === 'function' && value.name) return 'function ' + value.name;
+  if (typeof value === 'object') {
+    if (value.constructor && value.constructor.name) return 'an instance of ' + value.constructor.name;
+    return String(value);
+  }
+  if (typeof value === 'string') return "type string ('" + value + "')";
+  return 'type ' + typeof value + ' (' + String(value) + ')';
+}
+function exitCodeError(range, message, code) {
+  var error = range ? new RangeError(message) : new TypeError(message);
+  error.code = code;
+  return error;
+}
+function parseExitCode(value) {
+  if (value === undefined || value === null) return undefined;
+  var number = value;
+  if (typeof value === 'string') {
+    /* A string that is not one number at all is the wrong type, and node reports it as the string
+       it was handed, quotes and all; one that is a number is read as that number, which is what
+       leaves ' 7 ' as 7 and '0x10' as 16 and then fails the integer test as 7.5 does. */
+    if (value.replace(/^\s+|\s+$/g, '') === '') {
+      throw exitCodeError(false, EXIT_CODE_ARG_TYPE + specificTypeOf(value), 'ERR_INVALID_ARG_TYPE');
+    }
+    number = Number(value);
+    if (number !== number) {
+      throw exitCodeError(false, EXIT_CODE_ARG_TYPE + specificTypeOf(value), 'ERR_INVALID_ARG_TYPE');
+    }
+  } else if (typeof value !== 'number') {
+    throw exitCodeError(false, EXIT_CODE_ARG_TYPE + specificTypeOf(value), 'ERR_INVALID_ARG_TYPE');
+  }
+  if (number !== number || number === Infinity || number === -Infinity || Math.floor(number) !== number) {
+    throw exitCodeError(true,
+      'The value of "code" is out of range. It must be an integer. Received ' + String(number),
+      'ERR_OUT_OF_RANGE');
+  }
+  return number;
+}
+/*
+ * What leaves the process is the low eight bits of what it was given, because that is all a status
+ * the operating system carries: 256 leaves 0, -1 leaves 255 and -3 leaves 253. Node hands the
+ * whole integer to 'exit(2)' and lets the system cut it, so the value 'process.exitCode' still
+ * reads -- and the one an 'exit' handler is handed -- is the uncut one.
+ */
+function exitStatusOf(code) {
+  return typeof code === 'number' ? code & 0xff : 0;
+}
+var exitCodeStore = undefined;
+Object.defineProperty(proc, 'exitCode', {
+  get: function () { return exitCodeStore; },
+  set: function (value) {
+    try {
+      exitCodeStore = parseExitCode(value);
+    } catch (bad) {
+      recordExitFailure(bad, false);
+      throw bad;
+    }
+  },
+  enumerable: true,
+  configurable: true
+});
+/*
+ * The first frame of a stack that names a file of the guest's own: the place a caller's own code
+ * did the thing that failed. The frames in front of it belong to this container's bootstrap, which
+ * is no file a program wrote and which a host never names.
+ */
+function siteOf(text) {
+  var lines = String(text === undefined || text === null ? '' : text).split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].indexOf('owc-bootstrap.js:') >= 0) continue;
+    /* A frame with no name in front of it -- the body of a listener, or of a module -- is written
+       with the bare place and no parentheses at all, so both shapes are read. */
+    var found = /\(?(\/[^\s()]+):(\d+):(\d+)\)?/.exec(lines[i]);
+    if (found !== null) return found[1] + ':' + found[2] + ':' + found[3];
+  }
+  return '';
+}
+function stackTextOf(error) {
+  try { return String(error && error.stack ? error.stack : ''); } catch (e) { return ''; }
+}
+/* The one line node puts above the frames: the error's name, its 'code' in brackets when it has
+   one, and its message. */
+function headerOf(error) {
+  var text = api.formatUncaught(error);
+  var cut = text.indexOf('\n');
+  return cut < 0 ? text : text.slice(0, cut);
+}
+var exitFailureNote = '';
+var exitHandlerNote = '';
+var exitCallSite = '';
+function recordExitFailure(error, viaExit) {
+  exitFailureNote = JSON.stringify({
+    name: String(error.name || 'Error'),
+    code: String(error.code || ''),
+    message: String(error.message || ''),
+    viaExit: viaExit === true,
+    site: siteOf(stackTextOf(error))
+  });
+}
 var exitedByCall = false;
 proc.exit = function (code) {
-  if (exitedByCall) throw EXIT_SIGNAL;
-  exitedByCall = true;
-  var fallback = typeof proc.exitCode === 'number' ? proc.exitCode : 0;
-  var finalCode = code === undefined ? fallback : Number(code);
-  proc.exitCode = finalCode;
-  try {
-    api.emitExit(finalCode);
-  } catch (listenerError) {
-    host.stderr(formatErrorStack(listenerError instanceof Error ? listenerError : new Error(String(listenerError))) + '\n');
+  exitCallSite = siteOf(stackTextOf(new Error()));
+  /* 'process.exit()' with no argument leaves the status it already had; with one, it is that
+     argument validated and coerced exactly as an assignment to 'process.exitCode' is -- which is
+     where host node 24.15 raises the range and type errors it raises, before anything else runs. */
+  if (arguments.length !== 0) {
+    try {
+      proc.exitCode = code;
+    } catch (bad) {
+      recordExitFailure(bad, true);
+      throw bad;
+    }
   }
-  host.exit(finalCode);
+  /* The 'exit' handlers run once, and a second 'process.exit' from inside one does not run them
+     again: on host node 24.15 it only replaces the status, silently, and the process leaves with
+     the last status it was given. */
+  if (!exitedByCall) {
+    exitedByCall = true;
+    api.emitExit(typeof proc.exitCode === 'number' ? proc.exitCode : 0);
+  }
+  host.exit(exitStatusOf(proc.exitCode));
   throw EXIT_SIGNAL;
 };
 proc.nextTick = function (fn) {
@@ -3584,14 +3698,62 @@ function circularStructureText(value, replacer) {
 })();
 
 api.finalExitCode = function () {
-  var code = proc.exitCode;
-  return typeof code === 'number' ? code : 0;
+  return exitStatusOf(proc.exitCode);
+};
+/* The status the 'exit' handlers are handed: the whole integer, not the eight bits that leave. */
+api.exitEventCode = function () {
+  return typeof proc.exitCode === 'number' ? proc.exitCode : 0;
 };
 var exitEmitted = false;
 api.emitExit = function (code) {
+  /* A status that would not validate and was caught by the program is not a failure of the run: the
+     'exit' handlers running at all is what says so, and the note is dropped. */
+  exitFailureNote = '';
   if (exitEmitted) return;
   exitEmitted = true;
-  proc.emit('exit', code);
+  try {
+    proc.emit('exit', code);
+  } catch (listenerError) {
+    /*
+     * A 'process.exit' from inside a handler is not a failure: it has already written the status it
+     * was given, and host node 24.15 ends the process there without a word.
+     */
+    if (api.isExitSignal(listenerError)) return;
+    /*
+     * Anything else a handler throws is what host node 24.15 reports as an uncaught exception --
+     * the source line, a caret, the error and its frames -- and leaves the process with status 1,
+     * unless a status was already named, which is the one it keeps.
+     */
+    if (typeof proc.exitCode !== 'number') proc.exitCode = 1;
+    exitHandlerNote = JSON.stringify({
+      header: headerOf(listenerError),
+      site: siteOf(stackTextOf(listenerError)),
+      listeners: proc.listenerCount('exit'),
+      viaExit: exitedByCall,
+      exitSite: exitCallSite
+    });
+
+  }
+};
+/*
+ * What the host reads after it has run the 'exit' handlers: the note of a handler that threw, or of
+ * a status that would not validate, empty when neither happened. The report itself is the host's to
+ * write -- it is the only side that holds the source of the file a frame names.
+ */
+api.exitReport = function () {
+  if (exitHandlerNote !== '') {
+    var handler = exitHandlerNote;
+    exitHandlerNote = '';
+    return handler;
+  }
+  if (exitFailureNote !== '') {
+    /* Cleared as it is read: the host writes the report once, and the 'exit' handlers that run
+       behind it are given no note of their own. */
+    var failure = exitFailureNote;
+    exitFailureNote = '';
+    return failure;
+  }
+  return '';
 };
 api.formatUncaught = function (err) {
   if (err instanceof Error) return formatErrorStack(err);

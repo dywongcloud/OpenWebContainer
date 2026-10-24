@@ -69,7 +69,6 @@ The architecture consists of three main layers:
   - `npx <bin>` runs a project bin, or installs a package into a cache and runs its bin
   - `npm exec <bin> [-- <args>]` (alias `npm x`) is the same command under npm's own name
   - `npm run <script>` runs a `package.json` script with its `pre`/`post` lifecycle scripts, and `npm install` writes `package-lock.json` at lockfileVersion 3. Global installs are refused
-  - `npm ls [--depth=<n>]` prints the installed tree with npm's own branch characters, `npm install` reports `added N packages in <ms>` with no `+ <pkg>@<version>` lines, a script that exits non-zero ends `npm run` with the script's own status and nothing on stderr, and `npx` over a package that ships no bin writes nothing to stdout and `npm error could not determine executable to run` to stderr — all four matched against host npm 11.12.1
 
 ### ⚠️ What a WebAssembly call costs, and why it is proportional to the memory
 
@@ -692,6 +691,13 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   after the error, and ends with status 1; a `process.on('uncaughtException')` handler is called, and the
   status it leaves is the status the process leaves (`caught:boom`, `exit=7`, status 7), which is what the
   host does with the same three scripts. A normal exit runs them as it always did.
+- **The exit status is masked, validated and coerced as host node 24.15 does, and an `exit` handler can
+  still change it.** `process.exit(256)` leaves 0 and `process.exit(-1)` leaves 255, because only the low
+  eight bits of a status survive; `process.exit(1.7)` raises `RangeError [ERR_OUT_OF_RANGE]` and leaves 1,
+  and `process.exitCode = '7'` leaves 7, because a status is an integer and a string that is one is read as
+  that integer. A handler that assigns `process.exitCode`, or calls `process.exit` again, is the one that
+  decides the status -- `process.exit(3)` with a handler that writes 8 leaves 8 -- and a handler that throws
+  is reported the way node reports an uncaught exception and leaves 1 when no status was named.
 - **`fs.watch` of a file reports the name it was given when that file is renamed away, where host node on
   macOS reports the new name.** `fs.watch('s3.txt', cb)` followed by `fs.renameSync('s3.txt',
   's3-renamed.txt')` gives the host `rename:s3-renamed.txt` and this container `rename:s3.txt`: the host's

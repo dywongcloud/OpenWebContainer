@@ -317,6 +317,141 @@ const EVAL_RUNTIME_FRAMES = [
 ];
 
 /**
+ * The frames node writes behind the body of a CommonJS module that ran as the entry, and the one it
+ * writes for a module a `require` loaded. Captured from the build NODE_VERSION names, as the frames
+ * of a module that is not there are.
+ */
+const CJS_RUN_FRAMES = [
+    '    at Module._compile (node:internal/modules/cjs/loader:1830:14)',
+    '    at Object..js (node:internal/modules/cjs/loader:1961:10)',
+    '    at Module.load (node:internal/modules/cjs/loader:1553:32)',
+    '    at Module._load (node:internal/modules/cjs/loader:1355:12)',
+    '    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)'
+];
+const CJS_RUN_TAIL = [
+    '    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)',
+    '    at node:internal/main/run_main_module:33:47'
+];
+
+/** The trailer every report node writes on stderr ends with. */
+const REPORT_TRAILER = `\n\nNode.js ${NODE_VERSION}`;
+
+/**
+ * The eight bits of `code` a process leaves with: all a status the operating system carries, and so
+ * all host node 24.15 hands on -- 256 leaves 0, -1 leaves 255 and -3 leaves 253.
+ */
+function exitStatus(code: number): number {
+    return code & 0xff;
+}
+
+/** One frame's `path:line:column`, read out of the text the guest reported it as. */
+function parseSite(site: string): { path: string; line: number; column: number } | undefined {
+    const found = /^(\/[^\s]*):(\d+):(\d+)$/.exec(site);
+    if (found === null) return undefined;
+    return { path: found[1], line: Number(found[2]), column: Number(found[3]) };
+}
+
+/**
+ * The frame as node writes it: the same file and line, with the column moved onto the character V8
+ * would have named (`nodeColumn`). Undefined for a site that names no line this process can read.
+ */
+function nodeSite(site: string, sourceOf: (at: string) => string | undefined,
+                 recolumn?: (text: string, column: number) => number): string | undefined {
+    const at = parseSite(site);
+    if (at === undefined) return undefined;
+    const source = sourceOf(at.path);
+    if (source === undefined) return undefined;
+    const line = source.split('\n')[at.line - 1];
+    if (line === undefined) return undefined;
+    const text = line.replace(/\t/g, ' ');
+    const column = recolumn === undefined ? nodeColumn(text, at.column) : recolumn(text, nodeColumn(text, at.column));
+    return `${at.path}:${at.line}:${column}`;
+}
+
+/**
+ * The column node reports for a status written to `process.exitCode`: the `=` of the assignment, and
+ * not the property in front of it -- `process.exitCode = 1.7` is reported at the `=`, because that
+ * is the expression V8 evaluated. A line with no plain `=` behind the property keeps the column the
+ * property has, rather than one guessed at.
+ */
+function assignColumn(text: string, column: number): number {
+    let depth = 0;
+    let best = -1;
+    for (let at = 0; at < text.length; at++) {
+        const ch = text[at] ?? '';
+        if (ch === '(' || ch === '[') { depth++; continue; }
+        if (ch === ')' || ch === ']') { depth--; continue; }
+        if (ch !== '=' || depth > 0) continue;
+        /* `==`, `===`, `=>`, `<=`, `>=`, `!=` and the compound assignments are not the write. */
+        if ('=!<>+-*/%&|^?:'.includes(text[at - 1] ?? '') || text[at + 1] === '=' || text[at + 1] === '>') continue;
+        /* The write node reports is the one nearest the property the engine named, and not one of
+           another assignment further along a line that holds two. */
+        if (best < 0 || Math.abs(at + 1 - column) < Math.abs(best - column)) best = at + 1;
+    }
+    return best < 0 ? column : best;
+}
+
+/**
+ * What node writes for a status that would not validate -- `process.exit(1.7)`, or
+ * `process.exitCode = 'abc'`: the block of the internal that raised it, then the error, the setter
+ * it came out of, the call that asked, the loader's frames and the error's own `code` in braces.
+ *
+ * The block is node's own source and not the program's, because the error is raised inside
+ * `node:internal/errors` and not at the call: every part of it but the call's own frame is the same
+ * whatever the program wrote.
+ */
+function exitCodeFailureText(note: {
+    name: string; code: string; message: string; viaExit: boolean; site: string;
+}, sourceOf: (at: string) => string | undefined): string {
+    const frames = ['    at process.set [as exitCode] (node:internal/bootstrap/node:119:9)'];
+    if (note.viaExit) frames.push('    at process.exit (node:internal/process/per_thread:231:24)');
+    /* A status written to the property is reported at the `=` that wrote it; one handed to
+       `process.exit` at the call that asked. */
+    const site = nodeSite(note.site, sourceOf, note.viaExit ? undefined : assignColumn);
+    if (site !== undefined) frames.push(`    at Object.<anonymous> (${site})`);
+    frames.push(...CJS_RUN_FRAMES, ...CJS_RUN_TAIL);
+    return 'node:internal/errors:542\n' +
+        '      throw error;\n' +
+        '      ^\n' +
+        '\n' +
+        `${note.name} [${note.code}]: ${note.message}\n` +
+        frames.join('\n') +
+        ` {\n  code: '${note.code}'\n}` +
+        REPORT_TRAILER;
+}
+
+/**
+ * What node writes when a `process.on('exit')` handler throws: the line the throw is on, a caret
+ * under the `throw`, the error, and the two frames the throw came through -- the handler and the
+ * `emit` that called it, which node names after the branch its own `emit` took, one listener being
+ * a path of its own. A handler reached from `process.exit` carries that call behind it, and the
+ * loader's frames behind that.
+ */
+function exitHandlerFailureText(note: {
+    header: string; site: string; listeners: number; viaExit: boolean; exitSite: string;
+}, sourceOf: (at: string) => string | undefined): string | undefined {
+    const at = parseSite(note.site);
+    if (at === undefined) return undefined;
+    const source = sourceOf(at.path);
+    if (source === undefined) return undefined;
+    const shown = (source.split('\n')[at.line - 1] ?? '').replace(/\t/g, ' ');
+    if (shown === undefined) return undefined;
+    const marked = caretColumn(shown, nodeColumn(shown, at.column));
+    const caret = marked > shown.length ? ' '.repeat(shown.length) : ' '.repeat(marked - 1) + '^';
+    const frames = [`    at process.<anonymous> (${at.path}:${at.line}:${nodeColumn(shown, at.column)})`];
+    frames.push(note.listeners === 1
+        ? '    at process.emit (node:events:509:28)'
+        : '    at process.emit (node:events:521:24)');
+    if (note.viaExit) {
+        frames.push('    at process.exit (node:internal/process/per_thread:236:15)');
+        const exit = nodeSite(note.exitSite, sourceOf);
+        if (exit !== undefined) frames.push(`    at Object.<anonymous> (${exit})`);
+        frames.push(...CJS_RUN_FRAMES, '    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)');
+    }
+    return `${at.path}:${at.line}\n${shown}\n${caret}\n\n${note.header}\n${frames.join('\n')}${REPORT_TRAILER}`;
+}
+
+/**
  * The frames node writes for a source it could not compile. There is no frame of the source's own
  * in front of them: a source that did not compile never ran, so nothing of it was ever on the stack.
  */
@@ -2599,15 +2734,82 @@ export class NodeProcess extends Process {
     }
 
     private finishProcess(): number {
-        const exitCode = this.readFinalExitCode();
-        this.safeEmitExit(exitCode);
+        /* The handlers are handed the status as it was written -- the whole integer, not the eight
+           bits that leave -- and what the process leaves with is read again behind them, because a
+           handler may have written one of its own. */
+        this.emitExitHandlers(this.readExitEventCode());
         return this.readFinalExitCode();
     }
 
+    /**
+     * What the guest recorded of the exit path, read and cleared: a handler that threw, or a status
+     * that would not validate. Empty when neither happened.
+     */
+    private readExitReport(): string {
+        if (this.context === undefined || this.api === undefined) return '';
+        try {
+            const value = this.callApi('exitReport', []);
+            const text = this.context.typeof(value) === 'string' ? this.context.getString(value) : '';
+            value.dispose();
+            return text;
+        } catch {
+            return '';
+        }
+    }
+
+    /** The note the guest left, as the report node would write, or undefined for none. */
+    private exitReport(): string | undefined {
+        const note = this.readExitReport();
+        if (note === '') return undefined;
+        let parsed: Record<string, unknown>;
+        try {
+            parsed = JSON.parse(note) as Record<string, unknown>;
+        } catch {
+            return undefined;
+        }
+        const sourceOf = (at: string): string | undefined => this.fileSystem.readFile(at);
+        if (typeof parsed.header === 'string') {
+            return exitHandlerFailureText({
+                header: parsed.header,
+                site: String(parsed.site ?? ''),
+                listeners: Number(parsed.listeners ?? 0),
+                viaExit: parsed.viaExit === true,
+                exitSite: String(parsed.exitSite ?? '')
+            }, sourceOf);
+        }
+        if (typeof parsed.code === 'string' && parsed.code !== '') {
+            return exitCodeFailureText({
+                name: String(parsed.name ?? 'Error'),
+                code: parsed.code,
+                message: String(parsed.message ?? ''),
+                viaExit: parsed.viaExit === true,
+                site: String(parsed.site ?? '')
+            }, sourceOf);
+        }
+        return undefined;
+    }
+
+    /** The `exit` handlers, then the report of what one of them did, if it did anything. */
+    private emitExitHandlers(code: number): void {
+        this.safeEmitExit(code);
+        const reported = this.exitReport();
+        if (reported === undefined) return;
+        /* The report is the host's own account of a failure, not something the guest wrote, so it
+           goes out whether or not the guest is still allowed to: node writes it either way. */
+        this.emit(ProcessEvent.MESSAGE, { stderr: reported + '\n' });
+    }
+
     private handleFatal(error: unknown): number {
+        /* A status that would not validate is reported the way node reports it, over its own
+           internals, rather than as a bare stack of this container's. */
+        const statusFailure = this.exitReport();
+        /* Written here and not with the rest: a process that was already leaving when the report was
+           made -- an 'exit' handler that threw on the way out of `process.exit` -- returns its status
+           below without reaching the write that follows, and node writes the report either way. */
+        if (statusFailure !== undefined) this.emit(ProcessEvent.MESSAGE, { stderr: statusFailure + '\n' });
         if (this.exitRequested !== undefined) {
-            const code = this.exitRequested;
-            this.safeEmitExit(code);
+            const code = exitStatus(this.exitRequested);
+            this.emitExitHandlers(code);
             return code;
         }
         if (this.stopped) return -1;
@@ -2627,13 +2829,13 @@ export class NodeProcess extends Process {
            A failure of the run's own setup -- a preload that is not there -- is already the whole
            of what node writes, and is not a failure of the source at all. */
         const whole = error instanceof GuestFailure && error.whole;
-        const reported = this.evalScript === undefined || whole
+        const reported = statusFailure ?? (this.evalScript === undefined || whole
             ? message
             : evalFailureText(message, this.evalScript, {
                 ...(this.stackTraceLimit === undefined ? {} : { stackTraceLimit: this.stackTraceLimit }),
                 ...(error instanceof GuestFailure && error.thrown !== undefined ? { thrown: error.thrown } : {})
-            });
-        this.emitGuestOutput({ stderr: reported + '\n' });
+            }));
+        if (statusFailure === undefined) this.emitGuestOutput({ stderr: reported + '\n' });
         /*
          * The process is dying, and node runs what `process.on('exit')` registered on the way out
          * even when it dies like this: an uncaught throw and an unhandled rejection both reach
@@ -2641,11 +2843,11 @@ export class NodeProcess extends Process {
          * guest's own follows an exit handler -- the loop is not resumed -- but a handler that
          * writes, which is what the observable difference is, still writes here.
          */
-        this.safeEmitExit(1);
+        this.emitExitHandlers(1);
         /* An exit listener may have asked for a status of its own -- `process.exit(7)` inside one,
            which node honours -- and it is that one the process leaves with; otherwise the status of
            a process that died like this is 1, whatever the exit handlers wrote. */
-        return this.exitRequested !== undefined ? this.exitRequested : 1;
+        return this.exitRequested !== undefined ? exitStatus(this.exitRequested) : 1;
     }
 
     /** Runs until no ref is held, process.exit runs, a fatal error occurs, or the process is stopped.
@@ -2780,6 +2982,14 @@ export class NodeProcess extends Process {
 
     private readFinalExitCode(): number {
         const value = this.callApi('finalExitCode', []);
+        const code = this.context!.getNumber(value);
+        value.dispose();
+        return code;
+    }
+
+    /** The status the `exit` handlers are handed: the whole integer, not the eight bits that leave. */
+    private readExitEventCode(): number {
+        const value = this.callApi('exitEventCode', []);
         const code = this.context!.getNumber(value);
         value.dispose();
         return code;
