@@ -1,4 +1,5 @@
 import { IFileSystem } from '../../../filesystem';
+import type { PathStat } from '../../../filesystem';
 import { NetworkManager } from '../../../network/manager';
 import { base64ToBytes } from '../../../utils/bytes';
 import { Process, ProcessEvent, ProcessState, ProcessType, processOf } from '../../base';
@@ -15,8 +16,9 @@ import { CAPABILITIES } from './runtime/capabilities/index';
 import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbindVmRuntime, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs, syncRunActive } from './pump';
 import type { NodeFlagAnswer, NodeRunOptions } from './flags';
-import { NODE_TEST_DISCOVERY_SOURCE } from './flags';
+import { NODE_TEST_DISCOVERY_SOURCE, parseNodeOptions } from './flags';
 import { NODE_VERSION } from './runtime/guest/globals';
+import { parseEnvFile } from './runtime/env-file';
 import { CONTAINER_WORKDIR, containerEnv } from '../default-env';
 import type { SyncChildRequest, SyncChildResult } from './pump';
 
@@ -27,6 +29,50 @@ const RESERVED_WORDS = new Set([
     'while', 'with', 'yield', 'let', 'static', 'implements', 'interface', 'package', 'private', 'protected',
     'public', 'await', 'arguments', 'eval'
 ]);
+
+/** The status node leaves with when it refuses its own options, or the ones `NODE_OPTIONS` carries. */
+const BAD_OPTION_EXIT = 9;
+
+/**
+ * How often watch mode looks at the files it watches. Node's own watcher debounces a change by
+ * 200 ms; this container has no watcher to be told by, so it looks, and the interval is what stands
+ * in for the debounce.
+ */
+const WATCH_POLL_MS = 150;
+
+/** The most files one look at the tree takes in: a walk past it is a walk nothing asked for. */
+const WATCH_FILE_LIMIT = 4000;
+
+/** The directories watch mode never walks into, as node's own watcher never does. */
+const WATCH_SKIP_DIRECTORIES = new Set(['node_modules', '.git']);
+
+/**
+ * What host node writes when `--watch-path` names a path that is not there: the watcher it builds
+ * on `fs.watch` throws, and the throw is the whole of the report -- no entry is run at all. Captured
+ * from the build NODE_VERSION names, the way the usage block is; the path is the one the line named,
+ * resolved the way node resolves it before it watches.
+ */
+function watchPathMissingText(path: string): string {
+    return 'node:internal/fs/watchers:324\n' +
+        '    throw error;\n' +
+        '    ^\n' +
+        '\n' +
+        `Error: ENOENT: no such file or directory, watch '${path}'\n` +
+        '    at FSWatcher.<computed> (node:internal/fs/watchers:316:19)\n' +
+        '    at watch (node:fs:2538:36)\n' +
+        '    at FilesWatcher.watchPath (node:internal/watch_mode/files_watcher:117:21)\n' +
+        '    at node:internal/main/watch_mode:88:53\n' +
+        '    at Array.forEach (<anonymous>)\n' +
+        '    at node:internal/main/watch_mode:88:1 {\n' +
+        '  errno: -2,\n' +
+        "  syscall: 'watch',\n" +
+        "  code: 'ENOENT',\n" +
+        `  path: '${path}',\n` +
+        `  filename: '${path}'\n` +
+        '}\n' +
+        '\n' +
+        `Node.js ${NODE_VERSION}\n`;
+}
 
 /**
  * What a source threw when it threw something that is not an Error: node writes such a value with no
@@ -1432,9 +1478,23 @@ export class NodeProcess extends Process {
     /** `process.execArgv`: the options the line named, as node reports them. */
     private readonly execArgv: string[];
     /** `--stack-trace-limit=<n>`: the bound put on the frames of a stack trace. */
-    private readonly stackTraceLimit?: number;
+    private stackTraceLimit?: number;
     /** `--title=<name>`: what `process.title` reads, and what the process is named to the system. */
-    private readonly title?: string;
+    private title?: string;
+    /** `--watch`: the line asked for watch mode, which runs the entry again when a file changes. */
+    private readonly watch: boolean;
+    /** `--watch-path=<path>`: the paths watch mode watches, in the order the line named them. */
+    private readonly watchPaths: string[];
+    /** `--env-file=<file>`: the files whose lines become entries of `process.env`. */
+    private readonly envFiles: string[];
+    /** `--env-file-if-exists=<file>`: the same, for a file the run goes on without. */
+    private readonly envFilesIfExists: string[];
+    /** `node --run <script>`: the script of the nearest package.json the line named. */
+    private readonly runScript?: string;
+    /** The interval watch mode looks at the files it watches on; cleared when the process ends. */
+    private watchPoll?: ReturnType<typeof setInterval>;
+    /** The modules `NODE_OPTIONS` asked to be loaded before the entry. */
+    private optionPreloads: string[] = [];
     /** The `-e`/`-p` source as the line wrote it: the text node quotes back when the run fails. */
     private readonly evalScript?: string;
     /**
@@ -1564,6 +1624,14 @@ export class NodeProcess extends Process {
            of a file it found is a run of tests and not of a program the input happens to carry. */
         if (run.test === true && this.repl && evalSource === undefined) evalSource = NODE_TEST_DISCOVERY_SOURCE;
         this.test = run.test === true;
+        /* `--watch` and `--watch-path`: the line asked for the entry to be run again whenever a file
+           changes, and -- with `--watch-path` -- named the paths to watch instead of the tree the
+           entry stands in. */
+        this.watch = run.watch === true;
+        this.watchPaths = run.watchPaths ?? [];
+        this.envFiles = run.envFiles ?? [];
+        this.envFilesIfExists = run.envFilesIfExists ?? [];
+        this.runScript = run.run;
         /* A pipe on fd 0 is a writer, not a person: what it carries is a program, or data for one,
            and it ends when the writer closes it. A terminal is the only thing a REPL prompts at. */
         this.stdinFromPipe = env.OWC_STDIN === 'pipe';
@@ -1650,25 +1718,58 @@ export class NodeProcess extends Process {
         let code = 1;
         try {
             if (this.flagAnswer === undefined) {
-                /* What is left of the bound the process that started this one runs under: a shell
-                   hands its command line to a child and then only waits, so the child is what holds
-                   the host thread, and the caller's `timeout` is what has to end it -- see
-                   `ShellProcess.killDeadlineLeft`. */
-                const inherited = this.deadlineFromParent();
-                if (inherited !== undefined) this.armKillDeadline(inherited.ms, inherited.signal);
-                this.claimParentTerminal();
-                const entryPath = await this.bootGuest();
-                this.installRunOptions();
-                if (this.stdinScript) {
-                    /* What is piped in is the program, and it has not all arrived yet: the ref holds
-                       the process open until it has, and `endStdin` starts it. */
-                    this.holdRef(1);
-                    this.startStdinScript();
+                /* The environment the run starts from is settled before anything is run: `NODE_OPTIONS`
+                   and the files `--env-file` names are read first, and either can refuse the whole
+                   line -- with node's message and node's status 9 -- before a file is looked for. */
+                const refused = this.applyEnvironment();
+                if (refused !== undefined) {
+                    this.emitError(refused);
+                    code = BAD_OPTION_EXIT;
+                } else if (this.runScript !== undefined) {
+                    /* `node --run <script>`: what runs is a script out of package.json, in a shell, and
+                       no guest of this process's own is booted for it. */
+                    code = await this.runPackageScript();
                 } else {
-                    this.startEntryGated(entryPath);
+                    /* What is left of the bound the process that started this one runs under: a shell
+                       hands its command line to a child and then only waits, so the child is what holds
+                       the host thread, and the caller's `timeout` is what has to end it -- see
+                       `ShellProcess.killDeadlineLeft`. */
+                    const inherited = this.deadlineFromParent();
+                    if (inherited !== undefined) this.armKillDeadline(inherited.ms, inherited.signal);
+                    this.claimParentTerminal();
+                    const entryPath = await this.bootGuest();
+                    this.installRunOptions();
+                    /* Watch mode builds its watcher before it runs anything, as node does: a path it
+                       was told to watch that is not there is a failure of the whole line, reported
+                       before the entry has been run once. */
+                    const unwatchable = this.watchPathsFailure();
+                    if (unwatchable !== undefined) {
+                        this.emitError(unwatchable);
+                        code = 1;
+                    } else if (this.stdinScript) {
+                        /* What is piped in is the program, and it has not all arrived yet: the ref holds
+                           the process open until it has, and `endStdin` starts it. */
+                        this.holdRef(1);
+                        this.startStdinScript();
+                        await this.runEventLoop();
+                        code = this.finishProcess();
+                    } else {
+                        /* What the files watch mode watches read as when the entry starts: it is
+                           what the run is compared against once it has left, so a file the run
+                           wrote on its way through is a change, exactly as it is to node's own
+                           watcher, which is armed before the first run and never disarmed. */
+                        const began = this.watching() ? this.watchSnapshot() : undefined;
+                        if (began === undefined) {
+                            this.startEntryGated(entryPath);
+                            await this.runEventLoop();
+                            code = this.finishProcess();
+                        } else {
+                            code = await this.runOnce(entryPath);
+                            this.emitOutput(this.watchSettledText(code));
+                            code = await this.runWatched(entryPath, began);
+                        }
+                    }
                 }
-                await this.runEventLoop();
-                code = this.finishProcess();
             } else if (this.flagAnswer.check === undefined) {
                 // `node --version`, `node --nope`: the answer is the flags', and no guest is booted
                 code = this.answerFlags();
@@ -1847,6 +1948,12 @@ export class NodeProcess extends Process {
             clearTimeout(handle);
         }
         this.timers.clear();
+        /* Watch mode is waiting on an interval of its own, and nothing else ends it: a process being
+           killed while it waits would go on looking at files it was told to stop watching. */
+        if (this.watchPoll !== undefined) {
+            clearInterval(this.watchPoll);
+            this.watchPoll = undefined;
+        }
         this.wakeIfIdle();
     }
 
@@ -1919,6 +2026,128 @@ export class NodeProcess extends Process {
             this.context!.newString(JSON.stringify(meta === undefined ? null : meta)),
             this.context!.newArrayBuffer(exactArrayBuffer(bytes))
         ]);
+    }
+
+    /**
+     * What the environment hands this run before anything else is read: the files `--env-file` and
+     * `--env-file-if-exists` named, whose lines become entries of `process.env`, and the options
+     * `NODE_OPTIONS` carries.
+     *
+     * Both are settled before a file is looked for, the way node settles them: `NODE_OPTIONS` is read
+     * by the host before the script exists, and a file named by `--env-file` that is not there is a
+     * refusal of the whole line -- node's message on stderr and status 9 -- where one named by
+     * `--env-file-if-exists` is a note and a run that goes on without it.
+     *
+     * A name the environment already holds is left as it was: `FOO=1 node --env-file=.env` keeps 1,
+     * whatever the file says, which is what the host does.
+     *
+     * Returns the refusal, already ended with its newline, or undefined when the line stands.
+     */
+    private applyEnvironment(): string | undefined {
+        const options = this.env.get('NODE_OPTIONS');
+        if (options !== undefined && options !== '') {
+            const request = parseNodeOptions(options);
+            if (request.refusal !== undefined) return `node: ${request.refusal}\n`;
+            if (request.title !== undefined && this.title === undefined) this.title = request.title;
+            if (request.stackTraceLimit !== undefined && this.stackTraceLimit === undefined) {
+                this.stackTraceLimit = request.stackTraceLimit;
+            }
+            this.optionPreloads = request.preloads;
+        }
+        for (const spec of this.envFiles) {
+            const text = this.readEnvFile(spec);
+            if (text === undefined) return `node: ${spec}: not found\n`;
+            this.mergeEnvFile(text);
+        }
+        for (const spec of this.envFilesIfExists) {
+            const text = this.readEnvFile(spec);
+            if (text === undefined) {
+                /* A file that need not be there and is not: node says so on stderr and runs on. */
+                this.emitError(`${spec} not found. Continuing without it.\n`);
+                continue;
+            }
+            this.mergeEnvFile(text);
+        }
+        return undefined;
+    }
+
+    /** The contents of a file `--env-file` named, resolved from the directory the process is in. */
+    private readEnvFile(spec: string): string | undefined {
+        try {
+            const at = this.resolvePath(spec);
+            if (!this.fileSystem.fileExists(at)) return undefined;
+            return this.fileSystem.readFile(at);
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** The pairs of one env file, over the environment, for the names it does not hold yet. */
+    private mergeEnvFile(text: string): void {
+        for (const [name, value] of parseEnvFile(text)) {
+            if (this.env.has(name)) continue;
+            this.env.set(name, value);
+        }
+    }
+
+    /**
+     * `node --run <script>`: the script the nearest package.json keeps under that name, run in a
+     * shell the way npm runs one -- the command is a whole line, not a file -- with this process's
+     * own environment and directory behind it.
+     *
+     * A directory with no package.json above it, and a script the package does not have, are both
+     * reported the way node reports them and leave with status 1; a script that is there leaves with
+     * the status the shell left with.
+     */
+    private async runPackageScript(): Promise<number> {
+        const found = this.findPackageJson();
+        if (found === undefined) {
+            this.emitError(`Can't find package.json for directory ${this.currentCwd}\n`);
+            return 1;
+        }
+        const { dir, text } = found;
+        let scripts: Record<string, unknown> = {};
+        try {
+            const parsed = JSON.parse(text) as { scripts?: unknown };
+            if (parsed.scripts !== null && typeof parsed.scripts === 'object') {
+                scripts = parsed.scripts as Record<string, unknown>;
+            }
+        } catch {
+            /* A package.json that will not parse names no scripts, and the report below says so. */
+        }
+        const command = scripts[this.runScript!];
+        if (typeof command !== 'string') {
+            const names = Object.keys(scripts);
+            const listed = names.map((name) => `  ${name}: ${String(scripts[name])}`);
+            const at = dir === '/' ? '/package.json' : `${dir}/package.json`;
+            this.emitError(`Missing script: "${this.runScript}" for ${at}\n\nAvailable scripts are:\n${listed.join('\n')}\n`);
+            return 1;
+        }
+        const child = await this.spawnChild('sh', ['-c', command], Object.fromEntries(this.env), this.currentCwd);
+        return child.exitCode;
+    }
+
+    /**
+     * The nearest package.json at or above the directory the process is in, which is the one
+     * `node --run` reads: a run from a directory of the project finds the project's own.
+     */
+    private findPackageJson(): { dir: string; text: string } | undefined {
+        let dir = this.currentCwd.replace(/\/+$/, '') || '/';
+        for (;;) {
+            const at = dir === '/' ? '/package.json' : `${dir}/package.json`;
+            let text: string | undefined;
+            /* A file that is not there is a question this answers with nothing, not a failure: a
+               directory with no package.json above it is one this reports in its own words. */
+            try {
+                text = this.fileSystem.readFile(at);
+            } catch {
+                text = undefined;
+            }
+            if (text !== undefined) return { dir, text };
+            if (dir === '/') return undefined;
+            const next = dir.slice(0, dir.lastIndexOf('/'));
+            dir = next === '' ? '/' : next;
+        }
     }
 
     /**
@@ -2619,10 +2848,11 @@ export class NodeProcess extends Process {
      * The modules `-r` / `--require` names, in the order the line named them.
      *
      * They are read out of `process.execArgv`, which holds each option in the words node was given
-     * it: `--require=./pre.js` in one word, `--require ./pre.js` in two.
+     * it: `--require=./pre.js` in one word, `--require ./pre.js` in two. The modules `NODE_OPTIONS`
+     * named stand in front of them, the way node puts the variable's options in front of the line's.
      */
     private preloadSpecs(): string[] {
-        const specs: string[] = [];
+        const specs = [...this.optionPreloads];
         for (let i = 0; i < this.execArgv.length; i++) {
             const arg = this.execArgv[i];
             const eq = arg.indexOf('=');
@@ -2717,6 +2947,155 @@ export class NodeProcess extends Process {
      */
     private startEntryGated(entryPath: string | undefined): void {
         this.guestStep(() => this.startEntry(entryPath));
+    }
+
+    /**
+     * True when this run is a watch-mode one: `--watch` was given, and what it watches over is an
+     * entry that can be run again -- not a program read from the input, not a session, and not a
+     * script out of a package.json.
+     */
+    private watching(): boolean {
+        return this.watch && !this.stdinScript && !this.repl && this.runScript === undefined;
+    }
+
+    /** The command watch mode names in what it writes: the script and its arguments, as written. */
+    private watchCommand(): string {
+        return `'${[this.executablePath, ...this.args].join(' ')}'`;
+    }
+
+    /** What watch mode writes once the entry has left: it waits for a file to change, and says so. */
+    private watchSettledText(code: number): string {
+        const word = code === 0 ? 'Completed' : 'Failed';
+        return `${word} running ${this.watchCommand()}. Waiting for file changes before restarting...\n`;
+    }
+
+    /** What watch mode writes when it runs the entry again. */
+    private watchRestartText(): string {
+        return `Restarting ${this.watchCommand()}\n`;
+    }
+
+    /**
+     * A path `--watch-path` named, as the path it stands for: node resolves one against the directory
+     * the process is in before it watches it, and it is the resolved path its report names.
+     */
+    private resolveWatchPath(spec: string): string {
+        return spec.startsWith('/')
+            ? normalizeAbsolute(spec)
+            : normalizeAbsolute(joinPaths(this.currentCwd, spec));
+    }
+
+    private watchPathsFailure(): string | undefined {
+        if (!this.watching()) return undefined;
+        for (const spec of this.watchPaths) {
+            const at = this.resolveWatchPath(spec);
+            const stat = this.fileSystem.statPath(at);
+            if (stat === undefined) return watchPathMissingText(at);
+        }
+        return undefined;
+    }
+
+    /**
+     * One run of the entry, as a run of its own: what it writes it writes, and what it leaves with
+     * is what the failure behind it wrote -- the same path a run without watch mode takes, fatal
+     * errors and all, because what node runs in watch mode is a whole child process, which fails in
+     * the child and is reported over there.
+     */
+    private async runOnce(entryPath: string | undefined): Promise<number> {
+        try {
+            this.startEntryGated(entryPath);
+            await this.runEventLoop();
+            return this.finishProcess();
+        } catch (error) {
+            return this.handleFatal(error);
+        }
+    }
+
+    /**
+     * Watch mode: the entry has left, and this process stays where node's would -- waiting for a file
+     * to change, then running the entry again, and again, until something ends it.
+     */
+    private async runWatched(entryPath: string | undefined, atStart: Map<string, string>): Promise<number> {
+        let code = 0;
+        let snapshot = atStart;
+        for (;;) {
+            await this.waitForWatchChange(snapshot);
+            if (this.stopped) return code;
+            this.emitOutput(this.watchRestartText());
+            /* What the run that just left asked for on its way out -- a `process.exit`, a status of
+               its own -- is that run's and not this one's: the entry starts again as it started
+               before, which is what a new process on the host is. */
+            this.exitRequested = undefined;
+            this.fatalError = undefined;
+            snapshot = this.watchSnapshot();
+            code = await this.runOnce(entryPath);
+            this.emitOutput(this.watchSettledText(code));
+        }
+    }
+
+    /** Waits until something under the paths watch mode watches is not as it was. */
+    private waitForWatchChange(snapshot: Map<string, string>): Promise<void> {
+        return new Promise((resolve) => {
+            const stop = (): void => {
+                if (this.watchPoll !== undefined) clearInterval(this.watchPoll);
+                this.watchPoll = undefined;
+                resolve();
+            };
+            this.watchPoll = setInterval(() => {
+                if (this.stopped || this.watchChanged(snapshot)) stop();
+            }, WATCH_POLL_MS);
+        });
+    }
+
+    /** Whether the tree reads differently from `snapshot`: a file added, gone, or written again. */
+    private watchChanged(snapshot: Map<string, string>): boolean {
+        const now = this.watchSnapshot();
+        if (now.size !== snapshot.size) return true;
+        for (const [at, mark] of now) {
+            if (snapshot.get(at) !== mark) return true;
+        }
+        return false;
+    }
+
+    /**
+     * What the paths watch mode watches read as: each file under them with its size and the time it
+     * was last written. `--watch` with no `--watch-path` watches the tree the entry stands in, which
+     * is what node's own watcher does once it has been told which modules the run loaded.
+     */
+    private watchSnapshot(): Map<string, string> {
+        const seen = new Map<string, string>();
+        const roots = this.watchPaths.length > 0
+            ? this.watchPaths.map((spec) => this.resolveWatchPath(spec))
+            : [this.currentCwd];
+        for (const root of roots) this.watchWalk(root, seen);
+        return seen;
+    }
+
+    /** One path of a watch, whatever stands at it: a file by itself, a directory with all under it. */
+    private watchWalk(path: string, into: Map<string, string>): void {
+        if (into.size >= WATCH_FILE_LIMIT) return;
+        let stat: PathStat | undefined;
+        try {
+            stat = this.fileSystem.statPath(path);
+        } catch {
+            return;
+        }
+        if (stat === undefined) return;
+        if (stat.type === 'file') {
+            into.set(path, `${stat.size}:${stat.mtimeMs}`);
+            return;
+        }
+        const name = path.split('/').pop() ?? '';
+        if (WATCH_SKIP_DIRECTORIES.has(name)) return;
+        let names: string[] | undefined;
+        try {
+            names = this.fileSystem.readdirNames(path);
+        } catch {
+            return;
+        }
+        if (names === undefined) return;
+        for (const entry of names) {
+            this.watchWalk(path === '/' ? `/${entry}` : `${path}/${entry}`, into);
+        }
     }
 
     /**
@@ -3631,6 +4010,7 @@ export class NodeProcess extends Process {
         const text = typeof hooked.source === 'string' ? hooked.source : source;
         return { value: this.esmSource(text, file, false, suffix, dynamic) };
     }
+
 
     /** Maps a specifier to the module name QuickJS will load (a plain string on success). */
     private normalizeModule(baseName: string | undefined, requestedName: string): string | { error: Error | QuickJSHandle } {
