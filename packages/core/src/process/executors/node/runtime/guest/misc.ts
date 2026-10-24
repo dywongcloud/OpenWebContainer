@@ -2338,11 +2338,14 @@ BF.crypto = function () {
        2^48 - 1 is the widest it takes, so randomInt(2 ** 48) is out of range where randomInt(2 ** 48,
        2 ** 48 + 10) -- a span of 10 at the top of the safe integers -- is a draw like any other. */
     if (max - min > 281474976710655) throw outOfRange(singleBound ? 'max' : 'max - min', '<= 281474976710655', max - min);
-    /* Node draws on its thread pool, so the callback runs after the timers a program has already
-       armed and before its immediates, and the call itself answers undefined rather than a number.
-       The error it hands the callback is undefined, where randomBytes' is null. */
+    /* Node draws on its thread pool, and the callback it hands the draw to is queued on the tick
+       queue -- so it runs ahead of the immediates a program armed before the call, and ahead of the
+       timers too, which is the order host node 24.15 measures on every draw but the one that finds
+       that pool's cache empty. Arming a timer here instead ran the callback behind them all. The
+       call itself answers undefined rather than a number, and the error it hands the callback is
+       undefined, where randomBytes' is null. */
     if (done !== undefined) {
-      setTimeout(function () { done(undefined, randomIntDraw(min, max)); }, 0);
+      process.nextTick(done, undefined, randomIntDraw(min, max));
       return undefined;
     }
     return randomIntDraw(min, max);
