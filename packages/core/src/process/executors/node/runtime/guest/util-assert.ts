@@ -748,10 +748,79 @@ function formatLogArgs(args) {
   return out.join(' ');
 }
 
+/*
+ * Node's own list from lib/internal/util/comparisons.js: a strict deep comparison answers a pair of
+ * objects by their constructor when the left one's constructor is one of these, or when it is
+ * inherited rather than own, and by their prototype only otherwise. That is why {} is strictly
+ * deep-equal to Object.create({ q: 1 }) -- both answer Object, so a prototype of its own that
+ * is not Object.prototype is not what the comparison looks at -- while {} against
+ * Object.create(null) is unequal, because a null-prototype object answers no constructor at all
+ * and so falls to the prototype test, and a class instance against a plain object is unequal,
+ * because the two answer different constructors.
+ */
+var DEEP_WELL_KNOWN_CTORS = [
+  Array, ArrayBuffer, BigInt, Boolean, DataView, Date, Error, Function, Map, Number, Object,
+  Promise, RegExp, Set, String, Symbol, WeakMap, WeakSet,
+  Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array,
+  Float32Array, Float64Array
+];
+if (typeof BigInt64Array === 'function') DEEP_WELL_KNOWN_CTORS.push(BigInt64Array);
+if (typeof BigUint64Array === 'function') DEEP_WELL_KNOWN_CTORS.push(BigUint64Array);
+if (typeof Float16Array === 'function') DEEP_WELL_KNOWN_CTORS.push(Float16Array);
+if (typeof Buffer !== 'undefined') DEEP_WELL_KNOWN_CTORS.push(Buffer);
+
+function deepWellKnownCtor(v) {
+  if (v === null || v === undefined) return false;
+  for (var i = 0; i < DEEP_WELL_KNOWN_CTORS.length; i++) {
+    if (DEEP_WELL_KNOWN_CTORS[i] === v) return true;
+  }
+  return false;
+}
+
+/* Node's objectComparisonStart, verbatim in what it answers. */
+function deepObjectsStart(a, b) {
+  var ca = undefined;
+  try { ca = a.constructor; } catch (e) { ca = undefined; }
+  var cb = undefined;
+  try { cb = b.constructor; } catch (e) { cb = undefined; }
+  if (deepWellKnownCtor(ca) || (ca !== undefined && !Object.prototype.hasOwnProperty.call(a, 'constructor'))) {
+    return ca === cb;
+  }
+  return Object.getPrototypeOf(a) === Object.getPrototypeOf(b);
+}
+
+/*
+ * A loose comparison will not pair an object of one built-in kind with an object of another: node
+ * rejects {} against a Date, a RegExp, a Map, a Set, an Error or a typed array even though none
+ * of them carries an own enumerable key, while it accepts {} against Object.create({ q: 1 }).
+ */
+function deepLooseKindOf(v) {
+  if (Array.isArray(v)) return 'array';
+  if (v instanceof Date) return 'date';
+  if (v instanceof RegExp) return 'regexp';
+  if (v instanceof Map) return 'map';
+  if (v instanceof Set) return 'set';
+  if (v instanceof Error) return 'error';
+  if (typeof ArrayBuffer !== 'undefined' && (v instanceof ArrayBuffer || ArrayBuffer.isView(v))) return 'buffer';
+  return 'object';
+}
+
 function deepEqualValues(a, b, strict) {
-  if (strict ? Object.is(a, b) : (a == b || (a !== a && b !== b))) return true;
-  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
-  if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+  var aIsObj = a !== null && typeof a === 'object';
+  var bIsObj = b !== null && typeof b === 'object';
+  if (strict) {
+    if (Object.is(a, b)) return true;
+  } else {
+    /*
+     * A loose comparison of a primitive against an object is not the '==' of the two: node answers
+     * false for 1 against 'new Uint8Array([1])', which '1 == u8' would call true, and false for
+     * 'new Number(1)' against 1. Only a pair of primitives is compared with '=='.
+     */
+    if (aIsObj !== bIsObj) return false;
+    if (a == b || (a !== a && b !== b)) return true;
+  }
+  if (!aIsObj || !bIsObj) return false;
+  if (!strict && deepLooseKindOf(a) !== deepLooseKindOf(b)) return false;
   if (Array.isArray(a) !== Array.isArray(b)) return false;
   if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
   if (a instanceof RegExp && b instanceof RegExp) return String(a) === String(b);
@@ -779,6 +848,7 @@ function deepEqualValues(a, b, strict) {
     });
     return setOk;
   }
+  if (strict && !deepObjectsStart(a, b)) return false;
   var ka = Object.keys(a);
   var kb = Object.keys(b);
   if (ka.length !== kb.length) return false;
@@ -1995,6 +2065,65 @@ BF['util/types'] = function () {
   return requireBuiltin('util').types;
 };
 
+/*
+ * '+ actual - expected', as node's own assert prints a pair of values it cannot show side by side:
+ * one line per line of the two inspections, '  ' where they agree, '+ ' for a line only the actual
+ * has and '- ' for a line only the expected has. Two lines that differ by nothing but the trailing
+ * separator the last entry of a collection carries -- '  a: 1' against '  a: 1,' -- are one line,
+ * and are printed with it: that is why a value with an entry added at the end shows one '-' line
+ * and no '+' line at all.
+ */
+function deepSameDiffLine(a, b) {
+  return a === b || a + ',' === b || a === b + ',';
+}
+
+function deepDiffable(a, b, aText, bText) {
+  var aObj = a !== null && (typeof a === 'object' || typeof a === 'function');
+  var bObj = b !== null && (typeof b === 'object' || typeof b === 'function');
+  if (aObj && bObj) return true;
+  /* Two primitives are written 'a !== b' while they are short enough to read on one line. */
+  return aText.length + bText.length > 16;
+}
+
+function deepDiffLines(aText, bText) {
+  var a = aText.split('\n');
+  var b = bText.split('\n');
+  var n = a.length;
+  var m = b.length;
+  var out = [];
+  var i, j;
+  if (n * m > 40000) {
+    for (i = 0; i < n; i++) out.push('+ ' + a[i]);
+    for (j = 0; j < m; j++) out.push('- ' + b[j]);
+    return out.join('\n') + '\n';
+  }
+  /* L[i][j]: the longest common subsequence of a[i..] and b[j..]. */
+  var L = [];
+  for (i = 0; i <= n; i++) { L.push(new Array(m + 1)); L[i][m] = 0; }
+  for (j = 0; j <= m; j++) L[n][j] = 0;
+  for (i = n - 1; i >= 0; i--) {
+    for (j = m - 1; j >= 0; j--) {
+      L[i][j] = deepSameDiffLine(a[i], b[j]) ? 1 + L[i + 1][j + 1] : Math.max(L[i + 1][j], L[i][j + 1]);
+    }
+  }
+  i = 0;
+  j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && deepSameDiffLine(a[i], b[j])) {
+      out.push('  ' + (a[i].length >= b[j].length ? a[i] : b[j]));
+      i++;
+      j++;
+    } else if (j === m || (i < n && L[i + 1][j] >= L[i][j + 1])) {
+      out.push('+ ' + a[i]);
+      i++;
+    } else {
+      out.push('- ' + b[j]);
+      j++;
+    }
+  }
+  return out.join('\n') + '\n';
+}
+
 BF.assert = function () {
   var util = requireBuiltin('util');
 
@@ -2030,36 +2159,74 @@ BF.assert = function () {
   };
   assert.ok = assertOk;
   assert.AssertionError = function (options) { return AssertionError(options); };
+  /* The name a host's AssertionError answers to: node names the constructor in
+     'Missing expected exception (AssertionError).', and an anonymous function answers none. */
+  Object.defineProperty(assert.AssertionError, 'name', { value: 'AssertionError', configurable: true });
   assert.fail = function (message) {
     fail(undefined, undefined, message === undefined ? 'Failed' : message, 'fail', 'Failed');
   };
+  /*
+   * How node's own assert writes a value into a message: one entry per line, however short the
+   * value, and as deep as the value goes -- 'compact: false' and a depth no walk reaches, both of
+   * which util.inspect at its defaults does not do.
+   */
+  function assertInspect(v) {
+    return inspectValue(v, { compact: false, depth: 1000 });
+  }
+
+  function deepStrictMessage(actual, expected) {
+    var a = assertInspect(actual);
+    var b = assertInspect(expected);
+    if (deepDiffable(actual, expected, a, b)) {
+      return 'Expected values to be strictly deep-equal:\n+ actual - expected\n\n' + deepDiffLines(a, b);
+    }
+    return 'Expected values to be strictly deep-equal:\n\n' + a + ' !== ' + b + '\n';
+  }
+
+  function notDeepStrictMessage(expected) {
+    var b = assertInspect(expected);
+    /* One line sits on the header's own line; anything longer is a block of its own. */
+    return 'Expected "actual" not to be strictly deep-equal to:' + (b.indexOf('\n') >= 0 ? '\n\n' + b + '\n' : ' ' + b);
+  }
+
   assert.equal = function (actual, expected, message) {
     if (!(actual == expected || (actual !== actual && expected !== expected))) {
-      fail(actual, expected, message, '==', inspectValue(actual) + ' == ' + inspectValue(expected));
+      fail(actual, expected, message, '==', assertInspect(actual) + ' == ' + assertInspect(expected));
     }
   };
   assert.notEqual = function (actual, expected, message) {
-    if (actual == expected) fail(actual, expected, message, '!=', inspectValue(actual) + ' != ' + inspectValue(expected));
+    if (actual == expected) fail(actual, expected, message, '!=', assertInspect(actual) + ' != ' + assertInspect(expected));
   };
   assert.strictEqual = function (actual, expected, message) {
-    if (!Object.is(actual, expected)) {
-      fail(actual, expected, message, 'strictEqual', 'Expected values to be strictly equal:\n\n' + inspectValue(actual) + ' !== ' + inspectValue(expected) + '\n');
+    if (Object.is(actual, expected)) return;
+    var aObj = actual !== null && (typeof actual === 'object' || typeof actual === 'function');
+    var bObj = expected !== null && (typeof expected === 'object' || typeof expected === 'function');
+    if (!aObj || !bObj) {
+      fail(actual, expected, message, 'strictEqual', 'Expected values to be strictly equal:\n\n' + assertInspect(actual) + ' !== ' + assertInspect(expected) + '\n');
     }
+    /* Two values that a strict deep comparison would call equal, and that are not the same value:
+       node names that case on its own, and shows only the actual. */
+    if (util.__isDeepEqual(actual, expected, true)) {
+      fail(actual, expected, message, 'strictEqual', 'Values have same structure but are not reference-equal:\n\n' + assertInspect(actual) + '\n');
+    }
+    var a = assertInspect(actual);
+    var b = assertInspect(expected);
+    fail(actual, expected, message, 'strictEqual', 'Expected "actual" to be reference-equal to "expected":\n+ actual - expected\n\n' + deepDiffLines(a, b));
   };
   assert.notStrictEqual = function (actual, expected, message) {
-    if (Object.is(actual, expected)) fail(actual, expected, message, 'notStrictEqual', 'Expected "actual" to be strictly unequal to: ' + inspectValue(expected));
+    if (Object.is(actual, expected)) fail(actual, expected, message, 'notStrictEqual', 'Expected "actual" to be strictly unequal to: ' + assertInspect(expected));
   };
   assert.deepEqual = function (actual, expected, message) {
-    if (!util.__isDeepEqual(actual, expected, false)) fail(actual, expected, message, 'deepEqual', 'Expected values to be loosely deep-equal:\n\n' + inspectValue(actual) + '\n\nshould loosely deep-equal\n\n' + inspectValue(expected));
+    if (!util.__isDeepEqual(actual, expected, false)) fail(actual, expected, message, 'deepEqual', 'Expected values to be loosely deep-equal:\n\n' + assertInspect(actual) + '\n\nshould loosely deep-equal\n\n' + assertInspect(expected));
   };
   assert.deepStrictEqual = function (actual, expected, message) {
-    if (!util.__isDeepEqual(actual, expected, true)) fail(actual, expected, message, 'deepStrictEqual', 'Expected values to be strictly deep-equal:\n' + inspectValue(actual) + '\n\nshould equal\n\n' + inspectValue(expected));
+    if (!util.__isDeepEqual(actual, expected, true)) fail(actual, expected, message, 'deepStrictEqual', deepStrictMessage(actual, expected));
   };
   assert.notDeepStrictEqual = function (actual, expected, message) {
-    if (util.__isDeepEqual(actual, expected, true)) fail(actual, expected, message, 'notDeepStrictEqual', 'Expected "actual" not to be strictly deep-equal to: ' + inspectValue(expected));
+    if (util.__isDeepEqual(actual, expected, true)) fail(actual, expected, message, 'notDeepStrictEqual', notDeepStrictMessage(expected));
   };
   assert.notDeepEqual = function (actual, expected, message) {
-    if (util.__isDeepEqual(actual, expected, false)) fail(actual, expected, message, 'notDeepEqual', 'Expected "actual" not to be loosely deep-equal to: ' + inspectValue(expected));
+    if (util.__isDeepEqual(actual, expected, false)) fail(actual, expected, message, 'notDeepEqual', 'Expected "actual" not to be loosely deep-equal to:\n\n' + assertInspect(expected));
   };
   assert.throws = function (fn, expected, message) {
     var threw = false;
@@ -2070,7 +2237,10 @@ BF.assert = function () {
       threw = true;
       error = e;
     }
-    if (!threw) fail(undefined, expected, typeof expected === 'string' ? expected : message, 'throws', 'Missing expected exception.');
+    if (!threw) {
+      fail(undefined, expected, typeof expected === 'string' ? expected : message, 'throws',
+        'Missing expected exception' + (typeof expected === 'function' ? ' (' + (expected.name || '') + ').' : '.'));
+    }
     if (typeof expected === 'function' && expected.prototype !== undefined && !(error instanceof expected)) throw error;
     if (expected instanceof RegExp && !expected.test(String(error && error.message !== undefined ? error.message : error))) throw error;
   };
@@ -2081,16 +2251,29 @@ BF.assert = function () {
       fail(e, undefined, message, 'doesNotThrow', 'Got unwanted exception.\nActual message: "' + (e && e.message) + '"');
     }
   };
-  assert.rejects = function (promiseOrFn) {
+  assert.rejects = function (promiseOrFn, expected, message) {
     var promise = typeof promiseOrFn === 'function' ? promiseOrFn() : promiseOrFn;
     return promise.then(function () {
-      fail(undefined, undefined, undefined, 'rejects', 'Missing expected rejection.');
-    }, function () {
+      fail(undefined, expected, undefined, 'rejects', 'Missing expected rejection.');
+    }, function (error) {
+      if (expected === undefined) return undefined;
+      /* A rejection is matched the way assert.match matches a string and the way assert.throws
+         matches a constructor: over String(error), which is why 'Error: boom' and not 'boom'. */
+      if (expected instanceof RegExp) {
+        var text = String(error);
+        if (!expected.test(text)) {
+          fail(text, expected, message, 'match', 'The input did not match the regular expression ' + String(expected) + '. Input:\n\n' + assertInspect(text) + '\n');
+        }
+        return undefined;
+      }
+      if (typeof expected === 'function' && expected.prototype !== undefined && !(error instanceof expected)) {
+        fail(error, expected, message, 'rejects', 'The error is expected to be an instance of "' + (expected.name || '') + '". Received "' + (error && error.name) + '"\n\nError message:\n\n' + (error && error.message));
+      }
       return undefined;
     });
   };
   assert.match = function (string, regexp, message) {
-    if (!regexp.test(string)) fail(string, regexp, message, 'match', 'The input did not match the regular expression ' + String(regexp));
+    if (!regexp.test(string)) fail(string, regexp, message, 'match', 'The input did not match the regular expression ' + String(regexp) + '. Input:\n\n' + assertInspect(string) + '\n');
   };
   assert.strict = assert;
   return assert;
