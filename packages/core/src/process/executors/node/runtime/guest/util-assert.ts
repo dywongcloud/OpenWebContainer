@@ -258,6 +258,8 @@ function inspectValue(value, opts) {
   var depthGiven = opts !== undefined && opts !== null &&
     Object.prototype.hasOwnProperty.call(opts, 'depth');
   var depthGivenAs = depthGiven ? opts.depth : 2;
+  var customInspect = !(opts !== undefined && opts !== null && opts.customInspect === false);
+  var getters = gettersOf(opts);
   var depthUnbounded = depthGiven && (depthGivenAs === null || depthGivenAs === undefined);
   var maxDepth = depthUnbounded ? Infinity : (typeof depthGivenAs === 'number' ? depthGivenAs : 2);
   var stack = [];
@@ -339,8 +341,11 @@ function inspectValue(value, opts) {
     if (utilBrandCheck(WeakSet.prototype.has, v)) return 'WeakSet { ' + styleBracketed('<items unknown>') + ' }';
 
     /* A value that writes its own output wins: Node asks the custom function before it looks at
-       the object's own keys, which is the whole of what a Response or a Headers prints. */
-    if (INSPECT_CUSTOM !== undefined && typeof v[INSPECT_CUSTOM] === 'function') {
+       the object's own keys, which is the whole of what a Response or a Headers prints. Unless the
+       caller asked for the keys instead, which is what 'customInspect: false' is and what
+       console.dir passes: a class carrying a [util.inspect.custom] then prints its own keys, as it
+       does on host node 24.15. */
+    if (INSPECT_CUSTOM !== undefined && customInspect && typeof v[INSPECT_CUSTOM] === 'function') {
       /* The depth a custom inspect is handed is the depth the walk has left, and for a 'depth' that
          was given as 'undefined' that is NaN and not 'Infinity': node subtracts the level it is at
          from the depth it was given and gets NaN from 'undefined', which is what a function that
@@ -459,14 +464,14 @@ function inspectValue(value, opts) {
     for (i = 0; i < keys.length; i++) {
       if (isArr && /^\d+$/.test(keys[i])) continue;
       if (isTyped && /^\d+$/.test(keys[i])) continue;
-      entries.push(inspectEntryOf(fmt, v, keys[i], depth + 1, indent + 2));
+      entries.push(inspectEntryOf(fmt, v, keys[i], depth + 1, indent + 2, getters));
     }
     /* The own SYMBOL keys, after the string ones and in the order they were put on. Node writes one
        where a string key goes, as 'Symbol(k): 1' -- no brackets and no quotes -- for an ordinary
        object, for an array and for a Map alike, and it brackets the ones that are not enumerable,
        which is what 'showHidden' asks for. */
     for (var si = 0; si < syms.length; si++) {
-      entries.push(inspectEntryOf(fmt, v, syms[si], depth + 1, indent + 2));
+      entries.push(inspectEntryOf(fmt, v, syms[si], depth + 1, indent + 2, getters));
     }
     var subDepth = SUB_MAX - depth;
     SUB_MAX = savedMax > SUB_MAX ? savedMax : SUB_MAX;
@@ -1334,12 +1339,34 @@ function fmtPromiseValue(value, depth, indent) {
    reading it would produce: node asks the descriptor before it reads, so '{ get a() { return 1 } }'
    is '{ a: [Getter] }' under the default options and not '{ a: 1 }', a setter alone is '[Setter]'
    and the pair is '[Getter/Setter]'. Only a plain data property is printed as its value. */
-function inspectEntryOf(fmt, value, key, depth, indent) {
+/* What 'getters' the walk was asked for, in the one shape the entry writer reads it in. */
+function gettersOf(opts) {
+  var given = opts === undefined || opts === null ? undefined : opts.getters;
+  return given === 'get' || given === 'set' ? given : !!given;
+}
+function inspectEntryOf(fmt, value, key, depth, indent, getters) {
   var desc = undefined;
   try { desc = Object.getOwnPropertyDescriptor(value, key); } catch (e) { desc = undefined; }
   var text;
+  /* What an object's own value is printed as when the entry is a getter and the walk was asked for
+     what it returns: the value goes behind the marker for a primitive -- "[Getter: 1]", and the
+     string one quotes -- and *after* the marker for an object, which is why '{ get g() { return {} } }'
+     is '{ g: [Getter] { a: 1 } }' on host node 24.15 and not '{ g: [Getter: { a: 1 }] }'. */
+  var behind = '';
   if (desc !== undefined && (desc.get !== undefined || desc.set !== undefined)) {
-    text = styleBracketed(desc.get !== undefined ? (desc.set !== undefined ? '[Getter/Setter]' : '[Getter]') : '[Setter]');
+    var marker = desc.get !== undefined ? (desc.set !== undefined ? 'Getter/Setter' : 'Getter') : 'Setter';
+    var shown = '';
+    if (desc.get !== undefined && (getters === true || getters === 'get')) {
+      var read = undefined;
+      var readOk = false;
+      try { read = desc.get.call(value); readOk = true; } catch (getterThrew) { readOk = false; }
+      if (readOk) {
+        var printed = fmt(read, depth, indent);
+        if (read !== null && (typeof read === 'object' || typeof read === 'function')) behind = ' ' + printed;
+        else shown = ': ' + printed;
+      }
+    }
+    text = styleBracketed('[' + marker + shown + ']');
   } else if (desc !== undefined && 'value' in desc) {
     text = fmt(desc.value, depth, indent);
   } else {
@@ -1352,9 +1379,9 @@ function inspectEntryOf(fmt, value, key, depth, indent) {
      and so is a symbol; an identifier is written bare and in no colour at all. One that is not
      enumerable goes in brackets, and the brackets take the colour the key would have had away:
      '[h]: 1' is a plain key in front of a coloured value. */
-  if (desc === undefined || desc.enumerable === false) return '[' + name + ']: ' + text;
-  if (typeof key === 'symbol' || !isIdentifierKey(key)) return styleString(name) + ': ' + text;
-  return name + ': ' + text;
+  if (desc === undefined || desc.enumerable === false) return '[' + name + ']: ' + text + behind;
+  if (typeof key === 'symbol' || !isIdentifierKey(key)) return styleString(name) + ': ' + text + behind;
+  return name + ': ' + text + behind;
 }
 
 /* The entries of an object-like value, one line when node's own fit test lets them be and one per
@@ -1429,7 +1456,7 @@ function errorInspectOf(err, fmt, depth, indent, opts) {
   if (keys.length === 0) return head;
   var entries = [];
   for (var i = 0; i < keys.length; i++) {
-    entries.push(inspectEntryOf(fmt, err, keys[i], depth + 1, indent + 2));
+    entries.push(inspectEntryOf(fmt, err, keys[i], depth + 1, indent + 2, gettersOf(opts)));
   }
   if (opts && opts.sorted) entries.sort(typeof opts.sorted === 'function' ? opts.sorted : undefined);
   return joinInspectEntries(head + ' ', entries, indent, opts, 0);

@@ -1614,64 +1614,351 @@ function installStackHeader(name) {
 }
 for (var headerAt = 0; headerAt < STACK_HEADER_CTORS.length; headerAt++) installStackHeader(STACK_HEADER_CTORS[headerAt]);
 
-var groupIndent = '';
-var counters = Object.create(null);
-var timeLabels = Object.create(null);
+/*
+ * console: the Console class host node 24.15 hands out, and the global console, an instance of it
+ * over this process's own stdout and stderr.
+ *
+ * Every line goes out THROUGH process.stdout.write and process.stderr.write and not around them.
+ * That is where a host's console writes, and it is the whole of what a program that replaces either
+ * one to capture or to tee what console prints rests on: on the host the replacement is handed every
+ * byte console wrote, so writing straight to the host -- which is what this console did until now --
+ * left such a program with nothing at all, while the assignment itself looked like it had taken.
+ */
 
-function writeConsole(text, toStderr) {
-  var lines = groupIndent ? text.split('\n').map(function (l) { return groupIndent + l; }).join('\n') : text;
-  if (toStderr) host.stderr(lines + '\n');
-  else host.stdout(lines + '\n');
+/* How many columns a string takes up on a terminal: a full-width character -- a CJK ideograph, a
+   kana, a fullwidth latin form -- is two columns wide and not one, so a column holding one would be
+   two short of the rule drawn over it. */
+function charColumnsOf(text) {
+    var width = 0;
+    for (var i = 0; i < text.length; i++) {
+        var code = text.charCodeAt(i);
+        width += (code >= 0x1100 && code <= 0x115f) ||
+            (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f) ||
+            (code >= 0xac00 && code <= 0xd7a3) || (code >= 0xf900 && code <= 0xfaff) ||
+            (code >= 0xfe30 && code <= 0xfe6f) || (code >= 0xff00 && code <= 0xff60) ||
+            (code >= 0xffe0 && code <= 0xffe6) || (code >= 0x20000 && code <= 0x3fffd) ? 2 : 1;
+    }
+    return width;
 }
 
-var consoleObj = {
-  log: function () { writeConsole(formatLogArgs(arguments), false); },
-  info: function () { writeConsole(formatLogArgs(arguments), false); },
-  debug: function () { writeConsole(formatLogArgs(arguments), false); },
-  warn: function () { writeConsole(formatLogArgs(arguments), true); },
-  error: function () { writeConsole(formatLogArgs(arguments), true); },
-  trace: function () {
-    var message = formatLogArgs(arguments);
-    writeConsole('Trace' + (message ? ': ' + message : ''), true);
-  },
-  dir: function (value, opts) { writeConsole(inspectValue(value, opts), false); },
-  table: function (value) { writeConsole(inspectValue(value), false); },
-  assert: function (condition) {
-    if (condition) return;
-    var rest = Array.prototype.slice.call(arguments, 1);
-    writeConsole('Assertion failed' + (rest.length ? ': ' + formatLogArgs(rest) : ''), true);
-  },
-  count: function (label) {
-    var name = label === undefined ? 'default' : String(label);
-    counters[name] = (counters[name] || 0) + 1;
-    writeConsole(name + ': ' + counters[name], false);
-  },
-  countReset: function (label) {
-    delete counters[label === undefined ? 'default' : String(label)];
-  },
-  time: function (label) {
-    timeLabels[label === undefined ? 'default' : String(label)] = host.now();
-  },
-  timeLog: function (label) {
-    var name = label === undefined ? 'default' : String(label);
-    if (timeLabels[name] === undefined) return;
-    writeConsole(name + ': ' + (host.now() - timeLabels[name]).toFixed(3) + 'ms', false);
-  },
-  timeEnd: function (label) {
-    var name = label === undefined ? 'default' : String(label);
-    if (timeLabels[name] === undefined) return;
-    writeConsole(name + ': ' + (host.now() - timeLabels[name]).toFixed(3) + 'ms', false);
-    delete timeLabels[name];
-  },
-  group: function () {
-    if (arguments.length) writeConsole(formatLogArgs(arguments), false);
-    groupIndent += '  ';
-  },
-  groupEnd: function () {
-    groupIndent = groupIndent.slice(2);
-  }
+/* One of the three rules of the box a table draws: two dashes more than the widest thing each
+   column holds, parted by the joint and capped by the two corners. */
+function tableRuleOf(widths, left, joint, right) {
+    var line = left;
+    for (var i = 0; i < widths.length; i++) {
+        if (i !== 0) line += joint;
+        line += new Array(widths[i] + 3).join('─');
+    }
+    return line + right;
+}
+
+/* One row of the box: a cell is padded on the right to the width of its column and cells are parted
+   by the vertical rule. A cell whose own output carries a line break is as many rows as it has
+   lines, every part padded to the column it belongs to. */
+function tableRowOf(cells, widths, side) {
+    var line = side;
+    for (var i = 0; i < widths.length; i++) {
+        var text = cells[i] === undefined ? '' : String(cells[i]);
+        line += ' ' + text + new Array(widths[i] - charColumnsOf(text) + 1).join(' ') + ' ';
+        if (i !== widths.length - 1) line += side;
+    }
+    return line + side;
+}
+
+/* The box itself, from the headings and the rows under them, each row already the strings its cells
+   print as. A table with no row in it is still a box: the heading, the rule beneath it and the foot. */
+function tableTextOf(headings, rows) {
+    var widths = [];
+    var i;
+    for (i = 0; i < headings.length; i++) widths.push(charColumnsOf(headings[i]));
+    var split = [];
+    for (var r = 0; r < rows.length; r++) {
+        var parts = [];
+        var lines = 1;
+        for (i = 0; i < headings.length; i++) {
+            var text = rows[r][i] === undefined ? '' : String(rows[r][i]);
+            var pieces = text.split('\n');
+            if (pieces.length > lines) lines = pieces.length;
+            parts.push(pieces);
+            for (var p = 0; p < pieces.length; p++) {
+                var wide = charColumnsOf(pieces[p]);
+                if (wide > widths[i]) widths[i] = wide;
+            }
+        }
+        split.push({ pieces: parts, lines: lines });
+    }
+    var out = [tableRuleOf(widths, '┌', '┬', '┐'), tableRowOf(headings, widths, '│'),
+        tableRuleOf(widths, '├', '┼', '┤')];
+    for (var s = 0; s < split.length; s++) {
+        for (var l = 0; l < split[s].lines; l++) {
+            var line = [];
+            for (i = 0; i < headings.length; i++) line.push(split[s].pieces[i][l]);
+            out.push(tableRowOf(line, widths, '│'));
+        }
+    }
+    out.push(tableRuleOf(widths, '└', '┴', '┘'));
+    return out.join('\n');
+}
+
+/* What one cell prints: the value inspected at no depth at all, which is the depth node's own table
+   gives it -- '{ b: 1 }' for '{ b: 1 }', and '{ b: [Object] }' for one that nests further, because
+   the cell is the whole of what the walk is asked about and nothing beneath it is. */
+function tableCellOf(value) {
+    return inspectValue(value, { depth: 0 });
+}
+
+/* The rows and the columns of a console.table. A Map and a Set are indexed by their iteration and
+   get their own two headings, 'Key' and 'Values'; an array or a plain object is indexed by position
+   or by key, and its columns are the keys its rows carry -- every key of every row that is an
+   object, in the order they were met -- with a 'Values' column at the end for any row that carries
+   no keys of its own because it is not an object. A row with no keys at all is a row of blanks,
+   which is what a table of objects that print themselves draws. */
+function consoleTableOf(tabularData, properties) {
+    var indexKey = '(index)';
+    var headings = [];
+    var rows = [];
+    var i;
+    var isMap = utilBrandCheck(Map.prototype.has, tabularData);
+    var isSet = !isMap && utilBrandCheck(Set.prototype.has, tabularData);
+    if (isMap || isSet) {
+        indexKey = '(iteration index)';
+        headings.push(indexKey);
+        if (isMap) headings.push('Key');
+        headings.push('Values');
+        var at = 0;
+        tabularData.forEach(function (value, key) {
+            var row = [String(at++)];
+            if (isMap) row.push(tableCellOf(key));
+            row.push(tableCellOf(value));
+            rows.push(row);
+        });
+    } else {
+        var keys = Array.isArray(tabularData) ? null : Object.keys(tabularData);
+        var total = keys === null ? tabularData.length : keys.length;
+        var columns = [];
+        var primitive = false;
+        if (properties !== undefined && properties !== null) {
+            for (i = 0; i < properties.length; i++) columns.push(String(properties[i]));
+        } else {
+            var seen = Object.create(null);
+            for (i = 0; i < total; i++) {
+                var each = keys === null ? tabularData[i] : tabularData[keys[i]];
+                /* A Map and a Set are the third kind: not a row of keys, and not a value for a
+                   'Values' column either, which is why a table of them is a column of indices and
+                   nothing else -- just as node draws it. */
+                if (each !== null && typeof each === 'object' && !utilBrandCheck(Map.prototype.has, each) &&
+                    !utilBrandCheck(Set.prototype.has, each)) {
+                    var own = Object.keys(each);
+                    for (var o = 0; o < own.length; o++) {
+                        if (seen[own[o]] === undefined) { seen[own[o]] = true; columns.push(own[o]); }
+                    }
+                } else if (each === null || (typeof each !== 'object' && typeof each !== 'function')) {
+                    primitive = true;
+                }
+            }
+            if (primitive) columns.push('Values');
+        }
+        headings.push(indexKey);
+        for (i = 0; i < columns.length; i++) headings.push(columns[i]);
+        for (i = 0; i < total; i++) {
+            var item = keys === null ? tabularData[i] : tabularData[keys[i]];
+            var row = [keys === null ? String(i) : keys[i]];
+            var objectRow = item !== null && typeof item === 'object' && !utilBrandCheck(Map.prototype.has, item) &&
+                !utilBrandCheck(Set.prototype.has, item);
+            for (var c = 0; c < columns.length; c++) {
+                if (objectRow) {
+                    row.push(Object.prototype.hasOwnProperty.call(item, columns[c]) ? tableCellOf(item[columns[c]]) : '');
+                } else {
+                    row.push(columns[c] === 'Values' ? tableCellOf(item) : '');
+                }
+            }
+            rows.push(row);
+        }
+    }
+    return tableTextOf(headings, rows);
+}
+
+/* Node's own complaint about an argument of the wrong class, which is the one console.table makes of
+   a 'properties' that is not an array. */
+function invalidArgTypeOf(name, expected, value) {
+    var kind = value === null ? 'null' : typeof value;
+    var shown = kind === 'string' ? " ('" + value + "')"
+        : (kind === 'number' || kind === 'boolean' || kind === 'bigint' ? ' (' + String(value) + ')'
+            : (kind === 'null' ? '' : ' ' + kind));
+    var err = new TypeError('The "' + name + '" argument must be an instance of ' + expected +
+        '. Received type ' + kind + shown);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+}
+
+/* The methods one console carries: the nineteen a Console puts on its instances, each writing to
+   the pair of streams the console was built over. The counters, the time labels and the group
+   indent belong to the console and not to the class, as they do on the host, so two consoles count
+   and time apart. */
+function consoleMethodsOf(writeOut, writeErr) {
+    var counters = Object.create(null);
+    var timeLabels = Object.create(null);
+    var groupIndent = '';
+    function indent(text) {
+        return groupIndent ? text.split('\n').map(function (l) { return groupIndent + l; }).join('\n') : text;
+    }
+    function out(text) { writeOut(indent(text) + '\n'); }
+    function err(text) { writeErr(indent(text) + '\n'); }
+    function labelOf(value) { return value === undefined ? 'default' : String(value); }
+    return {
+        log: function () { out(formatLogArgs(arguments)); },
+        info: function () { out(formatLogArgs(arguments)); },
+        debug: function () { out(formatLogArgs(arguments)); },
+        warn: function () { err(formatLogArgs(arguments)); },
+        error: function () { err(formatLogArgs(arguments)); },
+        trace: function () {
+            var message = formatLogArgs(arguments);
+            err('Trace' + (message ? ': ' + message : ''));
+        },
+        /* console.dir asks util.inspect for the keys and NOT for the value's own output, which is
+           why a class carrying a [util.inspect.custom] prints 'Point { x: 1, y: 2 }' here and not
+           what its own function writes, exactly as on host node 24.15. */
+        dir: function (value, opts) {
+            var options = { customInspect: false };
+            if (opts !== null && typeof opts === 'object') {
+                for (var k in opts) if (Object.prototype.hasOwnProperty.call(opts, k)) options[k] = opts[k];
+            }
+            options.customInspect = false;
+            out(inspectValue(value, options));
+        },
+        dirxml: function () { out(formatLogArgs(arguments)); },
+        table: function (tabularData, properties) {
+            if (properties !== undefined && properties !== null && !Array.isArray(properties)) {
+                throw invalidArgTypeOf('properties', 'Array', properties);
+            }
+            /* Nothing to draw a table of -- a string, a number, null -- is printed as console.log
+               would print it, which is what node does with it. */
+            if (tabularData === null || (typeof tabularData !== 'object' && typeof tabularData !== 'function')) {
+                out(formatLogArgs([tabularData]));
+                return;
+            }
+            out(consoleTableOf(tabularData, properties));
+        },
+        assert: function (condition) {
+            if (condition) return;
+            var rest = Array.prototype.slice.call(arguments, 1);
+            err('Assertion failed' + (rest.length ? ': ' + formatLogArgs(rest) : ''));
+        },
+        count: function (label) {
+            var name = labelOf(label);
+            counters[name] = (counters[name] || 0) + 1;
+            out(name + ': ' + counters[name]);
+        },
+        countReset: function (label) { delete counters[labelOf(label)]; },
+        time: function (label) { timeLabels[labelOf(label)] = host.now(); },
+        timeLog: function (label) {
+            var name = labelOf(label);
+            if (timeLabels[name] === undefined) return;
+            out(name + ': ' + (host.now() - timeLabels[name]).toFixed(3) + 'ms');
+        },
+        timeEnd: function (label) {
+            var name = labelOf(label);
+            if (timeLabels[name] === undefined) return;
+            out(name + ': ' + (host.now() - timeLabels[name]).toFixed(3) + 'ms');
+            delete timeLabels[name];
+        },
+        group: function () {
+            if (arguments.length) out(formatLogArgs(arguments));
+            groupIndent += '  ';
+        },
+        groupCollapsed: function () {
+            if (arguments.length) out(formatLogArgs(arguments));
+            groupIndent += '  ';
+        },
+        groupEnd: function () { groupIndent = groupIndent.slice(2); },
+        /* Nothing is cleared when no terminal is behind the stream, which is what node writes to a
+           stream that is not one: the escape sequence is for a terminal and nothing else. */
+        clear: function () {}
+    };
+}
+
+/* A console's writer: what it was given if it was given a function, or the write of the stream it
+   was given, read at every write and not once, so a stream the program puts in the way is the one
+   console writes to. */
+function consoleWriterOf(target) {
+    if (typeof target === 'function') return target;
+    return function (text) { target.write(text); };
+}
+
+/*
+ * The Console class. 'new console.Console(process.stdout, process.stderr)' builds one over a pair of
+ * streams of its own, which is what every library that captures a program's output does, and the
+ * nineteen methods are bound onto the instance, named after themselves as node names them.
+ */
+function Console(stdout, stderr) {
+    var given = stdout;
+    /* 'new Console({ stdout: w, stderr: e })' is the other form node accepts. */
+    if (given !== null && typeof given === 'object' && typeof given.write !== 'function' &&
+        given.stdout !== undefined && given.stdout !== null) {
+        stderr = given.stderr;
+        given = given.stdout;
+    }
+    if (given === undefined || given === null) given = proc.stdout;
+    var second = stderr === undefined || stderr === null ? given : stderr;
+    var self = this;
+    Object.defineProperty(self, '__owcConsoleOut', { value: consoleWriterOf(given), writable: true, configurable: true });
+    Object.defineProperty(self, '__owcConsoleErr', { value: consoleWriterOf(second), writable: true, configurable: true });
+    var methods = consoleMethodsOf(function (t) { self.__owcConsoleOut(t); }, function (t) { self.__owcConsoleErr(t); });
+    Object.keys(methods).forEach(function (name) {
+        var bound = methods[name].bind(self);
+        Object.defineProperty(bound, 'name', { value: name, configurable: true });
+        self[name] = bound;
+    });
+}
+Object.keys(consoleMethodsOf(function () {}, function () {})).forEach(function (name) {
+    Object.defineProperty(Console.prototype, name, {
+        value: function () {
+            var self = this;
+            var methods = consoleMethodsOf(function (t) { self.__owcConsoleOut(t); },
+                function (t) { self.__owcConsoleErr(t); });
+            return methods[name].apply(self, arguments);
+        },
+        writable: true,
+        enumerable: true,
+        configurable: true
+    });
+});
+/* Node declares the options object as one parameter, so the constructor answers 1 and not the two a
+   stdout and a stderr would give it. */
+Object.defineProperty(Console, 'length', { value: 1, configurable: true });
+Object.defineProperty(Console.prototype, 'constructor', { value: Console, writable: true, enumerable: false, configurable: true });
+
+var consoleObj = new Console(function (text) { proc.stdout.write(text); }, function (text) { proc.stderr.write(text); });
+/*
+ * The seven that are the global console's own and no instance of the class carries: the class, and
+ * the six node hangs on the console it installs and on nothing else.
+ */
+var CONSOLE_EXTRAS = {
+    Console: function () { return Console; },
+    context: function () { return {}; },
+    createTask: function (name) {
+        return {
+            name: String(name),
+            run: function (logOrCallback, callback) {
+                var body = typeof logOrCallback === 'function' ? logOrCallback
+                    : (typeof callback === 'function' ? callback : function () {});
+                return body();
+            }
+        };
+    },
+    profile: function () {},
+    profileEnd: function () {},
+    timeStamp: function () {}
 };
-consoleObj.groupCollapsed = consoleObj.group;
+Object.keys(CONSOLE_EXTRAS).forEach(function (name) {
+    var value = CONSOLE_EXTRAS[name];
+    if (name === 'Console') {
+        Object.defineProperty(consoleObj, 'Console', { value: Console, writable: true, enumerable: true, configurable: true });
+        return;
+    }
+    Object.defineProperty(value, 'name', { value: name, configurable: true });
+    Object.defineProperty(consoleObj, name, { value: value, writable: true, enumerable: true, configurable: true });
+});
 globalThis.console = consoleObj;
 
 /*
@@ -2602,9 +2889,201 @@ globalThis.performance = {
   timeOrigin: Date.now() - (host.now() - startedAt),
   now: function () { return host.now() - startedAt; }
 };
-globalThis.structuredClone = function (value) {
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+/*
+ * structuredClone: the structured clone algorithm and not a JSON round-trip, which is what it was.
+ * A round-trip through JSON is a walk of the same graph that answers a different question -- what
+ * the value looks like as text -- and every type the algorithm names is gone by the time it answers:
+ * a Map comes back an empty object, a Date a string, a typed array a plain object, a circular
+ * reference an exception the host never throws and two properties holding one node two separate
+ * objects. So the walk below is the algorithm's own: a value of its own class for every type it
+ * names, one object for a node the value reaches twice, a reference that closes on itself kept
+ * closed, a Symbol or a function refused with the host's DataCloneError, and a transfer list that
+ * moves a buffer out of the value it was in and detaches the one it was given.
+ *
+ * DOMException is reached through globalThis and not as a bare name: the module that installs it
+ * registers itself further down the bootstrap than this file runs.
+ */
+var CLONE_ERROR_CTORS = ['Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError',
+    'URIError', 'AggregateError'];
+var CLONE_TYPED_CTORS = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
+    'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array'];
+
+function dataCloneError(message) {
+    var Ctor = typeof globalThis.DOMException === 'function' ? globalThis.DOMException : Error;
+    try {
+        return new Ctor(message, 'DataCloneError');
+    } catch (noDomException) {
+        var err = new Error(message);
+        err.name = 'DataCloneError';
+        return err;
+    }
+}
+
+/* What the walk refuses: a Symbol, a function, and anything else the algorithm will not carry. */
+function uncloneableText(value) {
+    return String(value) + ' could not be cloned.';
+}
+
+/*
+ * The clone itself. 'seen' is the map of what has been cloned already -- one entry per value, so a
+ * node two properties hold is one node in the clone as it is in the original, and a reference that
+ * closes on itself is kept closed rather than followed -- and 'moved' is what the transfer list
+ * detached, keyed by the buffer that was given and valued by the buffer it became.
+ */
+function structuredCloneOf(value, moved, seen) {
+    if (value === null) return null;
+    var kind = typeof value;
+    if (kind !== 'object') {
+        /* A Symbol and a function are the two the host refuses with a DataCloneError of its own
+           wording -- "Symbol(x) could not be cloned." -- and not with the SyntaxError a JSON
+           round-trip makes of the undefined they stringify to. */
+        if (kind === 'symbol' || kind === 'function') throw dataCloneError(uncloneableText(value));
+        return value;
+    }
+    if (moved !== null && moved.has(value)) return moved.get(value);
+    if (seen.has(value)) return seen.get(value);
+    var tag = Object.prototype.toString.call(value).slice(8, -1);
+    var isDomException = typeof globalThis.DOMException === 'function' && value instanceof globalThis.DOMException;
+    var out;
+    var i;
+    if (tag === 'Date') {
+        out = new Date(value.getTime());
+    } else if (tag === 'RegExp') {
+        /* The source and the flags travel; the lastIndex a caller moved does not, which is why a
+           /a/g whose lastIndex is 3 clones to one whose lastIndex is 0. */
+        out = new RegExp(value.source, value.flags);
+    } else if (tag === 'ArrayBuffer') {
+        out = new ArrayBuffer(value.byteLength);
+        new Uint8Array(out).set(new Uint8Array(value));
+    } else if (tag === 'SharedArrayBuffer') {
+        out = value;
+    } else if (CLONE_TYPED_CTORS.indexOf(tag) >= 0) {
+        /* A view is cloned as a view of its own: the same kind, the same length and the same
+           elements, and never the byte offset it sat at in the buffer it was made over. */
+        out = new globalThis[tag](value.length);
+        for (i = 0; i < value.length; i++) out[i] = value[i];
+    } else if (tag === 'DataView') {
+        var bytes = new ArrayBuffer(value.byteLength);
+        new Uint8Array(bytes).set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+        out = new DataView(bytes);
+    } else if (tag === 'Map') {
+        out = new Map();
+        seen.set(value, out);
+        value.forEach(function (val, key) {
+            out.set(structuredCloneOf(key, moved, seen), structuredCloneOf(val, moved, seen));
+        });
+        return out;
+    } else if (tag === 'Set') {
+        out = new Set();
+        seen.set(value, out);
+        value.forEach(function (val) { out.add(structuredCloneOf(val, moved, seen)); });
+        return out;
+    } else if (tag === 'Error' || tag === 'DOMException' || isDomException ||
+        CLONE_ERROR_CTORS.indexOf(tag) >= 0) {
+        /* The class, the message, the name and the stack travel; the own properties a caller put on
+           it do not, being non-enumerable, which is why an error carrying a code clones to one that
+           carries none. */
+        var message = typeof value.message === 'string' ? value.message : String(value.message);
+        if (isDomException || (tag === 'DOMException' && typeof globalThis.DOMException === 'function')) {
+            out = new globalThis.DOMException(message, typeof value.name === 'string' ? value.name : 'Error');
+        } else {
+            /* The class is the constructor's own name and not the tag: every error this engine
+               builds answers '[object Error]' to it whatever class it is, while host node 24.15
+               names a TypeError a TypeError in the clone. A subclass of Error is not one of the
+               engine's own, and clones to a plain Error as it does there. */
+            var errCtorName = constructorNameOf(value);
+            var ECtor = CLONE_ERROR_CTORS.indexOf(errCtorName) >= 0 && typeof globalThis[errCtorName] === 'function'
+                ? globalThis[errCtorName] : Error;
+            out = new ECtor(message);
+            if (Object.prototype.hasOwnProperty.call(value, 'name')) {
+                try { out.name = String(value.name); } catch (sealed) { /* a name that will not be written */ }
+            }
+        }
+        try {
+            if (typeof value.stack === 'string') out.stack = value.stack;
+        } catch (sealedStack) { /* a stack that will not be written */ }
+        return out;
+    } else if (tag === 'Blob') {
+        out = new globalThis.Blob([value], { type: value.type });
+    } else if (Array.isArray(value)) {
+        /* A hole stays a hole: only the indices the array carries are written, which is what keeps
+           Object.keys of '[1, , 3]' at 0 and 2 and not at 0, 1 and 2. */
+        out = new Array(value.length);
+        seen.set(value, out);
+        for (i = 0; i < value.length; i++) {
+            if (Object.prototype.hasOwnProperty.call(value, i)) out[i] = structuredCloneOf(value[i], moved, seen);
+        }
+    } else {
+        /* Anything else is an object of no class of its own: the prototype is dropped, a Symbol key
+           and a key that is not enumerable are dropped with it, and an accessor is read rather than
+           copied, so a getter clones to the value it returned. */
+        out = {};
+        seen.set(value, out);
+        var keys = Object.keys(value);
+        for (i = 0; i < keys.length; i++) out[keys[i]] = structuredCloneOf(value[keys[i]], moved, seen);
+        return out;
+    }
+    seen.set(value, out);
+    /* The own keys of an array that are not indices travel too, as they do on the host. */
+    if (Array.isArray(value)) {
+        var extra = Object.keys(value);
+        for (i = 0; i < extra.length; i++) {
+            if (/^\d+$/.test(extra[i])) continue;
+            out[extra[i]] = structuredCloneOf(value[extra[i]], moved, seen);
+        }
+    }
+    return out;
+}
+
+globalThis.structuredClone = function (value, options) {
+    var moved = null;
+    var transfer = options === undefined || options === null ? undefined : options.transfer;
+    if (transfer !== undefined && transfer !== null) {
+        /* WebIDL reads the list as a sequence: anything it cannot iterate -- a number, a string --
+           is refused with the wording the platform gives it, and not with a DataCloneError. */
+        var list = null;
+        if (typeof transfer === 'object') {
+            if (Array.isArray(transfer)) {
+                list = transfer;
+            } else if (typeof transfer[Symbol.iterator] === 'function' && typeof transfer.length === 'number') {
+                list = Array.prototype.slice.call(transfer, 0);
+            } else if (typeof transfer[Symbol.iterator] === 'function') {
+                list = [];
+                var walk = transfer[Symbol.iterator]();
+                var step = walk.next();
+                while (!step.done) { list.push(step.value); step = walk.next(); }
+            }
+        }
+        if (list === null) {
+            throw new TypeError("Failed to execute 'structuredClone': transfer in Options can not be converted to sequence.");
+        }
+        moved = new Map();
+        for (var t = 0; t < list.length; t++) {
+            var each = list[t];
+            /* An entry that is not an object at all is one kind of refusal, and one that is an
+               object but not a buffer the host can move out is another: a plain object and a typed
+               array both answer 'Found invalid value in transferList.', while a buffer that has
+               already been detached -- which is what the last transfer left behind -- answers that
+               there is nothing of a supported type left to transfer. */
+            if (each === null || (typeof each !== 'object' && typeof each !== 'function')) {
+                throw new TypeError('Value is not an object');
+            }
+            if (Object.prototype.toString.call(each) !== '[object ArrayBuffer]') {
+                throw dataCloneError('Found invalid value in transferList.');
+            }
+            /* And a buffer that has already been moved out of has nothing left to move, which is the
+               answer a second transfer of the same buffer gets. */
+            if (each.detached === true) throw dataCloneError('Cannot transfer object of unsupported type.');
+            var detached = each;
+            var fresh = typeof detached.transfer === 'function' ? detached.transfer() : null;
+            if (fresh === null) throw dataCloneError('Found invalid value in transferList.');
+            moved.set(each, fresh);
+        }
+    }
+    return structuredCloneOf(value, moved, new Map());
 };
+Object.defineProperty(globalThis.structuredClone, 'name', { value: 'structuredClone', configurable: true });
+Object.defineProperty(globalThis.structuredClone, 'length', { value: 2, configurable: true });
 globalThis.crypto = nodeCrypto.webcrypto;
 /*
  * fetch, with the three classes Node also defines beside it (Headers, Request, Response). The
