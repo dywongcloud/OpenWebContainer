@@ -1538,7 +1538,17 @@ class ShellSyntaxError extends Error {
     }
 }
 
-class UnsetVariableError extends Error {}
+/**
+ * A variable `set -u` will not let a line read. The status the shell leaves behind it is 127 -- the
+ * status of a command that never ran -- for every form but one: counting an array that is not there
+ * is `1` on a host, `set -u; echo ${#ARR[@]}` ending a subshell that way leaving 1 behind it where
+ * `set -u; echo ${ARR[@]}` leaves 127.
+ */
+class UnsetVariableError extends Error {
+    constructor(message: string, readonly status: number = 127) {
+        super(message);
+    }
+}
 
 /**
  * A substitution this shell's bash 3.2 cannot read -- `${v^^}`, `${v^}`, `${v@Q}` -- which a host
@@ -3798,10 +3808,19 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
             if (value !== undefined) return value;
             if (state.options.nounset) throw new UnsetVariableError(`${name}: unbound variable`);
             return '';
-        case 'len':
+        case 'len': {
             if (name === '@' || name === '*' || name === '#') return String(state.positional.length);
-            if (ARRAY_ALL_RE.test(name)) return String(arrayElements(state, name.replace(/\[[@*]\]$/, '[0]')).length);
+            const bare = name.replace(/\[[@*]\]$/, '');
+            const counted = arrayElements(state, `${bare}[0]`);
+            if (counted.length > 0) return String(counted.length);
+            /* Counting a variable `set -u` will not read names the bare name and no subscript behind
+               it, for an array as for a scalar: `set -u; echo ${#NOPE}` is `NOPE: unbound variable`
+               and `set -u; echo ${#ARR[@]}` is `ARR: unbound variable`. */
+            if (counted.length === 0 && state.options.nounset && value === undefined) {
+                throw new UnsetVariableError(`${bare}: unbound variable`, 1);
+            }
             return String((value ?? '').length);
+        }
         case 'substr': {
             const parts = arg.split(':');
             const text = value ?? '';
@@ -3989,6 +4008,9 @@ function arrayElementsFor(state: ShellState, name: string, ref: VarRef): string[
     const arg = rawArg === '' ? '' : expandToString(ref.op === 'substr' ? arithText(rawArg) : modifierText(rawArg), state);
     switch (ref.op) {
         case 'len':
+            /* Counting an array `set -u` will not read names the array and no subscript behind it:
+               `set -u; echo ${#ARR[@]}` is `ARR: unbound variable`. */
+            if (elements.length === 0 && state.options.nounset) throw new UnsetVariableError(`${name}: unbound variable`, 1);
             return [String(elements.length)];
         case 'substr': {
             const parts = arg.split(':');
@@ -4135,6 +4157,12 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
         const allElements = ARRAY_ALL_RE.exec(ref.name);
         if (allElements !== null && !DEFAULT_OPS.has(ref.op)) {
             const elements = arrayElementsFor(state, allElements[1], ref);
+            /* An array `set -u` will not read is named with the subscript it was written with --
+               `ARR[@]: unbound variable` -- and one declared with no elements in it is an array it
+               will not read either. */
+            if (elements.length === 0 && state.options.nounset && ref.op === '') {
+                throw new UnsetVariableError(`${ref.name}: unbound variable`);
+            }
             const joiner = ref.name.endsWith('[*]') ? ifsJoiner(state) : quoted ? FIELD_MARK : ' ';
             for (let i = 0; i < elements.length; i++) {
                 if (i > 0) appendText(target, joiner, quoted, !quoted);
@@ -4628,7 +4656,14 @@ function runSubstitution(state: ShellState, script: string): string {
         status = runCommandList(state, nodes, null);
     } catch (error) {
         if (error instanceof ExitSignal || error instanceof ReturnSignal) status = error.code;
-        else if (!(error instanceof BreakSignal) && !(error instanceof ContinueSignal)) {
+        else if (error instanceof UnsetVariableError) {
+            /* A substitution is a subshell of its own, so a variable `set -u` will not read ends the
+               substitution and the shell behind it goes on: `x=$(set -u; echo $NOPE); echo $?` is
+               the complaint and then the 1 the substitution left, with the line behind it still
+               running. */
+            writeErr(state, `${plainPrefix(state)}${error.message}\n`);
+            status = 1;
+        } else if (!(error instanceof BreakSignal) && !(error instanceof ContinueSignal)) {
             writeErr(state, errorMessage(error) + '\n');
         }
     } finally {
@@ -4873,11 +4908,12 @@ function runParsed(state: ShellState, script: string): number {
             return 2;
         }
         if (error instanceof UnsetVariableError) {
-            /* The complaint about a variable `set -u` will not read is one a host writes without the
-               line it stands on -- `$0: nope: unbound variable` -- and the shell a line was handed
-               to with `-c` ends on it, leaving 127. */
-            writeErr(state, `${state.shellName}: ${error.message}\n`);
-            return 127;
+            /* The complaint about a variable `set -u` will not read names the shell and the line the
+               expansion stands on -- no line at all on the one the string `sh -c` was handed opens
+               on, `line N` behind it -- and the shell a line was handed to with `-c` ends on it,
+               leaving 127. */
+            writeErr(state, `${plainPrefix(state)}${error.message}\n`);
+            return error.status;
         }
         if (error instanceof BadSubstitutionError) {
             /* `${v^^}` is the text a host names and not a variable's: `$0: ${v^^}: bad substitution`,
@@ -5144,11 +5180,19 @@ function runNode(state: ShellState, node: Node, input: string | null): number {
                 /* A word that will not expand ends the stage it stands in. Where stages stand behind
                    it, they still run and the pipeline takes the last one's status: `echo ${v^^} |
                    cat` is a host's `sh: ${v^^}: bad substitution` and then the 0 of the `cat`, where
-                   letting the error out of the pipeline ran nothing behind it. Where none does --
-                   a plain `echo ${v^^}` -- the error still ends the script, as on a host. */
-                if (!(error instanceof BadSubstitutionError) || node.commands.length < 2) throw error;
-                writeErr(state, `${plainPrefix(state)}${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
-                status = 1;
+                   letting the error out of the pipeline ran nothing behind it. A variable `set -u`
+                   will not read is the same: the stage ends on it with 127 and the stages behind it
+                   still run. Where none stands behind it -- a plain `echo ${v^^}`, or a bare
+                   `echo $NOPE` -- the error still ends the script, as on a host. */
+                if (error instanceof UnsetVariableError) {
+                    if (node.commands.length < 2) throw error;
+                    writeErr(state, `${plainPrefix(state)}${error.message}\n`);
+                    status = error.status;
+                } else if (!(error instanceof BadSubstitutionError) || node.commands.length < 2) throw error;
+                else {
+                    writeErr(state, `${plainPrefix(state)}${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
+                    status = 1;
+                }
             } finally {
                 const captured = state.io;
                 state.io = savedIo;
@@ -5772,6 +5816,15 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
             } catch (error) {
                 // `exit` inside ( ) leaves the subshell, not the script
                 if (error instanceof ExitSignal) return error.code;
+                /* A variable `set -u` will not read ends the subshell a host gives the line and not
+                   the shell behind it: `( set -u; echo $NOPE ) 2>&1; echo $?` is the complaint and
+                   then the 127 the subshell left, with every line behind it still running. It is
+                   written here, where the subshell's own redirection still stands, so the `2>&1` on
+                   the parens catches it instead of the shell's error stream behind them. */
+                if (error instanceof UnsetVariableError) {
+                    writeErr(state, `${plainPrefix(state)}${error.message}\n`);
+                    return error.status;
+                }
                 throw error;
             } finally {
                 /* A subshell is its own exit, so the EXIT trap it set for itself runs here -- before
@@ -7793,12 +7846,23 @@ function shiftBuiltin(ctx: CommandContext): CommandResult {
 }
 
 function aliasList(state: ShellState): string {
+    return joinLines([...state.aliases.keys()].sort().map((name) => `${name}='${state.aliases.get(name) ?? ''}'`));
+}
+
+/**
+ * The listing `alias -p` asks for: the same names in the same order, each behind the `alias ` a
+ * host puts there. A bare `alias` drops that prefix -- a POSIX shell's listing has no room for it,
+ * which is why `alias ll` answers `ll='echo aliased'` and `alias -p` answers `alias ll='echo
+ * aliased'` on one and the same host.
+ */
+function aliasPrintList(state: ShellState): string {
     return joinLines([...state.aliases.keys()].sort().map((name) => `alias ${name}='${state.aliases.get(name) ?? ''}'`));
 }
 
 function aliasBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
-    if (ctx.args.length === 0 || ctx.args[0] === '-p') return ok(aliasList(state), state);
+    if (ctx.args.length === 0) return ok(aliasList(state), state);
+    if (ctx.args[0] === '-p') return ok(aliasPrintList(state), state);
     for (const arg of ctx.args) {
         /* An option `alias` does not know is the two lines a host writes and the 2 it leaves, and
            not the `not found` a name no alias answers to gets: `alias -x` is `alias: -x: invalid
@@ -7810,7 +7874,7 @@ function aliasBuiltin(ctx: CommandContext): CommandResult {
         if (eq === -1) {
             const value = state.aliases.get(arg);
             if (value === undefined) return failDiag(state, `alias: ${arg}: not found`, 1);
-            return ok(`alias ${arg}='${value}'\n`, state);
+            return ok(`${arg}='${value}'\n`, state);
         }
         state.aliases.set(arg.slice(0, eq), arg.slice(eq + 1));
     }
