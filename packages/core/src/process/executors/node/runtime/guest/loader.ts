@@ -1065,6 +1065,7 @@ function fireTimer(id) {
         t.fn.apply(undefined, t.args);
       } catch (err) {
         uncaughtFromCallback(err);
+        leaveBoundDomain(t.fn);
       }
       return;
     }
@@ -1096,6 +1097,7 @@ function fireTimer(id) {
        * spent the same way, at the next timer.
        */
       if (proc && proc.domain === null) proc._owcIdleUndefined = true;
+      leaveBoundDomain(t.fn);
       return;
     }
     dom.exit();
@@ -1160,6 +1162,27 @@ var DOMAIN_UNCAUGHT = Symbol.for('owc.domain.uncaught');
 var DOMAIN_ENTERED = Symbol.for('owc.domain.entered');
 
 /*
+ * The leave host node 24.15 owes the resource whose callback just threw: its async_hooks after()
+ * hook exits the domain that resource was paired with -- the one active when the callback was
+ * scheduled, which is the one d.bind() puts on the wrapper and the one the wrapper entered -- once
+ * the uncaught route has run. Measured on host node 24.15 (k23 a timer, k24 a tick, k25 an
+ * immediate, g06, each throwing inside d.run() with every 'uncaughtException' listener registered
+ * before require('domain')): the handler itself reads process.domain as the domain and
+ * domain._stack.length 1 on both sides, and a timer that fires afterwards reads undefined and 0
+ * there against the domain still entered here -- the undefined an exit() writes when nothing is
+ * left on the stack, because nothing else clears it. A callback no domain was bound to is left
+ * alone, which is what host node 24.15 does too: an unpaired resource has no after() to run.
+ *
+ * A route that did clear -- a domain that listened, or the listener lib/domain.js prepends --
+ * empties the stack first, and then there is nothing on it for this to exit.
+ */
+function leaveBoundDomain(fn) {
+  var dom = fn && typeof fn === 'function' ? fn.domain : null;
+  if (!dom || typeof dom.exit !== 'function' || dom[DOMAIN_ENTERED] !== true) return;
+  dom.exit();
+}
+
+/*
  * An 'uncaughtException' listener, given an error no caller is going to receive: true once one has
  * run, and true as well when the listener itself throws something other than the exit signal, since
  * node lets that one end the process too. The listener is counted when the error is in hand and not
@@ -1172,9 +1195,9 @@ var DOMAIN_ENTERED = Symbol.for('owc.domain.entered');
  * listener is registered at all. A domain with no 'error' listener answers false, and then the
  * process gets the error exactly as it did before.
  */
-function emitUncaught(err) {
+function emitUncaught(err, skipDomain) {
   var proc = globalThis.process;
-  var dom = proc ? proc.domain : null;
+  var dom = proc && !skipDomain ? proc.domain : null;
   if (dom && typeof dom[DOMAIN_UNCAUGHT] === 'function') {
     try {
       if (dom[DOMAIN_UNCAUGHT](err)) return true;
@@ -1194,8 +1217,8 @@ function emitUncaught(err) {
 }
 
 /* what an error out of a timer or a tick does: a listener is given it, or it ends the process */
-function uncaughtFromCallback(err) {
-  if (!emitUncaught(err)) reportUncaught(err);
+function uncaughtFromCallback(err, skipDomain) {
+  if (!emitUncaught(err, skipDomain)) reportUncaught(err);
 }
 
 function drainTicks() {
@@ -1207,6 +1230,7 @@ function drainTicks() {
       });
     } catch (err) {
       uncaughtFromCallback(err);
+      leaveBoundDomain(job.fn);
     }
   }
 }
@@ -1239,24 +1263,27 @@ function queueMicrotaskImpl(fn) {
   var ctx = captureAsyncContext();
   ENGINE_THEN.call(Promise.resolve(), function () {
     var prior = dom ? setDomainContext(dom) : undefined;
+    var settled = false;
     try {
       runInAsyncContext(ctx, function () {
         fn();
       });
     } catch (err) {
-      if (dom && dom[DOMAIN_ENTERED] !== true) {
-        /* the domain is only this job's context: the fatal path asks the process, not the domain */
-        setDomainContext(null);
-        try {
-          uncaughtFromCallback(err);
-        } finally {
-          setDomainContext(dom);
-        }
-      } else {
-        uncaughtFromCallback(err);
-      }
+      /*
+       * A throw out of the job settles the process domain for the rest of the run, so neither the
+       * context it was given nor the one it replaced may be put back over what the route left:
+       * host node 24.15 leaves the value the route itself wrote -- the null the listener
+       * lib/domain.js prepends to every 'uncaughtException' list, or the domain when no listener was
+       * registered before require('domain') and there is no clear to run -- and restoring the
+       * pre-job context over it is what made a later timer read undefined where the host read null
+       * (f12, k04). The context is not nulled for the route either: the domain is only this job's
+       * context and not entered, so what asks the process instead of the domain is the flag, and
+       * the route itself sees the domain, as it does on host node 24.15.
+       */
+      settled = true;
+      uncaughtFromCallback(err, !!dom && dom[DOMAIN_ENTERED] !== true);
     } finally {
-      if (dom) setDomainContext(prior);
+      if (dom && !settled) setDomainContext(prior);
     }
   });
 }
