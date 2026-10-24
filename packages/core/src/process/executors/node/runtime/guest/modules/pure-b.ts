@@ -1575,7 +1575,36 @@ export const SRC = String.raw`
           Object.defineProperty(err, 'domain', { value: dom, writable: true, configurable: true });
           err.domainThrown = true;
         }
-        dom.emit('error', err);
+        /*
+         * A handler that throws is host node 24.15's own shape (lib/domain.js): the throw is
+         * offered to the domain left on top of the stack -- an inner domain's handler throwing
+         * prints the outer domain's handler and the process runs on -- and with nothing left it is
+         * thrown out of process._fatalException, which node answers with the fatal "the internal
+         * exception handler threw" and the status 7, not 1. Measured on host node 24.15 (n17,
+         * b17, c17, c18, and the two-deep shape): DOMAIN=c17 and nothing after it, exit 7.
+         */
+        try {
+          dom.emit('error', err);
+        } catch (er2) {
+          updateExceptionCapture();
+          if (stack.length > 0) {
+            var outer = stack[stack.length - 1];
+            setActive(outer);
+            return uncaughtInDomain(outer, er2);
+          }
+          clearDomains();
+          /*
+           * Nothing is left to receive it, so the status is the one node gives a fatal exception
+           * whose own handler threw: 7. reallyExit writes it and ends the run without waiting for
+           * anything -- host node 24.15 runs no 'exit' handler on this path either -- and the exit
+           * code goes on process as well, because that is what the run leaves with.
+           */
+          if (typeof process === 'object' && process !== null) {
+            try { process.exitCode = 7; } catch (inner) { /* a status that cannot be written */ }
+            if (typeof process.reallyExit === 'function') process.reallyExit(7);
+          }
+          throw er2;
+        }
         clearDomains();
         /*
          * The idle value host node 24.15 settles on is null -- that is what
@@ -1609,14 +1638,27 @@ export const SRC = String.raw`
         return true;
       }
       /*
-       * Nothing in the chain listens, so the process gets the error -- but it gets it with every
-       * domain this error was thrown inside already left. Measured on host node 24.15: a timer bound
-       * to a domain that has no 'error' listener, throwing with an 'uncaughtException' listener
-       * registered, prints that handler with domain._stack at 0, process.domain not the domain and
+       * Nothing in the chain listens, so the process gets the error -- and it gets it with the
+       * domain still entered, because host node 24.15 never leaves it here.
+       *
+       * Domain.prototype._errorHandler -- the route that ends with domainUncaughtExceptionClear --
+       * is only ever reached through the uncaught-exception capture callback, and that callback is
+       * off while no domain on the stack listens for 'error'. So what empties the stack on the way
+       * to an 'uncaughtException' listener is not the route at all: it is the listener lib/domain.js
+       * prepends, and it is prepended by the 'newListener' handler this module installs when it is
+       * loaded -- so it is absent whenever every 'uncaughtException' listener was registered before
+       * require('domain'), and host node 24.15 then hands the error over with the domain entered
+       * and leaves it entered for the rest of the process. Measured on host node 24.15 (n08, d02,
+       * d03): pd-in-uc=d / stack-in-uc=1 and a timer that fires afterwards reads pd=d / stack=1,
+       * against null and 0 here. Clearing here is what broke those three; the prepended listener
+       * above clears whenever node's does.
+       *
+       * Measured on host node 24.15: a timer bound to a domain that has no 'error' listener,
+       * throwing with an 'uncaughtException' listener registered *after* require('domain'), prints
+       * that handler with domain._stack at 0, process.domain not the domain and
        * hasUncaughtExceptionCaptureCallback() false, and a timer that fires afterwards runs outside
-       * the domain. Node leaves the domain before it falls through, so this does too.
+       * the domain -- the prepended listener's doing, not the route's.
        */
-      clearDomains();
       return false;
     }
     /* the two hooks above are defined on the instance, in Domain(), not here */
@@ -1669,6 +1711,24 @@ export const SRC = String.raw`
       var dom = this.domain;
       var type = args[0];
       if (type !== 'error' || this === process || !(dom instanceof Domain) || this.listenerCount('error') > 0) {
+        /*
+         * The other half of an emitter a domain owns: host node 24.15 (lib/domain.js) runs the
+         * listeners of every event but 'error' -- which has the route below -- *inside* that
+         * domain, and does it the way topLevelDomainCallback does: enter, emit, exit, with no
+         * finally, so a listener that throws leaves the domain entered for the uncaught route to
+         * find. An 'error' with a listener of its own, an emitter no domain owns and process
+         * itself are the three shapes it leaves alone. Measured on host node 24.15 (m3, m10,
+         * p07): the listener reads process.domain as the domain that owns the emitter where this
+         * container read null, and the leave that exit writes is what a timer that fires later
+         * reads -- undefined on the host, the null the uncaught route wrote here -- which is why
+         * an emit with no listener at all moves that value too.
+         */
+        if (type !== 'error' && this !== process && dom instanceof Domain) {
+          dom.enter();
+          var ret = eeEmit.apply(this, args);
+          dom.exit();
+          return ret;
+        }
         return eeEmit.apply(this, args);
       }
       var er = args.length > 1 && args[1] ? args[1] : new Error('Unhandled error.');

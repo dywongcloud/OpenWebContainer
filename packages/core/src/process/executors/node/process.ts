@@ -724,6 +724,9 @@ const REJECTION_TRACKER_SRC = String.raw`
       };
       super(function (resolve, reject) {
         var wrapped = function (reason) {
+          /* one rejection per promise: a resolver that rejects and then throws, or a rejection
+             this cell has already taken from a promise it adopted, is not a second one */
+          if (cell.rejected) return;
           cell.rejected = true;
           cell.reason = reason;
           var at = globalThis.process;
@@ -743,8 +746,45 @@ const REJECTION_TRACKER_SRC = String.raw`
           WATCHED.push(cell);
           reject(reason);
         };
+        /*
+         * Adoption: a promise resolved with another promise takes that promise's state, so the
+         * rejection never comes out through the reject this subclass handed the executor -- it
+         * arrives as the inner promise's, and without this the outer promise's cell stays
+         * 'rejected: false' forever and the rejection is lost: no domain 'error', no
+         * 'unhandledRejection', exit 0. Host node 24.15 reports it -- a reaction that returns a
+         * rejecting promise reaches the domain that owns it (b20, c09, c13) or a process
+         * 'unhandledRejection' listener when no domain owns it (c10, c14), and only a .catch on
+         * the derived promise keeps it quiet (c11, which is why this is the unhandled half alone).
+         *
+         * The inner promise is marked handled, because that is what taking its state over means:
+         * the engine attaches the outer promise's own resolving functions to it, so only the outer
+         * one is ever left unhandled, and host node 24.15 reports one rejection and not two.
+         */
+        function adopt(value) {
+          if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return;
+          var inner = CELLS.get(value);
+          if (inner === undefined || inner === cell || cell.rejected) return;
+          if (inner.rejected) {
+            cell.rejected = true;
+            cell.reason = inner.reason;
+            cell.domain = inner.domain;
+            WATCHED.push(cell);
+            return;
+          }
+          inner.handled = true;
+          /* the engine's own then, so attaching this costs no domain enter and no second cell */
+          try {
+            nativeThen.call(value, function () {}, function (reason) {
+              if (cell.rejected) return;
+              cell.rejected = true;
+              cell.reason = reason;
+              cell.domain = inner.domain;
+              WATCHED.push(cell);
+            });
+          } catch (inner2) { /* a value whose then throws is the executor's error, not ours */ }
+        }
         try {
-          executor(resolve, wrapped);
+          executor(function (value) { adopt(value); resolve(value); }, wrapped);
         } catch (err) {
           wrapped(err);
         }
