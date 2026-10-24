@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import Terminal from "./components/Terminal";
 import { useContainer } from "./hooks/useContainer";
 import Editor from "@monaco-editor/react";
@@ -8,6 +8,8 @@ import { FileExplorer } from "./components/FileExplorer";
 import { useFileTree } from "./hooks/useFileTree";
 import { FolderOpen, Terminal as TerminalIcon, Code, Loader2, Save } from "lucide-react";
 import { useShell } from "./hooks/useShell";
+import { usePersistence } from "./hooks/usePersistence";
+import type { SnapshotMeta, SnapshotServer } from "./persist/snapshot";
 import { previewUrl, setPreviewPorts, startPreviewGateway } from "./preview/gateway";
 
 export default function App() {
@@ -27,6 +29,29 @@ export default function App() {
 	const [isDirty, setIsDirty] = useState(false);
 	const [isSaving, setIsSaving] = useState(false);
 	const [currentEditorContent, setCurrentEditorContent] = useState("");
+
+	const commandLineRef = useRef("");
+	const lastCommandRef = useRef("");
+	const [serverCommands, setServerCommands] = useState<SnapshotServer[]>([]);
+	const [restored, setRestored] = useState<SnapshotMeta | null>(null);
+
+	/* The line being typed, kept so a port that starts listening can be remembered with the
+	   command that started it -- a reload can then run the line again and have the server back. */
+	const handleCommand = useCallback(
+		async (input: string) => {
+			if (input === "\r") {
+				const line = commandLineRef.current.trim();
+				if (line) lastCommandRef.current = line;
+				commandLineRef.current = "";
+			} else if (input === "\b") {
+				commandLineRef.current = commandLineRef.current.slice(0, -1);
+			} else if (input.length === 1) {
+				commandLineRef.current += input;
+			}
+			await sendCommand(input);
+		},
+		[sendCommand]
+	);
 
 	const handleEditorChange = (value: string | undefined) => {
 		if (!currentFile || !value) return;
@@ -93,11 +118,27 @@ server.listen(PORT, () => {
 	}, [container]);
 	useEffect(() => {
 		if (servers) {
-			console.log(servers);
 			// Tell the service worker which ports this tab serves, so previews reach this tab
 			// even when several tabs are open with servers on the same port number.
 			setPreviewPorts(servers);
 		}
+	}, [servers]);
+
+	useEffect(() => {
+		/* A reading that names no port at all is a reading the container could not answer -- it is
+		   busy running the very command that is listening -- and it says nothing about what has
+		   stopped, so it must not forget the lines that are running. */
+		if (servers.length === 0) return;
+		setServerCommands((previous) => {
+			const next = previous.filter((server) => servers.includes(server.port));
+			for (const port of servers) {
+				if (!next.some((server) => server.port === port)) {
+					next.push({ port, command: lastCommandRef.current });
+				}
+			}
+			const same = next.length === previous.length && next.every((server, index) => server === previous[index]);
+			return same ? previous : next;
+		});
 	}, [servers]);
 
 	useEffect(() => {
@@ -160,6 +201,26 @@ server.listen(PORT, () => {
 			// container?.deleteDirectory(path);
 		}
 	};
+
+	usePersistence({
+		containerReady,
+		container,
+		openFile: currentFile,
+		servers: serverCommands,
+		onRestored: setRestored
+	});
+
+	/* What the last load had: the file that was open comes back into the editor, and every line
+	   that had a server listening runs again, which is what brings the server itself back. */
+	useEffect(() => {
+		if (!restored || !shellReady) return;
+		const meta = restored;
+		setRestored(null);
+		if (meta.openFile) void handleSelectFile(meta.openFile);
+		for (const server of meta.servers) {
+			if (server.command) void handleCommand(server.command + "\r").catch(() => undefined);
+		}
+	}, [restored, shellReady, handleSelectFile, handleCommand]);
 
 	if (!containerReady || !shellReady) {
 		return (
@@ -276,7 +337,7 @@ server.listen(PORT, () => {
 									<TerminalIcon className="h-4 w-4 text-blue-400" />
 									<h3 className="text-sm font-medium text-gray-300">Terminal</h3>
 								</div>
-								<Terminal onCommand={sendCommand} output={output} />
+								<Terminal onCommand={handleCommand} output={output} />
 							</div>
 						</Allotment.Pane>
 					</Allotment>

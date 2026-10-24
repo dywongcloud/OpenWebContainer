@@ -141,11 +141,15 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 			resizeObserver.observe(element);
 		}
 		window.addEventListener("resize", safeFit);
+		// The split is laid out on an animation frame, so a pane that had no size when it mounted
+		// is given one when the tab is shown; fit again then.
+		document.addEventListener("visibilitychange", safeFit);
 
 		return () => {
 			disposed = true;
 			resizeObserver?.disconnect();
 			window.removeEventListener("resize", safeFit);
+			document.removeEventListener("visibilitychange", safeFit);
 			element.removeEventListener("paste", handlePaste);
 			xtermRef.current = undefined;
 			term?.dispose();
@@ -167,7 +171,18 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 
 	return (
 		<div className="h-full w-full bg-[#1e1e1e]">
-			<div ref={terminalRef} className="h-full" />
+			{/*
+			 * The pane owns a minimum size instead of inheriting everything from the split: a tab
+			 * that is not the visible one never gets the split laid out -- the layout runs on an
+			 * animation frame, which a hidden tab is never given -- so a pane measured only by what
+			 * its parent gave it is 0x0 there, and xterm never opens. The minimum is the split's own
+			 * minimum, so a laid-out pane is unaffected.
+			 */}
+			<div
+				ref={terminalRef}
+				className="h-full w-full"
+				style={{ minHeight: 150, minWidth: 200 }}
+			/>
 		</div>
 	);
 }

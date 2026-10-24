@@ -63,13 +63,13 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.pathname.startsWith(PREVIEW_PATH_PREFIX)) {
-    event.respondWith(handlePreview(event.request, url));
+    event.respondWith(handlePreview(event.request, url, event.clientId || ''));
     return;
   }
   event.respondWith(fetch(event.request));
 });
 
-async function handlePreview(request, url) {
+async function handlePreview(request, url, requesterId) {
   const match = PREVIEW_PATTERN.exec(url.pathname);
   if (!match) {
     return textResponse(404, 'Not a preview path.');
@@ -84,8 +84,9 @@ async function handlePreview(request, url) {
   try {
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
     const body = hasBody ? bytesToBase64(new Uint8Array(await request.arrayBuffer())) : null;
-    const found = await findClients(port, deadline);
+    const found = await findClients(port, deadline, requesterId);
     let lastError = null;
+    let unavailable = null;
     const budget = found.advertised ? deadline : Math.min(deadline, Date.now() + FALLBACK_TIMEOUT_MS);
     for (const client of found.clients) {
       if (Date.now() >= budget) break;
@@ -98,12 +99,18 @@ async function handlePreview(request, url) {
           headers: headersToObject(request.headers),
           body,
         }, Math.min(deadline, budget));
-        return responseFromReply(reply, port);
+        const response = responseFromReply(reply, port);
+        /* 503 is what a container answers for a port nothing in it is listening on: this window
+           is not the one serving the port, and answering with its 503 would hide the window that
+           is. It is kept as the answer of last resort. */
+        if (response.status !== 503) return response;
+        unavailable = response;
       } catch (error) {
         // Another page may serve the same port; keep going until the deadline.
         lastError = error;
       }
     }
+    if (unavailable) return unavailable;
     if (lastError instanceof GatewayError) {
       return textResponse(lastError.status, lastError.message);
     }
@@ -120,13 +127,18 @@ async function handlePreview(request, url) {
 }
 
 /**
- * Windows that advertise `port`, focused first, then the rest. When no page claims the
+ * Windows that advertise `port`, the one that asked first, then the rest. When no page claims the
  * port, fall back to any window so an unadvertised or still-starting server is not
  * answered with an immediate failure -- `advertised` says which of the two came back, so
  * the caller can give the fallback a shorter budget. If there is no window at all, wait
  * for one, so a page that is reloading still gets the request.
+ *
+ * `requesterId` is the window the request came from. Two tabs routinely listen on the same
+ * port number -- both run the boot server on 3000 -- so which tab advertised the port does
+ * not decide which tab is asking: the focused window used to win, and the other tab's own
+ * server was unreachable from the tab that started it. Asking tab answers its own tab.
  */
-async function findClients(port, deadline) {
+async function findClients(port, deadline, requesterId) {
   for (;;) {
     const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     // Drop the ports of pages that have gone: a client id that is no longer open would
@@ -141,8 +153,12 @@ async function findClients(port, deadline) {
         return ports !== undefined && ports.has(port);
       });
       const pool = serving.length > 0 ? serving : clients;
+      const isRequester = (client) => (requesterId && client.id === requesterId ? 0 : 1);
       return {
-        clients: [...pool].sort((left, right) => Number(right.focused) - Number(left.focused)),
+        clients: [...pool].sort(
+          (left, right) =>
+            isRequester(left) - isRequester(right) || Number(right.focused) - Number(left.focused)
+        ),
         advertised: serving.length > 0
       };
     }

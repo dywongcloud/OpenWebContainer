@@ -16,6 +16,8 @@ const SERVICE_WORKER_URL = '/owc-sw.js';
 const REQUEST_MESSAGE = 'owc-preview-request';
 const PORTS_MESSAGE = 'owc-preview-ports';
 const LOCAL_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
+/** How often a page tells the worker what it serves, whether or not its ports have changed. */
+const ADVERTISE_INTERVAL_MS = 5000;
 
 /**
  * Ports this page's container is serving. The service worker routes a preview by port,
@@ -124,7 +126,16 @@ export async function startPreviewGateway(handle: PreviewHandler): Promise<(() =
 		navigator.serviceWorker.addEventListener("controllerchange", advertisePorts);
 		controllerBound = true;
 	}
-	return stop;
+	/* A worker the browser has stopped and started again has forgotten what every page serves,
+	   and a page only spoke when its ports changed, so from that moment the gateway routed by
+	   guesswork until a server happened to start or stop. Saying it again on a timer costs one
+	   message and puts the map back. */
+	const heartbeat = setInterval(advertisePorts, ADVERTISE_INTERVAL_MS);
+	const stopAll = () => {
+		clearInterval(heartbeat);
+		stop();
+	};
+	return stopAll;
 }
 
 async function onWorkerMessage(event: MessageEvent): Promise<void> {
