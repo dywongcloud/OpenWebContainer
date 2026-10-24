@@ -216,8 +216,13 @@ export class NpmInstaller {
                 nodes.set(key, {
                     key,
                     version: typeof manifest.version === 'string' ? manifest.version : version?.version ?? '',
-                    resolved: version?.dist.tarball,
+                    /* A package installed out of a directory is recorded the way npm records a link:
+                       the `file:` spec it came from, and `link`, which is what tells a later `npm ls`
+                       the package is the one there and not a copy from the registry. */
+                    resolved: version?.dist.tarball
+                        ?? (edge.localPath === undefined ? undefined : `file:${relativeSpec(root, edge.localPath)}`),
                     integrity: version?.dist.integrity,
+                    link: edge.localPath !== undefined,
                     dev: edge.dev,
                     optional: edge.optional,
                     manifest

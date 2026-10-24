@@ -7,7 +7,9 @@ import {
     LIFECYCLE_COMMANDS,
     NPM_VERSION,
     findPackageRoot,
+    effectiveScripts,
     missingScriptMessage,
+    npmErrorLines,
     parseScriptArgs,
     readManifest,
     scriptCommandLine,
@@ -202,10 +204,13 @@ export class NpmProcess extends Process {
             return 1;
         }
         const label = scriptLabel(manifest, packageDir);
-        const scripts = (manifest.scripts ?? {}) as Record<string, unknown>;
+        const declared = (manifest.scripts ?? {}) as Record<string, unknown>;
+        /* `npm run` lists the scripts the package declares; a command *runs* npm's own stop-then-start
+           in place of a restart script the package does not have. */
+        const scripts = effectiveScripts(declared);
 
         if (name === undefined) {
-            this.emitOutput(scriptList(label, scripts));
+            this.emitOutput(scriptList(label, declared));
             return 0;
         }
         if (typeof scripts[name] !== 'string') {
@@ -281,22 +286,29 @@ export class NpmProcess extends Process {
     private init(): number {
         const dir = normalizeAbsolute(this.cwd ?? '/');
         const file = joinPaths(dir, 'package.json');
-        if (this.fileSystem.statPath(file)?.type === 'file') {
-            this.emitError(`npm init: package.json already exists in ${dir}\n`);
+        /* npm does not refuse a directory that already has one: init-package-json loads what is
+           there, keeps every field it carries, fills the ones it does not from its own default input
+           and writes it back, so `npm init -y` is idempotent. A file that is there but is not JSON
+           is left alone, as npm leaves a manifest it cannot read. */
+        const present = this.fileSystem.statPath(file)?.type === 'file';
+        const existing = present === true ? readManifest(this.fileSystem, dir) : undefined;
+        if (present === true && existing === undefined) {
+            /* npm parses the file that is there before it writes anything, and a file that does not
+               parse is an EJSONPARSE error rather than a reason to refuse: it names the parse error,
+               the text it was read from and the two notes npm puts behind them. */
+            this.emitOutput('\n');
+            this.emitError(malformedManifestMessage(this.fileSystem.readFile(file) ?? ''));
             return 1;
         }
-        const name = dir.split('/').filter(Boolean).pop() || 'project';
-        const manifest = {
-            name,
-            version: '1.0.0',
-            description: '',
-            main: 'index.js',
-            scripts: { test: 'echo "Error: no test specified" && exit 1' },
-            author: '',
-            license: 'ISC'
-        };
-        this.fileSystem.writeFile(file, JSON.stringify(manifest, null, 2) + '\n');
-        this.emitOutput(`Wrote to ${file}\n`);
+        /* The manifest init-package-json's own default input writes for `-y`, in the order it writes
+           it: npm answers `--yes` with no prompt, so every field is its default, `keywords` an empty
+           list and `type` the `commonjs` npm's own `init-type` defaults to. */
+        const manifest = initManifest(existing, dir);
+        const text = JSON.stringify(manifest, null, 2) + '\n';
+        this.fileSystem.writeFile(file, text);
+        /* npm echoes what it wrote: `Wrote to <file>:`, a blank line, then the JSON. The newline
+           `console.log` adds to the message is the one after the newline its format string ends on. */
+        this.emitOutput(`Wrote to ${file}:\n\n${text}\n` + '\n');
         return 0;
     }
 
@@ -386,6 +398,57 @@ export class NpmProcess extends Process {
         const binName = parseInstallSpec(command ?? requested).name.split('/').pop()!;
         return this.runBin(binName, requested, args, this.cwd ?? '/', registry, log, packageArg !== undefined);
     }
+}
+
+/** npm's `EJSONPARSE` block for a package.json it cannot read: the parse error, the text and its two notes. */
+function malformedManifestMessage(text: string): string {
+    let detail = '';
+    try {
+        JSON.parse(text);
+    } catch (error) {
+        detail = error instanceof Error ? error.message : String(error);
+    }
+    return npmErrorLines([
+        'code EJSONPARSE',
+        `JSON.parse Invalid package.json: JSONParseError: ${detail} while parsing ${JSON.stringify(text)}`,
+        'JSON.parse Failed to parse JSON data.',
+        'JSON.parse Note: package.json must be actual JSON, not just JavaScript.'
+    ].join('\n'));
+}
+
+/**
+ * The manifest `npm init -y` writes: the one already in the directory with npm's defaults filled in
+ * beside it. Every field the file carries is kept, in the order it carries them, and a default only
+ * takes a field the file has none of -- which is what makes a second `npm init -y` write the file
+ * the first one wrote and nothing else.
+ */
+function initManifest(existing: Record<string, any> | undefined, dir: string): Record<string, any> {
+    const manifest: Record<string, any> = { ...(existing ?? {}) };
+    const defaults: Record<string, unknown> = {
+        name: initPackageName(dir),
+        version: '1.0.0',
+        description: '',
+        main: 'index.js',
+        scripts: { test: 'echo "Error: no test specified" && exit 1' },
+        keywords: [],
+        author: '',
+        license: 'ISC',
+        type: 'commonjs'
+    };
+    for (const [field, value] of Object.entries(defaults)) {
+        if (manifest[field] === undefined) manifest[field] = value;
+    }
+    return manifest;
+}
+
+/**
+ * The name `npm init` gives a package: the directory's own, lowercased, with its runs of white space
+ * dashed and a `node-` prefix or a `-js`/`.js` suffix taken off, as init-package-json's own default
+ * input derives it.
+ */
+function initPackageName(dir: string): string {
+    const base = dir.split('/').filter(Boolean).pop() || 'project';
+    return base.replace(/^node-|[.-]js$/g, '').replace(/\s+/g, ' ').replace(/ /g, '-').toLowerCase() || 'project';
 }
 
 /**

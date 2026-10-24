@@ -87,13 +87,22 @@ export function scriptLabel(manifest: Record<string, any>, packageDir: string): 
     return `${name}@${manifest.version ?? ''}`;
 }
 
+/**
+ * What npm runs for `restart` when the package declares no restart script of its own: npm's
+ * `lib/commands/run.js` puts this in `scripts.restart` before it asks whether the script is there,
+ * so a package with no restart script is not a missing script -- npm stops the project and starts
+ * it, and only then do the pre and post events of `restart` apply.
+ */
+export const RESTART_COMMAND = 'npm stop --if-present && npm start';
+
+/** The scripts as npm runs them: `restart` a package has no script for is npm's own stop-then-start. */
+export function effectiveScripts(scripts: Record<string, unknown>): Record<string, unknown> {
+    return scripts.restart ? scripts : { ...scripts, restart: RESTART_COMMAND };
+}
+
 /** The scripts one command runs, in order: `pre<name>`, the script, `post<name>`. */
 export function scriptEvents(name: string, scripts: Record<string, unknown>): string[] {
-    /* npm restart has no script of its own to fall back on: it stops the project and starts it. */
-    const events = name === 'restart' && typeof scripts.restart !== 'string'
-        ? ['prestop', 'stop', 'poststop', 'prestart', 'start', 'poststart']
-        : [`pre${name}`, name, `post${name}`];
-    return events.filter((event) => typeof scripts[event] === 'string');
+    return [`pre${name}`, name, `post${name}`].filter((event) => typeof scripts[event] === 'string');
 }
 
 /** The line one event runs: the script, with the run's extra words on the script that was named. */

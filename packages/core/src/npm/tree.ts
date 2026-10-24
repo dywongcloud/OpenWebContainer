@@ -1,5 +1,6 @@
 import { IFileSystem } from '../filesystem';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../process/executors/node/runtime/resolver';
+import { lockKey } from './lockfile';
 import { localSpecLabel, readManifest } from './scripts';
 
 /**
@@ -125,10 +126,26 @@ function treeChildren(
             const dir = findInstalledCopy(fileSystem, pending.dir, entry.name);
             const installed = dir === undefined ? undefined : readManifest(fileSystem, dir) ?? {};
             const version = installed === undefined ? undefined : String(installed.version ?? '');
-            return { entry, dir, installed, version, id: `${entry.name}@${version ?? entry.range}` };
+            return { entry, dir, installed, version, id: `${entry.name}@${version ?? entry.range}`, extraneous: false };
         });
+        const declared = new Set(entries.map((entry) => entry.name));
+        /* npm draws the packages the tree holds that no edge out accounts for: they sit in
+           node_modules and no dependency field declares them, which is what `extraneous` names.
+           They take part in the same alphabetical order as the declared ones. */
+        for (const extra of extraneousPackages(fileSystem, pending.dir, declared)) {
+            const installed = readManifest(fileSystem, extra.dir) ?? {};
+            const version = String(installed.version ?? '');
+            prepared.push({
+                entry: { name: extra.name, range: version, optional: false },
+                dir: extra.dir,
+                installed,
+                version,
+                id: `${extra.name}@${version}`,
+                extraneous: true
+            });
+        }
         prepared.sort((left, right) => comparePackageIds(left.id, right.id));
-        for (const { entry, dir, installed, version } of prepared) {
+        for (const { entry, dir, installed, version, extraneous } of prepared) {
             if (dir === undefined || installed === undefined || version === undefined) {
                 const kind = entry.optional ? 'OPTIONAL ' : '';
                 pending.node.children.push({
@@ -144,9 +161,12 @@ function treeChildren(
             }
             /* A dependency installed out of a directory is drawn with the directory after it, which
                is how npm says the package is the one there and not a copy from the registry. */
-            const local = localSpecLabel(entry.range);
+            const local = extraneous ? linkLabel(fileSystem, packageDir, dir) : localSpecLabel(entry.range);
+            /* npm's own order for the marks after a package's id: `extraneous` where the package is
+               one no dependency declares, and the directory a link points at last. */
             const node: TreeNode = {
-                text: `${entry.name}@${version}${local === undefined ? '' : ` -> ${local}`}`,
+                text: `${entry.name}@${version}${extraneous ? ' extraneous' : ''}` +
+                    (local === undefined ? '' : ` -> ${local}`),
                 children: []
             };
             seen.set(dir, node);
@@ -180,6 +200,54 @@ function dependencyEntries(manifest: Record<string, any>, optional: Set<string>,
     if (includeDev) collect((manifest.devDependencies ?? {}) as Record<string, unknown>, false);
     collect((manifest.optionalDependencies ?? {}) as Record<string, unknown>, true);
     return entries;
+}
+
+/**
+ * The packages installed under `dir` whose name no dependency field of its manifest declares: what
+ * npm calls extraneous, and draws under the package that holds them. A `.bin` directory and a scope
+ * directory are not packages; a scope's own entries are.
+ */
+function extraneousPackages(fileSystem: IFileSystem, dir: string, declared: Set<string>): { name: string; dir: string }[] {
+    const nodeModules = joinPaths(dir, 'node_modules');
+    if (fileSystem.statPath(nodeModules)?.type !== 'dir') return [];
+    const out: { name: string; dir: string }[] = [];
+    const add = (name: string): void => {
+        if (declared.has(name)) return;
+        const at = joinPaths(nodeModules, name);
+        if (fileSystem.statPath(joinPaths(at, 'package.json'))?.type === 'file') out.push({ name, dir: at });
+    };
+    for (const name of fileSystem.readdirNames(nodeModules) ?? []) {
+        if (name === '.bin') continue;
+        if (name.startsWith('@')) {
+            for (const scoped of fileSystem.readdirNames(joinPaths(nodeModules, name)) ?? []) add(`${name}/${scoped}`);
+            continue;
+        }
+        add(name);
+    }
+    return out;
+}
+
+/**
+ * npm's `-> <path>` for a package installed out of a directory rather than fetched from the
+ * registry: the `file:` spec the lockfile records for it, as npm records a link. Undefined for a
+ * package no lockfile entry marks a link.
+ */
+function linkLabel(fileSystem: IFileSystem, packageDir: string, dir: string): string | undefined {
+    const entry = lockEntry(fileSystem, packageDir, dir);
+    if (entry?.link !== true || typeof entry.resolved !== 'string') return undefined;
+    return localSpecLabel(entry.resolved);
+}
+
+/** The package-lock.json entry of the package at `dir`, under the key npm keys it by. */
+function lockEntry(fileSystem: IFileSystem, packageDir: string, dir: string): Record<string, any> | undefined {
+    const file = joinPaths(packageDir, 'package-lock.json');
+    if (fileSystem.statPath(file)?.type !== 'file') return undefined;
+    try {
+        const lock = JSON.parse(fileSystem.readFile(file) ?? '{}') as { packages?: Record<string, Record<string, any>> };
+        return lock.packages?.[lockKey(packageDir, dir)];
+    } catch {
+        return undefined;
+    }
 }
 
 /** The copy of `name` Node would resolve from `fromDir`, which is where npm prints it from. */
