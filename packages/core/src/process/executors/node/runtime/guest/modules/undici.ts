@@ -300,10 +300,26 @@ function responseBody(res) {
   var ended = false;
   var stopped = false;
   var failure = null;
+  var failed = false;
   var wake = null;
   var controller = null;
   var complete = null;
   var finished = new Promise(function (resolve) { complete = resolve; });
+  /* Node ends a body the socket never finished carrying with TypeError: terminated -- reset, abort
+     or a server that dies mid-body -- and it ends it whether or not anyone is reading it then, so a
+     caller that reads later still gets the error instead of waiting for bytes that cannot arrive. */
+  function terminate(reason) {
+    if (stopped || ended) return;
+    failure = reason;
+    failed = true;
+    stopped = true;
+    ended = true;
+    if (controller !== null) {
+      try { controller.error(reason); } catch (errorError) {}
+    }
+    complete();
+    notify();
+  }
   /* A turn later, and not inside the event that woke the reader: two pieces that land together --
      a write and the end that follows it in the same tick -- are one chunk to the caller, because
      that is one read of the socket on the way in. Sixty milliseconds apart they are still two. */
@@ -327,7 +343,10 @@ function responseBody(res) {
     notify();
   });
   res.on('end', function () { ended = true; complete(); notify(); });
-  res.on('error', function (err) { failure = err; complete(); notify(); });
+  res.on('error', function (err) { failure = err; failed = true; complete(); notify(); });
+  /* The client marks a response the socket dropped before its last byte with 'aborted' and destroys
+     it; no 'error' follows, so without this the body would stay open and never answer again. */
+  res.on('aborted', function () { terminate(new TypeError('terminated')); });
   var stream = new globalThis.ReadableStream({
     /* a byte stream, as undici makes one: a body is bytes, so a caller can take a BYOB reader to it */
     type: 'bytes',
@@ -364,13 +383,17 @@ function responseBody(res) {
     /* the whole body, for a caller that wants it in one piece -- a dispatcher, which never reads
        the stream -- and only ever after the last byte has landed */
     text: function () {
-      return finished.then(function () { return Buffer.concat(all).toString('utf8'); });
+      return finished.then(function () {
+        if (failed) throw failure;
+        return Buffer.concat(all).toString('utf8');
+      });
     },
     /* An abort that lands after the head: it is the body that breaks, with the signal's own reason,
        and not the promise the head already settled. */
     abort: function (reason) {
       if (stopped || ended) return;
       failure = reason;
+      failed = true;
       if (controller !== null) {
         try { controller.error(reason); } catch (errorError) {}
       }

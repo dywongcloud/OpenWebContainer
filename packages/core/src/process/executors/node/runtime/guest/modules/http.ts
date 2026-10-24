@@ -444,6 +444,9 @@ BF['http'] = function () {
     this._hasBody = !(req && req.method === 'HEAD');
     this._keepAlive = false;
     this._keepAliveSeconds = 5;
+    /* Node writes the Keep-Alive line only while the server's keepAliveTimeout is above zero: at
+       zero it leaves the head without one, so a client cannot read a timeout the server never set. */
+    this._keepAliveTimeoutMs = 5000;
   }
   Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);
   ServerResponse.prototype.writeHead = function writeHead(statusCode, reason, headers) {
@@ -484,7 +487,7 @@ BF['http'] = function () {
     if (userConnection.indexOf('close') >= 0) this._keepAlive = false;
     if (this._keepAlive) {
       lines.push('Connection: keep-alive');
-      lines.push('Keep-Alive: timeout=' + this._keepAliveSeconds);
+      if (this._keepAliveTimeoutMs > 0) lines.push('Keep-Alive: timeout=' + this._keepAliveSeconds);
     } else {
       lines.push('Connection: close');
     }
@@ -1283,7 +1286,8 @@ BF['http'] = function () {
       res.socket = socket;
       res.connection = socket;
       res._keepAlive = wantsKeepAlive(head) && !server._closing;
-      res._keepAliveSeconds = Math.round(server.keepAliveTimeout / 1000) || 5;
+      res._keepAliveTimeoutMs = typeof server.keepAliveTimeout === 'number' ? server.keepAliveTimeout : 5000;
+      res._keepAliveSeconds = Math.floor(res._keepAliveTimeoutMs / 1000);
       state.res = res;
       state.responding = true;
       /* http.server.response.created: the response object for this request, before it is handed out. */
