@@ -954,6 +954,76 @@ BF.fs = function () {
     return count;
   }
 
+  /* stat follows a link to the name it points at, the way the kernel does: a path whose last part is
+     a link is read as the target, and so is a directory met part of the way along one. */
+  function statFollowingLinks(file) {
+    var at = file;
+    for (var hop = 0; SYMLINKS[at] !== undefined && hop < 32; hop++) at = SYMLINKS[at];
+    return statOf(at);
+  }
+
+  /*
+   * The permission bits a name carries, which is what a read or a write of it is checked against. A
+   * file system that reports no mode of its own falls back to the one a host's create leaves behind:
+   * 0o644 for a file and 0o755 for a directory.
+   */
+  function modeBitsOf(st) {
+    if (!st) return 0;
+    return (st.mode !== undefined ? st.mode : (st.type === 'dir' ? 0o755 : 0o644)) & 0o777;
+  }
+
+  /*
+   * The directory the four character devices live in is the kernel's on a host, not the user's: a
+   * name made in it is refused with EPERM rather than EACCES, and the refusal comes from the file
+   * system that mounts it, so a mode check here leaves it to that refusal.
+   */
+  var DEVICE_DIR = '/dev';
+
+  /*
+   * A name made in a directory is checked against that directory's bits, and the directory a mkdir
+   * names is the nearest one above the path that is already there -- the whole chain when the mkdir
+   * is recursive. A mkdir that was not asked for the parents gets no further than the one directory
+   * above it: that one being missing is the ENOENT a host reports, where the parents turning up
+   * anyway was this file system's createDirectory making a path instead of a directory.
+   */
+  function directoryToCreateIn(file, recursive, syscall) {
+    var at = P.dirname(file);
+    var dir = statFollowingLinks(at);
+    while (!dir && recursive) {
+      var up = P.dirname(at);
+      if (up === at) break;
+      at = up;
+      dir = statFollowingLinks(at);
+    }
+    if (!dir) throw fsError('ENOENT', syscall, file);
+    if (dir.type !== 'dir') throw fsError('ENOTDIR', syscall, file);
+    if (at !== DEVICE_DIR && (modeBitsOf(dir) & 0o200) === 0) throw fsError('EACCES', syscall, file);
+  }
+
+  /*
+   * A name is made or opened through the directory it sits in, and a host checks the bits of that
+   * directory when the name is not there yet: a read or a write of a name that is there is checked
+   * against the name's own bits. want is the W_OK/R_OK shape fs.constants gives -- 2 to write, 4 to
+   * read -- and the check is made at the open alone, which is why a descriptor opened before a chmod
+   * still writes afterwards: a host never rechecks a descriptor it has already handed out.
+   */
+  function requireAccess(file, want, syscall) {
+    var st = statFollowingLinks(file);
+    if (st) {
+      var bits = modeBitsOf(st);
+      if ((want & 2) !== 0 && (bits & 0o200) === 0) throw fsError('EACCES', syscall, file);
+      if ((want & 4) !== 0 && (bits & 0o400) === 0) throw fsError('EACCES', syscall, file);
+      return;
+    }
+    var dirPath = P.dirname(file);
+    var dir = statFollowingLinks(dirPath);
+    if (!dir) throw fsError('ENOENT', syscall, file);
+    if (dirPath === DEVICE_DIR) return;
+    var dirBits = modeBitsOf(dir);
+    if ((want & 2) !== 0 && (dirBits & 0o200) === 0) throw fsError('EACCES', syscall, file);
+    if ((want & 4) !== 0 && (dirBits & 0o400) === 0) throw fsError('EACCES', syscall, file);
+  }
+
   /* Node's blocks counts 512-byte blocks while the allocation it reports is in 4096-byte ones: a
      1-byte file holds 8, a 4097-byte one 16, and an empty one none. */
   function blocksOf(size) {
@@ -1102,6 +1172,7 @@ BF.fs = function () {
     var st = statOf(file);
     if (!st) throw fsError('ENOENT', 'open', String(p));
     if (st.type === 'dir') throw fsError('EISDIR', 'read', file);
+    requireAccess(file, 4, 'open');
     var enc = optionsEncoding(opts);
     if (enc && normalizeEncoding(enc) === 'utf8') return host.readText(canonicalOf(file));
     var bytes = readBytesOf(file);
@@ -1161,6 +1232,9 @@ BF.fs = function () {
     var file = toPathString(p);
     var mode = newMode(opts, 0o666);
     var flag = opts && typeof opts === 'object' && opts.flag ? opts.flag : 'w';
+    /* A write opens the name for writing, and 'r+' opens it for reading as well: the mode a chmod
+       set is checked here, at the open, so a 0444 file is EACCES the way it is on a host. */
+    requireAccess(file, (flagLetter(flag) === 'r' || flag.indexOf('+') >= 0 ? 4 : 0) | 2, 'open');
     var bytes;
     if (typeof data === 'string') bytes = encodeString(data, optionsEncoding(opts) || 'utf8');
     else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
@@ -1319,6 +1393,7 @@ BF.fs = function () {
       if (recursive && existing.type === 'dir') return undefined;
       throw fsError('EEXIST', 'mkdir', file);
     }
+    directoryToCreateIn(file, recursive, 'mkdir');
     check(host.mkdir(file, newMode(opts, 0o777)), 'mkdir', file);
     return recursive ? file : undefined;
   };
@@ -1445,10 +1520,37 @@ BF.fs = function () {
     if (want & 1) { if (!(bits & 0o100)) throw fsError('EACCES', 'access', file); }
   };
 
+  /*
+   * realpath resolves the links a path goes through, which is what the name asks for and what stat
+   * already does one hop at a time: a component that is a link is replaced by the target it names and
+   * the walk of what is left starts again from there, so a link to a directory carries the names
+   * under it and a link to a link is followed to the end. A path with no link in it is the path it
+   * was given, normalised, which is all toPathString has already left.
+   */
+  function realPathOf(file) {
+    var out = file;
+    for (var pass = 0; pass < 64; pass++) {
+      var parts = out.split('/').filter(function (s) { return s.length > 0; });
+      var replaced = false;
+      for (var i = 0; i < parts.length; i++) {
+        var link = SYMLINKS['/' + parts.slice(0, i + 1).join('/')];
+        if (link === undefined) continue;
+        var target = P.resolve(link);
+        var tail = parts.slice(i + 1);
+        out = tail.length > 0 ? P.resolve(target, tail.join('/')) : target;
+        replaced = true;
+        break;
+      }
+      if (!replaced) break;
+    }
+    return out;
+  }
+
   fs.realpathSync = function (p) {
     var file = toPathString(p);
-    if (!statOf(file)) throw fsError('ENOENT', 'realpath', file);
-    return file;
+    var resolved = realPathOf(file);
+    if (!statOf(resolved)) throw fsError('ENOENT', 'realpath', file);
+    return resolved;
   };
 
   /*
@@ -1469,6 +1571,11 @@ BF.fs = function () {
     var run = TRAILING_XS.exec(raw);
     var stem = run ? raw.slice(0, run.index) : raw;
     var width = run ? run[0].length : 6;
+    /* A mkdtemp whose directory is not there is the ENOENT Node reports against the template -- the
+       prefix with the X's still in it -- and not against one of the names it would have tried. */
+    if (!statFollowingLinks(P.dirname(toPathString(raw)))) {
+      throw fsError('ENOENT', 'mkdtemp', run ? raw : raw + 'XXXXXX');
+    }
     var name;
     do { name = randomName(stem, width); } while (statOf(name));
     fs.mkdirSync(name, { mode: 0o700 });
@@ -1507,7 +1614,19 @@ BF.fs = function () {
   }
 
   var DESCRIPTORS = {};
-  var nextDescriptor = 3;
+
+  /*
+   * Node hands back the lowest descriptor that is free: a close puts its number back in the pool and
+   * the next open takes it again, so a program that opens and closes in a loop stays at one number
+   * instead of walking up without bound. A monotonic counter handed out a new number every time and
+   * never gave one back.
+   */
+  function allocateDescriptor() {
+    var fd = 3;
+    // The pty fds the node-pty shim hands out start at 1000; never hand a file one of those.
+    while (DESCRIPTORS[fd] !== undefined || (globalThis.__owcPtyFds && globalThis.__owcPtyFds[fd] !== undefined)) fd++;
+    return fd;
+  }
 
   function descriptorOf(fd, syscall) {
     var rec = typeof fd === 'number' ? DESCRIPTORS[fd] : undefined;
@@ -1536,6 +1655,10 @@ BF.fs = function () {
     var creates = letter === 'w' || letter === 'a';
     var st = statOf(file);
     var isDir = !!(st && st.type === 'dir');
+    /* What the flags ask for is what the mode is checked against, at the open: 'r' needs the read
+       bit, 'w' and 'a' the write bit, and a '+' both. A name that is not there yet is checked
+       against the directory it would be made in. */
+    requireAccess(file, (letter === 'r' || f.indexOf('+') >= 0 ? 4 : 0) | (letter === 'r' && f.indexOf('+') < 0 ? 0 : 2), 'open');
     if (creates) {
       if (isDir) throw fsError('EISDIR', 'open', file);
       if (letter === 'w' || !st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file);
@@ -1543,9 +1666,7 @@ BF.fs = function () {
       throw fsError('ENOENT', 'open', file);
     }
     var bytes = letter === 'w' || !st || isDir ? new Uint8Array(0) : readBytesOf(file);
-    var fd = nextDescriptor++;
-    // The pty fds the node-pty shim hands out start at 1000; never hand a file one of those.
-    while (DESCRIPTORS[fd] !== undefined || (globalThis.__owcPtyFds && globalThis.__owcPtyFds[fd] !== undefined)) fd = nextDescriptor++;
+    var fd = allocateDescriptor();
     DESCRIPTORS[fd] = {
       path: file,
       flags: f,
@@ -2073,19 +2194,174 @@ BF.fs = function () {
     return new Dir(base, entries);
   };
 
-  // The browser has no file system events, so watching fails loudly instead of returning a dead watcher.
-  function watchUnavailable(api) {
-    var err = new TypeError(api + ' is not supported on this runtime: the browser cannot watch the file system');
-    err.code = 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM';
-    return err;
+  /*
+   * Watchers. A browser has no file system events to wait on, so a watcher is a poll of what the path
+   * looks like -- which is how Node's own watchFile works, and how fs.watch works on a platform with
+   * no inotify to subscribe to. The poll is the guest's own setTimeout, the only clock there is.
+   */
+  var WATCH_INTERVAL_MS = 32;
+  /* Node's own default interval for watchFile: the prime it picked so two watchers of files with the
+     same size drift apart rather than poll in lockstep. */
+  var WATCH_FILE_INTERVAL_MS = 5007;
+  var WATCH_FILES = {};
+  var EMPTY_STAT = { type: 'file', size: 0, mtimeMs: 0 };
+
+  function watchIntervalOf(opts, fallback) {
+    var options = typeof opts === 'object' && opts !== null ? opts : {};
+    var n = options.interval;
+    if (typeof n !== 'number' || !isFinite(n) || n < 1) return fallback;
+    return Math.floor(n);
   }
-  fs.watch = function () {
-    throw watchUnavailable('fs.watch');
+
+  var WATCH_EMITTER = (function () {
+    var mod = requireBuiltin('events');
+    return typeof mod === 'function' ? mod : (mod && mod.EventEmitter);
+  })();
+
+  /*
+   * A watcher is an EventEmitter named FSWatcher with the close, ref and unref Node's own carries --
+   * which is all a package reads of one. A host does not export the class on fs, so neither does this.
+   */
+  function FSWatcher(target) {
+    if (WATCH_EMITTER) WATCH_EMITTER.call(this);
+    this._owcTarget = target;
+    this._owcTimer = null;
+    this._owcClosed = false;
+    this._owcLast = watchSnapshotOf(target);
+  }
+  if (WATCH_EMITTER) {
+    FSWatcher.prototype = Object.create(WATCH_EMITTER.prototype);
+    FSWatcher.prototype.constructor = FSWatcher;
+  }
+  FSWatcher.prototype.start = function (interval) {
+    var self = this;
+    if (self._owcClosed) return;
+    self._owcTimer = setTimeout(function tick() {
+      if (self._owcClosed) return;
+      self._owcTimer = setTimeout(tick, interval);
+      var now = watchSnapshotOf(self._owcTarget);
+      if (watchSignatureOf(self._owcLast) !== watchSignatureOf(now)) watchEmitDiff(self, self._owcLast, now);
+      self._owcLast = now;
+    }, interval);
   };
-  fs.watchFile = function () {
-    throw watchUnavailable('fs.watchFile');
+  FSWatcher.prototype.close = function () {
+    this._owcClosed = true;
+    if (this._owcTimer !== null && typeof clearTimeout === 'function') clearTimeout(this._owcTimer);
+    this._owcTimer = null;
+    this.emit('close');
   };
-  fs.unwatchFile = function () {};
+  FSWatcher.prototype.ref = function () { return this; };
+  FSWatcher.prototype.unref = function () { return this; };
+
+  /* What a watched path looks like, as something two polls can be told apart by. */
+  function watchSnapshotOf(file) {
+    var st = statFollowingLinks(file);
+    if (!st) return null;
+    if (st.type !== 'dir') return { dir: false, sig: st.size + '/' + st.mtimeMs, names: null, sigs: null };
+    var names = sortedEntries(file);
+    var sigs = {};
+    for (var i = 0; i < names.length; i++) {
+      var child = statFollowingLinks(P.join(file, names[i]));
+      sigs[names[i]] = child ? child.type + '/' + child.size + '/' + child.mtimeMs : '-';
+    }
+    return { dir: true, sig: null, names: names, sigs: sigs };
+  }
+
+  function watchSignatureOf(snap) {
+    if (!snap) return '-';
+    if (!snap.dir) return 'f' + snap.sig;
+    var parts = [];
+    for (var i = 0; i < snap.names.length; i++) parts.push(snap.names[i] + '=' + snap.sigs[snap.names[i]]);
+    return 'd' + parts.join(',');
+  }
+
+  /*
+   * A file whose bytes moved is 'change'; in a directory a name that appeared or went is 'rename' and
+   * a name whose bytes moved is 'change', which is what a host reports for each. The event a watcher
+   * emits is always the one named 'change' -- the event type is the first thing the listener is
+   * handed, and the filename, never the path it watched, is the second.
+   */
+  function watchEmitDiff(w, before, after) {
+    if (!before || !after) { w.emit('change', 'rename', P.basename(w._owcTarget)); return; }
+    if (!before.dir) { w.emit('change', 'change', P.basename(w._owcTarget)); return; }
+    var i;
+    var name;
+    for (i = 0; i < after.names.length; i++) {
+      name = after.names[i];
+      if (before.sigs[name] === undefined) w.emit('change', 'rename', name);
+      else if (before.sigs[name] !== after.sigs[name]) w.emit('change', 'change', name);
+    }
+    for (i = 0; i < before.names.length; i++) {
+      name = before.names[i];
+      if (after.sigs[name] === undefined) w.emit('change', 'rename', name);
+    }
+  }
+
+  fs.watch = function (filename, opts, listener) {
+    var raw = filename && typeof filename === 'object' && filename.href ? filename.href : filename;
+    if (typeof raw !== 'string') {
+      throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "filename" argument must be of type string or an instance of Buffer or URL. Received ' + describeFsArg(filename));
+    }
+    /* Node stat's the name before it does anything else, and a name that is not there is the ENOENT
+       every other call reports: the platform refusal here came first, so the argument check a host
+       makes was never reached at all. */
+    if (!statFollowingLinks(toPathString(raw))) throw fsError('ENOENT', 'watch', raw);
+    var cb = typeof opts === 'function' ? opts : (typeof listener === 'function' ? listener : undefined);
+    var watcher = new FSWatcher(toPathString(raw));
+    if (cb) watcher.on('change', cb);
+    watcher.start(watchIntervalOf(opts, WATCH_INTERVAL_MS));
+    return watcher;
+  };
+
+  /*
+   * watchFile is Node's polling watcher, and a poll is the only watcher there can be: it hands the
+   * listener the stat it just took and the one it took before, and it does so when the interval
+   * between two polls has passed -- 5007 ms when no interval was asked for, which is Node's own
+   * default. A stat that is the same as the last one is not a change, so a listener is called once
+   * for a write, however many polls went by while it happened.
+   */
+  fs.watchFile = function (filename, opts, listener) {
+    var raw = filename && typeof filename === 'object' && filename.href ? filename.href : filename;
+    if (typeof raw !== 'string') {
+      throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "filename" argument must be of type string or an instance of Buffer or URL. Received ' + describeFsArg(filename));
+    }
+    var cb = typeof opts === 'function' ? opts : (typeof listener === 'function' ? listener : undefined);
+    var file = toPathString(raw);
+    var interval = watchIntervalOf(opts, WATCH_FILE_INTERVAL_MS);
+    var previous = statFollowingLinks(file);
+    var stopped = false;
+    var record = { file: file, listener: cb, stop: function () { stopped = true; } };
+    WATCH_FILES[file] = (WATCH_FILES[file] || []).concat([record]);
+    (function poll() {
+      if (stopped) return;
+      setTimeout(poll, interval);
+      var current = statFollowingLinks(file);
+      if (!cb) { previous = current; return; }
+      var moved = (previous === null) !== (current === null);
+      if (!moved && previous !== null && current !== null) {
+        moved = previous.mtimeMs !== current.mtimeMs || previous.size !== current.size ||
+          previous.type !== current.type;
+      }
+      if (!moved) return;
+      var before = previous;
+      previous = current;
+      cb(makeStats(current, undefined, false), makeStats(before === null ? EMPTY_STAT : before, undefined, false));
+    })();
+    return record;
+  };
+
+  fs.unwatchFile = function (filename, listener) {
+    var raw = filename && typeof filename === 'object' && filename.href ? filename.href : filename;
+    if (typeof raw !== 'string') return;
+    var file = toPathString(raw);
+    var list = WATCH_FILES[file];
+    if (!list) return;
+    for (var i = 0; i < list.length; i++) {
+      if (typeof listener !== 'function' || list[i].listener === listener) list[i].stop();
+    }
+  };
 
   // Node's fs.constants on the reference platform, so flag and mode values match exactly.
   fs.constants = {"UV_FS_SYMLINK_DIR":1,"UV_FS_SYMLINK_JUNCTION":2,"O_RDONLY":0,"O_WRONLY":1,"O_RDWR":2,"UV_DIRENT_UNKNOWN":0,"UV_DIRENT_FILE":1,"UV_DIRENT_DIR":2,"UV_DIRENT_LINK":3,"UV_DIRENT_FIFO":4,"UV_DIRENT_SOCKET":5,"UV_DIRENT_CHAR":6,"UV_DIRENT_BLOCK":7,"S_IFMT":61440,"S_IFREG":32768,"S_IFDIR":16384,"S_IFCHR":8192,"S_IFBLK":24576,"S_IFIFO":4096,"S_IFLNK":40960,"S_IFSOCK":49152,"O_CREAT":512,"O_EXCL":2048,"UV_FS_O_FILEMAP":0,"O_NOCTTY":131072,"O_TRUNC":1024,"O_APPEND":8,"O_DIRECTORY":1048576,"O_NOFOLLOW":256,"O_SYNC":128,"O_DSYNC":4194304,"O_SYMLINK":2097152,"O_NONBLOCK":4,"S_IRWXU":448,"S_IRUSR":256,"S_IWUSR":128,"S_IXUSR":64,"S_IRWXG":56,"S_IRGRP":32,"S_IWGRP":16,"S_IXGRP":8,"S_IRWXO":7,"S_IROTH":4,"S_IWOTH":2,"S_IXOTH":1,"F_OK":0,"R_OK":4,"W_OK":2,"X_OK":1,"UV_FS_COPYFILE_EXCL":1,"COPYFILE_EXCL":1,"UV_FS_COPYFILE_FICLONE":2,"COPYFILE_FICLONE":2,"UV_FS_COPYFILE_FICLONE_FORCE":4,"COPYFILE_FICLONE_FORCE":4};
@@ -2286,6 +2562,11 @@ BF.fs = function () {
    * descriptor calls or for readv either: those live on the handle alone.
    */
   var HANDLE_ONLY = { fstatSync: 1, fchmodSync: 1, ftruncateSync: 1, fdatasyncSync: 1, readvSync: 1 };
+  /* Nor for the calls whose promise form Node has never had, though the callback ones exist: close,
+     exists, fchown, fsync, futimes, read, write and writev are all callback-only, and writevSync is
+     the pair of the readvSync already named. Without this the promise surface carries eight names a
+     host's Object.keys(fs.promises) does not list. */
+  var NO_PROMISE = { closeSync: 1, existsSync: 1, fchownSync: 1, fsyncSync: 1, futimesSync: 1, readSync: 1, writeSync: 1, writevSync: 1 };
 
   var names = Object.keys(fs);
   var promises = {};
@@ -2310,7 +2591,7 @@ BF.fs = function () {
         else cb(null, result);
       });
     };
-    if (!HANDLE_ONLY[syncName]) {
+    if (!HANDLE_ONLY[syncName] && !NO_PROMISE[syncName]) {
       promises[base] = function () {
         var args = Array.prototype.slice.call(arguments);
         return new Promise(function (resolve, reject) {
@@ -2348,6 +2629,60 @@ BF.fs = function () {
     };
     disposable[Symbol.dispose] = function () { disposable.remove(); };
     return disposable;
+  };
+
+  /* Three names the *Sync sweep cannot generate, which Node keeps on the promise surface all the
+     same: the constants bag, the promise form of mkdtempDisposableSync, and watch, whose promise form
+     is an async iterator rather than the watcher the callback form hands back. The disposable
+     carries Symbol.asyncDispose as well as Symbol.dispose, so a caller can await using it. */
+  promises.constants = fs.constants;
+  promises.mkdtempDisposable = function (prefix, options) {
+    return new Promise(function (resolve, reject) {
+      try {
+        var dir = fs.mkdtempDisposableSync(prefix, options);
+        if (typeof Symbol.asyncDispose === 'symbol') {
+          dir[Symbol.asyncDispose] = function () {
+            return Promise.resolve(dir.remove());
+          };
+        }
+        resolve(dir);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  };
+  promises.watch = function (filename, opts) {
+    /* Node's promise form of watch is an async iterator of the events the watcher emits, and the
+       watcher behind it is the one fs.watch hands back. */
+    var watcher = fs.watch(filename, typeof opts === 'function' ? undefined : opts);
+    var queue = [];
+    var waiting = null;
+    watcher.on('change', function (eventType, name) {
+      var item = { eventType: eventType, filename: name };
+      if (waiting !== null) {
+        var resolve = waiting;
+        waiting = null;
+        resolve({ value: item, done: false });
+        return;
+      }
+      queue.push(item);
+    });
+    var iterator = {
+      next: function () {
+        if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false });
+        return new Promise(function (resolve) { waiting = resolve; });
+      },
+      'return': function () {
+        watcher.close();
+        return Promise.resolve({ value: undefined, done: true });
+      },
+      'throw': function () {
+        watcher.close();
+        return Promise.resolve({ value: undefined, done: true });
+      }
+    };
+    iterator[Symbol.asyncIterator] = function () { return iterator; };
+    return iterator;
   };
 
   /* Node's own time conversion, which it exports beside the calls it feeds: a Date or a number of
