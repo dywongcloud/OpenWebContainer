@@ -831,9 +831,26 @@ BF.fs = function () {
     EBADF: 'bad file descriptor'
   };
 
+  /*
+   * The errno a host's own error carries, which a package reads as readily as it reads the code. Node
+   * reports the platform's number -- the negative of the one errno.h gives -- and EPERM, 1, is the one
+   * the -1 any other code used to fall back to happened to get right.
+   */
+  var ERRNOS = {
+    ENOENT: -2,
+    EACCES: -13,
+    EEXIST: -17,
+    ENOTDIR: -20,
+    EISDIR: -21,
+    EINVAL: -22,
+    EBADF: -9,
+    ENOTEMPTY: -66,
+    EPERM: -1
+  };
+
   function fsError(code, syscall, path) {
     var err = new Error(code + ': ' + DESCRIPTIONS[code] + ', ' + syscall + " '" + path + "'");
-    err.errno = code === 'ENOENT' ? -2 : -1;
+    err.errno = ERRNOS[code] === undefined ? -1 : ERRNOS[code];
     err.code = code;
     err.syscall = syscall;
     err.path = path;
@@ -1549,7 +1566,8 @@ BF.fs = function () {
   fs.realpathSync = function (p) {
     var file = toPathString(p);
     var resolved = realPathOf(file);
-    if (!statOf(resolved)) throw fsError('ENOENT', 'realpath', file);
+    /* A host reaches the missing name through lstat, and it is lstat it names in the error. */
+    if (!statOf(resolved)) throw fsError('ENOENT', 'lstat', file);
     return resolved;
   };
 
