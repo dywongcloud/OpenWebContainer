@@ -105,6 +105,34 @@ export const SRC = String.raw`
     code: { get: function () { return domFieldOf(this, 'code'); }, enumerable: true, configurable: true }
   });
   /*
+   * The 25 legacy code constants the DOM spec names -- INDEX_SIZE_ERR = 1 through DATA_CLONE_ERR = 25
+   * -- are value properties of the prototype and of nothing else, which is where host node 24.15 puts
+   * them: writable false, enumerable true, configurable false, so a for-in over the prototype, or
+   * over any instance, walks 28 names and Object.keys(DOMException.prototype) is 28 long, where this
+   * prototype carried 3 and every one of them read undefined. They are the codes a DOMException of
+   * the matching name answers -- the same numbers LEGACY_CODES hands an instance -- plus the two no
+   * name carries any more, DOMSTRING_SIZE_ERR and NO_DATA_ALLOWED_ERR, whose errors the spec dropped
+   * and whose numbers it kept. Nothing on the instance changes: no instance gains an own name, so
+   * Object.getOwnPropertyNames(new DOMException('d', 'AbortError')) is still ['stack'], and nothing
+   * that reads a DOMException by its own names -- util.inspect's header first among them -- sees one
+   * more than it did, which is why the report the last row on this file fixed still opens with
+   * 'DOMException [AbortError]: d'.
+   */
+  var LEGACY_CONSTANTS = {
+    INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3, WRONG_DOCUMENT_ERR: 4,
+    INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6, NO_MODIFICATION_ALLOWED_ERR: 7,
+    NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9, INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11,
+    SYNTAX_ERR: 12, INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+    VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18, NETWORK_ERR: 19, ABORT_ERR: 20,
+    URL_MISMATCH_ERR: 21, QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24,
+    DATA_CLONE_ERR: 25
+  };
+  var LEGACY_DESCS = {};
+  Object.keys(LEGACY_CONSTANTS).forEach(function (constant) {
+    LEGACY_DESCS[constant] = { value: LEGACY_CONSTANTS[constant], writable: false, enumerable: true, configurable: false };
+  });
+  Object.defineProperties(DOMException.prototype, LEGACY_DESCS);
+  /*
    * The tag is the one thing a host DOMException carries that a plain Error does not, and it is
    * what Object.prototype.toString.call(new DOMException('d', 'AbortError')) reads to answer
    * '[object DOMException]' and not '[object Error]', as it does on host node 24.15. Host node
