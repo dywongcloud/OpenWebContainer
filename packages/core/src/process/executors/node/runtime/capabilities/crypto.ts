@@ -3743,6 +3743,11 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         if (modulusLength < 1024) {
             throw keyFail(null, 'error:05000072:dsa routines::bad ffc parameters');
         }
+        /* FIPS 186-4 offers a DSA subgroup of 160, 224 or 256 bits and no other width, so any other
+           divisor length never reaches the search: OpenSSL's provider has no parameters to offer. */
+        if (divisorLength !== 160 && divisorLength !== 224 && divisorLength !== 256) {
+            throw keyFail(null, 'error:030000E9:digital envelope routines::provider keymgmt failure');
+        }
         const ints = generateDsa(modulusLength, Number(divisorLength));
         const size = modulusSize(ints.p as bigint);
         return {
@@ -3759,8 +3764,9 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         if (typeof primeLength !== 'number') {
             throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.primeLength" property must be of type number. Received ' + receivedLike(primeLength), 'TypeError');
         }
-        /* OpenSSL's own floor for a DH modulus, and the uncoded error it answers below it. */
-        if (!Number.isInteger(primeLength) || primeLength < 16) {
+        /* OpenSSL's own floor for a DH modulus, and the uncoded error it answers below it: a DH
+           group needs 512 bits, which is where Node's own 'modulus too small' boundary sits. */
+        if (!Number.isInteger(primeLength) || primeLength < 512) {
             throw keyFail(null, 'error:0280007E:Diffie-Hellman routines::modulus too small');
         }
         const ints = generateDh(primeLength, options?.generator === undefined || options?.generator === null ? 2n : BigInt(String(options?.generator)));

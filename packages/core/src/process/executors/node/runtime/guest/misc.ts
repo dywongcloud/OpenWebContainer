@@ -2475,6 +2475,22 @@ BF.crypto = function () {
     }
     var opts = options;
     var format = opts.format;
+    /*
+     * Node asks for the type of an asymmetric export and will not guess one: a public key exports
+     * as 'spki' or, when it is an RSA key, 'pkcs1', and a private one as 'pkcs8' or 'pkcs1'. Any
+     * other name -- including no type at all -- is the property error Node gives, and 'pkcs1' on a
+     * key that is not RSA names the encoding instead. A JWK export carries no type: Node ignores it.
+     */
+    if (format !== 'jwk') {
+      var allowed = state.type === 'private' ? ['pkcs8', 'pkcs1'] : ['spki', 'pkcs1'];
+      if (allowed.indexOf(opts.type) < 0) throw invalidArgValue('options.type', opts.type);
+      var kind = opts.type === 'pkcs1' ? keyInfo(this).asymmetricKeyType : undefined;
+      if (opts.type === 'pkcs1' && kind !== 'rsa' && kind !== 'rsa-pss') {
+        var unusable = new Error('The selected key encoding pkcs1 can only be used for RSA keys.');
+        unusable.code = 'ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS';
+        throw unusable;
+      }
+    }
     var result = cryptoCap('crypto.key.export', { id: state.id, format: format, type: opts.type });
     if (format === 'jwk') return result.jwk;
     /* A PEM export is text on Node, and a DER one is bytes: only the latter comes back as a Buffer. */
@@ -2606,12 +2622,25 @@ BF.crypto = function () {
     };
   }
 
+  /*
+   * A secret KeyObject carries no asymmetric half, so a sign, a verify, an RSA cipher or a
+   * Diffie-Hellman exchange cannot use one and Node says which half it wanted instead of going on
+   * to a host that has no id to work with: 'expected private.' where only the private half will
+   * do, and 'expected private or public.' where either asymmetric half would.
+   */
+  function noAsymmetricHalf(want) {
+    var err = new TypeError('Invalid key object type secret, expected ' + (want === 'private' ? 'private.' : 'private or public.'));
+    err.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
+    return err;
+  }
+
   /* Any key form -- KeyObject, PEM, DER, JWK or a {key, ...} wrapper -- as a handle the host signs with. */
   function keyIdOf(key, want) {
     /* A {key, dsaEncoding} wrapper around a KeyObject: the encoding rides along, the key is inside. */
     if (key !== null && typeof key === 'object' && !isKeyObject(key) && Object.prototype.hasOwnProperty.call(key, 'key')) {
       var inner = keyStateOf(key.key, 'key');
       if (inner !== undefined) {
+        if (inner.type === 'secret') throw noAsymmetricHalf(want);
         if (inner.id === undefined) throw invalidArgType('key', 'an instance of KeyObject', key.key);
         if (want === 'public' && inner.type === 'private') return cryptoCap('crypto.key.public', { id: inner.id }).id;
         return inner.id;
@@ -2619,6 +2648,7 @@ BF.crypto = function () {
     }
     var state = keyStateOf(key, 'key');
     if (state !== undefined) {
+      if (state.type === 'secret') throw noAsymmetricHalf(want);
       if (state.id === undefined) throw invalidArgType('key', 'an instance of KeyObject', key);
       if (want === 'public' && state.type === 'private') return cryptoCap('crypto.key.public', { id: state.id }).id;
       return state.id;
@@ -2837,6 +2867,14 @@ BF.crypto = function () {
 
   /* sign and verify without a streaming object: one call over the same capability. */
   function signOne(algorithm, data, key, callback) {
+    /*
+     * The fourth argument is the callback and nothing else, and Node insists it be a function
+     * before it reads anything else -- before the algorithm, the data and the key -- so a string
+     * there is a type error naming 'callback' and never an encoding for the signature.
+     */
+    if (callback !== undefined && typeof callback !== 'function') {
+      throw invalidArgType('callback', 'of type function', callback);
+    }
     /* Node names the arguments in the order it reads them: the data, then the key. */
     var algo = algorithmOf(algorithm);
     var bytes = toBytes(data, undefined, 'data').toString('base64');
@@ -2878,6 +2916,14 @@ BF.crypto = function () {
   }
 
   function verifyOne(algorithm, data, key, signature, callback) {
+    /*
+     * The fifth argument is the callback and nothing else, and Node asks for it first -- before the
+     * algorithm, the data, the key and the signature -- so an options object there is a type error
+     * naming 'callback', not a second way to name a dsaEncoding.
+     */
+    if (callback !== undefined && typeof callback !== 'function') {
+      throw invalidArgType('callback', 'of type function', callback);
+    }
     var algo = algorithmOf(algorithm);
     var bytes = verifyDataBytes(data).toString('base64');
     /*
@@ -2887,14 +2933,6 @@ BF.crypto = function () {
      */
     var opts = keyOptionsOf(key);
     var sig = signatureBytes(signature).toString('base64');
-    /*
-     * The fifth argument is the callback and nothing else: Node reads the data, the key and the
-     * signature first, and only then insists that a fifth argument be a function -- so an options
-     * object there is a type error naming 'callback', not a second way to name a dsaEncoding.
-     */
-    if (callback !== undefined && typeof callback !== 'function') {
-      throw invalidArgType('callback', 'of type function', callback);
-    }
     var answer = cryptoCap('crypto.key.verify', {
       id: keyIdOf(key, 'public'),
       algorithm: algo,
@@ -3098,17 +3136,9 @@ BF.crypto = function () {
      * either asymmetric type, and says so.
      */
     var privateState = keyStateOf(opts.privateKey, 'key');
-    if (privateState !== undefined && privateState.type === 'secret') {
-      var wrong = new TypeError('Invalid key object type secret, expected private.');
-      wrong.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
-      throw wrong;
-    }
+    if (privateState !== undefined && privateState.type === 'secret') throw noAsymmetricHalf('private');
     var publicState = keyStateOf(opts.publicKey, 'key');
-    if (publicState !== undefined && publicState.type === 'secret') {
-      var bad = new TypeError('Invalid key object type secret, expected private or public.');
-      bad.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
-      throw bad;
-    }
+    if (publicState !== undefined && publicState.type === 'secret') throw noAsymmetricHalf('public');
     return Buf.from(cryptoCap('crypto.dh.ecdh', {
       private: keyIdOf(opts.privateKey, 'private'),
       public: keyIdOf(opts.publicKey, 'public')
@@ -3173,7 +3203,13 @@ BF.crypto = function () {
     if (state === undefined) {
       return toBytes(key, undefined, 'key', 'string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey');
     }
-    if (state.type !== 'secret') throw asymmetricUnavailable('createHmac');
+    /* An Hmac takes a secret key and nothing else: Node names the type the key has and the one it
+       wanted, where a runtime with no asymmetric key material at all would answer its own refusal. */
+    if (state.type !== 'secret') {
+      var wrong = new TypeError('Invalid key object type ' + state.type + ', expected secret.');
+      wrong.code = 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE';
+      throw wrong;
+    }
     return state.bytes;
   }
 
