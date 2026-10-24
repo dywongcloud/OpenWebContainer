@@ -1080,15 +1080,23 @@ if (!Error.captureStackTrace) {
     }
     /* The constructor the host is asked to stop at: everything from the topmost frame of that
        constructor down is the caller's own, so it and what is above it are dropped, the way
-       http-errors and every package that hands its own constructor here expects. */
-    if (typeof constructorOpt === 'function' && constructorOpt.name) {
+       http-errors and every package that hands its own constructor here expects. V8 walks the
+       captured frames for that one function and stops there when it finds it -- and drops every
+       frame there is when it does not, which is what a constructor that is not on the stack at all
+       names: an anonymous function handed straight to the call, the shape an assertion library uses
+       to hide its own frames, leaves a host with the header alone. */
+    if (typeof constructorOpt === 'function') {
       var own = constructorOpt.name;
-      for (var c = 0; c < frames.length; c++) {
-        if (frames[c].indexOf('at new ' + own + ' (') >= 0 || frames[c].indexOf('at ' + own + ' (') >= 0) {
-          frames = frames.slice(c + 1);
-          break;
+      var at = -1;
+      if (own) {
+        for (var c = 0; c < frames.length; c++) {
+          if (frames[c].indexOf('at new ' + own + ' (') >= 0 || frames[c].indexOf('at ' + own + ' (') >= 0) {
+            at = c;
+            break;
+          }
         }
       }
+      frames = at >= 0 ? frames.slice(at + 1) : [];
     }
     if (typeof keepPrepare === 'function') {
       target.stack = keepPrepare(target, frames.map(makeCallSite));

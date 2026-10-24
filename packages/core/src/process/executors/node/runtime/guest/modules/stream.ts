@@ -3761,24 +3761,56 @@ function owcBuildStreamCore() {
     return argTypeError(what, 'an instance of ' + what, value);
   }
 
+  /* Node bridges a readable to the web with its flowing mode and not with its async iterator: a
+     'data' listener enqueues ONE web chunk per chunk the readable emits, pull resumes the readable,
+     and a pause once the web queue is full stops it again. The iterator hands a pull whatever the
+     readable has buffered, which under a consumer slower than the producer is every chunk pushed
+     since the last pull coalesced into one -- 5 web chunks here against the host's 30, and 6
+     against 300 -- so a web consumer saw fewer, larger chunks than any host gives it, and one that
+     counts records, splits lines or parses NDJSON over a web stream read a different stream. */
   Readable.toWeb = function (stream) {
     if (typeof ReadableStream !== 'function') throw webStreamsMissing('ReadableStream', stream);
-    var it = createReadableIterator(stream, null);
     var objectMode = !!(stream && stream._readableState && stream._readableState.objectMode);
-    var ended = false;
+    var controller = null;
+    var settled = false;
+
+    function detach() {
+      offListener(stream, 'data', onData);
+      offListener(stream, 'end', onEnd);
+      offListener(stream, 'error', onError);
+    }
+    function onData(chunk) {
+      if (settled || controller === null) return;
+      controller.enqueue(webChunkOf(chunk, objectMode));
+      /* The web queue is full: stop the readable until the consumer asks for more, which is what
+         Node's own adapter does on a desiredSize that has run out. */
+      if (controller.desiredSize <= 0) stream.pause();
+    }
+    function onEnd() {
+      if (settled || controller === null) return;
+      settled = true;
+      detach();
+      controller.close();
+    }
+    function onError(err) {
+      if (settled || controller === null) return;
+      settled = true;
+      detach();
+      controller.error(err);
+    }
+
+    stream.on('data', onData);
+    stream.on('end', onEnd);
+    stream.on('error', onError);
+    stream.pause();
+
     return new ReadableStream({
-      pull: function (controller) {
-        return it.next().then(function (step) {
-          if (step.done) {
-            ended = true;
-            controller.close();
-            return;
-          }
-          controller.enqueue(webChunkOf(step.value, objectMode));
-        }, function (err) { controller.error(err); });
-      },
-      cancel: function () {
-        if (!ended && typeof it.return === 'function') it.return();
+      start: function (c) { controller = c; },
+      pull: function () { stream.resume(); },
+      cancel: function (reason) {
+        settled = true;
+        detach();
+        if (!stream.destroyed && typeof stream.destroy === 'function') stream.destroy(reason);
         return undefined;
       }
     });
