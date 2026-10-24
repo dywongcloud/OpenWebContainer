@@ -1065,6 +1065,20 @@ export const SRC = String.raw`
     };
   }
 
+  /* A resource that stands on its own rather than running as a callback -- a pipe, which a caller
+     opens and closes when it likes -- is not something to wrap a function in: node reports its init
+     when it is made and its destroy when it is closed, and nothing at all while no hook is enabled,
+     which is what the null a caller gets back means. */
+  function asyncOpenResource(type, resource) {
+    if (!asyncHooksLive()) return null;
+    var id = ++asyncIdCounter;
+    var triggerId = currentExecId;
+    asyncEmit('init', [id, type, triggerId, resource === undefined ? {} : resource]);
+    return function asyncCloseResource() {
+      asyncEmit('destroy', [id]);
+    };
+  }
+
   /* A promise reaction: node reports the resolve once, when the promise settles, and then the
      before and after of the reaction it runs. */
   function asyncReaction(fn, frame, promiseId, triggerId) {
@@ -1349,6 +1363,16 @@ export const SRC = String.raw`
     };
     ASYNC_CONTEXT.run = function (token, fn) {
       return runWithFrame(token, fn, undefined, []);
+    };
+    /* The two the rest of the runtime reports through: the fs requests buffer-fs settles and the
+       pipes globals builds are resources this module has never heard of, so they are made through
+       these rather than by any symbol of it. Both stay null until a hook is enabled, which is what
+       keeps an ordinary fs call or stdio read from paying for a resource nobody is watching. */
+    ASYNC_RESOURCE.wrap = function (type, fn, destroy) {
+      return asyncWrapScheduled(type, fn, destroy);
+    };
+    ASYNC_RESOURCE.open = function (type, resource) {
+      return asyncOpenResource(type, resource);
     };
     return {
       AsyncLocalStorage: AsyncLocalStorage,

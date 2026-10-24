@@ -1258,6 +1258,19 @@ BF.fs = function () {
 
   var fs = {};
 
+  /*
+   * A file request on host node 24.15 is its own async resource -- FSREQCALLBACK -- and node makes it
+   * when the call is made, runs the callback inside a before and after pair, and destroys it once the
+   * callback has settled: a hook hears init, before, after and destroy in that order, and
+   * executionAsyncId() inside the callback reads the request's own id. settleIO stands in for the
+   * round trip the request costs here, so the callback handed to it is the request's completion and
+   * the resource goes around that. It costs nothing until a hook is enabled, which is the only time
+   * asyncWrapResource hands back anything but the function it was given.
+   */
+  function settleRequest(fn, later) {
+    return settleIO(asyncWrapResource('FSREQCALLBACK', fn, true), later);
+  }
+
   fs.readFileSync = function (p, opts) {
     var file = toPathString(p);
     /* The file a read opens is the one the link names, not the link: its type and its access bits
@@ -2419,7 +2432,7 @@ BF.fs = function () {
     stream.bytesRead = 0;
     if (options.encoding) stream.setEncoding(options.encoding);
     // like Node, the file is opened when the stream is created: a missing file is an 'error' even with no reader
-    settleIO(function () {
+    settleRequest(function () {
       if (!statFollowingLinks(file)) {
         stream.destroy(fsError('ENOENT', 'open', file));
         return;
@@ -2438,7 +2451,7 @@ BF.fs = function () {
        * reader in the poll phase of the turn after the one the stream was made in, so an immediate
        * armed with the stream runs before any of it ('ideI' on host node 24.15).
        */
-      settleIO(function () {
+      settleRequest(function () {
         if (!wantsRead) return;
         wantsRead = false;
         /* the read that was turned away is still owed, and it is owed outside the turn that asked:
@@ -2551,7 +2564,7 @@ BF.fs = function () {
        mode forbids is an 'error' then, so a caller waiting on 'error' or 'open' is answered instead
        of left waiting on a stream that never opens. A stream over a descriptor has nothing to open,
        because the caller opened it, but the events a caller waits on are still 'open' and 'ready'. */
-    settleIO(function () {
+    settleRequest(function () {
       try {
         if (onFd === null) {
           if (flags.charAt(0) === 'w') fs.writeFileSync(file, '');
@@ -2566,7 +2579,7 @@ BF.fs = function () {
       stream.emit('ready');
       /* the writes the open was waited for: answered in the turn after it, as the file's own
          requests are, so a caller's 'close' follows the immediate armed with the stream */
-      settleIO(function () {
+      settleRequest(function () {
         var queued = waiting;
         waiting = [];
         for (var i = 0; i < queued.length; i++) writeChunk(queued[i][0], queued[i][1], queued[i][2]);
@@ -3129,7 +3142,7 @@ BF.fs = function () {
       } catch (err) {
         error = err;
       }
-      settleIO(function () {
+      settleRequest(function () {
         if (error) cb(error);
         else cb(null, result);
       }, contentCost(syncName, error));
@@ -3157,7 +3170,7 @@ BF.fs = function () {
             else resolve(result);
             return;
           }
-          settleIO(function () {
+          settleRequest(function () {
             if (error) reject(error);
             else resolve(result);
           }, true);

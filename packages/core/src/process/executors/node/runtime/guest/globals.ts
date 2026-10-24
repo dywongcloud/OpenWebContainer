@@ -994,11 +994,46 @@ function makeStdioStream(fd, writeText) {
     return stream;
 }
 /*
+ * The async_hooks capability fills these two in when it loads, and nothing in this file knows that
+ * module exists until then. A resource this runtime makes for itself is reported by the code that
+ * makes it -- the pipes below, and the file requests buffer-fs settles -- and not by the hook that
+ * hears of it, so both are reached through here. They are null while no hook is enabled, and a null
+ * costs its caller nothing: an fs call or a stdio read made before async_hooks loads is the call it
+ * always was.
+ */
+var ASYNC_RESOURCE = { wrap: null, open: null };
+/* A callback that runs as a resource of a given type: init when it is made, before and after around
+ *  it, and -- when destroy is set -- destroy once it has settled. */
+function asyncWrapResource(type, fn, destroy) {
+    if (ASYNC_RESOURCE.wrap === null || typeof fn !== 'function') return fn;
+    return ASYNC_RESOURCE.wrap(type, fn, destroy);
+}
+/* A resource of a given type that stands until its caller closes it. Null when there is no hook to
+ *  hear it, which is the answer that leaves the caller with nothing to close. */
+function asyncOpenResource(type, resource) {
+    if (ASYNC_RESOURCE.open === null) return null;
+    return ASYNC_RESOURCE.open(type, resource);
+}
+
+/*
  * Read lazily, as process.stdin already is: the stream module registers its builtin after this file
  * runs, and a stream built before that would keep the local chain for the life of the process.
  */
 function stdioOf(which, build) {
-    if (which === null) which = build();
+    if (which === null) {
+        which = build();
+        /*
+         * A host's process.stdout and process.stderr are the pipe node wrapped the descriptor in --
+         * PIPEWRAP, which is what a run whose output is not a terminal is given -- and node reports
+         * it when the stream is made, which is the first time a program reads either one, exactly as
+         * lazily as this container builds it. It is destroyed when the pipe closes, which for a
+         * stdio stream is the end of the process.
+         */
+        if (which !== null && typeof which.once === 'function') {
+            var closePipe = asyncOpenResource('PIPEWRAP', which);
+            if (closePipe !== null) which.once('close', closePipe);
+        }
+    }
     /* Rebased on every read until it takes: the first read can be a bootstrap-time one, before the
        stream module has registered its builtin, and a chain left local then is local forever. */
     if (!stdioChainLinked) linkStdioChain();
@@ -1131,6 +1166,10 @@ function stdinOf() {
     });
     /* fd 0, the descriptor a process reads its input from, whether anything is fed through it. */
     stdinStream.fd = 0;
+    /* The same pipe stdout and stderr are, reported the same way: fd 0 is a pipe on a run a parent
+       started with one, and a stream built here is built the first time a program reads it. */
+    var closeStdin = asyncOpenResource('PIPEWRAP', stdinStream);
+    if (closeStdin !== null) stdinStream.once('close', closeStdin);
     // as on stdout: a stream with no terminal behind it reports neither isTTY nor columns
     // text in, text out: a pushed chunk reaches a reader as the string it was written as
     stdinStream.setEncoding('utf8');
