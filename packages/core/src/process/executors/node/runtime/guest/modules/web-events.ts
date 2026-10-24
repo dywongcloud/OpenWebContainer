@@ -85,8 +85,19 @@ export const SRC = String.raw`
     return key === 'name' ? 'Error' : (key === 'code' ? 0 : '');
   }
 
+  /*
+   * The two parameters carry default values, which is what host node 24.15 declares --
+   * 'constructor(message = '', options = 'Error')' -- and which is the only reason the arity a
+   * DOMException answers is 0: Function.length counts the parameters before the first one with a
+   * default, so a constructor that reads 'constructor(message, name)' answers 2 where the host
+   * answers 0, both on DOMException.length and on DOMException.prototype.constructor.length, which
+   * is the same binding. A program that reads Function.length to decide how many arguments to pass,
+   * or that builds a wrapper with the arity of the thing it wraps, is told two here and one there.
+   * The defaults are the values the body already fell back to, so every call still lands where it
+   * did: an argument left out was undefined, and undefined takes the default.
+   */
   class DOMException extends Error {
-    constructor(message, name) {
+    constructor(message = '', name = 'Error') {
       var text = message === undefined ? '' : String(message);
       var given = name === undefined ? 'Error' : String(name);
       /* The engine is handed the message so the stack it captures opens with it -- 'AbortError: d',
