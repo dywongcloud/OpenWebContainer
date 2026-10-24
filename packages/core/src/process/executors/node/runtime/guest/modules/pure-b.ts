@@ -2511,13 +2511,20 @@ export const SRC = String.raw`
    * stdin is opened rather than ended, so what the terminal sends reaches it; closing the REPL --
    * the .exit keyword, or the end of the input -- ends the process, as it does in Node.
    */
-  api.startRepl = function () {
+  api.startRepl = function (terminal) {
     var proc = globalThis.process;
+    /* The two lines a host node writes above its first prompt, and the version it names is the one
+       this node answers --version with. They are written here rather than in node:repl because
+       they belong to the session a node starts, not to the repl a script starts itself. */
+    proc.stdout.write('Welcome to Node.js ' + proc.version + '.\n' +
+      'Type ".help" for more information.\n');
     var server = requireBuiltin('repl').start({
       input: api.openStdin(),
       output: proc.stdout,
       prompt: '> ',
-      terminal: true
+      /* A session a pipe feeds is not a terminal one, and it writes back nothing of what it read:
+         nothing typed it, so an echo would be characters nobody sent. */
+      terminal: terminal !== false
     });
     server.on('exit', function () { host.exit(0); });
     return true;
@@ -2669,6 +2676,10 @@ export const SRC = String.raw`
       this._closed = false;
       this._detach = null;
       this._rl = null;
+      /* A line that awaits is still being answered when the next one arrives, so what arrives
+         waits here until the value it is waiting for has been printed. */
+      this._awaitPending = false;
+      this._awaitQueue = [];
       /* The names this session has bound at its top level: _lexical the ones a let, a const or a
          class made, and _bound every one of them, which is what a second declaration is checked
          against -- node's context refuses a name it already holds, and the rewrite that keeps a
@@ -2710,7 +2721,16 @@ export const SRC = String.raw`
     };
 
     REPLServer.prototype.displayPrompt = function () {
+      /* A session that has closed does not prompt again, which is why a value a .exit waited for
+         is the last thing on its output: the prompt belongs to a line that will never be read. */
+      if (this._closed) return;
       this._writeOut(this._buffer !== '' ? '| ' : this._prompt);
+    };
+    /* The same, for a close that has been asked for but not finished: a .exit defers the close to
+       a turn of its own, and a prompt written before that turn would outlive the session. */
+    REPLServer.prototype.displayPromptAfter = function () {
+      if (this._closeScheduled === true) return;
+      this.displayPrompt();
     };
 
     REPLServer.prototype.prompt = function () {
@@ -2849,12 +2869,22 @@ export const SRC = String.raw`
       if (this._awaitValue === true && isObjectLike(result) && typeof result.then === 'function') {
         var repl = this;
         this._awaitValue = false;
+        /* A line that awaits is not done when the prompt comes back: the value it waits for is
+           what the session prints, and Node reads no further line until it has. So the lines that
+           arrive behind it wait here, and a .exit among them still sees its value printed. */
+        this._awaitPending = true;
         result.then(function (value) {
+          repl._awaitPending = false;
           repl._showResult(replUnwrapAwait(value));
-          repl.displayPrompt();
+          /* What waited for this value is read before the prompt is written, so a .exit among it
+             has closed the session by then and no prompt follows the value it waited for. */
+          repl._readAwaitQueue();
+          repl.displayPromptAfter();
         }, function (err) {
+          repl._awaitPending = false;
           repl._writeOut('Uncaught ' + replErrorHeader(err) + '\n');
-          repl.displayPrompt();
+          repl._readAwaitQueue();
+          repl.displayPromptAfter();
         });
         return true;
       }
@@ -2862,11 +2892,23 @@ export const SRC = String.raw`
       return false;
     };
 
+    REPLServer.prototype._readAwaitQueue = function () {
+      if (this._closed) return;
+      var queue = this._awaitQueue;
+      this._awaitQueue = [];
+      for (var i = 0; i < queue.length; i++) this._onLine(queue[i]);
+    };
+
     REPLServer.prototype._onLine = function (line) {
       if (this._closed) return;
       this.line = '';
       var trimmed = line.replace(/^\s+/, '');
       if (this._buffer === '' && /^\.[A-Za-z_]/.test(trimmed)) {
+        /* A keyword that arrives while a line is still awaiting waits for it: host node prints
+           the value it is waiting for before it closes the session on a .exit, and a session
+           that ends first would never print it. An ordinary line does not wait -- host node
+           reads on, and the value is written where it falls, behind the lines that came after. */
+        if (this._awaitPending === true) { this._awaitQueue.push(line); return; }
         var m = /^\.(\S+)\s*([\s\S]*)$/.exec(trimmed);
         var name = m[1];
         var args = m[2].replace(/\s+$/, '');
@@ -3179,8 +3221,14 @@ export const SRC = String.raw`
 
     function addTest(args) {
       var parts = partsOf(args);
+      /* skip and todo take a reason as well as a true: a string is the reason the report names
+         behind the mark, and skip: false is the one value that is not a skip at all. */
+      var skip = parts.options.skip === true ? true : typeof parts.options.skip === 'string' ? parts.options.skip
+        : parts.options.skip === false ? false : parts.options.skip === undefined ? false : Boolean(parts.options.skip);
+      var todo = parts.options.todo === true ? true : typeof parts.options.todo === 'string' ? parts.options.todo
+        : parts.options.todo === false ? false : parts.options.todo === undefined ? false : Boolean(parts.options.todo);
       var item = { kind: 'test', name: parts.name || '<anonymous>', fn: parts.fn, options: parts.options,
-        skip: parts.options.skip === true, todo: parts.options.todo === true,
+        skip: skip, todo: todo,
         only: parts.options.only === true, expectFailure: parts.options.expectFailure === true, hooks: [] };
       cursor.items.push(item);
       schedule();
@@ -3306,16 +3354,25 @@ export const SRC = String.raw`
        tick and '# TODO', and one its author said must fail carries '# EXPECTED FAILURE' whichever
        way it went. */
     function expectedSuffix(item) { return item.expectFailure === true ? ' # EXPECTED FAILURE' : ''; }
+    /* The word behind the mark: the reason the test's author wrote, when one was written, and
+       node's own word otherwise. A test that decided to skip or to todo while it ran has no
+       reason of its own, so it gets node's. */
+    function markSuffix(kind, value) {
+      return typeof value === 'string' && value !== '' ? ' # ' + value
+        : kind === 'skip' ? ' # SKIP' : ' # TODO';
+    }
     function lineOk(item, pad, at) { line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ')' + expectedSuffix(item)); }
     function lineNo(item, pad, at) { line(pad + '✖ ' + item.name + ' (' + durationOf(at) + ')' + expectedSuffix(item)); }
-    function lineSkipped(item, pad, at) { line(pad + '﹣ ' + item.name + ' (' + durationOf(at) + ') # SKIP'); }
-    function lineTodo(item, pad, at) { line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ') # TODO'); }
+    /* A todo is not a pass and not a fail, and node marks it with the warning sign rather than
+       with the tick a pass gets. */
+    function lineSkipped(item, pad, at) { line(pad + '﹣ ' + item.name + ' (' + durationOf(at) + ')' + markSuffix('skip', item.skip)); }
+    function lineTodo(item, pad, at) { line(pad + '⚠ ' + item.name + ' (' + durationOf(at) + ')' + markSuffix('todo', item.todo)); }
 
     function runTest(item, ancestors, depth, tailAfter) {
       var pad = new Array(depth + 1).join('  ');
-      if (item.skip === true || item.todo === true) {
+      if (item.skip !== false || item.todo !== false) {
         var at0 = Date.now();
-        if (item.todo === true) { todos += 1; lineTodo(item, pad, at0); }
+        if (item.todo !== false) { todos += 1; lineTodo(item, pad, at0); }
         else { skipped += 1; lineSkipped(item, pad, at0); }
         return Promise.resolve();
       }

@@ -46,6 +46,10 @@ export interface NodeCommand {
     inputType?: string;
     /** `--title=<name>`: what `process.title` reads, and what the process is named to the system. */
     title?: string;
+    /** `-i`/`--interactive`: the line asked for a REPL even where stdin is not a terminal. */
+    interactive?: boolean;
+    /** `--test`: the line asked for the test runner, which finds the files to run when none is named. */
+    test?: boolean;
     /** The answer for a run that never reaches the guest; set exactly when `file` is `[flags]`. */
     flagAnswer?: NodeFlagAnswer;
 }
@@ -57,10 +61,61 @@ export interface NodeRunOptions {
     evalScript?: string;
     inputType?: string;
     title?: string;
+    interactive?: boolean;
+    test?: boolean;
 }
 
 /** The status node exits with when it refuses its own arguments. */
 const BAD_OPTION_EXIT = 9;
+
+/**
+ * The program `node --test` runs when the line names no file: the runner's own search, and a
+ * `require` of everything it found, in the order it found them. The search is node's own -- a file
+ * whose name carries `.test`, `-test` or `_test` before its extension, one named `test.<ext>`, one
+ * under a directory named `test`, and no `node_modules` anywhere in it -- and it is written as a
+ * source rather than as a list so that what runs it is the guest the tests will run on, which is
+ * also the only thing here that can read the container's files.
+ *
+ * One run of the runner reports every file it was given, which is why the files are required and
+ * not run one after another: a report per file is a report node does not print.
+ */
+export const NODE_TEST_DISCOVERY_SOURCE = [
+    'var __fs = require("fs"), __path = require("path");',
+    'var __found = [];',
+    'function __isTest(name) {',
+    '  return /\\.test\\.[cm]?js$/.test(name) || /[-_]test\\.[cm]?js$/.test(name) ||',
+    '    /^test[-_][^\\/]*\\.[cm]?js$/.test(name) || /^test\\.[cm]?js$/.test(name);',
+    '}',
+    'function __walk(dir, underTest) {',
+    '  var names;',
+    '  try { names = __fs.readdirSync(dir); } catch (e) { return; }',
+    '  names.sort();',
+    '  for (var i = 0; i < names.length; i++) {',
+    '    var full = __path.join(dir, names[i]);',
+    '    var isDir = false;',
+    '    try { isDir = __fs.statSync(full).isDirectory(); } catch (e) { continue; }',
+    '    if (isDir) {',
+    '      if (names[i] === "node_modules") continue;',
+    '      __walk(full, underTest || names[i] === "test");',
+    '    } else if (__isTest(names[i]) || (underTest && /\\.[cm]?js$/.test(names[i]))) {',
+    '      __found.push(full);',
+    '    }',
+    '  }',
+    '}',
+    '__walk(process.cwd(), false);',
+    'if (__found.length === 0) {',
+    '  console.log("\\u2139 tests 0");',
+    '  console.log("\\u2139 suites 0");',
+    '  console.log("\\u2139 pass 0");',
+    '  console.log("\\u2139 fail 0");',
+    '  console.log("\\u2139 cancelled 0");',
+    '  console.log("\\u2139 skipped 0");',
+    '  console.log("\\u2139 todo 0");',
+    '  console.log("\\u2139 duration_ms 0");',
+    '} else {',
+    '  for (var __i = 0; __i < __found.length; __i++) require(__found[__i]);',
+    '}'
+].join('\n');
 
 /**
  * What node writes when `--print` is asked for a source it reads as an ES module: printing the
@@ -116,7 +171,7 @@ const BOOLEAN_LONG_OPTIONS = new Set((
     '--perf-basic-prof --perf-basic-prof-only-functions --perf-prof --perf-prof-unwinding-info ' +
     '--permission --preserve-symlinks --preserve-symlinks-main --prof --report-compact ' +
     '--report-exclude-env --report-exclude-network --report-on-fatalerror --report-on-signal ' +
-    '--report-uncaught-exception --require-module --strip-types --test-force-exit --test-only ' +
+    '--report-uncaught-exception --require-module --strip-types --test --test-force-exit --test-only ' +
     '--test-udp-no-try-send --test-update-snapshots --throw-deprecation --tls-max-v1.2 ' +
     '--tls-max-v1.3 --tls-min-v1.0 --tls-min-v1.1 --tls-min-v1.2 --tls-min-v1.3 ' +
     '--trace-deprecation --trace-env --trace-env-js-stack --trace-env-native-stack --trace-exit ' +
@@ -151,7 +206,7 @@ const VALUED_LONG_OPTIONS = new Set((
     '--network-family-autoselection-attempt-timeout --openssl-config --prof-process ' +
     '--redirect-warnings --report-dir --report-directory --report-filename --report-signal ' +
     '--require --run --secure-heap --secure-heap-min --security-revert --security-reverts ' +
-    '--snapshot-blob --stack-size --test --test-concurrency --test-coverage-branches ' +
+    '--snapshot-blob --stack-size --test-concurrency --test-coverage-branches ' +
     '--test-coverage-exclude ' +
     '--test-coverage-functions --test-coverage-include --test-coverage-lines ' +
     '--test-global-setup --test-isolation --test-name-pattern --test-reporter ' +
@@ -260,6 +315,10 @@ export function nodeCommand(args: string[]): NodeCommand {
     let evalSeen = false;
     /** `--input-type=<type>`: how the source behind `-e`/`-p` is read. */
     let inputType: string | undefined;
+    /** `-i`/`--interactive`: the line asked for a REPL even where stdin is not a terminal. */
+    let interactive = false;
+    /** `--test`: the line asked for the test runner, which finds the files to run when none is named. */
+    let test = false;
     /** `--title=<name>`: what `process.title` reads once the guest is up. */
     let title: string | undefined;
     /** The options of the line, in node's own words: what `process.execArgv` is. */
@@ -278,6 +337,16 @@ export function nodeCommand(args: string[]): NodeCommand {
             if (name === '--help') { help = true; execArgv.push(arg); continue; }
             if (name === '--check') { check = true; execArgv.push(arg); continue; }
             if (name === '--completion-bash') { completionBash = true; execArgv.push(arg); continue; }
+            if (name === '--interactive') { interactive = true; execArgv.push(arg); continue; }
+            if (name === '--no-interactive') { interactive = false; execArgv.push(arg); continue; }
+            if (name === '--test') {
+                /* `--test` is the one option of node's table that reads a value behind an `=` and
+                   never takes the argument after it: `node --test t.js` runs the file, where a valued
+                   option would have taken the name as its own value and left no file to run at all. */
+                test = true;
+                execArgv.push(arg);
+                continue;
+            }
             if (name === '--input-type') {
                 /* One of the valued options, and the one a run of a source reads: node takes the
                    value behind an `=` or as the next argument, and refuses a line with neither. */
@@ -365,6 +434,12 @@ export function nodeCommand(args: string[]): NodeCommand {
         if (arg === '-v') { version = true; execArgv.push(arg); continue; }
         if (arg === '-h') { help = true; execArgv.push(arg); continue; }
         if (arg === '-c') { check = true; execArgv.push(arg); continue; }
+        if (arg === '-i') {
+            /* `-i` is node's `--interactive`: a REPL whether or not stdin looks like a terminal. */
+            interactive = true;
+            execArgv.push(arg);
+            continue;
+        }
         if (arg === '-r') {
             /* `-r` is node's `--require`: a module to load before the entry. This container loads
                nothing for it, as it loads nothing for any other option of node's, but the line is
@@ -436,7 +511,9 @@ export function nodeCommand(args: string[]): NodeCommand {
         execArgv,
         ...(stackTraceLimit === undefined ? {} : { stackTraceLimit }),
         ...(inputType === undefined ? {} : { inputType }),
-        ...(title === undefined ? {} : { title })
+        ...(title === undefined ? {} : { title }),
+        ...(interactive ? { interactive } : {}),
+        ...(test ? { test } : {})
     };
     /* `--` ends the options: what follows is the script, even where it begins with a dash, so
        `node -- --version` runs the file rather than printing a version. */

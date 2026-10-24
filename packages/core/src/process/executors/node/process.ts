@@ -15,6 +15,7 @@ import { CAPABILITIES } from './runtime/capabilities/index';
 import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbindVmRuntime, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs, syncRunActive } from './pump';
 import type { NodeFlagAnswer, NodeRunOptions } from './flags';
+import { NODE_TEST_DISCOVERY_SOURCE } from './flags';
 import { NODE_VERSION } from './runtime/guest/globals';
 import { CONTAINER_WORKDIR, containerEnv } from '../default-env';
 import type { SyncChildRequest, SyncChildResult } from './pump';
@@ -1415,6 +1416,10 @@ export class NodeProcess extends Process {
     private readonly repl: boolean;
     /** `node -`: the program is what is piped to this process, as it is on the host. */
     private readonly stdinScript: boolean;
+    /** `-i`/`--interactive`: the line asked for a REPL even where stdin is not a terminal. */
+    private readonly interactive: boolean;
+    /** `--test`: the line asked for the test runner, which searches for files when none is named. */
+    private readonly test: boolean;
     /**
      * What the REPL reads: true while the terminal behind it can still be typed at. A `node` a user
      * started from a shell has one; one a program spawned `sh -c 'node'` has none, and neither has
@@ -1542,18 +1547,27 @@ export class NodeProcess extends Process {
         const processEnv = containerEnv(cwd, env);
         super(pid, ProcessType.JAVASCRIPT, executablePath, args, parentPid, cwd, processEnv);
         this.bootModule = bootModule;
-        this.repl = executablePath === '[repl]';
+        this.interactive = run.interactive === true;
+        /* `-i` beside a source is a REPL as well as a run of that source -- host node opens the
+           session and evaluates what the line gave it -- so the sentinel alone is not the whole
+           answer to whether this run is one. A file named on the line is still just a file: host
+           node runs it and starts no session, however many times `-i` was said. */
+        this.repl = executablePath === '[repl]' || (this.interactive && executablePath === '[eval]');
+        /* `--test` with no file named: the runner searches the working directory itself, and a run
+           of a file it found is a run of tests and not of a program the input happens to carry. */
+        if (run.test === true && this.repl && evalSource === undefined) evalSource = NODE_TEST_DISCOVERY_SOURCE;
+        this.test = run.test === true;
         /* A pipe on fd 0 is a writer, not a person: what it carries is a program, or data for one,
            and it ends when the writer closes it. A terminal is the only thing a REPL prompts at. */
         this.stdinFromPipe = env.OWC_STDIN === 'pipe';
-        this.replReadsTerminal = !this.stdinFromPipe && this.parentHasTerminal();
+        this.replReadsTerminal = this.interactive || (!this.stdinFromPipe && this.parentHasTerminal());
         /*
          * A bare `node` nobody is typing at reads its program from what it is given instead, exactly
          * as a host `node` does when its stdin is not a terminal: `echo 'console.log(7)' | node`
          * prints 7, and `node < /dev/null` runs nothing and leaves with status 0. Only a `node` with
          * a terminal behind it prompts, which is what `node -` asks for on any input at all.
          */
-        this.stdinScript = executablePath === '[stdin]' || (this.repl && !this.replReadsTerminal);
+        this.stdinScript = executablePath === '[stdin]' || (this.repl && !this.replReadsTerminal && !this.test);
         /* A piped stdin, a REPL and a `node -` all read what is written to them; a `node -` reads
            the whole program before it runs any of it. */
         this.stdinPiped = env.OWC_STDIN === 'pipe' || this.repl || this.stdinScript;
@@ -2641,6 +2655,13 @@ export class NodeProcess extends Process {
         this.runPreloads();
         let started: void | Promise<void>;
         if (this.evalSource !== undefined) {
+            /* `-i` beside a source is the one line node answers with both: it opens the session
+               first -- banner and prompt -- and what the source writes comes behind them, which is
+               the order `node -i -e <source>` prints them in. */
+            if (this.interactive) {
+                this.startRepl();
+                this.drainJobs();
+            }
             if (this.evalModule) {
                 this.runEsmEval(this.evalSource);
                 started = this.drainJobs();
@@ -2692,7 +2713,11 @@ export class NodeProcess extends Process {
      */
     private startRepl(): void {
         this.holdRef(1);
-        this.callApi('startRepl', []).dispose();
+        /* A REPL driven by a pipe is not a terminal one, and host node says so too: `node -i` with
+           a program on its input prints no echo of what it read, because nothing typed it. Only a
+           session with a terminal behind it writes back what arrives. */
+        const terminal = this.parentHasTerminal();
+        this.callApi('startRepl', [terminal ? this.context!.true : this.context!.false]).dispose();
     }
 
     /**
