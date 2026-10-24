@@ -256,6 +256,8 @@ function lineReadsStdin(line: string): boolean {
 export class ShellProcess extends Process {
     private shell: Shell;
     private prompt: string;
+    /** PS2: the prompt a construct that is still open is continued behind. */
+    private continuationPrompt: string;
     private currentLine: string = '';
     private running: boolean = true;
     private filteredArgs: string[];
@@ -267,6 +269,18 @@ export class ShellProcess extends Process {
      * what is being typed with an empty line.
      */
     private draftLine: string | null = null;
+
+    /**
+     * The lines of a command the terminal has typed but not closed yet -- a `for` without its
+     * `done`, an `if` without its `fi`, a quote without its match -- joined with the newlines the
+     * Enters behind them wrote. Empty while no construct is open.
+     *
+     * A shell reading a terminal does not run such a line and does not report it: it asks for the
+     * rest of it behind its secondary prompt and runs the whole once the line that closes it
+     * arrives. `sh -c <line>` has no such state -- its input is over the moment the line is -- so
+     * only the loop below ever holds one.
+     */
+    private pendingSource = '';
 
     // Add readline state
     private cursorPosition: number = 0;
@@ -337,6 +351,10 @@ export class ShellProcess extends Process {
             exitCode: 0
         }));
         this.prompt = oscMode ? '\x1b[1;32m$\x1b[0m ' : '$ ';
+        /* PS2: the prompt a host writes while a construct is still open. It is `> ` in every shell
+           that reads a terminal, and it is what tells the person typing that the Enter they just
+           pressed ended a line and not a command. */
+        this.continuationPrompt = oscMode ? '\x1b[1;32m>\x1b[0m ' : '> ';
     }
 
     /**
@@ -600,7 +618,29 @@ export class ShellProcess extends Process {
     private async handleEnterKey(): Promise<void> {
         this.emitOutput('\n');
 
-        const commandLine = this.currentLine.trim();
+        const typed = this.currentLine.trim();
+        /* What this shell has of the command so far: the lines a construct that is still open was
+           typed on, and the one just typed behind them. */
+        const source = this.pendingSource === '' ? typed : `${this.pendingSource}\n${typed}`;
+        /* A construct that is still open is not a command yet: a host's shell asks for the rest of
+           it behind `> ` and runs it only once the line that closes it arrives. `sh -c <line>` is
+           never asked -- its input is over the moment the line is, and a host reports what it was
+           given -- so only the loop that reads the terminal takes this path. An empty Enter inside
+           an open construct is a blank line of it, not a command: `echo "a` newline newline `b"`
+           prints two lines. */
+        if (this.pendingSource !== '' || typed !== '') {
+            if (this.shell.isIncomplete(source)) {
+                this.pendingSource = source;
+                this.currentLine = '';
+                this.cursorPosition = 0;
+                this.draftLine = null;
+                this.emitOutput(this.continuationPrompt);
+                return;
+            }
+        }
+        this.pendingSource = '';
+
+        const commandLine = source;
         if (commandLine) {
             // Add to history
             this.commandHistory.push({
@@ -698,6 +738,9 @@ export class ShellProcess extends Process {
         this.currentLine = '';
         this.cursorPosition = 0;
         this.draftLine = null;
+        /* The construct being typed is thrown away with the line: `^C` at a `> ` is how a person
+           abandons a command they opened and never closed. */
+        this.pendingSource = '';
         this.emitOutput('^C\n' + this.prompt);
     }
 

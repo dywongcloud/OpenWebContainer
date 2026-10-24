@@ -25,6 +25,7 @@ import {
     echoWords,
     formatJobText,
     getRunner,
+    isIncompleteSource,
     plainPrefix,
     runPendingJobs,
     runScript,
@@ -463,6 +464,20 @@ export class Shell implements IShell {
     /** True when a line is more than one simple command: the script engine runs those. */
     isCompound(line: string): boolean {
         return isCompoundLine(line);
+    }
+
+    /**
+     * True when `source` is a command the input ran out in the middle of, so what is typed next is
+     * the rest of it: `for i in 1 2; do`, `if true; then`, `case x in`, `{`, an unclosed quote.
+     *
+     * A shell reading a terminal does not run such a line and does not report it -- it asks for the
+     * rest behind its secondary prompt and runs the whole once the line that closes it arrives --
+     * so the loop that reads the terminal tests a line here before it hands it to the engine. A
+     * line handed to `sh -c` is never tested: that shell's input is over the moment the line is,
+     * and a host reports what it was given rather than waiting for more.
+     */
+    isIncomplete(source: string): boolean {
+        return isIncompleteSource(this.shellState, source);
     }
 
     /**

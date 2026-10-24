@@ -4747,6 +4747,30 @@ export function checkSyntax(state: ShellState, script: string): { ok: boolean; m
     }
 }
 
+/**
+ * True when `script` is a command the input ran out in the middle of, so a line typed after it is
+ * the rest of it and not a command of its own: a construct whose `done`, `fi`, `esac` or `}` has
+ * not been typed, or a quote, a `$(`, a `${` or a backquote that has not been closed.
+ *
+ * A shell reading a terminal does not run such a line and does not report it: it asks for the rest
+ * of it behind its secondary prompt and runs the whole thing once the line that closes it arrives.
+ * The one sure sign is the parser asking for a token the input does not hold -- every complaint it
+ * can make about input that ended is either the end of file itself or a bracket it was still
+ * looking for the match of when the input ran out. A complaint about a token it did read --
+ * `syntax error near unexpected token ...` -- is a real syntax error however many lines follow it,
+ * and is left to be reported as one.
+ */
+export function isIncompleteSource(state: ShellState, script: string): boolean {
+    try {
+        new Parser(script, state).parse();
+        return false;
+    } catch (error) {
+        if (!(error instanceof ShellSyntaxError)) return false;
+        return error.message === 'syntax error: unexpected end of file'
+            || error.message.startsWith('unexpected EOF while looking for matching');
+    }
+}
+
 function runCommandList(state: ShellState, nodes: Node[], input: string | null, top = false): number {
     let status = 0;
     for (let i = 0; i < nodes.length; i++) {
