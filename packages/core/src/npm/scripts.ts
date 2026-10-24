@@ -1,4 +1,5 @@
 import { IFileSystem } from '../filesystem';
+import { didYouMean } from './didyoumean';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../process/executors/node/runtime/resolver';
 
 /**
@@ -86,13 +87,22 @@ export function scriptLabel(manifest: Record<string, any>, packageDir: string): 
     return `${name}@${manifest.version ?? ''}`;
 }
 
+/**
+ * What npm runs for `restart` when the package declares no restart script of its own: npm's
+ * `lib/commands/run.js` puts this in `scripts.restart` before it asks whether the script is there,
+ * so a package with no restart script is not a missing script -- npm stops the project and starts
+ * it, and only then do the pre and post events of `restart` apply.
+ */
+export const RESTART_COMMAND = 'npm stop --if-present && npm start';
+
+/** The scripts as npm runs them: `restart` a package has no script for is npm's own stop-then-start. */
+export function effectiveScripts(scripts: Record<string, unknown>): Record<string, unknown> {
+    return scripts.restart ? scripts : { ...scripts, restart: RESTART_COMMAND };
+}
+
 /** The scripts one command runs, in order: `pre<name>`, the script, `post<name>`. */
 export function scriptEvents(name: string, scripts: Record<string, unknown>): string[] {
-    /* npm restart has no script of its own to fall back on: it stops the project and starts it. */
-    const events = name === 'restart' && typeof scripts.restart !== 'string'
-        ? ['prestop', 'stop', 'poststop', 'prestart', 'start', 'poststart']
-        : [`pre${name}`, name, `post${name}`];
-    return events.filter((event) => typeof scripts[event] === 'string');
+    return [`pre${name}`, name, `post${name}`].filter((event) => typeof scripts[event] === 'string');
 }
 
 /** The line one event runs: the script, with the run's extra words on the script that was named. */
@@ -100,17 +110,71 @@ export function scriptCommandLine(scripts: Record<string, unknown>, event: strin
     return [String(scripts[event]), ...(event === name ? extra : [])].join(' ');
 }
 
-/** `npm error` lines for a script the package does not have, as npm prints them. */
-export function missingScriptMessage(name: string): string {
-    return `npm error Missing script: "${name}"\n\nnpm error To see a list of scripts, run:\nnpm error   npm run\n`;
+/**
+ * The scripts npm draws under `Lifecycle scripts included in <pkg>:` rather than under
+ * `available via \`npm run\`:`: the ones whose names are lifecycle events, so a `start` or a
+ * `pretest` is a script npm runs on its own account and a `build` is one only `npm run` reaches.
+ */
+const LIFECYCLE_SCRIPT_NAMES = new Set([
+    'prepare', 'prepublishOnly',
+    'prepack', 'postpack',
+    'dependencies',
+    'preinstall', 'install', 'postinstall',
+    'prepublish', 'publish', 'postpublish',
+    'prerestart', 'restart', 'postrestart',
+    'prestart', 'start', 'poststart',
+    'prestop', 'stop', 'poststop',
+    'pretest', 'test', 'posttest',
+    'preuninstall', 'uninstall', 'postuninstall',
+    'preversion', 'version', 'postversion'
+]);
+
+/** npm prefixes every line of an error with `npm error`, a blank one included. */
+export function npmErrorLines(text: string): string {
+    return text.split('\n').map((line) => `npm error ${line}`.replace(/\s+$/, '')).join('\n') + '\n';
 }
 
-/** What `npm run` prints when no script is named. */
+/**
+ * The path `npm ls` prints after `->` for a dependency it installed out of a directory rather than
+ * the registry: the path of the `file:` spec, made relative the way npm writes it.
+ */
+export function localSpecLabel(range: string | undefined): string | undefined {
+    if (range === undefined || !range.startsWith('file:')) return undefined;
+    const path = range.slice('file:'.length);
+    if (path === '') return undefined;
+    return path.startsWith('/') || path.startsWith('.') ? path : `./${path}`;
+}
+
+/** `npm error` lines for a script the package does not have, as npm prints them. */
+export function missingScriptMessage(name: string, manifest?: Record<string, any>): string {
+    return npmErrorLines([
+        `Missing script: "${name}"${didYouMean(manifest, name)}`,
+        '',
+        'To see a list of scripts, run:',
+        '  npm run'
+    ].join('\n'));
+}
+
+/**
+ * What `npm run` prints when no script is named: the package's scripts split in two, the lifecycle
+ * ones under a heading of their own and the rest under `available via \`npm run\`:`, each indented
+ * under its name the way npm indents them. A package with no scripts gets no listing at all.
+ */
 export function scriptList(label: string, scripts: Record<string, unknown>): string {
-    const lines = [`Lifecycle scripts included in ${label}:`];
-    for (const [name, command] of Object.entries(scripts)) {
-        if (typeof command !== 'string') continue;
-        lines.push(`  ${name}`, `    ${command}`);
+    const entries = Object.entries(scripts).filter(([, command]) => typeof command === 'string');
+    /* npm prints nothing for a package whose scripts there are none of. */
+    if (entries.length === 0) return '';
+    const lifecycle: [string, unknown][] = [];
+    const runnable: [string, unknown][] = [];
+    for (const entry of entries) (LIFECYCLE_SCRIPT_NAMES.has(entry[0]) ? lifecycle : runnable).push(entry);
+    const lines: string[] = [];
+    if (lifecycle.length > 0) {
+        lines.push(`Lifecycle scripts included in ${label}:`);
+        for (const [name, command] of lifecycle) lines.push(`  ${name}`, `    ${String(command)}`);
+    }
+    if (runnable.length > 0) {
+        lines.push(lifecycle.length > 0 ? 'available via `npm run`:' : `Scripts available in ${label} via \`npm run\`:`);
+        for (const [name, command] of runnable) lines.push(`  ${name}`, `    ${String(command)}`);
     }
     return lines.join('\n') + '\n';
 }

@@ -20,11 +20,23 @@ export const WASM_SRC = String.raw`
   if (!host.wasm) return;
   var W = host.wasm;
 
-  class CompileError extends Error { constructor (m) { super(m); this.name = 'CompileError'; } }
-  class LinkError extends Error { constructor (m) { super(m); this.name = 'LinkError'; } }
-  class RuntimeError extends Error { constructor (m) { super(m); this.name = 'RuntimeError'; } }
+  /*
+   * The three error classes the namespace carries. Their name is on the prototype, as it is on a
+   * host: Error.prototype and its subclasses each own a name and a message, and an instance owns
+   * only what the constructor set.
+   */
+  class CompileError extends Error { constructor (m) { super(m); } }
+  class LinkError extends Error { constructor (m) { super(m); } }
+  class RuntimeError extends Error { constructor (m) { super(m); } }
+  [['CompileError', CompileError], ['LinkError', LinkError], ['RuntimeError', RuntimeError]].forEach(function (pair) {
+    Object.defineProperty(pair[1].prototype, 'name', { value: pair[0], writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(pair[1].prototype, 'message', { value: '', writable: true, enumerable: false, configurable: true });
+  });
 
-  var NAMED = { Error: Error, TypeError: TypeError, RangeError: RangeError, ReferenceError: ReferenceError, SyntaxError: SyntaxError };
+  var NAMED = {
+    Error: Error, TypeError: TypeError, RangeError: RangeError, ReferenceError: ReferenceError,
+    SyntaxError: SyntaxError, CompileError: CompileError, LinkError: LinkError, RuntimeError: RuntimeError
+  };
 
   function parse (text) {
     var value = JSON.parse(text);
@@ -37,22 +49,56 @@ export const WASM_SRC = String.raw`
     if (value && value.ok === false) throw buildError(value);
     return value.value;
   }
+  /*
+   * An error the host raised, rebuilt in the class the host raised it in. The class travels with
+   * the message: a bad import object and a Number where an i64 is wanted are both bad arguments
+   * and are a TypeError on a host, while an import that is present but not callable is the one
+   * case that really is a LinkError. Classifying by where the failure happened -- a link-time
+   * failure a LinkError, a failure inside a call a RuntimeError -- is what made the first a
+   * LinkError and the second a RuntimeError.
+   */
   function buildError (envelope) {
     var props = envelope.props || {};
     var message = envelope.message || 'WebAssembly failed';
-    var error;
-    if (envelope.code === 'ERR_WASM_COMPILE') error = new CompileError(message);
-    else if (envelope.code === 'ERR_WASM_LINK') error = new LinkError(message);
-    else if (envelope.code === 'ERR_WASM_TRAP') error = new RuntimeError(message);
-    else if (envelope.code === 'ERR_WASM_GUEST') {
+    if (envelope.code === 'ERR_WASM_GUEST') {
       var Ctor = NAMED[props.name] || Error;
-      error = new Ctor(message);
-      if (props.name && !NAMED[props.name]) error.name = props.name;
-      if (props.code) error.code = props.code;
-      return error;
-    } else error = new Error(message);
+      var guestError = new Ctor(message);
+      if (props.name && !NAMED[props.name]) guestError.name = props.name;
+      if (props.code) guestError.code = props.code;
+      return guestError;
+    }
+    /* A wasm exception is not an error: it is thrown as it is, so a catch sees it whole. */
+    if (envelope.code === 'ERR_WASM_EXCEPTION') return exceptionFor(props);
+    var Host = NAMED[props.name] || Error;
+    var error = new Host(message);
+    if (props.name && !NAMED[props.name]) error.name = props.name;
     error.code = envelope.code;
     return error;
+  }
+
+  /*
+   * A wasm exception. It is not an Error -- a host's is not -- so it is thrown as itself and a
+   * caller's catch answers is and getArg on it. TAG and EXC hold the host's objects by id;
+   * EXC is also how an exception that came out of a module is rebuilt as the same guest object
+   * whoever reads it.
+   */
+  var TAG = Object.create(null);
+  var EXC = Object.create(null);
+
+  /** A tagged BigInt, rebuilt the way wasmArgs tagged it. */
+  function decodeValue (value) {
+    if (typeof value === 'string' && value.charCodeAt(0) === 0 && value.charCodeAt(1) === 98) return BigInt(value.slice(2));
+    return value;
+  }
+  function exceptionFor (props) {
+    var known = EXC[props.id];
+    if (known) return known;
+    var rebuilt = Object.create(Exception.prototype);
+    rebuilt.__id = props.id;
+    rebuilt.__tag = TAG[props.tag];
+    rebuilt.__args = (props.args || []).map(decodeValue);
+    EXC[props.id] = rebuilt;
+    return rebuilt;
   }
 
   function toArrayBuffer (value) {
@@ -75,17 +121,22 @@ export const WASM_SRC = String.raw`
   /*
    * A wasm export takes numbers, and the JS API coerces anything else: ToNumber, then NaN
    * becomes 0 -- except at an i64, which the JS API takes as a BigInt and which JSON cannot
-   * carry, so a BigInt goes over as a string with a NUL and a 'b' in front and the host
-   * rebuilds it. Doing this here rather than shipping the arguments across as JSON keeps the
-   * heap out of it -- emscripten hands its Module object to a queued callback, and that
-   * object carries a typed array view over every byte of a memory this size.
+   * carry, so a BigInt goes over as a string with a NUL and a 'b' in front and the host rebuilds
+   * it. A string the caller really passed goes over as a string with a NUL and an 's', so the host
+   * hands it to the API as it is and the API does its own conversion: 'x' for an i64 is then the
+   * host's own 'Cannot convert x to a BigInt', not a 0 the guest coerced first. Doing this here
+   * rather than shipping the arguments across as JSON keeps the heap out of it -- emscripten
+   * hands its Module object to a queued callback, and that object carries a typed array view over
+   * every byte of a memory this size.
    */
   var BIGINT_TAG = '\u0000b';
+  var STRING_TAG = String.fromCharCode(0) + 's';
   function wasmArgs (args) {
     var out = [];
     for (var i = 0; i < args.length; i++) {
       var value = args[i];
       if (typeof value === 'bigint') out.push(BIGINT_TAG + value.toString());
+      else if (typeof value === 'string') out.push(STRING_TAG + value);
       else { var num = Number(value); out.push(num === num ? num : 0); }
     }
     return JSON.stringify(out);
@@ -95,6 +146,20 @@ export const WASM_SRC = String.raw`
   var MEM = Object.create(null);
   var TAB = Object.create(null);
   var GLOB = Object.create(null);
+
+  /*
+   * Resizing a memory's shadow. It is a plain function and not a method on the prototype, because
+   * a host's Memory.prototype owns only buffer, constructor and grow -- a fourth own name there is
+   * the sort of thing a package that enumerates the prototype trips over.
+   */
+  function resizeMemory (memory, bytes) {
+    if (bytes === memory.__buffer.byteLength) return;
+    var next = new ArrayBuffer(bytes);
+    var view = new Uint8Array(next);
+    var old = new Uint8Array(memory.__buffer);
+    view.set(old.subarray(0, Math.min(old.length, view.length)));
+    memory.__buffer = next;
+  }
 
   /* The guest side of a host memory: buffer is the shadow the guest code sees. */
   class Memory {
@@ -111,16 +176,8 @@ export const WASM_SRC = String.raw`
     grow (delta) {
       delta = Math.floor(delta);
       var before = unwrap(W.memoryGrow(this.__id, delta));
-      this.__resize(unwrap(W.memoryPages(this.__id)) * 65536);
+      resizeMemory(this, unwrap(W.memoryPages(this.__id)) * 65536);
       return before;
-    }
-    __resize (bytes) {
-      if (bytes === this.__buffer.byteLength) return;
-      var next = new ArrayBuffer(bytes);
-      var view = new Uint8Array(next);
-      var old = new Uint8Array(this.__buffer);
-      view.set(old.subarray(0, Math.min(old.length, view.length)));
-      this.__buffer = next;
     }
   }
 
@@ -138,6 +195,21 @@ export const WASM_SRC = String.raw`
     MEM[id] = memory;
     return memory;
   }
+
+  /*
+   * What marks a function that stands for a real wasm function: one the host holds, read out of a
+   * table, or an export of an instantiated module. A host's Table.set takes these and refuses an
+   * ordinary JavaScript function, so the difference travels under symbols, which no enumeration of
+   * a function or of a prototype sees. WASMFN_ID is the id the host already holds the function
+   * under, so setting one into a table sets the real function and not a wrapper around it.
+   */
+  var WASMFN = Symbol('wasmfn');
+  var WASMFN_ID = Symbol('wasmfnid');
+  /* Seeding a table with the host's own entries, at bind time. This is a symbol and not the name
+     it used to carry, because a host's Table.prototype owns no '__host': that name showed up in
+     Object.getOwnPropertyNames(WebAssembly.Table.prototype) on the container and not on a host.
+     Both are declared ahead of the class, whose prototype is built at install time. */
+  var SEED = Symbol('host');
 
   class Table {
     constructor (descriptor) {
@@ -160,14 +232,29 @@ export const WASM_SRC = String.raw`
       return entry;
     }
     set (index, value) {
-      if (value !== null && typeof value !== 'function') throw new TypeError('WebAssembly.Table.set: expected a function or null');
+      /*
+       * A function-typed table takes null or a wasm function object and nothing else. An ordinary
+       * JavaScript function is refused, in the host's own words, and the slot stays empty; the
+       * same refusal covers undefined, an object, a number and a string, which the host does not
+       * distinguish either.
+       */
+      if (value !== null && !(typeof value === 'function' && value[WASMFN] === true)) {
+        throw new TypeError('WebAssembly.Table.set(): Argument 1 is invalid for table: function-typed object must be null (if nullable) or a Wasm function object');
+      }
       var previous = this.__ids[index];
-      if (previous !== undefined) W.drop(previous);
-      var id = value === null ? 0 : W.retain(value);
-      var reply = JSON.parse(W.tableSet(this.__id, index, JSON.stringify(value === null ? { k: 'null' } : { k: 'fn', id: id })));
+      if (previous !== undefined) { W.drop(previous); this.__ids[index] = undefined; }
+      var descriptor = { k: 'null' };
+      if (value !== null) {
+        var held = value[WASMFN_ID];
+        if (typeof held === 'number') descriptor = { k: 'fn', id: held };
+        else {
+          this.__ids[index] = W.retain(value);
+          descriptor = { k: 'fn', id: this.__ids[index] };
+        }
+      }
+      var reply = JSON.parse(W.tableSet(this.__id, index, JSON.stringify(descriptor)));
       /* A function-typed table takes WebAssembly functions only, so the guest keeps its own. */
       if (reply && reply.ok === false && reply.code !== 'ERR_WASM_TABLE_JSFN') throw buildError(reply);
-      this.__ids[index] = value === null ? undefined : id;
       this.__entries[index] = value;
     }
     grow (delta) {
@@ -175,7 +262,9 @@ export const WASM_SRC = String.raw`
       this.__entries.length = unwrap(W.tableLength(this.__id));
       return before;
     }
-    __host (json) {
+  }
+  Object.defineProperty(Table.prototype, SEED, {
+    value: function (json) {
       var entries = JSON.parse(json);
       for (var i = 0; i < entries.length; i++) {
         var entry = entries[i];
@@ -183,8 +272,30 @@ export const WASM_SRC = String.raw`
         else if (this.__entries[entry.i] === undefined) this.__entries[entry.i] = null;
       }
       this.__entries.length = unwrap(W.tableLength(this.__id));
-    }
-  }
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true
+  });
+  /*
+   * A host's Table.prototype owns get, grow, length and set as enumerable members and its
+   * constructor as a non-enumerable one, which is what Object.keys answers 'get,grow,length,set'
+   * for. A class body makes every member non-enumerable, so the four are re-declared the way a
+   * host carries them, and the prototype answers '[object WebAssembly.Table]' to a toString.
+   */
+  var tableLength = Object.getOwnPropertyDescriptor(Table.prototype, 'length');
+  Object.defineProperty(Table.prototype, 'length', {
+    get: tableLength.get, set: tableLength.set, enumerable: true, configurable: true
+  });
+  ['get', 'grow', 'set'].forEach(function (name) {
+    var member = Object.getOwnPropertyDescriptor(Table.prototype, name);
+    Object.defineProperty(Table.prototype, name, {
+      value: member.value, writable: true, enumerable: true, configurable: true
+    });
+  });
+  Object.defineProperty(Table.prototype, Symbol.toStringTag, {
+    value: 'WebAssembly.Table', writable: false, enumerable: false, configurable: true
+  });
 
   function bindTable (id) {
     var table = Object.create(Table.prototype);
@@ -193,16 +304,20 @@ export const WASM_SRC = String.raw`
     table.__entries = new Array(unwrap(W.tableLength(id)));
     table.__ids = new Array(table.__entries.length);
     TAB[id] = table;
-    table.__host(W.tableDump(id));
+    table[SEED](W.tableDump(id));
     return table;
   }
 
   /** A wasm function the host holds: calling it goes through the host, with memory synced. */
   function hostFunction (instanceId, fnId) {
     var call = function () {
-      return unwrap(W.fnCall(fnId, wasmArgs(arguments), instanceId));
+      /* A wasm function the host ran answers a BigInt for an i64, and it crosses as a tagged
+         string, so it is rebuilt here: a caller sees the BigInt the JS API would have given it. */
+      return decodeValue(unwrap(W.fnCall(fnId, wasmArgs(arguments), instanceId)));
     };
     Object.defineProperty(call, 'name', { value: 'wasm-function', configurable: true });
+    Object.defineProperty(call, WASMFN, { value: true });
+    Object.defineProperty(call, WASMFN_ID, { value: fnId });
     return call;
   }
 
@@ -212,9 +327,25 @@ export const WASM_SRC = String.raw`
       this.__id = unwrap(W.globalNew(d.value || 'i32', !!d.mutable, value === undefined ? 0 : Number(value)));
       GLOB[this.__id] = this;
     }
-    get value () { return unwrap(W.globalGet(this.__id)); }
+    /* An i64 global's value is a BigInt on a host, and it crosses tagged like any other i64. */
+    get value () { return decodeValue(unwrap(W.globalGet(this.__id))); }
     set value (next) { unwrap(W.globalSet(this.__id, Number(next))); }
   }
+  /*
+   * A host's Global.prototype owns three names: constructor, value and valueOf. valueOf is an
+   * ordinary enumerable method that answers the value -- the Number or BigInt the getter answers,
+   * which is what makes global.valueOf() read 5 where its absence made it a TypeError here. A
+   * host also carries value as an enumerable accessor, so Object.keys reads 'value,valueOf' there,
+   * while a class body makes both non-enumerable.
+   */
+  Global.prototype.valueOf = function () { return this.value; };
+  var globalValue = Object.getOwnPropertyDescriptor(Global.prototype, 'value');
+  Object.defineProperty(Global.prototype, 'value', {
+    get: globalValue.get, set: globalValue.set, enumerable: true, configurable: true
+  });
+  Object.defineProperty(Global.prototype, Symbol.toStringTag, {
+    value: 'WebAssembly.Global', writable: false, enumerable: false, configurable: true
+  });
 
   function bindGlobal (id) {
     var global = Object.create(Global.prototype);
@@ -269,7 +400,7 @@ export const WASM_SRC = String.raw`
     var memory = MEM[id];
     if (!memory || !payload) return undefined;
     var start = typeof offset === 'number' && offset > 0 ? offset : 0;
-    if (start + payload.byteLength > memory.__buffer.byteLength) memory.__resize(start + payload.byteLength);
+    if (start + payload.byteLength > memory.__buffer.byteLength) resizeMemory(memory, start + payload.byteLength);
     if (payload.byteLength > 0) new Uint8Array(memory.__buffer, start, payload.byteLength).set(new Uint8Array(payload));
     return undefined;
   }
@@ -304,8 +435,9 @@ export const WASM_SRC = String.raw`
   }
 
   function describeImports (imports) {
+    /* No import object at all is its own case on a host, so it travels as null and not as {}. */
+    if (imports === undefined || imports === null) return null;
     var out = {};
-    if (!imports) return out;
     var namespaces = Object.keys(imports);
     for (var i = 0; i < namespaces.length; i++) {
       var entries = imports[namespaces[i]] || {};
@@ -329,9 +461,14 @@ export const WASM_SRC = String.raw`
   function wrapExport (instanceId, entry) {
     if (entry.kind === 'function') {
       var fn = function () {
-        return unwrap(W.call(instanceId, entry.name, wasmArgs(arguments)));
+        /* An export the module declared as i64 answers a BigInt on a host, and the host sends it
+           as a tagged string, so it is rebuilt here rather than arriving as a lossy Number. */
+        return decodeValue(unwrap(W.call(instanceId, entry.name, wasmArgs(arguments))));
       };
       Object.defineProperty(fn, 'name', { value: entry.name, configurable: true });
+      /* An export is a wasm function, so a host's Table.set takes it; only an ordinary JavaScript
+         function is refused. */
+      Object.defineProperty(fn, WASMFN, { value: true });
       return fn;
     }
     if (entry.kind === 'memory') return bindMemory(entry.id);
@@ -341,17 +478,89 @@ export const WASM_SRC = String.raw`
   }
 
   class Instance {
-    constructor (module, imports) {
+    constructor (module, imports, label) {
       if (!(module instanceof Module)) throw new TypeError('WebAssembly.Instance: expected a Module');
       var ids = syncIds();
-      var info = unwrap(W.instantiate(module.__id, JSON.stringify(describeImports(imports)), ids[0], ids[1]));
+      /*
+       * The label is the name the host's message should carry: the same link failure reads
+       * 'WebAssembly.instantiate(): ...' reached through instantiate and 'WebAssembly.Instance():
+       * ...' reached through the constructor, and only the guest knows which one was called.
+       */
+      var info = unwrap(W.instantiate(module.__id, JSON.stringify(describeImports(imports)), ids[0], ids[1],
+        label === undefined ? 'Instance' : label));
       this.__id = info.id;
       this.__module = module;
-      this.exports = Object.create(null);
+      this.__exports = Object.create(null);
       for (var i = 0; i < info.exports.length; i++) {
         var entry = info.exports[i];
-        this.exports[entry.name] = wrapExport(this.__id, entry);
+        this.__exports[entry.name] = wrapExport(this.__id, entry);
       }
+    }
+  }
+  /*
+   * A host's Instance.prototype owns exports, as a getter, and an instance does not own it at all.
+   * Keeping it on the prototype is what Object.getOwnPropertyNames(WebAssembly.Instance.prototype)
+   * answers 'constructor,exports' for.
+   */
+  Object.defineProperty(Instance.prototype, 'exports', {
+    get: function () { return this.__exports; },
+    enumerable: true,
+    configurable: true
+  });
+
+  /*
+   * The exception-handling surface. A tag and an exception are really host objects -- the module
+   * runs in the host realm, so it is a host tag the module throws and catches -- and what is made
+   * here is the host's own, with the guest keeping the id. Neither is an Error, because a host's
+   * is not: an exception is thrown as itself, and whoever catches it answers is and getArg.
+   *
+   * An exception thrown by an import goes back to the host as the host exception and not as an
+   * error, so a handler inside the module can catch it; one that comes out of the module is
+   * rebuilt here from the host's tag and payload.
+   */
+  class Tag {
+    constructor (descriptor) {
+      this.__id = unwrap(W.tagNew(descriptor === undefined || descriptor === null ? 'null' : JSON.stringify(descriptor)));
+      TAG[this.__id] = this;
+    }
+  }
+  /*
+   * WebAssembly.JSTag, the tag a host carries beside Tag. It is not a class: it is an object with
+   * Tag.prototype behind it, no own property of its own, and no way to construct it -- a TypeError
+   * is what a host raises for new WebAssembly.JSTag(). It is an own name of the namespace but not an
+   * own enumerable one, which is why Object.keys misses it and Object.getOwnPropertyNames does
+   * not. Tag.prototype carries the 'WebAssembly.Tag' tag a host answers, so a tag, an exception
+   * built from one and JSTag itself all read '[object WebAssembly.Tag]'.
+   */
+  var JSTAG = Object.create(Tag.prototype);
+  Object.defineProperty(Tag.prototype, Symbol.toStringTag, {
+    value: 'WebAssembly.Tag', writable: false, enumerable: false, configurable: true
+  });
+
+  class Exception {
+    constructor (tag, payload) {
+      var tagId = tag instanceof Tag ? tag.__id : 0;
+      /* A host refuses JSTag as the tag of an exception, in its own words, before anything else. */
+      if (tag === JSTAG) throw new TypeError('WebAssembly.Exception(): Argument 0 cannot be WebAssembly.JSTag');
+      /* Anything that is not a list of values is the call a host refuses in its own words. */
+      var args = 'null';
+      if (Array.isArray(payload)) {
+        args = JSON.stringify(payload.map(function (value) {
+          return typeof value === 'bigint' ? BIGINT_TAG + value.toString() : value;
+        }));
+      }
+      this.__tag = tag;
+      this.__args = Array.isArray(payload) ? payload.slice() : [];
+      this.__id = unwrap(W.exceptionNew(tagId, args));
+      EXC[this.__id] = this;
+      /* How the host tells an exception from an error when an import throws one. */
+      Object.defineProperty(this, '__exc', { value: this.__id });
+    }
+    is (tag) {
+      return unwrap(W.exceptionIs(this.__id, tag instanceof Tag ? tag.__id : 0)) === true;
+    }
+    getArg (tag, index) {
+      return decodeValue(unwrap(W.exceptionArg(this.__id, tag instanceof Tag ? tag.__id : 0, index)));
     }
   }
 
@@ -372,9 +581,9 @@ export const WASM_SRC = String.raw`
    */
   function instantiate (source, imports) {
     try {
-      if (source instanceof Module) return Promise.resolve(new Instance(source, imports));
+      if (source instanceof Module) return Promise.resolve(new Instance(source, imports, 'instantiate'));
       var module = new Module(source);
-      return Promise.resolve({ module: module, instance: new Instance(module, imports) });
+      return Promise.resolve({ module: module, instance: new Instance(module, imports, 'instantiate') });
     } catch (error) {
       return Promise.reject(error);
     }
@@ -458,8 +667,8 @@ export const WASM_SRC = String.raw`
     instantiateStreaming: instantiateStreaming,
     validate: validate
   };
-  var CLASS_NAMES = ['Module', 'Instance', 'Memory', 'Table', 'Global', 'CompileError', 'LinkError', 'RuntimeError'];
-  var CLASS_VALUES = [Module, Instance, Memory, Table, Global, CompileError, LinkError, RuntimeError];
+  var CLASS_NAMES = ['Module', 'Instance', 'Memory', 'Table', 'Global', 'Tag', 'Exception', 'CompileError', 'LinkError', 'RuntimeError'];
+  var CLASS_VALUES = [Module, Instance, Memory, Table, Global, Tag, Exception, CompileError, LinkError, RuntimeError];
   for (var cn = 0; cn < CLASS_NAMES.length; cn++) {
     Object.defineProperty(NS, CLASS_NAMES[cn], {
       value: CLASS_VALUES[cn],
@@ -468,6 +677,10 @@ export const WASM_SRC = String.raw`
       configurable: true
     });
   }
+  /* JSTag is not one of the classes: a host carries it non-writable, beside them. */
+  Object.defineProperty(NS, 'JSTag', {
+    value: JSTAG, writable: false, enumerable: false, configurable: true
+  });
 
   Object.defineProperty(globalThis, 'WebAssembly', {
     value: NS,

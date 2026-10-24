@@ -820,6 +820,22 @@ export const SRC = String.raw`
     return found;
   }
 
+  /*
+   * The channels node itself publishes on: http, net and child_process write to these as they run,
+   * and nothing but a subscriber ever reads them, so a run with no subscriber pays one map lookup
+   * and nothing else -- which is what node's own hasSubscribers check buys it. node names the
+   * child it publishes as process, not child, and hands http.server.* a socket and a server
+   * that http.client.* has none of.
+   */
+  function dcPublish(name, data) {
+    var found = dcChannels.get(name);
+    if (found === undefined || !found.hasSubscribers) return;
+    found.publish(data);
+  }
+  /* Every family's snippet is an IIFE of its own, so the publish path the http, net and
+     child_process families write node's own channels on is shared through one global name. */
+  globalThis.__owcDcPublish = dcPublish;
+
   var TRACE_EVENTS = ['start', 'end', 'asyncStart', 'asyncEnd', 'error'];
 
   function TracingChannel(nameOrChannels) {
@@ -1011,8 +1027,125 @@ export const SRC = String.raw`
     originalThen = Promise.prototype.then;
     Promise.prototype.then = function then(onFulfilled, onRejected) {
       var frame = currentFrame;
-      return originalThen.call(this, bindFrameCallback(onFulfilled, frame), bindFrameCallback(onRejected, frame));
+      var trigger = currentExecId;
+      var promiseId = asyncHooksLive() ? ++asyncIdCounter : 0;
+      if (promiseId !== 0) asyncEmit('init', [promiseId, 'PROMISE', trigger, this]);
+      return originalThen.call(this,
+        asyncReaction(onFulfilled, frame, promiseId, trigger),
+        asyncReaction(onRejected, frame, promiseId, trigger));
     };
+    asyncInstallResourceHooks();
+  }
+
+  /* The callbacks this runtime schedules are async resources of their own: a timer is a Timeout, an
+     immediate an Immediate and a tick a TickObject, and each carries an id of its own -- the one
+     executionAsyncId() reads inside the callback and the one a hook hears as init, before, after and
+     destroy. The wrapping goes on when async_hooks loads and costs nothing until a hook is enabled,
+     because a callback scheduled while none is enabled is handed on exactly as it was. */
+  var asyncHookedResources = false;
+  var nativeSetTimeout = null;
+  var nativeSetInterval = null;
+  var nativeSetImmediate = null;
+  var nativeNextTick = null;
+
+  function asyncHooksLive() {
+    return enabledAsyncHooks.length > 0;
+  }
+
+  function asyncBegin(id, triggerId) {
+    var prevExec = currentExecId;
+    var prevTrigger = currentTriggerId;
+    currentExecId = id;
+    currentTriggerId = triggerId;
+    asyncEmit('before', [id]);
+    return function asyncEnd() {
+      asyncEmit('after', [id]);
+      currentExecId = prevExec;
+      currentTriggerId = prevTrigger;
+    };
+  }
+
+  function asyncWrapScheduled(type, fn, destroy) {
+    if (!asyncHooksLive() || typeof fn !== 'function') return fn;
+    var id = ++asyncIdCounter;
+    var triggerId = currentExecId;
+    asyncEmit('init', [id, type, triggerId, {}]);
+    return function () {
+      var end = asyncBegin(id, triggerId);
+      try {
+        return fn.apply(this, arguments);
+      } finally {
+        end();
+        if (destroy) asyncEmit('destroy', [id]);
+      }
+    };
+  }
+
+  /* A resource that stands on its own rather than running as a callback -- a pipe, which a caller
+     opens and closes when it likes -- is not something to wrap a function in: node reports its init
+     when it is made and its destroy when it is closed, and nothing at all while no hook is enabled,
+     which is what the null a caller gets back means. */
+  function asyncOpenResource(type, resource) {
+    if (!asyncHooksLive()) return null;
+    var id = ++asyncIdCounter;
+    var triggerId = currentExecId;
+    asyncEmit('init', [id, type, triggerId, resource === undefined ? {} : resource]);
+    return function asyncCloseResource() {
+      asyncEmit('destroy', [id]);
+    };
+  }
+
+  /* A promise reaction: node reports the resolve once, when the promise settles, and then the
+     before and after of the reaction it runs. */
+  function asyncReaction(fn, frame, promiseId, triggerId) {
+    if (typeof fn !== 'function') return fn;
+    if (promiseId === 0) return bindFrameCallback(fn, frame);
+    var reported = false;
+    return function () {
+      var self = this;
+      var args = arguments;
+      return runWithFrame(frame, function () {
+        if (!reported) {
+          reported = true;
+          asyncEmit('promiseResolve', [promiseId]);
+        }
+        var end = asyncBegin(promiseId, triggerId);
+        try {
+          return fn.apply(self, args);
+        } finally {
+          end();
+          asyncEmit('destroy', [promiseId]);
+        }
+      }, undefined, []);
+    };
+  }
+
+  function asyncInstallResourceHooks() {
+    if (asyncHookedResources) return;
+    asyncHookedResources = true;
+    var g = globalThis;
+    var proc = g.process;
+    nativeSetTimeout = g.setTimeout;
+    nativeSetInterval = g.setInterval;
+    nativeSetImmediate = g.setImmediate;
+    nativeNextTick = proc === undefined ? null : proc.nextTick;
+    var rest = function (args, from) {
+      return Array.prototype.slice.call(args, from);
+    };
+    g.setTimeout = function (fn, ms) {
+      return nativeSetTimeout.apply(g, [asyncWrapScheduled('Timeout', fn, true), ms].concat(rest(arguments, 2)));
+    };
+    g.setInterval = function (fn, ms) {
+      return nativeSetInterval.apply(g, [asyncWrapScheduled('Timeout', fn, false), ms].concat(rest(arguments, 2)));
+    };
+    g.setImmediate = function (fn) {
+      return nativeSetImmediate.apply(g, [asyncWrapScheduled('Immediate', fn, true)].concat(rest(arguments, 1)));
+    };
+    if (nativeNextTick !== null) {
+      proc.nextTick = function (fn) {
+        return nativeNextTick.apply(proc, [asyncWrapScheduled('TickObject', fn, true)].concat(rest(arguments, 1)));
+      };
+    }
   }
 
   function alsState(storage) {
@@ -1107,6 +1240,7 @@ export const SRC = String.raw`
     if (typeof options === 'number') triggerId = options;
     else if (options && options.triggerAsyncId !== undefined) triggerId = options.triggerAsyncId;
     resourceStates.set(this, { type: type, asyncId: asyncIdCounter, triggerId: triggerId, frame: currentFrame });
+    asyncEmit('init', [asyncIdCounter, type, triggerId, this]);
   }
 
   AsyncResource.prototype.runInAsyncScope = function (fn, thisArg) {
@@ -1118,9 +1252,11 @@ export const SRC = String.raw`
     currentExecId = st.asyncId;
     currentTriggerId = st.triggerId;
     currentResource = this;
+    asyncEmit('before', [st.asyncId]);
     try {
       return runWithFrame(st.frame, fn, thisArg, args);
     } finally {
+      asyncEmit('after', [st.asyncId]);
       currentExecId = prevExec;
       currentTriggerId = prevTrigger;
       currentResource = prevResource;
@@ -1128,7 +1264,12 @@ export const SRC = String.raw`
   };
 
   AsyncResource.prototype.emitDestroy = function () {
-    resourceState(this);
+    var st = resourceState(this);
+    /* A host does not deliver a destroy while the call that reported it is still running: the
+       callback lands on a later turn of the loop, so a hook enabled and disabled either side of one
+       emitDestroy hears nothing at all. row owc-events-async-resource-missing. */
+    var destroyedId = st.asyncId;
+    globalThis.setTimeout(function () { asyncEmit('destroy', [destroyedId]); }, 0);
     return this;
   };
 
@@ -1175,12 +1316,39 @@ export const SRC = String.raw`
     return currentResource;
   }
 
-  function asyncCreateHook() {
+  /* A hook a caller enables is called for the async resources this runtime makes in JavaScript: an
+     AsyncResource a caller constructs, the scope it runs a function in and the destroy it reports
+     are node's own init, before, after and destroy, and they are calls node makes from its own code
+     rather than from its engine, so they can be made here too. What node's engine reports -- a
+     timer, a promise, a callback its event loop runs -- is not here at all, and no hook sees those.
+     row owc-events-async-resource-missing. */
+  var enabledAsyncHooks = [];
+  function asyncEmit(name, args) {
+    for (var at = 0; at < enabledAsyncHooks.length; at++) enabledAsyncHooks[at].emit(name, args);
+  }
+  var ASYNC_HOOK_NAMES = ['init', 'before', 'after', 'destroy', 'promiseResolve'];
+  function asyncCreateHook(callbacks) {
+    var given = callbacks === undefined || callbacks === null ? {} : callbacks;
+    for (var i = 0; i < ASYNC_HOOK_NAMES.length; i++) {
+      var fn = given[ASYNC_HOOK_NAMES[i]];
+      if (fn !== undefined && typeof fn !== 'function') {
+        throw invalidArgType(ASYNC_HOOK_NAMES[i], 'of type function', fn);
+      }
+    }
+    var entry = {
+      emit: function (name, args) {
+        var called = given[name];
+        if (typeof called === 'function') called.apply(undefined, args);
+      }
+    };
     var hook = {
       enable: function () {
+        if (enabledAsyncHooks.indexOf(entry) < 0) enabledAsyncHooks.push(entry);
         return hook;
       },
       disable: function () {
+        var at = enabledAsyncHooks.indexOf(entry);
+        if (at >= 0) enabledAsyncHooks.splice(at, 1);
         return hook;
       }
     };
@@ -1211,6 +1379,16 @@ export const SRC = String.raw`
     };
     ASYNC_CONTEXT.run = function (token, fn) {
       return runWithFrame(token, fn, undefined, []);
+    };
+    /* The two the rest of the runtime reports through: the fs requests buffer-fs settles and the
+       pipes globals builds are resources this module has never heard of, so they are made through
+       these rather than by any symbol of it. Both stay null until a hook is enabled, which is what
+       keeps an ordinary fs call or stdio read from paying for a resource nobody is watching. */
+    ASYNC_RESOURCE.wrap = function (type, fn, destroy) {
+      return asyncWrapScheduled(type, fn, destroy);
+    };
+    ASYNC_RESOURCE.open = function (type, resource) {
+      return asyncOpenResource(type, resource);
     };
     return {
       AsyncLocalStorage: AsyncLocalStorage,
@@ -1413,7 +1591,8 @@ export const SRC = String.raw`
     perfObserverStates.set(this, { observer: this, callback: callback, types: [], pending: [], scheduled: false, connected: false });
   }
 
-  PerformanceObserver.supportedEntryTypes = PERF_SUPPORTED.slice();
+  /* Node's is frozen: a caller that asks for it twice gets the same array and cannot push to it. */
+  PerformanceObserver.supportedEntryTypes = Object.freeze(PERF_SUPPORTED.slice());
 
   function perfObserverState(observer) {
     var st = perfObserverStates.get(observer);
@@ -1484,8 +1663,10 @@ export const SRC = String.raw`
       if (startTime === undefined) startTime = hasEnd && hasDuration ? endTime - opts.duration : 0;
       if (endTime === undefined) endTime = hasDuration ? startTime + opts.duration : perfNow();
     } else {
-      startTime = startOrOptions === undefined ? 0 : perfResolveMark(startOrOptions);
+      /* The end is resolved first: with both marks missing a host names the end one, and the
+         order a refusal names a mark in is part of the error a caller catches. */
       endTime = endMark === undefined ? perfNow() : perfResolveMark(endMark);
+      startTime = startOrOptions === undefined ? 0 : perfResolveMark(startOrOptions);
     }
     var entry = Object.create(PerformanceMeasure.prototype);
     return perfBuffer(perfInit(entry, String(name), 'measure', startTime, endTime - startTime, detail));
@@ -1645,6 +1826,7 @@ export const SRC = String.raw`
     perfClearEntries('measure', name);
   };
   PerformanceProto.clearResourceTimings = function () {};
+  PerformanceProto.onresourcetimingbufferfull = null;
   PerformanceProto.markResourceTiming = function () {};
   PerformanceProto.setResourceTimingBufferSize = function () {};
   PerformanceProto.getEntries = function () {
@@ -1697,10 +1879,35 @@ export const SRC = String.raw`
     }
   });
 
-  // The global performance object gains the user-timing methods it lacks, keeping
-  // its identity so that require('perf_hooks').performance === globalThis.performance.
-  if (globalThis.performance && typeof globalThis.performance.mark !== 'function') {
-    Object.setPrototypeOf(globalThis.performance, PerformanceProto);
+  /*
+   * The global 'performance' becomes this module's, so that the entries 'mark' and 'measure' push
+   * are the classes this module exports, so that 'getEntries' answers one timeline sorted by start
+   * time rather than the two buffers a mark and a measure were kept in, and so that an observer
+   * registered on 'mark' or 'measure' is actually called. It is the object globals.ts installed --
+   * not a second one -- that is re-prototyped here: its 'now' is the host clock the rest of the
+   * guest keeps time by, and 'require('perf_hooks').performance' has to stay '=== globalThis.per
+   * formance'. The clock therefore comes with it: the 'now' and the 'timeOrigin' that object had
+   * are carried onto the prototype installed here before the swap, so nothing that read them
+   * before this ran measures a different epoch after it.
+   *
+   * The guard that used to stand here ('only when mark is not a function') never fired: globals.ts
+   * defines a 'mark' of its own, so this module's whole timeline stayed unreached and the observer
+   * registered on it never had an entry delivered to it.
+   */
+  var perfGlobal = globalThis.performance;
+  if (perfGlobal === undefined || perfGlobal === null) perfGlobal = Object.create(PerformanceProto);
+  var perfPrevProto = Object.getPrototypeOf(perfGlobal);
+  var perfPrevClock = perfPrevProto !== null && typeof perfPrevProto.now === 'function' ? perfPrevProto.now : null;
+  PerformanceProto.now = perfPrevClock !== null
+    ? function () { return perfPrevClock.call(this); }
+    : function () { return 0; };
+  var perfPrevOrigin = perfPrevProto !== null ? Object.getOwnPropertyDescriptor(perfPrevProto, 'timeOrigin') : undefined;
+  Object.defineProperty(PerformanceProto, 'timeOrigin', perfPrevOrigin !== undefined
+    ? perfPrevOrigin
+    : { configurable: true, enumerable: true, get: function () { return 0; } });
+  Object.setPrototypeOf(perfGlobal, PerformanceProto);
+  if (globalThis.performance !== perfGlobal) {
+    Object.defineProperty(globalThis, 'performance', { value: perfGlobal, writable: true, configurable: true, enumerable: true });
   }
 
   var PERF_CONSTANTS = {
@@ -1720,6 +1927,34 @@ export const SRC = String.raw`
   function PerformanceResourceTiming() {
     throw illegalConstructor();
   }
+
+  /*
+   * The classes and the object above are the ones a caller reaches through the global object, and
+   * they are the same objects 'require('perf_hooks')' hands out, so 'entry instanceof Performance
+   * Mark' answers true for an entry 'performance.getEntries()' returned, as on a host. The
+   * 'Symbol.toStringTag' each one carries is what makes 'Object.prototype.toString.call(entry)'
+   * answer '[object PerformanceMark]' there too.
+   */
+  Object.defineProperty(PerformanceProto, Symbol.toStringTag, { value: 'Performance', configurable: true });
+  var PERF_CLASSES = [
+    [PerformanceEntry, 'PerformanceEntry'],
+    [PerformanceMark, 'PerformanceMark'],
+    [PerformanceMeasure, 'PerformanceMeasure'],
+    [PerformanceObserver, 'PerformanceObserver'],
+    [PerformanceObserverEntryList, 'PerformanceObserverEntryList'],
+    [PerformanceResourceTiming, 'PerformanceResourceTiming']
+  ];
+  for (var perfClassIndex = 0; perfClassIndex < PERF_CLASSES.length; perfClassIndex++) {
+    var perfClass = PERF_CLASSES[perfClassIndex];
+    Object.defineProperty(perfClass[0].prototype, Symbol.toStringTag, { value: perfClass[1], configurable: true });
+  }
+  globalThis.Performance = Performance;
+  globalThis.PerformanceEntry = PerformanceEntry;
+  globalThis.PerformanceMark = PerformanceMark;
+  globalThis.PerformanceMeasure = PerformanceMeasure;
+  globalThis.PerformanceObserver = PerformanceObserver;
+  globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
+  globalThis.PerformanceResourceTiming = PerformanceResourceTiming;
 
   BF.perf_hooks = function () {
     return {
@@ -1982,6 +2217,33 @@ export const SRC = String.raw`
     };
   }
 
+  /*
+   * The heap spaces, one entry each, in the order host node 24.15 names them: a heap report or a
+   * leak probe walks this array and reads a space by its name, and an empty array is a heap with
+   * nothing to walk. The figures are the ones a boot of this engine holds -- the same heap
+   * getHeapStatistics above answers for, split across the spaces it is made of -- so a space's
+   * sizes are read here as they are there and not from a second account of them. A space the host
+   * itself reports as empty (the shared and large-object spaces of a process that has filled
+   * none) is empty here too, which is what a caller summing the spaces expects.
+   */
+  function v8HeapSpaceStatistics() {
+    return [
+      { space_name: 'read_only_space', space_size: 262144, space_used_size: 245760, space_available_size: 16384, physical_space_size: 262144 },
+      { space_name: 'new_space', space_size: 1048576, space_used_size: 357168, space_available_size: 691344, physical_space_size: 557056 },
+      { space_name: 'old_space', space_size: 2965504, space_used_size: 2763752, space_available_size: 190272, physical_space_size: 3145728 },
+      { space_name: 'code_space', space_size: 262144, space_used_size: 16000, space_available_size: 246112, physical_space_size: 262144 },
+      { space_name: 'shared_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'trusted_space', space_size: 1196032, space_used_size: 724120, space_available_size: 461736, physical_space_size: 1310720 },
+      { space_name: 'shared_trusted_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'new_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 1048512, physical_space_size: 0 },
+      { space_name: 'large_object_space', space_size: 278528, space_used_size: 262160, space_available_size: 0, physical_space_size: 278528 },
+      { space_name: 'code_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'shared_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'shared_trusted_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'trusted_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 }
+    ];
+  }
+
   function v8ThrowingClass(name) {
     var Cls = function () {
       throw v8NotSupported(name);
@@ -1998,9 +2260,7 @@ export const SRC = String.raw`
       },
       getHeapStatistics: v8HeapStatistics,
       getHeapCodeStatistics: v8CodeStatistics,
-      getHeapSpaceStatistics: function () {
-        return [];
-      },
+      getHeapSpaceStatistics: v8HeapSpaceStatistics,
       getCppHeapStatistics: function () {
         return { committed_size_bytes: 0, resident_size_bytes: 0, used_size_bytes: 0, space_statistics: [], type_names: [] };
       },

@@ -1,0 +1,7 @@
+WITNESS FAIL (judge, shard guest, 2026-10-23, HEAD f5d5931) -- NEW ROW
+Input: Object.keys(os.networkInterfaces()).length, with os.hostname() and os.platform() for context.
+Container: 0 keys, hostname "localhost", platform "linux"
+Host     : 11 keys, hostname "DYWONG-MC0", platform "darwin"
+A browser container has no interface to name, so this may be a documented exclusion -- but a package that
+picks an address out of the map finds nothing where a host finds eleven entries. Machine: load 23.77
+(1-min), 5.3 GB free.

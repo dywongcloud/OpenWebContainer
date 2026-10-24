@@ -1,0 +1,84 @@
+Witness: engine-error divergences, container vs host Node 24.15 vs BARE QuickJS 0.32.
+  host        node v24.15.0 on this machine
+  container   /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, one process per case
+  bare        quickjs-emscripten 0.32 (@jitl/quickjs-wasmfile-release-sync) driven directly from
+              node with NOTHING of the container around it -- no guest globals, no bootstrap, no
+              error-constructor wrapper: /tmp/owc-r5/engerr/bare/run-bare-qjs.cjs
+  load while measured: 12.8 to 20.2, free memory 654 MB (39953 pages x 16 KB)
+  sources: /tmp/owc-r5/engerr/{cjs,mjs,probe,sh,bare}
+
+---- C: container ----
+C1-stack-null-x     at <anonymous> (<D>/main.js:61:66)
+C2-stack-json-parse     at <input>:1:2
+C3-stack-not-a-function     at <anonymous> (<D>/main.js:63:63)
+C4-stack-undefined-read     at <anonymous> (<D>/main.js:64:59)
+C5-stack-array-len     at Array (native)
+C6-stack-guest-error Error: boom
+---- C: host Node 24.15 ----
+C1-stack-null-x TypeError: Cannot read properties of null (reading 'x')
+C2-stack-json-parse SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+C3-stack-not-a-function TypeError: f is not a function
+C4-stack-undefined-read ReferenceError: zzNotDefinedAnywhere is not defined
+C5-stack-array-len RangeError: Invalid array length
+C6-stack-guest-error Error: boom
+---- C: bare QuickJS 0.32 ----
+C1-stack-null-x     at <anonymous> (bare.js:34:71)
+C2-stack-json-parse     at <input>:1:2
+C3-stack-not-a-function     at <anonymous> (bare.js:36:68)
+---- P: container ----
+(none)
+---- P: host Node 24.15 ----
+(none)
+---- P: bare QuickJS 0.32 ----
+P1-own-stack-is-data true
+P2-own-message-is-data true
+P3-Error.prototype.stack true
+P4-own-names message,stack
+---- own-property probe, container ----
+---- program output ----
+P1 own.stack            get=no set=no writable=true enumerable=false configurable=true value="    at <anonymous> (/app/main.js:21:4)\n    at call (native)\n    at loa"
+P2 own.message          get=no set=no writable=true enumerable=false configurable=true value="cannot read property 'x' of null"
+P3 own names            message,stack
+P4 proto is TypeError.prototype true
+P5 proto.stack          absent
+P6 proto.message        get=no set=no writable=true enumerable=false configurable=true value=""
+P7 gproto is Error.prototype true
+P8 Error.prototype.stack absent
+P9 Error.prototype.message get=no set=no writable=true enumerable=false configurable=true value=""
+P10 stack before            at <anonymous> (/app/main.js:21:4)
+P11 stack after delete  undefined
+P12 own.stack after del absent
+P13 guest own.stack     get=fn set=fn writable=undefined enumerable=false configurable=true
+P14 guest own.message   get=no set=no writable=true enumerable=false configurable=true value="boom"
+P15 String(Error)       function Error() { [native code] }
+P16 TypeError is shim   true
+P17 proto message hook hit seen=0 reads=cannot read property 'y' of null
+DONE
+---- program stderr ----
+[owc exit 0]
+
+---- ESM: container ----
+---- program output ----
+M1-direct-eval THREW InternalError: stack underflow (op=110, pc=8)
+M2-indirect-eval THREW InternalError: stack underflow (op=110, pc=8)
+M3-new-function function
+M4-get-newline function
+M5-get-newline-proto constructor,foo
+M6-get-same-line number
+M7-set-get-newline function
+M8-get-blank-line function
+DONE
+---- program stderr ----
+[owc exit 0]
+
+---- ESM: host Node 24.15 ----
+M1-direct-eval function
+M2-indirect-eval function
+M3-new-function function
+M4-get-newline number
+M5-get-newline-proto constructor,foo
+M6-get-same-line number
+M7-set-get-newline undefined
+M8-get-blank-line number
+DONE
+

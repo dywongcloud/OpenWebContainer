@@ -1,0 +1,8 @@
+WITNESS PASS (judge, shard guest, 2026-10-23, HEAD f5d5931)
+Input: fs.mkdirSync, statSync().isDirectory(), existsSync, writeFileSync + readFileSync inside, for ten
+directories whose names are Object.prototype keys, then readdirSync, renameSync and rmdirSync.
+Container: all ten "ok" (normal, constructor, toString, valueOf, hasOwnProperty, __proto__, isPrototypeOf,
+__defineGetter__, toJSON, then); listing identical to the host's and sorted the same; MUTATE ok.
+Host     : identical, all ten "ok", same listing, MUTATE ok.
+Measured in a fresh container, so no EEXIST from a previous run. Machine: load 23.77 (1-min), 5.3 GB free.
+Row closed.

@@ -63,12 +63,113 @@ export const SRC = String.raw`
     QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24, DataCloneError: 25
   };
 
+  /*
+   * The three members a DOMException answers -- name, message and code -- are getters on the
+   * prototype and not own properties of the instance, which is where host node 24.15 puts them and
+   * which is why Object.getOwnPropertyNames(new DOMException('d', 'AbortError')) is ['stack'] there:
+   * the stack is the one own property the engine gives an error itself. What hangs on that is the
+   * report: util.inspect opens with 'DOMException [AbortError]: d' -- the constructor's name in
+   * front and the name in brackets -- only while 'name' is NOT the error's own, which is the test
+   * formatErrorStack asks, and it is why the container printed 'AbortError: d' where host node 24.15
+   * prints 'DOMException [AbortError]: d' for as long as every instance carried its own. The values
+   * are one set per instance, so they live in a WeakMap, the way the rest of this module keeps the
+   * state an event or a port carries.
+   */
+  var DOM_FIELDS = new WeakMap();
+
+  /* The name, message and code of an instance this constructor never ran on -- one out of
+     'Object.create(DOMException.prototype)' -- are the ones a DOMException with no name answers. */
+  function domFieldOf(self, key) {
+    var fields = DOM_FIELDS.get(self);
+    if (fields !== undefined) return fields[key];
+    return key === 'name' ? 'Error' : (key === 'code' ? 0 : '');
+  }
+
+  /*
+   * The two parameters carry default values, which is what host node 24.15 declares --
+   * 'constructor(message = '', options = 'Error')' -- and which is the only reason the arity a
+   * DOMException answers is 0: Function.length counts the parameters before the first one with a
+   * default, so a constructor that reads 'constructor(message, name)' answers 2 where the host
+   * answers 0, both on DOMException.length and on DOMException.prototype.constructor.length, which
+   * is the same binding. A program that reads Function.length to decide how many arguments to pass,
+   * or that builds a wrapper with the arity of the thing it wraps, is told two here and one there.
+   * The defaults are the values the body already fell back to, so every call still lands where it
+   * did: an argument left out was undefined, and undefined takes the default.
+   */
   class DOMException extends Error {
-    constructor(message, name) {
-      super(message === undefined ? '' : String(message));
-      Object.defineProperty(this, 'name', { value: name === undefined ? 'Error' : String(name), configurable: true });
-      Object.defineProperty(this, 'code', { value: LEGACY_CODES[this.name] || 0, configurable: true });
+    constructor(message = '', name = 'Error') {
+      var text = message === undefined ? '' : String(message);
+      var given = name === undefined ? 'Error' : String(name);
+      /* The engine is handed the message so the stack it captures opens with it -- 'AbortError: d',
+         the header host node 24.15 writes -- and the own 'message' it wrote is taken back off, so
+         that 'stack' is the only own name an instance carries, as on the host. */
+      super(text);
+      DOM_FIELDS.set(this, { message: text, name: given, code: LEGACY_CODES[given] || 0 });
+      delete this.message;
     }
+  }
+  /* Enumerable and configurable and with no setter, as host node 24.15 declares them: a for-in over
+     an instance walks them in this order and an assignment to one is a no-op the host ignores. */
+  Object.defineProperties(DOMException.prototype, {
+    name: { get: function () { return domFieldOf(this, 'name'); }, enumerable: true, configurable: true },
+    message: { get: function () { return domFieldOf(this, 'message'); }, enumerable: true, configurable: true },
+    code: { get: function () { return domFieldOf(this, 'code'); }, enumerable: true, configurable: true }
+  });
+  /*
+   * The 25 legacy code constants the DOM spec names -- INDEX_SIZE_ERR = 1 through DATA_CLONE_ERR = 25
+   * -- are value properties of the prototype and of nothing else, which is where host node 24.15 puts
+   * them: writable false, enumerable true, configurable false, so a for-in over the prototype, or
+   * over any instance, walks 28 names and Object.keys(DOMException.prototype) is 28 long, where this
+   * prototype carried 3 and every one of them read undefined. They are the codes a DOMException of
+   * the matching name answers -- the same numbers LEGACY_CODES hands an instance -- plus the two no
+   * name carries any more, DOMSTRING_SIZE_ERR and NO_DATA_ALLOWED_ERR, whose errors the spec dropped
+   * and whose numbers it kept. Nothing on the instance changes: no instance gains an own name, so
+   * Object.getOwnPropertyNames(new DOMException('d', 'AbortError')) is still ['stack'], and nothing
+   * that reads a DOMException by its own names -- util.inspect's header first among them -- sees one
+   * more than it did, which is why the report the last row on this file fixed still opens with
+   * 'DOMException [AbortError]: d'.
+   */
+  var LEGACY_CONSTANTS = {
+    INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3, WRONG_DOCUMENT_ERR: 4,
+    INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6, NO_MODIFICATION_ALLOWED_ERR: 7,
+    NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9, INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11,
+    SYNTAX_ERR: 12, INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+    VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18, NETWORK_ERR: 19, ABORT_ERR: 20,
+    URL_MISMATCH_ERR: 21, QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24,
+    DATA_CLONE_ERR: 25
+  };
+  var LEGACY_DESCS = {};
+  Object.keys(LEGACY_CONSTANTS).forEach(function (constant) {
+    LEGACY_DESCS[constant] = { value: LEGACY_CONSTANTS[constant], writable: false, enumerable: true, configurable: false };
+  });
+  Object.defineProperties(DOMException.prototype, LEGACY_DESCS);
+  /*
+   * WebIDL declares a constant on the interface object as well as on the interface prototype
+   * object, and host node 24.15 does the same: Object.getOwnPropertyNames(DOMException) is 28 there
+   * -- length, name and prototype, then these same 25 in this same order, under this same
+   * descriptor -- where this constructor carried 3 and every static read answered undefined. Three
+   * things a program does hang off that and all three broke: 'e.code === DOMException.ABORT_ERR'
+   * compared against undefined and never matched, a table copied off the constructor to build an
+   * error class of its own came away empty, and a sloppy write to one of the names defined a
+   * property here -- a constructor is extensible, and an absent writable false is no bar -- where
+   * the host's constant ignores the write and its configurable false refuses the delete. One set of
+   * descriptors serves both objects: defineProperties installs a value property on each, so nothing
+   * that reads one side can move the other, and the 25 land behind the three names already there,
+   * which is the order the host reports them in. Nothing on the prototype or on an instance moves:
+   * no instance gains an own name, so Object.getOwnPropertyNames(new DOMException('d',
+   * 'AbortError')) is still ['stack'], and util.inspect's header still opens with
+   * 'DOMException [AbortError]: d'.
+   */
+  Object.defineProperties(DOMException, LEGACY_DESCS);
+  /*
+   * The tag is the one thing a host DOMException carries that a plain Error does not, and it is
+   * what Object.prototype.toString.call(new DOMException('d', 'AbortError')) reads to answer
+   * '[object DOMException]' and not '[object Error]', as it does on host node 24.15. Host node
+   * 24.15 declares it on the prototype -- writable false, enumerable false, configurable true,
+   * which is where WebIDL puts it -- and no instance owns one.
+   */
+  if (typeof Symbol === 'function' && Symbol.toStringTag !== undefined) {
+    Object.defineProperty(DOMException.prototype, Symbol.toStringTag, { value: 'DOMException', configurable: true });
   }
 
   class Event {

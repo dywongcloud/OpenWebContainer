@@ -1,4 +1,4 @@
-import { DeviceFS, ErrnoError, fs, InMemoryStore, normalizePath, StoreFS, type DeviceDriver } from '@zenfs/core';
+import { DeviceFS, Errno, ErrnoError, fs, InMemoryStore, normalizePath, StoreFS, type DeviceDriver } from '@zenfs/core';
 import { IFileSystem, PathStat } from './types';
 import { installPrototypeNameFix } from './zenfs-listing';
 import { NODE_BINARY } from '../process/executors/default-env';
@@ -239,6 +239,25 @@ function joinPath(dir: string, name: string): string {
     return dir === '/' ? `/${name}` : `${dir}/${name}`;
 }
 
+/*
+ * The two bounds a kernel refuses before it looks at anything else: a component past NAME_MAX of 255
+ * bytes, and a whole path past PATH_MAX of 4096. ZenFS keeps neither -- it writes and reads a
+ * 1024-byte name -- so a guest's fs.writeFileSync of 'b'.repeat(256) landed where host node 24.15
+ * answers ENAMETOOLONG, and a 4200-byte path answered ENOENT here, its parent looking missing,
+ * where the host refuses the whole path before it looks at any parent. The bound is read where a
+ * path is resolved rather than at the one call a probe made, so it holds for every write, every
+ * stat and every directory this file system makes.
+ */
+const NAME_MAX = 255;
+const PATH_MAX = 4096;
+
+function requirePathWithinLimits(path: string): void {
+    if (new TextEncoder().encode(path).length > PATH_MAX) throw new ErrnoError(Errno.ENAMETOOLONG, path);
+    for (const part of path.split('/')) {
+        if (new TextEncoder().encode(part).length > NAME_MAX) throw new ErrnoError(Errno.ENAMETOOLONG, path);
+    }
+}
+
 export class ZenFSCore implements IFileSystem {
     private fs: typeof fs;
 
@@ -256,6 +275,7 @@ export class ZenFSCore implements IFileSystem {
         return this.fs.readFileSync(path);
     }
     writeBuffer(path: string, buffer: Buffer): void {
+        requirePathWithinLimits(path);
         return this.fs.writeFileSync(path, buffer);
     }
     normalizePath(path: string): string {
@@ -263,6 +283,7 @@ export class ZenFSCore implements IFileSystem {
     }
 
     writeFile(path: string, content: string): void {
+        requirePathWithinLimits(path);
         this.fs.writeFileSync(path, content,{encoding:'utf-8'});
     }
 
@@ -376,6 +397,7 @@ export class ZenFSCore implements IFileSystem {
      * `drwxr-xr-x`.
      */
     createDirectory(path: string, mode?: number): void {
+        requirePathWithinLimits(path);
         this.fs.mkdirSync(path, { recursive: true, mode: (mode === undefined ? 0o777 : mode & 0o7777) & ~0o022 });
     }
 
@@ -394,6 +416,7 @@ export class ZenFSCore implements IFileSystem {
     /* `mode` is carried through: a guest's `fs.statSync` reports it, and the executable bit is
        what a search for a binary reads. */
     statPath(path: string): PathStat | undefined {
+        requirePathWithinLimits(path);
         if (!this.fs.existsSync(path)) return undefined;
         const stat = this.fs.statSync(path);
         /* A host's `/dev` is `dr-xr-xr-x`, the kernel's directory rather than the user's, so that is
@@ -425,7 +448,20 @@ export class ZenFSCore implements IFileSystem {
     }
 
     writeBytes(path: string, data: Uint8Array, mode?: number): void {
+        requirePathWithinLimits(path);
         this.fs.writeFileSync(path, data, mode === undefined ? undefined : { mode: mode & 0o7777 });
+    }
+
+    /* An append is a write at the end of what is already there. `writeBytes` hands the file system
+       a second copy of every byte, so the cost of one append grew with the file -- a 2 MiB log
+       written 5 KiB at a time took minutes where a host takes milliseconds -- and the bytes the
+       file already had were written again on every call. The size is read once and the new bytes
+       are written at it, which leaves the ones already there untouched. */
+    appendBytes(path: string, data: Uint8Array, mode?: number): void {
+        requirePathWithinLimits(path);
+        /* 'a+' is the flag an append is: it opens the name, seeks to the end of what is already
+           there and writes, so a name that is not there yet is made the way `writeBytes` makes it. */
+        this.fs.appendFileSync(path, data, mode === undefined ? undefined : { mode: mode & 0o7777 });
     }
 
     removePath(path: string, recursive = false): void {

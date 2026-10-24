@@ -1,6 +1,17 @@
 /** The lifecycle events npm runs for a package it installs, in run order. */
 export const INSTALL_SCRIPT_EVENTS = ['preinstall', 'install', 'postinstall'] as const;
 
+/**
+ * The lifecycle events npm runs for the package in the directory it installs into, in run order.
+ *
+ * `npm install` with no arguments runs them; `npm install <pkg>` runs none of them, because the
+ * package that install changes is a dependency and not the root. `preinstall` runs before the tree
+ * is placed, so a script of a package the install is about to add cannot have run yet; the rest
+ * wait for the tree, which is what lets `prepare` build from the dependencies it just got.
+ */
+export const ROOT_PRE_INSTALL_SCRIPT_EVENTS = ['preinstall'] as const;
+export const ROOT_POST_INSTALL_SCRIPT_EVENTS = ['install', 'postinstall', 'prepare'] as const;
+
 /** Characters that would need a shell (operators, expansion, globs, comments): a command using them is not run. */
 const SHELL_SYNTAX = new Set(['&', '|', ';', '<', '>', '(', ')', '$', '`', '*', '?', '[', ']', '{', '}', '~', '#']);
 

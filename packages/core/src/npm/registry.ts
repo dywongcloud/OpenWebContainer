@@ -25,6 +25,14 @@ export interface Packument {
     versions: Record<string, PackageVersion>;
 }
 
+/** One advisory the registry's security endpoint returns for a package. */
+export interface Advisory {
+    title: string;
+    url: string;
+    severity: string;
+    vulnerable_versions: string;
+}
+
 export const DEFAULT_REGISTRY = 'https://registry.npmjs.org/';
 
 /**
@@ -34,6 +42,9 @@ export const DEFAULT_REGISTRY = 'https://registry.npmjs.org/';
 export class NpmRegistry {
     private packuments = new Map<string, Promise<Packument>>();
     private manifests = new Map<string, Promise<PackageVersion>>();
+    /** Every tarball this process has fetched: what `npm cache verify` counts as content. */
+    private tarballCount = 0;
+    private tarballBytes = 0;
 
     constructor(
         private readonly baseUrl: string = DEFAULT_REGISTRY,
@@ -57,6 +68,8 @@ export class NpmRegistry {
         }
         const bytes = new Uint8Array(await response.arrayBuffer());
         await verifyIntegrity(bytes, version);
+        this.tarballCount += 1;
+        this.tarballBytes += bytes.length;
         return bytes;
     }
 
@@ -70,6 +83,32 @@ export class NpmRegistry {
             cached.catch(() => this.manifests.delete(key));
         }
         return cached;
+    }
+
+    /** The advisories the registry has for the versions asked about: one name against its versions. */
+    async fetchAdvisories(query: Record<string, string[]>): Promise<Record<string, Advisory[]>> {
+        const response = await this.fetcher(`${this.baseUrl}-/npm/v1/security/advisories/bulk`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(query)
+        });
+        if (!response.ok) {
+            throw new Error(`Registry responded ${response.status} for the advisory endpoint`);
+        }
+        return await response.json() as Record<string, Advisory[]>;
+    }
+
+    /**
+     * What this process holds of the registry: the tarballs it has fetched and the metadata it has
+     * fetched for them, which is what `npm cache verify` counts here -- a container has no
+     * `_cacache` on a disk, so the cache npm would verify is the one this process is holding.
+     */
+    cacheStats(): { content: number; bytes: number; index: number } {
+        return {
+            content: this.tarballCount,
+            bytes: this.tarballBytes,
+            index: this.packuments.size + this.manifests.size
+        };
     }
 
     private async fetchVersionManifest(name: string, version: string): Promise<PackageVersion> {

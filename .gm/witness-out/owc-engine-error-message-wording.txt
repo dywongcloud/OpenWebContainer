@@ -1,0 +1,116 @@
+Witness: engine-error divergences, container vs host Node 24.15 vs BARE QuickJS 0.32.
+  host        node v24.15.0 on this machine
+  container   /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, one process per case
+  bare        quickjs-emscripten 0.32 (@jitl/quickjs-wasmfile-release-sync) driven directly from
+              node with NOTHING of the container around it -- no guest globals, no bootstrap, no
+              error-constructor wrapper: /tmp/owc-r5/engerr/bare/run-bare-qjs.cjs
+  load while measured: 12.8 to 20.2, free memory 654 MB (39953 pages x 16 KB)
+  sources: /tmp/owc-r5/engerr/{cjs,mjs,probe,sh,bare}
+
+---- A: container ----
+A1-null-x.name TypeError
+A1-null-x.message cannot read property 'x' of null
+A1-null-x.string TypeError: cannot read property 'x' of null
+A2-undefined-fn.name ReferenceError
+A2-undefined-fn.message 'undefinedFn' is not defined
+A2-undefined-fn.string ReferenceError: 'undefinedFn' is not defined
+A3-json-parse.name SyntaxError
+A3-json-parse.message expecting property name
+A3-json-parse.string SyntaxError: expecting property name
+A4-array-len.name RangeError
+A4-array-len.message invalid array length
+A4-array-len.string RangeError: invalid array length
+A5-decode-uri.name URIError
+A5-decode-uri.message expecting hex digit
+A5-decode-uri.string URIError: expecting hex digit
+A6-not-a-function.name TypeError
+A6-not-a-function.message not a function
+A6-not-a-function.string TypeError: not a function
+A7-frozen-write.name TypeError
+A7-frozen-write.message 'z' is read-only
+A7-frozen-write.string TypeError: 'z' is read-only
+A8-nonwritable-write.name TypeError
+A8-nonwritable-write.message 'z' is read-only
+A8-nonwritable-write.string TypeError: 'z' is read-only
+---- A: host Node 24.15 ----
+A1-null-x.name TypeError
+A1-null-x.message Cannot read properties of null (reading 'x')
+A1-null-x.string TypeError: Cannot read properties of null (reading 'x')
+A2-undefined-fn.name ReferenceError
+A2-undefined-fn.message undefinedFn is not defined
+A2-undefined-fn.string ReferenceError: undefinedFn is not defined
+A3-json-parse.name SyntaxError
+A3-json-parse.message Expected property name or '}' in JSON at position 1 (line 1 column 2)
+A3-json-parse.string SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+A4-array-len.name RangeError
+A4-array-len.message Invalid array length
+A4-array-len.string RangeError: Invalid array length
+A5-decode-uri.name URIError
+A5-decode-uri.message URI malformed
+A5-decode-uri.string URIError: URI malformed
+A6-not-a-function.name TypeError
+A6-not-a-function.message f is not a function
+A6-not-a-function.string TypeError: f is not a function
+A7-frozen-write.name TypeError
+A7-frozen-write.message Cannot assign to read only property 'z' of object '#<Object>'
+A7-frozen-write.string TypeError: Cannot assign to read only property 'z' of object '#<Object>'
+A8-nonwritable-write.name TypeError
+A8-nonwritable-write.message Cannot assign to read only property 'z' of object '#<Object>'
+A8-nonwritable-write.string TypeError: Cannot assign to read only property 'z' of object '#<Object>'
+---- A: bare QuickJS 0.32 ----
+A1-null-x.name TypeError
+A1-null-x.message cannot read property 'x' of null
+A1-null-x.string TypeError: cannot read property 'x' of null
+A1-null-x.stack0     at <anonymous> (bare.js:15:59)
+A2-undefined-fn.name ReferenceError
+A2-undefined-fn.message 'undefinedFn' is not defined
+A2-undefined-fn.string ReferenceError: 'undefinedFn' is not defined
+A2-undefined-fn.stack0     at <anonymous> (bare.js:16:50)
+A3-json-parse.name SyntaxError
+A3-json-parse.message expecting property name
+A3-json-parse.string SyntaxError: expecting property name
+A3-json-parse.stack0     at <input>:1:2
+A4-array-len.name RangeError
+A4-array-len.message invalid array length
+A4-array-len.string RangeError: invalid array length
+A4-array-len.stack0     at Array (native)
+A5-decode-uri.name URIError
+A5-decode-uri.message expecting hex digit
+A5-decode-uri.string URIError: expecting hex digit
+A5-decode-uri.stack0     at decodeURIComponent (native)
+A6-not-a-function.name TypeError
+A6-not-a-function.message not a function
+A6-not-a-function.string TypeError: not a function
+A6-not-a-function.stack0     at <anonymous> (bare.js:20:56)
+A7-frozen-write NO-THROW
+---- G: container ----
+G1-inspect-null-x TypeError: cannot read property 'x' of null
+---- G: host Node 24.15 ----
+G1-inspect-null-x TypeError: Cannot read properties of null (reading 'x')
+---- G: bare QuickJS 0.32 ----
+(none)
+---- ESM: container ----
+---- program output ----
+M1-direct-eval THREW InternalError: stack underflow (op=110, pc=8)
+M2-indirect-eval THREW InternalError: stack underflow (op=110, pc=8)
+M3-new-function function
+M4-get-newline function
+M5-get-newline-proto constructor,foo
+M6-get-same-line number
+M7-set-get-newline function
+M8-get-blank-line function
+DONE
+---- program stderr ----
+[owc exit 0]
+
+---- ESM: host Node 24.15 ----
+M1-direct-eval function
+M2-indirect-eval function
+M3-new-function function
+M4-get-newline number
+M5-get-newline-proto constructor,foo
+M6-get-same-line number
+M7-set-get-newline undefined
+M8-get-blank-line number
+DONE
+

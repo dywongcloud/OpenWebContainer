@@ -77,3 +77,28 @@ h2 up ms=2070
  real	0m0.109s user	0m0.062s sys	0m0.021s 
 -n host cpu size=16777216: 
  real	0m0.194s user	0m0.085s sys	0m0.075s 
+
+
+==== judge re-run, own session adv5-judge-http2-net-5, HEAD bc261b6 ====
+machine: load 23-58 (never idle; a wait for load < 12 timed out at 25), free 40-215k pages
+one process per run, 16 MiB, both ends in the container, host Node 24.15.0 beside it
+
+VERDICT http2-throughput-gap: HOLDS. The gap reproduces (HTTP/2 2092/2432/3055 ms here against the
+host's 68/78/108 ms) and so does the cause, but two sentences of the recorded cause are wrong and are
+corrected in Readme.md.
+
+What survives: priced with a setImmediate chain measured in the same process, macrotask turns (259 for
+HTTP/1.1, 782 for HTTP/2, at 1.41-1.92 ms each here against 0.043-0.077 ms on host) account for 53% of
+the HTTP/2 wall and 82% of the HTTP/1.1 wall. The residue is 59-93 ns/byte for HTTP/2 and 4.6-13 for
+HTTP/1.1, against the host's 4.1-5.4 and 1.9-2.0: HTTP/2 is ~15x the host per byte where HTTP/1.1 is
+~2.5x, and 6-13x this container's own HTTP/1.1 where the host's HTTP/2 is 2.2-2.6x its own. HTTP/2 is
+the outlier and the transport is not the cause.
+
+What does not survive: (1) "no change to the bridge can move" -- the largest single term in the wall
+clock is a bridge turn, and it moves with the machine (1.92 ms per turn at load 45, 1.41 at load 25).
+Only the per-byte residue is immovable. (2) "a JavaScript HTTP/2 on this engine" -- the guest's own
+byte rate is 0.20 ns/byte copying 16 MiB in 64 KiB blocks against the host's 0.046, and 0.083 against
+0.053 for a 16 MiB concat, so 1.6-4.5x and not the ~15x the HTTP/2 path shows; it is this
+implementation's HTTP/2 path, not QuickJS's byte throughput. The adversary's "the guest's raw byte
+rate is host-class or better, 0.03 vs 0.04 ns/byte" does not reproduce -- measured here it is 0.20 vs
+0.046.

@@ -190,21 +190,66 @@ BF.timers = function () {
 };
 
 BF['timers/promises'] = function () {
-  function Scheduler() {}
-  Scheduler.prototype.wait = function (delay, options) {
-    return new Promise(function (resolve) {
-      setTimeoutImpl(function () { resolve(undefined); }, delay);
+  /*
+   * The error an aborted signal rejects with, as Node builds it: a subclass of Error whose name is
+   * 'AbortError' and whose code is 'ABORT_ERR', carrying the signal's own reason as its cause.
+   */
+  var ABORT_ERROR = (function () {
+    function AbortError(message) {
+      var err = new Error(message);
+      Object.setPrototypeOf(err, AbortError.prototype);
+      return err;
+    }
+    AbortError.prototype = Object.create(Error.prototype);
+    Object.defineProperty(AbortError.prototype, 'constructor', {
+      value: AbortError, writable: true, configurable: true
     });
-  };
-  Scheduler.prototype.yield = function () {
-    return new Promise(function (resolve) {
-      setImmediateImpl(function () { resolve(undefined); });
-    });
-  };
+    return AbortError;
+  })();
+  function abortErrorFor(signal) {
+    var err = ABORT_ERROR('The operation was aborted');
+    try {
+      var reason = signal === undefined || signal === null ? undefined : signal.reason;
+      if (reason !== undefined) err.cause = reason;
+    } catch (e) { /* a reason getter that throws is not the error's business */ }
+    err.code = 'ABORT_ERR';
+    err.name = 'AbortError';
+    return err;
+  }
+  /*
+   * A signal that is already aborted when the operation is asked for rejects at once, before any
+   * timer is armed; one that aborts while the operation is pending cancels the timer and rejects
+   * the same way. The listener comes off the signal the moment the operation settles, whichever
+   * way it settled, so an abort that never comes leaves nothing behind.
+   */
+  function armAbort(signal, onAborted) {
+    if (signal === undefined || signal === null || typeof signal.addEventListener !== 'function') return null;
+    var listener = function () { onAborted(); };
+    signal.addEventListener('abort', listener);
+    return function () {
+      if (typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', listener);
+    };
+  }
+  function abortRejection(signal) {
+    return new Promise(function (resolve, reject) { reject(abortErrorFor(signal)); });
+  }
+  function signalOf(options) {
+    var signal = options === undefined || options === null ? undefined : options.signal;
+    return signal === undefined || signal === null || typeof signal !== 'object' ? undefined : signal;
+  }
   /* one value per interval tick; ticks that elapse while the consumer is busy are yielded in turn */
-  async function* intervalValues(delay, value) {
+  async function* intervalValues(delay, value, signal) {
     var pending = 0;
     var wake = null;
+    var aborted = null;
+    var off = signal === undefined ? null : armAbort(signal, function () {
+      aborted = abortErrorFor(signal);
+      if (wake !== null) {
+        var resume = wake;
+        wake = null;
+        resume();
+      }
+    });
     var handle = setIntervalImpl(function () {
       pending++;
       if (wake !== null) {
@@ -215,9 +260,11 @@ BF['timers/promises'] = function () {
     }, delay);
     try {
       while (true) {
+        if (aborted !== null) throw aborted;
         if (pending === 0) {
           await new Promise(function (resolve) { wake = resolve; });
         }
+        if (aborted !== null) throw aborted;
         while (pending > 0) {
           pending--;
           yield value;
@@ -225,21 +272,69 @@ BF['timers/promises'] = function () {
       }
     } finally {
       clearTimer(handle);
+      if (off !== null) off();
     }
   }
+  function Scheduler() {}
+  Scheduler.prototype.wait = function (delay, options) {
+    var signal = signalOf(options);
+    if (signal !== undefined && signal.aborted === true) return abortRejection(signal);
+    return new Promise(function (resolve, reject) {
+      var off = null;
+      var handle = setTimeoutImpl(function () {
+        if (off !== null) off();
+        resolve(undefined);
+      }, delay);
+      if (signal !== undefined) {
+        off = armAbort(signal, function () {
+          clearTimer(handle);
+          reject(abortErrorFor(signal));
+        });
+      }
+    });
+  };
+  Scheduler.prototype.yield = function () {
+    return new Promise(function (resolve) {
+      setImmediateImpl(function () { resolve(undefined); });
+    });
+  };
   return {
-    setTimeout: function (ms, value) {
-      return new Promise(function (resolve) {
-        setTimeoutImpl(function () { resolve(value); }, ms);
+    setTimeout: function (ms, value, options) {
+      var signal = signalOf(options);
+      if (signal !== undefined && signal.aborted === true) return abortRejection(signal);
+      return new Promise(function (resolve, reject) {
+        var off = null;
+        var handle = setTimeoutImpl(function () {
+          if (off !== null) off();
+          resolve(value);
+        }, ms);
+        if (signal !== undefined) {
+          off = armAbort(signal, function () {
+            clearTimer(handle);
+            reject(abortErrorFor(signal));
+          });
+        }
       });
     },
-    setImmediate: function (value) {
-      return new Promise(function (resolve) {
-        setImmediateImpl(function () { resolve(value); });
+    setImmediate: function (value, options) {
+      var signal = signalOf(options);
+      if (signal !== undefined && signal.aborted === true) return abortRejection(signal);
+      return new Promise(function (resolve, reject) {
+        var off = null;
+        var handle = setImmediateImpl(function () {
+          if (off !== null) off();
+          resolve(value);
+        });
+        if (signal !== undefined) {
+          off = armAbort(signal, function () {
+            clearTimer(handle);
+            reject(abortErrorFor(signal));
+          });
+        }
       });
     },
-    setInterval: function (delay, value) {
-      return intervalValues(delay, value);
+    setInterval: function (delay, value, options) {
+      return intervalValues(delay, value, signalOf(options));
     },
     scheduler: new Scheduler()
   };
@@ -2190,8 +2285,25 @@ BF.crypto = function () {
     return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
   }
 
-  function randomInt(min, max) {
-    if (max === undefined) {
+  function randomIntDraw(min, max) {
+    var r = randomBytes(4).readUInt32BE(0) / 4294967296;
+    return min + Math.floor(r * (max - min));
+  }
+
+  /* randomInt([min, ]max[, callback]). A function where 'max' would be is the callback, and the one
+     number beside it is then the upper bound with 0 as the lower one -- so randomInt(10, cb) draws
+     in [0, 10) and calls cb later, and randomInt(10, cb, 5) does too, the 5 never being read. A
+     lone function is still the upper bound, which is why randomInt(cb) is an argument error about
+     'max' and not a callback; and an absent 'max' is that same one-number form, so randomInt(10,
+     undefined) draws in [0, 10) as well. Every bound is checked before anything is drawn, so a
+     range that cannot be drawn is thrown at the caller and not handed to the callback. */
+  function randomInt(min, max, callback) {
+    var done = callback;
+    if (typeof max === 'function') {
+      done = max;
+      max = min;
+      min = 0;
+    } else if (max === undefined) {
       max = min;
       min = 0;
     }
@@ -2200,8 +2312,15 @@ BF.crypto = function () {
     if (typeof max !== 'number' || !Number.isSafeInteger(max)) throw invalidArgType('max', 'a safe integer', max);
     if (typeof min !== 'number' || !Number.isSafeInteger(min)) throw invalidArgType('min', 'a safe integer', min);
     if (!(max > min)) throw outOfRange('max', 'greater than the value of "min" (' + min + ')', max);
-    var r = randomBytes(4).readUInt32BE(0) / 4294967296;
-    return min + Math.floor(r * (max - min));
+    if (done !== undefined && typeof done !== 'function') throw invalidArgType('callback', 'of type function', done);
+    /* Node draws on its thread pool, so the callback runs after the timers a program has already
+       armed and before its immediates, and the call itself answers undefined rather than a number.
+       The error it hands the callback is undefined, where randomBytes' is null. */
+    if (done !== undefined) {
+      setTimeout(function () { done(undefined, randomIntDraw(min, max)); }, 0);
+      return undefined;
+    }
+    return randomIntDraw(min, max);
   }
 
   /* The integer-typed arrays webcrypto.getRandomValues fills: a floating-point one and a DataView
@@ -4469,6 +4588,16 @@ function tsStripTypes(src) {
     var t = tokens[k];
     return t !== undefined && t.k === 'w';
   }
+  /* Whether the token at 'k' stands where a declaration can: 'enum', 'namespace' and 'module'
+     declare something strip-only mode has no way to erase, so node refuses the file -- but the word
+     behind a '.' is a property and not a declaration, and 'module.exports' is the CommonJS exports
+     object every CommonJS .ts writes to. A 'module' is a namespace only when a name or a string
+     literal follows it, which is what separates 'module Foo {}' from the identifier. */
+  function declaresAt(k) {
+    var p = prevIdx(k);
+    var before = p >= 0 ? tokens[p] : null;
+    return !(before !== null && before.k === 'p' && before.v === '.');
+  }
   /* The index of the significant token before 'k' and after it, comments skipped; and the index of
      the bracket that matches the one at 'k', or -1. */
   function prevIdx(k) {
@@ -4664,8 +4793,14 @@ function tsStripTypes(src) {
         i++;
         continue;
       }
-      if (t.v === 'enum') throw tsUnsupportedSyntax('enum');
-      if (t.v === 'namespace' || t.v === 'module') throw tsUnsupportedSyntax('namespace');
+      if (t.v === 'enum' && declaresAt(i)) throw tsUnsupportedSyntax('enum');
+      if (t.v === 'namespace' && declaresAt(i)) throw tsUnsupportedSyntax('namespace');
+      if (t.v === 'module') {
+        var nextT = tokens[i + 1];
+        if (nextT !== undefined && (nextT.k === 'w' || nextT.k === 's') && declaresAt(i)) {
+          throw tsUnsupportedSyntax('namespace');
+        }
+      }
       if (t.v === 'interface') {
         /* 'export interface' goes with the interface: node erases the export too, there being
            nothing left for it to export. */
@@ -5118,10 +5253,67 @@ BF.module = function () {
        row owc-module-globalpaths-empty. */
     return paths;
   };
-  /* The package.json of the package a specifier names, as a path: the specifier is resolved as a
-     module and the walk goes up from what it found to the nearest package.json carrying that name,
-     the way node's own reader goes from a resolved package to its manifest. */
-  Module.findPackageJSON = function findPackageJSON(specifier, base = undefined) {
+  /* The name a bare specifier asks a package by: everything before the first '/' for an ordinary
+     name and everything before the second for a scoped one, which is what makes '@a/b/c' a request
+     for '@a/b'. A name with no '/' in it at all is asked for whole. */
+  function findPackageNameOf(name) {
+    var first = name.indexOf('/');
+    if (name.charAt(0) !== '@') {
+      return { name: first < 0 ? name : name.slice(0, first), scoped: false };
+    }
+    var second = first < 0 ? -1 : name.indexOf('/', first + 1);
+    return { name: second < 0 ? name : name.slice(0, second), scoped: true };
+  }
+  /* Whether node's own loader resolves a specifier as a path: shouldBeTreatedAsRelativeOrAbsolutePath
+     in internal/modules/esm/resolve, which answers false for '' alone -- an empty specifier is not
+     a relative or an absolute path, so it is handed to packageResolve as a package name. */
+  function isRelativeOrAbsoluteOf(specifier) {
+    if (specifier === '') return false;
+    if (specifier.charAt(0) === '/') return true;
+    if (specifier.charAt(0) !== '.') return false;
+    if (specifier.length === 1 || specifier.charAt(1) === '/') return true;
+    if (specifier.charAt(1) !== '.') return false;
+    return specifier.length === 2 || specifier.charAt(2) === '/';
+  }
+  /* A path with no empty segment in it: an empty package name puts two slashes where one was
+     meant, and node's own URL keeps them apart, which is a path no message of its may carry. */
+  function collapsedPathOf(p) {
+    var parts = p.split('/');
+    var out = [];
+    for (var i = 0; i < parts.length; i++) if (parts[i] !== '') out.push(parts[i]);
+    return (p.charAt(0) === '/' ? '/' : '') + out.join('/');
+  }
+  /* The package.json at or above a path, as node's own reader finds it: the search starts at the
+     directory a trailing slash names and at the parent of the one that does not, and a path with no
+     package.json at or above it answers itself -- which is why a directory with none above comes
+     back as that directory, trailing slash and all, and not as undefined. */
+  function nearestPackageJSONOf(checkPath) {
+    var start;
+    if (checkPath === '/' || checkPath === '') start = '/';
+    else if (checkPath.charAt(checkPath.length - 1) === '/') start = checkPath.slice(0, -1);
+    else start = dirnameOf(checkPath);
+    var at = start === '' ? '/' : start;
+    while (true) {
+      var candidate = (at === '/' ? '' : at) + '/package.json';
+      if (host.readText(candidate) !== null) return candidate;
+      if (at === '/') break;
+      var up = dirnameOf(at);
+      if (up === at) break;
+      at = up;
+    }
+    return checkPath;
+  }
+  /* The package.json of the package a specifier names, as a path.
+     Node resolves from a *parent URL* and not from a directory, and the difference is the whole of
+     this function: a base that is a file path names that file, so a bare specifier is looked for
+     under the directory holding it and not under the base itself -- 'express' from '/a/case' is
+     '/a/node_modules/express' and not '/a/case/node_modules/express' -- and the default base is
+     'data:', a URL no relative specifier parses against, which is why no base at all is a failure
+     to resolve and not a package that cannot be found. row owc-module-findpackagejson-nonurl-base.
+     A bare name is not resolved as a module either: the node_modules folders are walked and the
+     package.json of the first directory that is there is the answer, whatever that manifest's
+     "exports" map says, which is why 'express/nope' answers express's own package.json on a host. */
+  Module.findPackageJSON = function findPackageJSON(specifier, base = 'data:') {
     if (arguments.length === 0) {
       var missing = new TypeError('The "specifier" argument must be specified');
       missing.code = 'ERR_MISSING_ARGS';
@@ -5139,66 +5331,149 @@ BF.module = function () {
       notString.code = 'ERR_INVALID_ARG_TYPE';
       throw notString;
     }
-    /* Node's own default base is 'data:', a URL no file path parses against, so with no base at
-       all a bare name is an invalid URL there rather than a package it cannot find; a base that is
-       neither a URL nor an absolute path fails the same way, and one that is not a string at all
-       is refused as an argument first. */
-    var from;
-    if (base === undefined) {
-      from = null;
+    var urlFor = requireBuiltin('url');
+    var URLForBase = urlFor.URL;
+    /* The base node resolves from: a URL as it was handed over, an absolute path as the file URL it
+       names -- trailing slash kept, which is the only thing that says a path is a directory -- and
+       anything else parsed as a URL with nothing to parse it against, which is what refuses it. */
+    var parentURL;
+    if (URLForBase.canParse(base)) {
+      parentURL = base;
     } else if (typeof base !== 'string') {
       var badBase = new TypeError('The "base" argument must be of type string. Received ' + receivedTypeOf(base));
       badBase.code = 'ERR_INVALID_ARG_TYPE';
       throw badBase;
-    } else if (base.indexOf('file://') === 0) {
-      from = base.slice(7);
     } else if (base.charAt(0) === '/') {
-      from = base;
+      parentURL = urlFor.pathToFileURL(base).href;
     } else {
       var badURL = new TypeError('Invalid URL');
       badURL.code = 'ERR_INVALID_URL';
       throw badURL;
     }
-    /* A specifier carrying a scheme is not a bare name, and node's resolver refuses every scheme
-       but file before it looks anywhere. */
-    var scheme = /^[A-Za-z][A-Za-z0-9+\-.]*:/.exec(name);
-    if (scheme && scheme[0].toLowerCase() !== 'file:') {
-      var badScheme = new TypeError('The URL must be of scheme file');
-      badScheme.code = 'ERR_INVALID_URL_SCHEME';
-      throw badScheme;
-    }
-    if (from === null) {
-      var noBase = new TypeError('Invalid URL');
-      noBase.code = 'ERR_INVALID_URL';
-      throw noBase;
-    }
-    /* Node resolves from the file it is handed, and reports that file, not the directory holding
-       it, in the message it gives when the package is not there; the host resolver reads a
-       package.json out of the directory it takes, and handing it a file makes it read that file as
-       one, so the file is walked up to the directory holding it before it is resolved from. */
-    var startDir = from;
-    if (Module._stat(startDir) !== 1) startDir = dirnameOf(startDir);
-    var found = host.resolve(name, startDir, 'require') || host.resolve(name, startDir, 'import');
-    if (!found) {
-      var err = new Error("Cannot find package '" + name + "' imported from " + from);
-      err.code = 'ERR_MODULE_NOT_FOUND';
-      throw err;
-    }
-    var dir = dirnameOf(found);
-    while (true) {
-      var pjsonPath = dir + '/package.json';
-      var text = host.readText(pjsonPath);
-      if (text !== null) {
-        try {
-          var parsed = JSON.parse(text);
-          if (parsed && parsed.name === name) return pjsonPath;
-        } catch (e) { /* a package.json that does not parse is not the one being looked for */ }
+    /* The path the base names, and whether it is a file URL at all: every step below reads a path
+       out of it, and a base no path can be read out of is what answers 'Invalid URL' for 'data:'. */
+    var parentPath = null;
+    try { parentPath = urlFor.fileURLToPath(parentURL); } catch (e) { parentPath = null; }
+    /* What node calls a bare specifier: not empty, not a path, and not a URL either. Only one of
+       those is looked for in node_modules; the rest are resolved against the base. */
+    var bare = name !== '' && name.charAt(0) !== '.' && name.charAt(0) !== '/' && !URLForBase.canParse(name);
+    if (bare) {
+      if (parentPath === null) {
+        var badParent = new TypeError('Invalid URL');
+        badParent.code = 'ERR_INVALID_URL';
+        throw badParent;
       }
-      var up = dirnameOf(dir);
-      if (up === dir) break;
-      dir = up;
+      var asked = findPackageNameOf(name);
+      /* The directory the base is read as a file in, which is the base's own parent unless a
+         trailing slash says the base is a directory: that is where the walk starts, and it is the
+         scope a package the base sits inside of is looked up in. */
+      var scopeDir = parentPath.charAt(parentPath.length - 1) === '/' ? parentPath.slice(0, -1) : dirnameOf(parentPath);
+      if (scopeDir === '') scopeDir = '/';
+      /* The package the base itself is in answers first, when it carries an "exports" map and the
+         name asked for is its own: a package may name itself before any node_modules is looked in. */
+      var scope = Module._readPackage(scopeDir);
+      if (scope.exists && scope.exports !== undefined && scope.exports !== null && scope.name === asked.name) {
+        return scope.pjsonPath;
+      }
+      /* The walk node's own reader makes: node_modules/<name> under each directory in turn, and the
+         package.json of the first directory that is there -- not the first package.json that is, so
+         a package installed with no manifest of its own is still the package that was found. */
+      var at = scopeDir;
+      var previous = '';
+      while (true) {
+        var candidate = (at === '/' ? '' : at) + '/node_modules/' + asked.name + '/package.json';
+        /* Node compares the length of the path it just built against the one before it, which is
+           how a walk that has reached the root stops: the next step up names the same folder. */
+        if (candidate.length === previous.length) break;
+        if (Module._stat((at === '/' ? '' : at) + '/node_modules/' + asked.name) === 1) return candidate;
+        previous = candidate;
+        /* One folder up, and two for a scoped name: the step climbs out of the node_modules/<name>
+           just looked in, which a name carrying a '/' of its own makes one folder deeper. */
+        var up = asked.scoped ? dirnameOf(dirnameOf(at)) : dirnameOf(at);
+        if (up === at) break;
+        at = up;
+      }
+      var noPackage = new Error("Cannot find package '" + asked.name + "' imported from " + parentPath);
+      noPackage.code = 'ERR_MODULE_NOT_FOUND';
+      throw noPackage;
     }
-    return undefined;
+    var resolved;
+    if (URLForBase.canParse(name)) {
+      /* A specifier carrying a scheme is a URL of its own and resolves to itself; the path is read
+         out of it afterwards, which is where every scheme but file is refused, whatever the base. */
+      resolved = urlFor.fileURLToPath(name);
+    } else if (parentPath === null && !/^[A-Za-z][A-Za-z0-9+\-.]*:\/\//.test(parentURL)) {
+      /* A base no relative specifier can be resolved against -- 'data:', the one node defaults to.
+         The refusal names the specifier and that base, both as node writes them. */
+      var unsupported = new TypeError('Failed to resolve module specifier "' + name + '" from "'
+        + parentURL + '": Invalid relative URL or base scheme is not hierarchical.');
+      unsupported.code = 'ERR_UNSUPPORTED_RESOLVE_REQUEST';
+      throw unsupported;
+    } else if (!isRelativeOrAbsoluteOf(name)) {
+      /* An empty specifier is the one node's own loader does not treat as a path, so it reaches
+         packageResolve with an empty package name: the walk for it matches the nearest node_modules
+         *directory* -- it stops on the directory and not on a package.json inside it -- and the
+         "main" or index.js that directory does not have is the package it reports as missing. It
+         is not the base's own package.json, which is what an empty specifier names here.
+         row owc-module-findpackagejson-empty-specifier. */
+      var empty = findPackageNameOf(name);
+      var emptyDir = parentPath.charAt(parentPath.length - 1) === '/' ? parentPath.slice(0, -1) : dirnameOf(parentPath);
+      if (emptyDir === '') emptyDir = '/';
+      /* The package the base itself sits in answers first, as in the walk above, when it carries an
+         "exports" map and the name asked for is its own. */
+      var ownPkg = Module._readPackage(emptyDir);
+      if (ownPkg.exists && ownPkg.exports !== undefined && ownPkg.exports !== null && ownPkg.name === empty.name) {
+        return ownPkg.pjsonPath;
+      }
+      var walk = emptyDir;
+      var before = '';
+      while (true) {
+        var pkgDir = collapsedPathOf((walk === '/' ? '' : walk) + '/node_modules/' + empty.name);
+        var manifest = pkgDir + '/package.json';
+        /* Node compares the length of the path it just built against the one before it, which is
+           how a walk that has reached the root stops. */
+        if (manifest.length === before.length) break;
+        if (Module._stat(pkgDir) === 1) {
+          var pkgMain = Module._readPackage(pkgDir);
+          var mainPath = pkgMain.exists && typeof pkgMain.main === 'string' && pkgMain.main !== ''
+            ? collapsedPathOf(pkgDir + '/' + pkgMain.main)
+            : pkgDir + '/index.js';
+          if (Module._stat(mainPath) !== 0) {
+            var noMain = new Error("Cannot find package '" + mainPath + "' imported from " + parentPath);
+            noMain.code = 'ERR_MODULE_NOT_FOUND';
+            throw noMain;
+          }
+          resolved = mainPath;
+          break;
+        }
+        before = manifest;
+        var higher = empty.scoped ? dirnameOf(dirnameOf(walk)) : dirnameOf(walk);
+        if (higher === walk) break;
+        walk = higher;
+      }
+      if (resolved === undefined) {
+        var noEmpty = new Error("Cannot find package '" + empty.name + "' imported from " + parentPath);
+        noEmpty.code = 'ERR_MODULE_NOT_FOUND';
+        throw noEmpty;
+      }
+    } else {
+      resolved = urlFor.fileURLToPath(new URLForBase(name, parentURL));
+    }
+    /* Node's loader resolves a path exactly -- no extension is added, no index and no "main" are
+       read -- and it refuses a directory, which findPackageJSON takes as the directory to look up
+       from rather than as a failure: the package.json at or above the directory is the answer. */
+    var kind = Module._stat(resolved);
+    if (kind !== 0 && kind !== 1) {
+      var noModule = new Error("Cannot find module '" + resolved + "' imported from "
+        + (parentPath === null ? parentURL : parentPath));
+      noModule.code = 'ERR_MODULE_NOT_FOUND';
+      /* The hint node's own loader appends to a resolution failure, in the message and in the
+         stack: the file the CommonJS loader would have answered for that specifier.
+         row owc-esm-resolve-did-you-mean-hint. */
+      decorateWithCommonJSHint(noModule, name, parentPath);
+      throw noModule;
+    }
+    return nearestPackageJSONOf(resolved);
   };
   /* Nothing here writes a source map, so there is never one to find: node answers undefined for a
      builtin, for a file under node_modules while that support is off, and for any file it holds no
@@ -5296,20 +5571,20 @@ BF.module = function () {
   };
   Module.flushCompileCache = function flushCompileCache() { return undefined; };
   Module.getCompileCacheDir = function getCompileCacheDir() { return undefined; };
-  /* Module customization hooks. Node runs the hooks a registration names in a loader thread of its
-     own, before every resolve and every load; this loader has no such thread, so a registration is
-     recorded and no hook is ever called -- the graph a program sees is the one the loader resolves
-     and reads itself. The two calls keep node's own argument handling, including the
-     ERR_UNSUPPORTED_RESOLVE_REQUEST a specifier it cannot resolve raises: node resolves against the
-     parent URL a second argument gives and against 'data:', which is not hierarchical, when there
-     is none, so a relative specifier with no parent fails there exactly as it does here. */
-  var registeredHooks = null;
+  /* Module customization hooks. Node runs the hooks a registration names before every resolve and
+     every load -- in a loader thread of its own for register(), on this thread for registerHooks()
+     -- and what a hook answers is what the loader resolves to and compiles. There is no second
+     thread here, so the hooks run where the loader runs: the CommonJS loader asks them itself, and
+     the host asks them through the two api calls below when it resolves and loads an ES module. A
+     hook that hands the call on, like one that was never registered, answers nothing, and the
+     loader resolves as it always has. */
   function unsupportedResolveRequest(specifier, base) {
     var err = new Error('Failed to resolve module specifier "' + specifier + '" from "' + base
       + '": Invalid relative URL or base scheme is not hierarchical.');
     err.code = 'ERR_UNSUPPORTED_RESOLVE_REQUEST';
     return err;
   }
+
   /* Node declares one parameter and reads the other two off its arguments -- the parent URL and the
      options both default -- so a caller that reads register.length sees 1 there. */
   Module.register = function register(specifier) {
@@ -5326,7 +5601,7 @@ BF.module = function () {
       resolved = host.resolve(spec, host.cwd(), 'require');
     }
     if (!resolved) throw unsupportedResolveRequest(spec, base);
-    registeredHooks = { specifier: resolved, options: options };
+    adoptLoaderModule(resolved);
     return undefined;
   };
   Module.registerHooks = function registerHooks(hooks) {
@@ -5336,7 +5611,10 @@ BF.module = function () {
       err.code = 'ERR_INVALID_ARG_TYPE';
       throw err;
     }
-    registeredHooks = { hooks: hooks };
+    hookResolveFn = typeof hooks.resolve === 'function' ? hooks.resolve : null;
+    hookLoadFn = typeof hooks.load === 'function' ? hooks.load : null;
+    hookForRequire = true;
+    hooksChanged();
     /* Node hands back a ModuleHooks carrying the two hooks a caller gave, as own keys worth
        undefined where it gave none. */
     return { resolve: hooks.resolve, load: hooks.load };

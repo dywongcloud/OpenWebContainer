@@ -12,6 +12,13 @@ import { writeNapiPlaceholders } from '../napi/placeholders';
 export interface InstallSpec {
     name: string;
     range?: string;
+    /**
+     * A directory on the virtual file system this spec installs from, which is what `npm install
+     * ./localpkg` and `npm install file:./localpkg` name. A spec with one is a local dependency:
+     * nothing is asked of the registry for it, and what package.json in that directory declares is
+     * the package -- its name and version -- that lands in the tree.
+     */
+    localPath?: string;
 }
 
 export type SaveTarget = 'dependencies' | 'devDependencies' | 'none';
@@ -38,6 +45,8 @@ interface Edge {
     dev: boolean;
     /** A peer dependency of a top-level package: wanted only while no copy is visible from the root. */
     peer?: boolean;
+    /** A directory this edge installs from instead of the registry, as `npm install ./localpkg` has it. */
+    localPath?: string;
 }
 
 interface InstalledCopy {
@@ -50,7 +59,7 @@ interface InstalledCopy {
  * has to resolve. The packument, version and libc manifest are filled in for the whole wave at once,
  * which is what lets one request serve every edge that needs it.
  */
-type Plan = {
+type ResolvePlan = {
     kind: 'resolve';
     edge: Edge;
     spec: { name: string; range?: string };
@@ -59,6 +68,16 @@ type Plan = {
     version?: PackageVersion;
     manifest?: Promise<PackageVersion>;
 };
+
+/** An edge the local file system answers: the package is copied out of `source`, not fetched. */
+type LocalPlan = {
+    kind: 'local';
+    edge: Edge;
+    source: string;
+    manifest: Record<string, any> | undefined;
+};
+
+type Plan = ResolvePlan | LocalPlan;
 
 /**
  * What an edge does once the wave's tarballs are placed: recording the node and enqueuing the edges
@@ -106,19 +125,21 @@ export class NpmInstaller {
     async addPackages(projectDir: string, specs: InstallSpec[], save: SaveTarget): Promise<InstallReport> {
         const root = normalizeAbsolute(projectDir);
         this.ensureManifest(root);
-        const edges: Edge[] = specs.map(spec => ({
-            requesterDir: root,
-            name: spec.name,
-            range: spec.range,
-            optional: false,
-            dev: save === 'devDependencies'
-        }));
+        const edges: Edge[] = specs.map(spec => this.specEdge(root, spec, save === 'devDependencies'));
         const { added, resolved, nodes } = await this.installTree(root, edges);
         if (save !== 'none') {
             const manifest = this.readManifest(root) ?? {};
             const field = (manifest[save] ?? {}) as Record<string, string>;
-            for (const spec of specs) {
-                field[spec.name] = savedRange(spec.range, resolved.get(spec.name) ?? '');
+            for (const [index, spec] of specs.entries()) {
+                /* A local spec was handed over as a path alone, so the name it is recorded under is
+                   the one the directory's own package.json declares, read into the edge above. */
+                const name = edges[index].name;
+                /* A local dependency is recorded as the path it was installed from, not as a
+                   version: npm writes `file:localpkg`, and reads the package out of that directory
+                   again on every later install. */
+                field[name] = spec.localPath !== undefined
+                    ? `file:${relativeSpec(root, spec.localPath)}`
+                    : savedRange(spec.range, resolved.get(name) ?? '');
             }
             manifest[save] = field;
             this.writeManifest(root, manifest);
@@ -149,6 +170,28 @@ export class NpmInstaller {
         return { added };
     }
 
+    /**
+     * The edge one requested spec becomes. A local spec is read now, so that the install knows the
+     * name and version the directory declares before anything is placed: they are what the tree,
+     * the lockfile and the summary line name the package by.
+     */
+    private specEdge(root: string, spec: InstallSpec, dev: boolean): Edge {
+        if (spec.localPath === undefined) {
+            return { requesterDir: root, name: spec.name, range: spec.range, optional: false, dev };
+        }
+        const source = normalizeAbsolute(spec.localPath);
+        const manifest = this.readManifest(source);
+        /* npm refuses a directory with no package.json in it: there is no package there to install,
+           and no name to put it in the tree under. */
+        if (manifest === undefined) {
+            throw new Error(`npm error code ENOLOCAL\nnpm error Could not install from "${source}" as it does not contain a package.json file`);
+        }
+        const name = typeof manifest.name === 'string' && manifest.name !== ''
+            ? manifest.name
+            : source.split('/').filter(Boolean).pop() ?? spec.name;
+        return { requesterDir: root, name, range: spec.range, optional: false, dev, localPath: source };
+    }
+
     /** `package-lock.json` for the tree just installed, in npm's lockfileVersion 3 layout. */
     private writeLock(root: string, nodes: LockTreeNode[]): void {
         writeLockfile(this.fileSystem, root, this.readManifest(root) ?? {}, nodes);
@@ -173,8 +216,13 @@ export class NpmInstaller {
                 nodes.set(key, {
                     key,
                     version: typeof manifest.version === 'string' ? manifest.version : version?.version ?? '',
-                    resolved: version?.dist.tarball,
+                    /* A package installed out of a directory is recorded the way npm records a link:
+                       the `file:` spec it came from, and `link`, which is what tells a later `npm ls`
+                       the package is the one there and not a copy from the registry. */
+                    resolved: version?.dist.tarball
+                        ?? (edge.localPath === undefined ? undefined : `file:${relativeSpec(root, edge.localPath)}`),
                     integrity: version?.dist.integrity,
+                    link: edge.localPath !== undefined,
                     dev: edge.dev,
                     optional: edge.optional,
                     manifest
@@ -202,6 +250,13 @@ export class NpmInstaller {
                 if (seen.has(requestKey)) continue;
                 seen.add(requestKey);
 
+                /* A local dependency is answered by the file system alone: it is never a name the
+                   registry is asked for, so it leaves the wave's requests to the packages that are. */
+                if (edge.localPath !== undefined) {
+                    plans.push({ kind: 'local', edge, source: edge.localPath, manifest: this.readManifest(edge.localPath) });
+                    continue;
+                }
+
                 /* Nothing about the tree is asked yet: whether this edge adopts a copy the tree
                    already has depends on what the edges before it place, and that is decided in one
                    pass below, once every packument of the wave is in. */
@@ -222,7 +277,8 @@ export class NpmInstaller {
                 packuments.set(name, packument);
                 await packument.then(() => undefined, () => undefined);
             });
-            for (const plan of plans) {
+            const resolves = plans.filter((plan): plan is ResolvePlan => plan.kind === 'resolve');
+            for (const plan of resolves) {
                 plan.packument = await packuments.get(plan.spec.name)!;
             }
 
@@ -231,7 +287,7 @@ export class NpmInstaller {
             const manifests = new Map<string, Promise<PackageVersion>>();
             const libc: { name: string; version: string }[] = [];
             const asked = new Set<string>();
-            for (const plan of plans) {
+            for (const plan of resolves) {
                 const version = selectVersion(plan.packument!, plan.spec.range);
                 plan.version = version;
                 if (platformMismatch(version) !== undefined) continue;
@@ -246,16 +302,29 @@ export class NpmInstaller {
                 manifests.set(`${name}@${version}`, manifest);
                 await manifest.then(() => undefined, () => undefined);
             });
-            for (const plan of plans) {
+            for (const plan of resolves) {
                 plan.manifest = manifests.get(`${plan.spec.name}@${plan.version!.version}`);
             }
 
             /* One pass, in the order npm reaches them: what an edge sees is what the edges before it
                in this wave placed, so a package the whole wave needs is placed once, at the root. */
             const installs: { target: string; version: PackageVersion }[] = [];
+            const localCopies: { target: string; source: string }[] = [];
             const actions: Action[] = [];
             for (const plan of plans) {
                 const { edge } = plan;
+                /* A local dependency is copied out of its directory into the place a fetched
+                   package would have gone, in the same pass and under the same claim as the rest,
+                   so a registry package of the same name is placed once and this one nests. */
+                if (plan.kind === 'local') {
+                    const version = typeof plan.manifest?.version === 'string' ? plan.manifest.version : '';
+                    const target = this.placementFor(root, edge, edge.requesterDir === root, claimed);
+                    claimed.set(target, version);
+                    added.push(`${edge.name}@${version}`);
+                    localCopies.push({ target, source: plan.source });
+                    actions.push({ edge, dir: target, placed: version });
+                    continue;
+                }
                 const isRootRequest = plan.isRootRequest;
                 const visible = this.findVisibleCopy(edge.requesterDir, edge.name, claimed);
                 if (edge.peer && visible !== undefined) continue;
@@ -294,6 +363,14 @@ export class NpmInstaller {
                 installedDirs.push(target);
                 installs.push({ target, version });
                 actions.push({ edge, dir: target, version, placed: version.version });
+            }
+
+            /* A local dependency is already on the file system, so it lands before anything is
+               fetched: the packages below it read the copy, not the directory it came from. */
+            for (const { target, source } of localCopies) {
+                this.copyLocalPackage(source, target);
+                this.forgetManifests(target);
+                this.linkBinaries(target);
             }
 
             /* Two edges of one wave that land in the same directory replace each other, and the last
@@ -443,6 +520,43 @@ export class NpmInstaller {
             }
         }
         writeNapiPlaceholders(this.fileSystem, target, version.name);
+    }
+
+    /**
+     * `npm install ./localpkg`: the directory's own files are copied into the place a fetched
+     * package would have gone. npm links it instead, but a copy answers `npm ls`, `npm exec` and a
+     * `require` of the package the same way, and the tree this runtime writes is one of real
+     * directories throughout.
+     *
+     * The directory's own `node_modules` is left behind: what it declares as dependencies is
+     * installed by this install, into the tree, and a tree inside a package of the tree is not
+     * something npm resolves either.
+     */
+    private copyLocalPackage(source: string, target: string): void {
+        const from = normalizeAbsolute(source);
+        const to = normalizeAbsolute(target);
+        if (this.fileSystem.statPath(from)?.type !== 'dir') {
+            throw new Error(`npm error code ENOLOCAL\nnpm error Could not install from "${from}" as it does not contain a package.json file`);
+        }
+        if (this.fileSystem.statPath(to)) this.fileSystem.removePath(to, true);
+        for (const ancestor of ancestorsOf(to)) {
+            if (this.fileSystem.statPath(ancestor)?.type !== 'dir') this.fileSystem.createDirectory(ancestor);
+        }
+        this.copyTree(from, to);
+    }
+
+    private copyTree(from: string, to: string): void {
+        const stat = this.fileSystem.statPath(from);
+        if (stat === undefined) return;
+        if (stat.type !== 'dir') {
+            this.fileSystem.writeBytes(to, this.fileSystem.readBytes(from) ?? new Uint8Array());
+            return;
+        }
+        this.fileSystem.createDirectory(to);
+        for (const name of this.fileSystem.readdirNames(from) ?? []) {
+            if (name === 'node_modules') continue;
+            this.copyTree(joinPaths(from, name), joinPaths(to, name));
+        }
     }
 
     /** Creates `dir` and the parents of it this extraction has not created yet. */
@@ -603,6 +717,37 @@ export function savedRange(range: string | undefined, resolvedVersion: string): 
     if (semver.valid(range) !== null) return `^${range}`;
     if (semver.validRange(range) !== null) return range;
     return `^${resolvedVersion}`;
+}
+
+/**
+ * The directory a spec names, or undefined for a spec that is a registry name's.
+ *
+ * npm reads `file:` and any spec that starts with a path -- `./localpkg`, `../localpkg`,
+ * `/abs/localpkg` -- as a package on the file system; a bare name is a name, and so is a scoped one
+ * whose slash belongs to the scope. This is the whole of the local half of a spec: everything else
+ * is the registry's, which is why a directory this container already holds is installed without a
+ * network it does not have.
+ */
+export function localSpecTarget(arg: string, cwd: string): string | undefined {
+    const text = arg.startsWith('file:') ? arg.slice('file:'.length) : arg;
+    if (text === '') return undefined;
+    if (!arg.startsWith('file:') && !isPathSpec(text)) return undefined;
+    return text.startsWith('/') ? normalizeAbsolute(text) : normalizeAbsolute(joinPaths(cwd, text));
+}
+
+/** Whether a bare word is a path npm would read as a directory: `.`, `..`, `./x`, `../x`, `/x`. */
+function isPathSpec(text: string): boolean {
+    return text === '.' || text === '..' ||
+        text.startsWith('./') || text.startsWith('../') || text.startsWith('/') || text.startsWith('~/');
+}
+
+/** `target` as the path npm writes after `file:` in package.json: relative to the package, absolute when it is not under it. */
+function relativeSpec(root: string, target: string): string {
+    const from = normalizeAbsolute(root);
+    const to = normalizeAbsolute(target);
+    if (to === from) return '.';
+    if (to.startsWith(from + '/')) return to.slice(from.length + 1);
+    return to;
 }
 
 /** Splits a command-line spec such as `lodash@^4`, `@scope/pkg` or `@scope/pkg@1.2.0`. */

@@ -1,0 +1,6 @@
+WITNESS FAIL (judge, shard guest, 2026-10-23, HEAD f5d5931) -- NEW ROW
+Input: process.argv0, alongside process.execPath.
+Container: argv0 undefined, execPath "/usr/local/bin/node"
+Host     : argv0 "/Users/dylanwong/.nvm/versions/node/v24.15.0/bin/node", execPath the same
+execPath is right in the container and argv0 is absent, though host Node sets argv0 to the path node was
+invoked by. Machine: load 23.77 (1-min), 5.3 GB free.

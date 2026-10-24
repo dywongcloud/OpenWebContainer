@@ -1,4 +1,5 @@
 import { IFileSystem } from '../../../filesystem';
+import type { PathStat } from '../../../filesystem';
 import { NetworkManager } from '../../../network/manager';
 import { base64ToBytes } from '../../../utils/bytes';
 import { Process, ProcessEvent, ProcessState, ProcessType, processOf } from '../../base';
@@ -15,7 +16,9 @@ import { CAPABILITIES } from './runtime/capabilities/index';
 import { bindVmRuntime, armVmBudget, cancelVmRuntime, takeVmInterruption, unbindVmRuntime, yieldVmSlice } from './runtime/capabilities/vm';
 import { enterSyncRun, leaveSyncRun, nodeSyncRunner, sleepMs, syncRunActive } from './pump';
 import type { NodeFlagAnswer, NodeRunOptions } from './flags';
+import { NODE_TEST_DISCOVERY_SOURCE, parseNodeOptions } from './flags';
 import { NODE_VERSION } from './runtime/guest/globals';
+import { parseEnvFile } from './runtime/env-file';
 import { CONTAINER_WORKDIR, containerEnv } from '../default-env';
 import type { SyncChildRequest, SyncChildResult } from './pump';
 
@@ -26,6 +29,50 @@ const RESERVED_WORDS = new Set([
     'while', 'with', 'yield', 'let', 'static', 'implements', 'interface', 'package', 'private', 'protected',
     'public', 'await', 'arguments', 'eval'
 ]);
+
+/** The status node leaves with when it refuses its own options, or the ones `NODE_OPTIONS` carries. */
+const BAD_OPTION_EXIT = 9;
+
+/**
+ * How often watch mode looks at the files it watches. Node's own watcher debounces a change by
+ * 200 ms; this container has no watcher to be told by, so it looks, and the interval is what stands
+ * in for the debounce.
+ */
+const WATCH_POLL_MS = 150;
+
+/** The most files one look at the tree takes in: a walk past it is a walk nothing asked for. */
+const WATCH_FILE_LIMIT = 4000;
+
+/** The directories watch mode never walks into, as node's own watcher never does. */
+const WATCH_SKIP_DIRECTORIES = new Set(['node_modules', '.git']);
+
+/**
+ * What host node writes when `--watch-path` names a path that is not there: the watcher it builds
+ * on `fs.watch` throws, and the throw is the whole of the report -- no entry is run at all. Captured
+ * from the build NODE_VERSION names, the way the usage block is; the path is the one the line named,
+ * resolved the way node resolves it before it watches.
+ */
+function watchPathMissingText(path: string): string {
+    return 'node:internal/fs/watchers:324\n' +
+        '    throw error;\n' +
+        '    ^\n' +
+        '\n' +
+        `Error: ENOENT: no such file or directory, watch '${path}'\n` +
+        '    at FSWatcher.<computed> (node:internal/fs/watchers:316:19)\n' +
+        '    at watch (node:fs:2538:36)\n' +
+        '    at FilesWatcher.watchPath (node:internal/watch_mode/files_watcher:117:21)\n' +
+        '    at node:internal/main/watch_mode:88:53\n' +
+        '    at Array.forEach (<anonymous>)\n' +
+        '    at node:internal/main/watch_mode:88:1 {\n' +
+        '  errno: -2,\n' +
+        "  syscall: 'watch',\n" +
+        "  code: 'ENOENT',\n" +
+        `  path: '${path}',\n` +
+        `  filename: '${path}'\n` +
+        '}\n' +
+        '\n' +
+        `Node.js ${NODE_VERSION}\n`;
+}
 
 /**
  * What a source threw when it threw something that is not an Error: node writes such a value with no
@@ -315,6 +362,141 @@ const EVAL_RUNTIME_FRAMES = [
     '    at evalTypeScript (node:internal/process/execution:295:3)',
     '    at node:internal/main/eval_string:71:3'
 ];
+
+/**
+ * The frames node writes behind the body of a CommonJS module that ran as the entry, and the one it
+ * writes for a module a `require` loaded. Captured from the build NODE_VERSION names, as the frames
+ * of a module that is not there are.
+ */
+const CJS_RUN_FRAMES = [
+    '    at Module._compile (node:internal/modules/cjs/loader:1830:14)',
+    '    at Object..js (node:internal/modules/cjs/loader:1961:10)',
+    '    at Module.load (node:internal/modules/cjs/loader:1553:32)',
+    '    at Module._load (node:internal/modules/cjs/loader:1355:12)',
+    '    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)'
+];
+const CJS_RUN_TAIL = [
+    '    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)',
+    '    at node:internal/main/run_main_module:33:47'
+];
+
+/** The trailer every report node writes on stderr ends with. */
+const REPORT_TRAILER = `\n\nNode.js ${NODE_VERSION}`;
+
+/**
+ * The eight bits of `code` a process leaves with: all a status the operating system carries, and so
+ * all host node 24.15 hands on -- 256 leaves 0, -1 leaves 255 and -3 leaves 253.
+ */
+function exitStatus(code: number): number {
+    return code & 0xff;
+}
+
+/** One frame's `path:line:column`, read out of the text the guest reported it as. */
+function parseSite(site: string): { path: string; line: number; column: number } | undefined {
+    const found = /^(\/[^\s]*):(\d+):(\d+)$/.exec(site);
+    if (found === null) return undefined;
+    return { path: found[1], line: Number(found[2]), column: Number(found[3]) };
+}
+
+/**
+ * The frame as node writes it: the same file and line, with the column moved onto the character V8
+ * would have named (`nodeColumn`). Undefined for a site that names no line this process can read.
+ */
+function nodeSite(site: string, sourceOf: (at: string) => string | undefined,
+                 recolumn?: (text: string, column: number) => number): string | undefined {
+    const at = parseSite(site);
+    if (at === undefined) return undefined;
+    const source = sourceOf(at.path);
+    if (source === undefined) return undefined;
+    const line = source.split('\n')[at.line - 1];
+    if (line === undefined) return undefined;
+    const text = line.replace(/\t/g, ' ');
+    const column = recolumn === undefined ? nodeColumn(text, at.column) : recolumn(text, nodeColumn(text, at.column));
+    return `${at.path}:${at.line}:${column}`;
+}
+
+/**
+ * The column node reports for a status written to `process.exitCode`: the `=` of the assignment, and
+ * not the property in front of it -- `process.exitCode = 1.7` is reported at the `=`, because that
+ * is the expression V8 evaluated. A line with no plain `=` behind the property keeps the column the
+ * property has, rather than one guessed at.
+ */
+function assignColumn(text: string, column: number): number {
+    let depth = 0;
+    let best = -1;
+    for (let at = 0; at < text.length; at++) {
+        const ch = text[at] ?? '';
+        if (ch === '(' || ch === '[') { depth++; continue; }
+        if (ch === ')' || ch === ']') { depth--; continue; }
+        if (ch !== '=' || depth > 0) continue;
+        /* `==`, `===`, `=>`, `<=`, `>=`, `!=` and the compound assignments are not the write. */
+        if ('=!<>+-*/%&|^?:'.includes(text[at - 1] ?? '') || text[at + 1] === '=' || text[at + 1] === '>') continue;
+        /* The write node reports is the one nearest the property the engine named, and not one of
+           another assignment further along a line that holds two. */
+        if (best < 0 || Math.abs(at + 1 - column) < Math.abs(best - column)) best = at + 1;
+    }
+    return best < 0 ? column : best;
+}
+
+/**
+ * What node writes for a status that would not validate -- `process.exit(1.7)`, or
+ * `process.exitCode = 'abc'`: the block of the internal that raised it, then the error, the setter
+ * it came out of, the call that asked, the loader's frames and the error's own `code` in braces.
+ *
+ * The block is node's own source and not the program's, because the error is raised inside
+ * `node:internal/errors` and not at the call: every part of it but the call's own frame is the same
+ * whatever the program wrote.
+ */
+function exitCodeFailureText(note: {
+    name: string; code: string; message: string; viaExit: boolean; site: string;
+}, sourceOf: (at: string) => string | undefined): string {
+    const frames = ['    at process.set [as exitCode] (node:internal/bootstrap/node:119:9)'];
+    if (note.viaExit) frames.push('    at process.exit (node:internal/process/per_thread:231:24)');
+    /* A status written to the property is reported at the `=` that wrote it; one handed to
+       `process.exit` at the call that asked. */
+    const site = nodeSite(note.site, sourceOf, note.viaExit ? undefined : assignColumn);
+    if (site !== undefined) frames.push(`    at Object.<anonymous> (${site})`);
+    frames.push(...CJS_RUN_FRAMES, ...CJS_RUN_TAIL);
+    return 'node:internal/errors:542\n' +
+        '      throw error;\n' +
+        '      ^\n' +
+        '\n' +
+        `${note.name} [${note.code}]: ${note.message}\n` +
+        frames.join('\n') +
+        ` {\n  code: '${note.code}'\n}` +
+        REPORT_TRAILER;
+}
+
+/**
+ * What node writes when a `process.on('exit')` handler throws: the line the throw is on, a caret
+ * under the `throw`, the error, and the two frames the throw came through -- the handler and the
+ * `emit` that called it, which node names after the branch its own `emit` took, one listener being
+ * a path of its own. A handler reached from `process.exit` carries that call behind it, and the
+ * loader's frames behind that.
+ */
+function exitHandlerFailureText(note: {
+    header: string; site: string; listeners: number; viaExit: boolean; exitSite: string;
+}, sourceOf: (at: string) => string | undefined): string | undefined {
+    const at = parseSite(note.site);
+    if (at === undefined) return undefined;
+    const source = sourceOf(at.path);
+    if (source === undefined) return undefined;
+    const shown = (source.split('\n')[at.line - 1] ?? '').replace(/\t/g, ' ');
+    if (shown === undefined) return undefined;
+    const marked = caretColumn(shown, nodeColumn(shown, at.column));
+    const caret = marked > shown.length ? ' '.repeat(shown.length) : ' '.repeat(marked - 1) + '^';
+    const frames = [`    at process.<anonymous> (${at.path}:${at.line}:${nodeColumn(shown, at.column)})`];
+    frames.push(note.listeners === 1
+        ? '    at process.emit (node:events:509:28)'
+        : '    at process.emit (node:events:521:24)');
+    if (note.viaExit) {
+        frames.push('    at process.exit (node:internal/process/per_thread:236:15)');
+        const exit = nodeSite(note.exitSite, sourceOf);
+        if (exit !== undefined) frames.push(`    at Object.<anonymous> (${exit})`);
+        frames.push(...CJS_RUN_FRAMES, '    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)');
+    }
+    return `${at.path}:${at.line}\n${shown}\n${caret}\n\n${note.header}\n${frames.join('\n')}${REPORT_TRAILER}`;
+}
 
 /**
  * The frames node writes for a source it could not compile. There is no frame of the source's own
@@ -652,6 +834,79 @@ function evalFailureText(message: string, source: string, options: EvalFailureOp
     const kept = options.stackTraceLimit === undefined ? all : all.slice(0, options.stackTraceLimit);
     if (kept.length === 0) return `[${block}\n${first}]${trailer}`;
     return `${block}\n${first}\n${kept.join('\n')}${trailer}`;
+}
+
+/**
+ * The `path:line:column` a frame of a script file names, read out of the line the guest wrote.
+ *
+ * A frame with no name in front of it -- the body of an anonymous callback, the shape host node
+ * writes for a `process.nextTick` callback -- names the place with no parentheses at all, so both
+ * shapes are read; `bare` says which one it was, because only a named one is rewritten in place.
+ */
+function scriptSiteOf(text: string):
+    { path: string; line: number; column: number; bare: boolean } | undefined {
+    const match = /^\s*at (?:(?:.*?) )?\((\/[^\s()]*):(\d+):(\d+)\)\s*$/.exec(text);
+    const at = match === null ? /^\s*at (\/[^\s()]*):(\d+):(\d+)\s*$/.exec(text) : match;
+    if (at === null) return undefined;
+    const site = parseSite(`${at[1]}:${at[2]}:${at[3]}`);
+    if (site === undefined) return undefined;
+    return { path: site.path, line: site.line, column: site.column, bare: match === null };
+}
+
+/**
+ * One frame of a script file, with the column moved onto the character V8 would have named. The
+ * line unchanged for a frame that names no file this process can read -- an internal of node's, or
+ * a file that is not there -- because such a column is node's own and not the engine's to move.
+ */
+function nodeFrame(text: string, sourceOf: (at: string) => string | undefined): string {
+    const site = scriptSiteOf(text);
+    if (site === undefined) return text;
+    const source = sourceOf(site.path);
+    if (source === undefined) return text;
+    const shown = (source.split('\n')[site.line - 1] ?? '').replace(/\t/g, ' ');
+    const column = nodeColumn(shown, site.column);
+    if (site.bare) return `    at ${site.path}:${site.line}:${column}`;
+    return text.replace(/\((\/[^\s()]*):(\d+):(\d+)\)\s*$/, `(${site.path}:${site.line}:${column})`);
+}
+
+/**
+ * What node writes when a script file -- not a `-e`/`-p` source -- dies on a fatal error: the file
+ * and the line, the offending line of the source, a caret under it, then the error, the frames of
+ * the source's own and the version trailer behind them. That block in front and that trailer behind
+ * are what this container never wrote for a file, so the run ended on a bare stack.
+ *
+ * The frames are the guest's own and already in node's shape; only the columns of the ones that
+ * name a file this process can read are moved, and nothing else about them is touched. Undefined
+ * when the top frame names no line this process can read -- a failure this renderer cannot place is
+ * reported exactly as it was rather than shown under a line it did not come from.
+ */
+function scriptFailureText(message: string, sourceOf: (at: string) => string | undefined): string | undefined {
+    /* A message that already ends with node's own trailer is a report node writes whole -- a module
+       that is not there, a preload that is not -- and not a stack to put a block in front of. */
+    if (message.endsWith(`Node.js ${NODE_VERSION}`)) return undefined;
+    const lines = message.split('\n');
+    /* A `require` of a module that is not there is the loader's failure and not the source's, so it
+       is reported with the loader's own dump and never in the shape of a source that threw. */
+    if (moduleNotFoundOf(lines) !== undefined) return undefined;
+    /* The `vm` timeout over a runaway guest is a report this container writes itself, over the stack
+       the guest's own formatter produced: there is no line it was raised at, and no host node shape
+       to put it in, so it is left as it was too. */
+    if (/^Error: Script execution timed out after /.test(lines[0] ?? '')) return undefined;
+    for (let at = 1; at < lines.length; at++) {
+        const site = scriptSiteOf(lines[at] ?? '');
+        if (site === undefined) continue;
+        const source = sourceOf(site.path);
+        if (source === undefined) return undefined;
+        const shown = (source.split('\n')[site.line - 1] ?? '').replace(/\t/g, ' ');
+        const column = nodeColumn(shown, site.column);
+        const marked = caretColumn(shown, column);
+        /* Node points past the end of a line with spaces and no caret, as it does for `-e`. */
+        const caret = marked > shown.length ? ' '.repeat(shown.length) : ' '.repeat(marked - 1) + '^';
+        const block = `${site.path}:${site.line}\n${shown}\n${caret}\n`;
+        const frames = lines.slice(1).map((text) => nodeFrame(text, sourceOf));
+        return `${block}\n${lines[0]}\n${frames.join('\n')}${REPORT_TRAILER}`;
+    }
+    return undefined;
 }
 
 /** What a guest is given to read a CommonJS body with: the wrapper the host compiles it inside. */
@@ -1207,6 +1462,10 @@ export class NodeProcess extends Process {
     private readonly repl: boolean;
     /** `node -`: the program is what is piped to this process, as it is on the host. */
     private readonly stdinScript: boolean;
+    /** `-i`/`--interactive`: the line asked for a REPL even where stdin is not a terminal. */
+    private readonly interactive: boolean;
+    /** `--test`: the line asked for the test runner, which searches for files when none is named. */
+    private readonly test: boolean;
     /**
      * What the REPL reads: true while the terminal behind it can still be typed at. A `node` a user
      * started from a shell has one; one a program spawned `sh -c 'node'` has none, and neither has
@@ -1219,9 +1478,23 @@ export class NodeProcess extends Process {
     /** `process.execArgv`: the options the line named, as node reports them. */
     private readonly execArgv: string[];
     /** `--stack-trace-limit=<n>`: the bound put on the frames of a stack trace. */
-    private readonly stackTraceLimit?: number;
+    private stackTraceLimit?: number;
     /** `--title=<name>`: what `process.title` reads, and what the process is named to the system. */
-    private readonly title?: string;
+    private title?: string;
+    /** `--watch`: the line asked for watch mode, which runs the entry again when a file changes. */
+    private readonly watch: boolean;
+    /** `--watch-path=<path>`: the paths watch mode watches, in the order the line named them. */
+    private readonly watchPaths: string[];
+    /** `--env-file=<file>`: the files whose lines become entries of `process.env`. */
+    private readonly envFiles: string[];
+    /** `--env-file-if-exists=<file>`: the same, for a file the run goes on without. */
+    private readonly envFilesIfExists: string[];
+    /** `node --run <script>`: the script of the nearest package.json the line named. */
+    private readonly runScript?: string;
+    /** The interval watch mode looks at the files it watches on; cleared when the process ends. */
+    private watchPoll?: ReturnType<typeof setInterval>;
+    /** The modules `NODE_OPTIONS` asked to be loaded before the entry. */
+    private optionPreloads: string[] = [];
     /** The `-e`/`-p` source as the line wrote it: the text node quotes back when the run fails. */
     private readonly evalScript?: string;
     /**
@@ -1265,6 +1538,13 @@ export class NodeProcess extends Process {
      * `asyncRunEntryPointWithESMLoader` behind a trace out of one.
      */
     private esmEntryLoading = false;
+    /**
+     * Whether the program has registered module customization hooks -- `module.register` or
+     * `module.registerHooks`. Node asks a registered resolve hook before every resolution and a
+     * registered load hook before every load; a program that registers none pays nothing for them,
+     * so the guest is asked only once this is set.
+     */
+    private hooksArmed = false;
     private stopped = false;
     private capabilityContext: CapabilityContext;
     /** Set for a run inside a capability call (runToCompletionSync): timers and host operations are stepped there. */
@@ -1334,18 +1614,35 @@ export class NodeProcess extends Process {
         const processEnv = containerEnv(cwd, env);
         super(pid, ProcessType.JAVASCRIPT, executablePath, args, parentPid, cwd, processEnv);
         this.bootModule = bootModule;
-        this.repl = executablePath === '[repl]';
+        this.interactive = run.interactive === true;
+        /* `-i` beside a source is a REPL as well as a run of that source -- host node opens the
+           session and evaluates what the line gave it -- so the sentinel alone is not the whole
+           answer to whether this run is one. A file named on the line is still just a file: host
+           node runs it and starts no session, however many times `-i` was said. */
+        this.repl = executablePath === '[repl]' || (this.interactive && executablePath === '[eval]');
+        /* `--test` with no file named: the runner searches the working directory itself, and a run
+           of a file it found is a run of tests and not of a program the input happens to carry. */
+        if (run.test === true && this.repl && evalSource === undefined) evalSource = NODE_TEST_DISCOVERY_SOURCE;
+        this.test = run.test === true;
+        /* `--watch` and `--watch-path`: the line asked for the entry to be run again whenever a file
+           changes, and -- with `--watch-path` -- named the paths to watch instead of the tree the
+           entry stands in. */
+        this.watch = run.watch === true;
+        this.watchPaths = run.watchPaths ?? [];
+        this.envFiles = run.envFiles ?? [];
+        this.envFilesIfExists = run.envFilesIfExists ?? [];
+        this.runScript = run.run;
         /* A pipe on fd 0 is a writer, not a person: what it carries is a program, or data for one,
            and it ends when the writer closes it. A terminal is the only thing a REPL prompts at. */
         this.stdinFromPipe = env.OWC_STDIN === 'pipe';
-        this.replReadsTerminal = !this.stdinFromPipe && this.parentHasTerminal();
+        this.replReadsTerminal = this.interactive || (!this.stdinFromPipe && this.parentHasTerminal());
         /*
          * A bare `node` nobody is typing at reads its program from what it is given instead, exactly
          * as a host `node` does when its stdin is not a terminal: `echo 'console.log(7)' | node`
          * prints 7, and `node < /dev/null` runs nothing and leaves with status 0. Only a `node` with
          * a terminal behind it prompts, which is what `node -` asks for on any input at all.
          */
-        this.stdinScript = executablePath === '[stdin]' || (this.repl && !this.replReadsTerminal);
+        this.stdinScript = executablePath === '[stdin]' || (this.repl && !this.replReadsTerminal && !this.test);
         /* A piped stdin, a REPL and a `node -` all read what is written to them; a `node -` reads
            the whole program before it runs any of it. */
         this.stdinPiped = env.OWC_STDIN === 'pipe' || this.repl || this.stdinScript;
@@ -1360,6 +1657,9 @@ export class NodeProcess extends Process {
         this.networkManager = networkManager;
         this.services = services;
         this.resolver = new NodeResolver(fileSystem);
+        /* The resolver detects the module syntax of a `.ts` in the type-stripped source, as node
+           does, and the stripper is this file's own. */
+        this.resolver.setTypeStripper(stripTsTypes);
         this.evalSource = evalSource;
         this.flagAnswer = flagAnswer;
         this.guestBudgetMs = services.guestBudgetMs ?? DEFAULT_GUEST_BUDGET_MS;
@@ -1418,25 +1718,58 @@ export class NodeProcess extends Process {
         let code = 1;
         try {
             if (this.flagAnswer === undefined) {
-                /* What is left of the bound the process that started this one runs under: a shell
-                   hands its command line to a child and then only waits, so the child is what holds
-                   the host thread, and the caller's `timeout` is what has to end it -- see
-                   `ShellProcess.killDeadlineLeft`. */
-                const inherited = this.deadlineFromParent();
-                if (inherited !== undefined) this.armKillDeadline(inherited.ms, inherited.signal);
-                this.claimParentTerminal();
-                const entryPath = await this.bootGuest();
-                this.installRunOptions();
-                if (this.stdinScript) {
-                    /* What is piped in is the program, and it has not all arrived yet: the ref holds
-                       the process open until it has, and `endStdin` starts it. */
-                    this.holdRef(1);
-                    this.startStdinScript();
+                /* The environment the run starts from is settled before anything is run: `NODE_OPTIONS`
+                   and the files `--env-file` names are read first, and either can refuse the whole
+                   line -- with node's message and node's status 9 -- before a file is looked for. */
+                const refused = this.applyEnvironment();
+                if (refused !== undefined) {
+                    this.emitError(refused);
+                    code = BAD_OPTION_EXIT;
+                } else if (this.runScript !== undefined) {
+                    /* `node --run <script>`: what runs is a script out of package.json, in a shell, and
+                       no guest of this process's own is booted for it. */
+                    code = await this.runPackageScript();
                 } else {
-                    this.startEntryGated(entryPath);
+                    /* What is left of the bound the process that started this one runs under: a shell
+                       hands its command line to a child and then only waits, so the child is what holds
+                       the host thread, and the caller's `timeout` is what has to end it -- see
+                       `ShellProcess.killDeadlineLeft`. */
+                    const inherited = this.deadlineFromParent();
+                    if (inherited !== undefined) this.armKillDeadline(inherited.ms, inherited.signal);
+                    this.claimParentTerminal();
+                    const entryPath = await this.bootGuest();
+                    this.installRunOptions();
+                    /* Watch mode builds its watcher before it runs anything, as node does: a path it
+                       was told to watch that is not there is a failure of the whole line, reported
+                       before the entry has been run once. */
+                    const unwatchable = this.watchPathsFailure();
+                    if (unwatchable !== undefined) {
+                        this.emitError(unwatchable);
+                        code = 1;
+                    } else if (this.stdinScript) {
+                        /* What is piped in is the program, and it has not all arrived yet: the ref holds
+                           the process open until it has, and `endStdin` starts it. */
+                        this.holdRef(1);
+                        this.startStdinScript();
+                        await this.runEventLoop();
+                        code = this.finishProcess();
+                    } else {
+                        /* What the files watch mode watches read as when the entry starts: it is
+                           what the run is compared against once it has left, so a file the run
+                           wrote on its way through is a change, exactly as it is to node's own
+                           watcher, which is armed before the first run and never disarmed. */
+                        const began = this.watching() ? this.watchSnapshot() : undefined;
+                        if (began === undefined) {
+                            this.startEntryGated(entryPath);
+                            await this.runEventLoop();
+                            code = this.finishProcess();
+                        } else {
+                            code = await this.runOnce(entryPath);
+                            this.emitOutput(this.watchSettledText(code));
+                            code = await this.runWatched(entryPath, began);
+                        }
+                    }
                 }
-                await this.runEventLoop();
-                code = this.finishProcess();
             } else if (this.flagAnswer.check === undefined) {
                 // `node --version`, `node --nope`: the answer is the flags', and no guest is booted
                 code = this.answerFlags();
@@ -1615,6 +1948,12 @@ export class NodeProcess extends Process {
             clearTimeout(handle);
         }
         this.timers.clear();
+        /* Watch mode is waiting on an interval of its own, and nothing else ends it: a process being
+           killed while it waits would go on looking at files it was told to stop watching. */
+        if (this.watchPoll !== undefined) {
+            clearInterval(this.watchPoll);
+            this.watchPoll = undefined;
+        }
         this.wakeIfIdle();
     }
 
@@ -1687,6 +2026,128 @@ export class NodeProcess extends Process {
             this.context!.newString(JSON.stringify(meta === undefined ? null : meta)),
             this.context!.newArrayBuffer(exactArrayBuffer(bytes))
         ]);
+    }
+
+    /**
+     * What the environment hands this run before anything else is read: the files `--env-file` and
+     * `--env-file-if-exists` named, whose lines become entries of `process.env`, and the options
+     * `NODE_OPTIONS` carries.
+     *
+     * Both are settled before a file is looked for, the way node settles them: `NODE_OPTIONS` is read
+     * by the host before the script exists, and a file named by `--env-file` that is not there is a
+     * refusal of the whole line -- node's message on stderr and status 9 -- where one named by
+     * `--env-file-if-exists` is a note and a run that goes on without it.
+     *
+     * A name the environment already holds is left as it was: `FOO=1 node --env-file=.env` keeps 1,
+     * whatever the file says, which is what the host does.
+     *
+     * Returns the refusal, already ended with its newline, or undefined when the line stands.
+     */
+    private applyEnvironment(): string | undefined {
+        const options = this.env.get('NODE_OPTIONS');
+        if (options !== undefined && options !== '') {
+            const request = parseNodeOptions(options);
+            if (request.refusal !== undefined) return `node: ${request.refusal}\n`;
+            if (request.title !== undefined && this.title === undefined) this.title = request.title;
+            if (request.stackTraceLimit !== undefined && this.stackTraceLimit === undefined) {
+                this.stackTraceLimit = request.stackTraceLimit;
+            }
+            this.optionPreloads = request.preloads;
+        }
+        for (const spec of this.envFiles) {
+            const text = this.readEnvFile(spec);
+            if (text === undefined) return `node: ${spec}: not found\n`;
+            this.mergeEnvFile(text);
+        }
+        for (const spec of this.envFilesIfExists) {
+            const text = this.readEnvFile(spec);
+            if (text === undefined) {
+                /* A file that need not be there and is not: node says so on stderr and runs on. */
+                this.emitError(`${spec} not found. Continuing without it.\n`);
+                continue;
+            }
+            this.mergeEnvFile(text);
+        }
+        return undefined;
+    }
+
+    /** The contents of a file `--env-file` named, resolved from the directory the process is in. */
+    private readEnvFile(spec: string): string | undefined {
+        try {
+            const at = this.resolvePath(spec);
+            if (!this.fileSystem.fileExists(at)) return undefined;
+            return this.fileSystem.readFile(at);
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** The pairs of one env file, over the environment, for the names it does not hold yet. */
+    private mergeEnvFile(text: string): void {
+        for (const [name, value] of parseEnvFile(text)) {
+            if (this.env.has(name)) continue;
+            this.env.set(name, value);
+        }
+    }
+
+    /**
+     * `node --run <script>`: the script the nearest package.json keeps under that name, run in a
+     * shell the way npm runs one -- the command is a whole line, not a file -- with this process's
+     * own environment and directory behind it.
+     *
+     * A directory with no package.json above it, and a script the package does not have, are both
+     * reported the way node reports them and leave with status 1; a script that is there leaves with
+     * the status the shell left with.
+     */
+    private async runPackageScript(): Promise<number> {
+        const found = this.findPackageJson();
+        if (found === undefined) {
+            this.emitError(`Can't find package.json for directory ${this.currentCwd}\n`);
+            return 1;
+        }
+        const { dir, text } = found;
+        let scripts: Record<string, unknown> = {};
+        try {
+            const parsed = JSON.parse(text) as { scripts?: unknown };
+            if (parsed.scripts !== null && typeof parsed.scripts === 'object') {
+                scripts = parsed.scripts as Record<string, unknown>;
+            }
+        } catch {
+            /* A package.json that will not parse names no scripts, and the report below says so. */
+        }
+        const command = scripts[this.runScript!];
+        if (typeof command !== 'string') {
+            const names = Object.keys(scripts);
+            const listed = names.map((name) => `  ${name}: ${String(scripts[name])}`);
+            const at = dir === '/' ? '/package.json' : `${dir}/package.json`;
+            this.emitError(`Missing script: "${this.runScript}" for ${at}\n\nAvailable scripts are:\n${listed.join('\n')}\n`);
+            return 1;
+        }
+        const child = await this.spawnChild('sh', ['-c', command], Object.fromEntries(this.env), this.currentCwd);
+        return child.exitCode;
+    }
+
+    /**
+     * The nearest package.json at or above the directory the process is in, which is the one
+     * `node --run` reads: a run from a directory of the project finds the project's own.
+     */
+    private findPackageJson(): { dir: string; text: string } | undefined {
+        let dir = this.currentCwd.replace(/\/+$/, '') || '/';
+        for (;;) {
+            const at = dir === '/' ? '/package.json' : `${dir}/package.json`;
+            let text: string | undefined;
+            /* A file that is not there is a question this answers with nothing, not a failure: a
+               directory with no package.json above it is one this reports in its own words. */
+            try {
+                text = this.fileSystem.readFile(at);
+            } catch {
+                text = undefined;
+            }
+            if (text !== undefined) return { dir, text };
+            if (dir === '/') return undefined;
+            const next = dir.slice(0, dir.lastIndexOf('/'));
+            dir = next === '' ? '/' : next;
+        }
     }
 
     /**
@@ -1997,6 +2458,9 @@ export class NodeProcess extends Process {
             holdRef: (delta) => this.holdRef(delta),
             onTeardown: (dispose) => this.guestTeardown.push(dispose),
             loadEsm: (file, token) => this.loadEsmSync(file, token),
+            /* A program just registered module customization hooks: every resolve and every load
+               asks the guest from here on. */
+            onHooksChanged: () => { this.hooksArmed = true; },
             onHostCall: () => {
                 yieldVmSlice(this.capabilityContext);
                 // the deadline is a moment in time, not a stretch: what is left of it is rearmed here
@@ -2384,10 +2848,11 @@ export class NodeProcess extends Process {
      * The modules `-r` / `--require` names, in the order the line named them.
      *
      * They are read out of `process.execArgv`, which holds each option in the words node was given
-     * it: `--require=./pre.js` in one word, `--require ./pre.js` in two.
+     * it: `--require=./pre.js` in one word, `--require ./pre.js` in two. The modules `NODE_OPTIONS`
+     * named stand in front of them, the way node puts the variable's options in front of the line's.
      */
     private preloadSpecs(): string[] {
-        const specs: string[] = [];
+        const specs = [...this.optionPreloads];
         for (let i = 0; i < this.execArgv.length; i++) {
             const arg = this.execArgv[i];
             const eq = arg.indexOf('=');
@@ -2433,6 +2898,13 @@ export class NodeProcess extends Process {
         this.runPreloads();
         let started: void | Promise<void>;
         if (this.evalSource !== undefined) {
+            /* `-i` beside a source is the one line node answers with both: it opens the session
+               first -- banner and prompt -- and what the source writes comes behind them, which is
+               the order `node -i -e <source>` prints them in. */
+            if (this.interactive) {
+                this.startRepl();
+                this.drainJobs();
+            }
             if (this.evalModule) {
                 this.runEsmEval(this.evalSource);
                 started = this.drainJobs();
@@ -2478,13 +2950,166 @@ export class NodeProcess extends Process {
     }
 
     /**
+     * True when this run is a watch-mode one: `--watch` was given, and what it watches over is an
+     * entry that can be run again -- not a program read from the input, not a session, and not a
+     * script out of a package.json.
+     */
+    private watching(): boolean {
+        return this.watch && !this.stdinScript && !this.repl && this.runScript === undefined;
+    }
+
+    /** The command watch mode names in what it writes: the script and its arguments, as written. */
+    private watchCommand(): string {
+        return `'${[this.executablePath, ...this.args].join(' ')}'`;
+    }
+
+    /** What watch mode writes once the entry has left: it waits for a file to change, and says so. */
+    private watchSettledText(code: number): string {
+        const word = code === 0 ? 'Completed' : 'Failed';
+        return `${word} running ${this.watchCommand()}. Waiting for file changes before restarting...\n`;
+    }
+
+    /** What watch mode writes when it runs the entry again. */
+    private watchRestartText(): string {
+        return `Restarting ${this.watchCommand()}\n`;
+    }
+
+    /**
+     * A path `--watch-path` named, as the path it stands for: node resolves one against the directory
+     * the process is in before it watches it, and it is the resolved path its report names.
+     */
+    private resolveWatchPath(spec: string): string {
+        return spec.startsWith('/')
+            ? normalizeAbsolute(spec)
+            : normalizeAbsolute(joinPaths(this.currentCwd, spec));
+    }
+
+    private watchPathsFailure(): string | undefined {
+        if (!this.watching()) return undefined;
+        for (const spec of this.watchPaths) {
+            const at = this.resolveWatchPath(spec);
+            const stat = this.fileSystem.statPath(at);
+            if (stat === undefined) return watchPathMissingText(at);
+        }
+        return undefined;
+    }
+
+    /**
+     * One run of the entry, as a run of its own: what it writes it writes, and what it leaves with
+     * is what the failure behind it wrote -- the same path a run without watch mode takes, fatal
+     * errors and all, because what node runs in watch mode is a whole child process, which fails in
+     * the child and is reported over there.
+     */
+    private async runOnce(entryPath: string | undefined): Promise<number> {
+        try {
+            this.startEntryGated(entryPath);
+            await this.runEventLoop();
+            return this.finishProcess();
+        } catch (error) {
+            return this.handleFatal(error);
+        }
+    }
+
+    /**
+     * Watch mode: the entry has left, and this process stays where node's would -- waiting for a file
+     * to change, then running the entry again, and again, until something ends it.
+     */
+    private async runWatched(entryPath: string | undefined, atStart: Map<string, string>): Promise<number> {
+        let code = 0;
+        let snapshot = atStart;
+        for (;;) {
+            await this.waitForWatchChange(snapshot);
+            if (this.stopped) return code;
+            this.emitOutput(this.watchRestartText());
+            /* What the run that just left asked for on its way out -- a `process.exit`, a status of
+               its own -- is that run's and not this one's: the entry starts again as it started
+               before, which is what a new process on the host is. */
+            this.exitRequested = undefined;
+            this.fatalError = undefined;
+            snapshot = this.watchSnapshot();
+            code = await this.runOnce(entryPath);
+            this.emitOutput(this.watchSettledText(code));
+        }
+    }
+
+    /** Waits until something under the paths watch mode watches is not as it was. */
+    private waitForWatchChange(snapshot: Map<string, string>): Promise<void> {
+        return new Promise((resolve) => {
+            const stop = (): void => {
+                if (this.watchPoll !== undefined) clearInterval(this.watchPoll);
+                this.watchPoll = undefined;
+                resolve();
+            };
+            this.watchPoll = setInterval(() => {
+                if (this.stopped || this.watchChanged(snapshot)) stop();
+            }, WATCH_POLL_MS);
+        });
+    }
+
+    /** Whether the tree reads differently from `snapshot`: a file added, gone, or written again. */
+    private watchChanged(snapshot: Map<string, string>): boolean {
+        const now = this.watchSnapshot();
+        if (now.size !== snapshot.size) return true;
+        for (const [at, mark] of now) {
+            if (snapshot.get(at) !== mark) return true;
+        }
+        return false;
+    }
+
+    /**
+     * What the paths watch mode watches read as: each file under them with its size and the time it
+     * was last written. `--watch` with no `--watch-path` watches the tree the entry stands in, which
+     * is what node's own watcher does once it has been told which modules the run loaded.
+     */
+    private watchSnapshot(): Map<string, string> {
+        const seen = new Map<string, string>();
+        const roots = this.watchPaths.length > 0
+            ? this.watchPaths.map((spec) => this.resolveWatchPath(spec))
+            : [this.currentCwd];
+        for (const root of roots) this.watchWalk(root, seen);
+        return seen;
+    }
+
+    /** One path of a watch, whatever stands at it: a file by itself, a directory with all under it. */
+    private watchWalk(path: string, into: Map<string, string>): void {
+        if (into.size >= WATCH_FILE_LIMIT) return;
+        let stat: PathStat | undefined;
+        try {
+            stat = this.fileSystem.statPath(path);
+        } catch {
+            return;
+        }
+        if (stat === undefined) return;
+        if (stat.type === 'file') {
+            into.set(path, `${stat.size}:${stat.mtimeMs}`);
+            return;
+        }
+        const name = path.split('/').pop() ?? '';
+        if (WATCH_SKIP_DIRECTORIES.has(name)) return;
+        let names: string[] | undefined;
+        try {
+            names = this.fileSystem.readdirNames(path);
+        } catch {
+            return;
+        }
+        if (names === undefined) return;
+        for (const entry of names) {
+            this.watchWalk(path === '/' ? `/${entry}` : `${path}/${entry}`, into);
+        }
+    }
+
+    /**
      * `node` with no file: a REPL on the guest's own stdin and stdout. The session holds a ref, so
      * the event loop waits for it instead of ending the process at once; closing the REPL is what
      * ends the process, with the status the REPL left.
      */
     private startRepl(): void {
         this.holdRef(1);
-        this.callApi('startRepl', []).dispose();
+        /* A REPL driven by a pipe is not a terminal one, and host node says so too: `node -i` with
+           a program on its input prints no echo of what it read, because nothing typed it. Only a
+           session with a terminal behind it writes back what arrives. */
+        const terminal = this.parentHasTerminal();
+        this.callApi('startRepl', [terminal ? this.context!.true : this.context!.false]).dispose();
     }
 
     /**
@@ -2599,15 +3224,82 @@ export class NodeProcess extends Process {
     }
 
     private finishProcess(): number {
-        const exitCode = this.readFinalExitCode();
-        this.safeEmitExit(exitCode);
+        /* The handlers are handed the status as it was written -- the whole integer, not the eight
+           bits that leave -- and what the process leaves with is read again behind them, because a
+           handler may have written one of its own. */
+        this.emitExitHandlers(this.readExitEventCode());
         return this.readFinalExitCode();
     }
 
+    /**
+     * What the guest recorded of the exit path, read and cleared: a handler that threw, or a status
+     * that would not validate. Empty when neither happened.
+     */
+    private readExitReport(): string {
+        if (this.context === undefined || this.api === undefined) return '';
+        try {
+            const value = this.callApi('exitReport', []);
+            const text = this.context.typeof(value) === 'string' ? this.context.getString(value) : '';
+            value.dispose();
+            return text;
+        } catch {
+            return '';
+        }
+    }
+
+    /** The note the guest left, as the report node would write, or undefined for none. */
+    private exitReport(): string | undefined {
+        const note = this.readExitReport();
+        if (note === '') return undefined;
+        let parsed: Record<string, unknown>;
+        try {
+            parsed = JSON.parse(note) as Record<string, unknown>;
+        } catch {
+            return undefined;
+        }
+        const sourceOf = (at: string): string | undefined => this.fileSystem.readFile(at);
+        if (typeof parsed.header === 'string') {
+            return exitHandlerFailureText({
+                header: parsed.header,
+                site: String(parsed.site ?? ''),
+                listeners: Number(parsed.listeners ?? 0),
+                viaExit: parsed.viaExit === true,
+                exitSite: String(parsed.exitSite ?? '')
+            }, sourceOf);
+        }
+        if (typeof parsed.code === 'string' && parsed.code !== '') {
+            return exitCodeFailureText({
+                name: String(parsed.name ?? 'Error'),
+                code: parsed.code,
+                message: String(parsed.message ?? ''),
+                viaExit: parsed.viaExit === true,
+                site: String(parsed.site ?? '')
+            }, sourceOf);
+        }
+        return undefined;
+    }
+
+    /** The `exit` handlers, then the report of what one of them did, if it did anything. */
+    private emitExitHandlers(code: number): void {
+        this.safeEmitExit(code);
+        const reported = this.exitReport();
+        if (reported === undefined) return;
+        /* The report is the host's own account of a failure, not something the guest wrote, so it
+           goes out whether or not the guest is still allowed to: node writes it either way. */
+        this.emit(ProcessEvent.MESSAGE, { stderr: reported + '\n' });
+    }
+
     private handleFatal(error: unknown): number {
+        /* A status that would not validate is reported the way node reports it, over its own
+           internals, rather than as a bare stack of this container's. */
+        const statusFailure = this.exitReport();
+        /* Written here and not with the rest: a process that was already leaving when the report was
+           made -- an 'exit' handler that threw on the way out of `process.exit` -- returns its status
+           below without reaching the write that follows, and node writes the report either way. */
+        if (statusFailure !== undefined) this.emit(ProcessEvent.MESSAGE, { stderr: statusFailure + '\n' });
         if (this.exitRequested !== undefined) {
-            const code = this.exitRequested;
-            this.safeEmitExit(code);
+            const code = exitStatus(this.exitRequested);
+            this.emitExitHandlers(code);
             return code;
         }
         if (this.stopped) return -1;
@@ -2627,13 +3319,19 @@ export class NodeProcess extends Process {
            A failure of the run's own setup -- a preload that is not there -- is already the whole
            of what node writes, and is not a failure of the source at all. */
         const whole = error instanceof GuestFailure && error.whole;
-        const reported = this.evalScript === undefined || whole
-            ? message
+        /* A script file that died is reported the way node reports one -- the file and the line, the
+           source line, a caret, the error, its frames and the version trailer -- and not as a bare
+           stack with none of them. A failure of the run's own setup is already the whole of what
+           node writes, and a failure whose top frame names no line this process can read is left as
+           it was rather than shown under a line it did not come from. */
+        const sourceOf = (at: string): string | undefined => this.fileSystem.readFile(at);
+        const reported = statusFailure ?? (this.evalScript === undefined || whole
+            ? (whole ? message : scriptFailureText(message, sourceOf) ?? message)
             : evalFailureText(message, this.evalScript, {
                 ...(this.stackTraceLimit === undefined ? {} : { stackTraceLimit: this.stackTraceLimit }),
                 ...(error instanceof GuestFailure && error.thrown !== undefined ? { thrown: error.thrown } : {})
-            });
-        this.emitGuestOutput({ stderr: reported + '\n' });
+            }));
+        if (statusFailure === undefined) this.emitGuestOutput({ stderr: reported + '\n' });
         /*
          * The process is dying, and node runs what `process.on('exit')` registered on the way out
          * even when it dies like this: an uncaught throw and an unhandled rejection both reach
@@ -2641,11 +3339,11 @@ export class NodeProcess extends Process {
          * guest's own follows an exit handler -- the loop is not resumed -- but a handler that
          * writes, which is what the observable difference is, still writes here.
          */
-        this.safeEmitExit(1);
+        this.emitExitHandlers(1);
         /* An exit listener may have asked for a status of its own -- `process.exit(7)` inside one,
            which node honours -- and it is that one the process leaves with; otherwise the status of
            a process that died like this is 1, whatever the exit handlers wrote. */
-        return this.exitRequested !== undefined ? this.exitRequested : 1;
+        return this.exitRequested !== undefined ? exitStatus(this.exitRequested) : 1;
     }
 
     /** Runs until no ref is held, process.exit runs, a fatal error occurs, or the process is stopped.
@@ -2780,6 +3478,14 @@ export class NodeProcess extends Process {
 
     private readFinalExitCode(): number {
         const value = this.callApi('finalExitCode', []);
+        const code = this.context!.getNumber(value);
+        value.dispose();
+        return code;
+    }
+
+    /** The status the `exit` handlers are handed: the whole integer, not the eight bits that leave. */
+    private readExitEventCode(): number {
+        const value = this.callApi('exitEventCode', []);
         const code = this.context!.getNumber(value);
         value.dispose();
         return code;
@@ -3104,8 +3810,15 @@ export class NodeProcess extends Process {
             /* A module name may carry the query and fragment of the specifier that named it, which
                are part of the module's identity but not of the file it is loaded from. */
             const { path: file, suffix } = splitModuleName(moduleName);
+            /* A load hook, if the program registered one, is asked before the file is read: see
+               hookLoadOf. A url no file stands behind -- one a resolve hook made up -- reaches the
+               engine as a module of its own because the hook answered a source for it. */
+            if (this.hooksArmed) {
+                const hooked = this.hookLoadOf(moduleName, file, suffix, dynamic);
+                if (hooked !== undefined) return hooked;
+            }
             if (file.endsWith('.json')) {
-                return { value: `export default ${this.readRequired(file)};` };
+                return { value: this.jsonModuleSource(this.readRequired(file), file) };
             }
             if (this.resolver.isESM(file, file === this.requireFile)) {
                 return { value: this.esmSource(this.readRequired(file), file, false, suffix, dynamic) };
@@ -3236,6 +3949,69 @@ export class NodeProcess extends Process {
         }
     }
 
+    /**
+     * The module name a registered resolve hook answered for `specifier`, or undefined when it left
+     * the call to the loader. A url a hook made up -- one no file stands behind, the way a virtual
+     * module is one in node -- is the module's own name here; a `file:` url is the file behind it,
+     * carrying the query and fragment of the specifier that named it, which are part of a module's
+     * identity and not of the file it is read from.
+     */
+    private hookResolveOf(spec: string, baseName: string | undefined, baseDir: string, suffix: string): string | undefined {
+        const defaultPath = this.resolver.resolve(spec, baseDir, 'import');
+        const context = this.context!;
+        const args = [
+            context.newString(spec),
+            context.newString(baseName === undefined || !baseName.startsWith('/') ? '' : toFileUrl(baseName)),
+            context.newString(defaultPath === undefined ? '' : toFileUrl(defaultPath)),
+        ];
+        let url = '';
+        try {
+            url = this.callApiString('hooksResolve', args);
+        } finally {
+            for (const arg of args) arg.dispose();
+        }
+        if (url === '') return undefined;
+        if (!url.startsWith('file://')) return url;
+        return escapePathChars(percentDecode(url.slice('file://'.length))) + suffix;
+    }
+
+    /**
+     * What a registered load hook answered for the module named `moduleName`: the source it is
+     * compiled from and the format it is compiled as, or undefined when the hook left the call to
+     * the loader. The file is read first whether or not the hook is asked, so a hook that changes
+     * the source it was given is given the real one; a url no file stands behind is an empty source,
+     * which is what a hook that answers a module out of nothing needs.
+     */
+    private hookLoadOf(moduleName: string, file: string, suffix: string, dynamic: boolean)
+        : { value: string } | undefined {
+        let source = '';
+        try { source = this.readRequired(file); } catch { /* no file behind it: a hook may supply it */ }
+        let defaultFormat = 'module';
+        try {
+            defaultFormat = file.endsWith('.json') ? 'json'
+                : this.resolver.isESM(file, file === this.requireFile) ? 'module' : 'commonjs';
+        } catch { /* a url no file stands behind has no format to detect */ }
+        const url = file.startsWith('/') ? toFileUrl(file) : moduleName;
+        const context = this.context!;
+        const args = [
+            context.newString(url),
+            context.newString(source),
+            context.newString(defaultFormat),
+        ];
+        let answer = '';
+        try {
+            answer = this.callApiString('hooksLoad', args);
+        } finally {
+            for (const arg of args) arg.dispose();
+        }
+        if (answer === '') return undefined;
+        const hooked = JSON.parse(answer) as { source: string | null; format: string | null };
+        if (hooked.format === 'commonjs') return { value: this.syntheticModule(file, false) };
+        const text = typeof hooked.source === 'string' ? hooked.source : source;
+        return { value: this.esmSource(text, file, false, suffix, dynamic) };
+    }
+
+
     /** Maps a specifier to the module name QuickJS will load (a plain string on success). */
     private normalizeModule(baseName: string | undefined, requestedName: string): string | { error: Error | QuickJSHandle } {
         const missingAttribute = requestedName.endsWith(MISSING_ATTRIBUTE_MARK);
@@ -3263,6 +4039,14 @@ export class NodeProcess extends Process {
                 : ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify(failure));
         }
         const baseDir = baseName && baseName.startsWith('/') ? dirnameOf(baseName) : this.currentCwd;
+        /* A resolve hook, if the program registered one, answers the url this specifier resolves to:
+           node asks it before its own resolution, so a specifier the default loader cannot read --
+           'virtual:thing' -- is still one a hook can name. The default is resolved first, so a hook
+           that hands the call on, or one that changes the url it was given, is answered with it. */
+        if (this.hooksArmed) {
+            const hooked = this.hookResolveOf(spec, baseName, baseDir, urlSuffixOf(spec));
+            if (hooked !== undefined) return hooked;
+        }
         const resolved = this.resolver.resolveDetailed(spec, baseDir, 'import');
         /* A require() reaching a name whose extension the ES module loader does not know still
            loads it: require has no handler for such an extension either, but it falls back to the
@@ -3416,6 +4200,38 @@ export class NodeProcess extends Process {
     }
 
     /**
+     * The source of a JSON module. Node parses the module's text as JSON and its default export is
+     * the parsed value, so the text is parsed and not handed to the engine as JavaScript, which read
+     * a trailing comma as a legal one and reported a syntax error of its own for an empty file. A
+     * text that is not JSON is the SyntaxError node's JSON parser gives -- naming the file and the
+     * position in it -- carried by a module that throws it, so an importer that catches reads the
+     * error and one that does not is written the report node writes. A valid text is parsed by the
+     * engine when the module evaluates, which keeps the value a parse produces: a `__proto__` key
+     * stays an own property, and a key given twice keeps the value it was given last.
+     */
+    private jsonModuleSource(text: string, file: string): string {
+        /* A byte order mark is not part of the text: node drops the one a file starts with before it
+           parses, and a file that starts with one is valid here as it is there. */
+        const body = text.replace(/^﻿/, '');
+        try {
+            JSON.parse(body);
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            return errorModuleSource(ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
+                ctor: 'SyntaxError',
+                message: `${file}: ${detail}`,
+                whole: jsonModuleFailureText(body, file, detail, false),
+            })));
+        }
+        /* U+2028 and U+2029 are legal in a string since ES2019 and in JSON throughout, so the engine
+           that parses this is given them escaped rather than as themselves. */
+        const literal = JSON.stringify(body)
+            .split(String.fromCharCode(0x2028)).join('\\u2028')
+            .split(String.fromCharCode(0x2029)).join('\\u2029');
+        return `export default JSON.parse(${literal});`;
+    }
+
+    /**
      * The source of a `data:` module, built from the text the URL carries. A base64 URL is decoded
      * as bytes; every other one is percent-decoded, since that is the text of the module.
      */
@@ -3428,7 +4244,7 @@ export class NodeProcess extends Process {
         const source = isBase64
             ? new TextDecoder().decode(base64ToBytes(body))
             : percentDecode(body);
-        if (dataUrlMediaType(url) === 'application/json') return { value: `export default ${source};` };
+        if (dataUrlMediaType(url) === 'application/json') return { value: this.jsonModuleSource(source, moduleName) };
         return { value: this.esmSource(source, moduleName, false, '') };
     }
 
@@ -3633,6 +4449,8 @@ const MISSING_ATTRIBUTE_MARK = '\u0001owc-attr-missing';
 const ERROR_MODULE_PREFIX = 'owc-error:';
 /** Marks a module that is a WebAssembly module: everything after the mark is the file it reads. */
 const WASM_MODULE_PREFIX = 'owc-wasm:';
+/** The name node's report gives the script a JSON module's text is parsed in. */
+const JSON_ANONYMOUS_SCRIPT = '<anonymous_script>';
 /**
  * get, set or async followed by a semicolon or a comment: a cheap superset of the class elements the
  * guest's compatibility rewrite quotes, so its slower scan runs only on sources that may hold one.
@@ -4225,11 +5043,12 @@ function syntaxFailureFile(stack: string, file: string, read: (at: string) => st
     return text === undefined ? file : at;
 }
 
-function esmCompileFrames(isMain: boolean, isTs = false): string {
-    const shared = [
-        '    at compileSourceTextModule (node:internal/modules/esm/utils:318:16)',
-        '    at ModuleLoader.moduleStrategy (node:internal/modules/esm/translators:90:18)'
-    ];
+/**
+ * The frames node's loader contributes to a module it failed to translate, under the frames of the
+ * translator that failed: the entry a run started in ends in the loader's own, and a dependency it
+ * linked ends in the job that linked it.
+ */
+function moduleLoaderFrames(head: string[], isMain: boolean, isTs: boolean): string {
     /* A `.ts` entry is stripped by the translator before it is compiled, and the frame of the
        stripper -- in the place TracingChannel.tracePromise has for any other entry -- is part of
        what node prints for it. */
@@ -4247,7 +5066,60 @@ function esmCompileFrames(isMain: boolean, isTs = false): string {
             ...(isTs ? [] : ['    at TracingChannel.tracePromise (node:diagnostics_channel:362:14)'])]
         : ['    at ModuleJob.syncLink (node:internal/modules/esm/module_job:162:33)',
             '    at ModuleJob.link (node:internal/modules/esm/module_job:252:17)'];
-    return shared.concat(stripped, after, last).join('\n');
+    return head.concat(stripped, after, last).join('\n');
+}
+
+/** The frames of a module the engine failed to compile. */
+function esmCompileFrames(isMain: boolean, isTs = false): string {
+    return moduleLoaderFrames([
+        '    at compileSourceTextModule (node:internal/modules/esm/utils:318:16)',
+        '    at ModuleLoader.moduleStrategy (node:internal/modules/esm/translators:90:18)',
+    ], isMain, isTs);
+}
+
+/** The frames of a module whose JSON the engine's parser refused. */
+function jsonModuleFrames(isMain: boolean): string {
+    return moduleLoaderFrames([
+        '    at parse (<anonymous>)',
+        '    at ModuleLoader.jsonStrategy (node:internal/modules/esm/translators:482:21)',
+    ], isMain, false);
+}
+
+/** The position a JSON error points at, as an offset into the text; undefined when it points at none. */
+function jsonErrorPosition(message: string, body: string): number | undefined {
+    const at = / at position (\d+) \(line \d+ column \d+\)$/.exec(message);
+    if (at !== null) return Number(at[1]);
+    /* Two of the messages carry no position of their own: a token the parser did not expect names
+       the character it stopped on, and a value it cannot read at all is reported at its first one.
+       `Unexpected end of JSON input` names neither, and node prints no caret under it. */
+    const token = /^Unexpected token '([\s\S]*?)', /.exec(message);
+    if (token !== null) {
+        const index = token[1] === '' ? -1 : body.indexOf(token[1]);
+        if (index >= 0) return index;
+    }
+    return /^"[\s\S]*" is not valid JSON$/.test(message) ? 0 : undefined;
+}
+
+/**
+ * A JSON module whose text is not JSON, as node reports it: the parse runs in a script the engine
+ * names `<anonymous_script>`, so the header, the line and the caret are the JSON's own, while the
+ * error names the file and the position in it. The frames are the JSON translator's, and then the
+ * loader's; a JSON module is reached as a dependency, so the report is the one a linked module gets.
+ */
+function jsonModuleFailureText(source: string, file: string, detail: string, isMain: boolean): string {
+    const position = jsonErrorPosition(detail, source);
+    const before = position === undefined ? '' : source.slice(0, position);
+    const line = position === undefined ? 1 : before.split('\n').length;
+    const column = position === undefined ? 0 : position - before.lastIndexOf('\n');
+    const lines = source.split('\n');
+    const shown = lines[Math.min(Math.max(line, 1), lines.length) - 1] ?? '';
+    /* A caret the width of the run of characters before the position, which keeps a tab a tab the
+       way node keeps one. An error with no position to point at -- an empty file, or one that ends
+       mid-value -- gets no caret line at all, and not a blank one where a caret would be. */
+    const caret = position === undefined ? undefined
+        : shown.slice(0, Math.max(column - 1, 0)).replace(/[^\t]/g, ' ') + '^';
+    return `${JSON_ANONYMOUS_SCRIPT}:${line}\n${shown}\n${caret === undefined ? '' : `${caret}\n`}` +
+        `\nSyntaxError: ${file}: ${detail}\n${jsonModuleFrames(isMain)}\n\nNode.js ${NODE_VERSION}`;
 }
 
 /**

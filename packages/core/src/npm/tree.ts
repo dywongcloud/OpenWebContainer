@@ -1,6 +1,7 @@
 import { IFileSystem } from '../filesystem';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../process/executors/node/runtime/resolver';
-import { readManifest } from './scripts';
+import { lockKey } from './lockfile';
+import { localSpecLabel, readManifest } from './scripts';
 
 /**
  * `npm ls`: the dependency tree of the package at a directory, drawn with npm's own branch
@@ -38,15 +39,43 @@ interface TreeNode {
     children: TreeNode[];
 }
 
+/** A package reached by the walk whose own dependencies have not been walked yet. */
+interface Pending {
+    /** The directory of the package whose dependencies are next. */
+    dir: string;
+    manifest: Record<string, any>;
+    /** devDependencies are the root's to show; a dependency's own are never installed. */
+    includeDev: boolean;
+    /** The line this package's dependencies are drawn under. */
+    node: TreeNode;
+}
+
+/**
+ * npm orders the lines under a package with the collator on `name@version`, not on the name alone:
+ * `cookie-signature@1.0.6` precedes `cookie@0.7.1` because '-' sorts before '@', where a sort on the
+ * name alone would put `cookie` first.
+ */
+const comparePackageIds: (left: string, right: string) => number = (() => {
+    try {
+        return new Intl.Collator('en').compare;
+    } catch {
+        return (left, right) => (left < right ? -1 : left > right ? 1 : 0);
+    }
+})();
+
 /** The whole `npm ls` report for the package at `packageDir`, ending with npm's own blank line. */
 export function dependencyTree(fileSystem: IFileSystem, packageDir: string, options: ListOptions): string {
     const manifest = readManifest(fileSystem, packageDir);
     const lines = [manifest === undefined ? packageDir : rootLabel(manifest, packageDir)];
-    const children = manifest === undefined
-        ? []
-        : childrenOf(fileSystem, packageDir, manifest, dependencyLevels(options.depth), true);
+    /* The whole tree is built whatever depth was asked for. Which package a dependency belongs to --
+       and so whether it is drawn in full or named `deduped` -- is decided by the breadth-first walk
+       over every edge in the tree, and a depth is only how much of that tree is then drawn: a
+       dependency hoisted to the root is reached through express two levels down, and `npm ls` at
+       the default depth does not print express's own dependencies but must not call them
+       extraneous for that. */
+    const children = manifest === undefined ? [] : treeChildren(fileSystem, packageDir, manifest);
     if (children.length === 0) lines.push('└── (empty)');
-    else drawChildren(children, '', lines);
+    else drawChildren(children, '', lines, dependencyLevels(options.depth));
     return lines.join('\n') + '\n\n';
 }
 
@@ -62,20 +91,124 @@ function dependencyLevels(depth: number): number {
 }
 
 /**
- * The lines under one package: its dependencies, devDependencies at the root alone (a dependency's
- * own devDependencies are never installed, so npm has nothing to show for them), and
- * optionalDependencies, each in npm's alphabetical order.
+ * The lines under the package at `packageDir`: its dependencies, devDependencies at the root alone
+ * (a dependency's own devDependencies are never installed, so npm has nothing to show for them),
+ * and optionalDependencies, each in npm's alphabetical order.
+ *
+ * The walk is breadth first, the way npm's is, and it gives every package it reaches a home at the
+ * first place it reaches it. That is what `deduped` means and why the order matters: a dependency
+ * hoisted to the root belongs to a shallower level than the package asking for it, so it is drawn in
+ * full under the root -- further down the output -- while the deeper package that asks for it names
+ * it `deduped` above, carrying none of its dependencies. A depth-first walk would give the same
+ * package to the deepest package that reaches it first and draw the two the other way round.
+ *
+ * A package the walk reaches twice is one physical package, so what decides it is the directory the
+ * dependency resolves to and not its name: two copies of a package at two directories are two
+ * packages, and each is drawn in full.
  */
-function childrenOf(
+function treeChildren(
     fileSystem: IFileSystem,
     packageDir: string,
-    manifest: Record<string, any>,
-    levels: number,
-    includeDev: boolean
+    manifest: Record<string, any>
 ): TreeNode[] {
-    if (levels <= 0) return [];
-    const optional = new Set(Object.keys((manifest.optionalDependencies ?? {}) as Record<string, string>));
-    const entries: { name: string; range: string; optional: boolean }[] = [];
+    const root: TreeNode = { text: '', children: [] };
+    /* The root's own directory is already taken, as npm's walk has it: a package that resolves to it
+       is named `deduped` and not drawn again. */
+    const seen = new Map<string, TreeNode>([[normalizeAbsolute(packageDir), root]]);
+    const queue: Pending[] = [{ dir: packageDir, manifest, includeDev: true, node: root }];
+    let next = 0;
+
+    /** One step of the walk: the dependency fields of `pending`, each given a home in npm's order. */
+    const walkEdges = (pending: Pending): void => {
+        const optional = new Set(Object.keys((pending.manifest.optionalDependencies ?? {}) as Record<string, string>));
+        const entries = dependencyEntries(pending.manifest, optional, pending.includeDev);
+        /* Resolved and ordered before any of them is given a home: the order is part of which
+           package the walk reaches first. */
+        const prepared = entries.map((entry) => {
+            const dir = findInstalledCopy(fileSystem, pending.dir, entry.name);
+            const installed = dir === undefined ? undefined : readManifest(fileSystem, dir) ?? {};
+            const version = installed === undefined ? undefined : String(installed.version ?? '');
+            return { entry, dir, installed, version, id: `${entry.name}@${version ?? entry.range}` };
+        });
+        prepared.sort((left, right) => comparePackageIds(left.id, right.id));
+        for (const { entry, dir, installed, version } of prepared) {
+            if (dir === undefined || installed === undefined || version === undefined) {
+                const kind = entry.optional ? 'OPTIONAL ' : '';
+                pending.node.children.push({
+                    text: `UNMET ${kind}DEPENDENCY ${entry.name}@${entry.range}`,
+                    children: []
+                });
+                continue;
+            }
+            const owner = seen.get(dir);
+            if (owner !== undefined) {
+                pending.node.children.push({ text: `${entry.name}@${version} deduped`, children: [] });
+                continue;
+            }
+            /* A dependency installed out of a directory is drawn with the directory after it, which
+               is how npm says the package is the one there and not a copy from the registry. */
+            const local = localSpecLabel(entry.range);
+            const node: TreeNode = {
+                text: `${entry.name}@${version}` + (local === undefined ? '' : ` -> ${local}`),
+                children: []
+            };
+            seen.set(dir, node);
+            pending.node.children.push(node);
+            queue.push({ dir, manifest: installed, includeDev: false, node });
+        }
+    };
+
+    /* The declared tree first, breadth first, so every package an edge reaches has a home before
+       anything is asked about what else sits in a node_modules. */
+    while (next < queue.length) walkEdges(queue[next++]);
+
+    /*
+     * Then the packages the tree holds that no edge accounts for, which is what `extraneous` names
+     * -- not "this package does not declare it", but "nothing in the tree is installed because of
+     * it". npm's own mark is the same: arborist re-marks every node extraneous and clears the ones
+     * an edge out of a node that is not extraneous itself reaches (calc-dep-flags.js), so a
+     * dependency hoisted to the root -- which sits in the root's node_modules and is declared by no
+     * field of the root at all -- is not extraneous, because express asks for it two levels down.
+     *
+     * They are drawn under the package whose node_modules physically holds them, after the children
+     * that package declares, and they are walked too: what they ask for is already placed.
+     */
+    for (let grown = true; grown;) {
+        grown = false;
+        for (const pending of [...queue]) {
+            const extras = extraneousPackages(fileSystem, pending.dir, seen)
+                .sort((left, right) => comparePackageIds(`${left.name}@${left.version}`, `${right.name}@${right.version}`));
+            for (const extra of extras) {
+                const node: TreeNode = {
+                    text: `${extra.name}@${extra.version} extraneous` +
+                        (extra.link === undefined ? '' : ` -> ${extra.link}`),
+                    children: []
+                };
+                seen.set(extra.dir, node);
+                pending.node.children.push(node);
+                queue.push({ dir: extra.dir, manifest: extra.manifest, includeDev: false, node });
+                grown = true;
+            }
+        }
+        while (next < queue.length) walkEdges(queue[next++]);
+    }
+
+    return root.children;
+}
+
+/** One dependency of a package: the name it is asked for by, the range asked for, and whether it is optional. */
+interface DependencyEntry {
+    name: string;
+    range: string;
+    optional: boolean;
+}
+
+/**
+ * The dependencies of one package, in the order npm draws them: a name both a dependency and an
+ * optional dependency is optional, and devDependencies are the root's alone.
+ */
+function dependencyEntries(manifest: Record<string, any>, optional: Set<string>, includeDev: boolean): DependencyEntry[] {
+    const entries: DependencyEntry[] = [];
     const collect = (source: Record<string, unknown>, isOptional: boolean) => {
         for (const [name, range] of Object.entries(source)) {
             if (!isOptional && optional.has(name)) continue;
@@ -85,23 +218,68 @@ function childrenOf(
     collect((manifest.dependencies ?? {}) as Record<string, unknown>, false);
     if (includeDev) collect((manifest.devDependencies ?? {}) as Record<string, unknown>, false);
     collect((manifest.optionalDependencies ?? {}) as Record<string, unknown>, true);
-    entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    return entries;
+}
 
-    const nodes: TreeNode[] = [];
-    for (const entry of entries) {
-        const dir = findInstalledCopy(fileSystem, packageDir, entry.name);
-        if (dir === undefined) {
-            const kind = entry.optional ? 'OPTIONAL ' : '';
-            nodes.push({ text: `UNMET ${kind}DEPENDENCY ${entry.name}@${entry.range}`, children: [] });
+/**
+ * The packages installed under `dir` that no edge of the whole tree accounts for: what npm calls
+ * extraneous, and draws under the package that physically holds them. A package an edge has already
+ * reached is not one, wherever it happens to sit, and neither is a `.bin` directory or a scope
+ * directory -- a scope's own entries are packages.
+ */
+function extraneousPackages(
+    fileSystem: IFileSystem,
+    dir: string,
+    seen: Map<string, TreeNode>
+): { name: string; version: string; dir: string; manifest: Record<string, any>; link?: string }[] {
+    const nodeModules = joinPaths(dir, 'node_modules');
+    if (fileSystem.statPath(nodeModules)?.type !== 'dir') return [];
+    const out: { name: string; version: string; dir: string; manifest: Record<string, any>; link?: string }[] = [];
+    const add = (name: string): void => {
+        const at = joinPaths(nodeModules, name);
+        if (seen.has(normalizeAbsolute(at))) return;
+        const manifest = readManifest(fileSystem, at);
+        if (manifest === undefined) return;
+        out.push({
+            name,
+            version: String(manifest.version ?? ''),
+            dir: at,
+            manifest,
+            link: linkLabel(fileSystem, dir, at) ?? undefined
+        });
+    };
+    for (const entry of fileSystem.readdirNames(nodeModules) ?? []) {
+        if (entry === '.bin') continue;
+        if (entry.startsWith('@')) {
+            for (const scoped of fileSystem.readdirNames(joinPaths(nodeModules, entry)) ?? []) add(`${entry}/${scoped}`);
             continue;
         }
-        const installed = readManifest(fileSystem, dir) ?? {};
-        nodes.push({
-            text: `${entry.name}@${installed.version ?? ''}`,
-            children: levels > 1 ? childrenOf(fileSystem, dir, installed, levels - 1, false) : []
-        });
+        add(entry);
     }
-    return nodes;
+    return out;
+}
+
+/**
+ * npm's `-> <path>` for a package installed out of a directory rather than fetched from the
+ * registry: the `file:` spec the lockfile records for it, as npm records a link. Undefined for a
+ * package no lockfile entry marks a link.
+ */
+function linkLabel(fileSystem: IFileSystem, packageDir: string, dir: string): string | undefined {
+    const entry = lockEntry(fileSystem, packageDir, dir);
+    if (entry?.link !== true || typeof entry.resolved !== 'string') return undefined;
+    return localSpecLabel(entry.resolved);
+}
+
+/** The package-lock.json entry of the package at `dir`, under the key npm keys it by. */
+function lockEntry(fileSystem: IFileSystem, packageDir: string, dir: string): Record<string, any> | undefined {
+    const file = joinPaths(packageDir, 'package-lock.json');
+    if (fileSystem.statPath(file)?.type !== 'file') return undefined;
+    try {
+        const lock = JSON.parse(fileSystem.readFile(file) ?? '{}') as { packages?: Record<string, Record<string, any>> };
+        return lock.packages?.[lockKey(packageDir, dir)];
+    } catch {
+        return undefined;
+    }
 }
 
 /** The copy of `name` Node would resolve from `fromDir`, which is where npm prints it from. */
@@ -118,13 +296,17 @@ function findInstalledCopy(fileSystem: IFileSystem, fromDir: string, name: strin
 }
 
 /** npm's branch characters: `├─┬`/`└─┬` where the tree continues, `├──`/`└──` at a leaf. */
-function drawChildren(children: TreeNode[], prefix: string, lines: string[]): void {
+function drawChildren(children: TreeNode[], prefix: string, lines: string[], levels: number): void {
+    if (levels <= 0) return;
     children.forEach((child, index) => {
         const last = index === children.length - 1;
-        const branch = child.children.length > 0
+        /* A package with dependencies of its own is drawn as a leaf once the depth cuts them off,
+           which is why the branch character follows what is drawn and not what is there. */
+        const continues = levels > 1 && child.children.length > 0;
+        const branch = continues
             ? (last ? '└─┬ ' : '├─┬ ')
             : (last ? '└── ' : '├── ');
         lines.push(prefix + branch + child.text);
-        if (child.children.length > 0) drawChildren(child.children, prefix + (last ? '  ' : '│ '), lines);
+        if (continues) drawChildren(child.children, prefix + (last ? '  ' : '│ '), lines, levels - 1);
     });
 }
