@@ -1872,6 +1872,13 @@ resource and not a shell with plausible numbers; every CommonJS `require`, not o
 `createRequire` hands out, has a `resolve.paths`; and `Module._stat`, `_readPackage`, `wrap` and
 `wrapper` are accessor pairs with node's own configurability rather than plain data properties.
 
+Fixed here too, one line each, four rows closed on a witness of host node v24.15.0 against one fresh container boot:
+
+- A `SharedArrayBuffer` posted to or from a `Worker` now arrives as one and keeps sharing its memory: the bytes live on the host (`packages/core/src/process/executors/node/runtime/capabilities/shared.ts`), both sides reach them through an id the buffer carries, and `Atomics.store`/`load`/`add`/`notify`/`wait` cross the boundary, with `wait` suspending the guest until another thread notifies it or its timeout runs out.
+- A `Worker` instance carries node's own surface: `stdout` and `stderr` streams that carry the worker's `console.log`/`console.error` and still reach the parent's output unless `stdout: true` or `stderr: true` stops them, `stdin` null, `resourceLimits` of four numbers, a `performance` of its own with `eventLoopUtilization`, and `cpuUsage`/`getHeapSnapshot`/`getHeapStatistics`/`startCpuProfile`/`startHeapProfile`/`threadName`.
+- `setEnvironmentData`/`getEnvironmentData` are a real map keyed by the value handed in (`getEnvironmentData(9)` and not `getEnvironmentData('9')`), and a worker is seeded with the keys its parent held when it started it.
+- `async_hooks.createHook` hears the resources this runtime schedules: `init`/`before`/`after`/`destroy` for a `Timeout`, an `Immediate` and a `TickObject`, and `init`/`promiseResolve`/`before`/`after` for a `PROMISE`, with `executionAsyncId()` reading that resource's own id inside the callback.
+
 Still measured and not fixed, each with its site: `Module.register` and `Module.registerHooks` accept hooks and
 never call them, so a registered `load` hook changes nothing a program sees -- the engine is not what stops them, since
 `quickjs-emscripten-core` 0.32.0 declares `setModuleLoader(moduleLoader: JSModuleLoaderAsync, ...)` and an async `load`

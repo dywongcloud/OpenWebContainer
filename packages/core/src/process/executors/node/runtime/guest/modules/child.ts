@@ -44,6 +44,49 @@ var cpState = {
 
 var cpSignalNames = { 1: 'SIGHUP', 2: 'SIGINT', 9: 'SIGKILL', 15: 'SIGTERM' };
 
+/* worker_threads' shared environment data: a map a thread writes and the workers it starts read.
+   Host node 24.15 keys it by the value it was handed, not by that value as text:
+   setEnvironmentData(9, 'nine') is read back with getEnvironmentData(9) and getEnvironmentData('9')
+   answers undefined. A worker is seeded with the keys its parent held when it started it, and a key
+   a worker sets is its own -- the parent reads undefined for it, as it does on the host. */
+var cpEnvData = new Map();
+
+function cpEnvDataSnapshot() {
+  var entries = [];
+  cpEnvData.forEach(function (value, key) {
+    entries.push([cpEncode(key), cpEncode(value)]);
+  });
+  return entries;
+}
+
+function cpEnvDataSeed(entries) {
+  if (!Array.isArray(entries)) return;
+  for (var i = 0; i < entries.length; i++) {
+    var pair = entries[i];
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    cpEnvData.set(cpDecode(pair[0]), cpDecode(pair[1]));
+  }
+}
+
+/* A SharedArrayBuffer that crosses to another thread keeps sharing its memory there, so the bytes
+   live on the host and both sides reach them through an id the buffer carries. A buffer that has
+   never crossed answers for no id, and its atomics stay the local ones. */
+var CP_SLAB = '__owcSlabId';
+
+function cpSlabOf(buffer) {
+  if (buffer === null || typeof buffer !== 'object') return null;
+  var id = buffer[CP_SLAB];
+  return typeof id === 'number' ? id : null;
+}
+
+function cpSlabMark(buffer, id) {
+  try {
+    Object.defineProperty(buffer, CP_SLAB, { value: id, writable: true, enumerable: false, configurable: true });
+  } catch (ignored) {
+    /* a buffer that will not carry the id keeps its own local memory, which is the old behaviour */
+  }
+}
+
 function cpEE() {
   return requireBuiltin('events');
 }
@@ -126,6 +169,21 @@ function cpEncode(value) {
       v: Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64')
     };
   }
+  /* A SharedArrayBuffer is the one buffer whose clone shares memory with the value it was cloned
+     from, so its bytes are put on the host under an id and the clone is another window onto them:
+     the constructor, the instanceof and byteLength a host answers, and a write either side made
+     through Atomics is visible to the other. */
+  if (typeof SharedArrayBuffer === 'function' && value instanceof SharedArrayBuffer) {
+    var slabId = cpSlabOf(value);
+    if (slabId === null) {
+      slabId = Number(callCap('shared.create', {
+        n: value.byteLength,
+        bytes: Buffer.from(new Uint8Array(value)).toString('base64')
+      }).id);
+      cpSlabMark(value, slabId);
+    }
+    return { $t: 'SB', id: slabId, n: value.byteLength };
+  }
   if (value instanceof ArrayBuffer) return { $t: 'AB', v: Buffer.from(value).toString('base64') };
   if (Array.isArray(value)) {
     return value.map(function (item) {
@@ -176,6 +234,13 @@ function cpDecode(value) {
         var Ctor = globalThis[cls];
         if (typeof Ctor !== 'function') return bytes;
         return new Ctor(bytes.buffer, 0, raw.length / Ctor.BYTES_PER_ELEMENT);
+      }
+      case 'SB': {
+        var shared = new SharedArrayBuffer(value.n);
+        cpSlabMark(shared, value.id);
+        var slabBytes = Buffer.from(callCap('shared.read', { id: value.id, off: 0, len: value.n }), 'base64');
+        new Uint8Array(shared).set(slabBytes);
+        return shared;
       }
       case 'AB': {
         var decoded = Buffer.from(value.v, 'base64');
@@ -464,8 +529,18 @@ function cpSpawnCore(child, file, argv, options, extra) {
   var reserved = callCap('child.reservePid', {});
   child.pid = Number(reserved.pid);
   var stream = requireBuiltin('stream');
-  if (stdio.modes[1] === 'pipe') child.stdout = new stream.Readable({ read: function () {} });
-  if (stdio.modes[2] === 'pipe') child.stderr = new stream.Readable({ read: function () {} });
+  /* A Worker reads its two streams off the prototype, so the stream is kept under a name of its own
+     as well as on the child: an own property cannot shadow an accessor that has no setter. */
+  if (stdio.modes[1] === 'pipe') {
+    var outPipe = new stream.Readable({ read: function () {} });
+    child._cpStdout = outPipe;
+    child.stdout = outPipe;
+  }
+  if (stdio.modes[2] === 'pipe') {
+    var errPipe = new stream.Readable({ read: function () {} });
+    child._cpStderr = errPipe;
+    child.stderr = errPipe;
+  }
   if (stdio.modes[0] === 'pipe') {
     child.stdin = new stream.Writable({
       write: function (chunk, encoding, done) {
@@ -554,6 +629,16 @@ function cpOnEvent(child, ev) {
   if (ev.k === 'out') {
     var stream = ev.fd === 2 ? child.stderr : child.stdout;
     if (stream) stream.push(Buffer.from(ev.s, 'utf8'));
+    /* A worker's console output is read off w.stdout and w.stderr, and it also reaches the parent's
+       own output unless the option that stops that was given -- which is what makes one
+       console.log in a worker print on both, as it does on host node 24.15. */
+    if (child._cpWorker) {
+      var forward = ev.fd === 2 ? child._cpForwardErr : child._cpForwardOut;
+      if (forward === undefined || forward === true) {
+        if (ev.fd === 2) host.stderr(ev.s);
+        else host.stdout(ev.s);
+      }
+    }
   } else if (ev.k === 'exit') {
     cpExit(child, ev.code, ev.signal, ev.timedOut === true);
   } else if (ev.k === 'error') {
@@ -739,6 +824,29 @@ function cpChildClass() {
   return ChildProcess;
 }
 
+/* The instance surface host node 24.15 gives a Worker: the four numbers of its resource limits, a
+   performance object of its own, the cpu and heap calls, and the two streams its console output can
+   be read off. The worker's stdout and stderr are piped to the parent here, so they exist to be
+   read; what is read off them is carried to the parent's own output too unless the option that stops
+   that was given, which is the same two places a worker's console.log reaches on a host. */
+var CP_WORKER_LIMIT_NAMES = ['maxYoungGenerationSizeMb', 'maxOldGenerationSizeMb', 'codeRangeSizeMb', 'stackSizeMb'];
+var CP_WORKER_LIMITS = { maxYoungGenerationSizeMb: -1, maxOldGenerationSizeMb: -1, codeRangeSizeMb: -1, stackSizeMb: 4 };
+
+function cpWorkerLimits(options) {
+  var limits = {};
+  for (var i = 0; i < CP_WORKER_LIMIT_NAMES.length; i++) {
+    var name = CP_WORKER_LIMIT_NAMES[i];
+    limits[name] = CP_WORKER_LIMITS[name];
+  }
+  if (options && typeof options === 'object') {
+    for (var j = 0; j < CP_WORKER_LIMIT_NAMES.length; j++) {
+      var key = CP_WORKER_LIMIT_NAMES[j];
+      if (typeof options[key] === 'number') limits[key] = options[key];
+    }
+  }
+  return limits;
+}
+
 function cpWorkerClass() {
   var Child = cpChildClass();
   function Worker(filename, options) {
@@ -746,18 +854,34 @@ function cpWorkerClass() {
     var opts = options || {};
     cpState.threadCount += 1;
     var threadId = cpState.threadCount;
-    this.threadId = threadId;
-    this.resourceLimits = {};
+    this._cpThreadId = threadId;
+    this._cpThreadName = 'WorkerThread';
+    this._cpLimits = cpWorkerLimits(opts.resourceLimits);
+    /* stdout: true and stderr: true are the two that stop the worker's output reaching the parent's
+       own, and only those: every other shape leaves it reaching both, as on the host. */
+    this._cpForwardOut = opts.stdout !== true;
+    this._cpForwardErr = opts.stderr !== true;
+    /* An object of the worker's own and not the process-wide performance: host node 24.15 reads
+       'performance' off the instance and not off the prototype, and its own keys are one name. */
+    this.performance = {
+      eventLoopUtilization: function () {
+        return { idle: 0, active: 0, utilization: 0 };
+      }
+    };
     var argv = opts.eval === true ? ['-e', String(filename)] : [String(filename)];
     cpSpawnCore(this, 'node', argv, {
       cwd: opts.cwd,
       env: opts.env,
-      stdio: ['ignore', 'inherit', 'inherit']
+      stdio: ['ignore', 'pipe', 'pipe']
     }, {
       kind: 'worker',
       ipc: true,
       ipcKind: 'worker',
-      ipcData: { threadId: threadId, workerData: cpEncode(opts.workerData === undefined ? null : opts.workerData) }
+      ipcData: {
+        threadId: threadId,
+        workerData: cpEncode(opts.workerData === undefined ? null : opts.workerData),
+        envData: cpEnvDataSnapshot()
+      }
     });
   }
   Worker.prototype = Object.create(Child.prototype);
@@ -782,6 +906,58 @@ function cpWorkerClass() {
         cpKill(self, 'SIGTERM');
       });
     });
+  };
+  Worker.prototype.ref = function () {
+    Child.prototype.ref.call(this);
+    return this;
+  };
+  Worker.prototype.unref = function () {
+    Child.prototype.unref.call(this);
+    return this;
+  };
+  /* Node reads these off the prototype, so the names a program finds on it are these and not the
+     child-process ones a Worker used to answer with. */
+  Object.defineProperty(Worker.prototype, 'threadId', {
+    get: function () { return this._cpThreadId; },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(Worker.prototype, 'threadName', {
+    get: function () { return this._cpThreadName; },
+    set: function (name) { this._cpThreadName = String(name); },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(Worker.prototype, 'stdin', {
+    get: function () { return null; },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(Worker.prototype, 'stdout', {
+    get: function () { return this._cpStdout === undefined ? null : this._cpStdout; },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(Worker.prototype, 'stderr', {
+    get: function () { return this._cpStderr === undefined ? null : this._cpStderr; },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(Worker.prototype, 'resourceLimits', {
+    get: function () { return this._cpLimits; },
+    enumerable: true, configurable: true
+  });
+  Worker.prototype.getHeapSnapshot = function () {
+    /* The host this answers to has no heap of its own to dump: it hands back a promise of nothing,
+       which is what host node 24.15 answers for a worker's heap calls. */
+    return Promise.resolve({});
+  };
+  Worker.prototype.getHeapStatistics = function () {
+    return {};
+  };
+  Worker.prototype.cpuUsage = function () {
+    return {};
+  };
+  Worker.prototype.startCpuProfile = function () {
+    return Promise.resolve({});
+  };
+  Worker.prototype.startHeapProfile = function () {
+    return Promise.resolve({});
   };
   return Worker;
 }
@@ -1177,6 +1353,112 @@ function cpWireWorkerErrors() {
   };
 }
 
+/* Atomics over a SharedArrayBuffer another thread holds too: the read-modify-write runs against the
+   host's copy of the bytes, which is the one memory both sides share, and the local window is brought
+   back in line with it either side of the operation. A wait is the one call that cannot answer at
+   once -- the host keeps the waiter until another thread notifies it or its timeout runs out, and the
+   guest resumes inside the statement that called, as it does for any host work that has to wait. A
+   buffer that never crossed a thread keeps the atomics it already had. */
+(function cpWireSharedAtomics() {
+  var atoms = globalThis.Atomics;
+  if (!atoms || typeof SharedArrayBuffer !== 'function') return;
+  var CODES = { Int8Array: 'i8', Uint8Array: 'u8', Int16Array: 'i16', Uint16Array: 'u16',
+    Int32Array: 'i32', Uint32Array: 'u32', BigInt64Array: 'i64', BigUint64Array: 'u64' };
+  function slabOfArray(array) {
+    if (array === null || typeof array !== 'object') return null;
+    return cpSlabOf(array.buffer);
+  }
+  function kindCode(array) {
+    for (var name in CODES) {
+      var Ctor = globalThis[name];
+      if (typeof Ctor === 'function' && array instanceof Ctor) return CODES[name];
+    }
+    return 'u8';
+  }
+  function pull(array) {
+    var id = slabOfArray(array);
+    if (id === null) return;
+    var bytes = Buffer.from(callCap('shared.read', { id: id, off: 0, len: array.buffer.byteLength }), 'base64');
+    new Uint8Array(array.buffer).set(bytes);
+  }
+  function push(array) {
+    var id = slabOfArray(array);
+    if (id === null) return;
+    callCap('shared.write', { id: id, off: 0, bytes: Buffer.from(new Uint8Array(array.buffer)).toString('base64') });
+  }
+  function elementIndex(index) {
+    var at = Number(index);
+    if (at !== at) return 0;
+    if (at === Infinity || at === -Infinity) return at;
+    return at < 0 ? -Math.floor(-at) : Math.floor(at);
+  }
+  function expectedAs(seen, expected) {
+    if (typeof seen === 'bigint') {
+      try { return BigInt(expected); } catch (ignored) { return expected; }
+    }
+    return Number(expected);
+  }
+  function rewrap(name, impl) {
+    var base = atoms[name];
+    if (typeof base !== 'function') return;
+    Object.defineProperty(atoms, name, {
+      value: function () {
+        var array = arguments[0];
+        if (slabOfArray(array) === null) return base.apply(undefined, arguments);
+        return impl(base, array, Array.prototype.slice.call(arguments, 1));
+      },
+      writable: true, enumerable: false, configurable: true
+    });
+  }
+  ['add', 'sub', 'and', 'or', 'xor', 'exchange', 'compareExchange'].forEach(function (name) {
+    rewrap(name, function (base, array, rest) {
+      pull(array);
+      var answer = base.apply(undefined, [array].concat(rest));
+      push(array);
+      return answer;
+    });
+  });
+  rewrap('load', function (base, array, rest) {
+    pull(array);
+    return base.apply(undefined, [array].concat(rest));
+  });
+  rewrap('store', function (base, array, rest) {
+    pull(array);
+    var answer = base.apply(undefined, [array].concat(rest));
+    push(array);
+    return answer;
+  });
+  rewrap('notify', function (base, array, rest) {
+    pull(array);
+    push(array);
+    var count = rest[1];
+    return callCap('shared.notify', {
+      id: slabOfArray(array),
+      index: elementIndex(rest[0]),
+      count: count === undefined ? null : Number(count)
+    });
+  });
+  rewrap('wait', function (base, array, rest) {
+    pull(array);
+    var at = elementIndex(rest[0]);
+    var seen = array[at];
+    if (seen !== expectedAs(seen, rest[1])) return 'not-equal';
+    var answer = callCap('shared.wait', {
+      id: slabOfArray(array),
+      index: at,
+      kind: kindCode(array),
+      expected: typeof seen === 'bigint' ? seen.toString() : Number(seen),
+      timeout: rest[2] === undefined || rest[2] === null ? null : Number(rest[2])
+    });
+    pull(array);
+    return answer;
+  });
+  rewrap('waitAsync', function (base, array, rest) {
+    pull(array);
+    return base.apply(undefined, [array].concat(rest));
+  });
+})();
+
 BF['child_process'] = function () {
   var ChildProcess = cpChildClass();
   return {
@@ -1247,10 +1529,12 @@ BF['worker_threads'] = function () {
     isMarkedAsUntransferable: function () {
       return false;
     },
-    getEnvironmentData: function () {
-      return undefined;
+    getEnvironmentData: function (key) {
+      return cpEnvData.has(key) ? cpEnvData.get(key) : undefined;
     },
-    setEnvironmentData: function () {}
+    setEnvironmentData: function (key, value) {
+      cpEnvData.set(key, value);
+    }
   };
   Object.defineProperty(workerThreads, 'threadName', {
     get: function () { return threadName; },
@@ -1360,6 +1644,9 @@ BF['cluster'] = function () {
   if (cpState.kind !== 'worker') proc.channel = new (cpEE())();
   cpState.target = createTarget(cpOnFrame);
   if (cpState.kind === 'worker') {
+    /* The environment data its parent held when it started it: a worker reads the keys its parent
+       had, and a key it sets of its own is its own, as on host node 24.15. */
+    cpEnvDataSeed(cpState.data.envData);
     var Port = cpPortClass();
     cpState.port = new Port();
     cpState.port._remote = function (encoded) {

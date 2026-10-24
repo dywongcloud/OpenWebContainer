@@ -1011,8 +1011,111 @@ export const SRC = String.raw`
     originalThen = Promise.prototype.then;
     Promise.prototype.then = function then(onFulfilled, onRejected) {
       var frame = currentFrame;
-      return originalThen.call(this, bindFrameCallback(onFulfilled, frame), bindFrameCallback(onRejected, frame));
+      var trigger = currentExecId;
+      var promiseId = asyncHooksLive() ? ++asyncIdCounter : 0;
+      if (promiseId !== 0) asyncEmit('init', [promiseId, 'PROMISE', trigger, this]);
+      return originalThen.call(this,
+        asyncReaction(onFulfilled, frame, promiseId, trigger),
+        asyncReaction(onRejected, frame, promiseId, trigger));
     };
+    asyncInstallResourceHooks();
+  }
+
+  /* The callbacks this runtime schedules are async resources of their own: a timer is a Timeout, an
+     immediate an Immediate and a tick a TickObject, and each carries an id of its own -- the one
+     executionAsyncId() reads inside the callback and the one a hook hears as init, before, after and
+     destroy. The wrapping goes on when async_hooks loads and costs nothing until a hook is enabled,
+     because a callback scheduled while none is enabled is handed on exactly as it was. */
+  var asyncHookedResources = false;
+  var nativeSetTimeout = null;
+  var nativeSetInterval = null;
+  var nativeSetImmediate = null;
+  var nativeNextTick = null;
+
+  function asyncHooksLive() {
+    return enabledAsyncHooks.length > 0;
+  }
+
+  function asyncBegin(id, triggerId) {
+    var prevExec = currentExecId;
+    var prevTrigger = currentTriggerId;
+    currentExecId = id;
+    currentTriggerId = triggerId;
+    asyncEmit('before', [id]);
+    return function asyncEnd() {
+      asyncEmit('after', [id]);
+      currentExecId = prevExec;
+      currentTriggerId = prevTrigger;
+    };
+  }
+
+  function asyncWrapScheduled(type, fn, destroy) {
+    if (!asyncHooksLive() || typeof fn !== 'function') return fn;
+    var id = ++asyncIdCounter;
+    var triggerId = currentExecId;
+    asyncEmit('init', [id, type, triggerId, {}]);
+    return function () {
+      var end = asyncBegin(id, triggerId);
+      try {
+        return fn.apply(this, arguments);
+      } finally {
+        end();
+        if (destroy) asyncEmit('destroy', [id]);
+      }
+    };
+  }
+
+  /* A promise reaction: node reports the resolve once, when the promise settles, and then the
+     before and after of the reaction it runs. */
+  function asyncReaction(fn, frame, promiseId, triggerId) {
+    if (typeof fn !== 'function') return fn;
+    if (promiseId === 0) return bindFrameCallback(fn, frame);
+    var reported = false;
+    return function () {
+      var self = this;
+      var args = arguments;
+      return runWithFrame(frame, function () {
+        if (!reported) {
+          reported = true;
+          asyncEmit('promiseResolve', [promiseId]);
+        }
+        var end = asyncBegin(promiseId, triggerId);
+        try {
+          return fn.apply(self, args);
+        } finally {
+          end();
+          asyncEmit('destroy', [promiseId]);
+        }
+      }, undefined, []);
+    };
+  }
+
+  function asyncInstallResourceHooks() {
+    if (asyncHookedResources) return;
+    asyncHookedResources = true;
+    var g = globalThis;
+    var proc = g.process;
+    nativeSetTimeout = g.setTimeout;
+    nativeSetInterval = g.setInterval;
+    nativeSetImmediate = g.setImmediate;
+    nativeNextTick = proc === undefined ? null : proc.nextTick;
+    var rest = function (args, from) {
+      return Array.prototype.slice.call(args, from);
+    };
+    g.setTimeout = function (fn, ms) {
+      return nativeSetTimeout.apply(g, [asyncWrapScheduled('Timeout', fn, true), ms].concat(rest(arguments, 2)));
+    };
+    g.setInterval = function (fn, ms) {
+      return nativeSetInterval.apply(g, [asyncWrapScheduled('Timeout', fn, false), ms].concat(rest(arguments, 2)));
+    };
+    g.setImmediate = function (fn) {
+      return nativeSetImmediate.apply(g, [asyncWrapScheduled('Immediate', fn, true)].concat(rest(arguments, 1)));
+    };
+    if (nativeNextTick !== null) {
+      proc.nextTick = function (fn) {
+        return nativeNextTick.apply(proc, [asyncWrapScheduled('TickObject', fn, true)].concat(rest(arguments, 1)));
+      };
+    }
   }
 
   function alsState(storage) {
