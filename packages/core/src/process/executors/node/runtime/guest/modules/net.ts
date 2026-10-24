@@ -333,6 +333,16 @@ function netListenHub(host) {
 }
 
 /**
+ * The address a listener reports for itself, which is not always the literal it was handed: the
+ * IPv4-mapped wildcard '::ffff:0.0.0.0' is bound as the wildcard and host Node 24.15 answers
+ * address() '::'/IPv6 for it, not the mapped literal. The hub still needs the literal, so only the
+ * reported text is rewritten.
+ */
+function netListenShown(text) {
+  return typeof text === 'string' && text.toLowerCase() === '::ffff:0.0.0.0' ? '::' : text;
+}
+
+/**
  * Cuts the zone (scope) id off an IPv6 literal ('::1%lo0' -> '::1'). A zone says which interface a
  * link-local address means, not which host it is: a host's kernel binds and dials the address the
  * zone is attached to, and its getsockname and getpeername report that address with no zone on it.
@@ -1771,7 +1781,7 @@ BF['net'] = function () {
       this._handleId = res.id;
       this._listening = true;
       /* A unix listener's address() is the path itself, a plain string, as Node reports it. */
-      this._address = usePath ? res.address : { address: shown, family: netFamilyName(shown), port: res.port };
+      this._address = usePath ? res.address : { address: netListenShown(shown), family: netFamilyName(shown), port: res.port };
       netRefresh(this);
       if (typeof args.cb === 'function') this.once('listening', args.cb);
       var listeningServer = this;
@@ -2525,7 +2535,10 @@ BF['dgram'] = function () {
       var res;
       try {
         res = callCap('net.udpBind', {
-          address: netListenHub(shown),
+          /* A udp6 socket is handed the address it was given, IPv4 spelling included: the hub folds
+             '0.0.0.0' to the wildcard for an IPv4 socket, and an IPv6 one handed the same literal
+             is the host's EINVAL, which only the literal itself can tell it. */
+          address: this._family === 'IPv6' ? shown : netListenHub(shown),
           port: port,
           targetId: this._targetId,
           family: this._family
@@ -2537,7 +2550,7 @@ BF['dgram'] = function () {
         return this;
       }
       this._hubId = res.id;
-      this._address = { address: shown, family: this._family, port: res.port };
+      this._address = { address: netListenShown(shown), family: this._family, port: res.port };
       this._binding = true;
       netRefresh(this);
       if (typeof args.cb === 'function') this.once('listening', args.cb);
@@ -2606,10 +2619,15 @@ BF['dgram'] = function () {
             callCapBytes('net.udpSend', { socketId: self._hubId, address: destination, port: port }, datagram);
           } catch (cause) {
             /* A datagram the hub refuses -- an IPv4 destination a socket bound to one address of its
-               own has no route to -- is the send's own answer, as uv_udp_send gives it. Anything
-               else raised here is a socket that is gone, and UDP drops those without a word. */
-            if (cause && cause.code === 'EADDRNOTAVAIL') {
+               own has no route to, and the unspecified address no socket has a route to at all --
+               is the send's own answer, as uv_udp_send gives it. Anything else raised here is a
+               socket that is gone, and UDP drops those without a word. */
+            var code = cause && cause.code;
+            if (code === 'EADDRNOTAVAIL' || code === 'EHOSTUNREACH' || code === 'EINVAL') {
               var refused = netSystemError(cause, 'send', destination, port);
+              /* The errno the kernel pairs with the code, which a send is the only path to raise:
+                 no route to the address, -65, as uv_udp_send reports it on a host. */
+              if (refused.errno === undefined && code === 'EHOSTUNREACH') refused.errno = -65;
               if (typeof callback === 'function') netDefer(function () { callback(refused); });
               else self.emit('error', refused);
               return;

@@ -36,6 +36,9 @@ export const HOST_PID = 0;
 
 const WILDCARD_ADDRESSES = new Set(['', '0.0.0.0', '::']);
 const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '::1']);
+/** A plain IPv4 literal, the spelling an IPv6 socket cannot bind or send to (host Node 24.15
+    answers EINVAL for it): the mapped '::ffff:127.0.0.1' carries a colon and so is IPv6 text. */
+const V4_DOTTED = /^\d{1,3}(\.\d{1,3}){3}$/;
 /** Longest path a `sockaddr_un` holds on this platform (macOS): a longer bind is EINVAL. Measured
     against host Node 24.15, which binds a 104-byte path and refuses 105 with EINVAL. */
 const UNIX_PATH_MAX = 104;
@@ -193,6 +196,15 @@ export class VirtualNetwork {
         if (!this.isLocal(address) && mappedLoopback(address) === null) {
             throw new VirtualNetworkError('EADDRNOTAVAIL', `address not available ${displayAddress(address)}`);
         }
+        /* A UDP socket binds in its own family and no other: a udp6 socket handed '127.0.0.1' is the
+           host's EINVAL, as a udp4 one handed '::1' or '::ffff:127.0.0.1' is -- uv__udp_bind reads
+           the literal in the socket's own family and finds no address there. */
+        if (protocol === 'udp' && request.address !== undefined && request.address !== '') {
+            const asIPv6 = request.address.includes(':');
+            if ((family === 'IPv4' && asIPv6) || (family === 'IPv6' && V4_DOTTED.test(request.address))) {
+                throw new VirtualNetworkError('EINVAL', `invalid argument ${request.address}`);
+            }
+        }
         const port = request.port || this.allocatePort(protocol, family, address);
         if (this.conflicts(protocol, family, address, port)) {
             throw new VirtualNetworkError('EADDRINUSE', `address already in use ${displayAddress(address)}:${port}`);
@@ -309,7 +321,7 @@ export class VirtualNetwork {
            IPv6 wildcard '::' is dual-stack, so its IPv4 client is accepted on the v4-mapped
            '::ffff:127.0.0.1' -- that is the address the host's accepted socket reports for the
            connection, on both of its ends. */
-        const acceptedAddress = listener.address === ''
+        const acceptedAddress = hubWildcard(listener.address)
             ? (listener.family === 'IPv6' && family === 'IPv4' ? '::ffff:' + localAddress : localAddress)
             : listener.address;
         this.offer(server, listener, {
@@ -326,10 +338,12 @@ export class VirtualNetwork {
                dialled '::ffff:127.0.0.1' reports it at both of its ends -- its own local address and
                the remote one -- not the plain IPv4 address the hub routed the dial to. It is reported
                in the canonical dotted spelling, so a dial of the short '::ffff:7f00:1' names
-               '::ffff:127.0.0.1', which is what a host's own getpeername renders for it. */
-            localAddress: mapped === null ? localAddress : '::ffff:' + mapped,
+               '::ffff:127.0.0.1', which is what a host's own getpeername renders for it -- and a dial
+               of the mapped wildcard '::ffff:0.0.0.0', which the kernel routes to the loopback, is
+               reported as '::ffff:127.0.0.1' for the same reason. */
+            localAddress: mapped === null ? localAddress : '::ffff:' + destination,
             localPort,
-            remoteAddress: mapped === null ? displayAddress(destination) : '::ffff:' + mapped,
+            remoteAddress: mapped === null ? displayAddress(destination) : '::ffff:' + destination,
             remotePort: request.port,
         };
     }
@@ -456,6 +470,21 @@ export class VirtualNetwork {
            a source in that family, so that is the peer the hub looks for and the address the sender
            is named by at the other end -- where the receiver's own family decides how it is written,
            a udp6 socket on '::' seeing '::ffff:127.0.0.1' and an IPv4 one seeing '127.0.0.1'. */
+        /* A datagram is addressed in the socket's own family and no other: a udp4 socket sending to
+           '::ffff:127.0.0.1' or '::' is the host's EINVAL, as a udp6 one sending to '0.0.0.0' is --
+           uv_udp_send reads the destination in the family the socket was opened in. The mapped
+           '::ffff:127.0.0.1' is IPv6 text, so a udp6 socket may send to it. */
+        const raw = options.address;
+        if ((socket.family === 'IPv4' && raw.includes(':')) || (socket.family === 'IPv6' && V4_DOTTED.test(raw))) {
+            throw new VirtualNetworkError('EINVAL', `send EINVAL ${raw}:${options.port}`);
+        }
+        /* The unspecified address is not a destination: the kernel has no route to it, which is the
+           EHOSTUNREACH Node reports from uv_udp_send. It is measured on both families -- '0.0.0.0'
+           for a udp4 socket, '::' and the mapped '::ffff:0.0.0.0' for a udp6 one -- where this hub
+           used to read it as the local host and deliver the datagram. */
+        if (raw === '0.0.0.0' || raw === '::' || mappedWildcard(raw)) {
+            throw new VirtualNetworkError('EHOSTUNREACH', `send EHOSTUNREACH ${raw}:${options.port}`);
+        }
         const mapped = v4MappedOf(options.address);
         /* A udp6 socket bound to one address of its own has no route to an IPv4 destination: the
            kernel refuses the send rather than picking a source the socket does not have, which is
@@ -604,20 +633,25 @@ export class VirtualNetwork {
     /** The bound endpoint that receives traffic for (address, port): exact address first, then wildcard. */
     private findEndpoint(protocol: VirtualProtocol, family: VirtualFamily, address: string, port: number): Listener | undefined {
         const table = protocol === 'tcp' ? this.listeners : this.udpSockets;
+        const wanted = hubWildcard(address) ? '' : address;
         let wildcard: Listener | undefined;
         for (const candidate of table.values()) {
             if (candidate.port !== port) continue;
             /* A unix binding is not an internet endpoint: it is reached by path, never by port. */
             if (candidate.path !== undefined) continue;
+            const bound = hubWildcard(candidate.address) ? '' : candidate.address;
             if (protocol === 'udp') {
                 if (candidate.family !== family && !udpTakes(candidate, family)) continue;
-            } else if (candidate.address === '' && !wildcardTakes(candidate, family)) {
+                /* The mapped wildcard answers IPv4 datagrams alone: a udp6 datagram to '::1' has no
+                   more route to it than an IPv6 client has to its listener. */
+                if (mappedWildcard(candidate.address) && family === 'IPv6') continue;
+            } else if (bound === '' && !wildcardTakes(candidate, family)) {
                 continue;
             }
             /* A udp6 socket bound to the mapped loopback is reached by the address it embeds, as
                well as by its own IPv6 spelling. */
-            if (candidate.address === address || mappedLoopback(candidate.address) === address) return candidate;
-            if (candidate.address === '') wildcard = candidate;
+            if (bound === wanted || mappedLoopback(candidate.address) === address) return candidate;
+            if (bound === '') wildcard = candidate;
         }
         return wildcard;
     }
@@ -625,18 +659,24 @@ export class VirtualNetwork {
     /** True when a new binding on (address, port) overlaps an existing one; a wildcard overlaps everything. */
     private conflicts(protocol: VirtualProtocol, family: VirtualFamily, address: string, port: number): boolean {
         const table = protocol === 'tcp' ? this.listeners : this.udpSockets;
+        const mine = hubWildcard(address) ? '' : address;
         for (const other of table.values()) {
             if (other.port !== port) continue;
             if (other.path !== undefined) continue;
+            const theirs = hubWildcard(other.address) ? '' : other.address;
             if (protocol === 'udp') {
                 if (other.family !== family) continue;
-                if (other.address === address || other.address === '' || address === '') return true;
-            } else if (other.address === address) {
+                if (theirs === mine || theirs === '' || mine === '') return true;
+            } else if (theirs === mine) {
                 /* TCP: an exact duplicate conflicts; a wildcard and a specific address coexist (macOS,
                    verified against Node 24). So do the two wildcards, when the IPv6 one is bound
                    second: this host binds '::' on a port whose '0.0.0.0' is already taken and refuses
                    the same pair in the other order, where folding both wildcards to '' refused both. */
-                if (address === '' && other.family === 'IPv4' && family === 'IPv6') continue;
+                if (mine === '' && !mappedWildcard(address) && other.family === 'IPv4' && family === 'IPv6') continue;
+                /* The mapped wildcard is the wildcard bound second over '::' -- this host binds the
+                   pair in that order and refuses it in the other -- but it still overlaps '0.0.0.0',
+                   in either order, because it is the same IPv4 wildcard under its IPv6 spelling. */
+                if (mine === '' && mappedWildcard(address) && other.family === 'IPv6') continue;
                 return true;
             }
         }
@@ -655,6 +695,7 @@ export class VirtualNetwork {
     /** True for the wildcard, loopback (both families), and any address registered in the name table. */
     private isLocal(address: string): boolean {
         if (address === '' || address === '127.0.0.1' || address === '::1' || address.startsWith('127.')) return true;
+        if (mappedWildcard(address)) return true;
         for (const registered of this.hosts.values()) {
             if (this.hubAddress(registered) === address) return true;
         }
@@ -682,6 +723,19 @@ export class VirtualNetwork {
         const resolved = this.hubAddress(address);
         return resolved === '' ? '127.0.0.1' : resolved;
     }
+}
+
+/** True when the address is a wildcard binding: '' (either spelling of it), or the IPv4-mapped IPv6
+    wildcard '::ffff:0.0.0.0', which host Node 24.15 binds, reports as '::'/IPv6, and reaches exactly
+    as far as '0.0.0.0' does -- an IPv4 client, accepted as '::ffff:<v4>', and no IPv6 one at all. */
+function hubWildcard(address: string | undefined): boolean {
+    return address === undefined || address === '' || mappedWildcard(address);
+}
+
+/** True for '::ffff:0.0.0.0' (and its hex spelling '::ffff:0:0'), the IPv4 wildcard written as an
+    IPv6 literal. */
+function mappedWildcard(address: string | undefined): boolean {
+    return typeof address === 'string' && v4MappedOf(address) === '0.0.0.0';
 }
 
 /**
@@ -733,7 +787,7 @@ function mappedLoopback(address: string | undefined): string | null {
  */
 function udpTakes(candidate: Listener, family: VirtualFamily): boolean {
     return family === 'IPv4' && candidate.family === 'IPv6'
-        && (candidate.address === '' || mappedLoopback(candidate.address) !== null);
+        && (hubWildcard(candidate.address) || mappedLoopback(candidate.address) !== null);
 }
 
 /**
@@ -743,7 +797,10 @@ function udpTakes(candidate: Listener, family: VirtualFamily): boolean {
  * That is the address and the family host Node reports in the `rinfo` of a datagram it receives.
  */
 function udpPeerAddress(receiver: Listener, source: string): string {
-    const asIPv4 = receiver.family === 'IPv4' || mappedLoopback(receiver.address) !== null;
+    /* A receiver bound to the mapped wildcard names an IPv4 peer in its own family, as one bound to
+       0.0.0.0 does: host Node 24.15 reports '127.0.0.1'/IPv4 there, where a udp6 socket on '::'
+       reports the mapped '::ffff:127.0.0.1'/IPv6. */
+    const asIPv4 = receiver.family === 'IPv4' || mappedLoopback(receiver.address) !== null || mappedWildcard(receiver.address);
     const embedded = v4MappedOf(source);
     if (asIPv4) return embedded ?? source;
     return embedded !== null || source.includes(':') ? source : '::ffff:' + source;
@@ -777,6 +834,9 @@ function displayAddress(address: string): string {
  * wildcard without IPV6_V6ONLY, and the IPv4 wildcard has no IPv6 address to answer on.
  */
 function wildcardTakes(candidate: Listener, family: VirtualFamily): boolean {
+    /* The mapped wildcard takes no IPv6 client at all: host Node 24.15 refuses ::1 and :: with
+       ECONNREFUSED against a listener on '::ffff:0.0.0.0', where '::' takes both. */
+    if (mappedWildcard(candidate.address)) return family === 'IPv4';
     return candidate.family === family || (candidate.family === 'IPv6' && family === 'IPv4');
 }
 
