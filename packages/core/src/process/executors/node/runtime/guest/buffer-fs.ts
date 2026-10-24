@@ -2224,17 +2224,17 @@ BF.fs = function () {
     }
     var bytes = null;
     var offset = 0;
+    var wantsRead = false;
     var stream = new Readable({
       highWaterMark: chunkSize,
       read: function () {
+        /* Node's own stream answers no read before its open has run -- the open is a request of its
+           own and the read is a second one -- so a chunk reaches nobody in the turn the stream was
+           made in, and an immediate armed before the stream still runs first ('ideI' on host node
+           24.15, where reading in that turn measured 'deiI'). */
         if (bytes === null) {
-          try {
-            bytes = readBytesOf(file);
-            if (rangeStart > 0 || rangeEnd !== Infinity) bytes = bytes.subarray(rangeStart, Math.min(rangeEnd + 1, bytes.length));
-          } catch (err) {
-            stream.destroy(err);
-            return;
-          }
+          wantsRead = true;
+          return;
         }
         if (offset >= bytes.length) {
           stream.push(null);
@@ -2252,14 +2252,35 @@ BF.fs = function () {
     stream.bytesRead = 0;
     if (options.encoding) stream.setEncoding(options.encoding);
     // like Node, the file is opened when the stream is created: a missing file is an 'error' even with no reader
-    setImmediate(function () {
+    settleIO(function () {
       if (!statOf(file)) {
         stream.destroy(fsError('ENOENT', 'open', file));
         return;
       }
+      try {
+        bytes = readBytesOf(file);
+        if (rangeStart > 0 || rangeEnd !== Infinity) bytes = bytes.subarray(rangeStart, Math.min(rangeEnd + 1, bytes.length));
+      } catch (err) {
+        stream.destroy(err);
+        return;
+      }
       stream.emit('open', 3);
       stream.emit('ready');
-    });
+      /*
+       * The read, which is a request of its own and not part of the open: the first chunk reaches the
+       * reader in the poll phase of the turn after the one the stream was made in, so an immediate
+       * armed with the stream runs before any of it ('ideI' on host node 24.15).
+       */
+      settleIO(function () {
+        if (!wantsRead) return;
+        wantsRead = false;
+        /* the read that was turned away is still owed, and it is owed outside the turn that asked:
+           the cycle it opened is over, so the state that closed it is reset before the read that
+           answers it, which is the only way a stream that has stalled waiting reaches its end. */
+        if (stream._readableState) stream._readableState.reading = false;
+        stream.read(0);
+      }, false);
+    }, false);
     Object.setPrototypeOf(stream, streamProtoOf(ReadStream, Readable, readStreamProto));
     readStreamProto = true;
     return stream;
@@ -2271,19 +2292,26 @@ BF.fs = function () {
     var file = toPathString(p);
     var flags = options.flags || 'w';
     var opened = false;
+    var waiting = [];
+    function writeChunk(chunk, encoding, callback) {
+      try {
+        fs.appendFileSync(file, chunk);
+        stream.bytesWritten += chunk.length;
+        callback();
+      } catch (err) {
+        callback(err);
+      }
+    }
     var stream = new Writable({
       write: function (chunk, encoding, callback) {
-        try {
-          if (!opened) {
-            opened = true;
-            if (flags.charAt(0) === 'w') fs.writeFileSync(file, '');
-          }
-          fs.appendFileSync(file, chunk);
-          stream.bytesWritten += chunk.length;
-          callback();
-        } catch (err) {
-          callback(err);
+        /* A write is answered the way the file's own requests are: after the open, which is a
+           request of its own, so 'close' follows an immediate armed with the stream instead of
+           preceding it ('iCI' on host node 24.15, where writing in that turn measured 'CiI'). */
+        if (!opened) {
+          waiting.push([chunk, encoding, callback]);
+          return;
         }
+        writeChunk(chunk, encoding, callback);
       }
     });
     stream.path = file;
@@ -2291,17 +2319,25 @@ BF.fs = function () {
     /* Like Node, the file is opened when the stream is created and not on the first write: a name the
        mode forbids is an 'error' then, so a caller waiting on 'error' or 'open' is answered instead
        of left waiting on a stream that never opens. */
-    setImmediate(function () {
+    settleIO(function () {
       try {
         if (flags.charAt(0) === 'w') fs.writeFileSync(file, '');
         else requireAccess(file, 2, 'open');
-        opened = true;
-        stream.emit('open', 3);
-        stream.emit('ready');
       } catch (err) {
         stream.destroy(err);
+        return;
       }
-    });
+      opened = true;
+      stream.emit('open', 3);
+      stream.emit('ready');
+      /* the writes the open was waited for: answered in the turn after it, as the file's own
+         requests are, so a caller's 'close' follows the immediate armed with the stream */
+      settleIO(function () {
+        var queued = waiting;
+        waiting = [];
+        for (var i = 0; i < queued.length; i++) writeChunk(queued[i][0], queued[i][1], queued[i][2]);
+      }, false);
+    }, false);
     Object.setPrototypeOf(stream, streamProtoOf(WriteStream, Writable, writeStreamProto));
     writeStreamProto = true;
     return stream;
@@ -2874,10 +2910,22 @@ BF.fs = function () {
           } catch (err) {
             error = err;
           }
+          /*
+           * Only the calls host node 24.15 spends a second turn on are settled late here. The others
+           * settle as they always did, because a promise's reaction is a microtask and a microtask
+           * lands before the check phase on both sides: an 'await fs.promises.stat' armed with an
+           * immediate answers first there ('SiI') and did here, while deferring the resolve pushed
+           * the reaction behind the immediate instead ('iSI').
+           */
+          if (!contentCost(syncName, error)) {
+            if (error) reject(error);
+            else resolve(result);
+            return;
+          }
           settleIO(function () {
             if (error) reject(error);
             else resolve(result);
-          }, contentCost(syncName, error));
+          }, true);
         });
       };
     }

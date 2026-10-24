@@ -23,6 +23,24 @@ var IMMEDIATE_QUEUE = [];
 /* The one host timer the queue holds: armed for the head so that a process whose only pending work
    is an immediate still has something to wake the loop, and re-armed as the head moves. */
 var IMMEDIATE_WAKE = 0;
+/*
+ * The poll phase, which is the turn host node 24.15 spends in it before it reaches the check phase.
+ * A file operation Node answers in one round trip -- a stat, an access, a readdir -- comes back in
+ * the poll phase of the turn after the one that asked, so it still runs ahead of an immediate armed
+ * with it. One Node answers in more than one round trip -- a readFile, whose open is a request of
+ * its own and whose read is a second one -- costs a whole extra turn, and that turn is what puts an
+ * immediate armed before it in front of it: host node 24.15 measures 'iFI' where this container,
+ * settling every callback inside the turn that asked, measured 'FiI'.
+ *
+ * IO_QUEUE holds the callbacks the poll phase of the next turn owes; IO_LATER holds the ones an
+ * extra round trip defers past that turn's check phase. Both run before the check phase they
+ * precede, which is the order host node 24.15 runs them in.
+ */
+var IO_QUEUE = [];
+var IO_LATER = [];
+/* The reserved host timer id the two queues wake on: never a timer-table id, which start at 1. */
+var TURN_TIMER = 0;
+var TURN_ARMED = false;
 var startedAt = host.now();
 
 /*
@@ -1033,16 +1051,68 @@ function scheduleImmediate(fn, args) {
  * whole queue, and it is moved along whenever the head is spent; a head that was already cleared is
  * dropped here rather than waited on, since the host timer it held is gone with it.
  */
+/*
+ * Settles a callback the way host node 24.15 settles an I/O callback: in the poll phase of the next
+ * turn, or -- when the operation costs it a second round trip -- in the poll phase of the turn after
+ * that one's check phase.
+ */
+function settleIO(fn, later) {
+  /* a pending request keeps the loop alive, as host node 24.15's own in-flight file request does */
+  host.ref(1);
+  if (later === true) IO_LATER.push(fn);
+  else IO_QUEUE.push(fn);
+  armTurn();
+}
+
+/*
+ * The one host timer both queues and the immediate queue wake on. They are one turn's phases and not
+ * three races, so a single timer runs them in their order instead of leaving the host's own timer
+ * order to decide which comes first.
+ */
+function armTurn() {
+  if (TURN_ARMED) return;
+  if (IMMEDIATE_QUEUE.length === 0 && IO_QUEUE.length === 0 && IO_LATER.length === 0) return;
+  TURN_ARMED = true;
+  host.setTimer(TURN_TIMER, 0);
+}
+
+/*
+ * One turn of the loop: the I/O callbacks already owed (the poll phase), the immediates standing when
+ * they have run (the check phase), then the callbacks a second round trip deferred -- which is the
+ * poll phase of the following turn, reached here because this container's smallest turn is the 1 ms
+ * floor a host timer cannot go under, and host node 24.15's own readFile lands well inside that.
+ */
+function runTurnPhases(due) {
+  var ready = IO_QUEUE;
+  IO_QUEUE = [];
+  for (var i = 0; i < ready.length; i++) {
+    host.ref(-1);
+    ready[i]();
+  }
+  /* a tick a callback queued is owed before the check phase, as it is on host node 24.15 */
+  drainTicks();
+  drainImmediatesUntil(due);
+  var later = IO_LATER;
+  IO_LATER = [];
+  if (later.length > 0) {
+    for (var j = 0; j < later.length; j++) {
+      host.ref(-1);
+      later[j]();
+    }
+    drainTicks();
+    /* the check phase of the turn those callbacks landed in, which owes every immediate standing */
+    drainImmediatesUntil(Infinity);
+  }
+}
+
 function armImmediateWake() {
-  if (IMMEDIATE_WAKE !== 0) return;
   while (IMMEDIATE_QUEUE.length > 0 && !timers[IMMEDIATE_QUEUE[0]]) {
     var spent = IMMEDIATE_QUEUE.shift();
     if (IMMEDIATE_WAKE === spent) IMMEDIATE_WAKE = 0;
   }
-  if (IMMEDIATE_QUEUE.length === 0) return;
-  var id = IMMEDIATE_QUEUE[0];
-  IMMEDIATE_WAKE = id;
-  host.setTimer(id, 0);
+  if (IMMEDIATE_QUEUE.length === 0) IMMEDIATE_WAKE = 0;
+  else IMMEDIATE_WAKE = IMMEDIATE_QUEUE[0];
+  armTurn();
 }
 
 function dropImmediate(id) {
@@ -1148,6 +1218,12 @@ function fireTimer(id) {
     if (typeof proc._owcSetDomainContext === 'function') proc._owcSetDomainContext(undefined);
   }
   if (IMMEDIATE_WAKE === id) IMMEDIATE_WAKE = 0;
+  if (id === TURN_TIMER) {
+    TURN_ARMED = false;
+    runTurnPhases(Infinity);
+    armTurn();
+    return;
+  }
   var entry = timers[id];
   if (!entry) return;
   if (entry.immediate) {
@@ -1160,7 +1236,7 @@ function fireTimer(id) {
     drainImmediatesUntil(Infinity);
     return;
   }
-  drainImmediatesUntil(entry.at + entry.delay);
+  runTurnPhases(entry.at + entry.delay);
   if (!timers[id]) return;
   runTimerEntry(id);
 }
@@ -1630,6 +1706,9 @@ var api = {
     timers = Object.create(null);
     IMMEDIATE_QUEUE.length = 0;
     IMMEDIATE_WAKE = 0;
+    IO_QUEUE = [];
+    IO_LATER = [];
+    TURN_ARMED = false;
   },
   keysOf: function (id, builtin) {
     var exported = builtin ? requireBuiltin(id) : loadCJS(id, null, false).exports;
