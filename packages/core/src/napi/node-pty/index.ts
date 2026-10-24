@@ -25,7 +25,9 @@
  * What resize() does. It records the size and nothing else: there is no TIOCSWINSZ, no SIGWINCH
  * and no program in the container that asks for the size of its terminal. cols and rows are
  * reported back, and COLUMNS and LINES are put in the child's environment at spawn, which is the
- * only place a size can reach a child here.
+ * only place a size can reach a child here. A resize after the child has exited fails, as it does
+ * on a host, with the add-on's own sentence for the errno it would have seen: 'ioctl(2) failed,
+ * EBADF'.
  *
  * What a spawned program sees. isatty is false: the guest's tty.isatty() returns false, the
  * stream node-pty reads from reports isTTY false, and the container's shell has no test for a
@@ -386,10 +388,13 @@ export function createAddon(env: PtyAddonEnv = {}): object {
     /** pty.resize: records the size. Nothing in the container has a window to resize. */
     function resize(fd: number, cols: number, rows: number): void {
         const record = table()[Number(fd)];
-        // The add-on resizes through the master descriptor, which the child's exit has closed, so a
-        // resize after the exit fails there (measured). The table entry is deleted on exit, which is
-        // what makes "no record" the same thing as "that terminal is gone".
-        if (!record) throw new Error(`resize: no terminal is open on fd ${Number(fd)}`);
+        /* The add-on resizes with ioctl(TIOCSWINSZ) on the master descriptor, and the child's exit
+           has closed that descriptor, so a resize after the exit fails there: measured against host
+           node-pty 1.1.0 on node v24.15.0, it throws 'ioctl(2) failed, EBADF', the sentence its
+           pty.cc builds for an EBADF errno. The table entry is deleted on exit, which is what makes
+           "no record" the same thing as "that descriptor is closed", so the add-on's own sentence
+           for it is thrown here rather than one of this shim's. */
+        if (!record) throw new Error('ioctl(2) failed, EBADF');
         record.cols = size(cols, record.cols);
         record.rows = size(rows, record.rows);
         if (record.socket) {
