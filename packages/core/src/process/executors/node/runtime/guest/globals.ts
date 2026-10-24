@@ -4086,9 +4086,16 @@ function circularStructureText(value, replacer) {
 
   /*
    * The two compression streams, over the zlib this container already has: gzip, deflate and
-   * deflate-raw, the three Node accepts. A stream buffers what it is written and compresses or
-   * decompresses the whole of it when it is closed, so the bytes a reader gets are the bytes
-   * node's gzip of the same input is -- there is no incremental deflate here to differ from.
+   * deflate-raw, the three Node accepts.
+   *
+   * Compressing is zlib's own stream driven one write at a time, so the pieces a reader sees are the
+   * pieces node's reader sees: the framing on its own -- ten bytes of gzip header, two of zlib --
+   * and then, when the stream is closed, whatever the deflate of those bytes came to. Node's own
+   * deflate of a write that fills no block yet produces nothing but the framing, which is why one
+   * 4096-byte write and eight 1024-byte ones both come out as two chunks and not one.
+   *
+   * Decompressing is the whole input at once -- the bytes are the same however it is split -- and
+   * hands the result back in Z_DEFAULT_CHUNK pieces, the 16384-byte buffer node's inflate fills.
    */
   var CODECS = null;
   function codecOf(tag, format) {
@@ -4122,15 +4129,102 @@ function circularStructureText(value, replacer) {
     }
     return out;
   }
-  function makeCompressionStream(Ctor, tag, run) {
+  /* The output buffer node's inflate fills: a decompressed body reaches a reader in 16384-byte
+     pieces, four of them for 65536 bytes, whatever the writes that fed the stream were. */
+  var Z_DEFAULT_CHUNK = 16384;
+
+  function chunkOf(bytes) {
+    return new Uint8Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  }
+
+  /*
+   * What node hands a reader when the bytes are not in the format the stream was built for: a
+   * TypeError that carries no message of its own, the zlib code on it, and the zlib error as its
+   * cause. It is also what node's own process dies of -- the same error, reported uncaught from
+   * its webstreams adapter once the caller's catch has run -- so it is thrown again on a later
+   * turn, which is what makes the exit code 1 come after 'after-catch' and not before it.
+   */
+  function codecFailure(error) {
+    var typeError = new TypeError('');
+    typeError.code = error && error.code !== undefined && error.code !== null ? error.code : 'Z_DATA_ERROR';
+    Object.defineProperty(typeError, 'cause', { value: error, writable: true, enumerable: false, configurable: true });
+    return typeError;
+  }
+
+  /* A readable and a writable of its own make, and not a TransformStream: a write to a
+     TransformStream here never settles, because its readable is not read until the writable
+     has closed, so a stream whose whole output is produced on close would hang the caller. */
+  function compressionStreamClass(Ctor, tag) {
     function Stream(format) {
       if (!(this instanceof Ctor)) throw new TypeError("Constructor " + tag + " requires 'new'");
-      codecOf(tag, format);
-      var held = [];
+      var zlib = codecOf(tag, format);
       var controller = null;
-      /* A readable and a writable of its own make, and not a TransformStream: a write to a
-         TransformStream here never settles, because its readable is not read until the writable
-         has closed, so a stream whose whole output is produced on close would hang the caller. */
+      var codec = null;
+      var dead = false;
+      function push(bytes) {
+        if (controller === null || bytes === null || bytes === undefined || bytes.length === 0) return;
+        controller.enqueue(chunkOf(bytes));
+      }
+      function open() {
+        if (codec !== null) return codec;
+        codec = format === 'gzip' ? zlib.createGzip() : format === 'deflate' ? zlib.createDeflate() : zlib.createDeflateRaw();
+        /* A zlib stream answers each write on its own, so the pieces it pushes are the pieces a
+           reader gets: the framing first, and the deflate of the bytes when the stream is closed. */
+        codec.on('data', push);
+        return codec;
+      }
+      function abandon() {
+        /* the readable is gone, so there is nothing left to compress into and nothing to close */
+        dead = true;
+        if (codec === null) return;
+        var held = codec;
+        codec = null;
+        try { held.destroy(); } catch (destroyError) {}
+      }
+      var readable = new ReadableStream({
+        start: function (c) { controller = c; },
+        cancel: function () { abandon(); }
+      });
+      var writable = new WritableStream({
+        write: function (chunk) { open().write(bytesOfChunk(chunk)); },
+        close: function () {
+          if (dead) return undefined;
+          var stream = open();
+          return new Promise(function (resolve) {
+            var settled = false;
+            function done() {
+              if (settled) return;
+              settled = true;
+              try { if (controller !== null) controller.close(); } catch (closeError) {}
+              resolve();
+            }
+            stream.on('end', done);
+            stream.on('error', function (err) {
+              if (controller !== null) controller.error(err);
+              done();
+            });
+            stream.end();
+          });
+        },
+        abort: function (reason) {
+          abandon();
+          controller.error(reason === undefined ? new TypeError('The stream was aborted') : reason);
+        }
+      });
+      Object.defineProperty(this, 'readable', { value: readable, configurable: true });
+      Object.defineProperty(this, 'writable', { value: writable, configurable: true });
+    }
+    Object.defineProperty(Stream.prototype, Symbol.toStringTag, { value: tag, configurable: true });
+    Object.defineProperty(Stream.prototype, 'constructor', { value: Ctor, writable: true, configurable: true });
+    return Stream;
+  }
+
+  function decompressionStreamClass(Ctor, tag) {
+    function Stream(format) {
+      if (!(this instanceof Ctor)) throw new TypeError("Constructor " + tag + " requires 'new'");
+      var zlib = codecOf(tag, format);
+      var controller = null;
+      var held = [];
       var readable = new ReadableStream({
         start: function (c) { controller = c; },
         cancel: function () { held = []; }
@@ -4138,9 +4232,25 @@ function circularStructureText(value, replacer) {
       var writable = new WritableStream({
         write: function (chunk) { held.push(bytesOfChunk(chunk)); },
         close: function () {
-          var out = run(format, joinBytes(held));
+          var input = joinBytes(held);
           held = [];
-          if (out.length > 0) controller.enqueue(new Uint8Array(out));
+          var out;
+          try {
+            out = format === 'gzip' ? zlib.gunzipSync(input)
+              : format === 'deflate' ? zlib.inflateSync(input) : zlib.inflateRawSync(input);
+          } catch (err) {
+            var failure = codecFailure(err);
+            if (controller !== null) controller.error(failure);
+            /* Node's process ends on the zlib error too, but only after the caller has caught the
+               one the read rejected with and gone on: the throw is what sets the exit code, and it
+               belongs to a later turn than the catch. */
+            setImmediateImpl(function () { throw failure; });
+            return;
+          }
+          if (controller === null) return;
+          for (var at = 0; at < out.length; at += Z_DEFAULT_CHUNK) {
+            controller.enqueue(chunkOf(out.subarray(at, Math.min(at + Z_DEFAULT_CHUNK, out.length))));
+          }
           controller.close();
         },
         abort: function (reason) {
@@ -4155,20 +4265,15 @@ function circularStructureText(value, replacer) {
     Object.defineProperty(Stream.prototype, 'constructor', { value: Ctor, writable: true, configurable: true });
     return Stream;
   }
+
   function CompressionStream(format) {
-    return makeCompressionStream(CompressionStream, 'CompressionStream', function (kind, bytes) {
-      var zlib = codecOf('CompressionStream', kind);
-      return kind === 'gzip' ? zlib.gzipSync(bytes) : kind === 'deflate' ? zlib.deflateSync(bytes) : zlib.deflateRawSync(bytes);
-    }).call(this, format) || this;
+    return compressionStreamClass(CompressionStream, 'CompressionStream').call(this, format) || this;
   }
-  CompressionStream.prototype = makeCompressionStream(CompressionStream, 'CompressionStream', function () { return new Uint8Array(0); }).prototype;
+  CompressionStream.prototype = compressionStreamClass(CompressionStream, 'CompressionStream').prototype;
   function DecompressionStream(format) {
-    return makeCompressionStream(DecompressionStream, 'DecompressionStream', function (kind, bytes) {
-      var zlib = codecOf('DecompressionStream', kind);
-      return kind === 'gzip' ? zlib.gunzipSync(bytes) : kind === 'deflate' ? zlib.inflateSync(bytes) : zlib.inflateRawSync(bytes);
-    }).call(this, format) || this;
+    return decompressionStreamClass(DecompressionStream, 'DecompressionStream').call(this, format) || this;
   }
-  DecompressionStream.prototype = makeCompressionStream(DecompressionStream, 'DecompressionStream', function () { return new Uint8Array(0); }).prototype;
+  DecompressionStream.prototype = decompressionStreamClass(DecompressionStream, 'DecompressionStream').prototype;
   globalThis.CompressionStream = CompressionStream;
   globalThis.DecompressionStream = DecompressionStream;
   /* Node 24 has URLPattern on the global object too, not only on 'node:url': the very class the

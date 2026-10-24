@@ -240,6 +240,33 @@ function streamOfBytes(readBytes, markUsed) {
   });
 }
 
+/*
+ * The body Node refuses to send unless init asks for it: a stream the caller owns -- a
+ * ReadableStream, an async iterable, or a Node stream -- only goes on the wire beside
+ * duplex 'half', which is the only value the option has. Sent without it, the stream is not refused
+ * at all and the bytes that reach the server are the String() of it, which is nothing like its body.
+ */
+var ASYNC_ITERATOR = typeof Symbol === 'function' && Symbol.asyncIterator !== undefined ? Symbol.asyncIterator : '@@asyncIterator';
+
+function streamedBody(value) {
+  if (value === null || value === undefined) return false;
+  if (typeof value.getReader === 'function') return true;
+  if (typeof value.pipe === 'function') return true;
+  return typeof value[ASYNC_ITERATOR] === 'function';
+}
+
+/* null when the body may be sent as it stands, and otherwise the TypeError Node raises for it. */
+function duplexRefusal(body, duplex) {
+  if (!streamedBody(body)) return null;
+  if (duplex === undefined || duplex === null) {
+    return new TypeError('RequestInit: duplex option is required when sending a body.');
+  }
+  if (String(duplex) !== 'half') {
+    return new TypeError('undefined: ' + String(duplex) + ' is not an accepted type. Expected one of half.');
+  }
+  return null;
+}
+
 function bodyBytes(body) {
   if (body === undefined || body === null) return Promise.resolve(null);
   /* bytes that are still being read, as a FormData holding a Blob reaches fetch: wait, then go on */
@@ -258,22 +285,107 @@ function bodyBytes(body) {
   return Promise.resolve({ payload: made.bytes, contentType: made.contentType });
 }
 
-function bodyOf(chunks) {
+function joinChunks(chunks) {
   var buffer = Buffer.concat(chunks);
+  return new Uint8Array(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength));
+}
+
+/* The body of a response that is still arriving. What a reader gets is one chunk per pull, of
+   everything the socket has buffered by then, which is what makes a server writing five pieces
+   60 ms apart five chunks and not one -- and what leaves an abort during the body something to
+   abort, where a body that was already complete when the head arrived has nothing left to break. */
+function responseBody(res) {
+  var buffered = [];
+  var all = [];
+  var ended = false;
+  var stopped = false;
+  var failure = null;
+  var wake = null;
+  var controller = null;
+  var complete = null;
+  var finished = new Promise(function (resolve) { complete = resolve; });
+  /* A turn later, and not inside the event that woke the reader: two pieces that land together --
+     a write and the end that follows it in the same tick -- are one chunk to the caller, because
+     that is one read of the socket on the way in. Sixty milliseconds apart they are still two. */
+  var defer = typeof globalThis.setImmediate === 'function'
+    ? globalThis.setImmediate
+    : function (fn) { return setTimeout(fn, 0); };
+  var queued = false;
+  function notify() {
+    if (wake === null || queued) return;
+    queued = true;
+    defer(function () {
+      queued = false;
+      if (wake === null) return;
+      if (wake()) wake = null;
+    });
+  }
+  res.on('data', function (chunk) {
+    var bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    buffered.push(bytes);
+    all.push(bytes);
+    notify();
+  });
+  res.on('end', function () { ended = true; complete(); notify(); });
+  res.on('error', function (err) { failure = err; complete(); notify(); });
+  var stream = new globalThis.ReadableStream({
+    /* a byte stream, as undici makes one: a body is bytes, so a caller can take a BYOB reader to it */
+    type: 'bytes',
+    start: function (c) { controller = c; },
+    pull: function (c) {
+      /* Everything the socket has buffered at the moment the caller asks for it, as one chunk: a
+         server writing five pieces 60 ms apart is five chunks here, and two pieces that land
+         together are one, which is the split node's own fetch hands its reader. */
+      function attempt() {
+        if (stopped) return true;
+        if (buffered.length > 0) {
+          var batch = buffered;
+          buffered = [];
+          c.enqueue(joinChunks(batch));
+          return true;
+        }
+        if (failure !== null) { stopped = true; c.error(failure); return true; }
+        if (ended) { stopped = true; c.close(); return true; }
+        return false;
+      }
+      if (attempt()) return undefined;
+      return new Promise(function (resolve) {
+        wake = function () {
+          if (!attempt()) return false;
+          resolve();
+          return true;
+        };
+      });
+    },
+    cancel: function () { stopped = true; ended = true; all = []; complete(); notify(); }
+  });
   return {
-    /* The bytes themselves, so a caller that wants them never decodes and re-encodes the body. */
-    buffer: buffer,
-    text: function () { return Promise.resolve(buffer.toString('utf8')); },
-    json: function () { return Promise.resolve(JSON.parse(buffer.toString('utf8'))); },
-    bytes: function () { return Promise.resolve(new Uint8Array(buffer)); },
-    arrayBuffer: function () { return Promise.resolve(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)); },
-    dump: function () { return Promise.resolve(); }
+    stream: stream,
+    /* the whole body, for a caller that wants it in one piece -- a dispatcher, which never reads
+       the stream -- and only ever after the last byte has landed */
+    text: function () {
+      return finished.then(function () { return Buffer.concat(all).toString('utf8'); });
+    },
+    /* An abort that lands after the head: it is the body that breaks, with the signal's own reason,
+       and not the promise the head already settled. */
+    abort: function (reason) {
+      if (stopped || ended) return;
+      failure = reason;
+      if (controller !== null) {
+        try { controller.error(reason); } catch (errorError) {}
+      }
+      stopped = true;
+      ended = true;
+      complete();
+      notify();
+    }
   };
 }
 
-/* request(url, options) -> { statusCode, headers, body }, as undici's request resolves. An
-   options.signal aborts it: the socket is destroyed and the promise rejects with the signal's own
-   reason, the way Node rejects an aborted fetch. */
+/* request(url, options) -> { statusCode, headers, body }, as undici's request resolves: with the
+   head, and not with the last byte of the body, so a caller reads a body while it is still arriving.
+   An options.signal aborts it -- before the head the promise rejects with the signal's own reason,
+   the way Node rejects an aborted fetch, and after it the body is what the reason breaks. */
 function request(target, options) {
   return bodyBytes(options && options.body !== undefined ? options.body : null).then(function (prepared) {
     return new Promise(function (resolve, reject) {
@@ -283,19 +395,20 @@ function request(target, options) {
         opts.headers = headersToObject(opts.headers);
         opts.headers['content-type'] = prepared.contentType;
       }
+      var settled = false;
+      var body = null;
       var req = mod.request(target, opts, function (res) {
-        var chunks = [];
-        res.on('data', function (chunk) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); });
-        res.on('end', function () {
-          resolve({ statusCode: res.statusCode, statusText: res.statusMessage, headers: res.headers, body: bodyOf(chunks) });
-        });
-        res.on('error', reject);
+        body = responseBody(res);
+        settled = true;
+        resolve({ statusCode: res.statusCode, statusText: res.statusMessage, headers: res.headers, body: body });
       });
       req.on('error', reject);
       var signal = options && options.signal;
       if (signal && typeof signal.addEventListener === 'function') {
         var onAbort = function () {
-          reject(signal.reason !== undefined ? signal.reason : new Error('This operation was aborted'));
+          var reason = signal.reason !== undefined ? signal.reason : new Error('This operation was aborted');
+          if (settled) { if (body !== null) body.abort(reason); }
+          else reject(reason);
           try { req.destroy(); } catch (destroyError) {}
         };
         if (signal.aborted) { onAbort(); return; }
@@ -617,6 +730,16 @@ function unusableBody() {
   return new TypeError('Body is unusable: Body has already been read');
 }
 
+/* Whether a body has been disturbed. A stream the caller owns is one it reads through, so a body
+   that is a stream a reader is already locked to counts as read -- which is what Node answers when
+   a text() follows a body.getReader(), and not the error a second reader on the stream would give. */
+function disturbed(body) {
+  var slots = bodySlots(body);
+  if (slots.used) return true;
+  var stream = slots.stream;
+  return stream !== null && stream !== undefined && stream.locked === true;
+}
+
 /* The bytes a body holds, whichever of the three kinds it is: what is in hand is returned as it is,
    what has to be read is read once and kept, and a body the caller owns is drained. */
 function bodyBuffer(body) {
@@ -768,7 +891,7 @@ Object.defineProperty(Response.prototype, 'body', {
   enumerable: true, configurable: true
 });
 Object.defineProperty(Response.prototype, 'bodyUsed', {
-  get: function () { return bodySlots(this).used; },
+  get: function () { return disturbed(this); },
   enumerable: true, configurable: true
 });
 
@@ -877,7 +1000,7 @@ function bodyFormData(body) {
     return Promise.reject(new TypeError('Content-Type was not one of "multipart/form-data" or "application/x-www-form-urlencoded".'));
   }
   var slots = bodySlots(body);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   var made = new globalThis.FormData();
   return bodyBuffer(body).then(function (bytes) {
@@ -957,14 +1080,14 @@ Response.prototype.clone = function () {
 
 Response.prototype.blob = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   var type = blobTypeOf(this.headers);
   return bodyBuffer(this).then(function (bytes) { return new globalThis.Blob([bytes], { type: type }); });
 };
 Response.prototype.arrayBuffer = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   return bodyBuffer(this).then(function (buffer) {
     return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
@@ -972,13 +1095,13 @@ Response.prototype.arrayBuffer = function () {
 };
 Response.prototype.text = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
 };
 Response.prototype.json = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
 };
@@ -987,7 +1110,7 @@ Response.prototype.formData = function () {
 };
 Response.prototype.bytes = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
 };
@@ -1146,6 +1269,7 @@ function Request(target, options) {
      therefore starts out with: only what init names is taken from init, so 'redirect' survives
      into a copy that says nothing about it. */
   var inherited = null;
+  var carried = false;
   if (target instanceof Request) {
     var given = bodySlots(target);
     if (given.used) {
@@ -1155,9 +1279,9 @@ function Request(target, options) {
     rawMethod = target.method;
     headersInit = target.headers;
     inherited = requestState(target);
-    if (given.bytes !== null && given.bytes !== undefined) bodyIn = given.bytes;
-    else if (given.stream !== null && given.stream !== undefined) bodyIn = given.stream;
-    else if (given.pending !== null && given.pending !== undefined) bodyIn = given.pending;
+    if (given.bytes !== null && given.bytes !== undefined) { bodyIn = given.bytes; carried = true; }
+    else if (given.stream !== null && given.stream !== undefined) { bodyIn = given.stream; carried = true; }
+    else if (given.pending !== null && given.pending !== undefined) { bodyIn = given.pending; carried = true; }
   } else {
     url = target === undefined || target === null ? '' : (target.href !== undefined ? String(target.href) : String(target));
   }
@@ -1172,6 +1296,11 @@ function Request(target, options) {
   var made = makeBody(bodyIn);
   if (made.has && (method === 'GET' || method === 'HEAD')) {
     throw new TypeError('Request with GET/HEAD method cannot have body.');
+  }
+  /* a stream a Request already carries came past the duplex check once, when that Request was built */
+  if (!carried) {
+    var refusal = duplexRefusal(bodyIn, options.duplex);
+    if (refusal !== null) throw refusal;
   }
   var state = requestState(this);
   state.url = parsed.href;
@@ -1231,7 +1360,7 @@ Object.defineProperty(Request.prototype, 'body', {
   enumerable: true, configurable: true
 });
 Object.defineProperty(Request.prototype, 'bodyUsed', {
-  get: function () { return bodySlots(this).used; },
+  get: function () { return disturbed(this); },
   enumerable: true, configurable: true
 });
 Object.defineProperty(Request.prototype, 'duplex', { get: function () { return 'half'; }, enumerable: true, configurable: true });
@@ -1282,14 +1411,14 @@ Request.prototype.clone = function () {
 };
 Request.prototype.blob = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   var type = blobTypeOf(this.headers);
   return bodyBuffer(this).then(function (bytes) { return new globalThis.Blob([bytes], { type: type }); });
 };
 Request.prototype.arrayBuffer = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   return bodyBuffer(this).then(function (buffer) {
     return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
@@ -1297,13 +1426,13 @@ Request.prototype.arrayBuffer = function () {
 };
 Request.prototype.text = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   return bodyBuffer(this).then(function (buffer) { return buffer.toString('utf8'); });
 };
 Request.prototype.json = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   return bodyBuffer(this).then(function (buffer) { return JSON.parse(buffer.toString('utf8')); });
 };
@@ -1312,7 +1441,7 @@ Request.prototype.formData = function () {
 };
 Request.prototype.bytes = function () {
   var slots = bodySlots(this);
-  if (slots.used) return Promise.reject(unusableBody());
+  if (slots.used || disturbed(this)) return Promise.reject(unusableBody());
   slots.used = true;
   return bodyBuffer(this).then(function (buffer) { return new Uint8Array(buffer); });
 };
@@ -1402,6 +1531,11 @@ function fetch(target, options) {
         ? held.stream
         : (held.pending !== null && held.pending !== undefined ? held.pending : null));
     init = { method: target.method, headers: target.headers, body: carried, redirect: target.redirect };
+    /* the body a Request already carries was accepted once, when that Request was built: it is not
+       asked about the duplex option again unless this call names a body of its own */
+    if (options === undefined || options === null || options.body === undefined || options.body === null) {
+      init.duplex = 'half';
+    }
     for (var key in options) init[key] = options[key];
     held.used = true;
     target = target.url;
@@ -1425,6 +1559,9 @@ function fetch(target, options) {
   if (init.body !== undefined && init.body !== null && (method === 'GET' || method === 'HEAD')) {
     return Promise.reject(notTransport(new TypeError('Request with GET/HEAD method cannot have body.')));
   }
+  /* the same refusal a Request makes, in the same order: a stream body is not sent without duplex */
+  var refusal = duplexRefusal(init.body, init.duplex);
+  if (refusal !== null) return Promise.reject(notTransport(refusal));
   if (parsed.protocol === 'data:') return Promise.resolve(dataResponse(url));
   /* a scheme the container has no client for is a failed fetch, not a parse error */
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return Promise.reject(new Error('unknown scheme'));
@@ -1442,8 +1579,9 @@ function fetch(target, options) {
   /* The response a hop hands back, with the three fields a redirect decides: the url it was
      answered from, whether a hop was taken to get there, and whether one of them left the origin. */
   function answer(res, at, hops, tainted) {
-    /* a status that carries no body gets none, so a 204 is not built with an empty one */
-    var payload = (res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304) ? null : res.body.buffer;
+    /* a status that carries no body gets none, so a 204 is not built with an empty one; the rest
+       are built from the stream the body is still arriving on, and not from bytes in hand */
+    var payload = (res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304) ? null : res.body.stream;
     var response = new Response(payload, { status: res.statusCode, statusText: res.statusText, headers: res.headers, url: at });
     var state = RESPONSE_STATE.get(response);
     state.redirected = hops > 0;
