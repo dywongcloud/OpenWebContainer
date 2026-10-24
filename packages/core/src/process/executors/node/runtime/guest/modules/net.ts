@@ -244,6 +244,57 @@ function netBufferSize(socket, size, syscall) {
   if (size > 2147483647) throw netBufferError(syscall, 'EINVAL', -22);
 }
 
+/**
+ * The two errors host Node 24.15 raises for a dgram option this socket cannot carry. One that is
+ * no longer running has had its handle nulled, so Node dereferences it and V8 throws its own
+ * TypeError -- "Cannot read properties of null (reading 'setTTL')" -- where one that is merely
+ * unbound reaches libuv and comes back with the errno the kernel answered with.
+ */
+function netDgramGone(name) {
+  return new TypeError("Cannot read properties of null (reading '" + name + "')");
+}
+
+/** uv's own answer for an option it refused: a SystemError naming the call and its errno. */
+function netDgramUvError(name, code, errno) {
+  var err = netError(Error, code, name + ' ' + code);
+  err.errno = errno;
+  err.syscall = name;
+  return err;
+}
+
+/** An argument Node reads with validateNumber / validateString: anything else is refused by type. */
+function netDgramArg(value, name, want) {
+  if (typeof value !== want) {
+    throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+      'The "' + name + '" argument must be of type ' + want + '. Received ' + netDescribe(value));
+  }
+}
+
+/** A whole byte as libuv truncates what it was handed: 255.5 is 255, 0.5 is 0, and NaN stays NaN. */
+function netDgramByte(value) {
+  return value >= 0 ? Math.floor(value) : Math.ceil(value);
+}
+
+/**
+ * The fault host Node 24.15 reports for a multicast address a socket cannot join, or null for one
+ * it can: a text no family can hold, and one of the family this socket is not, are each EINVAL
+ * (-22), as is an address outside the block the family keeps for multicast -- 224.0.0.0/4 for
+ * IPv4 and ff00::/8 for IPv6. The IPv6 block is checked only where the host checks it: leaving a
+ * group refuses an address outside it, where joining one reaches the kernel and answers for it.
+ */
+function netDgramMulticastFault(text, want6, checkV6) {
+  var family = typeof text === 'string' ? netIsIP(text) : 0;
+  if (family === 0 || (family === 6) !== want6) return 'EINVAL';
+  if (family === 4) {
+    var first = Number(text.split('.')[0]);
+    if (!(first >= 224 && first <= 239)) return 'EINVAL';
+  } else if (checkV6) {
+    /* ff00::/8 is the prefix, so the first group alone says it: ff02::1 is one and ::1 is not. */
+    if (!/^ff[0-9a-fA-F]{0,2}/.test(text)) return 'EINVAL';
+  }
+  return null;
+}
+
 /** Address shown for a listener: no host means the IPv6 wildcard, as Node does on a dual-stack host. */
 function netListenDisplay(host) {
   if (host === undefined || host === null || host === '' || host === '::') return '::';
@@ -1251,7 +1302,10 @@ BF['net'] = function () {
     }
 
     address() {
-      if (this._hubId === undefined || this._hubClosed) return {};
+      /* A socket still dialling answers with nothing at all, as a host's does: the name of the
+         connection is the kernel's to give, and it has not made one yet -- so address() is the
+         empty object until 'connect', even though this socket already knows the port it took. */
+      if (this.connecting || this._hubId === undefined || this._hubClosed) return {};
       return { address: this.localAddress, family: this.localFamily, port: this.localPort };
     }
 
@@ -1554,6 +1608,15 @@ BF['net'] = function () {
         options = undefined;
       }
       var opts = options || {};
+      /* The options Node reads off a Server and keeps on it, so a caller can read them back:
+         they are the socket settings its accepted connections are created with, and this runtime
+         carries them as the plain fields host Node 24.15 answers them with. */
+      this.allowHalfOpen = !!opts.allowHalfOpen;
+      this.pauseOnConnect = !!opts.pauseOnConnect;
+      this.noDelay = !!opts.noDelay;
+      this.keepAlive = !!opts.keepAlive;
+      this.keepAliveInitialDelay = 0;
+      this.highWaterMark = NET_CHUNK;
       this._serverOpts = { allowHalfOpen: !!opts.allowHalfOpen, pauseOnConnect: !!opts.pauseOnConnect };
       this._listening = false;
       this._address = null;
@@ -2297,10 +2360,14 @@ BF['net'] = function () {
 BF['dgram'] = function () {
   var EventEmitter = netEmitterBase();
 
-  class DgramSocket extends EventEmitter {
+  /* Named Socket, as Node's is: dgram.Socket.name is 'Socket' on host Node 24.15, and the class
+     is the one dgram.Socket hands out. */
+  class Socket extends EventEmitter {
     constructor(type) {
       super();
-      this._type = type;
+      /* 'udp4' or 'udp6', as an own field of the socket and not a getter on the prototype: that
+         is where host Node 24.15 keeps it, so it is what an instance enumerates. */
+      this.type = type;
       this._family = type === 'udp6' ? 'IPv6' : 'IPv4';
       this._hubId = undefined;
       this._targetId = undefined;
@@ -2313,15 +2380,24 @@ BF['dgram'] = function () {
       this._remote = null;
       this._recvBufferSize = undefined;
       this._sendBufferSize = undefined;
+      /* The groups this socket has joined, and the source-specific ones: a group joined without a
+         source is what makes a later source-specific join of it EINVAL, as a host's kernel
+         answers it, so the membership is kept to answer that. */
+      this._joined = [];
+      /* Kept out of what an instance enumerates, as a host's own state is: host Node 24.15 holds
+         a dgram socket's in a native handle, so Object.keys of one is its own type and nothing
+         else. This socket reads them by name, so hiding them changes nothing else. */
+      var hidden = ['_family', '_hubId', '_targetId', '_bound', '_binding', '_dead', '_address',
+        '_refed', '_holding', '_remote', '_recvBufferSize', '_sendBufferSize', '_joined'];
+      for (var h = 0; h < hidden.length; h++) {
+        Object.defineProperty(this, hidden[h], {
+          value: this[hidden[h]], writable: true, enumerable: false, configurable: true
+        });
+      }
     }
 
     _holdable() {
       return (this._bound || this._binding) && !this._dead;
-    }
-
-    /** 'udp4' or 'udp6', as Node names the kind of socket this is. */
-    get type() {
-      return this._type;
     }
 
     _onHub(name, payload, bytes) {
@@ -2531,21 +2607,62 @@ BF['dgram'] = function () {
       return this;
     }
 
-    setBroadcast() {}
+    /* Every TTL, broadcast and multicast option is a kernel setting this virtual network has no
+       kernel for. What is carried is the answer host Node 24.15 gives for it, which is where the
+       surface is observable: the argument each call refuses, the errno it refuses it with, the
+       value it hands back, and the three states a socket may be in -- closed, unbound, bound. */
+    setBroadcast() {
+      if (this._dead) throw netDgramGone('setBroadcast');
+      if (!this._bound && !this._binding) throw netDgramUvError('setBroadcast', 'EBADF', -9);
+    }
 
+    /* A second-to-live count of 1..255: uv truncates what it is handed, so 255.5 is 255 and 0.5
+       is the 0 a datagram may not be forwarded with, which the kernel refuses (EINVAL, -22). */
     setTTL(ttl) {
+      netDgramArg(ttl, 'ttl', 'number');
+      if (this._dead) throw netDgramGone('setTTL');
+      var whole = netDgramByte(ttl);
+      if (!(whole >= 1 && whole <= 255)) throw netDgramUvError('setTTL', 'EINVAL', -22);
+      if (!this._bound && !this._binding) throw netDgramUvError('setTTL', 'EBADF', -9);
       return ttl;
     }
 
+    /* The hop count of a multicast datagram, 0..255: 0 keeps it on this host, which the kernel
+       accepts, where a TTL of 0 is one it does not. */
     setMulticastTTL(ttl) {
+      netDgramArg(ttl, 'ttl', 'number');
+      if (this._dead) throw netDgramGone('setMulticastTTL');
+      var hops = netDgramByte(ttl);
+      if (!(hops >= 0 && hops <= 255)) throw netDgramUvError('setMulticastTTL', 'EINVAL', -22);
+      if (!this._bound && !this._binding) throw netDgramUvError('setMulticastTTL', 'EBADF', -9);
       return ttl;
     }
 
+    /* Whether a datagram this socket sends is looped back to it: answered with the flag itself,
+       whatever it was, as host Node 24.15 answers it. */
     setMulticastLoopback(flag) {
+      if (this._dead) throw netDgramGone('setMulticastLoopback');
+      if (!this._bound && !this._binding) throw netDgramUvError('setMulticastLoopback', 'EBADF', -9);
       return flag;
     }
 
-    setMulticastInterface() {}
+    /* The interface multicast goes out on: an address of this socket's own family, and on this
+       platform not an IPv6 one -- the loopback is the only address this container has and no
+       IPv6 interface carries multicast, which is the EINVAL (-22) host Node 24.15 reports for
+       '::1' on a udp6 socket. */
+    setMulticastInterface(interfaceAddress) {
+      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
+      netDgramArg(interfaceAddress, 'interfaceAddress', 'string');
+      var want6 = this._family === 'IPv6';
+      var family = netIsIP(interfaceAddress);
+      /* A text no family can hold is refused before the socket is asked for its handle, so an
+         unbound socket reports the descriptor it does not have (EBADF) rather than the address
+         it cannot use (EINVAL) -- host Node 24.15 answers EBADF for '::1' on an unbound udp4
+         socket and EINVAL for the same address on a bound one. */
+      if (family === 0) throw netDgramUvError('setMulticastInterface', 'EINVAL', -22);
+      if (!this._bound && !this._binding) throw netDgramUvError('setMulticastInterface', 'EBADF', -9);
+      if (want6 || (family === 6) !== want6) throw netDgramUvError('setMulticastInterface', 'EINVAL', -22);
+    }
 
     /* Buffer sizes are a kernel setting this runtime has no kernel for: accepted and checked, then
        remembered for the getter, which answers with this platform's own default until one is set. A
@@ -2573,15 +2690,91 @@ BF['dgram'] = function () {
       return this._sendBufferSize === undefined ? DGRAM_SEND_BUFFER_SIZE : this._sendBufferSize;
     }
 
-    addMembership() {}
+    /* Joining a group binds the socket if it was not bound yet, as Node's does, and keeps the
+       group: a group it is already in is what makes a source-specific join of it EINVAL. An IPv6
+       group reaches the kernel and comes back EADDRNOTAVAIL (-49) -- no interface of this host
+       carries IPv6 multicast, so there is nothing to join it on. */
+    addMembership(multicastAddress, multicastInterface) {
+      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
+      if (multicastAddress === undefined) {
+        throw netError(TypeError, 'ERR_MISSING_ARGS', 'The "multicastAddress" argument must be specified');
+      }
+      var want6 = this._family === 'IPv6';
+      var fault = netDgramMulticastFault(multicastAddress, want6, false);
+      if (fault !== null) throw netDgramUvError('addMembership', fault, -22);
+      if (multicastInterface !== undefined) {
+        var ifFamily = typeof multicastInterface === 'string' ? netIsIP(multicastInterface) : 0;
+        if (ifFamily === 0 || (ifFamily === 6) !== want6) throw netDgramUvError('addMembership', 'EINVAL', -22);
+      }
+      if (!this._bound && !this._binding) this.bind(0);
+      if (want6) throw netDgramUvError('addMembership', 'EADDRNOTAVAIL', -49);
+      if (this._joined.indexOf(multicastAddress) === -1) this._joined.push(multicastAddress);
+    }
 
-    dropMembership() {}
+    /* Leaving a group: one that is not a multicast address at all is the kernel's EINVAL, whether
+       or not this socket ever joined it, and an IPv6 one is the EADDRNOTAVAIL of a group no
+       interface of this host could have joined. */
+    dropMembership(multicastAddress) {
+      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
+      if (multicastAddress === undefined) {
+        throw netError(TypeError, 'ERR_MISSING_ARGS', 'The "multicastAddress" argument must be specified');
+      }
+      var want6 = this._family === 'IPv6';
+      var fault = netDgramMulticastFault(multicastAddress, want6, true);
+      if (fault !== null) throw netDgramUvError('dropMembership', fault, -22);
+      if (want6) throw netDgramUvError('dropMembership', 'EADDRNOTAVAIL', -49);
+      var at = this._joined.indexOf(multicastAddress);
+      if (at !== -1) this._joined.splice(at, 1);
+    }
 
-    /* Source-specific multicast, the two calls of the multicast surface that were missing: host
-       Node 24.15 has them as functions on every dgram socket. */
-    addSourceSpecificMembership() {}
+    /* A source-specific join names the source a group is joined for, so both are read as strings
+       before either is looked at; a group this socket is already in without a source is EINVAL. */
+    addSourceSpecificMembership(sourceAddress, groupAddress) {
+      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
+      netDgramArg(sourceAddress, 'sourceAddress', 'string');
+      netDgramArg(groupAddress, 'groupAddress', 'string');
+      var want6 = this._family === 'IPv6';
+      var fault = netDgramMulticastFault(groupAddress, want6, true);
+      if (fault !== null) throw netDgramUvError('addSourceSpecificMembership', fault, -22);
+      var sourceFamily = netIsIP(sourceAddress);
+      if (sourceFamily === 0 || (sourceFamily === 6) !== want6) {
+        throw netDgramUvError('addSourceSpecificMembership', 'EINVAL', -22);
+      }
+      if (want6) throw netDgramUvError('addSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
+      if (this._joined.indexOf(groupAddress) !== -1) {
+        throw netDgramUvError('addSourceSpecificMembership', 'EINVAL', -22);
+      }
+    }
 
-    dropSourceSpecificMembership() {}
+    /* Leaving one: a group this socket never joined that way is the kernel's EADDRNOTAVAIL. */
+    dropSourceSpecificMembership(sourceAddress, groupAddress) {
+      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
+      netDgramArg(sourceAddress, 'sourceAddress', 'string');
+      netDgramArg(groupAddress, 'groupAddress', 'string');
+      var want6 = this._family === 'IPv6';
+      var fault = netDgramMulticastFault(groupAddress, want6, true);
+      if (fault !== null) throw netDgramUvError('dropSourceSpecificMembership', fault, -22);
+      var sourceFamily = netIsIP(sourceAddress);
+      if (sourceFamily === 0 || (sourceFamily === 6) !== want6) {
+        throw netDgramUvError('dropSourceSpecificMembership', 'EINVAL', -22);
+      }
+      /* Leaving a group this socket is not a source-specific member of is the kernel's
+         EADDRNOTAVAIL (-49) on a host, whatever the join before it answered: this platform
+         answers the join and the leave out of two different tables. */
+      throw netDgramUvError('dropSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
+    }
+
+    /* Nothing is ever queued: a datagram this socket hands the hub is delivered on the next
+       macrotask, so both counts are 0, as a host's are for a socket that is not writing. */
+    getSendQueueCount() {
+      if (this._dead) throw netDgramGone('getSendQueueCount');
+      return 0;
+    }
+
+    getSendQueueSize() {
+      if (this._dead) throw netDgramGone('getSendQueueSize');
+      return 0;
+    }
   }
 
   function dgramCreateSocket(type, listener) {
@@ -2589,7 +2782,7 @@ BF['dgram'] = function () {
     if (kind !== 'udp4' && kind !== 'udp6') {
       throw netError(TypeError, 'ERR_SOCKET_BAD_TYPE', 'Bad socket type specified. Valid types are: udp4, udp6');
     }
-    var socket = new DgramSocket(kind);
+    var socket = new Socket(kind);
     /* The two sizes a socket can be opened with: Node passes them to the same setters, so a socket
        created with them reports them from the moment it is bound. */
     if (type !== null && typeof type === 'object') {
@@ -2604,7 +2797,7 @@ BF['dgram'] = function () {
     return socket;
   }
 
-  return { createSocket: dgramCreateSocket, Socket: DgramSocket };
+  return { createSocket: dgramCreateSocket, Socket: Socket };
 };
 })();
 `;
