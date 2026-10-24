@@ -18,6 +18,7 @@ import {
 import { dependencyTree, parseListArgs } from '../../../npm/tree';
 import { Process, ProcessType } from '../../base';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../node/runtime/resolver';
+import { ROOT_POST_INSTALL_SCRIPT_EVENTS, ROOT_PRE_INSTALL_SCRIPT_EVENTS } from '../../../npm/lifecycle';
 
 const USAGE = [
     'Usage: npm <command>',
@@ -125,11 +126,25 @@ export class NpmProcess extends Process {
             else specs.push(parseInstallSpec(arg));
         }
 
+        const projectDir = this.cwd ?? '/';
+        const packageDir = findPackageRoot(this.fileSystem, projectDir) ?? normalizeAbsolute(projectDir);
         const installer = new NpmInstaller(this.fileSystem, registry, log, (args, cwd, env) => this.runLifecycleScript(args, cwd, env));
         const started = performance.now();
+        /* npm runs the root's own scripts on `npm install` with no arguments and not on
+           `npm install <pkg>`, which changes a dependency rather than the root: preinstall before
+           the tree is placed, then install, postinstall and prepare once it is. */
+        const rootScripts = specs.length === 0;
+        if (rootScripts) {
+            const failed = await this.runRootScripts(packageDir, ROOT_PRE_INSTALL_SCRIPT_EVENTS);
+            if (failed !== undefined) return failed;
+        }
         const report = specs.length > 0
-            ? await installer.addPackages(this.cwd ?? '/', specs, save)
-            : await installer.installManifest(this.cwd ?? '/');
+            ? await installer.addPackages(projectDir, specs, save)
+            : await installer.installManifest(projectDir);
+        if (rootScripts) {
+            const failed = await this.runRootScripts(packageDir, ROOT_POST_INSTALL_SCRIPT_EVENTS);
+            if (failed !== undefined) return failed;
+        }
         const duration = elapsedDuration(performance.now() - started);
         /* npm's summary lines start on a line of their own, whichever one it is. */
         if (report.added.length === 0) {
@@ -185,6 +200,36 @@ export class NpmProcess extends Process {
             return exitCode;
         }
         return 0;
+    }
+
+    /**
+     * The root's own lifecycle scripts, as `npm run` runs them: the header npm prints above each one,
+     * then the script through the shell in the package directory with the tree's bins in front of
+     * PATH. The status of the script that fails is the status npm exits with, and the scripts after
+     * it do not run. Nothing is returned when every script that is there succeeded.
+     */
+    private async runRootScripts(packageDir: string, events: readonly string[]): Promise<number | undefined> {
+        const manifest = readManifest(this.fileSystem, packageDir);
+        if (manifest === undefined) return undefined;
+        const scripts = (manifest.scripts ?? {}) as Record<string, unknown>;
+        const label = scriptLabel(manifest, packageDir);
+        const PATH = scriptPath(this.fileSystem, packageDir, Object.fromEntries(this.env).PATH);
+        for (const event of events) {
+            const command = scripts[event];
+            if (typeof command !== 'string') continue;
+            this.emitOutput(scriptHeader(label, event, command));
+            const result = await this.spawnChild('sh', ['-c', command], {
+                ...Object.fromEntries(this.env),
+                PATH,
+                npm_package_name: String(manifest.name ?? ''),
+                npm_package_version: String(manifest.version ?? ''),
+                npm_package_json: joinPaths(packageDir, 'package.json'),
+                npm_lifecycle_event: event
+            }, packageDir);
+            const exitCode = result.exitCode ?? 1;
+            if (exitCode !== 0) return exitCode;
+        }
+        return undefined;
     }
 
     /** `npm ls`: the installed tree of the package here, as `npm ls` draws it. */
