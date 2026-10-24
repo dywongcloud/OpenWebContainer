@@ -5213,10 +5213,48 @@ BF.module = function () {
        row owc-module-globalpaths-empty. */
     return paths;
   };
-  /* The package.json of the package a specifier names, as a path: the specifier is resolved as a
-     module and the walk goes up from what it found to the nearest package.json carrying that name,
-     the way node's own reader goes from a resolved package to its manifest. */
-  Module.findPackageJSON = function findPackageJSON(specifier, base = undefined) {
+  /* The name a bare specifier asks a package by: everything before the first '/' for an ordinary
+     name and everything before the second for a scoped one, which is what makes '@a/b/c' a request
+     for '@a/b'. A name with no '/' in it at all is asked for whole. */
+  function findPackageNameOf(name) {
+    var first = name.indexOf('/');
+    if (name.charAt(0) !== '@') {
+      return { name: first < 0 ? name : name.slice(0, first), scoped: false };
+    }
+    var second = first < 0 ? -1 : name.indexOf('/', first + 1);
+    return { name: second < 0 ? name : name.slice(0, second), scoped: true };
+  }
+  /* The package.json at or above a path, as node's own reader finds it: the search starts at the
+     directory a trailing slash names and at the parent of the one that does not, and a path with no
+     package.json at or above it answers itself -- which is why a directory with none above comes
+     back as that directory, trailing slash and all, and not as undefined. */
+  function nearestPackageJSONOf(checkPath) {
+    var start;
+    if (checkPath === '/' || checkPath === '') start = '/';
+    else if (checkPath.charAt(checkPath.length - 1) === '/') start = checkPath.slice(0, -1);
+    else start = dirnameOf(checkPath);
+    var at = start === '' ? '/' : start;
+    while (true) {
+      var candidate = (at === '/' ? '' : at) + '/package.json';
+      if (host.readText(candidate) !== null) return candidate;
+      if (at === '/') break;
+      var up = dirnameOf(at);
+      if (up === at) break;
+      at = up;
+    }
+    return checkPath;
+  }
+  /* The package.json of the package a specifier names, as a path.
+     Node resolves from a *parent URL* and not from a directory, and the difference is the whole of
+     this function: a base that is a file path names that file, so a bare specifier is looked for
+     under the directory holding it and not under the base itself -- 'express' from '/a/case' is
+     '/a/node_modules/express' and not '/a/case/node_modules/express' -- and the default base is
+     'data:', a URL no relative specifier parses against, which is why no base at all is a failure
+     to resolve and not a package that cannot be found. row owc-module-findpackagejson-nonurl-base.
+     A bare name is not resolved as a module either: the node_modules folders are walked and the
+     package.json of the first directory that is there is the answer, whatever that manifest's
+     "exports" map says, which is why 'express/nope' answers express's own package.json on a host. */
+  Module.findPackageJSON = function findPackageJSON(specifier, base = 'data:') {
     if (arguments.length === 0) {
       var missing = new TypeError('The "specifier" argument must be specified');
       missing.code = 'ERR_MISSING_ARGS';
@@ -5234,66 +5272,98 @@ BF.module = function () {
       notString.code = 'ERR_INVALID_ARG_TYPE';
       throw notString;
     }
-    /* Node's own default base is 'data:', a URL no file path parses against, so with no base at
-       all a bare name is an invalid URL there rather than a package it cannot find; a base that is
-       neither a URL nor an absolute path fails the same way, and one that is not a string at all
-       is refused as an argument first. */
-    var from;
-    if (base === undefined) {
-      from = null;
+    var urlFor = requireBuiltin('url');
+    var URLForBase = urlFor.URL;
+    /* The base node resolves from: a URL as it was handed over, an absolute path as the file URL it
+       names -- trailing slash kept, which is the only thing that says a path is a directory -- and
+       anything else parsed as a URL with nothing to parse it against, which is what refuses it. */
+    var parentURL;
+    if (URLForBase.canParse(base)) {
+      parentURL = base;
     } else if (typeof base !== 'string') {
       var badBase = new TypeError('The "base" argument must be of type string. Received ' + receivedTypeOf(base));
       badBase.code = 'ERR_INVALID_ARG_TYPE';
       throw badBase;
-    } else if (base.indexOf('file://') === 0) {
-      from = base.slice(7);
     } else if (base.charAt(0) === '/') {
-      from = base;
+      parentURL = urlFor.pathToFileURL(base).href;
     } else {
       var badURL = new TypeError('Invalid URL');
       badURL.code = 'ERR_INVALID_URL';
       throw badURL;
     }
-    /* A specifier carrying a scheme is not a bare name, and node's resolver refuses every scheme
-       but file before it looks anywhere. */
-    var scheme = /^[A-Za-z][A-Za-z0-9+\-.]*:/.exec(name);
-    if (scheme && scheme[0].toLowerCase() !== 'file:') {
-      var badScheme = new TypeError('The URL must be of scheme file');
-      badScheme.code = 'ERR_INVALID_URL_SCHEME';
-      throw badScheme;
-    }
-    if (from === null) {
-      var noBase = new TypeError('Invalid URL');
-      noBase.code = 'ERR_INVALID_URL';
-      throw noBase;
-    }
-    /* Node resolves from the file it is handed, and reports that file, not the directory holding
-       it, in the message it gives when the package is not there; the host resolver reads a
-       package.json out of the directory it takes, and handing it a file makes it read that file as
-       one, so the file is walked up to the directory holding it before it is resolved from. */
-    var startDir = from;
-    if (Module._stat(startDir) !== 1) startDir = dirnameOf(startDir);
-    var found = host.resolve(name, startDir, 'require') || host.resolve(name, startDir, 'import');
-    if (!found) {
-      var err = new Error("Cannot find package '" + name + "' imported from " + from);
-      err.code = 'ERR_MODULE_NOT_FOUND';
-      throw err;
-    }
-    var dir = dirnameOf(found);
-    while (true) {
-      var pjsonPath = dir + '/package.json';
-      var text = host.readText(pjsonPath);
-      if (text !== null) {
-        try {
-          var parsed = JSON.parse(text);
-          if (parsed && parsed.name === name) return pjsonPath;
-        } catch (e) { /* a package.json that does not parse is not the one being looked for */ }
+    /* The path the base names, and whether it is a file URL at all: every step below reads a path
+       out of it, and a base no path can be read out of is what answers 'Invalid URL' for 'data:'. */
+    var parentPath = null;
+    try { parentPath = urlFor.fileURLToPath(parentURL); } catch (e) { parentPath = null; }
+    /* What node calls a bare specifier: not empty, not a path, and not a URL either. Only one of
+       those is looked for in node_modules; the rest are resolved against the base. */
+    var bare = name !== '' && name.charAt(0) !== '.' && name.charAt(0) !== '/' && !URLForBase.canParse(name);
+    if (bare) {
+      if (parentPath === null) {
+        var badParent = new TypeError('Invalid URL');
+        badParent.code = 'ERR_INVALID_URL';
+        throw badParent;
       }
-      var up = dirnameOf(dir);
-      if (up === dir) break;
-      dir = up;
+      var asked = findPackageNameOf(name);
+      /* The directory the base is read as a file in, which is the base's own parent unless a
+         trailing slash says the base is a directory: that is where the walk starts, and it is the
+         scope a package the base sits inside of is looked up in. */
+      var scopeDir = parentPath.charAt(parentPath.length - 1) === '/' ? parentPath.slice(0, -1) : dirnameOf(parentPath);
+      if (scopeDir === '') scopeDir = '/';
+      /* The package the base itself is in answers first, when it carries an "exports" map and the
+         name asked for is its own: a package may name itself before any node_modules is looked in. */
+      var scope = Module._readPackage(scopeDir);
+      if (scope.exists && scope.exports !== undefined && scope.exports !== null && scope.name === asked.name) {
+        return scope.pjsonPath;
+      }
+      /* The walk node's own reader makes: node_modules/<name> under each directory in turn, and the
+         package.json of the first directory that is there -- not the first package.json that is, so
+         a package installed with no manifest of its own is still the package that was found. */
+      var at = scopeDir;
+      var previous = '';
+      while (true) {
+        var candidate = (at === '/' ? '' : at) + '/node_modules/' + asked.name + '/package.json';
+        /* Node compares the length of the path it just built against the one before it, which is
+           how a walk that has reached the root stops: the next step up names the same folder. */
+        if (candidate.length === previous.length) break;
+        if (Module._stat((at === '/' ? '' : at) + '/node_modules/' + asked.name) === 1) return candidate;
+        previous = candidate;
+        /* One folder up, and two for a scoped name: the step climbs out of the node_modules/<name>
+           just looked in, which a name carrying a '/' of its own makes one folder deeper. */
+        var up = asked.scoped ? dirnameOf(dirnameOf(at)) : dirnameOf(at);
+        if (up === at) break;
+        at = up;
+      }
+      var noPackage = new Error("Cannot find package '" + asked.name + "' imported from " + parentPath);
+      noPackage.code = 'ERR_MODULE_NOT_FOUND';
+      throw noPackage;
     }
-    return undefined;
+    var resolved;
+    if (URLForBase.canParse(name)) {
+      /* A specifier carrying a scheme is a URL of its own and resolves to itself; the path is read
+         out of it afterwards, which is where every scheme but file is refused, whatever the base. */
+      resolved = urlFor.fileURLToPath(name);
+    } else if (parentPath === null && !/^[A-Za-z][A-Za-z0-9+\-.]*:\/\//.test(parentURL)) {
+      /* A base no relative specifier can be resolved against -- 'data:', the one node defaults to.
+         The refusal names the specifier and that base, both as node writes them. */
+      var unsupported = new TypeError('Failed to resolve module specifier "' + name + '" from "'
+        + parentURL + '": Invalid relative URL or base scheme is not hierarchical.');
+      unsupported.code = 'ERR_UNSUPPORTED_RESOLVE_REQUEST';
+      throw unsupported;
+    } else {
+      resolved = urlFor.fileURLToPath(new URLForBase(name, parentURL));
+    }
+    /* Node's loader resolves a path exactly -- no extension is added, no index and no "main" are
+       read -- and it refuses a directory, which findPackageJSON takes as the directory to look up
+       from rather than as a failure: the package.json at or above the directory is the answer. */
+    var kind = Module._stat(resolved);
+    if (kind !== 0 && kind !== 1) {
+      var noModule = new Error("Cannot find module '" + resolved + "' imported from "
+        + (parentPath === null ? parentURL : parentPath));
+      noModule.code = 'ERR_MODULE_NOT_FOUND';
+      throw noModule;
+    }
+    return nearestPackageJSONOf(resolved);
   };
   /* Nothing here writes a source map, so there is never one to find: node answers undefined for a
      builtin, for a file under node_modules while that support is off, and for any file it holds no
