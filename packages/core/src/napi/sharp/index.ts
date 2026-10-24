@@ -188,6 +188,25 @@ function decodeBytes(bytes: Uint8Array, shrink = 1): Decoded {
 function shrinkForLoad(bytes: Uint8Array, options: Record<string, unknown>): number {
     const size = jpegSize(bytes);
     if (size === undefined) return 1;
+    /*
+     * sharp's `shouldPreShrink` is false whenever the rotation, the flip or the flop is due before
+     * the pre-resize extract -- that is, whenever `rotateBeforePreExtract` is set, which sharp's own
+     * `resize()` does as soon as it sees both a rotation and a resize on the same pipeline. The frame
+     * has to be whole before it is turned, so libjpeg is handed no scale at all and the resize after
+     * the rotation carries the whole shrink. Measured against sharp 0.33.5: `.rotate(90).resize(16)`
+     * of a 64x64 jpeg hashes 3853382841 on host and was 1603733208 here, and the same rotate on a
+     * png or a raw of those pixels -- which carry no scale to miss -- already agreed, which is what
+     * says the shrink and not the rotation is the difference. `.resize(16).rotate(90)` leaves the
+     * flag unset, keeps its shrink and is unchanged.
+     */
+    if (options.rotateBeforePreExtract === true &&
+        (numberOption(options, 'angle', 0) % 360 !== 0 ||
+            options.flip === true ||
+            options.flop === true ||
+            numberOption(options, 'rotationAngle', 0) !== 0 ||
+            options.useExifOrientation === true)) {
+        return 1;
+    }
     /* A pre-extract crops before the resize, so it is the crop the shrink is measured against. */
     const widthPre = numberOption(options, 'widthPre', -1);
     const heightPre = numberOption(options, 'heightPre', -1);
