@@ -3394,7 +3394,7 @@ export class NodeProcess extends Process {
                are part of the module's identity but not of the file it is loaded from. */
             const { path: file, suffix } = splitModuleName(moduleName);
             if (file.endsWith('.json')) {
-                return { value: `export default ${this.readRequired(file)};` };
+                return { value: this.jsonModuleSource(this.readRequired(file), file) };
             }
             if (this.resolver.isESM(file, file === this.requireFile)) {
                 return { value: this.esmSource(this.readRequired(file), file, false, suffix, dynamic) };
@@ -3705,6 +3705,38 @@ export class NodeProcess extends Process {
     }
 
     /**
+     * The source of a JSON module. Node parses the module's text as JSON and its default export is
+     * the parsed value, so the text is parsed and not handed to the engine as JavaScript, which read
+     * a trailing comma as a legal one and reported a syntax error of its own for an empty file. A
+     * text that is not JSON is the SyntaxError node's JSON parser gives -- naming the file and the
+     * position in it -- carried by a module that throws it, so an importer that catches reads the
+     * error and one that does not is written the report node writes. A valid text is parsed by the
+     * engine when the module evaluates, which keeps the value a parse produces: a `__proto__` key
+     * stays an own property, and a key given twice keeps the value it was given last.
+     */
+    private jsonModuleSource(text: string, file: string): string {
+        /* A byte order mark is not part of the text: node drops the one a file starts with before it
+           parses, and a file that starts with one is valid here as it is there. */
+        const body = text.replace(/^﻿/, '');
+        try {
+            JSON.parse(body);
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            return errorModuleSource(ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
+                ctor: 'SyntaxError',
+                message: `${file}: ${detail}`,
+                whole: jsonModuleFailureText(body, file, detail, false),
+            })));
+        }
+        /* U+2028 and U+2029 are legal in a string since ES2019 and in JSON throughout, so the engine
+           that parses this is given them escaped rather than as themselves. */
+        const literal = JSON.stringify(body)
+            .split(String.fromCharCode(0x2028)).join('\\u2028')
+            .split(String.fromCharCode(0x2029)).join('\\u2029');
+        return `export default JSON.parse(${literal});`;
+    }
+
+    /**
      * The source of a `data:` module, built from the text the URL carries. A base64 URL is decoded
      * as bytes; every other one is percent-decoded, since that is the text of the module.
      */
@@ -3717,7 +3749,7 @@ export class NodeProcess extends Process {
         const source = isBase64
             ? new TextDecoder().decode(base64ToBytes(body))
             : percentDecode(body);
-        if (dataUrlMediaType(url) === 'application/json') return { value: `export default ${source};` };
+        if (dataUrlMediaType(url) === 'application/json') return { value: this.jsonModuleSource(source, moduleName) };
         return { value: this.esmSource(source, moduleName, false, '') };
     }
 
@@ -3922,6 +3954,8 @@ const MISSING_ATTRIBUTE_MARK = '\u0001owc-attr-missing';
 const ERROR_MODULE_PREFIX = 'owc-error:';
 /** Marks a module that is a WebAssembly module: everything after the mark is the file it reads. */
 const WASM_MODULE_PREFIX = 'owc-wasm:';
+/** The name node's report gives the script a JSON module's text is parsed in. */
+const JSON_ANONYMOUS_SCRIPT = '<anonymous_script>';
 /**
  * get, set or async followed by a semicolon or a comment: a cheap superset of the class elements the
  * guest's compatibility rewrite quotes, so its slower scan runs only on sources that may hold one.
@@ -4514,11 +4548,12 @@ function syntaxFailureFile(stack: string, file: string, read: (at: string) => st
     return text === undefined ? file : at;
 }
 
-function esmCompileFrames(isMain: boolean, isTs = false): string {
-    const shared = [
-        '    at compileSourceTextModule (node:internal/modules/esm/utils:318:16)',
-        '    at ModuleLoader.moduleStrategy (node:internal/modules/esm/translators:90:18)'
-    ];
+/**
+ * The frames node's loader contributes to a module it failed to translate, under the frames of the
+ * translator that failed: the entry a run started in ends in the loader's own, and a dependency it
+ * linked ends in the job that linked it.
+ */
+function moduleLoaderFrames(head: string[], isMain: boolean, isTs: boolean): string {
     /* A `.ts` entry is stripped by the translator before it is compiled, and the frame of the
        stripper -- in the place TracingChannel.tracePromise has for any other entry -- is part of
        what node prints for it. */
@@ -4536,7 +4571,60 @@ function esmCompileFrames(isMain: boolean, isTs = false): string {
             ...(isTs ? [] : ['    at TracingChannel.tracePromise (node:diagnostics_channel:362:14)'])]
         : ['    at ModuleJob.syncLink (node:internal/modules/esm/module_job:162:33)',
             '    at ModuleJob.link (node:internal/modules/esm/module_job:252:17)'];
-    return shared.concat(stripped, after, last).join('\n');
+    return head.concat(stripped, after, last).join('\n');
+}
+
+/** The frames of a module the engine failed to compile. */
+function esmCompileFrames(isMain: boolean, isTs = false): string {
+    return moduleLoaderFrames([
+        '    at compileSourceTextModule (node:internal/modules/esm/utils:318:16)',
+        '    at ModuleLoader.moduleStrategy (node:internal/modules/esm/translators:90:18)',
+    ], isMain, isTs);
+}
+
+/** The frames of a module whose JSON the engine's parser refused. */
+function jsonModuleFrames(isMain: boolean): string {
+    return moduleLoaderFrames([
+        '    at parse (<anonymous>)',
+        '    at ModuleLoader.jsonStrategy (node:internal/modules/esm/translators:482:21)',
+    ], isMain, false);
+}
+
+/** The position a JSON error points at, as an offset into the text; undefined when it points at none. */
+function jsonErrorPosition(message: string, body: string): number | undefined {
+    const at = / at position (\d+) \(line \d+ column \d+\)$/.exec(message);
+    if (at !== null) return Number(at[1]);
+    /* Two of the messages carry no position of their own: a token the parser did not expect names
+       the character it stopped on, and a value it cannot read at all is reported at its first one.
+       `Unexpected end of JSON input` names neither, and node prints no caret under it. */
+    const token = /^Unexpected token '([\s\S]*?)', /.exec(message);
+    if (token !== null) {
+        const index = token[1] === '' ? -1 : body.indexOf(token[1]);
+        if (index >= 0) return index;
+    }
+    return /^"[\s\S]*" is not valid JSON$/.test(message) ? 0 : undefined;
+}
+
+/**
+ * A JSON module whose text is not JSON, as node reports it: the parse runs in a script the engine
+ * names `<anonymous_script>`, so the header, the line and the caret are the JSON's own, while the
+ * error names the file and the position in it. The frames are the JSON translator's, and then the
+ * loader's; a JSON module is reached as a dependency, so the report is the one a linked module gets.
+ */
+function jsonModuleFailureText(source: string, file: string, detail: string, isMain: boolean): string {
+    const position = jsonErrorPosition(detail, source);
+    const before = position === undefined ? '' : source.slice(0, position);
+    const line = position === undefined ? 1 : before.split('\n').length;
+    const column = position === undefined ? 0 : position - before.lastIndexOf('\n');
+    const lines = source.split('\n');
+    const shown = lines[Math.min(Math.max(line, 1), lines.length) - 1] ?? '';
+    /* A caret the width of the run of characters before the position, which keeps a tab a tab the
+       way node keeps one. An error with no position to point at -- an empty file, or one that ends
+       mid-value -- gets no caret line at all, and not a blank one where a caret would be. */
+    const caret = position === undefined ? undefined
+        : shown.slice(0, Math.max(column - 1, 0)).replace(/[^\t]/g, ' ') + '^';
+    return `${JSON_ANONYMOUS_SCRIPT}:${line}\n${shown}\n${caret === undefined ? '' : `${caret}\n`}` +
+        `\nSyntaxError: ${file}: ${detail}\n${jsonModuleFrames(isMain)}\n\nNode.js ${NODE_VERSION}`;
 }
 
 /**
