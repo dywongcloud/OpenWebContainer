@@ -56,7 +56,8 @@ The architecture consists of three main layers:
   - Timers, `process.nextTick`, `process.exit` and exit codes, driven by a host event loop
   - `node -e <source>`
   - Console output integration
-  - `WebAssembly`: `compile`, `instantiate`, `validate`, `Module`, `Instance`, `Memory`, `Table` and `Global`, with `CompileError`, `LinkError` and `RuntimeError`. The engine has no WebAssembly of its own, so a module is compiled and run by the host and the guest gets objects that behave like the real ones; a `Memory` keeps a shadow of the bytes that is copied across the boundary in 1 MiB chunks on every call, so a guest write into `memory.buffer` is visible to the module from the next call on, and the module's writes are visible as soon as a call returns, but not in between. The copy is one per call, not per byte, so a module that makes very many calls over a very large memory pays for it
+  - `WebAssembly` errors come back in the class the host raises them in, not the one the bridge's own call site suggests: a bad import object and a Number where an i64 is wanted are both bad arguments and both a `TypeError` (`WebAssembly.instantiate(): Import #0 "env": module is not an object or function`, and `Cannot convert 5 to a BigInt`), an import that is present but not callable is the one case that really is a `LinkError`, a trap is still a `RuntimeError`, and `CompileError`, `LinkError` and `RuntimeError` own their `name` on the prototype as a host's do
+  - `WebAssembly.Tag` and `WebAssembly.Exception` are on the namespace, backed by the host's own, so `new Tag({parameters: ['i32']})`, `new Exception(tag, [42])`, `is` and `getArg` work, an exception an import throws reaches a handler, and what a host's prototypes own is matched: `Instance.prototype` carries `exports` and `Memory.prototype` carries only `buffer`, `constructor` and `grow`
 
 - **Previews**
   - Playground preview URLs (`/__owc/preview/<port>/...`) are answered by a service worker that forwards each request to the container's HTTP server on that port
@@ -691,7 +692,6 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   which is what `fs-extra`'s `ensureLinkSync` asks of one. Removing the *first* name is where the two part
   company: ext4 keeps the bytes for the names that remain, and here the copy the second name was given is
   what a read of it finds from then on.
-- **A symlink is a name in the tree that every call but `lstat` resolves.** `chmodSync`, `utimesSync`, `accessSync`, `statfsSync`, `existsSync`, `readdirSync`, `opendirSync` and `copyFileSync`, and every path under a link to a directory, reach the target as they do on host node 24.15: the mode, the times and the entries are the target's, and a link to a directory is listed as a link that a recursive `readdirSync` still descends into. `lstatSync` reports the link, its size the length of the target text and its mode `0o120755`; `renameSync`, `unlinkSync` and `rmSync` move and remove the link itself.
 - **`fs.statSync`'s `ino` is a number this file system made up.** It is not 0, it survives a write and it
   differs between two files, as a host's does; the number itself is a counter here, not an inode on a disk.
   `blocks` is now the host's own figure -- `Math.ceil(size / 4096) * 8`, so 8 for a 2-byte file and 16 for a
