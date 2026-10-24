@@ -1029,13 +1029,72 @@ if (typeof api.runMain === 'function' && !api.runMain.__owcLinksStdio) {
 /* stdin has no input source unless the host feeds one. A process started with a pipe on fd 0 keeps it
    open until the host ends it, so a parent's write reaches a reader there as it does in Node; every
    other run's stdin ends at once, so a reader sees end of input. A REPL is the run the terminal feeds:
-   the host keeps its stdin open and pushes into it what the terminal sends. */
+   the host keeps its stdin open and pushes into it what the terminal sends.
+
+   The bytes are one source behind both the readers of them -- the stream process.stdin is, and a
+   read of the descriptor 0 -- because on a host the two are one and the same pipe: process.stdin is
+   the Readable node wraps fd 0 in, so what one reader takes the other never sees, and a synchronous
+   read of 0 takes the bytes that have arrived, which is what a read of a pipe does. */
 var stdinStream = null;
 var stdinOpen = false;
 var stdinHeld = false;
-/** The whole input of a synchronous parent, fed the first time the stream is built: the built-ins are
- *  not there yet while this source runs, so nothing is pushed into a stream until something reads it. */
+/** The whole input of a synchronous parent, fed the first time either reader asks: the built-ins are
+ *  not there yet while this source runs, so nothing is decoded into bytes until something reads. */
 var stdinPending = null;
+/* What has arrived and not been taken yet, how much of the front of it has been taken, and whether
+   any more can still arrive. */
+var stdinBytes = new Uint8Array(0);
+var stdinAt = 0;
+var stdinDone = false;
+
+/* Bytes arriving on the pipe are appended to what is still there, the way a write to a pipe appends
+   to what an unread one already holds. */
+function stdinFeedBytes(bytes) {
+  if (bytes.length === 0) return;
+  var held = stdinBytes.length - stdinAt;
+  if (held === 0) {
+    stdinBytes = bytes;
+    stdinAt = 0;
+  } else {
+    var joined = new Uint8Array(held + bytes.length);
+    joined.set(stdinBytes.subarray(stdinAt), 0);
+    joined.set(bytes, held);
+    stdinBytes = joined;
+    stdinAt = 0;
+  }
+}
+/* A synchronous parent's input is all there is of it, and all of it is there from the start: it is
+   decoded the first time either reader asks, because the built-in that decodes is not up yet while
+   this source runs. */
+function stdinFlushPending() {
+  if (stdinPending === null) return;
+  var text = stdinPending;
+  stdinPending = null;
+  stdinFeedBytes(encodeString(text, 'utf8'));
+  stdinDone = true;
+}
+/* Up to n bytes of what has arrived, as a read of a pipe takes what is in it: fewer when fewer have
+   arrived, and none at all once the input is over. */
+function stdinTakeBytes(n) {
+  stdinFlushPending();
+  var held = stdinBytes.length - stdinAt;
+  if (held === 0 || !(n > 0)) return new Uint8Array(0);
+  var take = n < held ? n : held;
+  var out = stdinBytes.subarray(stdinAt, stdinAt + take);
+  stdinAt += take;
+  if (stdinAt === stdinBytes.length) {
+    stdinBytes = new Uint8Array(0);
+    stdinAt = 0;
+  }
+  return out;
+}
+/* Bytes that arrived, or the end of them, reach a stream that is already being read: the read it is
+   owed is owed now, outside the turn they arrived in, as on a host whose pipe was just written to. */
+function stdinKick() {
+  if (stdinStream === null) return;
+  if (stdinStream._readableState) stdinStream._readableState.reading = false;
+  stdinStream.read(0);
+}
 /* A reader holds a ref while it listens, the way Node's stdin keeps the loop alive while it is read:
    a child that reads its stdin waits for the parent, and one that stops reading no longer waits. */
 function stdinRef() {
@@ -1056,7 +1115,16 @@ function stdinOf() {
     function ReadStream(options) { Readable.call(this, options); }
     ReadStream.prototype = Object.create(Readable.prototype);
     ReadStream.prototype.constructor = ReadStream;
-    stdinStream = new ReadStream({ read: function () {} });
+    var Buf = requireBuiltin('buffer').Buffer;
+    /* The stream no longer holds the bytes: it draws them from the source above, one read at a time,
+       so what it hands to its own reader is exactly what a read of fd 0 would have taken. */
+    stdinStream = new ReadStream({
+      read: function () {
+        var chunk = stdinTakeBytes(65536);
+        if (chunk.length > 0) this.push(Buf.from(chunk));
+        else if (stdinDone) this.push(null);
+      }
+    });
     /* fd 0, the descriptor a process reads its input from, whether anything is fed through it. */
     stdinStream.fd = 0;
     // as on stdout: a stream with no terminal behind it reports neither isTTY nor columns
@@ -1066,17 +1134,11 @@ function stdinOf() {
     stdinStream.on('newListener', function (ev) { if (ev === 'data' || ev === 'readable') setImmediate(stdinRef); });
     stdinStream.on('removeListener', function (ev) { if (ev === 'data' || ev === 'readable') setImmediate(stdinRef); });
     stdinStream.once('end', function () { stdinOpen = false; stdinRef(); });
-    if (stdinPending !== null) {
-      // a synchronous parent's input is all there from the start, and ends as soon as it is read
-      var pending = stdinPending;
-      stdinPending = null;
-      stdinStream.push(pending);
-      stdinStream.push(null);
-    } else if (!stdinOpen) {
-      stdinStream.push(null);
-    } else {
-      stdinRef();
-    }
+    /* Whatever a synchronous parent wrote is fed now, and a run with no pipe on its input has
+       nothing behind it at all: both are already at their end, which the first read reports. */
+    stdinFlushPending();
+    if (!stdinOpen) stdinDone = true;
+    stdinRef();
   }
   return stdinStream;
 }
@@ -1097,14 +1159,16 @@ api.openStdin = function () {
 /* One chunk of terminal input, pushed into the stream a REPL reads. */
 api.pushStdin = function (text) {
   if (!stdinOpen) return false;
-  stdinOf().push(typeof text === 'string' ? text : String(text));
+  stdinFeedBytes(encodeString(typeof text === 'string' ? text : String(text), 'utf8'));
+  stdinKick();
   return true;
 };
 /* End of terminal input: Ctrl-D, or a terminal that closed. The reader sees end of file. */
 api.endStdin = function () {
   if (!stdinOpen) return false;
   stdinOpen = false;
-  stdinOf().push(null);
+  stdinDone = true;
+  stdinKick();
   return true;
 };
 /* What this run was started with: a pipe on fd 0 the parent may still write to, and the whole input of

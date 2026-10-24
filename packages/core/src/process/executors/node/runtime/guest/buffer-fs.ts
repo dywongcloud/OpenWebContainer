@@ -830,6 +830,7 @@ BF.fs = function () {
     EINVAL: 'invalid argument',
     ENOTSUP: 'operation not supported',
     EBADF: 'bad file descriptor',
+    ESPIPE: 'illegal seek',
     ELOOP: 'too many symbolic links encountered'
   };
 
@@ -849,6 +850,7 @@ BF.fs = function () {
     ENOTSUP: -45,
     ENOTEMPTY: -66,
     EPERM: -1,
+    ESPIPE: -29,
     ELOOP: -62
   };
 
@@ -1955,17 +1957,29 @@ BF.fs = function () {
     var rec = descriptorOf(fd, 'read');
     if (!rec.readable) throw badFdError('read');
     if (rec.isDir) throw fsError('EISDIR', 'read', rec.path);
-    /* A read of fd 0 asks the pipe the process was started with, and there is nothing in it a
-       synchronous read could take: a host's read of a pipe nobody has written to reports end of
-       input -- 0 bytes -- rather than the EBADF an unopened number would give. Input fed to the
-       process reaches process.stdin, which is a stream and not something a read can wait on. */
-    if (rec.stdio !== undefined) return 0;
     var opts = offset && typeof offset === 'object' ? offset : null;
     var off = opts ? opts.offset || 0 : typeof offset === 'number' ? offset : 0;
     var len = opts ? (opts.length === undefined ? buffer.length - off : opts.length)
       : (typeof length === 'number' ? length : buffer.length - off);
     var at = opts ? (typeof opts.position === 'number' ? opts.position : rec.position)
       : (typeof position === 'number' ? position : rec.position);
+    /*
+     * A read of the descriptor 0 takes what the process's standard input carries: it is the read end
+     * of the pipe the process was started with, and the same pipe process.stdin reads, so what has
+     * been written to it and not taken yet is what a read gets. A read that finds nothing there
+     * reports end of input -- 0 bytes, as a host's read of a pipe does -- rather than the EBADF an
+     * unopened number would give. The pipe has no position to seek to, so a read that asks for one
+     * is ESPIPE, which is what host node 24.15 answers; fd 1 and fd 2 are the write ends and were
+     * never readable, so a read of either is the EBADF above.
+     */
+    if (rec.stdio === 0) {
+      if (explicitRead(offset, length, position)) throw noPathError('ESPIPE', 'read');
+      var room = Math.max(0, (buffer.length || 0) - off);
+      var chunk = stdinTakeBytes(Math.min(len, room));
+      var sink = ArrayBuffer.isView(buffer) ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength) : buffer;
+      for (var s = 0; s < chunk.length; s++) sink[off + s] = chunk[s];
+      return chunk.length;
+    }
     /* A device has no bytes of its own, so the chunk openSync read of it -- 4096 of them -- was
        all a descriptor ever had: a second readSync past it reported end of file, and a guest that
        looped drawing entropy from /dev/zero or /dev/urandom got one chunk and then stopped, where
@@ -2286,7 +2300,16 @@ BF.fs = function () {
     var Readable = requireBuiltin('stream').Readable;
     var Buf = requireBuiltin('buffer').Buffer;
     var options = typeof opts === 'string' ? { encoding: opts } : (opts || {});
+    /*
+     * A descriptor in the options is what makes this a stream over a number the caller already has:
+     * createReadStream(null, { fd: 0 }) is the stream a host hands back for the process's own
+     * standard input, so there is no name to open and every chunk comes out of a read of that number.
+     * Answering it with a stream over a file called 'null' -- which is what a path built out of the
+     * null name is -- opened that name and failed ENOENT instead of reading the input.
+     */
+    var onFd = typeof options.fd === 'number' ? options.fd : null;
     var file = toPathString(p);
+    if (onFd !== null) return descriptorReadStream(onFd, options);
     var chunkSize = options.highWaterMark || 65536;
     /* Node validates the range when the stream is constructed, so a bad start or end throws before
        a chunk is ever read. */
@@ -2366,6 +2389,53 @@ BF.fs = function () {
     readStreamProto = true;
     return stream;
   };
+
+  /*
+   * A stream over a descriptor the caller already holds: the one a host hands back for
+   * createReadStream(null, { fd: 0 }). Nothing is opened -- the number is already open -- so there
+   * is no 'open' event and no name on the stream, and each chunk is one read of the number, which
+   * on fd 0 is the process's standard input. A read that answers 0 is the end of it, as it is on a
+   * pipe a host's stream is reading.
+   */
+  function descriptorReadStream(fd, options) {
+    var Readable = requireBuiltin('stream').Readable;
+    var Buf = requireBuiltin('buffer').Buffer;
+    var chunkSize = options.highWaterMark || 65536;
+    var stream = new Readable({
+      highWaterMark: chunkSize,
+      read: function () {
+        var buf = Buf.alloc(chunkSize);
+        var n;
+        try {
+          n = fs.readSync(fd, buf, 0, chunkSize);
+        } catch (err) {
+          stream.destroy(err);
+          return;
+        }
+        if (n <= 0) {
+          stream.push(null);
+          return;
+        }
+        stream.bytesRead += n;
+        stream.push(Buf.from(buf.subarray(0, n)));
+      }
+    });
+    stream.fd = fd;
+    stream.path = undefined;
+    // like Node, the byte count starts at 0 and holds what the stream has read out of the number
+    stream.bytesRead = 0;
+    if (options.encoding) stream.setEncoding(options.encoding);
+    /* autoClose is on unless a caller turns it off, so a stream that reaches its end closes the
+       number behind it, as a host's does: a later read through that number is EBADF. */
+    if (options.autoClose !== false) {
+      stream.on('end', function () {
+        try { fs.closeSync(fd); } catch (err) { stream.destroy(err); }
+      });
+    }
+    Object.setPrototypeOf(stream, streamProtoOf(ReadStream, Readable, readStreamProto));
+    readStreamProto = true;
+    return stream;
+  }
 
   fs.createWriteStream = function (p, opts) {
     var Writable = requireBuiltin('stream').Writable;
