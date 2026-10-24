@@ -63,13 +63,47 @@ export const SRC = String.raw`
     QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24, DataCloneError: 25
   };
 
+  /*
+   * The three members a DOMException answers -- name, message and code -- are getters on the
+   * prototype and not own properties of the instance, which is where host node 24.15 puts them and
+   * which is why Object.getOwnPropertyNames(new DOMException('d', 'AbortError')) is ['stack'] there:
+   * the stack is the one own property the engine gives an error itself. What hangs on that is the
+   * report: util.inspect opens with 'DOMException [AbortError]: d' -- the constructor's name in
+   * front and the name in brackets -- only while 'name' is NOT the error's own, which is the test
+   * formatErrorStack asks, and it is why the container printed 'AbortError: d' where host node 24.15
+   * prints 'DOMException [AbortError]: d' for as long as every instance carried its own. The values
+   * are one set per instance, so they live in a WeakMap, the way the rest of this module keeps the
+   * state an event or a port carries.
+   */
+  var DOM_FIELDS = new WeakMap();
+
+  /* The name, message and code of an instance this constructor never ran on -- one out of
+     'Object.create(DOMException.prototype)' -- are the ones a DOMException with no name answers. */
+  function domFieldOf(self, key) {
+    var fields = DOM_FIELDS.get(self);
+    if (fields !== undefined) return fields[key];
+    return key === 'name' ? 'Error' : (key === 'code' ? 0 : '');
+  }
+
   class DOMException extends Error {
     constructor(message, name) {
-      super(message === undefined ? '' : String(message));
-      Object.defineProperty(this, 'name', { value: name === undefined ? 'Error' : String(name), configurable: true });
-      Object.defineProperty(this, 'code', { value: LEGACY_CODES[this.name] || 0, configurable: true });
+      var text = message === undefined ? '' : String(message);
+      var given = name === undefined ? 'Error' : String(name);
+      /* The engine is handed the message so the stack it captures opens with it -- 'AbortError: d',
+         the header host node 24.15 writes -- and the own 'message' it wrote is taken back off, so
+         that 'stack' is the only own name an instance carries, as on the host. */
+      super(text);
+      DOM_FIELDS.set(this, { message: text, name: given, code: LEGACY_CODES[given] || 0 });
+      delete this.message;
     }
   }
+  /* Enumerable and configurable and with no setter, as host node 24.15 declares them: a for-in over
+     an instance walks them in this order and an assignment to one is a no-op the host ignores. */
+  Object.defineProperties(DOMException.prototype, {
+    name: { get: function () { return domFieldOf(this, 'name'); }, enumerable: true, configurable: true },
+    message: { get: function () { return domFieldOf(this, 'message'); }, enumerable: true, configurable: true },
+    code: { get: function () { return domFieldOf(this, 'code'); }, enumerable: true, configurable: true }
+  });
   /*
    * The tag is the one thing a host DOMException carries that a plain Error does not, and it is
    * what Object.prototype.toString.call(new DOMException('d', 'AbortError')) reads to answer

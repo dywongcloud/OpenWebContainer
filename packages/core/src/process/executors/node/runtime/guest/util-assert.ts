@@ -27,22 +27,41 @@ function formatErrorStack(err) {
      a stack -- carries that report with it, and it goes out as it stands: no name and colon go
      in front of a report that already holds the line Node opens with. */
   if (err && typeof err.__owcWhole === 'string') return err.__owcWhole;
-  /* 'class Z extends Error {}' prints 'Z [Error]: s' on host node 24.15: the constructor's name
-     in front and the error's own 'name' in brackets, because that name is the one Z inherited and
-     not one the error carries. A name the error *does* carry -- 'e.name = "Foo"', or a subclass
-     that sets its own -- is printed alone, as 'Foo: x', so what decides it is whether 'name' is
-     the error's own property and not whether it differs from the constructor's. */
+  /* 'class Z extends Error {}' prints 'Z [Error]: s' on host node 24.15: the constructor's name in
+     front and the name in brackets behind it. What decides it is node's 'improveStack', and it asks
+     three things and not one: that the name ends in 'Error', that the stack opens with that very
+     name, and that what follows it is the end of the stack, a colon or a newline. A name that ends
+     in something else is printed alone -- 'NotARealName: m', and 'Foo: x' for an 'e.name = "Foo"'
+     of the caller's -- and so is a name the stack does not open with. Whether 'name' is the error's
+     own property is not one of the three: a caller's own 'e.name = "TypeError"' on a plain Error
+     prints 'Error [TypeError]: x' there, own property and all.
+     The third of them is the one the guest's DOMException failed on: its name was an own property
+     of every instance where host node 24.15 reaches it on the prototype, so the test that used to
+     stand here -- own-ness -- is what opened its report with 'AbortError: d' and not with
+     'DOMException [AbortError]: d'. */
   var nameText = err.name === undefined || err.name === null ? 'Error' : String(err.name);
   var header = nameText;
   var ctorText = constructorNameOf(err);
+  var rawStack = '';
+  try { rawStack = err.stack === undefined || err.stack === null ? '' : String(err.stack); } catch (noStack) { rawStack = ''; }
   var subbed = false;
-  if (ctorText && ctorText !== nameText && ctorText !== 'Object' &&
-      !Object.prototype.hasOwnProperty.call(err, 'name')) {
-    header = ctorText + ' [' + nameText + ']';
-    subbed = true;
+  if (ctorText && ctorText !== 'Object' && stackOpensWith(rawStack, nameText)) {
+    var prefix = constructorPrefixOf(ctorText, utilTag(err));
+    if (nameText !== prefix) {
+      if (prefix.indexOf(nameText) >= 0) {
+        /* 'class MyError extends Error {}' prints 'MyError: s' and not 'MyError [Error]: s': the
+           name it inherited is the tail of the constructor's own, so node writes the constructor's
+           alone and drops the name rather than bracketing it. */
+        header = prefix;
+        subbed = true;
+      } else {
+        header = prefix + ' [' + nameText + ']';
+        subbed = true;
+      }
+    }
   }
   if (err.message) header += header === '' ? String(err.message) : ': ' + err.message;
-  var stack = err.stack ? String(err.stack) : '';
+  var stack = rawStack;
   var lines = stack === '' ? [] : guestFramesOf(stack.split('\n'));
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   var body = lines.join('\n');
@@ -68,6 +87,42 @@ function formatErrorStack(err) {
      and not with 'Error: th': that report holds its own 'Error: th' further down, and a header of
      ours in front would make the first line the one thing node does not print. */
   return body.indexOf(header) >= 0 ? body : header + '\n' + body;
+}
+
+/* Whether node's 'improveStack' will put a constructor's name in front of this stack at all, which
+   is the three things it asks: that the name ends in 'Error', that the stack opens with that very
+   name, and that what comes behind it is the end of the stack, a colon or a newline. A stack that
+   opens with something else -- one the caller wrote by hand, or one out of a 'vm' realm, whose
+   frames are all it has -- gets no name in front of it. */
+function stackOpensWith(stack, name) {
+  if (!/Error$/.test(name)) return false;
+  if (stack.length < name.length || stack.indexOf(name) !== 0) return false;
+  return stack.length === name.length || stack.charAt(name.length) === ':' || stack.charAt(name.length) === '\n';
+}
+
+/* The name node writes in front of a stack it took the header off: the constructor's own, with the
+   value's tag in brackets behind it when it carries one of its own and the constructor's name does
+   not already have it -- 'Dom2 [DOMException]' for a 'class Dom2 extends DOMException {}', and
+   'Tagged [Boom]' for a class tagged 'Boom' -- and with no brackets when it does, which is why
+   'MyError' and 'TypeError' get none. A value carrying no tag of its own answers '' for it -- the
+   '[object Error]' and '[object Object]' of an untagged one -- and that is what keeps a 'class Q
+   extends Error {}' with a 'get name()' of its own at 'Q [QuotaExceededError]: q' and not at
+   'Q [Error] [QuotaExceededError]: q'. */
+function constructorPrefixOf(ctorText, tagText) {
+  var tag = tagText === 'Error' || tagText === 'Object' ? '' : tagText;
+  var result = ctorText + ' ';
+  if (tag !== '') {
+    var position = ctorText.indexOf(tag);
+    if (position === -1) {
+      result += '[' + tag + '] ';
+    } else {
+      var endPos = position + tag.length;
+      if (endPos !== ctorText.length && ctorText.charAt(endPos) === ctorText.charAt(endPos).toLowerCase()) {
+        result += '[' + tag + '] ';
+      }
+    }
+  }
+  return result.slice(0, -1);
 }
 
 function hexByte(b) {
