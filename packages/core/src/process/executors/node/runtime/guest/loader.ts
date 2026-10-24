@@ -38,16 +38,6 @@ var IMMEDIATE_WAKE = 0;
  */
 var IO_QUEUE = [];
 var IO_LATER = [];
-/*
- * The poll phase of this turn, and the only one of the three host node 24.15's thread pool answers
- * into. A callback Node owes a crypto.randomBytes is not a microtask, so no batch of promise jobs
- * can carry it ahead of a process.nextTick a program armed before the call -- measured on host node
- * 24.15: 'TCI', the tick first. queueMicrotask put it on the microtask queue instead, and a call
- * made inside a promise continuation then ran its callback inside that continuation's own batch,
- * ahead of the tick: 'CTI'. The tick queue stands between, and IO_QUEUE is run ahead of drainTicks()
- * while IO_LATER is run behind the check phase, so neither of the two is this order.
- */
-var IO_POLL = [];
 /* The reserved host timer id the two queues wake on: never a timer-table id, which start at 1. */
 var TURN_TIMER = 0;
 var TURN_ARMED = false;
@@ -343,22 +333,6 @@ function readSource(filename) {
   return src;
 }
 
-/* TypeScript's own names, as the loader sees them. */
-var TS_SOURCE_NAME = /\.[cm]?ts$/;
-
-/* What a CommonJS file is compiled from. Node 24 strips the types out of a .ts it reads as
-   CommonJS and out of every .cts before it compiles what is left -- Module.prototype._compile
-   strips each of the three TypeScript formats (lib/internal/modules/cjs/loader.js), and which
-   format a .ts is was decided from the stripped source, so a file whose only import is an
-   "import type" has no import left and is CommonJS. A .mts is a module, so it never reaches
-   this. The stripper is the type stripper's own, so what Node refuses to strip -- an enum, a
-   namespace, a parameter property, a decorator -- is refused here in the same words, code and
-   all, instead of failing to parse afterwards. */
-function cjsSourceOf(filename) {
-  var src = readSource(filename);
-  return TS_SOURCE_NAME.test(filename) ? tsStripTypes(src) : src;
-}
-
 function stripHashbang(src) {
   return src.charAt(0) === '#' && src.charAt(1) === '!' ? '//' + src.slice(2) : src;
 }
@@ -432,7 +406,7 @@ Module.prototype.require = function _require(request) { return requireFrom(this,
 /* require.extensions (Module._extensions): .node files load through it, by process.dlopen; .js and .json files load in loadCJS */
 var EXTENSIONS = {
   '.js': function (module, filename) {
-    var wrapper = compileCjsWrapper(stripHashbang(cjsSourceOf(filename)), filename);
+    var wrapper = compileCjsWrapper(stripHashbang(readSource(filename)), filename);
     wrapper.call(module.exports, module.exports, makeRequire(module), module, filename, dirnameOf(filename));
   },
   '.json': function (module, filename) {
@@ -487,17 +461,6 @@ function requireFrom(parent, id) {
   }
   var base = parent && parent.path ? parent.path : host.cwd();
   var filename = host.resolve(id, base, 'require');
-  /* A resolve hook -- see Module.registerHooks in misc.ts -- answers the url the request resolves
-     to before the loader's own answer is used, so a specifier that names no file at all is still
-     one a hook can resolve. The hook's nextResolve is handed the loader's answer, or '' when it
-     found nothing, which is what node hands it for a specifier the default loader cannot resolve. */
-  var hookedUrl = hookForRequire
-    ? resolveHookUrl(id, urlOfFile(base + '/'), filename ? urlOfFile(filename) : '', 'commonjs')
-    : undefined;
-  if (hookedUrl !== undefined) {
-    var hookedFile = fileOfUrl(hookedUrl);
-    if (hookedFile !== undefined) filename = hookedFile;
-  }
   if (!filename) throw notFoundError(id, base, parent);
   return loadCJS(filename, parent, false).exports;
 }
@@ -758,9 +721,7 @@ function loadCJS(filename, parent, isMain) {
       if (filename.slice(-4) === '.mjs' || host.isESM(filename)) {
         return loadEsmFromRequire(filename, mod);
       }
-      var hooked = (typeof loadHookSource === 'function') ? loadHookSource(urlOfFile(filename), undefined, 'commonjs') : undefined;
-      var src = stripHashbang(hooked !== undefined && hooked.source !== undefined
-        ? hooked.source : cjsSourceOf(filename));
+      var src = stripHashbang(readSource(filename));
       var wrapper = compileCjsWrapper(src, filename);
       /* The body runs as this file, so a new Function it builds -- and a dynamic import in that
          body -- is resolved from here, as it is in Node. */
@@ -780,93 +741,6 @@ function loadCJS(filename, parent, isMain) {
   if (parent && parent.children) parent.children.push(mod);
   return mod;
 }
-
-var hookResolveFn = null;
-var hookLoadFn = null;
-/* Whether the hooks the pair holds reach require() as well: registerHooks() registers them on this
-   thread, and node asks them for a CommonJS require as it asks them for an import, while the
-   module register() names is loaded and asked in a graph of its own -- require() of a name it
-   rewrites is not rewritten on a host, which is what separates the two. */
-var hookForRequire = false;
-  /* The url of a file and the file of a url, the two halves of the name this loader carries. */
-  function urlOfFile(file) { return 'file://' + String(file); }
-  function fileOfUrl(url) {
-    var u = String(url);
-    if (u.indexOf('file://') !== 0) return undefined;
-    var cut = u.indexOf('?');
-    if (cut < 0) cut = u.indexOf('#');
-    return cut < 0 ? u.slice(7) : u.slice(7, cut);
-  }
-  /* The context object node hands a hook: the conditions and the import attributes of the
-     resolution, and the url it is made from. */
-  function resolveContextOf(parentURL) {
-    return { conditions: [], importAttributes: Object.create(null),
-      parentURL: parentURL === undefined || parentURL === '' ? undefined : String(parentURL) };
-  }
-  function loadContextOf(url, format) {
-    return { conditions: [], format: format === undefined ? undefined : String(format),
-      importAttributes: Object.create(null), url: String(url) };
-  }
-  /* What one hook answered. A hook is called here and not awaited, so a promise one hands back --
-     which node waits for in its loader thread -- is an answer this loader cannot read, and the call
-     is handed on exactly as it would be had the hook not answered at all. */
-  function hookAnswered(fn, args) {
-    if (typeof fn !== 'function') return undefined;
-    var answer = fn.apply(undefined, args);
-    if (answer === null || typeof answer !== 'object') return undefined;
-    if (typeof answer.then === 'function') return undefined;
-    return answer;
-  }
-  /* One resolve hook call, over one specifier. The url the loader resolved on its own is what the
-     hook's nextResolve hands back, so a hook that calls on -- or one that only changes what the
-     default names -- is answered the way node answers it. What comes back is the url to load, or
-     undefined when no hook was registered or the hook left the call to the loader. */
-  function resolveHookUrl(specifier, parentURL, defaultUrl, defaultFormat) {
-    if (hookResolveFn === null) return undefined;
-    var answer = hookAnswered(hookResolveFn, [String(specifier), resolveContextOf(parentURL),
-      function nextResolve(spec, context) {
-        return { url: defaultUrl === undefined ? '' : defaultUrl, shortCircuit: true,
-          format: defaultFormat === undefined ? 'module' : defaultFormat };
-      }]);
-    if (answer === undefined || answer.shortCircuit !== true) return undefined;
-    return typeof answer.url === 'string' && answer.url !== '' ? answer.url : undefined;
-  }
-  /* One load hook call, over the url a module was resolved to. What comes back is the source the
-     module is compiled from and the format it is compiled as -- each of them as the hook left it,
-     and undefined when the hook left the call to the loader. */
-  function loadHookSource(url, defaultSource, defaultFormat) {
-    if (hookLoadFn === null) return undefined;
-    var answer = hookAnswered(hookLoadFn, [String(url), loadContextOf(url, defaultFormat),
-      function nextLoad(which, context) {
-        return { format: defaultFormat, shortCircuit: true, source: defaultSource };
-      }]);
-    if (answer === undefined || answer.shortCircuit !== true) return undefined;
-    return { source: typeof answer.source === 'string' ? answer.source : undefined,
-      format: typeof answer.format === 'string' ? answer.format : undefined };
-  }
-  /* The host is told once that there are hooks to ask, so a program that registers none pays
-     nothing for them on every resolve and every load. */
-  function hooksChanged() {
-    if (typeof host.hooksChanged === 'function') host.hooksChanged();
-  }
-  /* The module register() names is loaded as the ES module it is, and the hooks it exports are the
-     hooks from then on: node loads it in its own thread, and 'initialize' is the one hook it calls
-     there and nowhere else. A loader that exports none leaves both halves of the pair unset. */
-  function adoptLoaderModule(file) {
-    var token = nextEsmToken++;
-    var failure = host.esmLoad(file, token);
-    var registry = globalThis.__owc_esm_registry || {};
-    var exported = registry[token];
-    delete registry[token];
-    if (failure) throw new Error(failure);
-    if (exported === undefined) return undefined;
-    hookResolveFn = typeof exported.resolve === 'function' ? exported.resolve : null;
-    hookLoadFn = typeof exported.load === 'function' ? exported.load : null;
-    if (typeof exported.initialize === 'function') exported.initialize();
-    hookForRequire = false;
-    hooksChanged();
-    return exported;
-  }
 
 var nextEsmToken = 1;
 
@@ -1279,26 +1153,13 @@ function settleIO(fn, later) {
 }
 
 /*
- * Settles a callback the way host node 24.15 settles a thread-pool completion that has come back:
- * in the poll phase of the turn that is running now, which stands behind the tick queue and in
- * front of the check phase. A derivation -- a pbkdf2, a scrypt -- costs the pool a whole turn of
- * its own, so it is IO_LATER's and not this queue's, exactly as a second round trip is.
- */
-function settlePoll(fn, later) {
-  host.ref(1);
-  if (later === true) IO_LATER.push(fn);
-  else IO_POLL.push(fn);
-  armTurn();
-}
-
-/*
  * The one host timer both queues and the immediate queue wake on. They are one turn's phases and not
  * three races, so a single timer runs them in their order instead of leaving the host's own timer
  * order to decide which comes first.
  */
 function armTurn() {
   if (TURN_ARMED) return;
-  if (IMMEDIATE_QUEUE.length === 0 && IO_QUEUE.length === 0 && IO_LATER.length === 0 && IO_POLL.length === 0) return;
+  if (IMMEDIATE_QUEUE.length === 0 && IO_QUEUE.length === 0 && IO_LATER.length === 0) return;
   TURN_ARMED = true;
   host.setTimer(TURN_TIMER, 0);
 }
@@ -1318,18 +1179,6 @@ function runTurnPhases(due) {
   }
   /* a tick a callback queued is owed before the check phase, as it is on host node 24.15 */
   drainTicks();
-  /*
-   * The poll phase proper: what the thread pool handed back, which is behind every tick this turn
-   * owes and ahead of every immediate it owes. A callback queued here cannot be carried in front of
-   * a nextTick by a batch of promise jobs, because it is not one of them.
-   */
-  var polled = IO_POLL;
-  IO_POLL = [];
-  for (var p = 0; p < polled.length; p++) {
-    host.ref(-1);
-    polled[p]();
-  }
-  if (polled.length > 0) drainTicks();
   drainImmediatesUntil(due);
   var later = IO_LATER;
   IO_LATER = [];
@@ -1403,7 +1252,7 @@ function makeTimeout(id) {
     ref: function () { handle._owcRefed = true; setTimerRef(id, true); return this; },
     unref: function () { handle._owcRefed = false; setTimerRef(id, false); return this; },
     hasRef: function () { return handle._owcRefed; },
-    refresh: function () { return this; }
+    refresh: function () { refreshTimer(handle); return this; }
   };
   if (!(entry && entry.immediate)) {
     handle._idleTimeout = entry ? entry.delay : 1;
@@ -1411,6 +1260,35 @@ function makeTimeout(id) {
   }
   handle[Symbol.toPrimitive] = function () { return id; };
   return handle;
+}
+
+/*
+ * refresh() restarts a timer's delay from the moment it is called, which is what host node 24.15
+ * does and what a Timeout that only ever handed itself back did not. A one-shot that has already
+ * fired is armed again from now -- host node 24.15 fires it once more, one delay later (trf2) --
+ * while one that was cleared is spent for good and stays dead (trf5). An Immediate has no delay to
+ * restart: its place is the queue it was pushed onto, not a deadline.
+ */
+function refreshTimer(handle) {
+  var id = handle._owcTimerId;
+  if (id === undefined) return;
+  var t = timers[id];
+  if (!t) {
+    var spent = handle._owcSpent;
+    if (!spent || spent.immediate) return;
+    t = spent;
+    t.at = host.now();
+    t.refed = handle._owcRefed === true;
+    timers[id] = t;
+    if (t.refed) host.ref(1);
+    host.setTimer(id, t.delay);
+    handle._destroyed = false;
+    handle._owcSpent = null;
+    return;
+  }
+  if (t.immediate) return;
+  t.at = host.now();
+  host.setTimer(id, t.delay);
 }
 
 function setTimerRef(id, on) {
@@ -1441,6 +1319,8 @@ function clearTimer(t) {
   }
   if (!handle) return;
   handle._destroyed = true;
+  /* a cleared timer is spent for good: host node 24.15's refresh() does not bring one back (trf5) */
+  handle._owcSpent = null;
   /* host node 24.15's clearTimeout writes -1 over _idleTimeout; an Immediate has none to write */
   if (handle._idleTimeout !== undefined) handle._idleTimeout = -1;
 }
@@ -1490,8 +1370,12 @@ function runTimerEntry(id) {
     delete timers[id];
     if (t.refed) host.ref(-1);
     /* a one-shot that has fired is spent: host node 24.15 leaves _idleTimeout at its delay and
-       marks the object destroyed, so hasRef() still answers true there */
-    if (t.handle) t.handle._destroyed = true;
+       marks the object destroyed, so hasRef() still answers true there. The entry is kept on the
+       handle all the same, because host node 24.15's refresh() arms it again from now. */
+    if (t.handle) {
+      t.handle._destroyed = true;
+      t.handle._owcSpent = t;
+    }
   }
   runInAsyncContext(t.ctx, function () {
     /*
@@ -1965,22 +1849,6 @@ var api = {
   },
   exportsOf: function (id, builtin) {
     return builtin ? requireBuiltin(id) : loadCJS(id, null, false).exports;
-  },
-  /* The two halves of the module customization hooks the host cannot ask from where it stands: it
-     resolves and loads an ES module itself, so a resolve hook is asked with the specifier and the
-     url the loader would have answered, and a load hook with the url and the source behind it. Both
-     answer '' when no hook is registered or the hook left the call to the loader. */
-  hooksResolve: function (specifier, parentURL, defaultUrl) {
-    var url = resolveHookUrl(specifier, parentURL === '' ? undefined : parentURL,
-      defaultUrl === '' ? undefined : defaultUrl, 'module');
-    return url === undefined ? '' : url;
-  },
-  hooksLoad: function (url, defaultSource, defaultFormat) {
-    var answer = loadHookSource(url, defaultSource === '' ? undefined : defaultSource,
-      defaultFormat === '' ? undefined : defaultFormat);
-    if (answer === undefined) return '';
-    return JSON.stringify({ source: answer.source === undefined ? null : answer.source,
-      format: answer.format === undefined ? null : answer.format });
   },
   /* the REPL's require: see createReplRequire */
   createReplRequire: function (directory) {

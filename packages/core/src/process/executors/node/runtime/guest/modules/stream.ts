@@ -2744,8 +2744,15 @@ function owcBuildStreamCore() {
       stream.on(type, fn);
       listeners.push([type, fn]);
     }
+    /* host node 24.15 hands the answer back one tick after the 'end' or the 'finish' that settled
+       it, while an 'error' and a 'close' call back inside the emit they belong to -- measured on
+       host node 24.15: a readable's 'end' and its callback one tick apart (h2), a clean writable's
+       'finish' and its callback the same (h3), a writable's 'error' and its callback in one tick
+       (h4, h6), a destroy's 'close' and its callback in one tick (h9). Calling back in the 'end'
+       itself inverted the pair: a readable that ends reports ahead of an errored writable registered
+       after it, where host node 24.15 reports the writable first. */
     function check() {
-      if (rDone && wDone) done();
+      if (rDone && wDone) process.nextTick(function () { done(); });
     }
 
     if (readable) {
