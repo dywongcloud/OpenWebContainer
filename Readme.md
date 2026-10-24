@@ -1081,6 +1081,7 @@ Known limits, measured rather than claimed:
   - Based on QuickJS for reliable JavaScript execution
   - Web Streams: `ReadableStream` (default and byte streams, BYOB reader), `WritableStream`, `TransformStream`, `TextEncoderStream`, `TextDecoderStream` and `stream/web`
   - `Event`, `EventTarget`, `AbortController` and `AbortSignal`, `DOMException`, `Blob` and `File` globals
+  - `DOMException` carries the tag host Node 24.15 gives it: `Object.prototype.toString.call(new DOMException('d', 'AbortError'))` is `[object DOMException]` and its `Symbol.toStringTag` is `DOMException`, on the prototype as the host declares it (row `owc-domexception-no-tostringtag`)
   - Synchronous child processes: `spawnSync`, `execSync` and `execFileSync`, including `node -e` and `node -p`
   - `vm` `timeout` for JavaScript loops, with Node's error codes
   - Preemption: a guest that runs away is stopped, with Node's `Script execution timed out` error

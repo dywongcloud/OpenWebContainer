@@ -70,6 +70,16 @@ export const SRC = String.raw`
       Object.defineProperty(this, 'code', { value: LEGACY_CODES[this.name] || 0, configurable: true });
     }
   }
+  /*
+   * The tag is the one thing a host DOMException carries that a plain Error does not, and it is
+   * what Object.prototype.toString.call(new DOMException('d', 'AbortError')) reads to answer
+   * '[object DOMException]' and not '[object Error]', as it does on host node 24.15. Host node
+   * 24.15 declares it on the prototype -- writable false, enumerable false, configurable true,
+   * which is where WebIDL puts it -- and no instance owns one.
+   */
+  if (typeof Symbol === 'function' && Symbol.toStringTag !== undefined) {
+    Object.defineProperty(DOMException.prototype, Symbol.toStringTag, { value: 'DOMException', configurable: true });
+  }
 
   class Event {
     /* Node's own signature: the second parameter carries a default, so Event.length -- and

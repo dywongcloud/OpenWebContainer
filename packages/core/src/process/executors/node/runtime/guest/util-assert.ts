@@ -329,7 +329,11 @@ function inspectValue(value, opts) {
        out of a context print 'Error {}' where the host prints 'Error: boom', and a promise
        'Promise {}' where the host prints 'Promise { 1 }'. */
     var vTag = utilTag(v);
-    if (vTag === 'Error') return errorInspectOf(v, fmt, depth, indent, opts);
+    /* A DOMException carries '[object DOMException]' and not '[object Error]', as it does on host
+       node 24.15, and node's inspect still writes the report of an error for it -- the header and
+       the frames -- because a DOMException is one of the native errors there. Reading only 'Error'
+       here would print 'DOMException {}' for it and lose its message and its frames. */
+    if (vTag === 'Error' || vTag === 'DOMException') return errorInspectOf(v, fmt, depth, indent, opts);
     if (vTag === 'Date') return styleDate(isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString());
     if (vTag === 'RegExp') return styleRegExp(String(v));
     if (vTag === 'Promise') return promiseInspectOf(v, depth, indent);
@@ -1583,7 +1587,10 @@ function utilTypes() {
     isMap: function (v) { return utilBrandCheck(Map.prototype.has, v); },
     isMapIterator: function (v) { return utilTag(v) === 'Map Iterator'; },
     isModuleNamespaceObject: function (v) { return utilTag(v) === 'Module'; },
-    isNativeError: function (v) { return utilTag(v) === 'Error'; },
+    /* A DOMException is a native error to node on every test it applies: host node 24.15 answers
+       true to util.types.isNativeError(new DOMException('d', 'AbortError')), and the tag is the
+       test, so the one it carries has to be read here as well. */
+    isNativeError: function (v) { var t = utilTag(v); return t === 'Error' || t === 'DOMException'; },
     isNumberObject: function (v) { return utilBrandCheck(Number.prototype.valueOf, v); },
     /* The tag and not 'instanceof': a promise out of a 'vm' context is of another realm, so
        'instanceof Promise' is false for it on host Node 24.15 as well, and 'util.types.isPromise'
