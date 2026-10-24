@@ -2148,3 +2148,34 @@ nothing this wave measured contradicts them, and the canvas guards for the row's
   to `handleEnterKey()` beside `'\r'`.
   Measured on one boot per side, host node v24.15.0 with `/bin/sh` on a real pty pair, load 13.1 with
   6.9 GB free.
+
+## The `timers` lane: two rows fixed on this lane's own boots
+
+- **`owc-timeout-object-internal-surface` -- fixed at HEAD**: the object `setTimeout()` returns now
+  carries `close()`, a numeric `_idleTimeout` and a boolean `_destroyed`, and `hasRef()` still reads
+  true after `clearTimeout`, which is what host node v24.15.0 answers. Host node v24.15.0 against one
+  fresh container process per case, stdout + stderr + exit code on both sides, load 8.3-10.0 with
+  1.9-2.6 GB free, two runs each: both sides print `close=function | idleTimeout=number |
+  destroyedLive=boolean | afterUnref=false | afterRef=true | refreshed=true | afterClear hasRef=true
+  destroyed=boolean idleTimeout=number`, where before the fix the container answered
+  `close=undefined`, `_idleTimeout=undefined`, `hasRef()=false` and `_destroyed=undefined`. An
+  `Immediate` is deliberately given neither of the two a `Timeout` has -- host node 24.15 answers
+  `close=undefined` and `_idleTimeout=undefined` there while still giving a `_destroyed` -- and an
+  `Interval` gets all three, matching the host. Fixed in
+  `packages/core/src/process/executors/node/runtime/guest/loader.ts`: `makeTimeout` builds the
+  surface from the entry's `immediate` flag, `clearTimer` writes `_destroyed = true` and `-1` over
+  `_idleTimeout`, and `fireTimer` marks a spent one-shot destroyed.
+- **`owc-timers-promises-signal-ignored` -- fixed at HEAD**: `node:timers/promises` reads
+  `options.signal` at last. `await setTimeout(50, undefined, { signal: ac.signal })` on an
+  already-aborted controller rejects `AbortError` with code `ABORT_ERR` instead of resolving, and so
+  do an abort 30 ms into a pending 300 ms timer, `setImmediate(v, { signal })`,
+  `scheduler.wait(d, { signal })` and a `setInterval` iterator whose signal aborts; a signal that
+  never aborts still resolves with its value, `scheduler.wait` and `scheduler.yield` with no signal
+  are untouched, and the rejection carries the signal's own reason as its `cause`. Same measurement
+  shape, one fresh container process per case: `immediateAbort=REJECTED name=AbortError code=ABORT_ERR
+  isError=true`, `laterAbort=REJECTED name=AbortError code=ABORT_ERR`, `immAbort=...`, `waitAbort=...`,
+  `noSignal=V`, `pendingSignal=W`, `wait=undefined`, `schedYield=undefined`, `intervalAborted
+  name=AbortError code=ABORT_ERR`, `cause=boom msg=The operation was aborted` -- byte-identical to
+  the host on all ten lines, where before the fix the container printed `RESOLVED`. Fixed in
+  `packages/core/src/process/executors/node/runtime/guest/misc.ts`: `BF['timers/promises']` builds
+  Node's `AbortError` and arms an abort listener on every promise form.

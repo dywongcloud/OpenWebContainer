@@ -982,27 +982,46 @@ function requireEsmFailureOf(failure) {
   return err;
 }
 
-function scheduleTimer(fn, ms, args, repeat) {
+function scheduleTimer(fn, ms, args, repeat, immediate) {
   if (typeof fn !== 'function') {
     throw new TypeError('The "callback" argument must be of type function. Received ' + typeof fn);
   }
   var delay = Number(ms);
   if (!(delay >= 1)) delay = 1;
   var id = nextTimerId++;
-  timers[id] = { fn: fn, args: args, repeat: repeat, delay: delay, refed: true, ctx: captureAsyncContext() };
+  timers[id] = { fn: fn, args: args, repeat: repeat, delay: delay, refed: true, ctx: captureAsyncContext(), immediate: immediate === true };
   host.ref(1);
   host.setTimer(id, delay);
-  return makeTimeout(id);
+  var handle = makeTimeout(id);
+  if (timers[id]) timers[id].handle = handle;
+  return handle;
 }
 
+/*
+ * The object setTimeout, setInterval and setImmediate hand back, shaped the way host node 24.15
+ * shapes it. close() and _idleTimeout belong to a Timeout and to an Interval; an Immediate carries
+ * neither -- host node 24.15's Immediate has a _destroyed and no more. _destroyed reads false
+ * while the timer is live and true once it is spent, whether it was cleared or fired.
+ *
+ * hasRef() answers the handle's own ref state and not whether the timer still stands in the table:
+ * host node 24.15 takes a cleared timer out of its list without unrefing the object the caller
+ * holds, so hasRef() is still true after a clearTimeout, and a fired one-shot is the same.
+ */
 function makeTimeout(id) {
+  var entry = timers[id];
   var handle = {
     _owcTimerId: id,
-    ref: function () { setTimerRef(id, true); return this; },
-    unref: function () { setTimerRef(id, false); return this; },
-    hasRef: function () { return !!(timers[id] && timers[id].refed); },
+    _owcRefed: true,
+    _destroyed: false,
+    ref: function () { handle._owcRefed = true; setTimerRef(id, true); return this; },
+    unref: function () { handle._owcRefed = false; setTimerRef(id, false); return this; },
+    hasRef: function () { return handle._owcRefed; },
     refresh: function () { return this; }
   };
+  if (!(entry && entry.immediate)) {
+    handle._idleTimeout = entry ? entry.delay : 1;
+    handle.close = function () { clearTimer(id); return this; };
+  }
   handle[Symbol.toPrimitive] = function () { return id; };
   return handle;
 }
@@ -1024,8 +1043,13 @@ function clearTimer(t) {
   var id = timerIdOf(t);
   if (id === undefined || !timers[id]) return;
   if (timers[id].refed) host.ref(-1);
+  var handle = timers[id].handle;
   delete timers[id];
   host.clearTimer(id);
+  if (!handle) return;
+  handle._destroyed = true;
+  /* host node 24.15's clearTimeout writes -1 over _idleTimeout; an Immediate has none to write */
+  if (handle._idleTimeout !== undefined) handle._idleTimeout = -1;
 }
 
 function fireTimer(id) {
@@ -1046,6 +1070,9 @@ function fireTimer(id) {
   } else {
     delete timers[id];
     if (t.refed) host.ref(-1);
+    /* a one-shot that has fired is spent: host node 24.15 leaves _idleTimeout at its delay and
+       marks the object destroyed, so hasRef() still answers true there */
+    if (t.handle) t.handle._destroyed = true;
   }
   runInAsyncContext(t.ctx, function () {
     /*
@@ -1120,11 +1147,8 @@ function setIntervalImpl(fn, ms) {
 }
 
 function setImmediateImpl(fn) {
-  var handle = scheduleTimer(bindToActiveDomain(fn), 0, Array.prototype.slice.call(arguments, 1), false);
   /* the one timer kind host node 24.15 runs a domain deeper: see the note in fireTimer */
-  var entry = timers[handle._owcTimerId];
-  if (entry) entry.immediate = true;
-  return handle;
+  return scheduleTimer(bindToActiveDomain(fn), 0, Array.prototype.slice.call(arguments, 1), false, true);
 }
 
 /* process.nextTick queue: drained by the host before each promise job, as Node does */

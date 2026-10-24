@@ -190,21 +190,66 @@ BF.timers = function () {
 };
 
 BF['timers/promises'] = function () {
-  function Scheduler() {}
-  Scheduler.prototype.wait = function (delay, options) {
-    return new Promise(function (resolve) {
-      setTimeoutImpl(function () { resolve(undefined); }, delay);
+  /*
+   * The error an aborted signal rejects with, as Node builds it: a subclass of Error whose name is
+   * 'AbortError' and whose code is 'ABORT_ERR', carrying the signal's own reason as its cause.
+   */
+  var ABORT_ERROR = (function () {
+    function AbortError(message) {
+      var err = new Error(message);
+      Object.setPrototypeOf(err, AbortError.prototype);
+      return err;
+    }
+    AbortError.prototype = Object.create(Error.prototype);
+    Object.defineProperty(AbortError.prototype, 'constructor', {
+      value: AbortError, writable: true, configurable: true
     });
-  };
-  Scheduler.prototype.yield = function () {
-    return new Promise(function (resolve) {
-      setImmediateImpl(function () { resolve(undefined); });
-    });
-  };
+    return AbortError;
+  })();
+  function abortErrorFor(signal) {
+    var err = ABORT_ERROR('The operation was aborted');
+    try {
+      var reason = signal === undefined || signal === null ? undefined : signal.reason;
+      if (reason !== undefined) err.cause = reason;
+    } catch (e) { /* a reason getter that throws is not the error's business */ }
+    err.code = 'ABORT_ERR';
+    err.name = 'AbortError';
+    return err;
+  }
+  /*
+   * A signal that is already aborted when the operation is asked for rejects at once, before any
+   * timer is armed; one that aborts while the operation is pending cancels the timer and rejects
+   * the same way. The listener comes off the signal the moment the operation settles, whichever
+   * way it settled, so an abort that never comes leaves nothing behind.
+   */
+  function armAbort(signal, onAborted) {
+    if (signal === undefined || signal === null || typeof signal.addEventListener !== 'function') return null;
+    var listener = function () { onAborted(); };
+    signal.addEventListener('abort', listener);
+    return function () {
+      if (typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', listener);
+    };
+  }
+  function abortRejection(signal) {
+    return new Promise(function (resolve, reject) { reject(abortErrorFor(signal)); });
+  }
+  function signalOf(options) {
+    var signal = options === undefined || options === null ? undefined : options.signal;
+    return signal === undefined || signal === null || typeof signal !== 'object' ? undefined : signal;
+  }
   /* one value per interval tick; ticks that elapse while the consumer is busy are yielded in turn */
-  async function* intervalValues(delay, value) {
+  async function* intervalValues(delay, value, signal) {
     var pending = 0;
     var wake = null;
+    var aborted = null;
+    var off = signal === undefined ? null : armAbort(signal, function () {
+      aborted = abortErrorFor(signal);
+      if (wake !== null) {
+        var resume = wake;
+        wake = null;
+        resume();
+      }
+    });
     var handle = setIntervalImpl(function () {
       pending++;
       if (wake !== null) {
@@ -215,9 +260,11 @@ BF['timers/promises'] = function () {
     }, delay);
     try {
       while (true) {
+        if (aborted !== null) throw aborted;
         if (pending === 0) {
           await new Promise(function (resolve) { wake = resolve; });
         }
+        if (aborted !== null) throw aborted;
         while (pending > 0) {
           pending--;
           yield value;
@@ -225,21 +272,69 @@ BF['timers/promises'] = function () {
       }
     } finally {
       clearTimer(handle);
+      if (off !== null) off();
     }
   }
+  function Scheduler() {}
+  Scheduler.prototype.wait = function (delay, options) {
+    var signal = signalOf(options);
+    if (signal !== undefined && signal.aborted === true) return abortRejection(signal);
+    return new Promise(function (resolve, reject) {
+      var off = null;
+      var handle = setTimeoutImpl(function () {
+        if (off !== null) off();
+        resolve(undefined);
+      }, delay);
+      if (signal !== undefined) {
+        off = armAbort(signal, function () {
+          clearTimer(handle);
+          reject(abortErrorFor(signal));
+        });
+      }
+    });
+  };
+  Scheduler.prototype.yield = function () {
+    return new Promise(function (resolve) {
+      setImmediateImpl(function () { resolve(undefined); });
+    });
+  };
   return {
-    setTimeout: function (ms, value) {
-      return new Promise(function (resolve) {
-        setTimeoutImpl(function () { resolve(value); }, ms);
+    setTimeout: function (ms, value, options) {
+      var signal = signalOf(options);
+      if (signal !== undefined && signal.aborted === true) return abortRejection(signal);
+      return new Promise(function (resolve, reject) {
+        var off = null;
+        var handle = setTimeoutImpl(function () {
+          if (off !== null) off();
+          resolve(value);
+        }, ms);
+        if (signal !== undefined) {
+          off = armAbort(signal, function () {
+            clearTimer(handle);
+            reject(abortErrorFor(signal));
+          });
+        }
       });
     },
-    setImmediate: function (value) {
-      return new Promise(function (resolve) {
-        setImmediateImpl(function () { resolve(value); });
+    setImmediate: function (value, options) {
+      var signal = signalOf(options);
+      if (signal !== undefined && signal.aborted === true) return abortRejection(signal);
+      return new Promise(function (resolve, reject) {
+        var off = null;
+        var handle = setImmediateImpl(function () {
+          if (off !== null) off();
+          resolve(value);
+        });
+        if (signal !== undefined) {
+          off = armAbort(signal, function () {
+            clearTimer(handle);
+            reject(abortErrorFor(signal));
+          });
+        }
       });
     },
-    setInterval: function (delay, value) {
-      return intervalValues(delay, value);
+    setInterval: function (delay, value, options) {
+      return intervalValues(delay, value, signalOf(options));
     },
     scheduler: new Scheduler()
   };
