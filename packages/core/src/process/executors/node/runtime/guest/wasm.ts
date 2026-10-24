@@ -196,6 +196,21 @@ export const WASM_SRC = String.raw`
     return memory;
   }
 
+  /*
+   * What marks a function that stands for a real wasm function: one the host holds, read out of a
+   * table, or an export of an instantiated module. A host's Table.set takes these and refuses an
+   * ordinary JavaScript function, so the difference travels under symbols, which no enumeration of
+   * a function or of a prototype sees. WASMFN_ID is the id the host already holds the function
+   * under, so setting one into a table sets the real function and not a wrapper around it.
+   */
+  var WASMFN = Symbol('wasmfn');
+  var WASMFN_ID = Symbol('wasmfnid');
+  /* Seeding a table with the host's own entries, at bind time. This is a symbol and not the name
+     it used to carry, because a host's Table.prototype owns no '__host': that name showed up in
+     Object.getOwnPropertyNames(WebAssembly.Table.prototype) on the container and not on a host.
+     Both are declared ahead of the class, whose prototype is built at install time. */
+  var SEED = Symbol('host');
+
   class Table {
     constructor (descriptor) {
       var d = descriptor || {};
@@ -217,14 +232,29 @@ export const WASM_SRC = String.raw`
       return entry;
     }
     set (index, value) {
-      if (value !== null && typeof value !== 'function') throw new TypeError('WebAssembly.Table.set: expected a function or null');
+      /*
+       * A function-typed table takes null or a wasm function object and nothing else. An ordinary
+       * JavaScript function is refused, in the host's own words, and the slot stays empty; the
+       * same refusal covers undefined, an object, a number and a string, which the host does not
+       * distinguish either.
+       */
+      if (value !== null && !(typeof value === 'function' && value[WASMFN] === true)) {
+        throw new TypeError('WebAssembly.Table.set(): Argument 1 is invalid for table: function-typed object must be null (if nullable) or a Wasm function object');
+      }
       var previous = this.__ids[index];
-      if (previous !== undefined) W.drop(previous);
-      var id = value === null ? 0 : W.retain(value);
-      var reply = JSON.parse(W.tableSet(this.__id, index, JSON.stringify(value === null ? { k: 'null' } : { k: 'fn', id: id })));
+      if (previous !== undefined) { W.drop(previous); this.__ids[index] = undefined; }
+      var descriptor = { k: 'null' };
+      if (value !== null) {
+        var held = value[WASMFN_ID];
+        if (typeof held === 'number') descriptor = { k: 'fn', id: held };
+        else {
+          this.__ids[index] = W.retain(value);
+          descriptor = { k: 'fn', id: this.__ids[index] };
+        }
+      }
+      var reply = JSON.parse(W.tableSet(this.__id, index, JSON.stringify(descriptor)));
       /* A function-typed table takes WebAssembly functions only, so the guest keeps its own. */
       if (reply && reply.ok === false && reply.code !== 'ERR_WASM_TABLE_JSFN') throw buildError(reply);
-      this.__ids[index] = value === null ? undefined : id;
       this.__entries[index] = value;
     }
     grow (delta) {
@@ -232,7 +262,9 @@ export const WASM_SRC = String.raw`
       this.__entries.length = unwrap(W.tableLength(this.__id));
       return before;
     }
-    __host (json) {
+  }
+  Object.defineProperty(Table.prototype, SEED, {
+    value: function (json) {
       var entries = JSON.parse(json);
       for (var i = 0; i < entries.length; i++) {
         var entry = entries[i];
@@ -240,8 +272,30 @@ export const WASM_SRC = String.raw`
         else if (this.__entries[entry.i] === undefined) this.__entries[entry.i] = null;
       }
       this.__entries.length = unwrap(W.tableLength(this.__id));
-    }
-  }
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true
+  });
+  /*
+   * A host's Table.prototype owns get, grow, length and set as enumerable members and its
+   * constructor as a non-enumerable one, which is what Object.keys answers 'get,grow,length,set'
+   * for. A class body makes every member non-enumerable, so the four are re-declared the way a
+   * host carries them, and the prototype answers '[object WebAssembly.Table]' to a toString.
+   */
+  var tableLength = Object.getOwnPropertyDescriptor(Table.prototype, 'length');
+  Object.defineProperty(Table.prototype, 'length', {
+    get: tableLength.get, set: tableLength.set, enumerable: true, configurable: true
+  });
+  ['get', 'grow', 'set'].forEach(function (name) {
+    var member = Object.getOwnPropertyDescriptor(Table.prototype, name);
+    Object.defineProperty(Table.prototype, name, {
+      value: member.value, writable: true, enumerable: true, configurable: true
+    });
+  });
+  Object.defineProperty(Table.prototype, Symbol.toStringTag, {
+    value: 'WebAssembly.Table', writable: false, enumerable: false, configurable: true
+  });
 
   function bindTable (id) {
     var table = Object.create(Table.prototype);
@@ -250,7 +304,7 @@ export const WASM_SRC = String.raw`
     table.__entries = new Array(unwrap(W.tableLength(id)));
     table.__ids = new Array(table.__entries.length);
     TAB[id] = table;
-    table.__host(W.tableDump(id));
+    table[SEED](W.tableDump(id));
     return table;
   }
 
@@ -262,6 +316,8 @@ export const WASM_SRC = String.raw`
       return decodeValue(unwrap(W.fnCall(fnId, wasmArgs(arguments), instanceId)));
     };
     Object.defineProperty(call, 'name', { value: 'wasm-function', configurable: true });
+    Object.defineProperty(call, WASMFN, { value: true });
+    Object.defineProperty(call, WASMFN_ID, { value: fnId });
     return call;
   }
 
@@ -275,6 +331,21 @@ export const WASM_SRC = String.raw`
     get value () { return decodeValue(unwrap(W.globalGet(this.__id))); }
     set value (next) { unwrap(W.globalSet(this.__id, Number(next))); }
   }
+  /*
+   * A host's Global.prototype owns three names: constructor, value and valueOf. valueOf is an
+   * ordinary enumerable method that answers the value -- the Number or BigInt the getter answers,
+   * which is what makes global.valueOf() read 5 where its absence made it a TypeError here. A
+   * host also carries value as an enumerable accessor, so Object.keys reads 'value,valueOf' there,
+   * while a class body makes both non-enumerable.
+   */
+  Global.prototype.valueOf = function () { return this.value; };
+  var globalValue = Object.getOwnPropertyDescriptor(Global.prototype, 'value');
+  Object.defineProperty(Global.prototype, 'value', {
+    get: globalValue.get, set: globalValue.set, enumerable: true, configurable: true
+  });
+  Object.defineProperty(Global.prototype, Symbol.toStringTag, {
+    value: 'WebAssembly.Global', writable: false, enumerable: false, configurable: true
+  });
 
   function bindGlobal (id) {
     var global = Object.create(Global.prototype);
@@ -395,6 +466,9 @@ export const WASM_SRC = String.raw`
         return decodeValue(unwrap(W.call(instanceId, entry.name, wasmArgs(arguments))));
       };
       Object.defineProperty(fn, 'name', { value: entry.name, configurable: true });
+      /* An export is a wasm function, so a host's Table.set takes it; only an ordinary JavaScript
+         function is refused. */
+      Object.defineProperty(fn, WASMFN, { value: true });
       return fn;
     }
     if (entry.kind === 'memory') return bindMemory(entry.id);
@@ -450,10 +524,24 @@ export const WASM_SRC = String.raw`
       TAG[this.__id] = this;
     }
   }
+  /*
+   * WebAssembly.JSTag, the tag a host carries beside Tag. It is not a class: it is an object with
+   * Tag.prototype behind it, no own property of its own, and no way to construct it -- a TypeError
+   * is what a host raises for new WebAssembly.JSTag(). It is an own name of the namespace but not an
+   * own enumerable one, which is why Object.keys misses it and Object.getOwnPropertyNames does
+   * not. Tag.prototype carries the 'WebAssembly.Tag' tag a host answers, so a tag, an exception
+   * built from one and JSTag itself all read '[object WebAssembly.Tag]'.
+   */
+  var JSTAG = Object.create(Tag.prototype);
+  Object.defineProperty(Tag.prototype, Symbol.toStringTag, {
+    value: 'WebAssembly.Tag', writable: false, enumerable: false, configurable: true
+  });
 
   class Exception {
     constructor (tag, payload) {
       var tagId = tag instanceof Tag ? tag.__id : 0;
+      /* A host refuses JSTag as the tag of an exception, in its own words, before anything else. */
+      if (tag === JSTAG) throw new TypeError('WebAssembly.Exception(): Argument 0 cannot be WebAssembly.JSTag');
       /* Anything that is not a list of values is the call a host refuses in its own words. */
       var args = 'null';
       if (Array.isArray(payload)) {
@@ -589,6 +677,10 @@ export const WASM_SRC = String.raw`
       configurable: true
     });
   }
+  /* JSTag is not one of the classes: a host carries it non-writable, beside them. */
+  Object.defineProperty(NS, 'JSTag', {
+    value: JSTAG, writable: false, enumerable: false, configurable: true
+  });
 
   Object.defineProperty(globalThis, 'WebAssembly', {
     value: NS,
