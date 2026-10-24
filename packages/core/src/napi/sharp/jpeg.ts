@@ -5,7 +5,8 @@
  *  - ES2020, platform neutral
  *  - decode: SOF0 / SOF1, Huffman, 1 or 3 components, arbitrary sampling
  *            factors, restart markers, APP0/APP1/APP2 metadata extraction
- *  - encode: baseline JFIF (SOI APP0 DQT SOF0 DHT SOS data EOI)
+ *  - encode: baseline (SOI DQT DQT SOF0 DHT SOS data EOI) -- no APP0, and one DQT
+ *            segment per table, which is the marker stream host sharp 0.33.5 writes
  *
  * Accuracy notes: the forward/inverse DCT is a separable float DCT built from
  * the exact JPEG basis matrix A[u][x] = (C(u)/2) * cos((2x+1)u*pi/16) with
@@ -480,7 +481,7 @@ function idct1x1(coef: Float32Array, out: Float32Array): void {
   out[0] = rangeLimit(descale(coef[0], 3));
 }
 
-/* Annex K quantisation tables, zigzag order */
+/* Annex K quantisation tables, natural (row major) order, which is how every text prints them */
 const STD_LUMA_Q = new Uint8Array([
   16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16,
   24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109,
@@ -1572,13 +1573,24 @@ export function encodeJpeg(
   const ncomp = grey ? 1 : 3;
   const comps: EncComp[] = [];
 
-  const qLumaZig = scaleQuant(STD_LUMA_Q, quality);
-  const qChromaZig = scaleQuant(STD_CHROMA_Q, quality);
-  const qLumaNat = new Float32Array(64);
-  const qChromaNat = new Float32Array(64);
-  for (let i = 0; i < 64; i++) {
-    qLumaNat[i] = qLumaZig[NAT2ZIG[i]];
-    qChromaNat[i] = qChromaZig[NAT2ZIG[i]];
+  /*
+   * STD_LUMA_Q and STD_CHROMA_Q are the Annex K tables in natural (row major) order, which is how
+   * every text prints them; the DQT segment wants them in zigzag order, so the zigzag copy is the
+   * one derived here. They used to be labelled the other way round, which put the natural table
+   * into the segment and quantised each coefficient with the value belonging to a different
+   * frequency: a jpeg this encoder wrote carried `00 100b0a101828333d...` -- row 0 of the luma
+   * table, then row 1 -- where host sharp 0.33.5 carries `00 100b0c0e0c0a100e0d0e1211101318281a`
+   * (measured at HEAD bfba8e9, quality 20/50/80/95). The two were self-cancelling, so a round trip
+   * still decoded, but the file was not a conformant jpeg and every coefficient was quantised by
+   * another frequency's step.
+   */
+  const qLumaNat = scaleQuant(STD_LUMA_Q, quality);
+  const qChromaNat = scaleQuant(STD_CHROMA_Q, quality);
+  const qLumaZig = new Float32Array(64);
+  const qChromaZig = new Float32Array(64);
+  for (let k = 0; k < 64; k++) {
+    qLumaZig[k] = qLumaNat[ZIG2NAT[k]];
+    qChromaZig[k] = qChromaNat[ZIG2NAT[k]];
   }
 
   /* full resolution YCbCr (or grey) */
@@ -1685,21 +1697,29 @@ export function encodeJpeg(
   bw.byte(0xff);
   bw.byte(0xd8); /* SOI */
 
-  /* APP0 JFIF, density 72 dpi */
-  seg(0xe0, [
-    0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x48, 0x00, 0x48, 0x00,
-    0x00,
-  ]);
+  /*
+   * No APP0. A JFIF APP0 is what every other encoder writes and is what this encoder used to write,
+   * but host sharp 0.33.5 writes none: its jpeg is mozjpeg's and begins SOI DQT, at every quality
+   * and every subsampling, plain, progressive and 4:4:4 alike (measured over 20 outputs at HEAD
+   * bfba8e9), so an APP0 here was 18 bytes of marker the host does not have in front of every
+   * file. Nothing reads it back: a jpeg this encoder wrote reports density 72 and no resolutionUnit
+   * on both sides with and without it.
+   */
 
-  /* DQT */
+  /*
+   * DQT: one segment per table, not one segment carrying both. Host sharp 0.33.5 emits
+   * `db:67, db:67` -- 2 + 1 byte of Pq/Tq + 64 values, twice -- where a single segment holding both
+   * tables is `db:132` (measured on the same 20 outputs).
+   */
   {
-    const payload: number[] = [0x00];
-    for (let i = 0; i < 64; i++) payload.push(qLumaZig[i]);
+    const luma: number[] = [0x00];
+    for (let i = 0; i < 64; i++) luma.push(qLumaZig[i]);
+    seg(0xdb, luma);
     if (!grey) {
-      payload.push(0x01);
-      for (let i = 0; i < 64; i++) payload.push(qChromaZig[i]);
+      const chroma: number[] = [0x01];
+      for (let i = 0; i < 64; i++) chroma.push(qChromaZig[i]);
+      seg(0xdb, chroma);
     }
-    seg(0xdb, payload);
   }
 
   /* SOF0 */

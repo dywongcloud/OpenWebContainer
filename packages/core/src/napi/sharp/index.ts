@@ -649,6 +649,27 @@ function cpuCount(): number {
 let concurrencySetting: number | undefined;
 let simdSetting = false;
 
+/**
+ * The operation cache's three limits, as libvips' own defaults: sharp sets them at load
+ * (lib/utility.js "Default cache settings of 50MB, 20 files, 100 items") and `cache()` reports them
+ * back as the three maxima.
+ */
+let cacheMemory = 50;
+let cacheFiles = 20;
+let cacheItems = 100;
+
+/**
+ * What the add-on's cache() does with one limit: a finite number sets it, truncated toward zero the
+ * way its own integer conversion does (2.7 reports a max of 2), and an argument that is not a number
+ * leaves that limit alone, so {files: 5} moves files and nothing else. A negative is clamped to 0;
+ * host 0.33.5 answers 17592186044415 for {memory: -1}, which is libvips saturating its own byte
+ * count, and that artefact is not reproduced here.
+ */
+function cacheLimit(current: number, value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return current;
+    return Math.max(0, Math.trunc(value));
+}
+
 /** The pool size libvips would be given: the count of CPUs until a caller sets it otherwise. */
 function concurrencyOf(n?: number): number {
     if (typeof n === 'number' && Number.isFinite(n) && n >= 1) concurrencySetting = Math.floor(n);
@@ -774,12 +795,26 @@ export function createAddon(host: SharpAddonHost = {}): object {
         metadata,
         stats,
         pipeline,
-        // libvips' own limits, which sharp sets at load (lib/utility.js: "Default cache settings of 50MB,
-        // 20 files, 100 items") and cache() reports back as the three maxima. Reporting 0 for them made
-        // this the one sharp answer that is wrong rather than refused: a caller sizing against
-        // cache().items.max saw 0 where the add-on says 100. current and high stay 0 -- the shim keeps
-        // no operation cache, so nothing has been cached here.
-        cache: () => ({ memory: { current: 0, high: 0, max: 50 }, files: { current: 0, max: 20 }, items: { current: 0, max: 100 } }),
+        /*
+         * The three limits are a setting and its reading, not three constants. sharp's wrapper does
+         * the shape handling itself (lib/utility.js): `cache(true)` is `cache(50, 20, 100)`,
+         * `cache(false)` is `cache(0, 0, 0)` and `cache({memory: 10})` is `cache(10, undefined,
+         * undefined)`, so what reaches the add-on is always three arguments, one per limit.
+         * Answering the defaults whatever it was handed made every one of those a no-op -- cache(false)
+         * answered max 50/20/100 where the add-on answers 0 -- so each limit is kept and moved.
+         * current and high stay 0: the shim keeps no operation cache, so nothing has been cached
+         * here, which is the one part of the answer libvips' own is not.
+         */
+        cache: (memory?: unknown, files?: unknown, items?: unknown): object => {
+            cacheMemory = cacheLimit(cacheMemory, memory);
+            cacheFiles = cacheLimit(cacheFiles, files);
+            cacheItems = cacheLimit(cacheItems, items);
+            return {
+                memory: { current: 0, high: 0, max: cacheMemory },
+                files: { current: 0, max: cacheFiles },
+                items: { current: 0, max: cacheItems }
+            };
+        },
         concurrency: (n?: number) => concurrencyOf(n),
         counters: () => ({ queue: 0, process: 0 }),
         simd: (on?: boolean) => {
