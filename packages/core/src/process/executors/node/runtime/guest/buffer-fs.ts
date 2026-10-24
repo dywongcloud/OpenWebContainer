@@ -958,6 +958,24 @@ BF.fs = function () {
     return at;
   }
 
+  /*
+   * The name a symbolic link stands for: itself, unless it is recorded as one, in which case the
+   * name the chain of links ends at. A read, a write, an open and a truncate of a link are all of
+   * the file the link names, because that is the file the kernel opens: the bytes a link was given
+   * when it was made are not the ones a caller reaches, so a write that is not resolved here lands
+   * on the link's own name and the target keeps the bytes it had before the call.
+   */
+  function linkTargetOf(file) {
+    var at = file;
+    for (var hop = 0; SYMLINKS[at] !== undefined && hop < 32; hop++) at = SYMLINKS[at];
+    return at;
+  }
+
+  /* The name whose bytes a path carries: a link's are the ones its target carries. */
+  function bytesNameOf(file) {
+    return canonicalOf(linkTargetOf(file));
+  }
+
   function inoOf(file) {
     var canonical = canonicalOf(file);
     if (INODES[canonical] === undefined) INODES[canonical] = INO_NEXT++;
@@ -1214,7 +1232,7 @@ BF.fs = function () {
   }
 
   function readBytesOf(file) {
-    return decodeBase64(host.readBase64(canonicalOf(file)));
+    return decodeBase64(host.readBase64(bytesNameOf(file)));
   }
 
   function check(code, syscall, file) {
@@ -1225,12 +1243,14 @@ BF.fs = function () {
 
   fs.readFileSync = function (p, opts) {
     var file = toPathString(p);
-    var st = statOf(file);
+    /* The file a read opens is the one the link names, not the link: its type and its access bits
+       are the target's, and so are the bytes that come back. */
+    var st = statOf(linkTargetOf(file));
     if (!st) throw fsError('ENOENT', 'open', String(p));
     if (st.type === 'dir') throw fsError('EISDIR', 'read', file);
     requireAccess(file, 4, 'open');
     var enc = optionsEncoding(opts);
-    if (enc && normalizeEncoding(enc) === 'utf8') return host.readText(canonicalOf(file));
+    if (enc && normalizeEncoding(enc) === 'utf8') return host.readText(bytesNameOf(file));
     var bytes = readBytesOf(file);
     if (enc) return decodeBytes(bytes, enc);
     return Buf.from(bytes);
@@ -1264,7 +1284,7 @@ BF.fs = function () {
     var file = toPathString(p);
     var type = opts && typeof opts === 'object' && typeof opts.type === 'string' ? opts.type : '';
     return new Promise(function (resolve, reject) {
-      var st = statOf(file);
+      var st = statOf(linkTargetOf(file));
       if (!st) { reject(fsError('ENOENT', 'open', String(p))); return; }
       if (st.type === 'dir') { reject(fsError('EISDIR', 'open', file)); return; }
       resolve(blobOf(readBytesOf(file), type));
@@ -1308,11 +1328,14 @@ BF.fs = function () {
        a log that grows by appends paid for every byte it had already written, again, on every
        call, so a 2 MiB log in 512 pieces took minutes where a host takes milliseconds. The file
        system appends, so nothing already written is read or written again. */
-    if (flag.charAt(0) === 'a' && statOf(file)) {
-      check(host.appendBase64(canonicalOf(file), encodeBase64(bytes)), 'open', file);
+    if (flag.charAt(0) === 'a' && statOf(linkTargetOf(file))) {
+      check(host.appendBase64(bytesNameOf(file), encodeBase64(bytes)), 'open', file);
       return;
     }
-    check(host.writeBase64(canonicalOf(file), encodeBase64(bytes), mode), 'open', file);
+    /* A write of a link is a write of what it names: a host opens the target, so the bytes land
+       there and the target's own name is the one that carries them, whether or not it was there
+       before the call -- a link to a name nothing has made yet is what makes that name. */
+    check(host.writeBase64(bytesNameOf(file), encodeBase64(bytes), mode), 'open', file);
   };
 
   fs.appendFileSync = function (p, data, opts) {
@@ -1401,7 +1424,7 @@ BF.fs = function () {
     /* A link is a name, not a copy, and a host lets it name a target that is not there yet: that is
        a dangling link, and it is what a link to a file another step creates looks like. Only a
        target that is a file carries bytes across, since a directory has none. */
-    var targetStat = statOf(from);
+    var targetStat = statOf(linkTargetOf(from));
     if (targetStat && targetStat.type === 'file') {
       check(host.writeBase64(to, encodeBase64(readBytesOf(from))), 'symlink', to);
     }
@@ -1803,7 +1826,11 @@ BF.fs = function () {
   fs.openSync = function (p, flags, mode) {
     var f = flags === undefined || flags === null ? 'r' : String(flags);
     if (VALID_FLAGS.indexOf(f) < 0) throw badFlagError(flags);
-    var file = toPathString(p);
+    var given = toPathString(p);
+    /* An open of a link opens the file the link names, as a host's open(2) does: the descriptor
+       that comes back is one on the target, so a write through it reaches the target and the bytes
+       it was opened with are the target's. Errors still name the path the caller handed over. */
+    var file = linkTargetOf(given);
     var letter = flagLetter(f);
     var creates = letter === 'w' || letter === 'a';
     var st = statOf(file);
@@ -1814,16 +1841,16 @@ BF.fs = function () {
     requireAccess(file, (letter === 'r' || f.indexOf('+') >= 0 ? 4 : 0) | (letter === 'r' && f.indexOf('+') < 0 ? 0 : 2), 'open');
     /* An 'x' in the flags is O_EXCL: the open is the creation of the name and fails when the name is
        already there, which is how a lock file and a cache write both ask for one writer. */
-    if (creates && f.indexOf('x') >= 0 && st) throw fsError('EEXIST', 'open', file);
+    if (creates && f.indexOf('x') >= 0 && st) throw fsError('EEXIST', 'open', given);
     if (creates) {
-      if (isDir) throw fsError('EISDIR', 'open', file);
+      if (isDir) throw fsError('EISDIR', 'open', given);
       /* A mode belongs to the creation and to nothing else: the name a 'w' truncates keeps the bits
          it already has, the way a host's open(2) applies O_CREAT's mode only when it makes the name.
          The default is the one a host leaves -- 0o666 for a file, masked with the umask. */
-      if (!st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0)), newMode(mode, 0o666)), 'open', file);
-      else if (letter === 'w') check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file);
+      if (!st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0)), newMode(mode, 0o666)), 'open', given);
+      else if (letter === 'w') check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', given);
     } else if (!st) {
-      throw fsError('ENOENT', 'open', file);
+      throw fsError('ENOENT', 'open', given);
     }
     var bytes = letter === 'w' || !st || isDir ? new Uint8Array(0) : readBytesOf(file);
     var fd = allocateDescriptor();
@@ -2787,6 +2814,32 @@ BF.fs = function () {
      host's Object.keys(fs.promises) does not list. */
   var NO_PROMISE = { closeSync: 1, existsSync: 1, fchownSync: 1, fsyncSync: 1, futimesSync: 1, readSync: 1, writeSync: 1, writevSync: 1 };
 
+  /*
+   * The calls host node 24.15 answers in more than one round trip, and so settles a turn later than
+   * the rest: a readFile opens the file and then reads it, a writeFile opens it and then writes it,
+   * and a realpath, a mkdtemp, a cp and the rest each resolve a name or walk a tree before the
+   * request that answers the caller. Measured on host node 24.15 against this container, one fresh
+   * boot per case and a setImmediate armed before the call: an immediate armed before a readFile
+   * runs first there ('iFI') and last here ('FiI'), while a stat, an access, a readdir, a readlink
+   * and an open all agree at one turn on both sides ('SiI', 'AiI', 'DiI', 'RiI', 'OiI').
+   */
+  var CONTENT_SYNC = { readFileSync: 1, writeFileSync: 1, appendFileSync: 1, copyFileSync: 1,
+    cpSync: 1, realpathSync: 1, symlinkSync: 1, linkSync: 1, renameSync: 1, truncateSync: 1,
+    mkdtempSync: 1, readvSync: 1, mkdirSync: 1, unlinkSync: 1 };
+  /*
+   * An error the first of those round trips reports comes back on the first turn: a readFile of a
+   * path that is not there fails at its open and answers before the immediate ('EiI' on both sides),
+   * while one of a directory opens and fails at its read and so still answers after it ('iEI' on
+   * host node 24.15). A writeFile onto a read-only directory is the same failure at the same place.
+   */
+  var OPEN_STAGE = { ENOENT: 1, ENOTDIR: 1, EACCES: 1, EPERM: 1, EROFS: 1, ELOOP: 1,
+    ENAMETOOLONG: 1, EMFILE: 1, ENFILE: 1, EBADF: 1, EEXIST: 1, ENOTEMPTY: 1 };
+  function contentCost(syncName, error) {
+    if (!CONTENT_SYNC[syncName]) return false;
+    if (error && OPEN_STAGE[error.code]) return false;
+    return true;
+  }
+
   var names = Object.keys(fs);
   var promises = {};
   fs.promises = promises;
@@ -2805,20 +2858,26 @@ BF.fs = function () {
       } catch (err) {
         error = err;
       }
-      queueMicrotask(function () {
+      settleIO(function () {
         if (error) cb(error);
         else cb(null, result);
-      });
+      }, contentCost(syncName, error));
     };
     if (!HANDLE_ONLY[syncName] && !NO_PROMISE[syncName]) {
       promises[base] = function () {
         var args = Array.prototype.slice.call(arguments);
         return new Promise(function (resolve, reject) {
+          var result;
+          var error = null;
           try {
-            resolve(impl.apply(fs, args));
+            result = impl.apply(fs, args);
           } catch (err) {
-            reject(err);
+            error = err;
           }
+          settleIO(function () {
+            if (error) reject(error);
+            else resolve(result);
+          }, contentCost(syncName, error));
         });
       };
     }
