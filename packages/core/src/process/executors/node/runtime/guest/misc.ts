@@ -2171,8 +2171,26 @@ BF.crypto = function () {
     return err;
   }
 
+  /*
+   * Node writes the value it received with numeric separators once it is past 2^32 either way --
+   * -4_294_967_297 and 281_474_976_710_656 carry them -- and leaves it bare below that, and bare
+   * whenever it is not a whole number: -4294967296 and -4294967297.5 are both plain. The bound the
+   * same message names never carries them, so it is only the received value that comes through
+   * here.
+   */
+  function separatedNumber(value) {
+    if (typeof value !== 'number' || !Number.isInteger(value) || !(Math.abs(value) > 4294967296)) return String(value);
+    var digits = String(Math.abs(value));
+    /* Past 1e21 a number prints in exponential form, which has no digits to group. */
+    if (digits.indexOf('e') >= 0) return String(value);
+    var grouped = '';
+    var i = digits.length;
+    while (i > 3) { grouped = '_' + digits.slice(i - 3, i) + grouped; i -= 3; }
+    return (value < 0 ? '-' : '') + digits.slice(0, i) + grouped;
+  }
+
   function outOfRange(name, range, value) {
-    var err = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + value);
+    var err = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + separatedNumber(value));
     err.code = 'ERR_OUT_OF_RANGE';
     return err;
   }
@@ -2299,6 +2317,9 @@ BF.crypto = function () {
      range that cannot be drawn is thrown at the caller and not handed to the callback. */
   function randomInt(min, max, callback) {
     var done = callback;
+    /* Whether the caller gave one number rather than two, which is what decides the name Node puts
+       on the span: 'max' for the one-number form, 'max - min' for the two-number one. */
+    var singleBound = max === undefined || typeof max === 'function';
     if (typeof max === 'function') {
       done = max;
       max = min;
@@ -2313,6 +2334,10 @@ BF.crypto = function () {
     if (typeof min !== 'number' || !Number.isSafeInteger(min)) throw invalidArgType('min', 'a safe integer', min);
     if (!(max > min)) throw outOfRange('max', 'greater than the value of "min" (' + min + ')', max);
     if (done !== undefined && typeof done !== 'function') throw invalidArgType('callback', 'of type function', done);
+    /* Node bounds the width of the range it draws from, and not the bounds themselves: a span of
+       2^48 - 1 is the widest it takes, so randomInt(2 ** 48) is out of range where randomInt(2 ** 48,
+       2 ** 48 + 10) -- a span of 10 at the top of the safe integers -- is a draw like any other. */
+    if (max - min > 281474976710655) throw outOfRange(singleBound ? 'max' : 'max - min', '<= 281474976710655', max - min);
     /* Node draws on its thread pool, so the callback runs after the timers a program has already
        armed and before its immediates, and the call itself answers undefined rather than a number.
        The error it hands the callback is undefined, where randomBytes' is null. */
