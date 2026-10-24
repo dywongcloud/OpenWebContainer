@@ -789,6 +789,68 @@ function evalFailureText(message: string, source: string, options: EvalFailureOp
     return `${block}\n${first}\n${kept.join('\n')}${trailer}`;
 }
 
+/** The `path:line:column` a frame of a script file names, read out of the line the guest wrote. */
+function scriptSiteOf(text: string): { path: string; line: number; column: number } | undefined {
+    const match = /^\s*at (?:(?:.*?) )?\((\/[^\s()]*):(\d+):(\d+)\)\s*$/.exec(text);
+    if (match === null) return undefined;
+    return parseSite(`${match[1]}:${match[2]}:${match[3]}`);
+}
+
+/**
+ * One frame of a script file, with the column moved onto the character V8 would have named. The
+ * line unchanged for a frame that names no file this process can read -- an internal of node's, or
+ * a file that is not there -- because such a column is node's own and not the engine's to move.
+ */
+function nodeFrame(text: string, sourceOf: (at: string) => string | undefined): string {
+    const site = scriptSiteOf(text);
+    if (site === undefined) return text;
+    const source = sourceOf(site.path);
+    if (source === undefined) return text;
+    const shown = (source.split('\n')[site.line - 1] ?? '').replace(/\t/g, ' ');
+    const column = nodeColumn(shown, site.column);
+    return text.replace(/\((\/[^\s()]*):(\d+):(\d+)\)\s*$/, `(${site.path}:${site.line}:${column})`);
+}
+
+/**
+ * What node writes when a script file -- not a `-e`/`-p` source -- dies on a fatal error: the file
+ * and the line, the offending line of the source, a caret under it, then the error, the frames of
+ * the source's own and the version trailer behind them. That block in front and that trailer behind
+ * are what this container never wrote for a file, so the run ended on a bare stack.
+ *
+ * The frames are the guest's own and already in node's shape; only the columns of the ones that
+ * name a file this process can read are moved, and nothing else about them is touched. Undefined
+ * when the top frame names no line this process can read -- a failure this renderer cannot place is
+ * reported exactly as it was rather than shown under a line it did not come from.
+ */
+function scriptFailureText(message: string, sourceOf: (at: string) => string | undefined): string | undefined {
+    /* A message that already ends with node's own trailer is a report node writes whole -- a module
+       that is not there, a preload that is not -- and not a stack to put a block in front of. */
+    if (message.endsWith(`Node.js ${NODE_VERSION}`)) return undefined;
+    const lines = message.split('\n');
+    /* A `require` of a module that is not there is the loader's failure and not the source's, so it
+       is reported with the loader's own dump and never in the shape of a source that threw. */
+    if (moduleNotFoundOf(lines) !== undefined) return undefined;
+    /* The `vm` timeout over a runaway guest is a report this container writes itself, over the stack
+       the guest's own formatter produced: there is no line it was raised at, and no host node shape
+       to put it in, so it is left as it was too. */
+    if (/^Error: Script execution timed out after /.test(lines[0] ?? '')) return undefined;
+    for (let at = 1; at < lines.length; at++) {
+        const site = scriptSiteOf(lines[at] ?? '');
+        if (site === undefined) continue;
+        const source = sourceOf(site.path);
+        if (source === undefined) return undefined;
+        const shown = (source.split('\n')[site.line - 1] ?? '').replace(/\t/g, ' ');
+        const column = nodeColumn(shown, site.column);
+        const marked = caretColumn(shown, column);
+        /* Node points past the end of a line with spaces and no caret, as it does for `-e`. */
+        const caret = marked > shown.length ? ' '.repeat(shown.length) : ' '.repeat(marked - 1) + '^';
+        const block = `${site.path}:${site.line}\n${shown}\n${caret}\n`;
+        const frames = lines.slice(1).map((text) => nodeFrame(text, sourceOf));
+        return `${block}\n${lines[0]}\n${frames.join('\n')}${REPORT_TRAILER}`;
+    }
+    return undefined;
+}
+
 /** What a guest is given to read a CommonJS body with: the wrapper the host compiles it inside. */
 const EVAL_WRAPPER_PREFIX = '(function (exports, require, module, __filename, __dirname) {'.length;
 
@@ -2829,8 +2891,14 @@ export class NodeProcess extends Process {
            A failure of the run's own setup -- a preload that is not there -- is already the whole
            of what node writes, and is not a failure of the source at all. */
         const whole = error instanceof GuestFailure && error.whole;
+        /* A script file that died is reported the way node reports one -- the file and the line, the
+           source line, a caret, the error, its frames and the version trailer -- and not as a bare
+           stack with none of them. A failure of the run's own setup is already the whole of what
+           node writes, and a failure whose top frame names no line this process can read is left as
+           it was rather than shown under a line it did not come from. */
+        const sourceOf = (at: string): string | undefined => this.fileSystem.readFile(at);
         const reported = statusFailure ?? (this.evalScript === undefined || whole
-            ? message
+            ? (whole ? message : scriptFailureText(message, sourceOf) ?? message)
             : evalFailureText(message, this.evalScript, {
                 ...(this.stackTraceLimit === undefined ? {} : { stackTraceLimit: this.stackTraceLimit }),
                 ...(error instanceof GuestFailure && error.thrown !== undefined ? { thrown: error.thrown } : {})
