@@ -432,8 +432,28 @@ function netRefresh(owner) {
  * dual-stack host and Node attempts each in turn, so connecting to 'localhost' -- or to no host at
  * all, which means 'localhost' -- is two attempts, and failing both is an AggregateError.
  */
-function netConnectList(host, family) {
+/** The name a connect asks about: a host that is not named at all is 'localhost', as Node's own default is. */
+/**
+ * One 'lookup' event, the announcement Node makes between resolving a name and dialling it: the
+ * address and the family that address is of, or the error when the name answered none, and the
+ * host that was asked for either way. A host makes it from the DNS callback, so it never lands
+ * in the turn that asked for it -- a listener attached after createConnection() returns still
+ * hears it.
+ */
+function netEmitLookup(socket, address, family, name) {
+  netDefer(function () { socket.emit('lookup', null, address, family, name); });
+}
+function netEmitLookupMiss(socket, failure, name) {
+  netDefer(function () { socket.emit('lookup', failure, null, null, name); });
+}
+
+function netConnectHost(host) {
   var name = host === undefined || host === null || host === '' ? 'localhost' : String(host);
+  return name;
+}
+
+function netConnectList(host, family) {
+  var name = netConnectHost(host);
   if (netIsIP(name)) return [name];
   if (name.toLowerCase() !== 'localhost') return null;
   if (family === 6) return ['::1'];
@@ -837,8 +857,31 @@ BF['net'] = function () {
       /* A name with two addresses is tried on both, as Node's happy-eyeballs does: only the caller's
          own lookup changes that, since it is the caller who says which addresses a name has. */
       var listed = typeof args.lookup === 'function' ? null : netConnectList(args.host, args.family);
+      /* The resolution a connect announces before it dials, as host Node 24.15 does: one 'lookup'
+         per address the name answered, in the order the addresses are tried, and one carrying the
+         error when the name answered none -- 'localhost' announces ::1 and then 127.0.0.1 before
+         the ECONNREFUSED, an unknown name announces the ENOTFOUND, and an IP literal announces
+         nothing at all because nothing was ever looked up. A caller's own lookup is not announced:
+         Node asks it instead of the resolver and reports nothing of what it answered. */
+      /* ... nothing at all for an IP literal, which no resolver was ever asked about. A caller's
+         own lookup is not announced either: Node asks it instead of the resolver and reports
+         nothing of what it answered. */
+      var asked = netConnectHost(args.host);
+      var told = typeof args.lookup === 'function' || netIsIP(asked) !== 0;
+      var announce = function (failure, addresses) {
+        if (told) return;
+        told = true;
+        if (failure) {
+          netEmitLookupMiss(self, failure, asked);
+          return;
+        }
+        for (var i = 0; i < addresses.length; i++) {
+          netEmitLookup(self, addresses[i], netIsIP(addresses[i]) === 6 ? 6 : 4, asked);
+        }
+      };
       var begin = function (failure, address) {
         if (failure) {
+          announce(failure, null);
           self.destroy(failure);
           return;
         }
@@ -855,7 +898,9 @@ BF['net'] = function () {
             return;
           }
         }
-        self._doConnect(listed || [address], port, args.localPort);
+        var dialled = listed || [address];
+        announce(null, dialled);
+        self._doConnect(dialled, port, args.localPort);
       };
       try {
         netResolve(args.host, args.family, begin, args.lookup);

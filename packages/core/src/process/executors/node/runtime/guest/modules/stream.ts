@@ -4969,21 +4969,24 @@ function owcBuildStreamCore() {
     if (s.length > 0) this._insertString(s);
   };
 
-  /* A control or meta key handed to write() is the line editor's, as it is on a host: rl.write('f',
-     { ctrl: true, name: 'u' }) kills the line it was given and leaves nothing behind. Text without
-     such a key stays on the path that echoes what the call brought in. */
+  /* A key handed to write() is the line editor's, as it is on a host: Node's write() sends every
+     write a terminal interface is given straight to _ttyWrite, so rl.write(null, { name: 'up' })
+     walks the history, rl.write(null, { name: 'left' }) moves the cursor and rl.write('f',
+     { ctrl: true, name: 'u' }) kills the line. A write that carries no key at all stays on the
+     path that decodes and echoes what the call brought in, which is the host's own split: text
+     without a key is not a keypress, and a host inserts it without asking the editor. */
   OwcRlBase.prototype.write = function (data, key) {
     if (this.closed) throw errUseAfterClose();
+    if (this.paused) this.resume();
+    if (this.terminal && key !== null && key !== undefined) {
+      this._ttyWrite(data, key);
+      return;
+    }
     /* A non-terminal interface writes bytes, and Node says so before it looks at the key or the
        output: anything that is neither a string nor a view over bytes is refused with
        ERR_INVALID_ARG_TYPE under the name 'buf'. A terminal one takes the same values without
        complaint, so only the path that decodes carries the check. */
     if (!this.terminal) checkWriteBuf(data);
-    if (this.paused) this.resume();
-    if (this.terminal && key !== null && key !== undefined && (!!key.ctrl || !!key.meta)) {
-      this._ttyWrite(data, key);
-      return;
-    }
     normalWrite(this, data, key);
   };
 

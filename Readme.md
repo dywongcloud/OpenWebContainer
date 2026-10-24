@@ -2139,6 +2139,14 @@ fitted:
   supplies that `sh`, once the shim's record for the fd is gone, so no answer of `pty.process`
   can make it `undefined` here.
 
+### `net`: the `lookup` event a connect by hostname emits before it dials
+
+- **A connect by name now announces the resolution before it dials, as host Node 24.15 does**: `net.createConnection({host:'localhost', port:45991})` emits `lookup` with `(null, '::1', 6, 'localhost')` and then `(null, '127.0.0.1', 4, 'localhost')`, and only then the `ECONNREFUSED`; a name getaddrinfo cannot answer emits one `lookup` carrying the `ENOTFOUND` before its `error`; `family: 4` and `family: 6` emit one, in that family; an IP literal emits none, because nothing was looked up; and a caller's own `lookup` option is not announced. Measured twice on one boot per side, host node v24.15.0, load 5.99 with 4.09 GB free and load 5.72 with 4.15 GB free: the sixteen lines of the socket sweep agree on both sides, including the round trip, the half-close, `server.close()` with a connection still open, `ECONNREFUSED`, the socket timeout, `EADDRINUSE` and a connect by name that succeeds. Site `packages/core/src/process/executors/node/runtime/guest/modules/net.ts`, `connect`.
+
+### `readline`: the key `write()` hands the line editor
+
+- **A key handed to `write()` is now the line editor's, as it is on a host**: `rl.write(null, {name:'up'})` on an interface built with `history: ['one','two']` and `terminal: true` puts `'one'` on the line with `rl.cursor` 3, a second up `'two'`, a third the empty line, and a down `'two'` again, with `rl.history` and `rl.historySize` untouched; the same routing moves the cursor, so `{name:'left'}`, `{name:'right'}`, `{name:'home'}` and `{name:'end'}` now write `\u001b[1D`, `\u001b[1C`, `\u001b[3D` and `\u001b[3C` as host does. Measured twice on one boot per side, host node v24.15.0, load 5.99 with 4.15 GB free and load 5.73 with 4.15 GB free: all fifteen lines of the surface agree, including the prompt, `rl.line` and `rl.cursor` after a write, the line events, `crlfDelay`, `question`, the async iterator and `emitKeypressEvents`. Site `packages/core/src/process/executors/node/runtime/guest/modules/stream.ts`, `OwcRlBase.prototype.write`.
+
 ### Upheld on this wave's own boots
 
 `owc-sharp-libc-getconf-versions`, `owc-sharp-position-attention-entropy` (attention refused, entropy
