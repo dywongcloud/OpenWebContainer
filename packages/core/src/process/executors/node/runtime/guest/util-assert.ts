@@ -2077,15 +2077,55 @@ function deepSameDiffLine(a, b) {
   return a === b || a + ',' === b || a === b + ',';
 }
 
-function deepDiffable(a, b, aText, bText) {
-  var aObj = a !== null && (typeof a === 'object' || typeof a === 'function');
-  var bObj = b !== null && (typeof b === 'object' || typeof b === 'function');
-  if (aObj && bObj) return true;
-  /* Two primitives are written 'a !== b' while they are short enough to read on one line. */
-  return aText.length + bText.length > 16;
+/*
+ * Node's own pointer row -- getStackedDiff in lib/internal/assert/assertion_error.js. Under a pair
+ * that is one line each it writes a third line of spaces with a '^' in the column at which the two
+ * inspections first differ, counting the two columns the '+ ' and '- ' take, which is why it is
+ * padded with two more spaces than that index, and it writes none at all while the first
+ * difference falls inside the first three columns, where the pair already reads as different at a
+ * glance, while that difference is past the end of the shorter of the two lines, once the two
+ * lines are together longer than a terminal is wide -- 80 where the standard error is not one --
+ * and for a pair of objects, which node shows through its line diff and not through this one.
+ */
+function deepDiffCaret(a, b, aText, bText) {
+  if (a !== null && typeof a === 'object' && b !== null && typeof b === 'object') return '';
+  if (aText.indexOf('\n') >= 0 || bText.indexOf('\n') >= 0) return '';
+  if (aText.length + bText.length > 80) return '';
+  var indicatorIdx = -1;
+  var i = 0;
+  for (; i < aText.length; i++) {
+    if (aText.charAt(i) !== bText.charAt(i)) {
+      if (i >= 3) indicatorIdx = i;
+      break;
+    }
+  }
+  if (indicatorIdx === -1) return '';
+  var pad = '';
+  for (i = 0; i < indicatorIdx + 2; i++) pad += ' ';
+  return pad + '^';
 }
 
-function deepDiffLines(aText, bText) {
+/*
+ * Node's own choice between the two shapes -- isSimpleDiff and getSimpleDiff in the same file. A
+ * pair of objects is never shown side by side, and neither is a pair either side of which
+ * inspects to more than one line: both go through node's line diff, with the '+ actual - expected'
+ * header. What is left is written 'a !== b' while it is still short enough to read on one line:
+ * node's own bound, kMaxShortStringLength, less the two quotes each side that is a string is
+ * written with. Everything else is the stacked pair, and it carries the pointer row.
+ */
+function deepDiffable(a, b, aText, bText) {
+  var aObj = a !== null && typeof a === 'object';
+  var bObj = b !== null && typeof b === 'object';
+  if (aObj && bObj) return true;
+  if (aText.indexOf('\n') >= 0 || bText.indexOf('\n') >= 0) return true;
+  var stringsLen = aText.length + bText.length;
+  if (typeof a === 'string') stringsLen -= 2;
+  if (typeof b === 'string') stringsLen -= 2;
+  if (stringsLen <= 12 && (a !== 0 || b !== 0)) return false;
+  return true;
+}
+
+function deepDiffLines(aText, bText, caret) {
   var a = aText.split('\n');
   var b = bText.split('\n');
   var n = a.length;
@@ -2095,7 +2135,7 @@ function deepDiffLines(aText, bText) {
   if (n * m > 40000) {
     for (i = 0; i < n; i++) out.push('+ ' + a[i]);
     for (j = 0; j < m; j++) out.push('- ' + b[j]);
-    return out.join('\n') + '\n';
+    return out.join('\n') + '\n' + (caret ? caret + '\n' : '');
   }
   /* L[i][j]: the longest common subsequence of a[i..] and b[j..]. */
   var L = [];
@@ -2121,7 +2161,7 @@ function deepDiffLines(aText, bText) {
       j++;
     }
   }
-  return out.join('\n') + '\n';
+  return out.join('\n') + '\n' + (caret ? caret + '\n' : '');
 }
 
 BF.assert = function () {
@@ -2178,7 +2218,8 @@ BF.assert = function () {
     var a = assertInspect(actual);
     var b = assertInspect(expected);
     if (deepDiffable(actual, expected, a, b)) {
-      return 'Expected values to be strictly deep-equal:\n+ actual - expected\n\n' + deepDiffLines(a, b);
+      return 'Expected values to be strictly deep-equal:\n+ actual - expected\n\n'
+        + deepDiffLines(a, b, deepDiffCaret(actual, expected, a, b));
     }
     return 'Expected values to be strictly deep-equal:\n\n' + a + ' !== ' + b + '\n';
   }
@@ -2211,7 +2252,8 @@ BF.assert = function () {
     }
     var a = assertInspect(actual);
     var b = assertInspect(expected);
-    fail(actual, expected, message, 'strictEqual', 'Expected "actual" to be reference-equal to "expected":\n+ actual - expected\n\n' + deepDiffLines(a, b));
+    fail(actual, expected, message, 'strictEqual', 'Expected "actual" to be reference-equal to "expected":\n+ actual - expected\n\n'
+      + deepDiffLines(a, b, deepDiffCaret(actual, expected, a, b)));
   };
   assert.notStrictEqual = function (actual, expected, message) {
     if (Object.is(actual, expected)) fail(actual, expected, message, 'notStrictEqual', 'Expected "actual" to be strictly unequal to: ' + assertInspect(expected));
