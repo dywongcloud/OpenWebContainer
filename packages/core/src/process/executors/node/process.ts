@@ -789,11 +789,21 @@ function evalFailureText(message: string, source: string, options: EvalFailureOp
     return `${block}\n${first}\n${kept.join('\n')}${trailer}`;
 }
 
-/** The `path:line:column` a frame of a script file names, read out of the line the guest wrote. */
-function scriptSiteOf(text: string): { path: string; line: number; column: number } | undefined {
+/**
+ * The `path:line:column` a frame of a script file names, read out of the line the guest wrote.
+ *
+ * A frame with no name in front of it -- the body of an anonymous callback, the shape host node
+ * writes for a `process.nextTick` callback -- names the place with no parentheses at all, so both
+ * shapes are read; `bare` says which one it was, because only a named one is rewritten in place.
+ */
+function scriptSiteOf(text: string):
+    { path: string; line: number; column: number; bare: boolean } | undefined {
     const match = /^\s*at (?:(?:.*?) )?\((\/[^\s()]*):(\d+):(\d+)\)\s*$/.exec(text);
-    if (match === null) return undefined;
-    return parseSite(`${match[1]}:${match[2]}:${match[3]}`);
+    const at = match === null ? /^\s*at (\/[^\s()]*):(\d+):(\d+)\s*$/.exec(text) : match;
+    if (at === null) return undefined;
+    const site = parseSite(`${at[1]}:${at[2]}:${at[3]}`);
+    if (site === undefined) return undefined;
+    return { path: site.path, line: site.line, column: site.column, bare: match === null };
 }
 
 /**
@@ -808,6 +818,7 @@ function nodeFrame(text: string, sourceOf: (at: string) => string | undefined): 
     if (source === undefined) return text;
     const shown = (source.split('\n')[site.line - 1] ?? '').replace(/\t/g, ' ');
     const column = nodeColumn(shown, site.column);
+    if (site.bare) return `    at ${site.path}:${site.line}:${column}`;
     return text.replace(/\((\/[^\s()]*):(\d+):(\d+)\)\s*$/, `(${site.path}:${site.line}:${column})`);
 }
 
