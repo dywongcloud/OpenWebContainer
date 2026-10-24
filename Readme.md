@@ -2088,3 +2088,36 @@ nothing this wave measured contradicts them, and the canvas guards for the row's
 32x32 to 8x8 resample, a 1:1 copy, `createPattern`, `putImageData`, the `source-in` and
 `destination-in` composites, `setTransform`/`resetTransform`, the 16-bit JPEG quant table at quality
 0.1 and the pdf refusal -- all still read as the record says they do.
+### `node-pty`: the sentence a `resize()` after the child has exited throws
+
+- **A resize after the exit is now the add-on's own sentence**: host node-pty 1.1.0 throws
+  `ioctl(2) failed, EBADF` -- the string its `PtyResize` builds for the `EBADF` an
+  `ioctl(TIOCSWINSZ)` on the master descriptor the child's exit closed returns -- and the
+  container now throws the same string, where it threw `resize: no terminal is open on fd 1011`.
+  Measured on one boot per side, host node v24.15.0 with node-pty 1.1.0, load 10.1 with 4.2 GB
+  free: `sh -c 'echo DONE'`, then `t.resize(60, 30)` 100 ms after the exit event, is
+  `ioctl(2) failed, EBADF` on both, and the 16 other lines of the same probe still agree. Site
+  `packages/core/src/napi/node-pty/index.ts`, `resize`. **`Terminal.process` is the shim's own and
+  stays recorded rather than fitted**: on a live terminal host reports the process in the
+  terminal's foreground group (`sh -c 'sleep 3'` answers `sleep`) and answers `undefined` once the
+  child has exited, where the container answers the file it spawned, `sh`, both while the child
+  runs and after it -- and after the exit it is node-pty's own `|| this._file` fallback that
+  supplies that `sh`, once the shim's record for the fd is gone, so no answer of `pty.process`
+  can make it `undefined` here.
+
+
+## The `fs-wasm` shard, executor wave adv16: two rows fixed on this wave's own boots
+
+- **`fs`: a mode handed to `openSync`/`mkdirSync` as a positional argument is applied at last**:
+  `openSync('z/a','w',0o600)` gives 600, `openSync('z/b','w',0o400)` 400, `openSync('z/h','wx',0o600)`
+  600 and `mkdirSync('z/f',0o700)` 700, which is what host node 24.15 answers for all four, while
+  `writeFileSync({mode})` 600/755, `mkdirSync({mode:0o700})` 700 and `appendFileSync` 644 stay as
+  they were and a write over a name already there still leaves the bits it has. Fixed in
+  `packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts`: `newMode` reads a bare number
+  as well as an options object, and `openSync` hands the mode to the creation only.
+- **`WebAssembly`'s own-key surface is the host's**: `Object.keys(WebAssembly).sort()` is now
+  `compile,compileStreaming,instantiate,instantiateStreaming,validate`, so the two streaming entry
+  points exist (each takes a Response or a promise of one: a Content-Type other than
+  `application/wasm` rejects `ERR_WEBASSEMBLY_RESPONSE`, anything else `ERR_INVALID_ARG_TYPE`) and the
+  eight constructors are no longer enumerable. Fixed in
+  `packages/core/src/process/executors/node/runtime/guest/wasm.ts`.

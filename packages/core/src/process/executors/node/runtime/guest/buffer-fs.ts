@@ -1279,8 +1279,15 @@ BF.fs = function () {
    * directory world writable: writeFileSync with mode 0o600 came back 0o644.
    */
   var UMASK = 0o022;
+  /*
+   * The mode reaches a call two ways: as the mode of an options object, and as a bare number in the
+   * overloads Node kept -- openSync(path, flags, mode) and mkdirSync(path, mode) -- where the number
+   * is the whole second or third argument. Both name the same bits, so a number is read here
+   * whichever of the two it arrived as.
+   */
   var newMode = function (opts, fallback) {
-    var asked = opts && typeof opts === 'object' && typeof opts.mode === 'number' ? opts.mode : fallback;
+    var asked = typeof opts === 'number' ? opts
+      : opts && typeof opts === 'object' && typeof opts.mode === 'number' ? opts.mode : fallback;
     return asked & ~UMASK & 0o7777;
   };
 
@@ -1808,7 +1815,11 @@ BF.fs = function () {
     if (creates && f.indexOf('x') >= 0 && st) throw fsError('EEXIST', 'open', file);
     if (creates) {
       if (isDir) throw fsError('EISDIR', 'open', file);
-      if (letter === 'w' || !st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file);
+      /* A mode belongs to the creation and to nothing else: the name a 'w' truncates keeps the bits
+         it already has, the way a host's open(2) applies O_CREAT's mode only when it makes the name.
+         The default is the one a host leaves -- 0o666 for a file, masked with the umask. */
+      if (!st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0)), newMode(mode, 0o666)), 'open', file);
+      else if (letter === 'w') check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file);
     } else if (!st) {
       throw fsError('ENOENT', 'open', file);
     }

@@ -380,20 +380,97 @@ export const WASM_SRC = String.raw`
     }
   }
 
+  /*
+   * The two streaming entry points. What either takes is a Response, or a promise of one, and what
+   * streams is its body: the bytes go through the same compile the non-streaming call uses, because
+   * a container has no host network behind the fetch that produced them. Both checks a host makes
+   * are made here, and both come back as a rejection rather than a throw: the argument is neither a
+   * Response nor a promise, and a Response whose Content-Type is not exactly application/wasm.
+   */
+  function describeSource (value) {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'string') return "type string ('" + value + "')";
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+      return 'type ' + typeof value + ' (' + String(value) + ')';
+    }
+    if (typeof value === 'symbol' || typeof value === 'function') return 'type ' + typeof value;
+    var ctor = value.constructor;
+    return 'an instance of ' + (ctor && typeof ctor.name === 'string' && ctor.name ? ctor.name : 'Object');
+  }
+  function badSource (value) {
+    var error = new TypeError('The "source" argument must be an instance of Response or an Promise resolving to Response. Received ' + describeSource(value));
+    error.code = 'ERR_INVALID_ARG_TYPE';
+    return error;
+  }
+  function badMime (type) {
+    var error = new TypeError("WebAssembly response has unsupported MIME type '" + (type === undefined || type === null ? 'null' : type) + "'");
+    error.code = 'ERR_WEBASSEMBLY_RESPONSE';
+    return error;
+  }
+  /* A Response is taken by what it can do rather than by what class made it, so a package that
+     installs its own Response under that name still works here. */
+  function isResponse (value) {
+    return !!value && typeof value.arrayBuffer === 'function';
+  }
+  function streamingBytes (source) {
+    if (isResponse(source)) {
+      /* A body is one-shot: a Response a caller already read -- or already handed to one of these
+         two -- is unusable, and a host says so in its own words rather than the Response's. */
+      if (source.bodyUsed === true) {
+        var used = new TypeError('WebAssembly response body has already been used');
+        used.code = 'ERR_WEBASSEMBLY_RESPONSE';
+        return Promise.reject(used);
+      }
+      var headers = source.headers;
+      var type = headers && typeof headers.get === 'function' ? headers.get('content-type') : null;
+      if (type !== 'application/wasm') return Promise.reject(badMime(type));
+      return Promise.resolve(source.arrayBuffer());
+    }
+    if (source && typeof source.then === 'function') {
+      return Promise.resolve(source).then(function (value) {
+        if (!isResponse(value)) throw badSource(value);
+        return streamingBytes(value);
+      });
+    }
+    return Promise.reject(badSource(source));
+  }
+  function compileStreaming (source) {
+    return streamingBytes(source).then(function (bytes) { return new Module(bytes); });
+  }
+  /* Given bytes a caller reads result.module and result.instance, the pair instantiate answers. */
+  function instantiateStreaming (source, imports) {
+    return streamingBytes(source).then(function (bytes) {
+      var module = new Module(bytes);
+      return { module: module, instance: new Instance(module, imports) };
+    });
+  }
+
+  /*
+   * The namespace object: the five functions a caller enumerates, and the constructors beside them,
+   * which a host does not enumerate -- Object.keys(WebAssembly) there is those five names and no
+   * more -- so the two kinds of member are put on it two different ways.
+   */
+  var NS = {
+    compile: compile,
+    compileStreaming: compileStreaming,
+    instantiate: instantiate,
+    instantiateStreaming: instantiateStreaming,
+    validate: validate
+  };
+  var CLASS_NAMES = ['Module', 'Instance', 'Memory', 'Table', 'Global', 'CompileError', 'LinkError', 'RuntimeError'];
+  var CLASS_VALUES = [Module, Instance, Memory, Table, Global, CompileError, LinkError, RuntimeError];
+  for (var cn = 0; cn < CLASS_NAMES.length; cn++) {
+    Object.defineProperty(NS, CLASS_NAMES[cn], {
+      value: CLASS_VALUES[cn],
+      writable: true,
+      enumerable: false,
+      configurable: true
+    });
+  }
+
   Object.defineProperty(globalThis, 'WebAssembly', {
-    value: {
-      compile: compile,
-      instantiate: instantiate,
-      validate: validate,
-      Module: Module,
-      Instance: Instance,
-      Memory: Memory,
-      Table: Table,
-      Global: Global,
-      CompileError: CompileError,
-      LinkError: LinkError,
-      RuntimeError: RuntimeError
-    },
+    value: NS,
     writable: true,
     configurable: true,
     enumerable: false
