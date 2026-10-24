@@ -99,6 +99,17 @@ function shebangInterpreter(fileSystem: IFileSystem, file: string): string | und
 /** A word that opens a construct the script engine parses: a line that opens with one is the engine's whole. */
 const COMPOUND_KEYWORDS = new Set(['if', 'for', 'while', 'until', 'case', 'select', 'function']);
 
+/**
+ * The reserved words that stand *inside* a construct one of `COMPOUND_KEYWORDS` opened. A line
+ * carrying one is a construct however it was reached, so it is the engine's whole too.
+ *
+ * `printf 'ab\n' | while read x; do echo hi; done` holds no `<`, `>`, `(`, `)` or backtick, so
+ * nothing above sends it to the engine, and its first step opens with `printf` rather than with a
+ * `COMPOUND_KEYWORDS` word: cut on the `;` it becomes a bare `do echo hi` and a bare `done`, which
+ * no shell parses.
+ */
+const CONSTRUCT_KEYWORDS = new Set(['then', 'elif', 'else', 'fi', 'do', 'done', 'esac']);
+
 /** The first word of a line, as the shell quotes it. */
 function firstWordOf(text: string): string {
     return splitCommandLine(text)[0] ?? '';
@@ -188,7 +199,13 @@ function splitCompoundLine(line: string): CompoundStep[] | null {
     steps.push({ op, text: text.trim() });
     if (steps.length === 0) return null;
     for (const step of steps) if (step.text === '') return null; // a command missing beside an operator
-    if (COMPOUND_KEYWORDS.has(firstWordOf(steps[0].text))) return null;
+    /* Every step is looked at, not only the first: a pipeline is a compound line whose first word is
+       the command on its left, and the construct on the right of the `|` is one only the engine
+       parses -- `echo a | while read v; do ...; done`. */
+    for (const step of steps) {
+        const word = firstWordOf(step.text);
+        if (COMPOUND_KEYWORDS.has(word) || CONSTRUCT_KEYWORDS.has(word)) return null;
+    }
     return steps;
 }
 
@@ -594,7 +611,11 @@ export class ShellProcess extends Process {
     }
     private async handlePaste(pastedText: string): Promise<void> {
         // Split the pasted text by lines
-        const lines = pastedText.split(/\r?\n/);
+        /* Each of CR and LF ends exactly one line, as it does on a terminal: the line discipline
+           turns a CR into an NL and leaves an NL alone, so a CRLF written as one write reaches the
+           shell as two line endings -- two lines submitted, two prompts printed -- and a write that
+           ends in a bare CR is one, which a `?` before the `|` would swallow instead of submit. */
+        const lines = pastedText.split(/\r|\n/);
 
         // Handle first line - insert at cursor position
         const firstLine = lines[0];
