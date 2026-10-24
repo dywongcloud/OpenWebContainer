@@ -26,6 +26,7 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 		let term: XTerm | undefined;
 		let fitAddon: FitAddon | undefined;
 		let resizeObserver: ResizeObserver | undefined;
+		let openTimer: ReturnType<typeof setTimeout> | undefined;
 
 		// xterm only builds its renderer once the pane has been laid out; opening into a pane with no
 		// size leaves _renderer unset, and the first fit or write then reads dimensions of undefined.
@@ -135,7 +136,14 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 			}
 		};
 
-		open();
+		/* xterm's Viewport defers a syncScrollArea to a timeout of its own. A terminal opened and
+		   disposed inside one commit -- which is what a StrictMode double mount does -- leaves that
+		   timeout to run against a RenderService whose renderer the dispose has cleared, and it
+		   throws an uncaught TypeError on every load. Opening on a later turn instead means a mount
+		   that is torn down in the same commit never opens a terminal at all, so nothing is left to
+		   throw; a real mount opens one a tick later, which is also after the pane has been laid
+		   out. A timer rather than a frame so a tab that is loading in the background opens too. */
+		openTimer = setTimeout(open, 0);
 		if (typeof ResizeObserver !== "undefined") {
 			resizeObserver = new ResizeObserver(safeFit);
 			resizeObserver.observe(element);
@@ -147,6 +155,7 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 
 		return () => {
 			disposed = true;
+			if (openTimer !== undefined) clearTimeout(openTimer);
 			resizeObserver?.disconnect();
 			window.removeEventListener("resize", safeFit);
 			document.removeEventListener("visibilitychange", safeFit);

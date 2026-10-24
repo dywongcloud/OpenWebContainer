@@ -218,7 +218,14 @@ server.listen(PORT, () => {
 		setRestored(null);
 		if (meta.openFile) void handleSelectFile(meta.openFile);
 		for (const server of meta.servers) {
-			if (server.command) void handleCommand(server.command + "\r").catch(() => undefined);
+			if (!server.command) continue;
+			/* The line the restore is running was not typed into this pane, so nothing has recorded
+			   it. Put it where a typed line leaves it, or the next reading of the ports remembers
+			   the port with no command at all and the server does not survive the reload after this
+			   one. */
+			commandLineRef.current = server.command;
+			lastCommandRef.current = server.command;
+			void handleCommand(server.command + "\r").catch(() => undefined);
 		}
 	}, [restored, shellReady, handleSelectFile, handleCommand]);
 

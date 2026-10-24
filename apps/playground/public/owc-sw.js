@@ -13,6 +13,9 @@ const PREVIEW_PATH_PREFIX = '/__owc/preview/';
 const PREVIEW_PATTERN = /^\/__owc\/preview\/(\d+)(\/.*)?$/;
 const REQUEST_MESSAGE = 'owc-preview-request';
 const PORTS_MESSAGE = 'owc-preview-ports';
+/* The page names the tab a preview link came from; it travels in the URL because a navigation
+   carries no client id, and is taken out again before the guest server sees the request. */
+const TAB_PARAM = '__owc-tab';
 const REQUEST_TIMEOUT_MS = 25000;
 const CLIENT_POLL_MS = 250;
 /*
@@ -27,10 +30,10 @@ const NULL_BODY_STATUSES = [204, 205, 304];
 const DROPPED_RESPONSE_HEADERS = ['connection', 'keep-alive', 'transfer-encoding', 'content-length'];
 
 /**
- * Which window is serving which ports. Several tabs can each run their own container,
- * and two of them may well listen on the same port number, so a request has to reach
- * the page that actually owns the listener rather than whichever window happens to be
- * focused. Each page advertises its live ports; entries are dropped when the client
+ * Which window is serving which ports, and which tab each window is. Several tabs can each run
+ * their own container, and two of them may well listen on the same port number, so a request has
+ * to reach the page that actually owns the listener rather than whichever window happens to be
+ * focused. Each page advertises its live ports and its tab; entries are dropped when the client
  * disappears and replaced on every advertisement.
  */
 const clientPorts = new Map();
@@ -40,10 +43,27 @@ self.addEventListener('message', (event) => {
   if (data.type !== PORTS_MESSAGE) return;
   const ports = Array.isArray(data.ports) ? data.ports.filter((port) => Number.isInteger(port)) : [];
   if (event.source && typeof event.source.id === 'string') {
-    if (ports.length === 0) clientPorts.delete(event.source.id);
-    else clientPorts.set(event.source.id, new Set(ports));
+    clientPorts.set(event.source.id, {
+      ports: new Set(ports),
+      tab: typeof data.tab === 'string' ? data.tab : ''
+    });
   }
 });
+
+/**
+ * The window whose page carries `tab`. A navigation has no client id -- the window that opened it
+ * is not the window being navigated -- so the page put its own tab id in the URL instead, and this
+ * maps it back to the window that advertised it.
+ */
+function clientIdForTab(tab) {
+  if (!tab) return '';
+  for (const [id, entry] of clientPorts) {
+    if (entry.tab && entry.tab === tab) {
+      return id;
+    }
+  }
+  return '';
+}
 
 class GatewayError extends Error {
   constructor(status, message) {
@@ -78,13 +98,14 @@ async function handlePreview(request, url, requesterId) {
   if (port < 1 || port > 65535) {
     return textResponse(400, 'Invalid preview port.');
   }
-  const path = (match[2] || '/') + url.search;
+  const path = withoutTabParam(url.search, match[2] || '/');
+  const tab = tabParam(url.search);
   const deadline = Date.now() + REQUEST_TIMEOUT_MS;
 
   try {
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
     const body = hasBody ? bytesToBase64(new Uint8Array(await request.arrayBuffer())) : null;
-    const found = await findClients(port, deadline, requesterId);
+    const found = await findClients(port, deadline, requesterId || clientIdForTab(tab));
     let lastError = null;
     let unavailable = null;
     const budget = found.advertised ? deadline : Math.min(deadline, Date.now() + FALLBACK_TIMEOUT_MS);
@@ -99,7 +120,7 @@ async function handlePreview(request, url, requesterId) {
           headers: headersToObject(request.headers),
           body,
         }, Math.min(deadline, budget));
-        const response = responseFromReply(reply, port);
+        const response = responseFromReply(reply, port, tab);
         /* 503 is what a container answers for a port nothing in it is listening on: this window
            is not the one serving the port, and answering with its 503 would hide the window that
            is. It is kept as the answer of last resort. */
@@ -149,10 +170,17 @@ async function findClients(port, deadline, requesterId) {
     }
     if (clients.length > 0) {
       const serving = clients.filter((client) => {
-        const ports = clientPorts.get(client.id);
-        return ports !== undefined && ports.has(port);
+        const entry = clientPorts.get(client.id);
+        return entry !== undefined && entry.ports.has(port);
       });
-      const pool = serving.length > 0 ? serving : clients;
+      /* The tab that asked is served by the tab that asked, whether or not that tab has said it
+         serves the port yet: an advertisement that is a heartbeat late must not hand the request
+         to another tab's container. */
+      const requester = requesterId ? clients.filter((client) => client.id === requesterId) : [];
+      const rest = (serving.length > 0 ? serving : clients).filter(
+        (client) => !requester.includes(client)
+      );
+      const pool = requester.concat(rest);
       const isRequester = (client) => (requesterId && client.id === requesterId ? 0 : 1);
       return {
         clients: [...pool].sort(
@@ -199,7 +227,7 @@ function askClient(client, message, deadline) {
   });
 }
 
-function responseFromReply(reply, port) {
+function responseFromReply(reply, port, tab) {
   const status = Number(reply.status);
   if (!Number.isInteger(status) || status < 200 || status > 599) {
     throw new GatewayError(502, 'Preview handler returned an invalid status.');
@@ -213,10 +241,15 @@ function responseFromReply(reply, port) {
     }
     headers.set(key, String(value));
   }
-  // Absolute-path redirects must stay inside the gateway prefix.
+  // Absolute-path redirects must stay inside the gateway prefix, and must keep naming the tab,
+  // or the follow-up navigation would be routed by focus again.
   const location = headers.get('location');
   if (location && location.startsWith('/') && !location.startsWith('//')) {
-    headers.set('location', '/__owc/preview/' + port + location);
+    const [target, query] = location.split('?');
+    const params = new URLSearchParams(query || '');
+    if (tab) params.set(TAB_PARAM, tab);
+    const search = params.toString();
+    headers.set('location', '/__owc/preview/' + port + target + (search ? '?' + search : ''));
   }
   // Preview output changes between runs; never let the browser keep it.
   headers.set('cache-control', 'no-store');
@@ -238,6 +271,19 @@ function textResponse(status, message) {
       'cache-control': 'no-store',
     },
   });
+}
+
+/** The tab a preview URL names, which is the tab that has to answer it. */
+function tabParam(search) {
+  return new URLSearchParams(search).get(TAB_PARAM) || '';
+}
+
+/** The path and query the guest server sees: the tab marker is this gateway's, not the guest's. */
+function withoutTabParam(search, path) {
+  const params = new URLSearchParams(search);
+  params.delete(TAB_PARAM);
+  const query = params.toString();
+  return path + (query ? '?' + query : '');
 }
 
 function headersToObject(headers) {

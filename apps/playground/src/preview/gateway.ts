@@ -15,6 +15,8 @@ const PREVIEW_PREFIX = '/__owc/preview';
 const SERVICE_WORKER_URL = '/owc-sw.js';
 const REQUEST_MESSAGE = 'owc-preview-request';
 const PORTS_MESSAGE = 'owc-preview-ports';
+const TAB_PARAM = '__owc-tab';
+const TAB_SCOPE_KEY = 'owc-playground-tab';
 const LOCAL_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
 /** How often a page tells the worker what it serves, whether or not its ports have changed. */
 const ADVERTISE_INTERVAL_MS = 5000;
@@ -26,11 +28,35 @@ const ADVERTISE_INTERVAL_MS = 5000;
  */
 let advertisedPorts: number[] = [];
 
+/**
+ * Which tab this page is.
+ *
+ * A navigation reaches the service worker with no client id of its own, so a preview opened by a
+ * link cannot be routed back to the tab the link came from by the request alone. sessionStorage is
+ * per tab and survives a reload, so it names this tab inside the URL the link carries; the worker
+ * strips it again before the guest server sees the request. It is the same key the snapshot uses,
+ * so one tab has one name for both.
+ */
+function tabId(): string {
+	try {
+		const existing = window.sessionStorage.getItem(TAB_SCOPE_KEY);
+		if (existing) return existing;
+		const created =
+			typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+				? crypto.randomUUID()
+				: `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		window.sessionStorage.setItem(TAB_SCOPE_KEY, created);
+		return created;
+	} catch {
+		return "";
+	}
+}
+
 function advertisePorts(): void {
 	const controller = navigator.serviceWorker && navigator.serviceWorker.controller;
 	if (!controller) return;
 	try {
-		controller.postMessage({ type: PORTS_MESSAGE, ports: advertisedPorts });
+		controller.postMessage({ type: PORTS_MESSAGE, ports: advertisedPorts, tab: tabId() });
 	} catch {
 		/* the worker is not ready; the next advertisement will reach it */
 	}
@@ -72,7 +98,12 @@ let controllerBound = false;
 /** Browser URL for a server inside the container, for example previewUrl(3070, "/hello"). */
 export function previewUrl(port: number, path: string = "/"): string {
 	const suffix = path === "" || path.startsWith("/") ? path : `/${path}`;
-	return `${PREVIEW_PREFIX}/${port}${suffix}`;
+	const [beforeQuery, existingQuery] = suffix.split("?");
+	const tab = tabId();
+	const query = [tab ? `${TAB_PARAM}=${encodeURIComponent(tab)}` : "", existingQuery || ""]
+		.filter((part) => part.length > 0)
+		.join("&");
+	return `${PREVIEW_PREFIX}/${port}${beforeQuery}${query ? `?${query}` : ""}`;
 }
 
 /**
