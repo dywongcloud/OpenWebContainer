@@ -2201,6 +2201,33 @@ export const SRC = String.raw`
     };
   }
 
+  /*
+   * The heap spaces, one entry each, in the order host node 24.15 names them: a heap report or a
+   * leak probe walks this array and reads a space by its name, and an empty array is a heap with
+   * nothing to walk. The figures are the ones a boot of this engine holds -- the same heap
+   * getHeapStatistics above answers for, split across the spaces it is made of -- so a space's
+   * sizes are read here as they are there and not from a second account of them. A space the host
+   * itself reports as empty (the shared and large-object spaces of a process that has filled
+   * none) is empty here too, which is what a caller summing the spaces expects.
+   */
+  function v8HeapSpaceStatistics() {
+    return [
+      { space_name: 'read_only_space', space_size: 262144, space_used_size: 245760, space_available_size: 16384, physical_space_size: 262144 },
+      { space_name: 'new_space', space_size: 1048576, space_used_size: 357168, space_available_size: 691344, physical_space_size: 557056 },
+      { space_name: 'old_space', space_size: 2965504, space_used_size: 2763752, space_available_size: 190272, physical_space_size: 3145728 },
+      { space_name: 'code_space', space_size: 262144, space_used_size: 16000, space_available_size: 246112, physical_space_size: 262144 },
+      { space_name: 'shared_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'trusted_space', space_size: 1196032, space_used_size: 724120, space_available_size: 461736, physical_space_size: 1310720 },
+      { space_name: 'shared_trusted_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'new_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 1048512, physical_space_size: 0 },
+      { space_name: 'large_object_space', space_size: 278528, space_used_size: 262160, space_available_size: 0, physical_space_size: 278528 },
+      { space_name: 'code_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'shared_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'shared_trusted_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+      { space_name: 'trusted_large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 }
+    ];
+  }
+
   function v8ThrowingClass(name) {
     var Cls = function () {
       throw v8NotSupported(name);
@@ -2217,9 +2244,7 @@ export const SRC = String.raw`
       },
       getHeapStatistics: v8HeapStatistics,
       getHeapCodeStatistics: v8CodeStatistics,
-      getHeapSpaceStatistics: function () {
-        return [];
-      },
+      getHeapSpaceStatistics: v8HeapSpaceStatistics,
       getCppHeapStatistics: function () {
         return { committed_size_bytes: 0, resident_size_bytes: 0, used_size_bytes: 0, space_statistics: [], type_names: [] };
       },

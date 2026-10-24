@@ -59,13 +59,39 @@ BF.buffer = function () {
     var known = ['utf8', 'utf-8', 'hex', 'base64', 'base64url', 'ascii', 'latin1', 'binary', 'ucs2', 'ucs-2', 'utf16le', 'utf-16le'];
     return typeof encoding === 'string' && known.indexOf(encoding.toLowerCase()) >= 0;
   };
+  /* An encoding that is not one node knows is read as utf8 here and only here: Buffer.byteLength
+     answers the utf8 count on host node 24.15 -- 1 for Buffer.byteLength('a', 'nope') -- while a
+     Buffer.from or a toString with the same name still throws ERR_UNKNOWN_ENCODING, as they do
+     there. A caller asking how many bytes a string will take is never refused for naming the
+     encoding it will write them in badly. */
   Buffer.byteLength = function (value, encoding) {
-    if (typeof value === 'string') return encodeString(value, encoding || 'utf8').length;
-    return value.byteLength;
+    if (typeof value === 'string') {
+      var enc = typeof encoding === 'string' ? encoding : 'utf8';
+      return encodeString(value, Buffer.isEncoding(enc) ? enc : 'utf8').length;
+    }
+    /* Anything that carries bytes of its own is measured by them, as there: a Buffer, any view
+       over an ArrayBuffer and the ArrayBuffer itself. Anything else is refused, rather than
+       answered with the undefined its .byteLength reads as. */
+    if (value instanceof Uint8Array || ArrayBuffer.isView(value)
+      || (typeof ArrayBuffer === 'function' && value instanceof ArrayBuffer)) {
+      return value.byteLength;
+    }
+    throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "string" argument must be of type string or an instance of Buffer or ArrayBuffer. Received ' + describeArg(value));
   };
   Buffer.concat = function (list, totalLength) {
+    if (!Array.isArray(list)) {
+      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "list" argument must be an instance of Array. Received ' + describeArg(list));
+    }
     var total = 0;
-    for (var i = 0; i < list.length; i++) total += list[i].length;
+    for (var i = 0; i < list.length; i++) {
+      /* A string among the pieces used to be copied as its bytes were read -- 'b' contributed one
+         zero byte and concat answered a buffer of the wrong length -- where host node 24.15 refuses
+         the list outright and names the element that is not a Buffer or Uint8Array. */
+      if (!(list[i] instanceof Uint8Array)) {
+        throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "list[' + i + ']" argument must be an instance of Buffer or Uint8Array. Received ' + describeArg(list[i]));
+      }
+      total += list[i].length;
+    }
     var size = totalLength === undefined ? total : totalLength;
     var out = wrapBytes(new Uint8Array(size));
     var pos = 0;
@@ -81,6 +107,14 @@ BF.buffer = function () {
     return out;
   };
   Buffer.compare = function (a, b) {
+    /* Node names the argument it refuses: a string where a Buffer belongs is a TypeError on
+       buf1 or buf2 and not a length of 1 compared against the bytes of the other. */
+    if (!(a instanceof Uint8Array)) {
+      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "buf1" argument must be an instance of Buffer or Uint8Array. Received ' + describeArg(a));
+    }
+    if (!(b instanceof Uint8Array)) {
+      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "buf2" argument must be an instance of Buffer or Uint8Array. Received ' + describeArg(b));
+    }
     return Buffer.prototype.compare.call(a, b);
   };
 
@@ -189,12 +223,14 @@ BF.buffer = function () {
     return v > 0x7fff ? v - 0x10000 : v;
   };
   Buffer.prototype.writeUInt16BE = function (value, offset) {
+    checkWriteValue(value, 0, 65535);
     var o = offset || 0;
     this[o] = (value >>> 8) & 0xff;
     this[o + 1] = value & 0xff;
     return o + 2;
   };
   Buffer.prototype.writeUInt16LE = function (value, offset) {
+    checkWriteValue(value, 0, 65535);
     var o = offset || 0;
     this[o] = value & 0xff;
     this[o + 1] = (value >>> 8) & 0xff;
@@ -207,6 +243,7 @@ BF.buffer = function () {
     return this.readUInt32LE(offset) | 0;
   };
   Buffer.prototype.writeUInt8 = function (value, offset) {
+    checkWriteValue(value, 0, 255);
     this[offset || 0] = value & 0xff;
     return (offset || 0) + 1;
   };
@@ -219,6 +256,7 @@ BF.buffer = function () {
     return ((this[o + 3] << 24) >>> 0) + (this[o + 2] << 16) + (this[o + 1] << 8) + this[o];
   };
   Buffer.prototype.writeUInt32BE = function (value, offset) {
+    checkWriteValue(value, 0, 4294967295);
     var o = offset || 0;
     this[o] = (value >>> 24) & 0xff;
     this[o + 1] = (value >>> 16) & 0xff;
@@ -227,6 +265,7 @@ BF.buffer = function () {
     return o + 4;
   };
   Buffer.prototype.writeUInt32LE = function (value, offset) {
+    checkWriteValue(value, 0, 4294967295);
     var o = offset || 0;
     this[o] = value & 0xff;
     this[o + 1] = (value >>> 8) & 0xff;
@@ -252,6 +291,21 @@ BF.buffer = function () {
     if (typeof value === 'object') return 'an instance of ' + ((value.constructor && value.constructor.name) || 'Object');
     if (typeof value === 'string') return "type string ('" + value + "')";
     return 'type ' + typeof value + ' (' + String(value) + ')';
+  }
+
+  /*
+   * A value a width cannot hold is refused rather than truncated: host node 24.15 throws
+   * "The value of \"value\" is out of range. It must be >= 0 and <= 255. Received 300" where this
+   * used to write the low eight bits of it and answer the caller a byte it never meant to write.
+   * The comparison is the host's own, odd values and all: NaN is written as 0 there -- it is neither
+   * greater than the maximum nor less than the minimum -- and a value of another type is coerced the
+   * way the write itself coerces it, so writeUInt8('5') writes 5 and writeUInt8('abc') writes 0.
+   */
+  function checkWriteValue(value, min, max) {
+    var at = typeof value === 'number' ? value : Number(value);
+    if (at > max || at < min) {
+      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "value" is out of range. It must be >= ' + min + ' and <= ' + max + '. Received ' + value);
+    }
   }
 
   function checkOffset(buf, offset, size) {
@@ -336,26 +390,31 @@ BF.buffer = function () {
   };
 
   Buffer.prototype.writeInt8 = function (value, offset) {
+    checkWriteValue(value, -128, 127);
     var o = checkOffset(this, offset, 1);
     this[o] = value & 0xff;
     return o + 1;
   };
   Buffer.prototype.writeInt16LE = function (value, offset) {
+    checkWriteValue(value, -32768, 32767);
     var o = checkOffset(this, offset, 2);
     viewOf(this).setInt16(o, value, true);
     return o + 2;
   };
   Buffer.prototype.writeInt16BE = function (value, offset) {
+    checkWriteValue(value, -32768, 32767);
     var o = checkOffset(this, offset, 2);
     viewOf(this).setInt16(o, value, false);
     return o + 2;
   };
   Buffer.prototype.writeInt32LE = function (value, offset) {
+    checkWriteValue(value, -2147483648, 2147483647);
     var o = checkOffset(this, offset, 4);
     viewOf(this).setInt32(o, value, true);
     return o + 4;
   };
   Buffer.prototype.writeInt32BE = function (value, offset) {
+    checkWriteValue(value, -2147483648, 2147483647);
     var o = checkOffset(this, offset, 4);
     viewOf(this).setInt32(o, value, false);
     return o + 4;

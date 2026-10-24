@@ -46,18 +46,31 @@ var proc = Object.create(EventEmitterCls.prototype);
 EventEmitterCls.call(proc);
 proc.title = 'node';
 proc.version = '${NODE_VERSION}';
-proc.versions = { node: '24.15.0', v8: '13.6.233.10-node.24', uv: '1.51.0', owc: '0.1.0', napi: '10' };
+/*
+ * The version table node 24.15 carries, whole: every entry process.versions has on the host, at the
+ * version the host reports for it. A package reads this table to decide what it may do --
+ * process.versions.modules, .zlib, .openssl, .icu and .unicode are the ones asked most -- and an
+ * undefined where the host has a string cost it the answer. 'owc' is this container's own entry
+ * beside them, as it was. The same numbers are the report's own componentVersions (process.ts),
+ * so the two cannot disagree.
+ */
+proc.versions = { node: '24.15.0', acorn: '8.16.0', ada: '3.4.4', amaro: '1.1.8', ares: '1.34.6',
+  brotli: '1.2.0', cldr: '48.0', icu: '78.2', llhttp: '9.3.1', merve: '1.2.2', modules: '137',
+  napi: '10', nbytes: '0.1.3', ncrypto: '0.0.1', nghttp2: '1.68.0', openssl: '3.5.5',
+  simdjson: '4.5.0', simdutf: '6.4.0', sqlite: '3.51.3', tz: '2026a', undici: '7.24.4',
+  unicode: '17.0', uv: '1.51.0', uvwasi: '0.0.23', v8: '13.6.233.17-node.48',
+  zlib: '1.3.1-e00f703', zstd: '1.5.7', owc: '0.1.0' };
 proc.arch = 'x64';
 proc.platform = 'linux';
 proc.release = { name: 'node' };
 Object.defineProperty(proc, Symbol.toStringTag, { value: 'process', configurable: true });
 /*
- * The flags node 24.15 reports in process.features that this container can answer for itself: an
- * inspector that answers Runtime.evaluate, a tls module that does SNI and ALPN, a loopback that has
- * an IPv6 address, a loader that requires an ES module, and an engine that is not BoringSSL and is
- * not built with --debug. What node answers and this container cannot is left out rather than
- * claimed: tls_ocsp (the tls module has no OCSP stapling) and typescript (a .ts file is not
- * stripped of its types here).
+ * Every flag node 24.15 reports in process.features, with the value the host reports for it. The
+ * ten this container answers for itself are answered the same way either way; tls_ocsp and
+ * typescript are carried at the host's own values because a package reads the table to ask what the
+ * runtime it stands on is -- and the host answers true and 'strip' for both, so a check that finds
+ * undefined here takes the branch for a runtime without OCSP stapling or type stripping, which is
+ * not the runtime the check was written against.
  */
 proc.features = {
   inspector: true,
@@ -66,10 +79,12 @@ proc.features = {
   ipv6: true,
   tls_alpn: true,
   tls_sni: true,
+  tls_ocsp: true,
   tls: true,
   cached_builtins: true,
   openssl_is_boringssl: false,
-  require_module: true
+  require_module: true,
+  typescript: 'strip'
 };
 /*
  * The flags node 24.15 accepts in NODE_OPTIONS, as the Set process.allowedNodeEnvironmentFlags is:
@@ -498,11 +513,60 @@ proc.hrtime.bigint = function () {
 proc.uptime = function () {
   return (host.now() - startedAt) / 1000;
 };
+/*
+ * What this process's memory and cpu are measured against. The container's heap is the one its own
+ * v8 module answers for, so process.memoryUsage reads heapTotal, heapUsed and external there and
+ * never reports a second, disagreeing account of it; rss, arrayBuffers and the cpu figures are the
+ * host process the container runs inside, which is the only place a container process has memory
+ * outside its heap or cpu time of its own. The account comes from the host as one capability call,
+ * and a host that cannot answer (a browser worker, where there is no process to ask) is answered
+ * with the figures below rather than with zeros: a caller that divides by rss, or measures a delta
+ * with cpuUsage, has to be able to tell a running process from one that has not begun.
+ */
+var RESOURCE_BASE = { rss: 33554432, heapTotal: 8388608, heapUsed: 4194304, external: 1048576, arrayBuffers: 65536 };
+function resourceNum(value, fallback) {
+  return typeof value === 'number' && isFinite(value) ? value : fallback;
+}
+function resourceAccount() {
+  try { return callCap('resource.usage', {}) || null; } catch (e) { return null; }
+}
+function heapAccount() {
+  try {
+    var stats = requireBuiltin('v8').getHeapStatistics();
+    return {
+      total: resourceNum(stats.total_heap_size, RESOURCE_BASE.heapTotal),
+      used: resourceNum(stats.used_heap_size, RESOURCE_BASE.heapUsed),
+      external: resourceNum(stats.external_memory, RESOURCE_BASE.external)
+    };
+  } catch (e) {
+    return { total: RESOURCE_BASE.heapTotal, used: RESOURCE_BASE.heapUsed, external: RESOURCE_BASE.external };
+  }
+}
 proc.memoryUsage = function () {
-  return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 };
+  var account = resourceAccount();
+  var heap = heapAccount();
+  var memory = (account && account.memory) || {};
+  return {
+    rss: resourceNum(memory.rss, RESOURCE_BASE.rss),
+    heapTotal: heap.total,
+    heapUsed: heap.used,
+    external: resourceNum(memory.external, heap.external),
+    arrayBuffers: resourceNum(memory.arrayBuffers, RESOURCE_BASE.arrayBuffers)
+  };
 };
-proc.cpuUsage = function () {
-  return { user: 0, system: 0 };
+/* Node's own short form: memoryUsage.rss() is the resident number and nothing else. */
+proc.memoryUsage.rss = function () { return proc.memoryUsage().rss; };
+proc.cpuUsage = function (previous) {
+  var account = resourceAccount();
+  var cpu = (account && account.cpu) || { user: 0, system: 0 };
+  var now = { user: resourceNum(cpu.user, 0), system: resourceNum(cpu.system, 0) };
+  if (previous === undefined || previous === null) return now;
+  /* The delta is the whole point of the argument: the time this process spent between the two
+     calls, in microseconds, which is what a package measures a hot loop with. */
+  return {
+    user: now.user - resourceNum(previous && previous.user, 0),
+    system: now.system - resourceNum(previous && previous.system, 0)
+  };
 };
 /*
  * Signals a child of this process, as Node does with the pids it knows. The container has no
@@ -2498,8 +2562,38 @@ globalThis.File = (function () {
 })();
 globalThis.URL = typeof nodeUrl.URL === 'function' ? urlGlobalOf(nodeUrl) : nodeUrl.URL;
 globalThis.URLSearchParams = nodeUrl.URLSearchParams;
+/*
+ * atob: the forgiving base64 read of the web pair, over the checks host node 24.15 makes before it
+ * decodes. ASCII whitespace is dropped first, as there; a text that is then one past a whole number
+ * of quads -- a length no base64 text can have, padding or not -- is refused with "The string to be
+ * decoded is not correctly encoded.", and everything else the alphabet will not hold -- a character
+ * outside it, or padding where padding cannot be (more than two '=', an '=' that is not one of the
+ * last two, or any '=' in a text whose length is not a whole number of quads) -- with "Invalid
+ * character". Both are DOMExceptions, as on the host. The text itself is decoded as it was: two or
+ * three quads without padding still decode, which is what the host answers for 'YWJjZA'.
+ */
+function domExceptionOf(message) {
+  if (typeof DOMException === 'function') return new DOMException(message, 'InvalidCharacterError');
+  var err = new Error(message);
+  err.name = 'InvalidCharacterError';
+  err.code = 5;
+  return err;
+}
+function base64TextOf(input) {
+  var text = String(input).replace(/[\t\n\f\r ]/g, '');
+  var body = text.replace(/=+$/, '');
+  var padding = text.length - body.length;
+  if (padding > 2 || body.indexOf('=') >= 0) throw domExceptionOf('Invalid character');
+  /* The alphabet is asked before the length: '!' is one past a quad and is also no base64
+     character, and node answers "Invalid character" for it where it answers "The string to be
+     decoded is not correctly encoded." for 'a', which is the same length and a legal character. */
+  if (/[^A-Za-z0-9+/]/.test(body)) throw domExceptionOf('Invalid character');
+  if (body.length % 4 === 1) throw domExceptionOf('The string to be decoded is not correctly encoded.');
+  if (padding > 0 && text.length % 4 !== 0) throw domExceptionOf('Invalid character');
+  return text;
+}
 globalThis.atob = function (input) {
-  return decodeBytes(decodeBase64(String(input)), 'latin1');
+  return decodeBytes(decodeBase64(base64TextOf(input)), 'latin1');
 };
 globalThis.btoa = function (input) {
   return encodeBase64(encodeString(String(input), 'latin1'));
@@ -3790,12 +3884,26 @@ function circularStructureText(value, replacer) {
      nothing here is inside a cgroup, so it is 0. */
   proc.constrainedMemory = function () { return 0; };
   proc.resourceUsage = function () {
+    var account = resourceAccount();
     var cpu = proc.cpuUsage();
+    var usage = (account && account.resource) || {};
     return {
-      userCPUTime: cpu.user, systemCPUTime: cpu.system, maxRSS: proc.memoryUsage().rss,
-      sharedMemorySize: 0, unsharedDataSize: 0, unsharedStackSize: 0, minorPageFault: 0,
-      majorPageFault: 0, swappedOut: 0, fsRead: 0, fsWrite: 0, ipcSent: 0, ipcReceived: 0,
-      signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0
+      userCPUTime: cpu.user, systemCPUTime: cpu.system,
+      /* The high-water mark of the resident set, which node reports in kilobytes: the same number
+         memoryUsage().rss gives, divided into kibibytes, so the two agree instead of differing by
+         a factor of 1024. */
+      maxRSS: Math.round(proc.memoryUsage().rss / 1024),
+      sharedMemorySize: resourceNum(usage.sharedMemorySize, 0),
+      unsharedDataSize: resourceNum(usage.unsharedDataSize, 0),
+      unsharedStackSize: resourceNum(usage.unsharedStackSize, 0),
+      minorPageFault: resourceNum(usage.minorPageFault, 0),
+      majorPageFault: resourceNum(usage.majorPageFault, 0),
+      swappedOut: resourceNum(usage.swappedOut, 0),
+      fsRead: resourceNum(usage.fsRead, 0), fsWrite: resourceNum(usage.fsWrite, 0),
+      ipcSent: resourceNum(usage.ipcSent, 0), ipcReceived: resourceNum(usage.ipcReceived, 0),
+      signalsCount: resourceNum(usage.signalsCount, 0),
+      voluntaryContextSwitches: resourceNum(usage.voluntaryContextSwitches, 0),
+      involuntaryContextSwitches: resourceNum(usage.involuntaryContextSwitches, 0)
     };
   };
   proc.threadCpuUsage = function (previous) {
