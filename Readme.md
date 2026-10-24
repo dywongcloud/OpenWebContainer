@@ -1435,7 +1435,12 @@ re-run in isolation; the rows are open.
   this container does not is its own `(node:<pid>) ExperimentalWarning: Importing WebAssembly module
   instances is an experimental feature`, which carries the pid of the process printing it and so
   cannot be byte-identical across the two. `.ts`, `.mts` and
-  `.cts` are stripped of their types the way Node 24 strips them, on the token stream and never on
+  `.cts` are stripped of their types the way Node 24 strips them, CommonJS mode included -- a `.ts`
+  with no `import` and no `export`, and every `.cts`, are compiled from the stripped source and not
+  from the file as it stands -- and which of the two a `.ts` is was decided from the type-stripped
+  source and not from the source as written, the way node's own `getFileProtocolModuleFormat` decides
+  it, so a `.ts` whose only import is an `import type` is CommonJS (row `owc-typestrip-cjs-mode-skipped`).
+  The stripper still works on the token stream and never on
   the text, so the `:` of a ternary, of an object literal, of a `case` and of a label survives: a
   `.ts` file holding an `interface`, a `type`, an `import type`, a `private` member, a typed
   parameter, a return type, a function type, an `Array<T>` and an `as` cast is byte-identical to
@@ -1903,12 +1908,17 @@ Fixed here too, one line each, four rows closed on a witness of host node v24.15
 - `setEnvironmentData`/`getEnvironmentData` are a real map keyed by the value handed in (`getEnvironmentData(9)` and not `getEnvironmentData('9')`), and a worker is seeded with the keys its parent held when it started it.
 - `async_hooks.createHook` hears the resources this runtime schedules: `init`/`before`/`after`/`destroy` for a `Timeout`, an `Immediate` and a `TickObject`, and `init`/`promiseResolve`/`before`/`after` for a `PROMISE`, with `executionAsyncId()` reading that resource's own id inside the callback.
 
-Still measured and not fixed, each with its site: `Module.register` and `Module.registerHooks` accept hooks and
-never call them, so a registered `load` hook changes nothing a program sees -- the engine is not what stops them, since
-`quickjs-emscripten-core` 0.32.0 declares `setModuleLoader(moduleLoader: JSModuleLoaderAsync, ...)` and an async `load`
-hook can be awaited, but the two halves of the loader, `loadModule`
-(`packages/core/src/process/executors/node/process.ts:3014`) and `normalizeModule` (`:3152`), consult no registry, and
-the one both calls fill lives in the guest (`runtime/guest/misc.ts`); five of the 72 `builtinModules` are not requirable
+Module customization hooks now run before every resolve and every load. `module.registerHooks({resolve, load})` is
+asked by the CommonJS loader itself and `module.register('./loader.mjs', import.meta.url)` by the host on behalf of the
+ES module graph, through `hooksResolve`/`hooksLoad` in `runtime/guest/loader.ts`: a `resolve` that rewrites `./dep.js`
+to `./dep2.js` makes `require('./dep.js')` load `dep2.js`, a `load` that answers `{format:'commonjs', shortCircuit:true,
+source}` is what that module is compiled from, and a `resolve` answering a url no file stands behind --
+`owcvirtual:thing` -- is a module of its own, so `await import('virtual:thing')` never reaches the default loader. Two
+shapes stay with the default loader as they do on host Node 24.15: a hook that hands back a promise, which node would
+await in its own loader thread, and a `register` hook over a `require()` of a name it would rewrite (row
+`owc-module-hooks-never-invoked`).
+
+Still measured and not fixed, each with its site: five of the 72 `builtinModules` are not requirable
 though `Module.isBuiltin` answers `true` for them, each because there is nothing here to put behind the name --
 `_http_common` is llhttp's parser object and this runtime's `http` parses with no parser object to hand out,
 `_stream_wrap` is `JSStreamSocket`, a socket node's own `net` builds over a stream, `wasi` needs an import object that

@@ -333,6 +333,22 @@ function readSource(filename) {
   return src;
 }
 
+/* TypeScript's own names, as the loader sees them. */
+var TS_SOURCE_NAME = /\.[cm]?ts$/;
+
+/* What a CommonJS file is compiled from. Node 24 strips the types out of a .ts it reads as
+   CommonJS and out of every .cts before it compiles what is left -- Module.prototype._compile
+   strips each of the three TypeScript formats (lib/internal/modules/cjs/loader.js), and which
+   format a .ts is was decided from the stripped source, so a file whose only import is an
+   "import type" has no import left and is CommonJS. A .mts is a module, so it never reaches
+   this. The stripper is the type stripper's own, so what Node refuses to strip -- an enum, a
+   namespace, a parameter property, a decorator -- is refused here in the same words, code and
+   all, instead of failing to parse afterwards. */
+function cjsSourceOf(filename) {
+  var src = readSource(filename);
+  return TS_SOURCE_NAME.test(filename) ? tsStripTypes(src) : src;
+}
+
 function stripHashbang(src) {
   return src.charAt(0) === '#' && src.charAt(1) === '!' ? '//' + src.slice(2) : src;
 }
@@ -406,7 +422,7 @@ Module.prototype.require = function _require(request) { return requireFrom(this,
 /* require.extensions (Module._extensions): .node files load through it, by process.dlopen; .js and .json files load in loadCJS */
 var EXTENSIONS = {
   '.js': function (module, filename) {
-    var wrapper = compileCjsWrapper(stripHashbang(readSource(filename)), filename);
+    var wrapper = compileCjsWrapper(stripHashbang(cjsSourceOf(filename)), filename);
     wrapper.call(module.exports, module.exports, makeRequire(module), module, filename, dirnameOf(filename));
   },
   '.json': function (module, filename) {
@@ -461,6 +477,17 @@ function requireFrom(parent, id) {
   }
   var base = parent && parent.path ? parent.path : host.cwd();
   var filename = host.resolve(id, base, 'require');
+  /* A resolve hook -- see Module.registerHooks in misc.ts -- answers the url the request resolves
+     to before the loader's own answer is used, so a specifier that names no file at all is still
+     one a hook can resolve. The hook's nextResolve is handed the loader's answer, or '' when it
+     found nothing, which is what node hands it for a specifier the default loader cannot resolve. */
+  var hookedUrl = hookForRequire
+    ? resolveHookUrl(id, urlOfFile(base + '/'), filename ? urlOfFile(filename) : '', 'commonjs')
+    : undefined;
+  if (hookedUrl !== undefined) {
+    var hookedFile = fileOfUrl(hookedUrl);
+    if (hookedFile !== undefined) filename = hookedFile;
+  }
   if (!filename) throw notFoundError(id, base, parent);
   return loadCJS(filename, parent, false).exports;
 }
@@ -721,7 +748,9 @@ function loadCJS(filename, parent, isMain) {
       if (filename.slice(-4) === '.mjs' || host.isESM(filename)) {
         return loadEsmFromRequire(filename, mod);
       }
-      var src = stripHashbang(readSource(filename));
+      var hooked = (typeof loadHookSource === 'function') ? loadHookSource(urlOfFile(filename), undefined, 'commonjs') : undefined;
+      var src = stripHashbang(hooked !== undefined && hooked.source !== undefined
+        ? hooked.source : cjsSourceOf(filename));
       var wrapper = compileCjsWrapper(src, filename);
       /* The body runs as this file, so a new Function it builds -- and a dynamic import in that
          body -- is resolved from here, as it is in Node. */
@@ -741,6 +770,93 @@ function loadCJS(filename, parent, isMain) {
   if (parent && parent.children) parent.children.push(mod);
   return mod;
 }
+
+var hookResolveFn = null;
+var hookLoadFn = null;
+/* Whether the hooks the pair holds reach require() as well: registerHooks() registers them on this
+   thread, and node asks them for a CommonJS require as it asks them for an import, while the
+   module register() names is loaded and asked in a graph of its own -- require() of a name it
+   rewrites is not rewritten on a host, which is what separates the two. */
+var hookForRequire = false;
+  /* The url of a file and the file of a url, the two halves of the name this loader carries. */
+  function urlOfFile(file) { return 'file://' + String(file); }
+  function fileOfUrl(url) {
+    var u = String(url);
+    if (u.indexOf('file://') !== 0) return undefined;
+    var cut = u.indexOf('?');
+    if (cut < 0) cut = u.indexOf('#');
+    return cut < 0 ? u.slice(7) : u.slice(7, cut);
+  }
+  /* The context object node hands a hook: the conditions and the import attributes of the
+     resolution, and the url it is made from. */
+  function resolveContextOf(parentURL) {
+    return { conditions: [], importAttributes: Object.create(null),
+      parentURL: parentURL === undefined || parentURL === '' ? undefined : String(parentURL) };
+  }
+  function loadContextOf(url, format) {
+    return { conditions: [], format: format === undefined ? undefined : String(format),
+      importAttributes: Object.create(null), url: String(url) };
+  }
+  /* What one hook answered. A hook is called here and not awaited, so a promise one hands back --
+     which node waits for in its loader thread -- is an answer this loader cannot read, and the call
+     is handed on exactly as it would be had the hook not answered at all. */
+  function hookAnswered(fn, args) {
+    if (typeof fn !== 'function') return undefined;
+    var answer = fn.apply(undefined, args);
+    if (answer === null || typeof answer !== 'object') return undefined;
+    if (typeof answer.then === 'function') return undefined;
+    return answer;
+  }
+  /* One resolve hook call, over one specifier. The url the loader resolved on its own is what the
+     hook's nextResolve hands back, so a hook that calls on -- or one that only changes what the
+     default names -- is answered the way node answers it. What comes back is the url to load, or
+     undefined when no hook was registered or the hook left the call to the loader. */
+  function resolveHookUrl(specifier, parentURL, defaultUrl, defaultFormat) {
+    if (hookResolveFn === null) return undefined;
+    var answer = hookAnswered(hookResolveFn, [String(specifier), resolveContextOf(parentURL),
+      function nextResolve(spec, context) {
+        return { url: defaultUrl === undefined ? '' : defaultUrl, shortCircuit: true,
+          format: defaultFormat === undefined ? 'module' : defaultFormat };
+      }]);
+    if (answer === undefined || answer.shortCircuit !== true) return undefined;
+    return typeof answer.url === 'string' && answer.url !== '' ? answer.url : undefined;
+  }
+  /* One load hook call, over the url a module was resolved to. What comes back is the source the
+     module is compiled from and the format it is compiled as -- each of them as the hook left it,
+     and undefined when the hook left the call to the loader. */
+  function loadHookSource(url, defaultSource, defaultFormat) {
+    if (hookLoadFn === null) return undefined;
+    var answer = hookAnswered(hookLoadFn, [String(url), loadContextOf(url, defaultFormat),
+      function nextLoad(which, context) {
+        return { format: defaultFormat, shortCircuit: true, source: defaultSource };
+      }]);
+    if (answer === undefined || answer.shortCircuit !== true) return undefined;
+    return { source: typeof answer.source === 'string' ? answer.source : undefined,
+      format: typeof answer.format === 'string' ? answer.format : undefined };
+  }
+  /* The host is told once that there are hooks to ask, so a program that registers none pays
+     nothing for them on every resolve and every load. */
+  function hooksChanged() {
+    if (typeof host.hooksChanged === 'function') host.hooksChanged();
+  }
+  /* The module register() names is loaded as the ES module it is, and the hooks it exports are the
+     hooks from then on: node loads it in its own thread, and 'initialize' is the one hook it calls
+     there and nowhere else. A loader that exports none leaves both halves of the pair unset. */
+  function adoptLoaderModule(file) {
+    var token = nextEsmToken++;
+    var failure = host.esmLoad(file, token);
+    var registry = globalThis.__owc_esm_registry || {};
+    var exported = registry[token];
+    delete registry[token];
+    if (failure) throw new Error(failure);
+    if (exported === undefined) return undefined;
+    hookResolveFn = typeof exported.resolve === 'function' ? exported.resolve : null;
+    hookLoadFn = typeof exported.load === 'function' ? exported.load : null;
+    if (typeof exported.initialize === 'function') exported.initialize();
+    hookForRequire = false;
+    hooksChanged();
+    return exported;
+  }
 
 var nextEsmToken = 1;
 
@@ -1814,6 +1930,22 @@ var api = {
   },
   exportsOf: function (id, builtin) {
     return builtin ? requireBuiltin(id) : loadCJS(id, null, false).exports;
+  },
+  /* The two halves of the module customization hooks the host cannot ask from where it stands: it
+     resolves and loads an ES module itself, so a resolve hook is asked with the specifier and the
+     url the loader would have answered, and a load hook with the url and the source behind it. Both
+     answer '' when no hook is registered or the hook left the call to the loader. */
+  hooksResolve: function (specifier, parentURL, defaultUrl) {
+    var url = resolveHookUrl(specifier, parentURL === '' ? undefined : parentURL,
+      defaultUrl === '' ? undefined : defaultUrl, 'module');
+    return url === undefined ? '' : url;
+  },
+  hooksLoad: function (url, defaultSource, defaultFormat) {
+    var answer = loadHookSource(url, defaultSource === '' ? undefined : defaultSource,
+      defaultFormat === '' ? undefined : defaultFormat);
+    if (answer === undefined) return '';
+    return JSON.stringify({ source: answer.source === undefined ? null : answer.source,
+      format: answer.format === undefined ? null : answer.format });
   },
   /* the REPL's require: see createReplRequire */
   createReplRequire: function (directory) {

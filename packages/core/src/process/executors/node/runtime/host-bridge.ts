@@ -50,6 +50,12 @@ export interface HostBridgeDeps {
     /** Evaluates an ES module synchronously for require(); returns '' or the failure text. */
     loadEsm: (file: string, token: number) => string;
     /**
+     * Called once when a program registers module customization hooks, so the host knows there is a
+     * resolve and a load hook to ask on every resolution from then on. A program that registers none
+     * pays nothing for them.
+     */
+    onHooksChanged: () => void;
+    /**
      * Called on every call the guest makes into the host. A guest that reaches the host is not
      * running a runaway loop, so the runaway guard's clock starts again here.
      */
@@ -345,6 +351,12 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         return result.value;
     });
     define('esmLoad', (file, token) => context.newString(deps.loadEsm(text(file), context.getNumber(token))));
+    /* Module customization hooks: the guest has just been given a resolve hook, a load hook or both,
+       and from here every resolution and every load asks it. */
+    define('hooksChanged', () => {
+        deps.onHooksChanged();
+        return context.undefined;
+    });
     define('ref', (delta) => {
         deps.holdRef(context.getNumber(delta));
         return context.undefined;

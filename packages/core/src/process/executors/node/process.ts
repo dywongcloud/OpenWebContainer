@@ -1478,6 +1478,13 @@ export class NodeProcess extends Process {
      * `asyncRunEntryPointWithESMLoader` behind a trace out of one.
      */
     private esmEntryLoading = false;
+    /**
+     * Whether the program has registered module customization hooks -- `module.register` or
+     * `module.registerHooks`. Node asks a registered resolve hook before every resolution and a
+     * registered load hook before every load; a program that registers none pays nothing for them,
+     * so the guest is asked only once this is set.
+     */
+    private hooksArmed = false;
     private stopped = false;
     private capabilityContext: CapabilityContext;
     /** Set for a run inside a capability call (runToCompletionSync): timers and host operations are stepped there. */
@@ -1582,6 +1589,9 @@ export class NodeProcess extends Process {
         this.networkManager = networkManager;
         this.services = services;
         this.resolver = new NodeResolver(fileSystem);
+        /* The resolver detects the module syntax of a `.ts` in the type-stripped source, as node
+           does, and the stripper is this file's own. */
+        this.resolver.setTypeStripper(stripTsTypes);
         this.evalSource = evalSource;
         this.flagAnswer = flagAnswer;
         this.guestBudgetMs = services.guestBudgetMs ?? DEFAULT_GUEST_BUDGET_MS;
@@ -2219,6 +2229,9 @@ export class NodeProcess extends Process {
             holdRef: (delta) => this.holdRef(delta),
             onTeardown: (dispose) => this.guestTeardown.push(dispose),
             loadEsm: (file, token) => this.loadEsmSync(file, token),
+            /* A program just registered module customization hooks: every resolve and every load
+               asks the guest from here on. */
+            onHooksChanged: () => { this.hooksArmed = true; },
             onHostCall: () => {
                 yieldVmSlice(this.capabilityContext);
                 // the deadline is a moment in time, not a stretch: what is left of it is rearmed here
@@ -3418,6 +3431,13 @@ export class NodeProcess extends Process {
             /* A module name may carry the query and fragment of the specifier that named it, which
                are part of the module's identity but not of the file it is loaded from. */
             const { path: file, suffix } = splitModuleName(moduleName);
+            /* A load hook, if the program registered one, is asked before the file is read: see
+               hookLoadOf. A url no file stands behind -- one a resolve hook made up -- reaches the
+               engine as a module of its own because the hook answered a source for it. */
+            if (this.hooksArmed) {
+                const hooked = this.hookLoadOf(moduleName, file, suffix, dynamic);
+                if (hooked !== undefined) return hooked;
+            }
             if (file.endsWith('.json')) {
                 return { value: this.jsonModuleSource(this.readRequired(file), file) };
             }
@@ -3550,6 +3570,68 @@ export class NodeProcess extends Process {
         }
     }
 
+    /**
+     * The module name a registered resolve hook answered for `specifier`, or undefined when it left
+     * the call to the loader. A url a hook made up -- one no file stands behind, the way a virtual
+     * module is one in node -- is the module's own name here; a `file:` url is the file behind it,
+     * carrying the query and fragment of the specifier that named it, which are part of a module's
+     * identity and not of the file it is read from.
+     */
+    private hookResolveOf(spec: string, baseName: string | undefined, baseDir: string, suffix: string): string | undefined {
+        const defaultPath = this.resolver.resolve(spec, baseDir, 'import');
+        const context = this.context!;
+        const args = [
+            context.newString(spec),
+            context.newString(baseName === undefined || !baseName.startsWith('/') ? '' : toFileUrl(baseName)),
+            context.newString(defaultPath === undefined ? '' : toFileUrl(defaultPath)),
+        ];
+        let url = '';
+        try {
+            url = this.callApiString('hooksResolve', args);
+        } finally {
+            for (const arg of args) arg.dispose();
+        }
+        if (url === '') return undefined;
+        if (!url.startsWith('file://')) return url;
+        return escapePathChars(percentDecode(url.slice('file://'.length))) + suffix;
+    }
+
+    /**
+     * What a registered load hook answered for the module named `moduleName`: the source it is
+     * compiled from and the format it is compiled as, or undefined when the hook left the call to
+     * the loader. The file is read first whether or not the hook is asked, so a hook that changes
+     * the source it was given is given the real one; a url no file stands behind is an empty source,
+     * which is what a hook that answers a module out of nothing needs.
+     */
+    private hookLoadOf(moduleName: string, file: string, suffix: string, dynamic: boolean)
+        : { value: string } | undefined {
+        let source = '';
+        try { source = this.readRequired(file); } catch { /* no file behind it: a hook may supply it */ }
+        let defaultFormat = 'module';
+        try {
+            defaultFormat = file.endsWith('.json') ? 'json'
+                : this.resolver.isESM(file, file === this.requireFile) ? 'module' : 'commonjs';
+        } catch { /* a url no file stands behind has no format to detect */ }
+        const url = file.startsWith('/') ? toFileUrl(file) : moduleName;
+        const context = this.context!;
+        const args = [
+            context.newString(url),
+            context.newString(source),
+            context.newString(defaultFormat),
+        ];
+        let answer = '';
+        try {
+            answer = this.callApiString('hooksLoad', args);
+        } finally {
+            for (const arg of args) arg.dispose();
+        }
+        if (answer === '') return undefined;
+        const hooked = JSON.parse(answer) as { source: string | null; format: string | null };
+        if (hooked.format === 'commonjs') return { value: this.syntheticModule(file, false) };
+        const text = typeof hooked.source === 'string' ? hooked.source : source;
+        return { value: this.esmSource(text, file, false, suffix, dynamic) };
+    }
+
     /** Maps a specifier to the module name QuickJS will load (a plain string on success). */
     private normalizeModule(baseName: string | undefined, requestedName: string): string | { error: Error | QuickJSHandle } {
         const missingAttribute = requestedName.endsWith(MISSING_ATTRIBUTE_MARK);
@@ -3577,6 +3659,14 @@ export class NodeProcess extends Process {
                 : ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify(failure));
         }
         const baseDir = baseName && baseName.startsWith('/') ? dirnameOf(baseName) : this.currentCwd;
+        /* A resolve hook, if the program registered one, answers the url this specifier resolves to:
+           node asks it before its own resolution, so a specifier the default loader cannot read --
+           'virtual:thing' -- is still one a hook can name. The default is resolved first, so a hook
+           that hands the call on, or one that changes the url it was given, is answered with it. */
+        if (this.hooksArmed) {
+            const hooked = this.hookResolveOf(spec, baseName, baseDir, urlSuffixOf(spec));
+            if (hooked !== undefined) return hooked;
+        }
         const resolved = this.resolver.resolveDetailed(spec, baseDir, 'import');
         /* A require() reaching a name whose extension the ES module loader does not know still
            loads it: require has no handler for such an extension either, but it falls back to the

@@ -4564,6 +4564,16 @@ function tsStripTypes(src) {
     var t = tokens[k];
     return t !== undefined && t.k === 'w';
   }
+  /* Whether the token at 'k' stands where a declaration can: 'enum', 'namespace' and 'module'
+     declare something strip-only mode has no way to erase, so node refuses the file -- but the word
+     behind a '.' is a property and not a declaration, and 'module.exports' is the CommonJS exports
+     object every CommonJS .ts writes to. A 'module' is a namespace only when a name or a string
+     literal follows it, which is what separates 'module Foo {}' from the identifier. */
+  function declaresAt(k) {
+    var p = prevIdx(k);
+    var before = p >= 0 ? tokens[p] : null;
+    return !(before !== null && before.k === 'p' && before.v === '.');
+  }
   /* The index of the significant token before 'k' and after it, comments skipped; and the index of
      the bracket that matches the one at 'k', or -1. */
   function prevIdx(k) {
@@ -4759,8 +4769,14 @@ function tsStripTypes(src) {
         i++;
         continue;
       }
-      if (t.v === 'enum') throw tsUnsupportedSyntax('enum');
-      if (t.v === 'namespace' || t.v === 'module') throw tsUnsupportedSyntax('namespace');
+      if (t.v === 'enum' && declaresAt(i)) throw tsUnsupportedSyntax('enum');
+      if (t.v === 'namespace' && declaresAt(i)) throw tsUnsupportedSyntax('namespace');
+      if (t.v === 'module') {
+        var nextT = tokens[i + 1];
+        if (nextT !== undefined && (nextT.k === 'w' || nextT.k === 's') && declaresAt(i)) {
+          throw tsUnsupportedSyntax('namespace');
+        }
+      }
       if (t.v === 'interface') {
         /* 'export interface' goes with the interface: node erases the export too, there being
            nothing left for it to export. */
@@ -5531,20 +5547,20 @@ BF.module = function () {
   };
   Module.flushCompileCache = function flushCompileCache() { return undefined; };
   Module.getCompileCacheDir = function getCompileCacheDir() { return undefined; };
-  /* Module customization hooks. Node runs the hooks a registration names in a loader thread of its
-     own, before every resolve and every load; this loader has no such thread, so a registration is
-     recorded and no hook is ever called -- the graph a program sees is the one the loader resolves
-     and reads itself. The two calls keep node's own argument handling, including the
-     ERR_UNSUPPORTED_RESOLVE_REQUEST a specifier it cannot resolve raises: node resolves against the
-     parent URL a second argument gives and against 'data:', which is not hierarchical, when there
-     is none, so a relative specifier with no parent fails there exactly as it does here. */
-  var registeredHooks = null;
+  /* Module customization hooks. Node runs the hooks a registration names before every resolve and
+     every load -- in a loader thread of its own for register(), on this thread for registerHooks()
+     -- and what a hook answers is what the loader resolves to and compiles. There is no second
+     thread here, so the hooks run where the loader runs: the CommonJS loader asks them itself, and
+     the host asks them through the two api calls below when it resolves and loads an ES module. A
+     hook that hands the call on, like one that was never registered, answers nothing, and the
+     loader resolves as it always has. */
   function unsupportedResolveRequest(specifier, base) {
     var err = new Error('Failed to resolve module specifier "' + specifier + '" from "' + base
       + '": Invalid relative URL or base scheme is not hierarchical.');
     err.code = 'ERR_UNSUPPORTED_RESOLVE_REQUEST';
     return err;
   }
+
   /* Node declares one parameter and reads the other two off its arguments -- the parent URL and the
      options both default -- so a caller that reads register.length sees 1 there. */
   Module.register = function register(specifier) {
@@ -5561,7 +5577,7 @@ BF.module = function () {
       resolved = host.resolve(spec, host.cwd(), 'require');
     }
     if (!resolved) throw unsupportedResolveRequest(spec, base);
-    registeredHooks = { specifier: resolved, options: options };
+    adoptLoaderModule(resolved);
     return undefined;
   };
   Module.registerHooks = function registerHooks(hooks) {
@@ -5571,7 +5587,10 @@ BF.module = function () {
       err.code = 'ERR_INVALID_ARG_TYPE';
       throw err;
     }
-    registeredHooks = { hooks: hooks };
+    hookResolveFn = typeof hooks.resolve === 'function' ? hooks.resolve : null;
+    hookLoadFn = typeof hooks.load === 'function' ? hooks.load : null;
+    hookForRequire = true;
+    hooksChanged();
     /* Node hands back a ModuleHooks carrying the two hooks a caller gave, as own keys worth
        undefined where it gave none. */
     return { resolve: hooks.resolve, load: hooks.load };
