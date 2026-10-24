@@ -2080,14 +2080,6 @@ fitted:
   `sh` is still waiting. Both are the guest shell, `packages/core/src/shell/`, outside this shard's
   grant.
 
-### Upheld on this wave's own boots
-
-`owc-sharp-libc-getconf-versions`, `owc-sharp-position-attention-entropy` (attention refused, entropy
-a few per cent of crops) and `owc-sharp-jpeg-decode-pixels` close as the earlier witnesses left them;
-nothing this wave measured contradicts them, and the canvas guards for the row's own surface -- the
-32x32 to 8x8 resample, a 1:1 copy, `createPattern`, `putImageData`, the `source-in` and
-`destination-in` composites, `setTransform`/`resetTransform`, the 16-bit JPEG quant table at quality
-0.1 and the pdf refusal -- all still read as the record says they do.
 ### `node-pty`: the sentence a `resize()` after the child has exited throws
 
 - **A resize after the exit is now the add-on's own sentence**: host node-pty 1.1.0 throws
@@ -2105,6 +2097,14 @@ nothing this wave measured contradicts them, and the canvas guards for the row's
   supplies that `sh`, once the shim's record for the fd is gone, so no answer of `pty.process`
   can make it `undefined` here.
 
+### Upheld on this wave's own boots
+
+`owc-sharp-libc-getconf-versions`, `owc-sharp-position-attention-entropy` (attention refused, entropy
+a few per cent of crops) and `owc-sharp-jpeg-decode-pixels` close as the earlier witnesses left them;
+nothing this wave measured contradicts them, and the canvas guards for the row's own surface -- the
+32x32 to 8x8 resample, a 1:1 copy, `createPattern`, `putImageData`, the `source-in` and
+`destination-in` composites, `setTransform`/`resetTransform`, the 16-bit JPEG quant table at quality
+0.1 and the pdf refusal -- all still read as the record says they do.
 
 ## The `fs-wasm` shard, executor wave adv16: two rows fixed on this wave's own boots
 
@@ -2121,3 +2121,29 @@ nothing this wave measured contradicts them, and the canvas guards for the row's
   `application/wasm` rejects `ERR_WEBASSEMBLY_RESPONSE`, anything else `ERR_INVALID_ARG_TYPE`) and the
   eight constructors are no longer enumerable. Fixed in
   `packages/core/src/process/executors/node/runtime/guest/wasm.ts`.
+
+### Interactive `sh`: the prompt it prints, and the line terminator it takes
+
+- **`owc-shell-interactive-prompt` -- fixed at HEAD**: an interactive `sh` prompts `sh-3.2$ `, which
+  is the prompt this machine's `/bin/sh` prints on a real terminal. One boot per side, `sh` with no
+  arguments and a single `\r` written to it: container stdout `sh-3.2$ \nsh-3.2$ ` against host
+  `sh: no job control in this shell\r\n\x1b[?1034hsh-3.2$ \r\nsh-3.2$ ` -- the `\x1b[?1034h` is the
+  terminal's own meta-mode sequence, which a container with no terminal has no reason to emit, and
+  what is left of the two is the same prompt. Fixed in
+  `packages/core/src/process/executors/shell/process.ts`: `PS1` is built the way bash 3.2 builds its
+  own default `\s-\v\$ ` -- the name the shell was called by (`sh`, not `bash`), the version down to
+  the minor number, then `$ ` -- which is the prompt of the shell this container already reports
+  being (`BASH_VERSION` 3.2).
+- **`owc-shell-interactive-enter-nl` -- fixed at HEAD**: a `\n` written to the interactive shell's
+  terminal ends the line exactly as a `\r` does, which is what a real terminal does -- its line
+  discipline turns the CR the Enter key sends into NL, and readline binds both to `accept-line`, so
+  host `/bin/sh` runs the line for either. One boot per side, `e`,`c`,`h`,`o`,` `,`h`,`i`,`<term>`,
+  `e`,`c`,`h`,`o`,` `,`4`,`2`,`<term>`,`e`,`x`,`i`,`t`,`<term>` written one keystroke at a time with
+  140 ms between them: container stdout is `sh-3.2$ echo hi\nhi\nsh-3.2$ echo 42\n42\nsh-3.2$ exit\n`
+  with exit 0 for `\n` and byte-identical for `\r`, against
+  `sh-3.2$ echo hi\r\nhi\r\nsh-3.2$ echo 42\r\n42\r\nsh-3.2$ exit\r\nexit\r\n` with exit 0 on the host
+  for both terminators -- so the container no longer echoes a whole session and runs none of it.
+  Fixed in `packages/core/src/process/executors/shell/process.ts`: `handleInput` sends a lone `'\n'`
+  to `handleEnterKey()` beside `'\r'`.
+  Measured on one boot per side, host node v24.15.0 with `/bin/sh` on a real pty pair, load 13.1 with
+  6.9 GB free.

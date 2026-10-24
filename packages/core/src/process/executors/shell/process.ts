@@ -350,7 +350,13 @@ export class ShellProcess extends Process {
             stderr: '',
             exitCode: 0
         }));
-        this.prompt = oscMode ? '\x1b[1;32m$\x1b[0m ' : '$ ';
+        /* PS1 as a host's interactive `/bin/sh` builds it: bash 3.2's default `\s-\v\$ `, where
+           `\s` is the name the shell was called by -- `sh`, not `bash` -- and `\v` is its version
+           down to the minor number, so a shell that reports `BASH_VERSION` 3.2 prompts
+           `sh-3.2$ `. The `$` is the one a user who is not root gets, and it is followed by a
+           space, which is the space bash puts after it. */
+        const primary = 'sh-3.2$ ';
+        this.prompt = oscMode ? `\x1b[1;32m${primary.slice(0, -1)}\x1b[0m ` : primary;
         /* PS2: the prompt a host writes while a construct is still open. It is `> ` in every shell
            that reads a terminal, and it is what tells the person typing that the Enter they just
            pressed ended a line and not a command. */
@@ -538,7 +544,15 @@ export class ShellProcess extends Process {
         }
 
         switch (input) {
+            /* Both line terminators end a line, as they do on a terminal. A terminal sends CR for
+               the Enter key and its line discipline turns it into NL, which is the byte a program
+               reading a line sees -- but a program that writes a NL straight at the master side
+               reaches that program unchanged, and readline binds NL and CR alike to accept-line,
+               so `/bin/sh` on a real terminal runs the line for either. A write that is one
+               character reaches this switch and not the paste path above, which is the only other
+               reader of a NL. */
             case '\r': // Enter
+            case '\n': // Enter, written as a newline rather than a carriage return
                 await this.handleEnterKey();
                 break;
 
