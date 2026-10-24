@@ -12,6 +12,17 @@ var EXIT_SIGNAL = { __owcExit: true };
 var mainModule = undefined;
 var timers = Object.create(null);
 var nextTimerId = 1;
+/*
+ * The immediate queue: setImmediate arms no host timer of its own ordering, because a host timer
+ * cannot be cheaper than 1 ms and an ordered against setTimeout(f, 1) as another 1 ms timer is
+ * exactly the divergence this queue exists to remove. An immediate is queued here instead and runs
+ * in the loop's check phase -- after the I/O callbacks of the turn, and before the next turn's
+ * timers -- which the host asks for by draining it (see fireTimer).
+ */
+var IMMEDIATE_QUEUE = [];
+/* The one host timer the queue holds: armed for the head so that a process whose only pending work
+   is an immediate still has something to wake the loop, and re-armed as the head moves. */
+var IMMEDIATE_WAKE = 0;
 var startedAt = host.now();
 
 /*
@@ -989,12 +1000,79 @@ function scheduleTimer(fn, ms, args, repeat, immediate) {
   var delay = Number(ms);
   if (!(delay >= 1)) delay = 1;
   var id = nextTimerId++;
-  timers[id] = { fn: fn, args: args, repeat: repeat, delay: delay, refed: true, ctx: captureAsyncContext(), immediate: immediate === true };
+  timers[id] = { fn: fn, args: args, repeat: repeat, delay: delay, refed: true, ctx: captureAsyncContext(), immediate: immediate === true, at: host.now() };
   host.ref(1);
   host.setTimer(id, delay);
   var handle = makeTimeout(id);
   if (timers[id]) timers[id].handle = handle;
   return handle;
+}
+
+/*
+ * setImmediate's own arm, which is not scheduleTimer's: the clamp there is what setTimeout wants
+ * (host node 24.15 prices setTimeout(f, 0) at the 1 ms floor too) and it is the one thing an
+ * immediate must not inherit. The entry still stands in the timer table -- so clearImmediate,
+ * ref/unref, hasRef and the id all read as they did -- but its ordering comes from the queue.
+ */
+function scheduleImmediate(fn, args) {
+  if (typeof fn !== 'function') {
+    throw new TypeError('The "callback" argument must be of type function. Received ' + typeof fn);
+  }
+  var id = nextTimerId++;
+  timers[id] = { fn: fn, args: args, repeat: false, delay: 0, refed: true, ctx: captureAsyncContext(), immediate: true, at: host.now() };
+  host.ref(1);
+  IMMEDIATE_QUEUE.push(id);
+  var handle = makeTimeout(id);
+  if (timers[id]) timers[id].handle = handle;
+  armImmediateWake();
+  return handle;
+}
+
+/*
+ * The host timer that wakes the loop for the queue. It stands on the head, so one wake covers the
+ * whole queue, and it is moved along whenever the head is spent; a head that was already cleared is
+ * dropped here rather than waited on, since the host timer it held is gone with it.
+ */
+function armImmediateWake() {
+  if (IMMEDIATE_WAKE !== 0) return;
+  while (IMMEDIATE_QUEUE.length > 0 && !timers[IMMEDIATE_QUEUE[0]]) {
+    var spent = IMMEDIATE_QUEUE.shift();
+    if (IMMEDIATE_WAKE === spent) IMMEDIATE_WAKE = 0;
+  }
+  if (IMMEDIATE_QUEUE.length === 0) return;
+  var id = IMMEDIATE_QUEUE[0];
+  IMMEDIATE_WAKE = id;
+  host.setTimer(id, 0);
+}
+
+function dropImmediate(id) {
+  var at = IMMEDIATE_QUEUE.indexOf(id);
+  if (at >= 0) IMMEDIATE_QUEUE.splice(at, 1);
+  if (IMMEDIATE_WAKE === id) IMMEDIATE_WAKE = 0;
+}
+
+/*
+ * The check phase: every immediate armed at or before the due time it is handed runs now, in the
+ * order it was queued. That time is what separates the two orders node separates -- an immediate armed while a timer was
+ * still pending was queued for a turn that has already gone by, so it runs ahead of that timer; one
+ * armed after the timer came due has not come up yet and waits for a later turn, so a timer already
+ * overdue when the immediate was armed keeps the priority it has in node.
+ */
+function drainImmediatesUntil(due) {
+  while (IMMEDIATE_QUEUE.length > 0) {
+    var id = IMMEDIATE_QUEUE[0];
+    var t = timers[id];
+    if (!t) {
+      IMMEDIATE_QUEUE.shift();
+      if (IMMEDIATE_WAKE === id) IMMEDIATE_WAKE = 0;
+      continue;
+    }
+    if (t.at > due) break;
+    IMMEDIATE_QUEUE.shift();
+    if (IMMEDIATE_WAKE === id) IMMEDIATE_WAKE = 0;
+    runTimerEntry(id);
+  }
+  armImmediateWake();
 }
 
 /*
@@ -1043,9 +1121,15 @@ function clearTimer(t) {
   var id = timerIdOf(t);
   if (id === undefined || !timers[id]) return;
   if (timers[id].refed) host.ref(-1);
+  var wasImmediate = timers[id].immediate === true;
   var handle = timers[id].handle;
   delete timers[id];
   host.clearTimer(id);
+  /* an immediate is taken out of the queue as well, and the wake moves to the next one standing */
+  if (wasImmediate) {
+    dropImmediate(id);
+    armImmediateWake();
+  }
   if (!handle) return;
   handle._destroyed = true;
   /* host node 24.15's clearTimeout writes -1 over _idleTimeout; an Immediate has none to write */
@@ -1063,9 +1147,29 @@ function fireTimer(id) {
     proc._owcIdleUndefined = false;
     if (typeof proc._owcSetDomainContext === 'function') proc._owcSetDomainContext(undefined);
   }
+  if (IMMEDIATE_WAKE === id) IMMEDIATE_WAKE = 0;
+  var entry = timers[id];
+  if (!entry) return;
+  if (entry.immediate) {
+    /*
+     * The queue's own wake, which is the check phase of this turn: every immediate standing in the
+     * queue runs in it, and so does one a callback arms while it runs -- host node 24.15 drains its
+     * immediate queue whole, and a 300-hop setImmediate chain measures 5 ms there against 300 turns
+     * of 1 ms here when each hop waits for a turn of its own.
+     */
+    drainImmediatesUntil(Infinity);
+    return;
+  }
+  drainImmediatesUntil(entry.at + entry.delay);
+  if (!timers[id]) return;
+  runTimerEntry(id);
+}
+
+function runTimerEntry(id) {
   var t = timers[id];
   if (!t) return;
   if (t.repeat) {
+    t.at = host.now();
     host.setTimer(id, t.delay);
   } else {
     delete timers[id];
@@ -1148,7 +1252,7 @@ function setIntervalImpl(fn, ms) {
 
 function setImmediateImpl(fn) {
   /* the one timer kind host node 24.15 runs a domain deeper: see the note in fireTimer */
-  return scheduleTimer(bindToActiveDomain(fn), 0, Array.prototype.slice.call(arguments, 1), false, true);
+  return scheduleImmediate(bindToActiveDomain(fn), Array.prototype.slice.call(arguments, 1));
 }
 
 /* process.nextTick queue: drained by the host before each promise job, as Node does */
@@ -1524,6 +1628,8 @@ var api = {
   fire: fireTimer,
   clearAll: function () {
     timers = Object.create(null);
+    IMMEDIATE_QUEUE.length = 0;
+    IMMEDIATE_WAKE = 0;
   },
   keysOf: function (id, builtin) {
     var exported = builtin ? requireBuiltin(id) : loadCJS(id, null, false).exports;
