@@ -587,12 +587,21 @@ function cpExit(child, code, signal, timedOut) {
     child.connected = false;
     cpEmitDisconnect(child);
   }
-  child.emit('exit', exitCode, signal);
-  cpClusterEmit(child, 'exit', [exitCode, signal]);
   cpCloseWhenDone(child, exitCode, signal);
 }
 
-/* 'close' follows 'exit' once every piped stream that is being read has ended; unread streams do not hold it */
+function cpEmitExit(child, code, signal) {
+  child.emit('exit', code, signal);
+  cpClusterEmit(child, 'exit', [code, signal]);
+}
+
+/* 'exit' and 'close' follow the child's end once every piped stream that is being read has ended
+   and closed; unread streams do not hold them. A host reads a child's pipe and reaches its end
+   before it reaps the child, so by the time the host reports the child's exit and close, a
+   destination the child's stdout was piped into has ended, finished, been unpiped and closed. The
+   container hands a piped stream its output in one turn, which left 'close' ahead of a destination
+   that had not ended yet; waiting for the read side's own close and then for one turn of the loop
+   puts the destination's close first, as it comes first on a host. */
 function cpCloseWhenDone(child, code, signal) {
   var waiting = [];
   var streams = [child.stdout, child.stderr];
@@ -603,6 +612,7 @@ function cpCloseWhenDone(child, code, signal) {
     if (stream.listenerCount('data') > 0 || stream.readableFlowing === true) waiting.push(stream);
   }
   if (waiting.length === 0) {
+    cpEmitExit(child, code, signal);
     proc.nextTick(function () {
       child.emit('close', code, signal);
     });
@@ -610,9 +620,13 @@ function cpCloseWhenDone(child, code, signal) {
   }
   var left = waiting.length;
   waiting.forEach(function (stream) {
-    stream.once('end', function () {
+    stream.once('close', function () {
       left -= 1;
-      if (left === 0) child.emit('close', code, signal);
+      if (left > 0) return;
+      setImmediate(function () {
+        cpEmitExit(child, code, signal);
+        child.emit('close', code, signal);
+      });
     });
   });
 }
@@ -953,6 +967,27 @@ function cpBytesOf(text) {
   return Buffer.from(text, binary ? 'latin1' : 'utf8');
 }
 
+/* The mark a host cuts an overlong output back to. A host reads a child's pipe a read unit at a
+   time and ends the child on the read that crosses the limit, so it hands back that whole read:
+   4096 of limit and 65536 of output where the child wrote 65536 in one write, 1048576 and 1114112
+   where it wrote two mebibytes. The container reads a synchronous child's output as one piece after
+   the child has gone, so the unit is the 64 KiB one a host's pipe is read in. */
+function cpMaxBufferMark(maxBuffer) {
+  var unit = 65536;
+  return Math.ceil((maxBuffer + 1) / unit) * unit;
+}
+
+/* The error a host reports for a child that overran maxBuffer: no status, the signal it ended the
+   child with, and ENOBUFS. */
+function cpMaxBufferError(exe, argv) {
+  var error = cpError('spawnSync ' + exe + ' ENOBUFS', 'ENOBUFS');
+  error.errno = -55;
+  error.syscall = 'spawnSync ' + exe;
+  error.path = exe;
+  error.spawnargs = argv;
+  return error;
+}
+
 /* one run, shaped as Node's spawnSync result: status, signal, output, pid, stdout, stderr and error */
 function cpSyncRun(file, list, opts) {
   var exe = file;
@@ -981,9 +1016,18 @@ function cpSyncRun(file, list, opts) {
     killSignal: cpSyncKillName(opts.killSignal)
   });
   var encoding = opts.encoding === undefined ? null : opts.encoding;
+  /* maxBuffer: the most either stream may hold, a megabyte when the caller names none and no check
+     at all when it names zero. A host ends the child that writes more, and reports no status, the
+     SIGTERM it ended it with and ENOBUFS, with the stream cut back to the mark. */
+  var maxBuffer = opts.maxBuffer === undefined || opts.maxBuffer === null ? 1024 * 1024 : Number(opts.maxBuffer);
+  var over = null;
   function shaped(text, fd) {
     if (stdio.modes[fd] !== 'pipe' || text === null || text === undefined) return null;
     var buffer = cpBytesOf(text);
+    if (maxBuffer > 0 && buffer.length > maxBuffer) {
+      if (over === null) over = fd === 1 ? 'stdout' : 'stderr';
+      buffer = buffer.slice(0, Math.min(buffer.length, cpMaxBufferMark(maxBuffer)));
+    }
     return encoding === null || encoding === 'buffer' ? buffer : buffer.toString(encoding);
   }
   var output = raw.spawned ? [null, shaped(raw.stdout, 1), shaped(raw.stderr, 2)] : undefined;
@@ -1003,6 +1047,11 @@ function cpSyncRun(file, list, opts) {
     if (raw.error.path !== undefined) error.path = raw.error.path;
     if (raw.error.spawnargs !== undefined) error.spawnargs = raw.error.spawnargs;
     result.error = error;
+  }
+  if (over !== null && !raw.error) {
+    result.status = null;
+    result.signal = 'SIGTERM';
+    result.error = cpMaxBufferError(exe, argv);
   }
   return result;
 }
