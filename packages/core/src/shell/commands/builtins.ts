@@ -1436,7 +1436,7 @@ interface VarRef {
 type Part =
     | { t: 'lit'; v: string }
     | { t: 'sq'; v: string }
-    | { t: 'dq'; parts: Part[] }
+    | { t: 'dq'; parts: Part[]; assign?: boolean }
     | { t: 'var'; ref: VarRef }
     | { t: 'cmd'; script: string }
     | { t: 'arith'; expr: string };
@@ -1673,7 +1673,8 @@ function parseVarRefBody(body: string): VarRef {
 function rawText(word: Word): string {
     let out = '';
     for (const part of word) {
-        if (part.t === 'lit' || part.t === 'sq') out += part.v;
+        if (part.t === 'lit') out += stripMarks(part.v);
+        else if (part.t === 'sq') out += part.v;
         else if (part.t === 'dq') out += rawText(part.parts);
         else if (part.t === 'var') out += part.ref.raw;
         else if (part.t === 'arith') out += `$((${part.expr}))`;
@@ -1685,7 +1686,7 @@ function rawText(word: Word): string {
 function wordSourceText(word: Word, keepQuotes: boolean): string {
     let out = '';
     for (const part of word) {
-        if (part.t === 'lit') out += part.v;
+        if (part.t === 'lit') out += stripMarks(part.v);
         else if (part.t === 'sq') out += keepQuotes ? `'${part.v}'` : part.v;
         else if (part.t === 'dq') {
             if (keepQuotes) out += '"';
@@ -1709,9 +1710,16 @@ function dequotedSourceText(word: Word): string {
     return wordSourceText(word, false);
 }
 
-/** Re-lexes the right-hand side of an assignment, which was split off at the `=`. */
+/**
+ * Re-lexes the right-hand side of an assignment, which was split off at the `=`.
+ *
+ * The value is lexed as if it stood inside a pair of double quotes -- an assignment is never
+ * field-split and never globbed, `v=*.txt` holding the two characters a `*` and a `.` are -- and the
+ * mark says it is a value and not quoted text, which is the one thing a host still does to it: `v=~`
+ * is the home directory, and `PATH=~/a:~/b` is two of them.
+ */
 function parseValueWord(text: string): Word {
-    return [{ t: 'dq', parts: lexParts(text) }];
+    return [{ t: 'dq', parts: lexParts(text), assign: true }];
 }
 
 /** Lexes a bare text into word parts (no operator handling): used for assignment values. */
@@ -2449,6 +2457,17 @@ class Parser {
                    goes in its place: `echo a\{b,c\}d` is one word, `a{b,c}d`. */
                 if (next === '{' || next === '}') {
                     literal += ESCAPED_BRACE + next;
+                    this.pos += 2;
+                    continue;
+                }
+                /* A pattern character the backslash escaped is one pathname expansion must read as a
+                   literal: `echo \*` prints `*` and `echo \[ab].txt` prints `[ab].txt`, which is what
+                   a host's /bin/sh does, where a `\*` no mark was left for was expanded as a pattern
+                   and grew into every name the directory holds. The mark is put in front of the
+                   character and not in the word's quoting, because a word holding one is not a quoted
+                   word to anything else: `[[ abc == \a* ]]` is still true, the `*` a pattern. */
+                if (next === '*' || next === '?' || next === '[' || next === '~' || next === ':') {
+                    literal += ESCAPED_META + next;
                     this.pos += 2;
                     continue;
                 }
@@ -3612,6 +3631,31 @@ const FIELD_MARK = ' ';
  */
 const ESCAPED_BRACE = '\u0001';
 
+/**
+ * The word a `\*`, a `\?` and a `\[` read as, so pathname expansion knows the character was escaped
+ * and is a literal to match and not a pattern: `echo \*` is the `*` it was written as, where a
+ * quoted `*` was the only kind this shell left alone.
+ *
+ * The mark goes in front of the character for the same reason the brace's does -- the backslash is
+ * gone by the time the word is expanded -- and it is taken out where the literal is read, leaving
+ * the character behind it marked as quoted, which is what a quoted metacharacter is to a pattern.
+ */
+const ESCAPED_META = '\u0005';
+
+/** The text of a literal with the marks the lexer left in it taken out. */
+function stripMarks(text: string): string {
+    return text.split(ESCAPED_BRACE).join('').split(ESCAPED_META).join('');
+}
+
+/**
+ * True where a literal opens with a mark, so the character behind it was escaped: the `\~` of
+ * `echo \~` is not the tilde tilde expansion reads, and neither is the `\{` of `echo \{a`.
+ */
+function startsMarked(marked: string): boolean {
+    const ch = marked[0];
+    return ch === ESCAPED_BRACE || ch === ESCAPED_META;
+}
+
 interface Expanded {
     text: string;
     quoted: boolean[];
@@ -3629,6 +3673,26 @@ function appendText(target: Expanded, text: string, quoted: boolean, split = !qu
         target.text += ch;
         target.quoted.push(quoted);
         target.split.push(split);
+    }
+}
+
+/**
+ * Appends the text a literal part holds, with the marks the lexer left in it taken out: a `\` that
+ * escaped a brace is gone, and one that escaped a pattern character leaves the character behind it,
+ * marked as quoted, so pathname expansion reads it as the literal it is.
+ */
+function appendLiteral(target: Expanded, marked: string, quoted: boolean): void {
+    let escaped = false;
+    for (const ch of marked) {
+        if (ch === ESCAPED_META) {
+            escaped = true;
+            continue;
+        }
+        if (ch === ESCAPED_BRACE) continue;
+        target.text += ch;
+        target.quoted.push(quoted || escaped);
+        target.split.push(false);
+        escaped = false;
     }
 }
 
@@ -3791,19 +3855,111 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
 }
 
 /**
+ * The parts of an assignment's value with the tilde expansion a host does to it already done, so the
+ * ordinary expansion behind this one -- which reads the whole value as quoted text, and so leaves a
+ * `~` alone -- has nothing left to do.
+ *
+ * A `~` opens a place it is expanded in at the start of the value and behind every colon that was
+ * written unquoted: `v=~` is the home directory, and `PATH=~/bin:~/bin` is two of them. One behind a
+ * quoted colon, or behind anything an expansion produced, is the character it was written as -- a
+ * host reads `v="a:"~` as `a:~`.
+ */
+function tildeParts(state: ShellState, parts: Part[], atStart: boolean): Part[] {
+    const out: Part[] = [];
+    let start = atStart;
+    for (const part of parts) {
+        /* Only the text that was written out is looked at: what a variable, a substitution or an
+           arithmetic expression produced is never a tilde prefix, and neither is what stands behind
+           a quoted string, whose colon is a quoted colon. */
+        if (part.t !== 'lit') {
+            out.push(part);
+            start = false;
+            continue;
+        }
+        out.push({ t: 'lit', v: tildeLiteral(state, part.v, start, true) });
+        start = false;
+    }
+    return out;
+}
+
+/**
+ * One literal with its tilde prefixes expanded. `atStart` is true where the literal opens the word,
+ * or stands behind a colon the last part ended on, and `colonStarts` is what says a colon opens a
+ * place a `~` is expanded in -- true in the value of an assignment, where `PATH=~/a:~/b` is two of
+ * them, and false in the word of a command, where `echo a:~` prints the two characters it was given.
+ */
+function tildeLiteral(state: ShellState, marked: string, atStart: boolean, colonStarts: boolean): string {
+    let out = '';
+    let start = atStart;
+    let i = 0;
+    while (i < marked.length) {
+        const ch = marked[i];
+        /* An escaped character is the character it is, and it opens no tilde of its own: `v=\~` is
+           the `~` a host keeps. */
+        if (ch === ESCAPED_META || ch === ESCAPED_BRACE) {
+            out += ESCAPED_META + (marked[i + 1] ?? '');
+            i += 2;
+            start = false;
+            continue;
+        }
+        if (start && ch === '~') {
+            /* The prefix is the `~` and every character behind it up to the next unquoted `/` or
+               `:` -- an escaped one among them, which is why `v=~\*` is the `~*` a host keeps: the
+               `*` is part of the login name the prefix names, and no such user is in the table. */
+            let end = i + 1;
+            let prefix = '~';
+            while (end < marked.length) {
+                const at = marked[end];
+                if (at === ESCAPED_META || at === ESCAPED_BRACE) {
+                    prefix += marked[end + 1] ?? '';
+                    end += 2;
+                    continue;
+                }
+                if (at === '/' || at === ':') break;
+                prefix += at;
+                end++;
+            }
+            out += expandTilde(prefix, state);
+            i = end;
+            start = false;
+            continue;
+        }
+        out += ch;
+        start = colonStarts && ch === ':';
+        i++;
+    }
+    return out;
+}
+
+/**
  * Tilde expansion of the word a literal part opened: `~` and `~/rest` are the home directory, with
  * the rest of the word kept after it. A `~` that names a user -- `~root` -- is left as it was
  * written: the container holds no passwd table to answer a login name with a home directory, and a
- * path invented for one would be a path no file has.
+ * path invented for one would be a path no file has. `~+` is the directory the shell stands in and
+ * `~-` the one it stood in before, where this shell keeps one.
  */
 function expandTilde(text: string, state: ShellState): string {
     if (!text.startsWith('~')) return text;
     const slash = text.indexOf('/');
     const name = slash === -1 ? text.slice(1) : text.slice(1, slash);
-    if (name !== '') return text;
+    if (name !== '') {
+        /* `~+` is the directory the shell stands in and `~-` the one it stood in before, which is
+           what a host's `$PWD` and `$OLDPWD` hold; a shell that has not moved keeps no `~-`, and a
+           host leaves the two characters there as it was written. */
+        if (name === '+') return tildeDirectory(state, 'PWD', text, slash);
+        if (name === '-') return tildeDirectory(state, 'OLDPWD', text, slash);
+        return text;
+    }
     const home = getVar(state, 'HOME');
     if (home === undefined || home === '') return text;
     return home + (slash === -1 ? '' : text.slice(slash));
+}
+
+/** A `~+` or a `~-` as the directory the name holds, or the word as it was written where it has none. */
+function tildeDirectory(state: ShellState, name: string, text: string, slash: number): string {
+    const dir = getVar(state, name);
+    if (dir === undefined || dir === '') return text;
+    return dir + (slash === -1 ? '' : text.slice(slash));
 }
 
 /**
@@ -3870,17 +4026,22 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
     for (let index = 0; index < parts.length; index++) {
         const part = parts[index];
         if (part.t === 'lit') {
-            /* The mark a `\{` left is not text, and it goes out here -- everywhere the literal is
-               read, including the tilde expansion a word opening with `~` gets. */
-            const literal = part.v.split(ESCAPED_BRACE).join('');
+            /* The marks a `\{` and a `\*` left are not text, and they go out here -- everywhere the
+               literal is read, including the tilde expansion a word opening with `~` gets. A `~` a
+               backslash escaped is no tilde at all: `echo \~` is the `~` a host prints, where the
+               mark being invisible to the test below made it the home directory. */
+            const marked = part.v;
             /* Tilde expansion is the first expansion a word gets, and only where the word opens with
-               an unquoted `~`: `echo ~` is the home directory, `echo a~b` and `echo "~"` are not. */
-            if (index === 0 && !quoted && target.text.length === 0) {
-                appendText(target, expandTilde(literal, state), quoted, false);
+               an unquoted `~`: `echo ~` is the home directory, `echo a~b`, `echo "~"` and `echo \~`
+               are not. Only its own prefix is taken out of the literal, so the marks behind it --
+               the `\*` of `echo ~\*`, a `*` to print and not a pattern to expand -- still reach the
+               expansion behind this one. */
+            if (index === 0 && !quoted && target.text.length === 0 && !startsMarked(marked) && stripMarks(marked).startsWith('~')) {
+                appendLiteral(target, tildeLiteral(state, marked, true, false), quoted);
                 continue;
             }
             /* Literal text is never field-split: only what an expansion produced is. */
-            appendText(target, literal, quoted, false);
+            appendLiteral(target, marked, quoted);
             continue;
         }
         if (part.t === 'sq') {
@@ -3888,6 +4049,16 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             continue;
         }
         if (part.t === 'dq') {
+            /* The value of an assignment carries the mark `parseValueWord` put on it. It is expanded
+               as quoted text is -- no field splitting, no pathname expansion -- and then given the
+               one expansion a host still does to it, which the quotes would otherwise have taken
+               away: `v=~` is the home directory, and `PATH=~/a:~/b` is two of them. */
+            if (part.assign === true && index === 0 && target.text.length === 0) {
+                const value: Expanded = { text: '', quoted: [], split: [] };
+                expandParts(state, tildeParts(state, part.parts, true), true, value, dequotedSourceText(part.parts));
+                appendText(target, value.text.split(FIELD_MARK).join(' '), true, false);
+                continue;
+            }
             /* A substitution a host meets inside a pair of double quotes is one it names by the
                quoted text with the quotes taken out, and not by the whole word around it, so what
                the parts inside are given to report is that text and not the word they stand in. */

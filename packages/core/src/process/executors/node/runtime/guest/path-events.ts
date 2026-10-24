@@ -704,16 +704,62 @@ BF.events = function () {
     }
   }
 
-  function EventEmitter() {
-    EventEmitter.init.call(this);
+  /* captureRejections: whether a listener that returns a promise is watched, so its rejection is
+     routed to the emitter's error listener instead of being dropped. The flag is read once, when
+     the emitter is made -- from the option where it was given and from the module's own flag where
+     it was not -- which is why a host's EventEmitter.captureRejections = true behind an emitter
+     that already exists leaves that one alone. */
+  var kCapture = Symbol('kCapture');
+
+  function captureOption(opts) {
+    var value = opts === undefined || opts === null ? undefined : opts.captureRejections;
+    if (!value) return EventEmitter.captureRejections === true;
+    if (value !== true) {
+      var err = new TypeError('The "options.captureRejections" property must be of type boolean. Received ' + specificTypeOf(value));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    return true;
   }
 
-  EventEmitter.init = function () {
+  /*
+   * A rejection a captured listener left behind, handed to the emitter on the next tick: to its
+   * error listener as the one argument a host gives it, or to the handler standing behind
+   * captureRejectionSymbol where the emitter carries one. The capture is off while the error is
+   * emitted, so an error listener that rejects does not come back here for a second time.
+   */
+  function emitUnhandledRejection(ee, err) {
+    var rejection = ee[EventEmitter.captureRejectionSymbol];
+    if (typeof rejection === 'function') {
+      rejection.call(ee, err);
+      return;
+    }
+    var prev = ee[kCapture];
+    ee[kCapture] = false;
+    ee.emit('error', err);
+    ee[kCapture] = prev;
+  }
+
+  function addCatch(that, result) {
+    if (result === undefined || result === null || that[kCapture] !== true) return;
+    var then = result.then;
+    if (typeof then !== 'function') return;
+    then.call(result, undefined, function (err) {
+      requireBuiltin('process').nextTick(emitUnhandledRejection, that, err);
+    });
+  }
+
+  function EventEmitter(opts) {
+    EventEmitter.init.call(this, opts);
+  }
+
+  EventEmitter.init = function (opts) {
     if (this._events === undefined) {
       this._events = Object.create(null);
       this._eventsCount = 0;
     }
     this._maxListeners = this._maxListeners || undefined;
+    this[kCapture] = captureOption(opts);
   };
   EventEmitter.prototype._events = undefined;
   EventEmitter.prototype._eventsCount = 0;
@@ -826,10 +872,10 @@ BF.events = function () {
     var handler = events[type];
     if (handler === undefined) return false;
     if (typeof handler === 'function') {
-      handler.apply(this, args);
+      addCatch(this, handler.apply(this, args));
     } else {
       var list = handler.slice();
-      for (var i = 0; i < list.length; i++) list[i].apply(this, args);
+      for (var i = 0; i < list.length; i++) addCatch(this, list[i].apply(this, args));
     }
     return true;
   };
@@ -1034,7 +1080,23 @@ BF.events = function () {
   var kErrorMonitor = Symbol('events.errorMonitor');
   EventEmitter.errorMonitor = kErrorMonitor;
   EventEmitter.captureRejectionSymbol = Symbol.for('nodejs.rejection');
-  EventEmitter.captureRejections = false;
+  /* The module's own flag, which every emitter made behind it reads: setting it is a host's way of
+     turning the capture on for all of them at once. Anything but a boolean is the
+     ERR_INVALID_ARG_TYPE a host gives. */
+  var captureRejections = false;
+  Object.defineProperty(EventEmitter, 'captureRejections', {
+    get: function () { return captureRejections; },
+    set: function (value) {
+      if (typeof value !== 'boolean') {
+        var err = new TypeError('The "captureRejections" property must be of type boolean. Received ' + specificTypeOf(value));
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      captureRejections = value;
+    },
+    enumerable: true,
+    configurable: true
+  });
   EventEmitter.getEventListeners = function (emitter, name) {
     return emitter.listeners(name);
   };

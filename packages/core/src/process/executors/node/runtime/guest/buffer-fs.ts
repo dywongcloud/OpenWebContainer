@@ -922,6 +922,16 @@ BF.fs = function () {
     return err;
   }
 
+  /* The name a diagnostic prints, which is the one the call was made with and not the path it
+     resolves to: open 'a' and not open '/app/a', whatever directory the name stands in. */
+  function pathName(p) {
+    if (typeof p === 'string') return p;
+    if (p !== null && typeof p === 'object' && typeof p.href === 'string') {
+      return decodeURIComponent(p.href.indexOf('file://') === 0 ? p.href.slice(7) : p.href);
+    }
+    return String(p);
+  }
+
   function toPathString(p) {
     var s = p && typeof p === 'object' && p.href ? p.href : String(p);
     if (s.indexOf('file://') === 0) s = decodeURIComponent(s.slice(7));
@@ -1693,15 +1703,41 @@ BF.fs = function () {
   fs.renameSync = function (from, to) {
     var a = toPathString(from);
     var b = toPathString(to);
+    /* The names a diagnostic prints are the ones the call was made with, and not the paths they
+       resolve to: a host's rename 'a' -> 'b' names the two arguments and not the directory they
+       stand in, which is the pair a caller recognises its own call in. */
+    var an = pathName(from);
+    var bn = pathName(to);
     /* A rename moves the name and not what it points at, so a link is renamed as the link: the walk
        stops before the last part of the path, which is the name being moved. */
     var at = resolveParentPath(a);
     var bt = resolveParentPath(b);
-    if (!statOf(at)) throw fsError('ENOENT', 'rename', a);
+    var st = statOf(at);
+    if (!st) throw twoEndError('ENOENT', 'rename', an, bn);
+    /* A rename onto the very name it came from moves nothing: POSIX reports success and leaves the
+       entry alone, so the name and everything under it are still there afterwards -- where taking
+       the name out of its directory and putting it back under the same one deleted both, and
+       fs.renameSync('a', 'a') left nothing behind where a host kept the file and its contents. */
+    if (at === bt) return;
+    var into = statFollowingLinks(P.dirname(bt));
+    if (!into) throw twoEndError('ENOENT', 'rename', an, bn);
+    if (into.type !== 'dir') throw twoEndError('ENOTDIR', 'rename', an, bn);
+    /* The destination decides what a rename may do, and a host refuses before it moves anything:
+       a directory goes onto a directory and only an empty one, a file never goes onto a directory
+       and a directory never onto a file, and none of them is merged into the name already there. */
+    var dest = statOf(bt);
+    if (dest) {
+      if (st.type === 'dir' && dest.type !== 'dir') throw twoEndError('ENOTDIR', 'rename', an, bn);
+      if (st.type !== 'dir' && dest.type === 'dir') throw twoEndError('EISDIR', 'rename', an, bn);
+      if (st.type === 'dir' && sortedEntries(resolvePath(b)).length > 0) throw twoEndError('ENOTEMPTY', 'rename', an, bn);
+    }
+    /* A directory cannot be moved into a directory it carries: the tree it holds would be its own
+       destination, which is the EINVAL a host answers for fs.renameSync('d', 'd/sub'). */
+    if (st.type === 'dir' && bt.indexOf(at + '/') === 0) throw twoEndError('EINVAL', 'rename', an, bn);
     /* A rename takes a name out of the directory it is in and puts one into the directory it is
        moved to, and a host checks the write bit of both. */
-    requireDirWrite(at, 'rename', a, b);
-    requireDirWrite(bt, 'rename', a, b);
+    requireDirWrite(at, 'rename', an, bn);
+    requireDirWrite(bt, 'rename', an, bn);
     check(host.rename(at, bt), 'rename', a);
     /* The record follows the name: a link renamed is the same link, at the name it was moved to. */
     if (SYMLINKS[at] !== undefined) { SYMLINKS[bt] = SYMLINKS[at]; delete SYMLINKS[at]; }
