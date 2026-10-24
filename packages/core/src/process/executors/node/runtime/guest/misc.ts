@@ -5224,6 +5224,25 @@ BF.module = function () {
     var second = first < 0 ? -1 : name.indexOf('/', first + 1);
     return { name: second < 0 ? name : name.slice(0, second), scoped: true };
   }
+  /* Whether node's own loader resolves a specifier as a path: shouldBeTreatedAsRelativeOrAbsolutePath
+     in internal/modules/esm/resolve, which answers false for '' alone -- an empty specifier is not
+     a relative or an absolute path, so it is handed to packageResolve as a package name. */
+  function isRelativeOrAbsoluteOf(specifier) {
+    if (specifier === '') return false;
+    if (specifier.charAt(0) === '/') return true;
+    if (specifier.charAt(0) !== '.') return false;
+    if (specifier.length === 1 || specifier.charAt(1) === '/') return true;
+    if (specifier.charAt(1) !== '.') return false;
+    return specifier.length === 2 || specifier.charAt(2) === '/';
+  }
+  /* A path with no empty segment in it: an empty package name puts two slashes where one was
+     meant, and node's own URL keeps them apart, which is a path no message of its may carry. */
+  function collapsedPathOf(p) {
+    var parts = p.split('/');
+    var out = [];
+    for (var i = 0; i < parts.length; i++) if (parts[i] !== '') out.push(parts[i]);
+    return (p.charAt(0) === '/' ? '/' : '') + out.join('/');
+  }
   /* The package.json at or above a path, as node's own reader finds it: the search starts at the
      directory a trailing slash names and at the parent of the one that does not, and a path with no
      package.json at or above it answers itself -- which is why a directory with none above comes
@@ -5350,6 +5369,53 @@ BF.module = function () {
         + parentURL + '": Invalid relative URL or base scheme is not hierarchical.');
       unsupported.code = 'ERR_UNSUPPORTED_RESOLVE_REQUEST';
       throw unsupported;
+    } else if (!isRelativeOrAbsoluteOf(name)) {
+      /* An empty specifier is the one node's own loader does not treat as a path, so it reaches
+         packageResolve with an empty package name: the walk for it matches the nearest node_modules
+         *directory* -- it stops on the directory and not on a package.json inside it -- and the
+         "main" or index.js that directory does not have is the package it reports as missing. It
+         is not the base's own package.json, which is what an empty specifier names here.
+         row owc-module-findpackagejson-empty-specifier. */
+      var empty = findPackageNameOf(name);
+      var emptyDir = parentPath.charAt(parentPath.length - 1) === '/' ? parentPath.slice(0, -1) : dirnameOf(parentPath);
+      if (emptyDir === '') emptyDir = '/';
+      /* The package the base itself sits in answers first, as in the walk above, when it carries an
+         "exports" map and the name asked for is its own. */
+      var ownPkg = Module._readPackage(emptyDir);
+      if (ownPkg.exists && ownPkg.exports !== undefined && ownPkg.exports !== null && ownPkg.name === empty.name) {
+        return ownPkg.pjsonPath;
+      }
+      var walk = emptyDir;
+      var before = '';
+      while (true) {
+        var pkgDir = collapsedPathOf((walk === '/' ? '' : walk) + '/node_modules/' + empty.name);
+        var manifest = pkgDir + '/package.json';
+        /* Node compares the length of the path it just built against the one before it, which is
+           how a walk that has reached the root stops. */
+        if (manifest.length === before.length) break;
+        if (Module._stat(pkgDir) === 1) {
+          var pkgMain = Module._readPackage(pkgDir);
+          var mainPath = pkgMain.exists && typeof pkgMain.main === 'string' && pkgMain.main !== ''
+            ? collapsedPathOf(pkgDir + '/' + pkgMain.main)
+            : pkgDir + '/index.js';
+          if (Module._stat(mainPath) !== 0) {
+            var noMain = new Error("Cannot find package '" + mainPath + "' imported from " + parentPath);
+            noMain.code = 'ERR_MODULE_NOT_FOUND';
+            throw noMain;
+          }
+          resolved = mainPath;
+          break;
+        }
+        before = manifest;
+        var higher = empty.scoped ? dirnameOf(dirnameOf(walk)) : dirnameOf(walk);
+        if (higher === walk) break;
+        walk = higher;
+      }
+      if (resolved === undefined) {
+        var noEmpty = new Error("Cannot find package '" + empty.name + "' imported from " + parentPath);
+        noEmpty.code = 'ERR_MODULE_NOT_FOUND';
+        throw noEmpty;
+      }
     } else {
       resolved = urlFor.fileURLToPath(new URLForBase(name, parentURL));
     }
@@ -5361,6 +5427,10 @@ BF.module = function () {
       var noModule = new Error("Cannot find module '" + resolved + "' imported from "
         + (parentPath === null ? parentURL : parentPath));
       noModule.code = 'ERR_MODULE_NOT_FOUND';
+      /* The hint node's own loader appends to a resolution failure, in the message and in the
+         stack: the file the CommonJS loader would have answered for that specifier.
+         row owc-esm-resolve-did-you-mean-hint. */
+      decorateWithCommonJSHint(noModule, name, parentPath);
       throw noModule;
     }
     return nearestPackageJSONOf(resolved);

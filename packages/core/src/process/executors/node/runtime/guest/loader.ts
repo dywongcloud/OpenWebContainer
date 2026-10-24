@@ -110,6 +110,94 @@ function dirnameOf(p) {
   return i <= 0 ? '/' : p.slice(0, i);
 }
 
+/* The relative path from one absolute path to another, the way node's own path.relative writes it:
+   one '..' for each segment of the first that is left behind, then the segments of the second that
+   follow, joined with '/'. */
+function relativePosixOf(from, to) {
+  var f = from.split('/');
+  var t = to.split('/');
+  var i = 0;
+  while (i < f.length && i < t.length - 1 && f[i] === t[i]) i++;
+  var out = [];
+  for (var k = i; k < f.length - 1; k++) out.push('..');
+  for (var j = i; j < t.length; j++) out.push(t[j]);
+  return out.join('/');
+}
+
+function isDirectoryOf(p) {
+  try { return Module._stat(p) === 1; } catch (e) { return false; }
+}
+
+/* Node's "Did you mean to import ...?" hint: the line its ESM loader appends to a resolution
+   failure when the file the specifier names is not there but a nearby one is --
+   decorateErrorWithCommonJSHints over resolveAsCommonJS, in internal/modules/esm/resolve. The
+   CommonJS loader is asked for the same specifier, which is what answers dep.js for './dep' and
+   dirpkg/index.js for './dirpkg', and the file it answers is written as a path relative to the one
+   that asked, with './' put in front unless it climbs. Only a specifier that is a path is given
+   one: a bare name that resolves to no package has nothing nearby to suggest, and node gives it no
+   hint either. Node resolves a relative specifier against its cwd here -- its throwaway module
+   carries no filename, so the one lookup path is '.' -- and this container's cwd is /app while the
+   program that asks sits in a directory of its own, so the hint is built from the directory the
+   parent names, which is that same directory whenever a program is run from where it lives.
+   row owc-esm-resolve-did-you-mean-hint. */
+function commonJsHintOf(specifier, parentPath) {
+  if (typeof specifier !== 'string' || specifier === '') return '';
+  if (typeof parentPath !== 'string' || parentPath === '') return '';
+  var lead = specifier.charAt(0);
+  if (lead !== '.' && lead !== '/') return '';
+  var base = isDirectoryOf(parentPath) ? parentPath : dirnameOf(parentPath);
+  var found = '';
+  try { found = host.resolve(specifier, base, 'require'); } catch (e) { found = ''; }
+  if (typeof found !== 'string' || found === '' || found.charAt(0) !== '/') return '';
+  var cut = parentPath.lastIndexOf('/');
+  var from = cut <= 0 ? '/' : parentPath.slice(0, cut);
+  var rel = relativePosixOf(from, found);
+  /* The specifier the user already wrote is no suggestion. */
+  if (rel === '' || rel === specifier || './' + rel === specifier) return '';
+  if (rel.slice(0, 3) !== '../') rel = './' + rel;
+  if (rel === specifier) return '';
+  return 'Did you mean to import ' + JSON.stringify(rel) + '?';
+}
+
+/* The hint written onto an error the way node writes it: as a second line of the message, and into
+   the stack right after the line that names the error. */
+function decorateWithCommonJSHint(err, specifier, parentPath) {
+  if (err === null || typeof err !== 'object') return err;
+  var hint = commonJsHintOf(specifier, parentPath);
+  if (hint === '') return err;
+  if (typeof err.message !== 'string') return err;
+  try { err.message = err.message + '\n' + hint; } catch (e) { return err; }
+  var stack = typeof err.stack === 'string' ? err.stack : '';
+  if (stack === '') {
+    /* The engine writes the stack of a rejected import only once user code reads it, so the line
+       the hint goes after does not exist yet: it is the line node's own errors start with -- the
+       error named, its code in brackets, then the message -- and the frames follow it. */
+    var named = typeof err.name === 'string' && err.name !== '' ? err.name : 'Error';
+    var tagged = typeof err.code === 'string' && err.code !== '' ? named + ' [' + err.code + ']' : named;
+    stack = tagged + ': ' + String(err.message).split('\n')[0];
+  }
+  var at = stack.indexOf('\n');
+  try {
+    err.stack = at < 0 ? stack + '\n' + hint : stack.slice(0, at) + '\n' + hint + stack.slice(at);
+  } catch (e) { /* a frozen error keeps the stack it already has */ }
+  return err;
+}
+
+/* The path a failed import was asking for and the file it was asking from, read back out of the
+   message the host wrote for it: "Cannot find module '/app/dep' imported from /app/main.js", and
+   the same tail on a directory import. Undefined for a failure that names no path at all -- a bare
+   package name that resolves to nothing. */
+function importFailurePathOf(err) {
+  var text = String(err && err.message !== undefined ? err.message : '').split('\n')[0];
+  var open = text.indexOf("'");
+  var close = open < 0 ? -1 : text.indexOf("'", open + 1);
+  if (close < 0) return undefined;
+  var target = text.slice(open + 1, close);
+  var at = text.indexOf(' imported from ');
+  if (at < 0 || target.charAt(0) !== '/') return undefined;
+  return { target: target, parent: text.slice(at + ' imported from '.length) };
+}
+
 /* The files a require came from, as Node lists them under a resolution failure: the module that
    made the require first, then the one that required it, and so on up to the entry. A require with
    no module behind it -- one the host made, or one made from a path with no file of its own -- has
@@ -1661,6 +1749,16 @@ function importWrap(promise, strict) {
          written only when there is one, and never as undefined. */
       if (typeof url === 'string' && err.url === undefined) {
         try { err.url = url; } catch (e) { /* a frozen error keeps the message it already has */ }
+      }
+      /* The hint node appends to a resolution failure, which the message the host wrote does not
+         carry: the path the specifier named and the file it was named from are read back out of it,
+         and the CommonJS loader is asked what that specifier would have meant. A failure under any
+         other code -- a package subpath no "exports" map defines, a scheme no loader reads -- is
+         left exactly as the host wrote it. */
+      var named = typeof err.code === 'string' ? err.code : code;
+      if (named === 'ERR_MODULE_NOT_FOUND' || named === 'ERR_UNSUPPORTED_DIR_IMPORT') {
+        var failed = importFailurePathOf(err);
+        if (failed !== undefined) decorateWithCommonJSHint(err, failed.target, failed.parent);
       }
     }
     throw err;
