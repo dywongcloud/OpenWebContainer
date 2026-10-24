@@ -41,15 +41,39 @@ body: |-
 
   Recorded in Readme.md under "Virtual net".
 witness_2026_10_23_adv9: 'RE-VERIFIED 2026-10-23 by the executor for shard net (session adv9-exec-net) at HEAD 1ff048b plus this pass''''s dgram mapped fix, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core against host node v24.15.0, one process per side, stdout/stderr/exit separate, load 6-10 with 2.2-2.9 GB free, probe /tmp/owc-r4/adv9-exec-net/p-wildcard, SAME on two container runs (before and after this pass''''s change). The row holds on all eleven cases: a server bound to :: accepts an IPv4 client and reports ::ffff:127.0.0.1/IPv6 at both of its ends, accepts an IPv6 client as ::1/IPv6, and accepts a dial of ::ffff:127.0.0.1 as ::ffff:127.0.0.1/IPv6; one bound to 0.0.0.0 accepts the IPv4 client as 127.0.0.1/IPv4, refuses the IPv6 client ECONNREFUSED, and answers a dial of the mapped form with 127.0.0.1/IPv4; a server on 127.0.0.1 dialled at ::ffff:127.0.0.1 reports 127.0.0.1/IPv4 at its own end; and 0.0.0.0 then :: on one port binds both while the reverse order is EADDRINUSE, as on a host. The client''''s own four values agree on both sides throughout. Nothing in this row still diverges; nothing was edited for it in this pass.'
-witness_2026_10_24_adv10_judge: 'RE-VERIFIED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36 + this pass''''s hub change, differential
-against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts
-out of packages/core, stdout/stderr/exit separate, all runs exit 0, container run twice and identical,
-load 6.9-8.9 with 3.6-3.9 GB free, probe /tmp/owc-r4/adv10-judge-net-3/j-reg. HOLDS, and it survives the
-change that lets a TCP bind take the IPv4-mapped loopback, which is the surface this row shares with
-owc-virtual-net-ipv6-family: a server on the default bind accepts an IPv4 client (::ffff:127.0.0.1/IPv6 at
-both of its ends) and an IPv6 client (::1/IPv6); one on :: does the same; one on 0.0.0.0 accepts the IPv4
-client as 127.0.0.1/IPv4, refuses the IPv6 client ECONNREFUSED and answers a dial of the mapped form with
-127.0.0.1/IPv4; a server on 127.0.0.1 answers a dial of ::ffff:127.0.0.1; ::1 dialled against 127.0.0.1 is
-ECONNREFUSED; localhost binds ::1; and 0.0.0.0:P then ::P on one port binds both while the reverse order is
-EADDRINUSE. The client''''s own four values agree throughout. All 19 rows identical to host Node 24.15 but
-for the host''''s own ephemeral ports. Nothing was edited for this row.'
+witness_2026_10_24_adv10_judge: 'RE-VERIFIED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36 + this pass''''s hub change, differential against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout/stderr/exit separate, all runs exit 0, container run twice and identical, load 6.9-8.9 with 3.6-3.9 GB free, probe /tmp/owc-r4/adv10-judge-net-3/j-reg. HOLDS, and it survives the change that lets a TCP bind take the IPv4-mapped loopback, which is the surface this row shares with owc-virtual-net-ipv6-family: a server on the default bind accepts an IPv4 client (::ffff:127.0.0.1/IPv6 at both of its ends) and an IPv6 client (::1/IPv6); one on :: does the same; one on 0.0.0.0 accepts the IPv4 client as 127.0.0.1/IPv4, refuses the IPv6 client ECONNREFUSED and answers a dial of the mapped form with 127.0.0.1/IPv4; a server on 127.0.0.1 answers a dial of ::ffff:127.0.0.1; ::1 dialled against 127.0.0.1 is ECONNREFUSED; localhost binds ::1; and 0.0.0.0:P then ::P on one port binds both while the reverse order is EADDRINUSE. The client''''s own four values agree throughout. All 19 rows identical to host Node 24.15 but for the host''''s own ephemeral ports. Nothing was edited for this row.'
+witness_2026_10_24_adv11: |-
+  RE-VERIFIED BY THE EXECUTOR FOR SHARD NET (session adv11-exec-net) at HEAD e169099 plus this pass's
+  net.ts change, differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout/stderr/exit separate, all runs exit
+  0, container run twice and identical, load 6.5-7.7 with 3.2-4.1 GB free, probe
+  /tmp/owc-r4/adv11-exec-net/j-reg. HOLDS on all nineteen rows: a server on the default bind and one on
+  :: each accept an IPv4 client (::ffff:127.0.0.1/IPv6 at both of its ends) and an IPv6 client
+  (::1/IPv6); one on 0.0.0.0 accepts the IPv4 client as 127.0.0.1/IPv4, refuses the IPv6 client
+  ECONNREFUSED and answers a dial of the mapped form with 127.0.0.1/IPv4; a server on 127.0.0.1 answers
+  a dial of ::ffff:127.0.0.1; ::1 dialled against 127.0.0.1 is ECONNREFUSED; and 0.0.0.0:P then ::P on
+  one port binds both while the reverse order is EADDRINUSE. The client's own four values agree
+  throughout. Identical to host Node 24.15 but for the host's own ephemeral ports, and byte-identical,
+  modulo those ports, to the adv10 judge's own container run of the same probe. Nothing was edited for
+  this row in this pass.
+witness_2026_10_24_adv12: |-
+  RE-VERIFIED BY THE EXECUTOR FOR SHARD NET (session adv12-exec-net) at HEAD 5dd5b85 plus this pass's net.ts change, differential against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately, every probe run twice on each side, load 4.7-6.7 with 3.6-5.1 GB free.
+  Probe /tmp/owc-r4/adv12-exec-net/j-reg, container run twice and identical. HOLDS on all nineteen rows: a
+  server on the default bind and one on :: each accept an IPv4 client (::ffff:127.0.0.1/IPv6 at both of its
+  ends) and an IPv6 client (::1/IPv6); one on 0.0.0.0 accepts the IPv4 client as 127.0.0.1/IPv4, refuses
+  the IPv6 client ECONNREFUSED and answers a dial of the mapped form with 127.0.0.1/IPv4; a server on
+  127.0.0.1 answers a dial of ::ffff:127.0.0.1; ::1 dialled against 127.0.0.1 is ECONNREFUSED; and
+  0.0.0.0:P then ::P on one port binds both while the reverse order is EADDRINUSE. The client's own four
+  values agree throughout. Identical to host Node 24.15 but for the host's own ephemeral ports -- the
+  whole of j-reg's diff is four port lines. Nothing was edited for this row.
+witness_2026_10_24_adv12_judge: |-
+  RE-VERIFIED BY THE JUDGE FOR SHARD NET (session adv12-judge-net-1) at HEAD e022edd plus this pass's
+  net.ts change, differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured
+  separately, every probe run twice on each side, load 7.0-10.9, the adversary's own r-fam3 re-run
+  (F1-F19 bind/dial pairs and U1-U7 UDP scenes) plus /tmp/owc-r4/adv12-judge-net-1/j7-udp6zone.
+  HOLDS, and no new divergence found: this pass's net.ts change touches the SocketAddress and
+  BlockList value types, the auto-select-family flags and a udp6 bind on a scoped literal, and none
+  of the nineteen bind/dial pairs or the seven UDP scenes moved. The only line anywhere near this row
+  that differs is U7, a udp6 socket bound on '::1%lo0', and that is fixed in this pass and recorded
+  under row owc-virtual-net-ipv6-family, whose UDP surface it belongs to.

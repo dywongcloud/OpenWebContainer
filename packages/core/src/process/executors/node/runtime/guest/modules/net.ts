@@ -84,6 +84,8 @@ function netDescribe(value) {
   if (value === null || value === undefined) return String(value);
   if (typeof value === 'object') return 'an instance of ' + ((value.constructor && value.constructor.name) || 'Object');
   if (typeof value === 'string') return "type string ('" + value + "')";
+  /* A BigInt keeps the 'n' Node prints it with: 'type bigint (24n)', not 'type bigint (24)'. */
+  if (typeof value === 'bigint') return 'type bigint (' + String(value) + 'n)';
   return 'type ' + typeof value + ' (' + String(value) + ')';
 }
 
@@ -258,6 +260,17 @@ function netListenDisplay(host) {
 function netListenHub(host) {
   var shown = netListenDisplay(host);
   return shown === '0.0.0.0' ? '' : shown;
+}
+
+/**
+ * Cuts the zone (scope) id off an IPv6 literal ('::1%lo0' -> '::1'). A zone says which interface a
+ * link-local address means, not which host it is: a host's kernel binds and dials the address the
+ * zone is attached to, and its getsockname and getpeername report that address with no zone on it.
+ */
+function netStripZone(text) {
+  if (typeof text !== 'string') return text;
+  var at = text.indexOf('%');
+  return at === -1 ? text : text.slice(0, at);
 }
 
 /** A Node-shaped system error: 'listen EADDRINUSE: address already in use 127.0.0.1:80', 'connect ECONNREFUSED ...'. */
@@ -480,6 +493,10 @@ BF['net'] = function () {
   var DuplexBase = netDuplexBase();
   var duplexMode = DuplexBase !== null;
   var baseAddListener = EventEmitter.prototype.addListener || EventEmitter.prototype.on;
+  /* The auto-select-family defaults Node starts with: true, and a 250 ms attempt timeout. Both are
+     kept here so the setter that names one is the value the getter later answers with. */
+  var NET_AUTO_SELECT_FAMILY = true;
+  var NET_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT = 250;
 
   class Socket extends (duplexMode ? DuplexBase : EventEmitter) {
     constructor(options) {
@@ -1918,10 +1935,96 @@ BF['net'] = function () {
     return true;
   }
 
+  /**
+   * The host and port a URL reads out of 'http://' + input, with the family the brackets (or their
+   * absence) ask for; null for a string a URL refuses. A bracketed literal is IPv6 and a zone id is
+   * not a thing a URL's host may carry; an unbracketed one keeps its last colon as the separator, so
+   * a literal carrying a colon of its own -- '::1', '::' -- is not a host at all.
+   */
+  function netSplitHostPort(input) {
+    var host;
+    var portText;
+    var family;
+    if (input.charAt(0) === '[') {
+      var close = input.indexOf(']');
+      if (close === -1) return null;
+      host = input.slice(1, close);
+      if (host.indexOf('%') !== -1) return null;
+      var rest = input.slice(close + 1);
+      if (rest !== '' && rest.charAt(0) !== ':') return null;
+      portText = rest === '' ? '' : rest.slice(1);
+      family = 'ipv6';
+    } else {
+      var colon = input.lastIndexOf(':');
+      if (colon === -1) {
+        host = input;
+        portText = '';
+      } else {
+        host = input.slice(0, colon);
+        portText = input.slice(colon + 1);
+      }
+      if (host === '' || host.indexOf(':') !== -1) return null;
+      family = 'ipv4';
+    }
+    if (portText !== '' && !/^[0-9]+$/.test(portText)) return null;
+    var port = portText === '' ? 0 : Number(portText);
+    if (port > 65535) return null;
+    /* 80 is the port of the scheme Node prepends, so the URL carries none and the port reads back 0;
+       every other port, 0 included, is the number it was given. */
+    return { host: host, port: port === 80 ? 0 : port, family: family };
+  }
+
+  /* One part of a dotted quad as the URL host parser reads it: a leading '0x' is hexadecimal, a
+     leading zero octal, anything else decimal; null for a part it cannot read. */
+  function netUrlIPv4Number(part) {
+    if (part === '') return null;
+    var radix = 10;
+    var digits = part;
+    if (part.length > 1 && part.charAt(0) === '0' && (part.charAt(1) === 'x' || part.charAt(1) === 'X')) {
+      radix = 16;
+      digits = part.slice(2);
+    } else if (part.length > 1 && part.charAt(0) === '0') {
+      radix = 8;
+      digits = part.slice(1);
+    }
+    if (digits === '') return 0;
+    if (radix === 16 && !/^[0-9a-fA-F]+$/.test(digits)) return null;
+    if (radix === 8 && !/^[0-7]+$/.test(digits)) return null;
+    if (radix === 10 && !/^[0-9]+$/.test(digits)) return null;
+    var value = 0;
+    for (var i = 0; i < digits.length; i++) value = value * radix + parseInt(digits.charAt(i), radix);
+    return value;
+  }
+
+  /* A dotted quad as the URL host parser reads it: one to four parts, the last of them filling every
+     byte the others leave, so '01.2.3.4' is '1.2.3.4', '010.1.1.1' is '8.1.1.1', and '127.1' and
+     '2130706433' are both '127.0.0.1'; null for anything that is not one. Host Node 24.15 reads the
+     text this way and not as 'net.isIPv4' does, which answers false for all four of them. */
+  function netUrlIPv4(text) {
+    if (netIsIPv4(text)) return text;
+    if (text === '' || !/^[0-9a-fA-FxX.]+$/.test(text)) return null;
+    var parts = text.split('.');
+    if (parts.length > 4) return null;
+    var head = [];
+    var i;
+    for (i = 0; i < parts.length - 1; i++) {
+      var value = netUrlIPv4Number(parts[i]);
+      if (value === null || value > 255) return null;
+      head.push(value);
+    }
+    var last = netUrlIPv4Number(parts[parts.length - 1]);
+    if (last === null) return null;
+    if (head.length > 3) return null;
+    if (last >= Math.pow(256, 4 - head.length)) return null;
+    var bytes = head.slice();
+    for (i = head.length; i < 4; i++) bytes.push(Math.floor(last / Math.pow(256, 3 - i)) % 256);
+    return bytes.join('.');
+  }
+
   /* net.BlockList: address, range and subnet rules, each of one family; rules lists the newest first, as Node does */
   class BlockList {
     constructor() {
-      this._rules = [];
+      netHide(this, '_rules', []);
     }
 
     addAddress(address, type) {
@@ -1973,6 +2076,56 @@ BF['net'] = function () {
       return false;
     }
 
+    /** The rules as JSON: the same list 'rules' answers with, newest first. */
+    toJSON() {
+      return this.rules;
+    }
+
+    /**
+     * Adds the rules a JSON string or an array of strings names -- 'Address: IPv4 1.2.3.4',
+     * 'Subnet: IPv4 192.168.1.0/24', 'Range: IPv4 10.0.0.1-10.0.0.10' -- which is the text 'rules'
+     * writes them in. A rule whose kind or family is spelled some other way is skipped, as Node
+     * skips it, and the argument itself is ERR_INVALID_ARG_TYPE for a string or array of strings
+     * that is not one ('The "data" argument must be of type string or string[].').
+     */
+    fromJSON(data) {
+      var rules = data;
+      if (typeof data === 'string') {
+        rules = JSON.parse(data);
+        if (!Array.isArray(rules)) {
+          throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+            'The "data" argument must be of type string or string[]. Received ' + netDescribe(data));
+        }
+      } else if (!Array.isArray(rules)) {
+        throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+          'The "data" argument must be of type string or string[]. Received ' + netDescribe(data));
+      }
+      for (var i = 0; i < rules.length; i++) {
+        if (typeof rules[i] !== 'string') {
+          throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+            'The "data" argument must be of type string or string[]. Received ' + netDescribe(data));
+        }
+      }
+      for (var n = 0; n < rules.length; n++) {
+        var parts = rules[n].split(' ');
+        var kind = parts[0].slice(-1) === ':' ? parts[0].slice(0, -1) : parts[0];
+        var family = parts[1] === 'IPv4' ? 'ipv4' : parts[1] === 'IPv6' ? 'ipv6' : null;
+        if (family === null || parts[2] === undefined || parts[2] === '') continue;
+        var body = parts[2];
+        if (kind === 'Address') {
+          this.addAddress(body.split('/')[0], family);
+        } else if (kind === 'Subnet') {
+          var at = body.lastIndexOf('/');
+          if (at === -1) continue;
+          this.addSubnet(body.slice(0, at), Number(body.slice(at + 1)), family);
+        } else if (kind === 'Range') {
+          var dash = body.indexOf('-');
+          if (dash === -1) continue;
+          this.addRange(body.slice(0, dash), body.slice(dash + 1), family);
+        }
+      }
+    }
+
     get rules() {
       var out = [];
       for (var i = this._rules.length - 1; i >= 0; i--) {
@@ -1983,18 +2136,40 @@ BF['net'] = function () {
     }
   }
 
+  /* An own field kept out of Object.keys: host Node holds a SocketAddress's and a BlockList's state
+     in a native handle, so an instance of either enumerates nothing at all. */
+  function netHide(target, key, value) {
+    Object.defineProperty(target, key, { value: value, writable: true, enumerable: false, configurable: true });
+  }
+
   /* net.SocketAddress: an immutable address, family ('ipv4' or 'ipv6'), port and flow label */
   class SocketAddress {
-    constructor(options) {
-      var opts = options || {};
+    /* No named parameter, because Node's own constructor answers 'length' 0: it defaults the whole
+       options object, so 'new SocketAddress()' and 'new SocketAddress({ ... })' are one signature. */
+    constructor() {
+      var options = arguments[0];
+      /* The options object is required to be one -- undefined builds the default address, and null,
+         a number, a string, an array and a function are each ERR_INVALID_ARG_TYPE 'The "options"
+         argument must be of type object', which is Node's validateObject with no array or function
+         allowed. */
+      if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) {
+        throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+          'The "options" argument must be of type object. Received ' + netDescribe(options));
+      }
+      var opts = options === undefined ? {} : options;
       var family = opts.family === undefined ? 'ipv4' : String(opts.family).toLowerCase();
       if (family !== 'ipv4' && family !== 'ipv6') {
         throw netError(TypeError, 'ERR_INVALID_ARG_VALUE',
           "The property 'options.family' is invalid. Received " + netInspectValue(opts.family));
       }
       /* The address of an IPv6 socket with none named is the unspecified '::', not '::1': the
-         SocketAddress host Node 24.15 builds with no address carries the family's own wildcard. */
-      var address = opts.address === undefined ? (family === 'ipv6' ? '::' : '127.0.0.1') : opts.address;
+         SocketAddress host Node 24.15 builds with no address carries the family's own wildcard --
+         and it picks it from the family as it was given, before the case is folded, so 'ipv4' names
+         '127.0.0.1' while 'iPv4' and 'IPV4' name '::' and are then asked to hold it as IPv4, which
+         is ERR_INVALID_ADDRESS 'Invalid socket address'. */
+      var address = opts.address === undefined
+        ? (opts.family === undefined || opts.family === 'ipv4' ? '127.0.0.1' : '::')
+        : opts.address;
       if (typeof address !== 'string') {
         throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
           'The "options.address" property must be of type string. Received ' + netDescribe(address));
@@ -2005,22 +2180,22 @@ BF['net'] = function () {
          lower case, its longest run of zero groups compressed, a v4-mapped one written in dotted
          IPv4 -- '2001:DB8::1' is kept as '2001:db8::1' and '::FFFF:7B7B:7B7B' as
          '::ffff:123.123.123.123'. */
-      this._address = netTextOf(parsed);
-      this._family = family;
-      this._port = opts.port === undefined ? 0 : netPortOf(opts.port, true);
-      this._flowlabel = netSocketFlowlabel(opts.flowlabel, family);
+      netHide(this, '_address', netTextOf(parsed));
+      netHide(this, '_port', opts.port === undefined ? 0 : netPortOf(opts.port, true));
+      netHide(this, '_family', family);
+      netHide(this, '_flowlabel', netSocketFlowlabel(opts.flowlabel, family));
     }
 
     get address() {
       return this._address;
     }
 
-    get family() {
-      return this._family;
-    }
-
     get port() {
       return this._port;
+    }
+
+    get family() {
+      return this._family;
     }
 
     get flowlabel() {
@@ -2034,22 +2209,34 @@ BF['net'] = function () {
 
     /**
      * An 'address:port' or '[address]:port' string as a SocketAddress, or undefined for one that is
-     * neither. The port is validated but not carried: host Node 24.15 answers 0 for every input,
-     * including '127.0.0.1:80', and undefined for one whose port is outside the 16-bit range.
+     * neither. An input that is not a string is ERR_INVALID_ARG_TYPE 'The "input" argument must be
+     * of type string', the way Node refuses it.
+     *
+     * Host Node 24.15 reads the string as the host and port of a URL: it reads
+     * 'http://' + input, and that reading is what decides every case here. 80 is
+     * the scheme's own port, so the URL carries none and the port comes back 0
+     * ('127.0.0.1:80' is port 0 while ':1' is 1). A bracketed literal is IPv6, and
+     * a zone id is a thing a URL's host may not carry, so a bracketed one is not
+     * parsed at all. An unbracketed literal with a colon of its own -- '::1' -- is
+     * not a URL's host. And a dotted quad is read by the URL host parser, which
+     * takes '01.2.3.4' for '1.2.3.4'.
      */
     static parse(input) {
-      var text = typeof input === 'string' ? input : String(input);
-      var v4 = /^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?$/.exec(text);
-      if (v4 && netIsIPv4(v4[1])) {
-        if (v4[2] !== undefined && Number(v4[2]) > 65535) return undefined;
-        return new SocketAddress({ address: v4[1], family: 'ipv4', port: 0 });
+      if (typeof input !== 'string') {
+        throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+          'The "input" argument must be of type string. Received ' + netDescribe(input));
       }
-      var v6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(text);
-      if (v6 && netIsIPv6(v6[1])) {
-        if (v6[2] !== undefined && Number(v6[2]) > 65535) return undefined;
-        return new SocketAddress({ address: v6[1], family: 'ipv6', port: 0 });
+      /* Trailing space is stripped off the whole URL string, so '1.2.3.4 ' is parsed; a leading
+         space sits inside the authority and is not, so ' 1.2.3.4' is not. */
+      var split = netSplitHostPort(input.replace(/[\s]+$/, ''));
+      if (split === null) return undefined;
+      if (split.family === 'ipv6') {
+        if (!netIsIPv6(split.host)) return undefined;
+        return new SocketAddress({ address: split.host, family: 'ipv6', port: split.port });
       }
-      return undefined;
+      var text = netUrlIPv4(split.host);
+      if (text === null) return undefined;
+      return new SocketAddress({ address: text, family: 'ipv4', port: split.port });
     }
   }
 
@@ -2087,13 +2274,23 @@ BF['net'] = function () {
     isIPv4: netIsIPv4,
     isIPv6: netIsIPv6,
     getDefaultAutoSelectFamily: function () {
-      return true;
+      return NET_AUTO_SELECT_FAMILY;
     },
-    setDefaultAutoSelectFamily: function () {},
+    /* A setter that sets: host Node 24.15 keeps the flag a caller gave it, and refuses one that is
+       not a boolean with ERR_INVALID_ARG_TYPE 'The "value" argument must be of type boolean'. */
+    setDefaultAutoSelectFamily: function (value) {
+      if (typeof value !== 'boolean') {
+        throw netError(TypeError, 'ERR_INVALID_ARG_TYPE',
+          'The "value" argument must be of type boolean. Received ' + netDescribe(value));
+      }
+      NET_AUTO_SELECT_FAMILY = value;
+    },
     getDefaultAutoSelectFamilyAttemptTimeout: function () {
-      return 250;
+      return NET_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT;
     },
-    setDefaultAutoSelectFamilyAttemptTimeout: function () {}
+    setDefaultAutoSelectFamilyAttemptTimeout: function (value) {
+      NET_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT = value;
+    }
   };
 };
 
@@ -2150,8 +2347,11 @@ BF['dgram'] = function () {
          (0.0.0.0:55602 there), where a path meant as a unix socket is not a thing dgram opens. */
       var port = args.port === undefined ? 0
         : netPortOf(typeof args.port === 'string' && !/^\d+$/.test(args.port) ? 0 : args.port);
+      /* A zone id is not part of the address a UDP socket binds or sends to: a host's own getsockname
+         answers '::1' for a socket bound on '::1%lo0', and a datagram sent to the scoped literal
+         arrives at the address the zone is attached to. */
       var shown = args.address
-        ? netListenDisplay(args.address)
+        ? netStripZone(netListenDisplay(args.address))
         : (this._family === 'IPv6' ? '::' : '0.0.0.0');
       if (this._targetId === undefined) {
         var target = this;
@@ -2229,8 +2429,9 @@ BF['dgram'] = function () {
         }
         /* A datagram addressed to the other family is refused by the send itself, the way
            uv_udp_send answers it, rather than dropped without a word. */
-        if ((netIsIP(resolved) === 6) !== (self._family === 'IPv6')) {
-          var mismatch = netError(Error, 'EINVAL', 'send EINVAL ' + resolved + ':' + port);
+        var destination = netStripZone(resolved);
+        if ((netIsIP(destination) === 6) !== (self._family === 'IPv6')) {
+          var mismatch = netError(Error, 'EINVAL', 'send EINVAL ' + destination + ':' + port);
           mismatch.errno = -22;
           mismatch.syscall = 'send';
           if (typeof callback === 'function') netDefer(function () { callback(mismatch); });
@@ -2239,13 +2440,13 @@ BF['dgram'] = function () {
         }
         if (self._hubId !== undefined) {
           try {
-            callCapBytes('net.udpSend', { socketId: self._hubId, address: resolved, port: port }, datagram);
+            callCapBytes('net.udpSend', { socketId: self._hubId, address: destination, port: port }, datagram);
           } catch (cause) {
             /* A datagram the hub refuses -- an IPv4 destination a socket bound to one address of its
                own has no route to -- is the send's own answer, as uv_udp_send gives it. Anything
                else raised here is a socket that is gone, and UDP drops those without a word. */
             if (cause && cause.code === 'EADDRNOTAVAIL') {
-              var refused = netSystemError(cause, 'send', resolved, port);
+              var refused = netSystemError(cause, 'send', destination, port);
               if (typeof callback === 'function') netDefer(function () { callback(refused); });
               else self.emit('error', refused);
               return;

@@ -3,30 +3,136 @@ subject: 'Virtual network hub per container: loopback TCP and UDP ports, connect
 session_id: claude-gm-owc-2
 status: closed
 witness_2026_10_23_adv9: 'RETIRED 2026-10-23 by the executor for shard net (session adv9-exec-net) at HEAD 1ff048b plus this pass''''s dgram mapped fix, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core against host node v24.15.0, one process per side, stdout, stderr and exit captured separately, machine load 6-10 with 2.2-2.9 GB free, probes /tmp/owc-r4/adv9-exec-net/p-net and p-tls. Every surface the row names is present and matches: a server''''s listening/address/getConnections/close; a TCP round trip with its event order and bytesWritten/bytesRead; EADDRINUSE (errno -48, err.port) on a port already bound and ECONNREFUSED on one that is not; UDP in both families with the rinfo a receiver reads; the Socket accessors (localPort type, remotePort, remoteAddress, setNoDelay and setKeepAlive chaining, writable/readable/destroyed); net.isIP/isIPv4/isIPv6; a port bound in one process reached from another (a child node dials the parent''''s port and exchanges bytes, exit 0 on both sides); and tls over the same hub -- tls.createServer answered by tls.connect reports secureConnect, authorized, getProtocol() TLSv1.3, a cipher name, encrypted true, and bytes in both directions. Two lines remain and neither is a missing feature; both are recorded in Readme.md under Virtual net: the order at the end of a connection both sides have ended (srv.end,cli.end,srv.close,cli.close against the host''''s srv.end,srv.close,cli.end,cli.close -- one scheduling model on each side, and delaying every peer delivery until after this side''''s close fixes three other interleavings and loses finish on the last two, so it is not one knob), and tls.rootCertificates is 145 entries on the host and 0 here, which is the no-built-in-roots note. Fixed in this pass under this row: dgram''''s IPv4-mapped loopback. A udp6 socket may now bind ::ffff:127.0.0.1 (it hung before -- the bind was refused EADDRNOTAVAIL and the callback never fired); a udp6 socket on :: sending to ::ffff:127.0.0.1 reaches receivers on ::, on ::ffff:127.0.0.1, on 127.0.0.1 and on 0.0.0.0 with rinfo ::ffff:127.0.0.1/IPv6 for the udp6 ones and 127.0.0.1/IPv4 for the rest; an IPv4 sender is seen by a udp6 socket on :: as ::ffff:127.0.0.1/IPv6; and a udp6 socket bound to ::1 has no route to a mapped destination, so its send is EADDRNOTAVAIL as on a host. Measured as the 60 triples of sender x receiver x destination over the loopback in both families (/tmp/owc-r4/adv9-exec-net/p-udp): SAME on two container runs, where the same matrix before the change lost 8 deliveries, dropped 5 more, and never finished. Changed: sendUdp, findEndpoint and three new helpers in packages/core/src/network/virtual/hub.ts, and the rinfo family in runtime/guest/modules/net.ts (it is the family the peer address is written in, not the socket''''s own). npx tsc --noEmit clean in packages/core; pnpm build succeeds. No regression: p-net, p-family, p-wildcard, p-path, p-tls and p-buffer all come back with exactly the lines they had before the change.'
-witness_2026_10_24_adv10_judge: 'RE-VERIFIED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36 + this pass''''s changes, differential
-against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts
-out of packages/core, stdout/stderr/exit captured separately, every probe run twice on each side,
-load 6.9-8.9 with 3.6-3.9 GB free, probes /tmp/owc-r4/adv10-judge-net-3/j-net, j-net2, j-reg.
-HOLDS on the retirement''''s own cases: j-reg re-runs 17 bind x dial combinations, dual binds on one port
-in both orders, a unix path bind/connect/exchange/rebind/105-byte EINVAL/unbound-connect ENOENT/address
-after close, and dgram in both families with the mapped destination -- all 23 lines identical to host
-Node 24.15 but for the host''''s own ephemeral ports. TWO things the retirement did not name were confirmed
-in isolation and one is FIXED here: `socket.resetAndDestroy` was `undefined` here and a `function` on
-host Node 24.15 (j-net, both sides exit 0, both reruns identical), and so were `getTypeOfService` and
-`setTypeOfService`. All three are now on Socket in runtime/guest/modules/net.ts: resetAndDestroy closes
-the hub with bytes left unread so the peer gets ECONNRESET and no `end` (measured: peerErr=ECONNRESET
-peerEnd=no peerClose=yes, byte-identical to host), getTypeOfService answers 0, setTypeOfService takes
-0..255 and throws ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE with Node''''s messages and returns the socket.
-j-net2 is now 0 lines different from host. The TLS half is STALE, not fixed: measured in isolation
-(j-tls, both reruns identical on each side), `tls.getCiphers()` is 3 here
-(tls_aes_128_gcm_sha256,tls_aes_256_gcm_sha384,tls_chacha20_poly1305_sha256) and 62 on host
-(aes128-gcm-sha256,aes128-sha,aes128-sha256); a server and a client both pinned to
-minVersion/maxVersion ''''TLSv1.2'''' fail here (client ECONNRESET, server ERR_SSL_NO_PROTOCOLS_AVAILABLE)
-where host Node 24.15 connects with protocol TLSv1.2 and cipher ECDHE-RSA-AES128-GCM-SHA256;
-getEphemeralKeyInfo() is {} on host for a TLS 1.3 session and {type:ECDH,name:X25519,size:253} here;
-and a TLS socket''''s bytesRead is 1293 here and 0 on host at secureConnect. The site is
-packages/core/src/process/executors/node/runtime/guest/modules/tls.ts, outside this shard''''s grant
-(packages/core/src/network/virtual/hub.ts and runtime/guest/modules/net.ts); named, not edited. A
-self-signed certificate with no ca (DEPTH_ZERO_SELF_SIGNED_CERT), rejectUnauthorized:false, ALPN, a
-servername mismatch, checkServerIdentity and requestCert agree with host. One concrete line for each
-half added to Readme.md under Virtual net. npx tsc --noEmit clean in packages/core; pnpm build succeeds.'
+witness_2026_10_24_adv10_judge: 'RE-VERIFIED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36 + this pass''''s changes, differential against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout/stderr/exit captured separately, every probe run twice on each side, load 6.9-8.9 with 3.6-3.9 GB free, probes /tmp/owc-r4/adv10-judge-net-3/j-net, j-net2, j-reg. HOLDS on the retirement''''s own cases: j-reg re-runs 17 bind x dial combinations, dual binds on one port in both orders, a unix path bind/connect/exchange/rebind/105-byte EINVAL/unbound-connect ENOENT/address after close, and dgram in both families with the mapped destination -- all 23 lines identical to host Node 24.15 but for the host''''s own ephemeral ports. TWO things the retirement did not name were confirmed in isolation and one is FIXED here: `socket.resetAndDestroy` was `undefined` here and a `function` on host Node 24.15 (j-net, both sides exit 0, both reruns identical), and so were `getTypeOfService` and `setTypeOfService`. All three are now on Socket in runtime/guest/modules/net.ts: resetAndDestroy closes the hub with bytes left unread so the peer gets ECONNRESET and no `end` (measured: peerErr=ECONNRESET peerEnd=no peerClose=yes, byte-identical to host), getTypeOfService answers 0, setTypeOfService takes 0..255 and throws ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE with Node''''s messages and returns the socket. j-net2 is now 0 lines different from host. The TLS half is STALE, not fixed: measured in isolation (j-tls, both reruns identical on each side), `tls.getCiphers()` is 3 here (tls_aes_128_gcm_sha256,tls_aes_256_gcm_sha384,tls_chacha20_poly1305_sha256) and 62 on host (aes128-gcm-sha256,aes128-sha,aes128-sha256); a server and a client both pinned to minVersion/maxVersion ''''TLSv1.2'''' fail here (client ECONNRESET, server ERR_SSL_NO_PROTOCOLS_AVAILABLE) where host Node 24.15 connects with protocol TLSv1.2 and cipher ECDHE-RSA-AES128-GCM-SHA256; getEphemeralKeyInfo() is {} on host for a TLS 1.3 session and {type:ECDH,name:X25519,size:253} here; and a TLS socket''''s bytesRead is 1293 here and 0 on host at secureConnect. The site is packages/core/src/process/executors/node/runtime/guest/modules/tls.ts, outside this shard''''s grant (packages/core/src/network/virtual/hub.ts and runtime/guest/modules/net.ts); named, not edited. A self-signed certificate with no ca (DEPTH_ZERO_SELF_SIGNED_CERT), rejectUnauthorized:false, ALPN, a servername mismatch, checkServerIdentity and requestCert agree with host. One concrete line for each half added to Readme.md under Virtual net. npx tsc --noEmit clean in packages/core; pnpm build succeeds.'
+witness_2026_10_24_adv11: |-
+  RE-VERIFIED AND EXTENDED BY THE EXECUTOR FOR SHARD NET (session adv11-exec-net) at HEAD e169099 plus
+  this pass's net.ts change, differential against host node v24.15.0, one process per side, container
+  driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout/stderr/exit captured
+  separately, every probe run twice on each side, load 5.2-7.7 with 3.2-4.1 GB free, probes
+  /tmp/owc-r4/adv11-exec-net/j-reg, j-net, j-net2, j-path, j-pathfs, j-fam, pa-buf, j-writehost, j-tls,
+  a-surf, a-eis. The retirement HOLDS: j-reg's 17 bind x dial combinations, its dual binds in both
+  orders, its unix path surface and dgram in both families are identical to host Node 24.15 but for the
+  host's own ephemeral ports, and j-net2 is 0 lines different. THREE divergences no earlier wave named
+  were measured in isolation (a-surf, a-eis) and all three are FIXED here: dgram's getRecvBufferSize()
+  and getSendBufferSize() were `not a function` here and answered 786896 and 9216 on host, and now
+  report what a setRecvBufferSize or setSendBufferSize last gave them, or this platform's own default,
+  are EBADF (ERR_SOCKET_BUFFER_SIZE, uv_recv_buffer_size) on an unbound socket and throw the TypeError
+  host Node throws for a closed one, and a size of 0 is accepted and leaves the figure alone, as the
+  host's kernel does; a buffer size is now refused with Node's own text, `Buffer size must be a
+  positive integer`, where this runtime printed `non-negative integer` and echoed the value back; and a
+  second connect() on one socket is refused -- one already made is EISCONN (errno -56), one still in
+  flight is EALREADY (errno -37), each reported asynchronously by destroying the socket (error then
+  close, destroyed true), with the text naming the destination and the local end the socket had already
+  bound (`connect EISCONN 127.0.0.1:PORT - Local (127.0.0.1:PORT)`), a path naming itself with no local
+  end, and connect() still answering with the socket, while a name that does not resolve is still
+  ENOTFOUND because the lookup comes first. a-surf is now 0 lines different from host across 44 cases
+  (a fresh socket's fields, setTimeout and the timeout event, unref and ref, getConnections,
+  maxConnections, close with a connection open, a localAddress bind, setEncoding, isIP/isIPv4/isIPv6 on
+  13 texts, seven dgram socket options, a slice send, the accepted socket's own address, listen with no
+  arguments and with a backlog, and a reconnect), and a-eis is 1 line different. Changed: connect(),
+  netConnectAgainError, netBufferSize, netBufferState and the DgramSocket buffer-size methods plus two
+  constants in runtime/guest/modules/net.ts. npx tsc --noEmit clean in packages/core; pnpm build
+  succeeds. NO REGRESSION: j-reg, j-fam, j-path, j-net and j-net2 come back byte-identical, modulo
+  ephemeral ports, to the adv10 judge's own container runs of the same probes. TWO lines remain stale on
+  the witnesses already recorded and re-measured here: the tls half (j-tls, 9 lines -- getCiphers 3
+  against 62, TLSv1.2 pinned failing ERR_SSL_NO_PROTOCOLS_AVAILABLE, getEphemeralKeyInfo inverted,
+  bytesRead 1293 against 0; all packages/core/src/process/executors/node/runtime/guest/modules/tls.ts,
+  outside this shard's grant) and the connect on a socket already destroyed: host Node clears its
+  destroyed flag there and this runtime cannot without reopening a connection the hub has released, so
+  it stays true. One concrete line for each added to Readme.md under Virtual net.
+witness_2026_10_24_adv12: |-
+  RE-VERIFIED BY THE EXECUTOR FOR SHARD NET (session adv12-exec-net) at HEAD 5dd5b85 plus this pass's net.ts change, differential against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately, every probe run twice on each side, load 4.7-6.7 with 3.6-5.1 GB free.
+  Probes /tmp/owc-r4/adv12-exec-net/j-reg, j-net, j-net2, a-surf, a-eis, f-conn, f-conn2, s-val, s-val2,
+  s-val3, s-surf. HOLDS: j-reg's 17 bind x dial combinations, its dual binds in both orders, its unix path
+  surface and dgram in both families come back identical to host Node 24.15 but for the host's own
+  ephemeral ports (4 diff lines, every one of them a port); j-net2 and a-eis are 0 lines different; a-surf
+  differs in 8 lines, all ports; j-net in 1, the list of own keys on Socket.prototype, which is an
+  implementation shape and not behaviour. TWO probes written for this pass and both 0 lines different
+  (f-conn, f-conn2, 8 scenes, 20 connections): a server sees one 'connection' for every client that
+  connects, on a bind of ::ffff:127.0.0.1, ::1, 127.0.0.1, ::, 0.0.0.0 and the default, whether the
+  clients connect and destroy back to back or 60 ms apart, and reports the same four values the host
+  reports for each accepted socket. FIXED here, in runtime/guest/modules/net.ts, the two value types on
+  the module: net.BlockList and net.SocketAddress diverged in 24 measured lines and now answer as host
+  Node 24.15 answers them (s-val2 and s-val3, 68 cases, both 0 lines different): an address that is not a
+  string is ERR_INVALID_ARG_TYPE and one no family can hold is ERR_INVALID_ADDRESS 'Invalid socket
+  address', where this runtime said ERR_INVALID_IP_ADDRESS and echoed the value back; the family argument
+  of a BlockList method is refused by type when it is not a string (so null is no longer the default
+  'ipv4') and by value, in Node's own wording, when it names no family; a prefix is refused in the three
+  bands a host uses (not a number, not an integer, outside the family's own 0..32 or 0..128); a reversed
+  range names the start it was handed the way inspect prints a SocketAddress; a SocketAddress keeps the
+  address the kernel renders (lower case, longest zero run compressed, a v4-mapped one written
+  ::ffff:123.123.123.123) rather than the text it was given, defaults an IPv6 address to :: and not ::1,
+  refuses a port with 'options.port should be >= 0 and < 65536', carries a flow label only on IPv6 and
+  only inside 32 bits, has toJSON() and prints as 'SocketAddress { address: ..., port: 0, family: 'ipv4',
+  flowlabel: 0 }'; and SocketAddress.parse validates the port of an 'address:port' string without
+  carrying it, because host Node 24.15 answers port 0 even for '127.0.0.1:80'. One line of that surface is
+  the engine's and stays: calling net.SocketAddress(...) without new is 'class constructors must be
+  invoked with 'new'' here where V8 says 'Class constructor SocketAddress cannot be invoked without 'new''.
+  STALE, measured again here (j-fam): a server closed immediately after the last of four connects keeps
+  one of the four 'connection' events here against the host's three, which is the same one-scheduling-model
+  difference the retirement already records at the end of a connection and not a separate fix. The dns
+  half (dns.lookup('::1%lo0') ENOENT, dns.lookup('localhost') 127.0.0.1/4) and the tls half are
+  re-confirmed and remain packages/core/src/process/executors/node/runtime/guest/modules/dns.ts and
+  tls.ts, outside this shard's grant. npx tsc --noEmit clean in packages/core; pnpm build succeeds. No
+  regression: j-reg, j-fam, j-path, j-pathfs, j-net2, a-surf, a-eis, j-net, f-conn and f-conn2 all come
+  back with exactly the lines they had before this pass's change.
+witness_2026_10_24_adv12_judge: |-
+  JUDGE FOR SHARD NET (session adv12-judge-net-1) at HEAD e022edd plus this pass's net.ts change,
+  differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured
+  separately, every probe run twice on each side, load 4.7-10.9. Six probes written for this pass,
+  none copied from the executor: /tmp/owc-r4/adv12-judge-net-1/{j1-sa-opts,j2-sa-parse,
+  j3-sa-familycase,j4-bl-json,j5-shape,j6-autofam,j7-udp6zone}, plus j11-conn for the
+  connection-counting scene the adversary added. The adversary's own r-sa and r-bl were re-run as a
+  regression check afterwards.
+
+  Every disputed case was re-run IN ISOLATION and every one DIVERGED on the pre-fix tree: j1 5
+  lines, j2 13, j3 2, j4 7, j5 8, j6 4, j7 4. Twenty-three of those twenty-five lines are now FIXED
+  and j1, j2, j3, j5 and j6 come back 0 lines different from host on both container runs. Changed,
+  all in packages/core/src/process/executors/node/runtime/guest/modules/net.ts: `new
+  net.SocketAddress(null | 1 | 'x' | [])` is ERR_INVALID_ARG_TYPE 'The "options" argument must be of
+  type object' (Node defaults the option to an empty object and then validateObject's it, so
+  undefined still builds the default address and an array is refused); `SocketAddress.parse` of a
+  non-string is ERR_INVALID_ARG_TYPE 'The "input" argument must be of type string'; parse now reads
+  its input the way host Node 24.15 does -- as the host and port of URLParse('http://' + input) --
+  so it carries the port (':1' -> 1, ':1024' -> 1024, ':65535' -> 65535) and answers 0 only for the
+  one port that scheme elides (':80', and ':0' which is 0 anyway), takes '01.2.3.4:80' for 1.2.3.4
+  and '010.1.1.1' for 8.1.1.1 (a URL host part with a leading zero is octal), parses '1.2.3.4:', and
+  refuses both a bracketed literal carrying a zone ('[fe80::1%lo0]:80') and an unbracketed IPv6
+  literal ('::1'), which a URL's host may not be; the default address is chosen from the family as
+  it was given, before its case is folded, so 'iPv4' and 'IPV4' with no address named are
+  ERR_INVALID_ADDRESS 'Invalid socket address'; a BigInt argument renders 'type bigint (24n)'; the
+  state is held in non-enumerable own fields, so an instance enumerates nothing (Object.keys is [])
+  as a host's does, and the constructor takes no named parameter so net.SocketAddress.length is 0;
+  net.BlockList carries toJSON() (the rules array, newest first) and fromJSON(data) (a JSON string
+  or array of strings in the text `rules` writes them in, 'Address: IPv4 1.2.3.4', refused 'The
+  "data" argument must be of type string or string[]' otherwise); and net.setDefaultAutoSelectFamily
+  and its getter keep what a caller set (false reads back false, a non-boolean is ERR_INVALID_ARG_TYPE
+  'The "value" argument must be of type boolean'), as the attempt-timeout pair does. A udp6 socket
+  now binds a scoped literal: bind(21025, '::1%lo0') binds ::1, address() reports ::1 with no zone on
+  it, and a datagram sent to '::1%lo0' arrives at it -- a zone names which interface a link-local
+  address means, not which host it is, and dgram is BF['dgram'] inside net.ts, inside this shard's
+  grant.
+
+  REGRESSION: the adversary's own r-sa (85 lines) is now 0 lines different from host, where it was
+  17, and r-bl (67) is 1, where it was 8.
+
+  TWO lines are not fixable and stay recorded. j4's and r-bl's one remaining line is the engine's:
+  calling a static that does not exist -- net.BlockList.fromJSON(...) -- is 'net.BlockList.fromJSON
+  is not a function' on V8 and 'not a function' on QuickJS, and net.BlockList() with no 'new' is
+  'Class constructor BlockList cannot be invoked without new' against 'class constructors must be
+  invoked with new'. j7's one remaining line is the host's own ephemeral source port (56694 against
+  this side's 49152).
+
+  The connection-counting scene the adversary added is CONFIRMED in isolation and ends STALE, not
+  fixed (j11-conn, both reruns identical on each side): server.close() issued while four connects are
+  in flight has host Node 24.15 refuse all four with ECONNREFUSED, where here all four clients emit
+  'connect'; the server emits 0 'connection' on both sides. It is not the count and not a missing
+  feature: this side's connect reaches the hub in the turn it was made, because netResolve answers an
+  IP literal synchronously, so the four dials land before the close that follows them, where a host's
+  libuv defers a connect to a later poll and the close wins. Making it match means deferring every
+  connect a macrotask, a scheduling change across the whole surface that the Readme records as
+  matching host line for line (connect ordering, bytesWritten, the end-of-connection ordering), so it
+  is the same one-scheduling-model difference the row already carries rather than one small change.
+  One concrete line for it, and one for the whole value-type surface, added to Readme.md under
+  Virtual net. npx tsc --noEmit clean in packages/core; pnpm build succeeds.

@@ -59,29 +59,51 @@ body: |-
 
   Recorded in Readme.md under "Virtual net".
 witness_2026_10_23_adv9: 'RE-VERIFIED 2026-10-23 by the executor for shard net (session adv9-exec-net) at HEAD 1ff048b plus this pass''''s dgram mapped fix, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core against host node v24.15.0, one process per side, stdout/stderr/exit separate, load 6-10 with 2.2-2.9 GB free, probe /tmp/owc-r4/adv9-exec-net/p-family, SAME on two container runs (before and after this pass''''s change). The row holds: a bind on ::1 dialled as ::1 is IPv6 at all four of the client''''s values and all four of the server''''s; a bind on 127.0.0.1 dialled as 127.0.0.1 or as localhost is IPv4 at every one; dialling ::1 against a server bound on 127.0.0.1 is ECONNREFUSED; a wildcard bind accepts an IPv6 client on ::1/IPv6; udp6 on ::1 and udp4 on 127.0.0.1 each deliver their datagram with the rinfo the host reports. Nothing in this row still diverges; nothing was edited for it in this pass.'
-witness_2026_10_24_adv10_judge: 'RE-MEASURED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36: ''''nothing in this row still diverges''''
-is REFUTED in isolation and the two divergences are FIXED here. Differential against host node v24.15.0,
-one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core,
-stdout/stderr/exit separate, all four runs exit 0, every probe run twice on each side, load 6.9-8.9 with
-3.6-3.9 GB free, probes /tmp/owc-r4/adv10-judge-net-3/j-fam and j-reg. (1) `server.listen(0,
-''''''''::ffff:127.0.0.1'''''''')` was EADDRNOTAVAIL here (address() null, never listening) and binds on host
-(address() ::ffff:127.0.0.1/IPv6); the mapped-loopback escape in hub.listen was granted to UDP alone.
-hub.ts now admits it for either protocol, and after the change the bind answers ::ffff:127.0.0.1/IPv6, a
-client dialling 127.0.0.1 connects (client 127.0.0.1/IPv4, accepted socket ::ffff:127.0.0.1/IPv6), one
-dialling the mapped literal connects (::ffff:127.0.0.1/IPv6 at both of its own ends) and ::1 is
-ECONNREFUSED -- every value as host Node 24.15 reports it. (2) `net.connect({host:''''''''::1%lo0''''''''})` was
-ENOTFOUND here and connects on host (remote=::1/IPv6 local=::1/IPv6): netIsIPv6 now reads a zone (scope)
-id as part of the literal (Node''''s own isIPv6 answers 6 for ''''''''::1%lo0'''''''' and 0 for ''''''''::1%''''''''), and
-hub.connect strips the zone and dials the address it is attached to. j-fam after the change differs from
-host only in the host''''s own ephemeral ports, in two server-side lines a probe that destroys its client
-the instant it connects races (j-reg, which waits 40 ms, matches on all 17 rows), and in dns.lookup.
-NOT FIXED, OUT OF THIS SHARD: `dns.lookup(''''''''::1%lo0'''''''')` is ENOENT here where host Node 24.15 answers
-''''''''::1%lo0''''''''/6 -- the site is packages/core/src/process/executors/node/runtime/guest/modules/dns.ts,
-named and not edited; `dns.lookup(''''''''localhost'''''''')` still answers 127.0.0.1/4 here and ::1/6 on host,
-which is already recorded under row owc-virtual-net-localhost-bind. No regression: j-reg re-runs the 17
-bind x dial combinations this row and owc-virtual-net-wildcard-mapped were retired on (binds on the
-default, ::, 0.0.0.0, ::1, 127.0.0.1, localhost; dials of localhost, 127.0.0.1, ::1, ::ffff:127.0.0.1
-and ::ffff:7f00:1), the dual binds in both orders, the unix path surface and dgram in both families --
-all identical to host but for the host''''s own ports. Changed: listen() and connect() plus stripZone() in
-packages/core/src/network/virtual/hub.ts, netIsIPv6 in runtime/guest/modules/net.ts. npx tsc --noEmit
-clean in packages/core; pnpm build succeeds. Recorded in Readme.md under Virtual net.'
+witness_2026_10_24_adv10_judge: 'RE-MEASURED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36: ''''nothing in this row still diverges'''' is REFUTED in isolation and the two divergences are FIXED here. Differential against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout/stderr/exit separate, all four runs exit 0, every probe run twice on each side, load 6.9-8.9 with 3.6-3.9 GB free, probes /tmp/owc-r4/adv10-judge-net-3/j-fam and j-reg. (1) `server.listen(0, ''''''''::ffff:127.0.0.1'''''''')` was EADDRNOTAVAIL here (address() null, never listening) and binds on host (address() ::ffff:127.0.0.1/IPv6); the mapped-loopback escape in hub.listen was granted to UDP alone. hub.ts now admits it for either protocol, and after the change the bind answers ::ffff:127.0.0.1/IPv6, a client dialling 127.0.0.1 connects (client 127.0.0.1/IPv4, accepted socket ::ffff:127.0.0.1/IPv6), one dialling the mapped literal connects (::ffff:127.0.0.1/IPv6 at both of its own ends) and ::1 is ECONNREFUSED -- every value as host Node 24.15 reports it. (2) `net.connect({host:''''''''::1%lo0''''''''})` was ENOTFOUND here and connects on host (remote=::1/IPv6 local=::1/IPv6): netIsIPv6 now reads a zone (scope) id as part of the literal (Node''''s own isIPv6 answers 6 for ''''''''::1%lo0'''''''' and 0 for ''''''''::1%''''''''), and hub.connect strips the zone and dials the address it is attached to. j-fam after the change differs from host only in the host''''s own ephemeral ports, in two server-side lines a probe that destroys its client the instant it connects races (j-reg, which waits 40 ms, matches on all 17 rows), and in dns.lookup. NOT FIXED, OUT OF THIS SHARD: `dns.lookup(''''''''::1%lo0'''''''')` is ENOENT here where host Node 24.15 answers ''''''''::1%lo0''''''''/6 -- the site is packages/core/src/process/executors/node/runtime/guest/modules/dns.ts, named and not edited; `dns.lookup(''''''''localhost'''''''')` still answers 127.0.0.1/4 here and ::1/6 on host, which is already recorded under row owc-virtual-net-localhost-bind. No regression: j-reg re-runs the 17 bind x dial combinations this row and owc-virtual-net-wildcard-mapped were retired on (binds on the default, ::, 0.0.0.0, ::1, 127.0.0.1, localhost; dials of localhost, 127.0.0.1, ::1, ::ffff:127.0.0.1 and ::ffff:7f00:1), the dual binds in both orders, the unix path surface and dgram in both families -- all identical to host but for the host''''s own ports. Changed: listen() and connect() plus stripZone() in packages/core/src/network/virtual/hub.ts, netIsIPv6 in runtime/guest/modules/net.ts. npx tsc --noEmit clean in packages/core; pnpm build succeeds. Recorded in Readme.md under Virtual net.'
+witness_2026_10_24_adv11: |-
+  RE-VERIFIED BY THE EXECUTOR FOR SHARD NET (session adv11-exec-net) at HEAD e169099 plus this pass's
+  net.ts change, differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout/stderr/exit separate, all runs exit
+  0, container run twice and identical, load 6.5-7.7 with 3.2-4.1 GB free, probes
+  /tmp/owc-r4/adv11-exec-net/j-fam and j-reg. HOLDS: the mapped-loopback bind answers
+  ::ffff:127.0.0.1/IPv6, takes a client dialling 127.0.0.1 (accepted as ::ffff:127.0.0.1/IPv6) and one
+  dialling the mapped literal (::ffff:127.0.0.1/IPv6 at both of its own ends) and refuses ::1
+  ECONNREFUSED; a bind on ::1 dialled as ::1 is IPv6 at all four of the client's values and all four of
+  the server's; a scoped literal connects; and j-reg's 17 bind x dial combinations match host line for
+  line. NOT FIXED, OUT OF THIS SHARD, re-measured here: dns.lookup('::1%lo0') is ENOENT here where host
+  answers ::1%lo0/6, and dns.lookup('localhost') is 127.0.0.1/4 here and ::1/6 on host -- both
+  packages/core/src/process/executors/node/runtime/guest/modules/dns.ts, named and not edited. No source
+  change for this row in this pass.
+witness_2026_10_24_adv12: |-
+  RE-VERIFIED BY THE EXECUTOR FOR SHARD NET (session adv12-exec-net) at HEAD 5dd5b85 plus this pass's net.ts change, differential against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately, every probe run twice on each side, load 4.7-6.7 with 3.6-5.1 GB free.
+  Probes /tmp/owc-r4/adv12-exec-net/j-fam and j-reg. HOLDS: the mapped-loopback bind answers
+  ::ffff:127.0.0.1/IPv6, takes a client dialling 127.0.0.1 (accepted as ::ffff:127.0.0.1/IPv6) and one
+  dialling the mapped literal (::ffff:127.0.0.1/IPv6 at both of its own ends) and refuses ::1
+  ECONNREFUSED; a bind on ::1 dialled as ::1 is IPv6 at all four of the client's values and all four of
+  the server's; a scoped literal ('::1%lo0') connects and reports ::1/IPv6 at both ends; and j-reg's 17
+  bind x dial combinations match host line for line, as does its dgram section in both families. The only
+  lines j-fam differs in are the host's own ephemeral ports and dns.lookup, which is named below. NOT
+  FIXED, OUT OF THIS SHARD, re-measured here: dns.lookup('::1%lo0') is ENOENT here where host answers
+  ::1%lo0/6, and dns.lookup('localhost') is 127.0.0.1/4 here and ::1/6 on host -- both
+  packages/core/src/process/executors/node/runtime/guest/modules/dns.ts, named and not edited. No source
+  change for this row in this pass.
+witness_2026_10_24_adv12_judge: |-
+  RE-VERIFIED BY THE JUDGE FOR SHARD NET (session adv12-judge-net-1) at HEAD e022edd plus this pass's
+  net.ts change, differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured
+  separately, every probe run twice on each side, load 4.7-10.9, probe
+  /tmp/owc-r4/adv12-judge-net-1/j7-udp6zone written for this pass.
+  ONE OF THE TWO THINGS THE ADVERSARY ADDED IS FIXED HERE: a udp6 socket bound on a scoped address.
+  bind(21025, '::1%lo0') was EADDRNOTAVAIL here with address() throwing EBADF and no datagram
+  arriving, against a host that binds (::1/21025) and receives; it now binds ::1, address() reports
+  {"address":"::1","family":"IPv6","port":21025} with no zone on it, and a datagram sent to
+  '::1%lo0' arrives from ::1/IPv6. One line of j7 still differs and it is the host's own ephemeral
+  source port (56694 against 49152). The change is netStripZone in
+  runtime/guest/modules/net.ts, applied to the address a dgram bind shows and hands the hub and to
+  the destination a datagram is sent to -- a zone names which interface a link-local address means,
+  not which host it is, exactly as the hub's own connect already treated it. dgram is BF['dgram']
+  inside net.ts, inside this shard's grant.
+  THE OTHER IS NOT THIS ROW'S AND WAS NOT RE-ATTACKED: net.setDefaultAutoSelectFamily is named and
+  fixed under row owc-virtual-net in the same pass, where the value-type surface lives. The two
+  dns.lookup divergences the row records stay outside the grant
+  (runtime/guest/modules/dns.ts). npx tsc --noEmit clean in packages/core; pnpm build succeeds.

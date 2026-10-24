@@ -35,28 +35,62 @@ body: |-
   bufferSizeGrew=true maxBufferSize=11993088/12582912/12648448/12648448 -- the host's own figure moves
   with the run, and this side's does not. Unfixed, for the reason above; the row stays open.
 witness_2026_10_23_adv9: 'CLOSED STALE 2026-10-23 by the executor for shard net (session adv9-exec-net) at HEAD 1ff048b, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core against host node v24.15.0, one process per side, stdout/stderr/exit separate, load 6-10 with 2.2-2.9 GB free, probe /tmp/owc-r4/adv9-exec-net/p-buffer, re-run after this pass''''s dgram change with the same figures. The subject''''s claim is refuted: 200x64 KiB into a server socket the server paused now gives writeReturnedFalse=true bufferSizeGrew=true maxBufferSize=13107200 here, against the host''''s writeReturnedFalse=true bufferSizeGrew=true maxBufferSize=12845056, and a fresh unconnected socket is undefined and a closed one undefined on both sides. What still differs is what comes after the burst, measured on the same run: the count is 0 here by t60 and at t600 where the host holds 12779520 at both, a single 5-byte write to a peer that reads it at once counts 5 for the turn it made where the host reports 0, while corked it is 0 here and 131072 on uncork against the host''''s 131072 then 0, ten single bytes to a reading peer count 1..10 here and 0 there, and with the peer never resumed the host holds 12.58 MB through t1500 while this side is 0 from t0. It is one missing piece and it is not reachable from the two files this shard owns. The count cannot fall on the turn that made it: every delivery the hub makes is a macrotask, and bare QuickJS 0.32 -- the asyncify build this container runs, probed with nothing else in the way (/tmp/owc-r4/adv9-exec-net/qjs-reentry4.mjs) -- does let a host call into the guest while the guest is calling out (a function called from inside a host call runs and the guest sees what it set before that call returned), but it will not run the guest''''s own pending jobs there: a promise queued before the call is still unrun when the call comes back. So the engine is not the wall, and a synchronous delivery would still not give the host''''s number, because a host counts what a bounded send buffer holds and this hub accepts every byte it is handed -- there is nothing for a count to stall on. A faithful figure needs the peer to report its own consumption back to the hub, and no net.* capability carries that: the site is packages/core/src/process/executors/node/runtime/capabilities/net.ts, outside this shard''''s grant (packages/core/src/network/virtual/hub.ts and runtime/guest/modules/net.ts). Nor can any fixed buffer be tuned to the host''''s peak, which moves with the run (12845056, 12648448, 11862016 of 13107200 written). One concrete line added to Readme.md under Virtual net recording both halves of this, including that the engine does allow the re-entrant call. No source change for this row.'
-witness_2026_10_24_adv10_judge: 'RE-VERIFIED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36 + this pass''''s changes, differential
-against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts
-out of packages/core, stdout/stderr/exit separate, both sides exit 0, every probe run twice on each side,
-load 6.9-8.9 with 3.6-3.9 GB free, probes /tmp/owc-r4/adv10-judge-net-3/pa-buf (the adversary''''s, re-run)
-and j-writehost (new, written for this pass). The subject stays REFUTED: 200x64 KiB into a server socket
-the server paused is writeReturnedFalse=true bufferSizeGrew=true maxBufferSize=13107200 here on both
-container runs, against a host whose figure moves with ITS OWN run (12648448 and 12845056 in the two runs
-of this pass, 11862016-12845056 over earlier waves). The count half therefore ends STALE on the same
-witness the earlier waves recorded: no bounded send buffer, no peer-consumption report on any net.*
-capability, and a host peak that moves with the run. What the row had not named is `write()`''''s return
-value, and it DIVERGES in isolation, measured two ways. j-writehost (one fresh connection per size, eight
-writes each, the peer paused): host returns T for the writes that fit the kernel''''s send buffer and then
-F -- 65536 gives TTTTFFFF, 100000 TTTFFFFF, 262144 TFFFFFFF, 262145 TFFFFFFF, 16384 and 32768 all T --
-where this side returns F from the very first 65536-byte write and T for every write below 262145 bytes
-(16384..262144 all T, 262145 all F): its rule is only ''''is this one write larger than NET_SNDBUF'''', because
-_settleWrite calls the write callback on the turn that made it. pa-buf agrees from the other direction: one
-262145-byte write is true here and false on host, and two 100000-byte writes in one turn are true,true
-here and false,false there, on both container runs. It ends STALE with the count, not fixed: it is the same
-missing piece -- a host''''s write stalls on a bounded send buffer and this hub accepts every byte -- and the
-host''''s own threshold is not a fixed figure to tune to (it moved between the two host runs of THIS pass,
-5308416 against 5111808 for the server-side peak). Holding the callback back until the hub''''s outstanding
-bytes fall would be the only way to make write() return false, and it also stops the stream calling _write
-for the rest of the burst, which loses bytesWritten=13107200 -- the figure this side currently matches
-host on -- so it trades one divergence for a larger one. One concrete line added to Readme.md under
-Virtual net recording the measured rule on each side. No source change for this row.'
+witness_2026_10_24_adv10_judge: 'RE-VERIFIED BY THE JUDGE (adv10-judge-net-3) at HEAD 99cae36 + this pass''''s changes, differential against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout/stderr/exit separate, both sides exit 0, every probe run twice on each side, load 6.9-8.9 with 3.6-3.9 GB free, probes /tmp/owc-r4/adv10-judge-net-3/pa-buf (the adversary''''s, re-run) and j-writehost (new, written for this pass). The subject stays REFUTED: 200x64 KiB into a server socket the server paused is writeReturnedFalse=true bufferSizeGrew=true maxBufferSize=13107200 here on both container runs, against a host whose figure moves with ITS OWN run (12648448 and 12845056 in the two runs of this pass, 11862016-12845056 over earlier waves). The count half therefore ends STALE on the same witness the earlier waves recorded: no bounded send buffer, no peer-consumption report on any net.* capability, and a host peak that moves with the run. What the row had not named is `write()`''''s return value, and it DIVERGES in isolation, measured two ways. j-writehost (one fresh connection per size, eight writes each, the peer paused): host returns T for the writes that fit the kernel''''s send buffer and then F -- 65536 gives TTTTFFFF, 100000 TTTFFFFF, 262144 TFFFFFFF, 262145 TFFFFFFF, 16384 and 32768 all T -- where this side returns F from the very first 65536-byte write and T for every write below 262145 bytes (16384..262144 all T, 262145 all F): its rule is only ''''is this one write larger than NET_SNDBUF'''', because _settleWrite calls the write callback on the turn that made it. pa-buf agrees from the other direction: one 262145-byte write is true here and false on host, and two 100000-byte writes in one turn are true,true here and false,false there, on both container runs. It ends STALE with the count, not fixed: it is the same missing piece -- a host''''s write stalls on a bounded send buffer and this hub accepts every byte -- and the host''''s own threshold is not a fixed figure to tune to (it moved between the two host runs of THIS pass, 5308416 against 5111808 for the server-side peak). Holding the callback back until the hub''''s outstanding bytes fall would be the only way to make write() return false, and it also stops the stream calling _write for the rest of the burst, which loses bytesWritten=13107200 -- the figure this side currently matches host on -- so it trades one divergence for a larger one. One concrete line added to Readme.md under Virtual net recording the measured rule on each side. No source change for this row.'
+witness_2026_10_24_adv11: |-
+  RE-MEASURED BY THE EXECUTOR FOR SHARD NET (session adv11-exec-net) at HEAD e169099 plus this pass's
+  net.ts change, differential against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout/stderr/exit separate, all runs exit
+  0, load 6.5-7.7 with 3.2-3.8 GB free, probes /tmp/owc-r4/adv11-exec-net/pa-buf (re-run) and
+  j-writehost, each run twice on each side. Both halves stay STALE on the witness the earlier waves
+  recorded, and neither moved: the count is 19 lines different (this side 13107200 at t0 and 0 from
+  t60, host 12648448/12845056 at t0 and holding 12779520 at t600 -- the host's own figure moves with
+  ITS OWN run, as it did twice within this pass), and write()'s return value is 7 lines different
+  (false from the first 65536-byte write here, TTTTFFFF on host). It is one missing piece and it is not
+  reachable from the two files this shard owns: a host's write stalls on a bounded send buffer and this
+  hub accepts every byte; a faithful count needs the peer to report its own consumption back to the
+  hub, and no net.* capability carries that
+  (packages/core/src/process/executors/node/runtime/capabilities/net.ts); the engine is not the wall,
+  since bare QuickJS 0.32 does allow a host call into the guest while the guest is calling out but will
+  not run the guest's own pending jobs there; and holding the write callback back until the hub's
+  outstanding bytes fall would lose bytesWritten=13107200, the figure this side matches host on. The one
+  line that differs between the two container runs of this pass is F.cbAfter 0ms against 1ms, a
+  millisecond timing that jitters the same way on the host. No source change for this row in this pass;
+  the same two lines stand in Readme.md.
+witness_2026_10_24_adv12: |-
+  RE-VERIFIED BY THE EXECUTOR FOR SHARD NET (session adv12-exec-net) at HEAD 5dd5b85 plus this pass's net.ts change, differential against host node v24.15.0, one process per side, container driven by /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured separately, every probe run twice on each side, load 4.7-6.7 with 3.6-5.1 GB free.
+  Probes /tmp/owc-r4/adv12-exec-net/pa-buf (re-run) and j-writehost. STALE on the witness the earlier
+  waves recorded, and unchanged: pa-buf is 18 lines different and j-writehost 7. The subject stays
+  REFUTED -- 200x64 KiB into a server socket the server paused is writeReturnedFalse=true
+  bufferSizeGrew=true maxBufferSize=13107200 here on both container runs, against a host whose own figure
+  moves with ITS OWN run (12845056 in this pass). The cork half moved with commit a7a3ef9 and is measured
+  again here: while corked the count is now 131072, the bytes the stream itself holds, which is what host
+  Node 24.15 reports, where this side used to hold 0; what still differs is the uncork that hands those
+  bytes on (131072 here for the one macrotask the hub takes to deliver, 0 on a host), bytesWritten while
+  corked (0 here, 131072 on a host), ten single bytes to a peer reading everything (1,2,...,10 here, 0
+  there), and the count falling to 0 by t60 here where the host holds 12779520 at t600 while the peer
+  never resumes. write()'s return value keeps its own shape (7 lines): false from the first 65536-byte
+  write here, TTTTFFFF on a host. It is one missing piece and it is not reachable from the two files this
+  shard owns: a host's write stalls on a bounded send buffer and this hub accepts every byte; a faithful
+  count needs the peer to report its own consumption back to the hub, and no net.* capability carries that
+  (packages/core/src/process/executors/node/runtime/capabilities/net.ts). Holding the write callback back
+  would lose bytesWritten=13107200, the figure this side matches host on. No source change for this row in
+  this pass; the same two lines stand in Readme.md under Virtual net.
+witness_2026_10_24_adv12_judge: |-
+  RE-VERIFIED BY THE JUDGE FOR SHARD NET (session adv12-judge-net-1) at HEAD e022edd, differential
+  against host node v24.15.0, one process per side, container driven by
+  /tmp/owc-r4/probe2/run-owc-repo.mts out of packages/core, stdout, stderr and exit captured
+  separately, every probe run twice on each side, load 4.7-6.0, probe
+  /tmp/owc-r4/adv12-judge-net-1/j9-buf written for this pass. STALE on the witness the earlier waves
+  recorded, and unchanged by this pass: the count still cannot be one number that is 0 while the peer
+  is reading and ~12.8M while it is not, no net.* capability carries a peer's own consumption back to
+  the hub, the engine is not the wall, and the host's own peak moves with its own run.
+  What the row had not recorded, and what this pass measured in isolation, is the NEW SHAPE the
+  adversary named: the counter OVER-reports where the host reads 0. 400 writes of 1 KiB into a peer
+  the server paused is grew=false max=0 on host and grew=true max=409600 here; with a peer that reads
+  eagerly the host reads [0,0,0,0,65536,131072,...] where this side reads [65536,131072,...] from the
+  first write; and ten single bytes count 1..10 here against 0 there. All three on both container
+  runs, byte-identical. So the row's own sentence "writableLength never grows" no longer describes
+  it: bufferSize here is this socket's own un-flushed queue, not the peer's, and one net.ts-side rule
+  cannot be both figures. Readme.md amended under Virtual net to say so. No source change for this
+  row; the site stays packages/core/src/network/virtual/hub.ts and
+  runtime/capabilities/net.ts, outside this shard's grant (runtime/guest/modules/net.ts).
