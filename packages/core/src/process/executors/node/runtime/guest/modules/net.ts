@@ -2503,12 +2503,25 @@ BF['dgram'] = function () {
       /* The family is the one the peer's address is written in, not this socket's own: a udp6 socket
          on the wildcard sees an IPv4 peer as '::ffff:127.0.0.1'/IPv6, and one bound to the mapped
          loopback sees the same peer as '127.0.0.1'/IPv4, which is what host Node reports there. */
-      this.emit('message', datagram, {
+      var rinfo = {
         address: payload.address,
         family: netFamilyName(payload.address),
         port: payload.port,
         size: datagram.length
-      });
+      };
+      /* A listener that ends the process -- or throws -- does it from inside the hub's delivery,
+         while the host still holds the handles it handed that delivery, and the unwind skips the
+         code that frees them: an object stays on the runtime's list and QuickJS asserts on it when
+         the runtime is freed, printing one Aborted(Assertion failed: list_empty(&rt->gc_obj_list))
+         line on the host's own stderr after the container's own output has matched. So the throw is
+         raised a task later, when the delivery has answered and its handles are gone. An exit is
+         raised not at all: process.exit has already written the status and never returns on a host
+         either. */
+      try {
+        this.emit('message', datagram, rinfo);
+      } catch (thrown) {
+        if (!api.isExitSignal(thrown)) netDefer(function () { throw thrown; });
+      }
     }
 
     bind() {

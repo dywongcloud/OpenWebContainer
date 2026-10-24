@@ -300,9 +300,25 @@ function localAddresses(name: string, ctx: CapabilityContext): LocalAddresses | 
     };
 }
 
+/**
+ * The container's /etc/hosts as text, or undefined when nothing stands behind the path.
+ *
+ * A read of a path with no file behind it throws ENOENT rather than answering undefined, and a
+ * container is not obliged to carry a hosts file at all -- only /etc is created. An absent one is
+ * not a resolution failure: it lists no addresses, exactly as an empty one would, so the name
+ * falls through to the resolver and fails there with the error the failure really is.
+ */
+function readHostsFile(ctx: CapabilityContext): string | undefined {
+    try {
+        return ctx.fileSystem.readFile('/etc/hosts');
+    } catch {
+        return undefined;
+    }
+}
+
 /** Addresses that the container's /etc/hosts file lists for a name, IPv4 and IPv6 in file order. */
 export function hostsFileAddresses(name: string, ctx: CapabilityContext): string[] {
-    const text = ctx.fileSystem.readFile('/etc/hosts');
+    const text = readHostsFile(ctx);
     if (text === undefined) return [];
     const wanted = name.toLowerCase();
     const found: string[] = [];
