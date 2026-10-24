@@ -1062,6 +1062,68 @@ BF.fs = function () {
     return canonicalOf(resolvePath(file));
   }
 
+  /*
+   * The module resolver is the one caller that reaches the file system without going through this
+   * file's own walk: it asks the host, and the host's file system has no links in it at all -- a
+   * link is a name recorded here, and the node the host holds for a link to a directory is an empty
+   * file, so a path under one was handed to the host as a name under a file. The host read that
+   * file as the listing of a directory, and a require through a link to a directory failed with the
+   * SyntaxError of that read -- 'Unexpected end of JSON input' -- instead of loading the module.
+   *
+   * Every path the resolver is asked about is walked here first, the way every call above walks the
+   * path it acts on, so the host is given a path with no link in it. That is also the path a host's
+   * own require answers: its realpath, which is the __dirname and __filename a module reached
+   * through a link carries there.
+   *
+   * A specifier with no link in it is passed through exactly as it was written -- the walk is only
+   * applied when it changes something -- so a trailing slash, a query or a fragment, which the
+   * resolver's own rules read, reach it untouched.
+   */
+  function isPathSpecifierForResolve(spec) {
+    if (spec.charAt(0) === '/') return true;
+    if (spec === '.' || spec === '..') return true;
+    return spec.charAt(0) === '.' &&
+      (spec.charAt(1) === '/' || (spec.charAt(1) === '.' && spec.charAt(2) === '/'));
+  }
+
+  /* The tail a specifier carries that is no part of the name it resolves: a query or a fragment,
+     which the resolver drops, and the slash a specifier ends with, which names a directory. */
+  function splitSpecifierTail(spec) {
+    var cut = spec.length;
+    var query = spec.indexOf('?');
+    var hash = spec.indexOf('#');
+    if (query >= 0 && (hash < 0 || query < hash)) cut = query;
+    else if (hash >= 0) cut = hash;
+    var head = spec.slice(0, cut);
+    var slashes = /\/+$/.exec(head);
+    var slash = slashes === null ? '' : slashes[0];
+    return { body: head.slice(0, head.length - slash.length), slash: slash, tail: spec.slice(cut) };
+  }
+
+  function walkedSpecifierForResolve(spec, base) {
+    var parts = splitSpecifierTail(spec);
+    if (parts.body === '') return spec;
+    var absolute = P.isAbsolute(parts.body) ? P.resolve(parts.body) : P.resolve(base, parts.body);
+    var walked = resolvePath(absolute);
+    if (walked === absolute) return spec;
+    return walked + parts.slash + parts.tail;
+  }
+
+  function walkedDirectoryForResolve(dir) {
+    if (typeof dir !== 'string' || dir === '') return dir;
+    var absolute = P.resolve(dir);
+    var walked = resolvePath(absolute);
+    return walked === absolute ? dir : walked;
+  }
+
+  var resolveThroughHost = host.resolve;
+  host.resolve = function (specifier, fromDir, mode) {
+    var spec = typeof specifier === 'string' ? specifier : String(specifier);
+    var base = walkedDirectoryForResolve(fromDir);
+    var sent = isPathSpecifierForResolve(spec) ? walkedSpecifierForResolve(spec, base) : spec;
+    return resolveThroughHost(sent, base, mode);
+  };
+
   function inoOf(file) {
     var canonical = canonicalOf(file);
     if (INODES[canonical] === undefined) INODES[canonical] = INO_NEXT++;
@@ -1547,8 +1609,19 @@ BF.fs = function () {
 
   fs.lstatSync = function (p, opts) {
     var file = toPathString(p);
-    var st = statOf(file);
-    var linked = SYMLINKS[file] !== undefined;
+    /*
+     * lstat is of the entry and not of what it points at -- but the entry it is of is the one that
+     * sits in the directory the path really reaches, and a path that gets there through a link to a
+     * directory reaches an entry of that link's target. So the walk stops before the last part:
+     * every directory above the name is followed, and the name itself is left alone, so a link the
+     * path ends at is still reported as a link while a file under a link to a directory is reported
+     * as the file. Taking the path as it was handed over asked the file system for a name under the
+     * link, which is not an entry of anything, and every lstat of such a path answered ENOENT where
+     * a host answers the file's stat.
+     */
+    var at = resolveParentPath(file);
+    var st = statOf(at);
+    var linked = SYMLINKS[at] !== undefined;
     /*
      * A link is reported as itself, whatever its target is: its size is the length of the target it
      * names -- the text symlink was handed, which is not always the path stat follows -- and its
@@ -1557,12 +1630,12 @@ BF.fs = function () {
      * the link.
      */
     if (linked) {
-      var named = LINKTARGETS[file] !== undefined ? LINKTARGETS[file] : SYMLINKS[file];
+      var named = LINKTARGETS[at] !== undefined ? LINKTARGETS[at] : SYMLINKS[at];
       st = {
         type: 'file',
         size: String(named).length,
         mtimeMs: st ? st.mtimeMs : 0,
-        mode: MODES[file] !== undefined ? MODES[file] : 41453
+        mode: MODES[at] !== undefined ? MODES[at] : 41453
       };
     }
     if (!st) {

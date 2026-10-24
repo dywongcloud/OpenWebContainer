@@ -1026,12 +1026,37 @@ BF.events = function () {
       if (name !== 'error') emitter.once('error', onError);
     });
   };
-  /* events.on: an async iterator of argument arrays; break or return() removes its listeners */
-  EventEmitter.on = function (emitter, name) {
+  /*
+   * events.on: an async iterator of argument arrays; break or return() removes its listeners.
+   *
+   * options.signal is the way out of an iteration that would otherwise never end. Node throws its
+   * AbortError from on() itself when the signal is already aborted, and when the abort comes while
+   * the iteration is waiting it rejects the promise the for-await is suspended on -- so the loop
+   * throws, the statement after it runs, and the listeners come off the emitter. Taking no notice
+   * of the signal left a for-await hanging for as long as the process ran: it had read one event
+   * and printed it, and neither an abort nor the end of the program settled it.
+   */
+  EventEmitter.on = function (emitter, name, options) {
+    /* Node reads options first and validates it, then options.signal: a caller passing two bad
+       arguments is told about the options, not about the signal. */
+    if (options !== undefined && (typeof options !== 'object' || options === null)) {
+      throw invalidArgType('options', 'object', options);
+    }
+    var signal = options === undefined || options === null ? undefined : options.signal;
+    if (signal !== undefined && (signal === null || !isAbortSignalLike(signal))) {
+      throw invalidArgType('options.signal', 'AbortSignal', signal);
+    }
+    /* An aborted signal is refused before any listener goes on: the iterator never exists, and a
+       for-await over the call throws here rather than at its first next(). */
+    if (signal !== undefined && signal !== null && signal.aborted) throw abortErrorFor(signal);
     var queued = [];
     var waiting = [];
     var failure = null;
     var finished = false;
+    var onAbort = undefined;
+    function detachAbort() {
+      if (onAbort !== undefined) { signal.removeEventListener('abort', onAbort); onAbort = undefined; }
+    }
     function onEvent() {
       var args = Array.prototype.slice.call(arguments);
       if (waiting.length > 0) waiting.shift().resolve({ value: args, done: false });
@@ -1042,15 +1067,29 @@ BF.events = function () {
       else failure = err;
       close();
     }
+    /* An abort is an error with a name of its own: it rejects the promise the iteration is
+       suspended on, or waits as the iterator's failure for the next() that comes for it, and then
+       closes the iterator so no listener of this call is left on the emitter. */
+    function onAbortHandler() {
+      var err = abortErrorFor(signal);
+      if (waiting.length > 0) waiting.shift().reject(err);
+      else failure = err;
+      close();
+    }
     function close() {
       if (finished) return;
       finished = true;
+      detachAbort();
       emitter.removeListener(name, onEvent);
       if (name !== 'error') emitter.removeListener('error', onError);
       while (waiting.length > 0) waiting.shift().resolve({ value: undefined, done: true });
     }
     emitter.on(name, onEvent);
     if (name !== 'error') emitter.on('error', onError);
+    if (signal !== undefined && signal !== null) {
+      onAbort = onAbortHandler;
+      signal.addEventListener('abort', onAbort);
+    }
     var iterator = {
       next: function () {
         if (queued.length > 0) return Promise.resolve({ value: queued.shift(), done: false });
