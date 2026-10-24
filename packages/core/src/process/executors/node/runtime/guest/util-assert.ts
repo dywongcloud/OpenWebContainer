@@ -105,6 +105,68 @@ var PROMISIFY_CUSTOM = typeof Symbol.for === 'function' ? Symbol.for('nodejs.uti
 var INSPECT_FMT = null;
 
 /*
+ * The colours 'util.inspect' writes when its 'colors' option is on, which is the one option this
+ * walk had no answer to at all: it printed the same text for 'colors: true' as for no option,
+ * where host node 24.15 wraps every value it prints in the SGR codes its own 'stylize' keeps --
+ * 33 for a number, a bigint and a boolean, 32 for a string and a symbol, 1 with 22 for 'null',
+ * 90 for 'undefined', 35 for a date, 31 for a regexp, and 36 for the things it names in brackets
+ * rather than prints: a function, a class, '[Object]', '[Array]', '[Circular *n]', '<ref *n>',
+ * '<pending>', '<items unknown>', '[Getter]'. A colour closes with 39, and 'null' with 22, because
+ * that is the code that undoes the one that opened it. Nothing else in the output is coloured:
+ * not a brace, not an identifier key, not the '... 3 more items' line, not the bytes of a Buffer.
+ * The flag is a property of the walk now printing, like 'INSPECT_FMT' above it, so a walk with no
+ * 'colors' in its options -- every 'console.log', every assertion message -- is untouched by it.
+ */
+var INSPECT_COLORS = false;
+var INSPECT_ESCAPE = String.fromCharCode(27);
+
+function stylizeWith(text, open, close) {
+  if (!INSPECT_COLORS) return text;
+  return INSPECT_ESCAPE + '[' + open + 'm' + text + INSPECT_ESCAPE + '[' + (close === undefined ? '39' : close) + 'm';
+}
+/* A number, a bigint and a boolean: 33. 'NaN', 'Infinity' and '-0' are numbers to it too. */
+function styleNumber(text) {
+  return stylizeWith(text, '33');
+}
+/* A string, and the symbol that prints as one -- 'Symbol(k)' is written in a string's colour
+   whether it is the value of a key or the key itself. */
+function styleString(text) {
+  return stylizeWith(text, '32');
+}
+/* 'null' alone: bold, which is what opens with 1 and closes with 22 rather than 39. */
+function styleNull(text) {
+  return stylizeWith(text, '1', '22');
+}
+function styleUndefined(text) {
+  return stylizeWith(text, '90');
+}
+function styleDate(text) {
+  return stylizeWith(text, '35');
+}
+function styleRegExp(text) {
+  return stylizeWith(text, '31');
+}
+/* Everything node names in brackets: a function, a class, '[Object]', '[Array]', '[Getter]',
+   '[Circular *n]', '<ref *n>', '<pending>', '<items unknown>'. */
+function styleBracketed(text) {
+  return stylizeWith(text, '36');
+}
+
+/*
+ * What a coloured entry measures as. Node asks the width the terminal shows -- its 'getStringWidth'
+ * strips the SGR codes before it counts -- so whether a value fits on one line is decided by the
+ * text without them and not by the text with them: a value that fits with 'colors' off fits with
+ * 'colors' on, and the escapes that carry the colour are never what pushes it over 'breakLength'.
+ * A padding that is added back the number of characters the codes took is what lines the columns
+ * up in spite of them.
+ */
+var INSPECT_ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
+function styledWidth(text) {
+  var s = String(text);
+  return INSPECT_COLORS ? s.replace(INSPECT_ANSI, '').length : s.length;
+}
+
+/*
  * The options that shape what a walk prints, read off the options object the way node reads them:
  * 'maxArrayLength' (100), 'maxStringLength' (10000), 'breakLength' (80) and 'numericSeparator'
  * (off). 'null' for either limit is no limit at all -- that is what node turns it into before the
@@ -183,7 +245,21 @@ function stringInspectText(s, opts) {
 }
 
 function inspectValue(value, opts) {
-  var maxDepth = opts && typeof opts.depth === 'number' ? opts.depth : 2;
+  /*
+   * Node copies every own key of the options object it was handed over its own defaults, and it
+   * copies the VALUE, so a 'depth' a caller passed as 'undefined' is the depth the walk runs at and
+   * not the default that key would have got had it been left out. 'undefined' and 'null' both answer
+   * false to every 'level > depth' test they are put to, which is why '{ depth: undefined }' prints
+   * a value five levels deep on host node 24.15 exactly as 'depth: null' and 'depth: Infinity' do,
+   * while no option at all stops at two. Which of the two it was still matters after the test,
+   * because it is what a custom inspect is handed as its depth argument: 'null' for 'depth: null',
+   * and NaN -- what 'undefined - 0' is -- for 'depth: undefined'.
+   */
+  var depthGiven = opts !== undefined && opts !== null &&
+    Object.prototype.hasOwnProperty.call(opts, 'depth');
+  var depthGivenAs = depthGiven ? opts.depth : 2;
+  var depthUnbounded = depthGiven && (depthGivenAs === null || depthGivenAs === undefined);
+  var maxDepth = depthUnbounded ? Infinity : (typeof depthGivenAs === 'number' ? depthGivenAs : 2);
   var stack = [];
   /* The objects a circular reference points back at, numbered from 1 in the order one was met.
      Cleared for every walk, so the count starts again and '<ref *1>' belongs to this value. */
@@ -195,25 +271,29 @@ function inspectValue(value, opts) {
   var SUB_MAX = 0;
 
   function fmt(v, depth, indent) {
-    if (v === null) return 'null';
+    if (v === null) return styleNull('null');
     var t = typeof v;
     if (t === 'string') {
       var asString = stringInspectText(v, opts);
-      return quoteStringLiteral(asString.text) + asString.trailer;
+      /* The colour closes in front of the trailer and not behind it: "'abcd'... 6 more characters"
+         is a green string followed by six words about it. */
+      return styleString(quoteStringLiteral(asString.text)) + asString.trailer;
     }
     if (t === 'number') {
-      if (Object.is(v, -0)) return '-0';
+      if (Object.is(v, -0)) return styleNumber('-0');
       var asNumber = String(v);
-      return numericSeparatorOf(opts) ? withNumericSeparators(asNumber) : asNumber;
+      return styleNumber(numericSeparatorOf(opts) ? withNumericSeparators(asNumber) : asNumber);
     }
     if (t === 'bigint') {
       var asBigInt = String(v) + 'n';
-      return numericSeparatorOf(opts) ? withNumericSeparators(String(v)) + 'n' : asBigInt;
+      return styleNumber(numericSeparatorOf(opts) ? withNumericSeparators(String(v)) + 'n' : asBigInt);
     }
-    if (t === 'boolean' || t === 'undefined' || t === 'symbol') return String(v);
+    if (t === 'boolean') return styleNumber(String(v));
+    if (t === 'undefined') return styleUndefined(String(v));
+    if (t === 'symbol') return styleString(String(v));
     if (t === 'function') {
       var name = v.name ? v.name : '';
-      if (/^class[\s{]/.test(Function.prototype.toString.call(v))) return '[class ' + (name || '(anonymous)') + ']';
+      if (/^class[\s{]/.test(Function.prototype.toString.call(v))) return styleBracketed('[class ' + (name || '(anonymous)') + ']');
       /* The three families node names by what they are: '[AsyncFunction: foo]',
          '[GeneratorFunction: foo]' and '[AsyncGeneratorFunction: foo]', where a plain function is
          '[Function: foo]'. The value's own prototype is what says which of the four it is -- its
@@ -230,7 +310,7 @@ function inspectValue(value, opts) {
       /* A function with no name is '[Function (anonymous)]' and not '[Function: (anonymous)]':
          the colon belongs to the name that follows it, and node writes none when there is no name
          to write -- which is what 'util.inspect(function () {})' prints on host node 24.15. */
-      return name ? '[' + fnKind + ': ' + name + ']' : '[' + fnKind + ' (anonymous)]';
+      return name ? styleBracketed('[' + fnKind + ': ' + name + ']') : styleBracketed('[' + fnKind + ' (anonymous)]');
     }
     /* A value the walk is already inside. Node numbers the objects a '[Circular *n]' marker points
        back at -- in the order it meets them, from 1 -- and writes '<ref *n> ' in front of the one
@@ -239,7 +319,7 @@ function inspectValue(value, opts) {
     if (stack.indexOf(v) >= 0) {
       var seen = REF_IDS.get(v);
       if (seen === undefined) { seen = REF_NEXT++; REF_IDS.set(v, seen); }
-      return '[Circular *' + seen + ']';
+      return styleBracketed('[Circular *' + seen + ']');
     }
     /* The tag and not 'instanceof': a value out of a 'vm' context is of another realm, so
        'instanceof' answers false for it on host Node 24.15 too, and what 'util.inspect' reads
@@ -248,20 +328,25 @@ function inspectValue(value, opts) {
        'Promise {}' where the host prints 'Promise { 1 }'. */
     var vTag = utilTag(v);
     if (vTag === 'Error') return errorInspectOf(v, fmt, depth, indent, opts);
-    if (vTag === 'Date') return isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
-    if (vTag === 'RegExp') return String(v);
+    if (vTag === 'Date') return styleDate(isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString());
+    if (vTag === 'RegExp') return styleRegExp(String(v));
     if (vTag === 'Promise') return promiseInspectOf(v, depth, indent);
 
     /* The one thing a weak collection shows of what it holds: nothing, and that word. Node prints
        'WeakMap { <items unknown> }' and 'WeakSet { <items unknown> }' for every one, empty or not,
        where this walk would reach them as plain objects with no keys and print 'WeakMap {}'. */
-    if (utilBrandCheck(WeakMap.prototype.has, v)) return 'WeakMap { <items unknown> }';
-    if (utilBrandCheck(WeakSet.prototype.has, v)) return 'WeakSet { <items unknown> }';
+    if (utilBrandCheck(WeakMap.prototype.has, v)) return 'WeakMap { ' + styleBracketed('<items unknown>') + ' }';
+    if (utilBrandCheck(WeakSet.prototype.has, v)) return 'WeakSet { ' + styleBracketed('<items unknown>') + ' }';
 
     /* A value that writes its own output wins: Node asks the custom function before it looks at
        the object's own keys, which is the whole of what a Response or a Headers prints. */
     if (INSPECT_CUSTOM !== undefined && typeof v[INSPECT_CUSTOM] === 'function') {
-      var written = v[INSPECT_CUSTOM](maxDepth - depth, opts, function (inner) { return inspectValue(inner, opts); });
+      /* The depth a custom inspect is handed is the depth the walk has left, and for a 'depth' that
+         was given as 'undefined' that is NaN and not 'Infinity': node subtracts the level it is at
+         from the depth it was given and gets NaN from 'undefined', which is what a function that
+         prints its own output sees as its first argument there. */
+      var customDepth = depthUnbounded ? (depthGivenAs === null ? null : NaN) : maxDepth - depth;
+      var written = v[INSPECT_CUSTOM](customDepth, opts, function (inner) { return inspectValue(inner, opts); });
       return typeof written === 'string' ? written : String(written);
     }
 
@@ -280,8 +365,8 @@ function inspectValue(value, opts) {
     var isTyped = !isArr && ArrayBuffer.isView(v) && vTag !== 'DataView';
     var bare = Object.getPrototypeOf(v) === null;
     if (depth > maxDepth) {
-      if (isArr) return '[Array]';
-      return '[' + (bare ? nullPrototypeTagOf(v) + ': null prototype' : (ctor || 'Object')) + ']';
+      if (isArr) return styleBracketed('[Array]');
+      return styleBracketed('[' + (bare ? nullPrototypeTagOf(v) + ': null prototype' : (ctor || 'Object')) + ']');
     }
     /* An ArrayBuffer, a SharedArrayBuffer and a DataView print what no walk of own keys can reach:
        node gives them the pseudo-entries '[Uint8Contents]' and '[byteLength]' -- and '[byteOffset]'
@@ -326,7 +411,7 @@ function inspectValue(value, opts) {
       close = ']';
       prefix = ctor + '(' + v.length + ') ';
       var typedLimit = Math.min(v.length, maxArr);
-      for (i = 0; i < typedLimit; i++) entries.push(String(v[i]));
+      for (i = 0; i < typedLimit; i++) entries.push(styleNumber(String(v[i])));
       /* What is left over past the hundred node prints of a typed array is said in the same words
          it says the items of an ordinary array in: '... 1 more item', singular, and '... 2 more
          items' past that. */
@@ -397,7 +482,7 @@ function inspectValue(value, opts) {
     /* Read after the walk of the children and not before: a value is only a '<ref *n>' once a
        circular reference inside it has been met, which happens while its entries are printed. */
     var refNo = REF_IDS.get(v);
-    var head = refNo === undefined ? '' : '<ref *' + refNo + '> ';
+    var head = refNo === undefined ? '' : styleBracketed('<ref *' + refNo + '>') + ' ';
     prefix = head + prefix;
 
     if (entries.length === 0) return prefix + open + close;
@@ -420,7 +505,7 @@ function inspectValue(value, opts) {
       packed = shown.length !== entries.length;
     }
     var width = breakLengthOf(opts);
-    var start = entries.length + indent + open.length + prefix.length + 10;
+    var start = entries.length + indent + open.length + styledWidth(prefix) + 10;
     var totalLength = entries.length + start;
     /* 'compact: false' is one entry per line and never a fit test: node's own inspect writes
        '[1,2,3,4,5,6,7,8]' on one line by default and one number to a line under that option. So is
@@ -428,7 +513,7 @@ function inspectValue(value, opts) {
        that: '{ a: { b: 1 } }' is one line at the default 3 and three lines at 'compact: 1'. */
     var fits = !multiline && !packed && compactAllowsOneLine(opts, subDepth) && totalLength + entries.length <= width;
     for (var s = 0; fits && s < entries.length; s++) {
-      totalLength += entries[s].length;
+      totalLength += styledWidth(entries[s]);
       if (totalLength > width) fits = false;
     }
     if (fits) return prefix + open + ' ' + entries.join(', ') + ' ' + close;
@@ -436,8 +521,14 @@ function inspectValue(value, opts) {
     return prefix + open + '\n' + shown.map(function (entry) { return pad + entry; }).join(',\n') + '\n' + ' '.repeat(indent) + close;
   }
 
+  var savedFmt = INSPECT_FMT;
+  var savedColors = INSPECT_COLORS;
   INSPECT_FMT = fmt;
-  return fmt(value, 0, 0);
+  INSPECT_COLORS = !!(opts && opts.colors);
+  var printed = fmt(value, 0, 0);
+  INSPECT_FMT = savedFmt;
+  INSPECT_COLORS = savedColors;
+  return printed;
 }
 
 function padBy(order, text, width) {
@@ -479,7 +570,10 @@ function groupArrayElements(output, value, indent, compact, trailerAt, breakLeng
   var outputLength = trailerAt >= 0 ? trailerAt : output.length;
   var dataLen = new Array(outputLength);
   for (var i = 0; i < outputLength; i++) {
-    var len = output[i].length;
+    /* The width the entry shows and not the width its string has: the SGR codes of a coloured
+       entry are not columns it takes up, and 'output[k].length - dataLen[k]' below is exactly
+       how many characters they add, which is what the padding puts back to line the columns up. */
+    var len = styledWidth(output[i]);
     dataLen[i] = len;
     totalLength += len + 2;
     if (maxLength < len) maxLength = len;
@@ -1010,6 +1104,31 @@ function utilReceivedAs(value) {
   return 'an instance of ' + (typeof name === 'string' && name !== '' ? name : 'Object');
 }
 
+/*
+ * The warning 'util.deprecate' emits, written the way the host writes it: on the next tick, to
+ * stderr, as '(node:<pid>) [<code>] DeprecationWarning: <message>' -- the code in brackets only when
+ * one was given, because a deprecation that carries no code of its own is one node names by no code
+ * at all. The message is what the host's 'process.emitWarning' is asked to emit and validates before
+ * it emits anything, so the error a caller sees for a message that is neither a string nor an Error
+ * is that function's own TypeError and not one 'deprecate' writes: 'The "warning" argument must be
+ * of type string or an instance of Error. Received undefined'.
+ */
+function emitDeprecationWarning(msg, code) {
+  if (typeof msg !== 'string' && !(msg instanceof Error)) {
+    var bad = new TypeError('The "warning" argument must be of type string or an instance of Error. Received ' +
+      (msg === null || msg === undefined ? utilReceivedAs(msg) : 'type ' + utilReceivedAs(msg)));
+    bad.code = 'ERR_INVALID_ARG_TYPE';
+    throw bad;
+  }
+  var proc = globalThis.process;
+  if (!proc || !proc.stderr || typeof proc.nextTick !== 'function') return;
+  var text = msg instanceof Error ? String(msg.message === undefined ? msg : msg.message) : msg;
+  proc.nextTick(function () {
+    proc.stderr.write('(node:' + proc.pid + ') ' + (typeof code === 'string' ? '[' + code + '] ' : '') +
+      'DeprecationWarning: ' + text + '\n');
+  });
+}
+
 function utilGetterOf(proto, name) {
   var desc = Object.getOwnPropertyDescriptor(proto, name);
   return desc && typeof desc.get === 'function' ? desc.get : null;
@@ -1186,9 +1305,9 @@ function promiseInspectOf(v, depth, indent) {
   var ctorText = constructorNameOf(v);
   var head = (ctorText && ctorText !== 'Promise' && ctorText !== 'Object') ? ctorText + ' [Promise]' : 'Promise';
   var cell = PROMISE_CELLS.get(v);
-  if (cell === undefined || cell.state === 0) return head + ' { <pending> }';
+  if (cell === undefined || cell.state === 0) return head + ' { ' + styleBracketed('<pending>') + ' }';
   var inner = fmtPromiseValue(cell.value, depth, indent);
-  var body = (cell.state === 2 ? '<rejected> ' : '') + inner;
+  var body = (cell.state === 2 ? styleBracketed('<rejected>') + ' ' : '') + inner;
   /* A value that prints on more than one line -- an error, whose stack is part of what it prints --
      opens the braces instead of sitting inside them: host node 24.15 writes
      'Promise {\n  <rejected> Error: r\n      at ...\n}' and not one line with a stack hanging off
@@ -1220,7 +1339,7 @@ function inspectEntryOf(fmt, value, key, depth, indent) {
   try { desc = Object.getOwnPropertyDescriptor(value, key); } catch (e) { desc = undefined; }
   var text;
   if (desc !== undefined && (desc.get !== undefined || desc.set !== undefined)) {
-    text = desc.get !== undefined ? (desc.set !== undefined ? '[Getter/Setter]' : '[Getter]') : '[Setter]';
+    text = styleBracketed(desc.get !== undefined ? (desc.set !== undefined ? '[Getter/Setter]' : '[Getter]') : '[Setter]');
   } else if (desc !== undefined && 'value' in desc) {
     text = fmt(desc.value, depth, indent);
   } else {
@@ -1229,7 +1348,12 @@ function inspectEntryOf(fmt, value, key, depth, indent) {
   var name;
   if (typeof key === 'symbol') name = String(key);
   else name = isIdentifierKey(key) ? key : quoteStringLiteral(key);
-  if (desc === undefined || desc.enumerable === false) name = '[' + name + ']';
+  /* A key node has to quote -- 'a-b', '1', '' -- is a string and is written in a string's colour,
+     and so is a symbol; an identifier is written bare and in no colour at all. One that is not
+     enumerable goes in brackets, and the brackets take the colour the key would have had away:
+     '[h]: 1' is a plain key in front of a coloured value. */
+  if (desc === undefined || desc.enumerable === false) return '[' + name + ']: ' + text;
+  if (typeof key === 'symbol' || !isIdentifierKey(key)) return styleString(name) + ': ' + text;
   return name + ': ' + text;
 }
 
@@ -1241,10 +1365,10 @@ function inspectEntryOf(fmt, value, key, depth, indent) {
 function joinInspectEntries(prefix, entries, indent, opts, subDepth) {
   if (entries.length === 0) return prefix + '{}';
   var width = opts && typeof opts.breakLength === 'number' ? opts.breakLength : 80;
-  var totalLength = entries.length + (entries.length + indent + 1 + prefix.length + 10);
+  var totalLength = entries.length + (entries.length + indent + 1 + styledWidth(prefix) + 10);
   var fits = compactAllowsOneLine(opts, subDepth);
   for (var i = 0; fits && i < entries.length; i++) {
-    totalLength += entries[i].length;
+    totalLength += styledWidth(entries[i]);
     if (totalLength > width) fits = false;
   }
   /* A prefix that already carries a line break -- the stack of an error, which is where its own
@@ -1345,7 +1469,11 @@ function bufferInspectOf(v, indent, opts) {
   var length = 0;
   try { length = v.byteLength; } catch (e) { /* detached */ }
   /* Nothing nests inside a buffer, so 'compact' is measured against a depth of 0. */
-  return joinInspectEntries(prefix, ['[Uint8Contents]: ' + bufferBytesText(v, opts), '[byteLength]: ' + length], indent, opts, 0);
+  /* A pseudo-key is written in a string's colour -- '[byteLength]' opens and closes with the green
+     of one -- but '[Uint8Contents]' is the one pseudo-entry node writes in the colour it writes
+     the things it names in brackets with, and the bytes it names are in no colour at all. */
+  return joinInspectEntries(prefix, [styleBracketed('[Uint8Contents]') + ': ' + bufferBytesText(v, opts),
+    styleString('[byteLength]') + ': ' + styleNumber(String(length))], indent, opts, 0);
 }
 
 /* What 'util.inspect' writes for a DataView: the three things about it, the buffer it views last
@@ -1361,7 +1489,9 @@ function dataViewInspectOf(v, depth, indent, opts) {
     buffer = INSPECT_FMT === null ? '[ArrayBuffer]' : INSPECT_FMT(v.buffer, depth + 1, indent + 2);
   } catch (e) { /* detached */ }
   /* The buffer it views is one level of nesting, so 'compact' is measured against a depth of 1. */
-  return joinInspectEntries(prefix, ['[byteLength]: ' + length, '[byteOffset]: ' + offset, '[buffer]: ' + buffer], indent, opts, 1);
+  return joinInspectEntries(prefix, [styleString('[byteLength]') + ': ' + styleNumber(String(length)),
+    styleString('[byteOffset]') + ': ' + styleNumber(String(offset)),
+    styleString('[buffer]') + ': ' + buffer], indent, opts, 1);
 }
 
 /* the element type name of a typed array (Uint8Array and the rest), or undefined for any other value */
@@ -1692,8 +1822,32 @@ BF.util = function () {
         fn.apply(this, args).then(function (value) { cb(null, value); }, function (err) { cb(err); });
       };
     },
-    deprecate: function (fn) {
-      return fn;
+    /*
+     * The wrapper 'util.deprecate' hands back. Host node 24.15 gives the message to
+     * 'process.emitWarning' the first time it is called and not before, which is why
+     * 'util.deprecate(fn)' with no message is a function that answers -- and whose FIRST call
+     * throws 'ERR_INVALID_ARG_TYPE: The "warning" argument must be of type string or an instance
+     * of Error. Received undefined'. The warning the host fails to emit is one it counts as
+     * emitted all the same: 'warned' is set before the call, so the second call goes straight
+     * through to the function and answers 5 where the first threw. A message that is a string or
+     * an Error is written on the next tick, as node's own is, in front of the value the function
+     * returns and behind the output the synchronous part of the program has already made.
+     */
+    deprecate: function (fn, msg, code) {
+      if (code !== undefined && typeof code !== 'string') {
+        throw utilArgError('ERR_INVALID_ARG_TYPE',
+          'The "code" argument must be of type string. Received type ' + utilReceivedAs(code));
+      }
+      var warned = false;
+      function deprecated() {
+        var proc = globalThis.process;
+        if (!warned && !(proc && proc.noDeprecation)) {
+          warned = true;
+          emitDeprecationWarning(msg, code);
+        }
+        return fn.apply(this, arguments);
+      }
+      return deprecated;
     },
     debuglog: function () {
       return function () {};
