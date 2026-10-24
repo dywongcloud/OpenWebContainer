@@ -2183,6 +2183,7 @@ nothing this wave measured contradicts them, and the canvas guards for the row's
   `application/wasm` rejects `ERR_WEBASSEMBLY_RESPONSE`, anything else `ERR_INVALID_ARG_TYPE`) and the
   eight constructors are no longer enumerable. Fixed in
   `packages/core/src/process/executors/node/runtime/guest/wasm.ts`.
+- **A wasm export the module declared as `i64` now answers a BigInt, the way host node 24.15 does**: `exports.ret_i64()` is `9007199254740993n` with `typeof` `'bigint'` where it used to be the lossy Number `9007199254740992`, and the same now holds for an `i64` reached through an import callback, through a function taken out of an exported table, through a re-entrant call made from inside a callback, and for an `i64` global's `value`, while `f32`, `f64` and `i32` exports and an `f64` global still answer exactly the Number they always did. Fixed in `packages/core/src/process/executors/node/runtime/wasm-host.ts`, where the value a call returns crosses as the tagged BigInt string `encodeValue` makes instead of as `Number(value)` -- JSON has no BigInt, which is why it was flattened -- and in `packages/core/src/process/executors/node/runtime/guest/wasm.ts`, where `decodeValue` rebuilds it on the far side.
 
 ### Interactive `sh`: the prompt it prints, and the line terminator it takes
 

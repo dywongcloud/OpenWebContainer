@@ -257,7 +257,9 @@ export const WASM_SRC = String.raw`
   /** A wasm function the host holds: calling it goes through the host, with memory synced. */
   function hostFunction (instanceId, fnId) {
     var call = function () {
-      return unwrap(W.fnCall(fnId, wasmArgs(arguments), instanceId));
+      /* A wasm function the host ran answers a BigInt for an i64, and it crosses as a tagged
+         string, so it is rebuilt here: a caller sees the BigInt the JS API would have given it. */
+      return decodeValue(unwrap(W.fnCall(fnId, wasmArgs(arguments), instanceId)));
     };
     Object.defineProperty(call, 'name', { value: 'wasm-function', configurable: true });
     return call;
@@ -269,7 +271,8 @@ export const WASM_SRC = String.raw`
       this.__id = unwrap(W.globalNew(d.value || 'i32', !!d.mutable, value === undefined ? 0 : Number(value)));
       GLOB[this.__id] = this;
     }
-    get value () { return unwrap(W.globalGet(this.__id)); }
+    /* An i64 global's value is a BigInt on a host, and it crosses tagged like any other i64. */
+    get value () { return decodeValue(unwrap(W.globalGet(this.__id))); }
     set value (next) { unwrap(W.globalSet(this.__id, Number(next))); }
   }
 
@@ -387,7 +390,9 @@ export const WASM_SRC = String.raw`
   function wrapExport (instanceId, entry) {
     if (entry.kind === 'function') {
       var fn = function () {
-        return unwrap(W.call(instanceId, entry.name, wasmArgs(arguments)));
+        /* An export the module declared as i64 answers a BigInt on a host, and the host sends it
+           as a tagged string, so it is rebuilt here rather than arriving as a lossy Number. */
+        return decodeValue(unwrap(W.call(instanceId, entry.name, wasmArgs(arguments))));
       };
       Object.defineProperty(fn, 'name', { value: entry.name, configurable: true });
       return fn;

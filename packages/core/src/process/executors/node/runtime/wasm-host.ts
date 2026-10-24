@@ -602,7 +602,13 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             syncIn(record);
             const value = (target as (...args: Array<number | bigint | string>) => unknown)(...numberArgs(parse(argsJson)));
             syncOut(record);
-            return ok(typeof value === 'bigint' ? Number(value) : (value ?? null));
+            /*
+             * An export the module declared as i64 answers a BigInt, the way the JS API gives it to
+             * a caller, and JSON has no BigInt -- so it travels as the tagged string encodeValue
+             * makes and the guest rebuilds it there. A Number here would lose every value past
+             * 2**53 the moment the module handed it over, which is what an i64 export used to do.
+             */
+            return ok(value === undefined ? null : encodeValue(value));
         } catch (error) {
             if (error instanceof GuestThrow) {
                 return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
@@ -740,7 +746,8 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
     define('globalGet', (id) => {
         const global = globals.get(number(id));
         if (!global) return fail('ERR_WASM', 'no such global');
-        return ok(typeof global.value === 'bigint' ? Number(global.value) : Number(global.value));
+        /* An i64 global's value is a BigInt on a host, and it travels tagged like any other i64. */
+        return ok(encodeValue(global.value));
     });
     define('globalSet', (id, value) => {
         const global = globals.get(number(id));
@@ -868,7 +875,9 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         if (!hostFn) {
             try {
                 const guest = callGuest(fnId, numberArgs(parse(argsJson)).map((value) => valueHandle(value as number | bigint)));
-                return ok(typeof guest === 'bigint' ? Number(guest) : guest);
+                /* Same as an export: a BigInt a guest function answered travels tagged, not as a
+                   Number, so a value past 2**53 survives the boundary. */
+                return ok(guest === undefined ? null : encodeValue(guest));
             } catch (error) {
                 if (error instanceof GuestThrow) {
                     return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
@@ -884,7 +893,9 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             if (record) syncIn(record);
             const value = hostFn(...numberArgs(parse(argsJson)));
             if (record) syncOut(record);
-            return ok(typeof value === 'bigint' ? Number(value) : (value ?? null));
+            /* A function taken out of a table is a wasm function: one the module declared as
+               returning an i64 answers a BigInt, and it travels tagged for the same reason. */
+            return ok(value === undefined ? null : encodeValue(value));
         } catch (error) {
             if (error instanceof GuestThrow) {
                 return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
