@@ -1162,6 +1162,25 @@ BF.fs = function () {
     }
   }
 
+  /*
+   * The code a path that is not there is refused with. It is ENOENT, except where a name on the way
+   * to it is not a directory: a host's kernel stops at the file it met and answers ENOTDIR, so a
+   * stat, an lstat and an rm of a name under a file all report that and not a name that is missing.
+   * This file system answers null for both, so the two are told apart by walking up to the nearest
+   * name that is there and asking what it is.
+   */
+  function absentCode(file) {
+    var at = P.dirname(toPathString(file));
+    for (var hop = 0; hop < 64; hop++) {
+      var st = statFollowingLinks(at);
+      if (st) return st.type === 'dir' ? 'ENOENT' : 'ENOTDIR';
+      var up = P.dirname(at);
+      if (up === at) break;
+      at = up;
+    }
+    return 'ENOENT';
+  }
+
   function requireAccess(file, want, syscall, from, to) {
     requireTraverse(file, syscall);
     var st = statFollowingLinks(file);
@@ -1346,7 +1365,10 @@ BF.fs = function () {
        are the target's, and so are the bytes that come back. */
     var st = statFollowingLinks(file);
     if (!st) throw fsError('ENOENT', 'open', String(p));
-    if (st.type === 'dir') throw fsError('EISDIR', 'read', file);
+    /* A read of a directory is EISDIR on host node 24.15, and the error it raises carries the
+       syscall alone: no path, and none in its sentence either, where every other rejection this
+       file composes names the file it was asked about. */
+    if (st.type === 'dir') throw noPathError('EISDIR', 'read');
     requireAccess(file, 4, 'open');
     var enc = optionsEncoding(opts);
     if (enc && normalizeEncoding(enc) === 'utf8') return host.readText(bytesNameOf(file));
@@ -1460,7 +1482,7 @@ BF.fs = function () {
     var st = statFollowingLinks(file);
     if (!st) {
       if (opts && opts.throwIfNoEntry === false) return undefined;
-      throw fsError('ENOENT', 'stat', toPathString(p));
+      throw fsError(absentCode(file), 'stat', pathName(p));
     }
     return makeStats(st, opts, false);
   };
@@ -1487,7 +1509,7 @@ BF.fs = function () {
     }
     if (!st) {
       if (opts && opts.throwIfNoEntry === false) return undefined;
-      throw fsError('ENOENT', 'lstat', file);
+      throw fsError(absentCode(file), 'lstat', pathName(p));
     }
     return makeStats(st, opts, linked);
   };
@@ -1649,7 +1671,9 @@ BF.fs = function () {
   function eisdirError(syscall, file) {
     var err = new Error('Path is a directory: ' + syscall + ' returned EISDIR (is a directory) ' + file);
     err.code = 'ERR_FS_EISDIR';
-    err.errno = -21;
+    /* The errno host node 24.15 pairs this one with is the uv number itself, 21, and not the
+       negation every uv errno below carries: probed on the host, an rm of a directory reports 21. */
+    err.errno = 21;
     err.syscall = syscall;
     err.path = file;
     return err;
@@ -1657,13 +1681,23 @@ BF.fs = function () {
 
   fs.rmSync = function (p, opts) {
     var file = toPathString(p);
+    var recursive = !!(opts && opts.recursive);
+    var force = !!(opts && opts.force);
+    /*
+     * Node's rm lstat's the name it was handed before it decides what to do with it -- it has to, to
+     * know whether a directory is what it is looking at -- and the error a caller sees is that
+     * lstat's and not the removal's: a name that is not there is "ENOENT ... lstat 'p'", and one
+     * standing under a file is "ENOTDIR ... lstat 'p'", both naming lstat where a removal that got
+     * as far as the name names rm. force is what turns the first into nothing at all, and with
+     * recursive it turns the second into nothing too.
+     */
     var st = statOf(file);
     if (!st) {
-      if (opts && opts.force) return;
-      throw fsError('ENOENT', 'rm', file);
+      var absent = absentCode(file);
+      if (force && (absent === 'ENOENT' || recursive)) return;
+      throw fsError(absent, 'lstat', pathName(p));
     }
-    var recursive = !!(opts && opts.recursive);
-    if (st.type === 'dir' && !recursive) throw eisdirError('rm', file);
+    if (st.type === 'dir' && !recursive) throw eisdirError('rm', pathName(p));
     try { requireDirWrite(file, 'rm'); } catch (err) {
       if (err.code === 'EACCES') throw rmAccessError(file);
       throw err;
@@ -2121,7 +2155,7 @@ BF.fs = function () {
   fs.readSync = function (fd, buffer, offset, length, position) {
     var rec = descriptorOf(fd, 'read');
     if (!rec.readable) throw badFdError('read');
-    if (rec.isDir) throw fsError('EISDIR', 'read', rec.path);
+    if (rec.isDir) throw noPathError('EISDIR', 'read');
     var opts = offset && typeof offset === 'object' ? offset : null;
     var off = opts ? opts.offset || 0 : typeof offset === 'number' ? offset : 0;
     var len = opts ? (opts.length === undefined ? buffer.length - off : opts.length)
@@ -2334,7 +2368,7 @@ BF.fs = function () {
   fs.readvSync = function (fd, buffers, position) {
     var rec = descriptorOf(fd, 'read');
     if (!rec.readable) throw badFdError('read');
-    if (rec.isDir) throw fsError('EISDIR', 'read', rec.path);
+    if (rec.isDir) throw noPathError('EISDIR', 'read');
     var at = typeof position === 'number' ? position : rec.position;
     var total = 0;
     for (var i = 0; i < buffers.length; i++) {
@@ -3130,6 +3164,9 @@ BF.fs = function () {
     var self = this;
     return handleCall(function () {
       var rec = descriptorOf(self.fd, 'read');
+      /* A handle opened on a directory reads EISDIR, as a read of one does: the error names the
+         read and carries no path. */
+      if (rec.isDir) throw noPathError('EISDIR', 'read');
       var bytes = rec.bytes.subarray(rec.position);
       rec.position = rec.bytes.length;
       var enc = optionsEncoding(options);
