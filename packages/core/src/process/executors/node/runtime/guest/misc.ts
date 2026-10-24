@@ -3944,43 +3944,33 @@ BF.crypto = function () {
     return bytes.toString(encoding);
   }
 
-  function Cipher(algorithm, direction, id, aead) {
-    this._algorithm = algorithm;
-    this._direction = direction;
-    this._id = id;
-    this._aead = aead;
-    this._finalized = false;
-    this._tag = undefined;
-    this._encoding = undefined;
-  }
-
-  Cipher.prototype.update = function (data, inputEncoding, outputEncoding) {
+  function cipherUpdate(data, inputEncoding, outputEncoding) {
     if (this._finalized) throw new Error('Trying to add data in unsupported state');
     /* The data a cipher is fed is one of the families that take no bare ArrayBuffer, as a hash's is. */
     var bytes = cipherBytes(data, inputEncoding, 'data', 'string or an instance of Buffer, TypedArray, or DataView');
     var out = Buf.from(cipherCap('crypto.cipher.update', { id: this._id, data: bytes.toString('base64') }), 'base64');
     return cipherOut(this, out, outputEncoding);
-  };
+  }
 
-  Cipher.prototype.final = function (outputEncoding) {
+  function cipherFinal(outputEncoding) {
     if (this._finalized) throw cipherStateError('Invalid state');
     this._finalized = true;
     var result = cipherCap('crypto.cipher.final', { id: this._id });
     if (result.tag !== undefined) this._tag = Buf.from(result.tag, 'base64');
     var out = Buf.from(result.data, 'base64');
     return cipherOut(this, out, outputEncoding);
-  };
+  }
 
-  Cipher.prototype.setAutoPadding = function (autoPadding) {
+  function cipherSetAutoPadding(autoPadding) {
     cipherCap('crypto.cipher.setAutoPadding', { id: this._id, on: autoPadding !== false });
     return this;
-  };
+  }
 
-  Cipher.prototype.setAAD = function (buffer, options) {
+  function cipherSetAAD(buffer, options) {
     var aad = cipherBytes(buffer, typeof options === 'string' ? options : undefined, 'buffer');
     cipherCap('crypto.cipher.setAAD', { id: this._id, aad: aad.toString('base64') });
     return this;
-  };
+  }
 
   /* Node puts getAuthTag on a cipher and setAuthTag on a decipher, and neither on the other. */
   function cipherGetAuthTag() {
@@ -3994,7 +3984,91 @@ BF.crypto = function () {
     return this;
   }
 
+  /*
+   * A cipher is a Transform stream on host Node 24.15: createCipheriv answers one a program pipes
+   * into a file, a socket or another cipher, and update() and final() are what its _transform and
+   * _flush call -- so the two classes are built off the stream module's Transform, the way zlib
+   * builds its own. The module is looked up when the first cipher is made and not before, so
+   * requiring crypto never requires stream.
+   */
+  var cipherClasses = null;
+
+  function cipherClassesOf() {
+    if (cipherClasses !== null) return cipherClasses;
+    var streamModule = requireBuiltin('stream');
+    var Transform = streamModule && streamModule.Transform;
+    if (typeof Transform !== 'function') throw new Error('crypto ciphers need the stream module');
+
+    /*
+     * A cipher holds back the block it cannot fill yet, so a chunk it answers nothing to is the
+     * ordinary case and not an error -- and nothing is not a chunk a pipeline sees, which is why
+     * an empty buffer is not pushed.
+     */
+    function cipherTransform(chunk, encoding, callback) {
+      var out;
+      try {
+        out = this.update(chunk, encoding);
+      } catch (err) {
+        callback(err);
+        return;
+      }
+      if (out === undefined || out.length === 0) callback();
+      else callback(null, out);
+    }
+
+    function cipherFlush(callback) {
+      var out;
+      try {
+        out = this.final();
+      } catch (err) {
+        callback(err);
+        return;
+      }
+      if (out === undefined || out.length === 0) callback();
+      else callback(null, out);
+    }
+
+    function cipherClass(name, decrypt) {
+      function Cipheriv(algorithm, id, aead) {
+        var self = Reflect.construct(Transform, [], Cipheriv);
+        self._algorithm = algorithm;
+        self._direction = decrypt ? 'decrypt' : 'encrypt';
+        self._id = id;
+        self._aead = aead;
+        self._finalized = false;
+        self._tag = undefined;
+        self._encoding = undefined;
+        return self;
+      }
+      Cipheriv.prototype = Object.create(Transform.prototype, {
+        constructor: { value: Cipheriv, writable: true, configurable: true }
+      });
+      /* The name a caller reads off the object it was handed: 'Cipheriv' and 'Decipheriv', which is
+         what constructor.name answers on the host and not the name this function was written with. */
+      Object.defineProperty(Cipheriv, 'name', { value: name });
+      /* Node's own order on the prototype: the two stream callbacks, then update and final, then
+         setAutoPadding, then the one of getAuthTag and setAuthTag this direction has, and setAAD
+         last. */
+      Cipheriv.prototype._transform = cipherTransform;
+      Cipheriv.prototype._flush = cipherFlush;
+      Cipheriv.prototype.update = cipherUpdate;
+      Cipheriv.prototype.final = cipherFinal;
+      Cipheriv.prototype.setAutoPadding = cipherSetAutoPadding;
+      if (decrypt) Cipheriv.prototype.setAuthTag = decipherSetAuthTag;
+      else Cipheriv.prototype.getAuthTag = cipherGetAuthTag;
+      Cipheriv.prototype.setAAD = cipherSetAAD;
+      return Cipheriv;
+    }
+
+    cipherClasses = {
+      encrypt: cipherClass('Cipheriv', false),
+      decrypt: cipherClass('Decipheriv', true)
+    };
+    return cipherClasses;
+  }
+
   function createCipher(direction) {
+    var Klass = null;
     return function (algorithm, key, iv, options) {
       var opts = options !== undefined && options !== null && typeof options === 'object'
         ? { authTagLength: options.authTagLength }
@@ -4006,10 +4080,8 @@ BF.crypto = function () {
         iv: iv === null || iv === undefined ? null : cipherBytes(iv, undefined, 'iv').toString('base64'),
         options: opts
       });
-      var cipher = new Cipher(String(algorithm), direction, opened.id, opened.aead === true);
-      if (direction === 'decrypt') cipher.setAuthTag = decipherSetAuthTag;
-      else cipher.getAuthTag = cipherGetAuthTag;
-      return cipher;
+      if (Klass === null) Klass = cipherClassesOf()[direction];
+      return new Klass(String(algorithm), opened.id, opened.aead === true);
     };
   }
 

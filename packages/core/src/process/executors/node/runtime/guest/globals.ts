@@ -2805,6 +2805,38 @@ function urlGlobalOf(nodeUrl) {
       return false;
     }
   };
+  /*
+   * Object URLs. URL.createObjectURL answers 'blob:nodedata:<uuid>' for a Blob and URL.revokeObjectURL
+   * drops it again, and the Blob itself is what the store behind the two holds -- the statics are the
+   * only way in or out of it, so a blob: URL cannot be made any other way. Node refuses a blob: URL
+   * everywhere it takes one, including an import, so nothing here ever reads one back out; what the
+   * store has to answer is the URL's shape, that a second call is a second URL, and that a revoked
+   * one is gone.
+   */
+  var objectURLs = Object.create(null);
+  function notABlob(value) {
+    var err = new TypeError('The "obj" argument must be an instance of Blob. Received ' + specificTypeOf(value));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+  }
+  URL.createObjectURL = function (obj) {
+    var BlobClass = requireBuiltin('buffer').Blob;
+    /* A Blob is one by construction and not by its tag: node takes a File, which extends Blob, and
+       refuses a plain object carrying 'Blob' as its Symbol.toStringTag. */
+    if (!(typeof BlobClass === 'function' && obj instanceof BlobClass)) throw notABlob(obj);
+    var url = 'blob:nodedata:' + requireBuiltin('crypto').randomUUID();
+    objectURLs[url] = obj;
+    return url;
+  };
+  URL.revokeObjectURL = function (url) {
+    if (arguments.length === 0) {
+      var missing = new TypeError('The "url" argument must be specified');
+      missing.code = 'ERR_MISSING_ARGS';
+      throw missing;
+    }
+    /* A URL that was never handed out, or one already revoked, is simply not there. */
+    delete objectURLs[String(url)];
+  };
   /* require('url').URL and the global are one class in Node, so the module is handed this one too */
   nodeUrl.URL = URL;
   /* Node's URL takes one argument as far as URL.length is concerned: the base is optional. */
