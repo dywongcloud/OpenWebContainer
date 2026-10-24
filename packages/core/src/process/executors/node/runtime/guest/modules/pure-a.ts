@@ -1448,7 +1448,8 @@ export const SRC = String.raw`
     perfObserverStates.set(this, { observer: this, callback: callback, types: [], pending: [], scheduled: false, connected: false });
   }
 
-  PerformanceObserver.supportedEntryTypes = PERF_SUPPORTED.slice();
+  /* Node's is frozen: a caller that asks for it twice gets the same array and cannot push to it. */
+  PerformanceObserver.supportedEntryTypes = Object.freeze(PERF_SUPPORTED.slice());
 
   function perfObserverState(observer) {
     var st = perfObserverStates.get(observer);
@@ -1519,8 +1520,10 @@ export const SRC = String.raw`
       if (startTime === undefined) startTime = hasEnd && hasDuration ? endTime - opts.duration : 0;
       if (endTime === undefined) endTime = hasDuration ? startTime + opts.duration : perfNow();
     } else {
-      startTime = startOrOptions === undefined ? 0 : perfResolveMark(startOrOptions);
+      /* The end is resolved first: with both marks missing a host names the end one, and the
+         order a refusal names a mark in is part of the error a caller catches. */
       endTime = endMark === undefined ? perfNow() : perfResolveMark(endMark);
+      startTime = startOrOptions === undefined ? 0 : perfResolveMark(startOrOptions);
     }
     var entry = Object.create(PerformanceMeasure.prototype);
     return perfBuffer(perfInit(entry, String(name), 'measure', startTime, endTime - startTime, detail));
@@ -1680,6 +1683,7 @@ export const SRC = String.raw`
     perfClearEntries('measure', name);
   };
   PerformanceProto.clearResourceTimings = function () {};
+  PerformanceProto.onresourcetimingbufferfull = null;
   PerformanceProto.markResourceTiming = function () {};
   PerformanceProto.setResourceTimingBufferSize = function () {};
   PerformanceProto.getEntries = function () {
@@ -1732,10 +1736,35 @@ export const SRC = String.raw`
     }
   });
 
-  // The global performance object gains the user-timing methods it lacks, keeping
-  // its identity so that require('perf_hooks').performance === globalThis.performance.
-  if (globalThis.performance && typeof globalThis.performance.mark !== 'function') {
-    Object.setPrototypeOf(globalThis.performance, PerformanceProto);
+  /*
+   * The global 'performance' becomes this module's, so that the entries 'mark' and 'measure' push
+   * are the classes this module exports, so that 'getEntries' answers one timeline sorted by start
+   * time rather than the two buffers a mark and a measure were kept in, and so that an observer
+   * registered on 'mark' or 'measure' is actually called. It is the object globals.ts installed --
+   * not a second one -- that is re-prototyped here: its 'now' is the host clock the rest of the
+   * guest keeps time by, and 'require('perf_hooks').performance' has to stay '=== globalThis.per
+   * formance'. The clock therefore comes with it: the 'now' and the 'timeOrigin' that object had
+   * are carried onto the prototype installed here before the swap, so nothing that read them
+   * before this ran measures a different epoch after it.
+   *
+   * The guard that used to stand here ('only when mark is not a function') never fired: globals.ts
+   * defines a 'mark' of its own, so this module's whole timeline stayed unreached and the observer
+   * registered on it never had an entry delivered to it.
+   */
+  var perfGlobal = globalThis.performance;
+  if (perfGlobal === undefined || perfGlobal === null) perfGlobal = Object.create(PerformanceProto);
+  var perfPrevProto = Object.getPrototypeOf(perfGlobal);
+  var perfPrevClock = perfPrevProto !== null && typeof perfPrevProto.now === 'function' ? perfPrevProto.now : null;
+  PerformanceProto.now = perfPrevClock !== null
+    ? function () { return perfPrevClock.call(this); }
+    : function () { return 0; };
+  var perfPrevOrigin = perfPrevProto !== null ? Object.getOwnPropertyDescriptor(perfPrevProto, 'timeOrigin') : undefined;
+  Object.defineProperty(PerformanceProto, 'timeOrigin', perfPrevOrigin !== undefined
+    ? perfPrevOrigin
+    : { configurable: true, enumerable: true, get: function () { return 0; } });
+  Object.setPrototypeOf(perfGlobal, PerformanceProto);
+  if (globalThis.performance !== perfGlobal) {
+    Object.defineProperty(globalThis, 'performance', { value: perfGlobal, writable: true, configurable: true, enumerable: true });
   }
 
   var PERF_CONSTANTS = {
@@ -1755,6 +1784,34 @@ export const SRC = String.raw`
   function PerformanceResourceTiming() {
     throw illegalConstructor();
   }
+
+  /*
+   * The classes and the object above are the ones a caller reaches through the global object, and
+   * they are the same objects 'require('perf_hooks')' hands out, so 'entry instanceof Performance
+   * Mark' answers true for an entry 'performance.getEntries()' returned, as on a host. The
+   * 'Symbol.toStringTag' each one carries is what makes 'Object.prototype.toString.call(entry)'
+   * answer '[object PerformanceMark]' there too.
+   */
+  Object.defineProperty(PerformanceProto, Symbol.toStringTag, { value: 'Performance', configurable: true });
+  var PERF_CLASSES = [
+    [PerformanceEntry, 'PerformanceEntry'],
+    [PerformanceMark, 'PerformanceMark'],
+    [PerformanceMeasure, 'PerformanceMeasure'],
+    [PerformanceObserver, 'PerformanceObserver'],
+    [PerformanceObserverEntryList, 'PerformanceObserverEntryList'],
+    [PerformanceResourceTiming, 'PerformanceResourceTiming']
+  ];
+  for (var perfClassIndex = 0; perfClassIndex < PERF_CLASSES.length; perfClassIndex++) {
+    var perfClass = PERF_CLASSES[perfClassIndex];
+    Object.defineProperty(perfClass[0].prototype, Symbol.toStringTag, { value: perfClass[1], configurable: true });
+  }
+  globalThis.Performance = Performance;
+  globalThis.PerformanceEntry = PerformanceEntry;
+  globalThis.PerformanceMark = PerformanceMark;
+  globalThis.PerformanceMeasure = PerformanceMeasure;
+  globalThis.PerformanceObserver = PerformanceObserver;
+  globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
+  globalThis.PerformanceResourceTiming = PerformanceResourceTiming;
 
   BF.perf_hooks = function () {
     return {
