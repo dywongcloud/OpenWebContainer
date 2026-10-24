@@ -144,6 +144,24 @@ export const SRC = String.raw`
   });
   Object.defineProperties(DOMException.prototype, LEGACY_DESCS);
   /*
+   * WebIDL declares a constant on the interface object as well as on the interface prototype
+   * object, and host node 24.15 does the same: Object.getOwnPropertyNames(DOMException) is 28 there
+   * -- length, name and prototype, then these same 25 in this same order, under this same
+   * descriptor -- where this constructor carried 3 and every static read answered undefined. Three
+   * things a program does hang off that and all three broke: 'e.code === DOMException.ABORT_ERR'
+   * compared against undefined and never matched, a table copied off the constructor to build an
+   * error class of its own came away empty, and a sloppy write to one of the names defined a
+   * property here -- a constructor is extensible, and an absent writable false is no bar -- where
+   * the host's constant ignores the write and its configurable false refuses the delete. One set of
+   * descriptors serves both objects: defineProperties installs a value property on each, so nothing
+   * that reads one side can move the other, and the 25 land behind the three names already there,
+   * which is the order the host reports them in. Nothing on the prototype or on an instance moves:
+   * no instance gains an own name, so Object.getOwnPropertyNames(new DOMException('d',
+   * 'AbortError')) is still ['stack'], and util.inspect's header still opens with
+   * 'DOMException [AbortError]: d'.
+   */
+  Object.defineProperties(DOMException, LEGACY_DESCS);
+  /*
    * The tag is the one thing a host DOMException carries that a plain Error does not, and it is
    * what Object.prototype.toString.call(new DOMException('d', 'AbortError')) reads to answer
    * '[object DOMException]' and not '[object Error]', as it does on host node 24.15. Host node
