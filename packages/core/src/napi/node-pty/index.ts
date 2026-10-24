@@ -6,12 +6,15 @@
  * device: no openpty, no file descriptor that is a tty, no line discipline, no window size and no
  * job control.
  *
- * What fork() starts. The container can run three kinds of executable: `sh` (a ShellProcess),
- * `node` and a `.js` file (a NodeProcess). `sh` with no arguments is the interactive shell: it
- * prints a prompt, echoes what is written to it, runs a command line on the line terminator and
- * prints the result, which is the closest thing the container has to a session on a terminal.
- * `sh` with arguments (['-c', line]) runs one command line and exits. A file that is none of
- * these three fails with ENOENT, as a file with no executor does in Node.
+ * What fork() starts. A name is resolved the way the container's own child_process resolves it:
+ * `sh` is the container's shell (a ShellProcess), `node` is its interpreter (a NodeProcess), and any
+ * other name is looked for on PATH and runs when the file behind it is one the container can run, a
+ * .js file or a script whose shebang names node, sh or bash -- the way the kernel runs a file through
+ * its shebang. A name nothing is behind fails with ENOENT, as a file with no executor does in Node.
+ * `sh` with no arguments is the interactive shell: it prints a prompt, echoes what is written to it,
+ * runs a command line on the line terminator and prints the result, which is the closest thing the
+ * container has to a session on a terminal. `sh` with arguments (['-c', line]) runs one command line
+ * and exits.
  *
  * What onData delivers. The child's stdout and its stderr, merged in the order they arrive, as
  * one stream, the way a pty merges them, with every newline turned into CR NL the way the line
@@ -34,6 +37,16 @@
 export interface PtyAddonEnv {
     /** child_process.spawn of the guest: starts a container child and returns its ChildProcess. */
     child?: { spawn(file: string, args: string[], options: Record<string, unknown>): any };
+    /**
+     * The virtual file system, as every Node-API shim is handed it (NAPI_HOST.fs in
+     * runtime/guest/globals.ts): byte-level, resolved against the guest's cwd. Only the two reads a
+     * name is resolved with are used, and both are optional: with no file system a name is handed to
+     * the container unchanged and it is the container that answers ENOENT for it.
+     */
+    fs?: {
+        stat?(path: string): string | undefined;
+        read?(path: string): Uint8Array | undefined;
+    };
 }
 
 /**
@@ -46,6 +59,9 @@ const FD_TABLE = '__owcPtyFds';
 /** The size node-pty uses when it is given none (lib/terminal.js DEFAULT_COLS / DEFAULT_ROWS). */
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
+
+/** The PATH a lookup falls back to: the one the container's own spawn uses when the environment names none. */
+const DEFAULT_PATH = '/bin:/usr/bin:/usr/local/bin';
 
 /**
  * Signal numbers, as Linux numbers them (the guest reports linux-x64). The real add-on reports
@@ -115,18 +131,74 @@ function envObject(pairs: unknown): Record<string, string> {
     return out;
 }
 
+/** True when a file stands at a path. Undefined with no file system to ask. */
+function isFileAt(fs: PtyAddonEnv['fs'], path: string): boolean {
+    if (!fs || typeof fs.stat !== 'function') return true;
+    try {
+        return fs.stat(path) === 'file';
+    } catch {
+        return false;
+    }
+}
+
+/** The interpreter the first line of a file names, as the kernel reads it: `#!/usr/bin/env node` gives `node`. */
+function shebangInterpreter(fs: PtyAddonEnv['fs'], path: string): string | undefined {
+    if (!fs || typeof fs.read !== 'function') return undefined;
+    let text: string;
+    try {
+        const bytes = fs.read(path);
+        if (bytes === undefined) return undefined;
+        const B = bufferOf();
+        text = B.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8');
+    } catch {
+        return undefined;
+    }
+    const match = /^#!([^\n]*)/.exec(text);
+    if (match === null) return undefined;
+    const tokens = match[1].trim().split(/\s+/).filter((token) => token !== '');
+    if (tokens.length === 0) return undefined;
+    return tokens[0] === 'env' || tokens[0].endsWith('/env')
+        ? tokens.slice(1).find((token) => !token.startsWith('-'))
+        : tokens[0].split('/').pop();
+}
+
+/** True when the file at a path is one the container can run: a node script, or a script whose shebang names node, sh or bash. */
+function isRunnableAt(fs: PtyAddonEnv['fs'], path: string): boolean {
+    const base = path.slice(path.lastIndexOf('/') + 1);
+    if (base === 'sh' || base === 'bash' || base === 'node') return true;
+    if (path.endsWith('.js')) return true;
+    const interpreter = shebangInterpreter(fs, path);
+    return interpreter === 'node' || interpreter === 'sh' || interpreter === 'bash';
+}
+
 /**
- * The executable the container can start for a file, or null when it can start none. Only sh,
- * node and a .js file have an executor here; anything else fails the way a file with no executor
- * fails in Node.
+ * The executable the container can start for a file, or null when it can start none.
+ *
+ * The names this answers are the names the container's own child_process answers, because it is the
+ * same resolution (spawnExecutableOf in runtime/capabilities/child.ts): `sh` and `node` are the
+ * container's executors and are named as they are, a path is handed on unchanged, and a bare name is
+ * looked for on PATH and kept when the file behind it is one the container can run -- a .js file, or
+ * a script whose shebang names an interpreter the container has. A name nothing is behind, and a file
+ * with no interpreter for it, fail the way a file with no executor fails in Node: ENOENT.
  */
-function executableOf(file: string): string | null {
+function executableOf(file: string, fs: PtyAddonEnv['fs'], envPairs: Record<string, string>): string | null {
     if (file === 'sh' || file === '/bin/sh') return 'sh';
     if (file === 'node' || file === '/usr/local/bin/node') return 'node';
     if (file.endsWith('.js')) return file;
     const base = file.slice(file.lastIndexOf('/') + 1);
     if (base === 'sh') return 'sh';
     if (base === 'node') return 'node';
+    /* A path the caller named: kept as it was, so the container resolves it -- a shebang stand-in
+       like /bin/echo is a script there, and a path with nothing behind it is its ENOENT. */
+    if (file.includes('/')) return isFileAt(fs, file) ? file : null;
+    for (const entry of (envPairs.PATH ?? DEFAULT_PATH).split(':')) {
+        const directory = entry === '' ? '.' : entry.endsWith('/') ? entry.slice(0, -1) : entry;
+        const path = `${directory}/${file}`;
+        if (!isFileAt(fs, path)) continue;
+        /* A file that stands at a name PATH holds but that nothing can run is not an executable:
+           the container answers ENOENT for it, as a host does for a file with no interpreter. */
+        return isRunnableAt(fs, path) ? path : null;
+    }
     return null;
 }
 
@@ -204,6 +276,7 @@ function makeEmitter(): PtyRecord['emitter'] {
 
 export function createAddon(env: PtyAddonEnv = {}): object {
     const spawnChild = env && env.child && typeof env.child.spawn === 'function' ? env.child.spawn : undefined;
+    const hostFs = env && env.fs ? env.fs : undefined;
     let nextFd = 1000;
 
     /**
@@ -229,7 +302,8 @@ export function createAddon(env: PtyAddonEnv = {}): object {
         }
         const name = file === undefined || file === null || file === '' ? 'sh' : String(file);
         const argv: string[] = Array.isArray(args) ? args.map((item) => String(item)) : [];
-        const exe = executableOf(name);
+        const envObject_ = envObject(parsedEnv);
+        const exe = executableOf(name, hostFs, envObject_);
         if (exe === null) {
             const failure: any = new Error(`spawn ${name} ENOENT`);
             failure.code = 'ENOENT';
@@ -239,7 +313,6 @@ export function createAddon(env: PtyAddonEnv = {}): object {
             failure.spawnargs = argv;
             throw failure;
         }
-        const envObject_ = envObject(parsedEnv);
         const child = spawnChild(exe, argv, {
             cwd: typeof cwd === 'string' && cwd !== '' ? cwd : undefined,
             env: envObject_,
