@@ -51,7 +51,26 @@ var cpState = {
   bcDomain: null
 };
 
-var cpSignalNames = { 1: 'SIGHUP', 2: 'SIGINT', 9: 'SIGKILL', 15: 'SIGTERM' };
+/* Every signal a host Node 24.15 answers to, and the number each one carries: the set
+   os.constants.signals reports, which is also the set a kill validates against. A name outside it
+   -- or a number no name carries, 7 and everything above 31 among them -- is ERR_UNKNOWN_SIGNAL on
+   a host, raised before anything is signalled, so the child the signal was meant for is still
+   running afterwards. A number names one signal: 6 is SIGABRT and not SIGIOT, the way a host
+   reports the signal a child died of. */
+var CP_SIGNAL_NUMBERS = {
+  SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6, SIGBUS: 10,
+  SIGFPE: 8, SIGKILL: 9, SIGUSR1: 30, SIGSEGV: 11, SIGUSR2: 31, SIGPIPE: 13, SIGALRM: 14,
+  SIGTERM: 15, SIGCHLD: 20, SIGCONT: 19, SIGSTOP: 17, SIGTSTP: 18, SIGTTIN: 21, SIGTTOU: 22,
+  SIGURG: 16, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 23,
+  SIGINFO: 29, SIGSYS: 12
+};
+var cpSignalNames = {
+  1: 'SIGHUP', 2: 'SIGINT', 3: 'SIGQUIT', 4: 'SIGILL', 5: 'SIGTRAP', 6: 'SIGABRT', 8: 'SIGFPE',
+  9: 'SIGKILL', 10: 'SIGBUS', 11: 'SIGSEGV', 12: 'SIGSYS', 13: 'SIGPIPE', 14: 'SIGALRM',
+  15: 'SIGTERM', 16: 'SIGURG', 17: 'SIGSTOP', 18: 'SIGTSTP', 19: 'SIGCONT', 20: 'SIGCHLD',
+  21: 'SIGTTIN', 22: 'SIGTTOU', 23: 'SIGIO', 24: 'SIGXCPU', 25: 'SIGXFSZ', 26: 'SIGVTALRM',
+  27: 'SIGPROF', 28: 'SIGWINCH', 29: 'SIGINFO', 30: 'SIGUSR1', 31: 'SIGUSR2'
+};
 
 /* worker_threads' shared environment data: a map a thread writes and the workers it starts read.
    Host node 24.15 keys it by the value it was handed, not by that value as text:
@@ -1041,12 +1060,54 @@ function cpKillName(signal) {
   return String(signal === undefined || signal === null ? 'SIGTERM' : signal);
 }
 
+/* The words a host writes for a signal it does not know: 'Unknown signal: NOPE' for a name, and
+   the value as Node renders it for anything else -- '{}' for an object, which String() would make
+   '[object Object]'. The code rides in String() of the error as well as in 'code', the way a host
+   TypeError carries it. */
+function cpSignalUnknown(signal) {
+  var shown = String(signal);
+  if (signal !== null && typeof signal === 'object') {
+    var util = requireBuiltin('util');
+    if (util !== undefined && util !== null && typeof util.inspect === 'function') {
+      shown = util.inspect(signal);
+    }
+  }
+  var bad = new TypeError('Unknown signal: ' + shown);
+  bad.code = 'ERR_UNKNOWN_SIGNAL';
+  bad.toString = function () {
+    return 'TypeError [ERR_UNKNOWN_SIGNAL]: ' + String(this.message);
+  };
+  return bad;
+}
+
+/* The one signal a kill sends. undefined is SIGTERM; 0 is not a signal at all but the question
+   whether the child is still there, and it is the one number a host answers true without ending
+   anything; a name is read the way a host reads it, upper-cased, so 'sigterm' ends a child of
+   SIGTERM; and a number is the name that number carries. Everything else -- null, a boolean, a
+   fraction, a name no signal has -- throws before the child is looked at, which is what leaves a
+   child that cannot be signalled running and makes kill of a child that has already left answer
+   false for a real signal and throw for a made-up one. */
+function cpKillSignalOf(signal) {
+  if (signal === undefined) return 'SIGTERM';
+  if (typeof signal === 'number') {
+    if (signal === 0) return 0;
+    if (signal !== signal || signal % 1 !== 0) throw cpSignalUnknown(signal);
+    var named = cpSignalNames[signal];
+    if (named === undefined) throw cpSignalUnknown(signal);
+    return named;
+  }
+  if (typeof signal === 'string') {
+    var upper = signal.toUpperCase();
+    if (CP_SIGNAL_NUMBERS[upper] === undefined) throw cpSignalUnknown(signal);
+    return upper;
+  }
+  throw cpSignalUnknown(signal);
+}
+
 function cpKill(child, signal) {
+  var name = cpKillSignalOf(signal);
   if (!child._cpSpawned || child._cpExited) return false;
-  if (signal === 0 || signal === '0') return true;
-  var name = typeof signal === 'number'
-    ? (cpSignalNames[signal] || 'SIGTERM')
-    : String(signal === undefined || signal === null ? 'SIGTERM' : signal);
+  if (name === 0) return true;
   var ok = callCap('child.kill', { pid: child.pid, signal: name });
   if (ok) child.killed = true;
   return ok === true;

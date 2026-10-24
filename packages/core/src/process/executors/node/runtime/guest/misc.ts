@@ -2285,8 +2285,25 @@ BF.crypto = function () {
     return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
   }
 
-  function randomInt(min, max) {
-    if (max === undefined) {
+  function randomIntDraw(min, max) {
+    var r = randomBytes(4).readUInt32BE(0) / 4294967296;
+    return min + Math.floor(r * (max - min));
+  }
+
+  /* randomInt([min, ]max[, callback]). A function where 'max' would be is the callback, and the one
+     number beside it is then the upper bound with 0 as the lower one -- so randomInt(10, cb) draws
+     in [0, 10) and calls cb later, and randomInt(10, cb, 5) does too, the 5 never being read. A
+     lone function is still the upper bound, which is why randomInt(cb) is an argument error about
+     'max' and not a callback; and an absent 'max' is that same one-number form, so randomInt(10,
+     undefined) draws in [0, 10) as well. Every bound is checked before anything is drawn, so a
+     range that cannot be drawn is thrown at the caller and not handed to the callback. */
+  function randomInt(min, max, callback) {
+    var done = callback;
+    if (typeof max === 'function') {
+      done = max;
+      max = min;
+      min = 0;
+    } else if (max === undefined) {
       max = min;
       min = 0;
     }
@@ -2295,8 +2312,15 @@ BF.crypto = function () {
     if (typeof max !== 'number' || !Number.isSafeInteger(max)) throw invalidArgType('max', 'a safe integer', max);
     if (typeof min !== 'number' || !Number.isSafeInteger(min)) throw invalidArgType('min', 'a safe integer', min);
     if (!(max > min)) throw outOfRange('max', 'greater than the value of "min" (' + min + ')', max);
-    var r = randomBytes(4).readUInt32BE(0) / 4294967296;
-    return min + Math.floor(r * (max - min));
+    if (done !== undefined && typeof done !== 'function') throw invalidArgType('callback', 'of type function', done);
+    /* Node draws on its thread pool, so the callback runs after the timers a program has already
+       armed and before its immediates, and the call itself answers undefined rather than a number.
+       The error it hands the callback is undefined, where randomBytes' is null. */
+    if (done !== undefined) {
+      setTimeout(function () { done(undefined, randomIntDraw(min, max)); }, 0);
+      return undefined;
+    }
+    return randomIntDraw(min, max);
   }
 
   /* The integer-typed arrays webcrypto.getRandomValues fills: a floating-point one and a DataView
