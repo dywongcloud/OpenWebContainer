@@ -13,7 +13,7 @@
  */
 
 import type { RGBA } from './color';
-import { formatColor, parseColor, rgba } from './color';
+import { formatColor, INVALID_COLOR, parseColor, rgba } from './color';
 import type { Mat } from './matrix';
 import { clone as cloneMat, identity, invert, mat, matFrom, multiply, scaleOf } from './matrix';
 import { PathBuilder, transformPath } from './path';
@@ -203,7 +203,7 @@ export class Canvas {
      * recreates the surface. Measured on canvas 3.2.3.
      */
     private resetContexts(): void {
-        for (const context of this.contexts) context.reset();
+        for (const context of this.contexts) context.resetSurface();
     }
 
     get stride(): number {
@@ -482,7 +482,7 @@ export class CanvasGradient {
         const at = Number(offset);
         if (!isFinite(at) || at < 0 || at > 1) return;
         const parsed = parseColor(String(color));
-        if (parsed === null) throw new TypeError('parse color failed');
+        if (parsed === null || parsed === INVALID_COLOR) throw new TypeError('parse color failed');
         this.paint.add(at, parsed);
     }
 }
@@ -554,8 +554,12 @@ export class CanvasRenderingContext2d {
     /**
      * What the add-on does when the canvas is resized: the state, the save() stack and the current
      * path all go with the surface cairo recreates.
+     *
+     * Deliberately not called `reset`. canvas 3.2.3 has no ctx.reset() -- typeof is 'undefined'
+     * there and it is a browser-only method -- and a shim that offers it wipes the transform for a
+     * caller that expects the add-on's own surface.
      */
-    reset(): void {
+    resetSurface(): void {
         this.state = freshState();
         this.stack.length = 0;
         this.path = new PathBuilder();
@@ -1206,11 +1210,16 @@ export class CanvasRenderingContext2d {
         const paint: Paint = {
             uniform: false,
             colorAt: (ux: number, uy: number): RGBA => {
-                const u = sx + ((ux - dx) / dw) * sw;
-                const v = sy + ((uy - dy) / dh) * sh;
+                /* (ux - dx) * (sw / dw), not (ux - dx) / dw * sw: cairo multiplies by the scale it
+                 * derived from the two rectangles, and the two orderings differ in the last bit --
+                 * at 8 into 24 the destination column 16 lands on 5.5 exactly one way and on
+                 * 5.499999999999999 the other, which is the difference between reading source
+                 * pixel 5 and reading 255/256 of it plus 1/256 of pixel 4. Measured on 3.2.3. */
+                const u = sx + (ux - dx) * (sw / dw);
+                const v = sy + (uy - dy) * (sh / dh);
                 const c = averaging
                     ? sampleArea(source, u - stepU / 2, v - stepV / 2, u + stepU / 2, v + stepV / 2)
-                    : sampleSurface(source, u, v, smooth, 'pad');
+                    : sampleSurface(source, u, v, smooth, 'pad', 0.5 * Math.min(stepU, 1), 0.5 * Math.min(stepV, 1));
                 return rgba(c[0], c[1], c[2], c[3] * 255);
             }
         };

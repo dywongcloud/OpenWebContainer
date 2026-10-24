@@ -441,22 +441,28 @@ export function sampleArea(
 
 /** Bilinear sample of an RGBA byte surface at a real-valued position; outside is transparent. */
 export function sampleSurface(
-    s: Surface, x: number, y: number, smooth: boolean, extend?: 'pad'
+    s: Surface, x: number, y: number, smooth: boolean, extend?: 'pad',
+    /* How far left of `x` the nearest pixel begins, and how far up from `y`: a half source pixel on a
+     * downscale, a half DESTINATION pixel on an upscale. Measured on canvas 3.2.3, a 32-wide source
+     * drawn into 8 with imageSmoothingEnabled false reads source pixels 1, 5, 9 for the first three
+     * destination pixels -- floor(x - 0.5) -- but an 8-wide source drawn into 16 reads 0, 0, 1, 1,
+     * 2, 2, which is floor(x * 8 / 16), so the half shifts with the scale and not with the source.
+     * Half a source pixel on an upscale reads pixel -1 for the first column of every row, which
+     * leaves the upscaled image with a transparent border cairo does not draw. */
+    backX: number = 0.5, backY: number = 0.5
 ): [number, number, number, number] {
     if (!smooth) {
-        /* The same pixel the bilinear branch starts from: `x` is a continuous position, so the pixel
-         * whose centre x+0.5 is nearest begins at floor(x - 0.5). Reading floor(x) instead put every
-         * nearest sample half a pixel late, which cairo does not do -- measured on canvas 3.2.3, a
-         * 32x32 source drawn into 8x8 with imageSmoothingEnabled false reads source pixels (1,1),
-         * (5,1) and (9,1) for the first three destination pixels, where floor(x) reads (2,2), (6,2)
-         * and (10,2). */
-        const ix = Math.floor(x - 0.5), iy = Math.floor(y - 0.5);
+        const ix = Math.floor(x - backX + 1e-9), iy = Math.floor(y - backY + 1e-9);
         if (ix < 0 || iy < 0 || ix >= s.width || iy >= s.height) return [0, 0, 0, 0];
         const at = (iy * s.width + ix) * 4;
         return [s.data[at], s.data[at + 1], s.data[at + 2], s.data[at + 3] / 255];
     }
     const x0 = Math.floor(x - 0.5), y0 = Math.floor(y - 0.5);
-    const fx = x - 0.5 - x0, fy = y - 0.5 - y0;
+    /* cairo's bilinear tap weights are 8-bit: an 8-wide ramp of 0, 30, 60 ... drawn into 24 with
+     * smoothing on reads 0, 0, 9, 19, 30, 39 -- the 1/3 and 2/3 taps quantised to 85/256 and
+     * 170/256, not 0.33333 and 0.66667, which read 10 and 20. */
+    const fx = Math.max(0, Math.min(255, Math.floor((x - 0.5 - x0) * 256))) / 256;
+    const fy = Math.max(0, Math.min(255, Math.floor((y - 0.5 - y0) * 256))) / 256;
     let r = 0, g = 0, b = 0, a = 0;
     for (let j = 0; j < 2; j++) {
         for (let i = 0; i < 2; i++) {
@@ -479,5 +485,8 @@ export function sampleSurface(
         }
     }
     if (a <= 0) return [0, 0, 0, 0];
-    return [r / a, g / a, b / a, a];
+    /* cairo's bilinear read truncates: an 8-wide ramp of 0, 30, 60 ... drawn into 16 with smoothing
+     * on reads 0, 7, 22, 37, 52 -- the exact halves 7.5, 22.5, 37.5 taken downwards, where rounding
+     * them gives 8, 22, 38, 52 and puts every second pixel of an upscale one level high. */
+    return [Math.floor(r / a), Math.floor(g / a), Math.floor(b / a), a];
 }

@@ -25,6 +25,20 @@ export const TRANSPARENT_BLACK: RGBA = { r: 0, g: 0, b: 0, a: 0 };
 /** 'transparent' is rgba(0,0,0,0), but cairo reports it back as white with zero alpha, so it is kept apart. */
 export const TRANSPARENT_WHITE: RGBA = { r: 255, g: 255, b: 255, a: 0 };
 
+/**
+ * What node-canvas's parser yields for a colour function whose arguments do not parse -- rgb(255,0),
+ * rgb(50%,0%,0%), rgba(), rgb(0xff,0,0). A property setter still applies it (measured: fillStyle
+ * becomes rgba(0, 0, 0, 0.00)) while addColorStop still refuses it with 'parse color failed', so it
+ * is a value a caller can tell apart by identity from a colour that parsed.
+ */
+export const INVALID_COLOR: RGBA = { r: 0, g: 0, b: 0, a: 0 };
+
+/** A number as node-canvas reads it: signed, and it must consume the whole token, so '50%' and '0xff' fail. */
+const NUMBER = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/;
+
+/** An alpha as node-canvas reads it: unsigned, and it may be a percentage. A leading '-' fails, so it stays opaque. */
+const ALPHA = /^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?%?$/;
+
 export function rgba(r: number, g: number, b: number, a: number): RGBA {
     return { r: r, g: g, b: b, a: a };
 }
@@ -88,32 +102,6 @@ function alpha255(value: number): number {
     return value < 0 ? 0 : value > 255 ? 255 : Math.floor(value);
 }
 
-/** One channel of rgb()/rgba(): a number, or a percentage of 255. */
-function channel(token: string): number | null {
-    const t = token.trim();
-    if (t === '') return null;
-    if (t.charCodeAt(t.length - 1) === 37) {
-        const pct = Number(t.slice(0, -1));
-        if (!isFinite(pct)) return null;
-        return (pct / 100) * 255;
-    }
-    const n = Number(t);
-    return isFinite(n) ? n : null;
-}
-
-/** The alpha argument of rgb()/rgba()/hsl()/hsla(): a number, a percentage, or none at all. */
-function alphaOf(tokens: string[]): number | null {
-    if (tokens.length === 0) return 255;
-    const t = tokens[0].trim();
-    if (t.charCodeAt(t.length - 1) === 37) {
-        const pct = Number(t.slice(0, -1));
-        if (!isFinite(pct)) return null;
-        return (pct / 100) * 255;
-    }
-    const n = Number(t);
-    return isFinite(n) ? n * 255 : null;
-}
-
 /** CSS hsl() to sRGB, the standard conversion. */
 function hslToRgb(h: number, s: number, l: number): RGBA {
     const hh = ((h % 360) + 360) % 360;
@@ -133,12 +121,23 @@ function hslToRgb(h: number, s: number, l: number): RGBA {
 /**
  * Parses a CSS colour the way node-canvas does: '#rgb', '#rgba', '#rrggbb', '#rrggbbaa',
  * rgb()/rgba()/hsl()/hsla() with either comma or space separators and an optional '/ <alpha>',
- * and the CSS named colours. Returns null for anything else; the caller decides whether that is
- * ignored (a property setter) or an error (addColorStop).
+ * and the CSS named colours. Measured on canvas 3.2.3:
+ *
+ *   leading spaces are skipped but a tab or a newline is not, and nothing trailing is skipped --
+ *   ' #ff0000' parses, 'red ' and '\t#ff0000' do not
+ *   '#ff0000  ' is an eight-digit payload whose alpha digits are not hex, so it is alpha 0
+ *   the closing paren and anything after it are optional -- 'rgb(0,0,0' and 'rgb(0,0,0) ' parse
+ *   rgb() reads a fourth argument as alpha but hsl() does not; hsla() does
+ *   an alpha that does not parse, including a negative one, leaves the colour opaque
+ *
+ * Returns null for a string that is not a colour at all (the caller ignores it) and INVALID_COLOR
+ * for a colour function whose arguments do not parse (the caller applies it).
  */
 export function parseColor(text: string): RGBA | null {
     if (typeof text !== 'string') return null;
-    const s = text.trim().toLowerCase();
+    let lead = 0;
+    while (lead < text.length && text.charCodeAt(lead) === 32) lead++;
+    const s = text.slice(lead).toLowerCase();
     if (s === '') return null;
     if (s === 'transparent') return cloneColor(TRANSPARENT_WHITE);
     if (s.charCodeAt(0) === 35) {
@@ -149,11 +148,16 @@ export function parseColor(text: string): RGBA | null {
             const a = hex.length === 4 ? hex2(hex[3]) * 17 : 255;
             return rgba(r, g, b, a);
         }
-        if (hex.length === 6 || hex.length === 8) {
-            if (!/^[0-9a-f]+$/.test(hex)) return null;
-            const r = hex2(hex.slice(0, 2)), g = hex2(hex.slice(2, 4)), b = hex2(hex.slice(4, 6));
-            const a = hex.length === 8 ? hex2(hex.slice(6, 8)) : 255;
-            return rgba(r, g, b, a);
+        if (hex.length === 6) {
+            if (!/^[0-9a-f]{6}$/.test(hex)) return null;
+            return rgba(hex2(hex.slice(0, 2)), hex2(hex.slice(2, 4)), hex2(hex.slice(4, 6)), 255);
+        }
+        if (hex.length === 8) {
+            if (!/^[0-9a-f]{6}$/.test(hex.slice(0, 6))) return null;
+            /* The alpha digits may be anything that cannot be hex -- '#ff0000  ' is alpha 0. */
+            const tail = hex.slice(6, 8);
+            const a = /^[0-9a-f]{2}$/.test(tail) ? hex2(tail) : 0;
+            return rgba(hex2(hex.slice(0, 2)), hex2(hex.slice(2, 4)), hex2(hex.slice(4, 6)), a);
         }
         return null;
     }
@@ -162,20 +166,33 @@ export function parseColor(text: string): RGBA | null {
         return rgba(hex2(named.slice(0, 2)), hex2(named.slice(2, 4)), hex2(named.slice(4, 6)), 255);
     }
     const open = s.indexOf('(');
-    if (open < 0 || s.charCodeAt(s.length - 1) !== 41) return null;
+    if (open < 0) return null;
     const fn = s.slice(0, open);
-    const body = s.slice(open + 1, s.length - 1).replace(/\//g, ' ').replace(/,/g, ' ');
-    const tokens = body.split(/\s+/).filter((t) => t !== '');
+    let body = s.slice(open + 1);
+    const close = body.indexOf(')');
+    if (close >= 0) body = body.slice(0, close);
+    const tokens = body.replace(/\//g, ' ').replace(/,/g, ' ').split(/\s+/).filter((t) => t !== '');
+    const channel = (token: string): number | null => {
+        if (!NUMBER.test(token)) return null;
+        return clamp255(Number(token));
+    };
+    const alpha = (token: string | undefined): number => {
+        if (token === undefined || !ALPHA.test(token)) return 255;
+        const t = token;
+        if (t.charCodeAt(t.length - 1) === 37) {
+            const pct = Number(t.slice(0, -1));
+            return isFinite(pct) ? alpha255((pct / 100) * 255) : 255;
+        }
+        return alpha255(Number(t) * 255);
+    };
     if (fn === 'rgb' || fn === 'rgba') {
-        if (tokens.length < 3 || tokens.length > 4) return null;
+        if (tokens.length < 3) return INVALID_COLOR;
         const r = channel(tokens[0]), g = channel(tokens[1]), b = channel(tokens[2]);
-        if (r === null || g === null || b === null) return null;
-        const a = alphaOf(tokens.slice(3));
-        if (a === null) return null;
-        return rgba(clamp255(r), clamp255(g), clamp255(b), alpha255(a));
+        if (r === null || g === null || b === null) return INVALID_COLOR;
+        return rgba(r, g, b, alpha(tokens[3]));
     }
     if (fn === 'hsl' || fn === 'hsla') {
-        if (tokens.length < 3 || tokens.length > 4) return null;
+        if (tokens.length < 3) return INVALID_COLOR;
         let h = Number(tokens[0].replace(/deg$/, ''));
         if (!isFinite(h)) {
             const turn = /^(-?[\d.]+)turn$/.exec(tokens[0]);
@@ -184,16 +201,14 @@ export function parseColor(text: string): RGBA | null {
             if (turn) h = Number(turn[1]) * 360;
             else if (grad) h = (Number(grad[1]) * 360) / 400;
             else if (rad) h = (Number(rad[1]) * 180) / Math.PI;
-            else return null;
+            else return INVALID_COLOR;
         }
         const sPct = tokens[1], lPct = tokens[2];
-        if (sPct.charCodeAt(sPct.length - 1) !== 37 || lPct.charCodeAt(lPct.length - 1) !== 37) return null;
+        if (sPct.charCodeAt(sPct.length - 1) !== 37 || lPct.charCodeAt(lPct.length - 1) !== 37) return INVALID_COLOR;
         const sv = Number(sPct.slice(0, -1)), lv = Number(lPct.slice(0, -1));
-        if (!isFinite(sv) || !isFinite(lv)) return null;
-        const a = alphaOf(tokens.slice(3));
-        if (a === null) return null;
+        if (!isFinite(sv) || !isFinite(lv)) return INVALID_COLOR;
         const c = hslToRgb(h, sv / 100, lv / 100);
-        return rgba(c.r, c.g, c.b, alpha255(a));
+        return rgba(c.r, c.g, c.b, fn === 'hsla' ? alpha(tokens[3]) : 255);
     }
     return null;
 }
@@ -210,17 +225,20 @@ export function formatColor(c: RGBA): string {
     return 'rgba(' + (c.r & 0xff) + ', ' + (c.g & 0xff) + ', ' + (c.b & 0xff) + ', ' + a.toFixed(2) + ')';
 }
 
-/** Linear interpolation in premultiplied space, which is what the canvas gradient spec asks for. */
+/**
+ * Linear interpolation in straight (non-premultiplied) space, which is what cairo's gradient does.
+ * Measured on canvas 3.2.3, a 100x1 gradient from rgba(255,0,0,0.2) to rgba(0,255,0,0.9) reads
+ * 255,0,0,52 / 191,66,0,96 / 126,128,0,141 / 62,192,0,185 at x = 0/25/50/75: the RGB walks from
+ * full red to full green exactly as it does when both stops are opaque, and only the alpha is the
+ * one that belongs to the translucent pair -- so the channels are interpolated before any alpha is
+ * applied to them. Interpolating premultiplied instead reads 249/101/46/17 on the red channel,
+ * which is up to 93 levels away over the 100 columns.
+ */
 export function mixColor(from: RGBA, to: RGBA, t: number): RGBA {
-    const fa = from.a / 255, ta = to.a / 255;
-    const a = fa + (ta - fa) * t;
-    if (a <= 0) return rgba(0, 0, 0, 0);
-    const fr = from.r * fa, fg = from.g * fa, fb = from.b * fa;
-    const tr = to.r * ta, tg = to.g * ta, tb = to.b * ta;
     return rgba(
-        Math.round((fr + (tr - fr) * t) / a),
-        Math.round((fg + (tg - fg) * t) / a),
-        Math.round((fb + (tb - fb) * t) / a),
-        Math.round(a * 255)
+        Math.round(from.r + (to.r - from.r) * t),
+        Math.round(from.g + (to.g - from.g) * t),
+        Math.round(from.b + (to.b - from.b) * t),
+        Math.round(from.a + (to.a - from.a) * t)
     );
 }

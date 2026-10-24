@@ -5,8 +5,9 @@
  * the paint itself needs no matrix. Gradient coordinates therefore follow the spec: they are in the
  * user space of the drawing operation, not of the gradient's creation.
  *
- * Stops are interpolated in premultiplied space (mixColor), which is what the canvas gradient spec asks
- * for and what cairo does. Cairo also extends the first and last stop's colour past 0 and 1, which the
+ * Stops are interpolated in straight (non-premultiplied) space (mixColor), which is what cairo does --
+ * measured on canvas 3.2.3, a gradient between two translucent stops walks its channels exactly as the
+ * same gradient does when both stops are opaque. Cairo also extends the first and last stop's colour past 0 and 1, which the
  * shim copies. The radial solution takes the larger root of the cone equation, the branch the spec
  * describes; where no real root exists the first stop's colour is used.
  */
