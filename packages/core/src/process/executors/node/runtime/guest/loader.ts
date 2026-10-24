@@ -38,6 +38,16 @@ var IMMEDIATE_WAKE = 0;
  */
 var IO_QUEUE = [];
 var IO_LATER = [];
+/*
+ * The poll phase of this turn, and the only one of the three host node 24.15's thread pool answers
+ * into. A callback Node owes a crypto.randomBytes is not a microtask, so no batch of promise jobs
+ * can carry it ahead of a process.nextTick a program armed before the call -- measured on host node
+ * 24.15: 'TCI', the tick first. queueMicrotask put it on the microtask queue instead, and a call
+ * made inside a promise continuation then ran its callback inside that continuation's own batch,
+ * ahead of the tick: 'CTI'. The tick queue stands between, and IO_QUEUE is run ahead of drainTicks()
+ * while IO_LATER is run behind the check phase, so neither of the two is this order.
+ */
+var IO_POLL = [];
 /* The reserved host timer id the two queues wake on: never a timer-table id, which start at 1. */
 var TURN_TIMER = 0;
 var TURN_ARMED = false;
@@ -1269,13 +1279,26 @@ function settleIO(fn, later) {
 }
 
 /*
+ * Settles a callback the way host node 24.15 settles a thread-pool completion that has come back:
+ * in the poll phase of the turn that is running now, which stands behind the tick queue and in
+ * front of the check phase. A derivation -- a pbkdf2, a scrypt -- costs the pool a whole turn of
+ * its own, so it is IO_LATER's and not this queue's, exactly as a second round trip is.
+ */
+function settlePoll(fn, later) {
+  host.ref(1);
+  if (later === true) IO_LATER.push(fn);
+  else IO_POLL.push(fn);
+  armTurn();
+}
+
+/*
  * The one host timer both queues and the immediate queue wake on. They are one turn's phases and not
  * three races, so a single timer runs them in their order instead of leaving the host's own timer
  * order to decide which comes first.
  */
 function armTurn() {
   if (TURN_ARMED) return;
-  if (IMMEDIATE_QUEUE.length === 0 && IO_QUEUE.length === 0 && IO_LATER.length === 0) return;
+  if (IMMEDIATE_QUEUE.length === 0 && IO_QUEUE.length === 0 && IO_LATER.length === 0 && IO_POLL.length === 0) return;
   TURN_ARMED = true;
   host.setTimer(TURN_TIMER, 0);
 }
@@ -1295,6 +1318,18 @@ function runTurnPhases(due) {
   }
   /* a tick a callback queued is owed before the check phase, as it is on host node 24.15 */
   drainTicks();
+  /*
+   * The poll phase proper: what the thread pool handed back, which is behind every tick this turn
+   * owes and ahead of every immediate it owes. A callback queued here cannot be carried in front of
+   * a nextTick by a batch of promise jobs, because it is not one of them.
+   */
+  var polled = IO_POLL;
+  IO_POLL = [];
+  for (var p = 0; p < polled.length; p++) {
+    host.ref(-1);
+    polled[p]();
+  }
+  if (polled.length > 0) drainTicks();
   drainImmediatesUntil(due);
   var later = IO_LATER;
   IO_LATER = [];

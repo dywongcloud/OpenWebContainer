@@ -2284,7 +2284,15 @@ BF.crypto = function () {
     /* A draw that reached its end empties OpenSSL's error queue, as a derivation that did. */
     scryptReason = null;
     if (typeof callback === 'function') {
-      queueMicrotask(function () { callback(null, bytes); });
+      /*
+       * Node draws on its thread pool, and the callback it hands the bytes to is owed in the poll
+       * phase -- behind the tick queue, which is why a nextTick a program armed before the call
+       * still runs first (host node 24.15 measures 'TCI'), and ahead of the check phase, which is
+       * why an immediate armed with it does not (host node 24.15 measures 'TCI' there too). A
+       * microtask was the wrong queue: called inside a promise continuation, the callback ran in
+       * that continuation's own batch and beat the tick.
+       */
+      settlePoll(function () { callback(null, bytes); });
       return undefined;
     }
     return bytes;
@@ -2424,7 +2432,8 @@ BF.crypto = function () {
     }
     if (typeof done !== 'function') throw invalidArgType('callback', 'of type function', done);
     randomFillSync(buf, start, count);
-    queueMicrotask(function () { done(null, buf); });
+    /* The fill is a draw like randomBytes', and the callback is owed in the same poll phase. */
+    settlePoll(function () { done(null, buf); });
   }
 
   /*
@@ -3472,7 +3481,13 @@ BF.crypto = function () {
 
   function pbkdf2(password, salt, iterations, keylen, digest, callback) {
     var key = pbkdf2Sync(password, salt, iterations, keylen, digest);
-    queueMicrotask(function () { callback(null, key); });
+    /*
+     * A derivation is the expensive half of the pool's work: host node 24.15 hands the key back a
+     * turn later than it hands a draw back, which is behind the immediates the turn that asked owes
+     * -- it measures 'TIC' against randomBytes' 'TCI'. IO_LATER is that turn, as it is for a file
+     * operation whose read is a second round trip.
+     */
+    settlePoll(function () { callback(null, key); }, true);
   }
 
   /* The bytes of a timing-safe compare: Node's message for the pair ends at the list, it names no
@@ -3665,7 +3680,8 @@ BF.crypto = function () {
     } finally {
       scryptReason = queued;
     }
-    queueMicrotask(function () { done(null, key); });
+    /* As pbkdf2's is, the key a derivation hands back is owed a turn behind the immediates. */
+    settlePoll(function () { done(null, key); }, true);
   }
 
   /*
