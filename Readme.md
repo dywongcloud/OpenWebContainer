@@ -691,6 +691,21 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   after the error, and ends with status 1; a `process.on('uncaughtException')` handler is called, and the
   status it leaves is the status the process leaves (`caught:boom`, `exit=7`, status 7), which is what the
   host does with the same three scripts. A normal exit runs them as it always did.
+- **`fs.watch` of a file reports the name it was given when that file is renamed away, where host node on
+  macOS reports the new name.** `fs.watch('s3.txt', cb)` followed by `fs.renameSync('s3.txt',
+  's3-renamed.txt')` gives the host `rename:s3-renamed.txt` and this container `rename:s3.txt`: the host's
+  FSEvents watcher follows the file's inode to the name it now has, and this file system has no inode for
+  a poll to follow, so the only name it can report is the one it was watching. A rename of a name *inside*
+  a watched directory, a write to a name in one and a new name in one all agree.
+- **A non-recursive `fs.watch` of a directory does not see a write inside a subdirectory of it, where host
+  node on macOS does.** With `fs.watch('s5dir')` and a write to `s5dir/inner/old.txt`, the host emits
+  `change:s5dir` then `rename:inner` and this container emits nothing at all: FSEvents hands a watcher
+  every event under the path it was given and Node passes it on, which is leakage rather than the
+  non-recursive watch that was asked for. The same leakage is why a host's directory watch reports a
+  leading `change:<the directory itself>` before the event for the name, names a write to a name that
+  is already there `rename` where this container names it `change`, and reports that event twice
+  (`change:s10dir|rename:e.txt|rename:e.txt` against `change:e.txt`); the two agree on a brand new
+  name and on a name that is removed, apart from that leading change and the doubling.
 
 ### ⚠️ `node` with no arguments: the REPL, and where it differs from host node
 

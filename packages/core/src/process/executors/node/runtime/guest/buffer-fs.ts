@@ -828,7 +828,8 @@ BF.fs = function () {
     ENOTDIR: 'not a directory',
     ENOTEMPTY: 'directory not empty',
     EINVAL: 'invalid argument',
-    EBADF: 'bad file descriptor'
+    EBADF: 'bad file descriptor',
+    ELOOP: 'too many symbolic links encountered'
   };
 
   /*
@@ -845,7 +846,8 @@ BF.fs = function () {
     EINVAL: -22,
     EBADF: -9,
     ENOTEMPTY: -66,
-    EPERM: -1
+    EPERM: -1,
+    ELOOP: -62
   };
 
   function fsError(code, syscall, path) {
@@ -1024,12 +1026,49 @@ BF.fs = function () {
    * read -- and the check is made at the open alone, which is why a descriptor opened before a chmod
    * still writes afterwards: a host never rechecks a descriptor it has already handed out.
    */
-  function requireAccess(file, want, syscall) {
+  /*
+   * A name is reached through every directory above it, and a host needs the search bit -- 0o100 --
+   * on each one of them: it is what makes a 0000 directory opaque, so that a stat, an open or a read
+   * of a name inside it is refused however readable that name is on its own.
+   */
+  function requireTraverse(file, syscall) {
+    var at = P.dirname(toPathString(file));
+    for (var hop = 0; hop < 64; hop++) {
+      var st = statFollowingLinks(at);
+      if (!st || st.type !== 'dir') return;
+      if (at !== DEVICE_DIR && (modeBitsOf(st) & 0o100) === 0) throw fsError('EACCES', syscall, file);
+      var up = P.dirname(at);
+      if (up === at) return;
+      at = up;
+    }
+  }
+
+  /*
+   * A name is put into, or taken out of, the directory it sits in, and what a host checks is that
+   * directory's write bit -- not the bits of the name itself. A 0555 directory holds a 0644 file
+   * that a unlink, a rename, a rmdir, a rm and a symlink or link made in it are all refused for,
+   * which is why this is the check those six make and requireAccess is not.
+   */
+  function requireDirWrite(file, syscall, from, to) {
+    var dirPath = P.dirname(toPathString(file));
+    var dir = statFollowingLinks(dirPath);
+    if (!dir) throw fsError('ENOENT', syscall, file);
+    if (dir.type !== 'dir') throw fsError('ENOTDIR', syscall, file);
+    if (dirPath !== DEVICE_DIR && (modeBitsOf(dir) & 0o200) === 0) {
+      throw from === undefined ? fsError('EACCES', syscall, file) : twoEndError('EACCES', syscall, from, to);
+    }
+  }
+
+  function requireAccess(file, want, syscall, from, to) {
+    requireTraverse(file, syscall);
     var st = statFollowingLinks(file);
+    var denied = function () {
+      return from === undefined ? fsError('EACCES', syscall, file) : twoEndError('EACCES', syscall, from, to);
+    };
     if (st) {
       var bits = modeBitsOf(st);
-      if ((want & 2) !== 0 && (bits & 0o200) === 0) throw fsError('EACCES', syscall, file);
-      if ((want & 4) !== 0 && (bits & 0o400) === 0) throw fsError('EACCES', syscall, file);
+      if ((want & 2) !== 0 && (bits & 0o200) === 0) throw denied();
+      if ((want & 4) !== 0 && (bits & 0o400) === 0) throw denied();
       return;
     }
     var dirPath = P.dirname(file);
@@ -1037,8 +1076,8 @@ BF.fs = function () {
     if (!dir) throw fsError('ENOENT', syscall, file);
     if (dirPath === DEVICE_DIR) return;
     var dirBits = modeBitsOf(dir);
-    if ((want & 2) !== 0 && (dirBits & 0o200) === 0) throw fsError('EACCES', syscall, file);
-    if ((want & 4) !== 0 && (dirBits & 0o400) === 0) throw fsError('EACCES', syscall, file);
+    if ((want & 2) !== 0 && (dirBits & 0o200) === 0) throw denied();
+    if ((want & 4) !== 0 && (dirBits & 0o400) === 0) throw denied();
   }
 
   /* Node's blocks counts 512-byte blocks while the allocation it reports is in 4096-byte ones: a
@@ -1282,6 +1321,9 @@ BF.fs = function () {
   // stat follows a recorded link to its target; lstat reports the link itself.
   fs.statSync = function (p, opts) {
     var file = toPathString(p);
+    /* A stat walks the path, so it is the directories above the name that are checked: a name under
+       a directory with no search bit is EACCES however readable the name is. */
+    requireTraverse(file, 'stat');
     for (var hop = 0; SYMLINKS[file] !== undefined && hop < 32; hop++) file = SYMLINKS[file];
     var st = statOf(file);
     if (!st) {
@@ -1308,10 +1350,32 @@ BF.fs = function () {
     return makeStats(st, opts, linked);
   };
 
+  /*
+   * rename, copyfile, link and symlink name both ends of what they were asked for in the error they
+   * raise -- "rename 'a' -> 'b'" -- which is the pair a caller recognises its own call in.
+   */
+  function twoEndError(code, syscall, from, to) {
+    var err = fsError(code, syscall, to);
+    err.message = code + ': ' + DESCRIPTIONS[code] + ', ' + syscall + " '" + from + "' -> '" + to + "'";
+    return err;
+  }
+
   // Node names both ends of a symlink in its error: 'symlink '<target>' -> '<link>''.
   function symlinkError(code, from, to) {
-    var err = fsError(code, 'symlink', to);
-    err.message = code + ': ' + DESCRIPTIONS[code] + ', symlink ' + "'" + from + "' -> '" + to + "'";
+    return twoEndError(code, 'symlink', from, to);
+  }
+
+  /*
+   * Node's rm is its own rimraf walk rather than one binding call, and the error it raises carries the
+   * errno number itself where every other call carries its negation, and the path twice: "EACCES,
+   * Permission denied: p 'p'".
+   */
+  function rmAccessError(file) {
+    var err = new Error("EACCES, Permission denied: " + file + " '" + file + "'");
+    err.errno = 13;
+    err.code = 'EACCES';
+    err.syscall = 'rm';
+    err.path = file;
     return err;
   }
 
@@ -1322,6 +1386,9 @@ BF.fs = function () {
     // where the system resolves it when the link is opened, and where Node leaves it for readlink.
     var from = P.isAbsolute(raw) ? toPathString(raw) : P.resolve(P.dirname(to), raw);
     if (statOf(to)) throw symlinkError('EEXIST', from, to);
+    /* The link is a name made in the directory it is put in, and a host refuses one in a directory
+       with no write bit for it. */
+    requireDirWrite(to, 'symlink', raw, to);
     /* A link is a name, not a copy, and a host lets it name a target that is not there yet: that is
        a dangling link, and it is what a link to a file another step creates looks like. Only a
        target that is a file carries bytes across, since a directory has none. */
@@ -1349,6 +1416,9 @@ BF.fs = function () {
     if (!st) throw fsError('ENOENT', 'link', String(existingPath));
     if (st.type === 'dir') throw fsError('EPERM', 'link', String(existingPath));
     if (statOf(to)) throw fsError('EEXIST', 'link', String(newPath));
+    /* The second name is made in the directory it is put in, so it is that directory's write bit a
+       host checks rather than the bits of the name being linked. */
+    requireDirWrite(to, 'link', from, to);
     var canonical = canonicalOf(from);
     var raw = host.readBase64(canonical);
     if (raw === null) throw fsError('ENOENT', 'link', String(existingPath));
@@ -1375,6 +1445,9 @@ BF.fs = function () {
     var st = statOf(file);
     if (!st) throw fsError('ENOENT', 'scandir', file);
     if (st.type !== 'dir') throw fsError('ENOTDIR', 'scandir', file);
+    /* Listing a directory reads it, so a directory with no read bit is EACCES here the way it is on
+       a host: the names under it are not readable through it, whatever their own modes are. */
+    requireAccess(file, 4, 'scandir');
     var withTypes = !!(opts && typeof opts === 'object' && opts.withFileTypes);
     var recursive = !!(opts && typeof opts === 'object' && opts.recursive);
     var base = typeof p === 'string' ? p : file;
@@ -1435,6 +1508,10 @@ BF.fs = function () {
     }
     var recursive = !!(opts && opts.recursive);
     if (st.type === 'dir' && !recursive) throw eisdirError('rm', file);
+    try { requireDirWrite(file, 'rm'); } catch (err) {
+      if (err.code === 'EACCES') throw rmAccessError(file);
+      throw err;
+    }
     check(host.rm(file, recursive), 'rm', file);
   };
 
@@ -1443,6 +1520,7 @@ BF.fs = function () {
     var st = statOf(file);
     if (!st) throw fsError('ENOENT', 'rmdir', file);
     if (st.type !== 'dir') throw fsError('ENOTDIR', 'rmdir', file);
+    requireDirWrite(file, 'rmdir');
     check(host.rm(file, !!(opts && opts.recursive)), 'rmdir', file);
   };
 
@@ -1451,6 +1529,9 @@ BF.fs = function () {
     var st = statOf(file);
     if (!st) throw fsError('ENOENT', 'unlink', file);
     if (st.type === 'dir') throw fsError('EISDIR', 'unlink', file);
+    /* The name goes out of the directory it sits in, and it is that directory a host checks: a 0555
+       directory keeps every name in it however writable the name itself is. */
+    requireDirWrite(file, 'unlink');
     check(host.rm(file, false), 'unlink', file);
     /* A second name of a file is dropped from the table when its own name goes; the bytes it was
        sharing stay under the name they were written to. */
@@ -1459,14 +1540,24 @@ BF.fs = function () {
 
   fs.renameSync = function (from, to) {
     var a = toPathString(from);
+    var b = toPathString(to);
     if (!statOf(a)) throw fsError('ENOENT', 'rename', a);
-    check(host.rename(a, toPathString(to)), 'rename', a);
+    /* A rename takes a name out of the directory it is in and puts one into the directory it is
+       moved to, and a host checks the write bit of both. */
+    requireDirWrite(a, 'rename', a, b);
+    requireDirWrite(b, 'rename', a, b);
+    check(host.rename(a, b), 'rename', a);
   };
 
   fs.copyFileSync = function (from, to) {
     var src = toPathString(from);
+    var dest = toPathString(to);
     if (!statOf(src)) throw fsError('ENOENT', 'copyfile', src);
-    check(host.writeBase64(toPathString(to), encodeBase64(readBytesOf(src))), 'copyfile', src);
+    /* A copy reads one name and writes the other, so both modes are checked: a 0444 destination is
+       EACCES the way a host answers it, even though the bytes of it are what the copy replaces. */
+    requireAccess(src, 4, 'copyfile', src, dest);
+    requireAccess(dest, 2, 'copyfile', src, dest);
+    check(host.writeBase64(dest, encodeBase64(readBytesOf(src))), 'copyfile', src);
   };
 
   /*
@@ -1546,7 +1637,14 @@ BF.fs = function () {
    */
   function realPathOf(file) {
     var out = file;
+    var seen = {};
+    var linked = false;
+    var loop = false;
     for (var pass = 0; pass < 64; pass++) {
+      /* A cycle of links is a walk that comes back to a path it already stood on: a host stops there
+         with ELOOP rather than going round until the pass count runs out. */
+      if (seen['p' + out] !== undefined) { loop = true; break; }
+      seen['p' + out] = true;
       var parts = out.split('/').filter(function (s) { return s.length > 0; });
       var replaced = false;
       for (var i = 0; i < parts.length; i++) {
@@ -1556,26 +1654,53 @@ BF.fs = function () {
         var tail = parts.slice(i + 1);
         out = tail.length > 0 ? P.resolve(target, tail.join('/')) : target;
         replaced = true;
+        linked = true;
         break;
       }
       if (!replaced) break;
     }
-    return out;
+    return { path: out, linked: linked, loop: loop };
   }
 
-  fs.realpathSync = function (p) {
+  /*
+   * The error a path that does not resolve carries. A host's realpathScan reaches a name with no link
+   * in it through lstat, and the target a link named through the stat of that target -- which is why
+   * a dangling link and a cycle are both 'stat' while a plain missing name is 'lstat'. The .native
+   * entry point is uv_fs_realpath, and it names realpath in either case. A cycle is ELOOP, not the
+   * ENOENT a target that simply is not there is.
+   */
+  function realPathError(seen, native) {
+    if (seen.loop) return fsError('ELOOP', native ? 'realpath' : 'stat', '');
+    return fsError('ENOENT', native ? 'realpath' : (seen.linked ? 'stat' : 'lstat'), '');
+  }
+
+  function realPathSync(p, native) {
     var file = toPathString(p);
     var resolved = realPathOf(file);
-    /* A host reaches the missing name through lstat, and it is lstat it names in the error. */
-    if (!statOf(resolved)) throw fsError('ENOENT', 'lstat', file);
-    return resolved;
-  };
+    if (statOf(resolved.path)) return resolved.path;
+    var err = realPathError(resolved, native);
+    err.path = file;
+    err.message = err.code + ': ' + DESCRIPTIONS[err.code] + ', ' + err.syscall + " '" + file + "'";
+    throw err;
+  }
+
+  fs.realpathSync = function (p) { return realPathSync(p, false); };
+  /* Node's .native is the binding entry point behind the JavaScript wrapper: it resolves the same
+     path and differs only in the syscall it names when it does not resolve. */
+  fs.realpathSync.native = function (p) { return realPathSync(p, true); };
 
   /*
    * mkdtemp replaces the run of X's at the end of the prefix with random characters -- a template
    * whose X's are still there in the name it hands back is a prefix it never substituted -- and
    * makes the directory 0o700, because a temporary directory is private to the user who asked for
    * it. It is retried while the name is taken, the way mkdtemp(3) is.
+   */
+  /*
+   * mkdtemp hands back the prefix with its run of X's replaced and six more characters after it --
+   * the six Node appends to the prefix before it calls mkdtemp(3), which is what makes the template
+   * the ENOENT of a missing parent names 'XXXXXX' longer than the prefix was. Substituting only the
+   * run the caller wrote is a shorter name: 'three-XXX' comes back with three characters here and
+   * with nine on a host.
    */
   var TEMP_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   var TRAILING_XS = /X+$/;
@@ -1588,11 +1713,12 @@ BF.fs = function () {
     var raw = String(prefix);
     var run = TRAILING_XS.exec(raw);
     var stem = run ? raw.slice(0, run.index) : raw;
-    var width = run ? run[0].length : 6;
+    var width = (run ? run[0].length : 0) + 6;
     /* A mkdtemp whose directory is not there is the ENOENT Node reports against the template -- the
-       prefix with the X's still in it -- and not against one of the names it would have tried. */
+       prefix with the six X's it appends still in it -- and not against one of the names it would
+       have tried. */
     if (!statFollowingLinks(P.dirname(toPathString(raw)))) {
-      throw fsError('ENOENT', 'mkdtemp', run ? raw : raw + 'XXXXXX');
+      throw fsError('ENOENT', 'mkdtemp', raw + 'XXXXXX');
     }
     var name;
     do { name = randomName(stem, width); } while (statOf(name));
@@ -1677,6 +1803,9 @@ BF.fs = function () {
        bit, 'w' and 'a' the write bit, and a '+' both. A name that is not there yet is checked
        against the directory it would be made in. */
     requireAccess(file, (letter === 'r' || f.indexOf('+') >= 0 ? 4 : 0) | (letter === 'r' && f.indexOf('+') < 0 ? 0 : 2), 'open');
+    /* An 'x' in the flags is O_EXCL: the open is the creation of the name and fails when the name is
+       already there, which is how a lock file and a cache write both ask for one writer. */
+    if (creates && f.indexOf('x') >= 0 && st) throw fsError('EEXIST', 'open', file);
     if (creates) {
       if (isDir) throw fsError('EISDIR', 'open', file);
       if (letter === 'w' || !st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file);
@@ -2085,8 +2214,6 @@ BF.fs = function () {
           if (!opened) {
             opened = true;
             if (flags.charAt(0) === 'w') fs.writeFileSync(file, '');
-            stream.emit('open', 3);
-            stream.emit('ready');
           }
           fs.appendFileSync(file, chunk);
           stream.bytesWritten += chunk.length;
@@ -2098,6 +2225,20 @@ BF.fs = function () {
     });
     stream.path = file;
     stream.bytesWritten = 0;
+    /* Like Node, the file is opened when the stream is created and not on the first write: a name the
+       mode forbids is an 'error' then, so a caller waiting on 'error' or 'open' is answered instead
+       of left waiting on a stream that never opens. */
+    setImmediate(function () {
+      try {
+        if (flags.charAt(0) === 'w') fs.writeFileSync(file, '');
+        else requireAccess(file, 2, 'open');
+        opened = true;
+        stream.emit('open', 3);
+        stream.emit('ready');
+      } catch (err) {
+        stream.destroy(err);
+      }
+    });
     Object.setPrototypeOf(stream, streamProtoOf(WriteStream, Writable, writeStreamProto));
     writeStreamProto = true;
     return stream;
@@ -2271,16 +2412,18 @@ BF.fs = function () {
   FSWatcher.prototype.ref = function () { return this; };
   FSWatcher.prototype.unref = function () { return this; };
 
-  /* What a watched path looks like, as something two polls can be told apart by. */
+  /* What a watched path looks like, as something two polls can be told apart by. The mode is part of
+     the signature because a host reports a chmod as a change: the bytes did not move, but the name
+     did, and a watcher that waited for a write alone stayed silent through one. */
   function watchSnapshotOf(file) {
     var st = statFollowingLinks(file);
     if (!st) return null;
-    if (st.type !== 'dir') return { dir: false, sig: st.size + '/' + st.mtimeMs, names: null, sigs: null };
+    if (st.type !== 'dir') return { dir: false, sig: st.size + '/' + st.mtimeMs + '/' + modeBitsOf(st), names: null, sigs: null };
     var names = sortedEntries(file);
     var sigs = {};
     for (var i = 0; i < names.length; i++) {
       var child = statFollowingLinks(P.join(file, names[i]));
-      sigs[names[i]] = child ? child.type + '/' + child.size + '/' + child.mtimeMs : '-';
+      sigs[names[i]] = child ? child.type + '/' + child.size + '/' + child.mtimeMs + '/' + modeBitsOf(child) : '-';
     }
     return { dir: true, sig: null, names: names, sigs: sigs };
   }
@@ -2319,7 +2462,7 @@ BF.fs = function () {
     var raw = filename && typeof filename === 'object' && filename.href ? filename.href : filename;
     if (typeof raw !== 'string') {
       throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
-        'The "filename" argument must be of type string or an instance of Buffer or URL. Received ' + describeFsArg(filename));
+        'The "path" argument must be of type string or an instance of Buffer or URL. Received ' + describeFsArg(filename));
     }
     /* Node stat's the name before it does anything else, and a name that is not there is the ENOENT
        every other call reports: the platform refusal here came first, so the argument check a host
@@ -2333,6 +2476,26 @@ BF.fs = function () {
   };
 
   /*
+   * What watchFile hands back is a StatWatcher -- named that, an EventEmitter, and carrying ref and
+   * unref the way FSWatcher does -- and not the plain record of a poll. A package that adds a
+   * listener with .on, or keeps the process alive with .ref, on what watchFile gave it throws on a
+   * plain Object, and the class is the surface Node exports for it.
+   */
+  function StatWatcher(target) {
+    if (WATCH_EMITTER) WATCH_EMITTER.call(this);
+    this._owcTarget = target;
+    this._owcStopped = false;
+  }
+  if (WATCH_EMITTER) {
+    StatWatcher.prototype = Object.create(WATCH_EMITTER.prototype);
+    StatWatcher.prototype.constructor = StatWatcher;
+  }
+  StatWatcher.prototype.start = function () {};
+  StatWatcher.prototype.stop = function () { this._owcStopped = true; };
+  StatWatcher.prototype.ref = function () { return this; };
+  StatWatcher.prototype.unref = function () { return this; };
+
+  /*
    * watchFile is Node's polling watcher, and a poll is the only watcher there can be: it hands the
    * listener the stat it just took and the one it took before, and it does so when the interval
    * between two polls has passed -- 5007 ms when no interval was asked for, which is Node's own
@@ -2343,20 +2506,22 @@ BF.fs = function () {
     var raw = filename && typeof filename === 'object' && filename.href ? filename.href : filename;
     if (typeof raw !== 'string') {
       throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
-        'The "filename" argument must be of type string or an instance of Buffer or URL. Received ' + describeFsArg(filename));
+        'The "path" argument must be of type string or an instance of Buffer or URL. Received ' + describeFsArg(filename));
     }
     var cb = typeof opts === 'function' ? opts : (typeof listener === 'function' ? listener : undefined);
     var file = toPathString(raw);
     var interval = watchIntervalOf(opts, WATCH_FILE_INTERVAL_MS);
     var previous = statFollowingLinks(file);
-    var stopped = false;
-    var record = { file: file, listener: cb, stop: function () { stopped = true; } };
-    WATCH_FILES[file] = (WATCH_FILES[file] || []).concat([record]);
+    var watcher = new StatWatcher(file);
+    /* The listener is the one a caller passed and the one unwatchFile stops, so it rides on the
+       watcher where a caller can read it back, and the change itself goes out as an event. */
+    watcher.listener = cb;
+    if (cb) watcher.on('change', cb);
+    WATCH_FILES[file] = (WATCH_FILES[file] || []).concat([watcher]);
     (function poll() {
-      if (stopped) return;
+      if (watcher._owcStopped) return;
       setTimeout(poll, interval);
       var current = statFollowingLinks(file);
-      if (!cb) { previous = current; return; }
       var moved = (previous === null) !== (current === null);
       if (!moved && previous !== null && current !== null) {
         moved = previous.mtimeMs !== current.mtimeMs || previous.size !== current.size ||
@@ -2365,9 +2530,9 @@ BF.fs = function () {
       if (!moved) return;
       var before = previous;
       previous = current;
-      cb(makeStats(current, undefined, false), makeStats(before === null ? EMPTY_STAT : before, undefined, false));
+      watcher.emit('change', makeStats(current, undefined, false), makeStats(before === null ? EMPTY_STAT : before, undefined, false));
     })();
-    return record;
+    return watcher;
   };
 
   fs.unwatchFile = function (filename, listener) {
@@ -2752,7 +2917,6 @@ BF.fs = function () {
    * typeof fs.realpath.native at load time and warns, loudly, when it is not a function.
    */
   fs.realpath.native = fs.realpath;
-  fs.realpathSync.native = fs.realpathSync;
   return fs;
 };
 
