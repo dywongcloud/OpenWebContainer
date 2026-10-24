@@ -1,6 +1,0 @@
-WITNESS PASS (judge, shard guest, 2026-10-23, HEAD f5d5931)
-Input: os.tmpdir(); /tmp and /var/tmp exist+isDirectory+accessSync(W_OK); fs.mkdtempSync then write+read.
-Container: TMPDIR "/tmp"; both {"exists":true,"isDir":true,"access":"W_OK"}; MKTEMP {"dir":"judge-z9ZoPB","read":"hi"}
-Host     : TMPDIR "/var/folders/.../T"; both {"exists":true,"isDir":true,"access":"W_OK"}; MKTEMP {"dir":"judge-m3WUO7","read":"hi"}
-The tmpdir itself is a different path, as it must be; every operation on it agrees. Machine: load 23.77
-(1-min), 5.3 GB free. Row closed.

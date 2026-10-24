@@ -1,15 +1,11 @@
 import { IFileSystem } from '../../../filesystem';
-import { InstallSpec, NpmInstaller, localSpecTarget, parseInstallSpec, ScriptRunResult } from '../../../npm/installer';
+import { InstallSpec, NpmInstaller, parseInstallSpec, ScriptRunResult } from '../../../npm/installer';
 import { NpmRegistry } from '../../../npm/registry';
-import { runPkgCommand } from '../../../npm/pkg';
-import { didYouMean } from '../../../npm/didyoumean';
 import {
     LIFECYCLE_COMMANDS,
     NPM_VERSION,
     findPackageRoot,
-    effectiveScripts,
     missingScriptMessage,
-    npmErrorLines,
     parseScriptArgs,
     readManifest,
     scriptCommandLine,
@@ -22,7 +18,6 @@ import {
 import { dependencyTree, parseListArgs } from '../../../npm/tree';
 import { Process, ProcessType } from '../../base';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../node/runtime/resolver';
-import { ROOT_POST_INSTALL_SCRIPT_EVENTS, ROOT_PRE_INSTALL_SCRIPT_EVENTS } from '../../../npm/lifecycle';
 
 const USAGE = [
     'Usage: npm <command>',
@@ -34,7 +29,6 @@ const USAGE = [
     '  npm run [<script> [-- <args>]] [--if-present]                 alias: run-script',
     '  npm test | npm start | npm stop | npm restart',
     '  npm exec [<pkg>[@range>] [-- <args>]] [-p|--package <pkg>]    alias: x',
-    '  npm pkg get|set|delete [<key>...] | npm pkg fix',
     '',
     'npx [-y] [-p <pkg>] <command|pkg[@range]> [args...]',
     ''
@@ -113,35 +107,10 @@ export class NpmProcess extends Process {
             case 'exec':
             case 'x':
                 return this.runExec(rest, registry, log);
-            case 'pkg':
-                return this.runPkg(rest);
             default:
-                return this.unknownCommand(command);
+                this.emitError(`Unknown command: "${command}"\n`);
+                return 1;
         }
-    }
-
-    /** `npm pkg get|set|delete|fix`: the subcommand that reads and writes package.json as data. */
-    private runPkg(args: string[]): number {
-        const result = runPkgCommand(this.fileSystem, args, this.cwd ?? '/');
-        if (result.stdout !== '') this.emitOutput(result.stdout);
-        if (result.stderr !== '') this.emitError(result.stderr);
-        return result.exitCode;
-    }
-
-    /**
-     * A command npm does not have. npm answers it on stdout, not on stderr -- an unknown command is
-     * a question about npm's own names, and it suggests the ones that were meant.
-     */
-    private unknownCommand(command: string): number {
-        const packageDir = findPackageRoot(this.fileSystem, this.cwd ?? '/');
-        const suggestions = didYouMean(packageDir === undefined ? undefined : readManifest(this.fileSystem, packageDir), command);
-        this.emitOutput([
-            `Unknown command: "${command}"`,
-            suggestions,
-            'To see a list of supported npm commands, run:',
-            '  npm help'
-        ].join('\n') + '\n');
-        return 1;
     }
 
     private async install(args: string[], registry: NpmRegistry, log: (line: string) => void): Promise<number> {
@@ -153,33 +122,14 @@ export class NpmProcess extends Process {
             else if (arg === '--no-save') save = 'none';
             else if (arg === '-g' || arg === '--global') throw new Error('Global installs are not supported by this runtime');
             else if (arg.startsWith('-')) continue;
-            else {
-                /* A spec that names a directory -- `./localpkg`, `file:./localpkg`, an absolute
-                   path -- is a package already on this file system, and is installed from there. */
-                const local = localSpecTarget(arg, this.cwd ?? '/');
-                specs.push(local === undefined ? parseInstallSpec(arg) : { name: '', localPath: local });
-            }
+            else specs.push(parseInstallSpec(arg));
         }
 
-        const projectDir = this.cwd ?? '/';
-        const packageDir = findPackageRoot(this.fileSystem, projectDir) ?? normalizeAbsolute(projectDir);
         const installer = new NpmInstaller(this.fileSystem, registry, log, (args, cwd, env) => this.runLifecycleScript(args, cwd, env));
         const started = performance.now();
-        /* npm runs the root's own scripts on `npm install` with no arguments and not on
-           `npm install <pkg>`, which changes a dependency rather than the root: preinstall before
-           the tree is placed, then install, postinstall and prepare once it is. */
-        const rootScripts = specs.length === 0;
-        if (rootScripts) {
-            const failed = await this.runRootScripts(packageDir, ROOT_PRE_INSTALL_SCRIPT_EVENTS);
-            if (failed !== undefined) return failed;
-        }
         const report = specs.length > 0
-            ? await installer.addPackages(projectDir, specs, save)
-            : await installer.installManifest(projectDir);
-        if (rootScripts) {
-            const failed = await this.runRootScripts(packageDir, ROOT_POST_INSTALL_SCRIPT_EVENTS);
-            if (failed !== undefined) return failed;
-        }
+            ? await installer.addPackages(this.cwd ?? '/', specs, save)
+            : await installer.installManifest(this.cwd ?? '/');
         const duration = elapsedDuration(performance.now() - started);
         /* npm's summary lines start on a line of their own, whichever one it is. */
         if (report.added.length === 0) {
@@ -204,18 +154,15 @@ export class NpmProcess extends Process {
             return 1;
         }
         const label = scriptLabel(manifest, packageDir);
-        const declared = (manifest.scripts ?? {}) as Record<string, unknown>;
-        /* `npm run` lists the scripts the package declares; a command *runs* npm's own stop-then-start
-           in place of a restart script the package does not have. */
-        const scripts = effectiveScripts(declared);
+        const scripts = (manifest.scripts ?? {}) as Record<string, unknown>;
 
         if (name === undefined) {
-            this.emitOutput(scriptList(label, declared));
+            this.emitOutput(scriptList(label, scripts));
             return 0;
         }
         if (typeof scripts[name] !== 'string') {
             if (ifPresent) return 0;
-            this.emitError(missingScriptMessage(name, manifest));
+            this.emitError(missingScriptMessage(name));
             return 1;
         }
 
@@ -240,36 +187,6 @@ export class NpmProcess extends Process {
         return 0;
     }
 
-    /**
-     * The root's own lifecycle scripts, as `npm run` runs them: the header npm prints above each one,
-     * then the script through the shell in the package directory with the tree's bins in front of
-     * PATH. The status of the script that fails is the status npm exits with, and the scripts after
-     * it do not run. Nothing is returned when every script that is there succeeded.
-     */
-    private async runRootScripts(packageDir: string, events: readonly string[]): Promise<number | undefined> {
-        const manifest = readManifest(this.fileSystem, packageDir);
-        if (manifest === undefined) return undefined;
-        const scripts = (manifest.scripts ?? {}) as Record<string, unknown>;
-        const label = scriptLabel(manifest, packageDir);
-        const PATH = scriptPath(this.fileSystem, packageDir, Object.fromEntries(this.env).PATH);
-        for (const event of events) {
-            const command = scripts[event];
-            if (typeof command !== 'string') continue;
-            this.emitOutput(scriptHeader(label, event, command));
-            const result = await this.spawnChild('sh', ['-c', command], {
-                ...Object.fromEntries(this.env),
-                PATH,
-                npm_package_name: String(manifest.name ?? ''),
-                npm_package_version: String(manifest.version ?? ''),
-                npm_package_json: joinPaths(packageDir, 'package.json'),
-                npm_lifecycle_event: event
-            }, packageDir);
-            const exitCode = result.exitCode ?? 1;
-            if (exitCode !== 0) return exitCode;
-        }
-        return undefined;
-    }
-
     /** `npm ls`: the installed tree of the package here, as `npm ls` draws it. */
     private listDependencies(args: string[]): number {
         const packageDir = findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/');
@@ -286,29 +203,22 @@ export class NpmProcess extends Process {
     private init(): number {
         const dir = normalizeAbsolute(this.cwd ?? '/');
         const file = joinPaths(dir, 'package.json');
-        /* npm does not refuse a directory that already has one: init-package-json loads what is
-           there, keeps every field it carries, fills the ones it does not from its own default input
-           and writes it back, so `npm init -y` is idempotent. A file that is there but is not JSON
-           is left alone, as npm leaves a manifest it cannot read. */
-        const present = this.fileSystem.statPath(file)?.type === 'file';
-        const existing = present === true ? readManifest(this.fileSystem, dir) : undefined;
-        if (present === true && existing === undefined) {
-            /* npm parses the file that is there before it writes anything, and a file that does not
-               parse is an EJSONPARSE error rather than a reason to refuse: it names the parse error,
-               the text it was read from and the two notes npm puts behind them. */
-            this.emitOutput('\n');
-            this.emitError(malformedManifestMessage(this.fileSystem.readFile(file) ?? ''));
+        if (this.fileSystem.statPath(file)?.type === 'file') {
+            this.emitError(`npm init: package.json already exists in ${dir}\n`);
             return 1;
         }
-        /* The manifest init-package-json's own default input writes for `-y`, in the order it writes
-           it: npm answers `--yes` with no prompt, so every field is its default, `keywords` an empty
-           list and `type` the `commonjs` npm's own `init-type` defaults to. */
-        const manifest = initManifest(existing, dir);
-        const text = JSON.stringify(manifest, null, 2) + '\n';
-        this.fileSystem.writeFile(file, text);
-        /* npm echoes what it wrote: `Wrote to <file>:`, a blank line, then the JSON. The newline
-           `console.log` adds to the message is the one after the newline its format string ends on. */
-        this.emitOutput(`Wrote to ${file}:\n\n${text}\n` + '\n');
+        const name = dir.split('/').filter(Boolean).pop() || 'project';
+        const manifest = {
+            name,
+            version: '1.0.0',
+            description: '',
+            main: 'index.js',
+            scripts: { test: 'echo "Error: no test specified" && exit 1' },
+            author: '',
+            license: 'ISC'
+        };
+        this.fileSystem.writeFile(file, JSON.stringify(manifest, null, 2) + '\n');
+        this.emitOutput(`Wrote to ${file}\n`);
         return 0;
     }
 
@@ -343,18 +253,6 @@ export class NpmProcess extends Process {
         explicitPackage: boolean
     ): Promise<number> {
         let shim = explicitPackage ? undefined : findLocalBinShim(this.fileSystem, cwd, binName);
-
-        if (shim === undefined && !explicitPackage) {
-            /* The package in the directory itself declares bins, and `npm exec` runs one of them
-               before it looks anywhere else: it is this project's command, not a package's. npm
-               reaches it the same way, which is why `npm exec -- rootbin` never leaves the machine
-               even when no install has linked one into node_modules/.bin. */
-            const packageDir = findPackageRoot(this.fileSystem, cwd);
-            const own = packageDir === undefined
-                ? undefined
-                : binFromPackage(this.fileSystem, packageDir, binName, true);
-            if (own !== undefined) shim = own;
-        }
 
         if (shim === undefined) {
             const spec = parseInstallSpec(requested);
@@ -398,57 +296,6 @@ export class NpmProcess extends Process {
         const binName = parseInstallSpec(command ?? requested).name.split('/').pop()!;
         return this.runBin(binName, requested, args, this.cwd ?? '/', registry, log, packageArg !== undefined);
     }
-}
-
-/** npm's `EJSONPARSE` block for a package.json it cannot read: the parse error, the text and its two notes. */
-function malformedManifestMessage(text: string): string {
-    let detail = '';
-    try {
-        JSON.parse(text);
-    } catch (error) {
-        detail = error instanceof Error ? error.message : String(error);
-    }
-    return npmErrorLines([
-        'code EJSONPARSE',
-        `JSON.parse Invalid package.json: JSONParseError: ${detail} while parsing ${JSON.stringify(text)}`,
-        'JSON.parse Failed to parse JSON data.',
-        'JSON.parse Note: package.json must be actual JSON, not just JavaScript.'
-    ].join('\n'));
-}
-
-/**
- * The manifest `npm init -y` writes: the one already in the directory with npm's defaults filled in
- * beside it. Every field the file carries is kept, in the order it carries them, and a default only
- * takes a field the file has none of -- which is what makes a second `npm init -y` write the file
- * the first one wrote and nothing else.
- */
-function initManifest(existing: Record<string, any> | undefined, dir: string): Record<string, any> {
-    const manifest: Record<string, any> = { ...(existing ?? {}) };
-    const defaults: Record<string, unknown> = {
-        name: initPackageName(dir),
-        version: '1.0.0',
-        description: '',
-        main: 'index.js',
-        scripts: { test: 'echo "Error: no test specified" && exit 1' },
-        keywords: [],
-        author: '',
-        license: 'ISC',
-        type: 'commonjs'
-    };
-    for (const [field, value] of Object.entries(defaults)) {
-        if (manifest[field] === undefined) manifest[field] = value;
-    }
-    return manifest;
-}
-
-/**
- * The name `npm init` gives a package: the directory's own, lowercased, with its runs of white space
- * dashed and a `node-` prefix or a `-js`/`.js` suffix taken off, as init-package-json's own default
- * input derives it.
- */
-function initPackageName(dir: string): string {
-    const base = dir.split('/').filter(Boolean).pop() || 'project';
-    return base.replace(/^node-|[.-]js$/g, '').replace(/\s+/g, ' ').replace(/ /g, '-').toLowerCase() || 'project';
 }
 
 /**
@@ -513,25 +360,15 @@ function npxCacheDir(requested: string): string {
     return normalizeAbsolute(`/.npm/_npx/${hashString(requested)}`);
 }
 
-/**
- * The bin file of `binName` in the package at `packageDir`. `exact` is what resolving a command
- * against the package in the directory needs: a name the package does not declare is not this
- * package's command, however few bins it has, so `npm exec -- somethingelse` is left to the
- * registry instead of being handed the one bin there is. Without it the single bin of a package
- * answers for any name, which is how `npx cowsay` finds `cowsay` in a package that ships one.
- */
-function binFromPackage(fileSystem: IFileSystem, packageDir: string, binName: string, exact = false): string | undefined {
+function binFromPackage(fileSystem: IFileSystem, packageDir: string, binName: string): string | undefined {
     const file = joinPaths(packageDir, 'package.json');
     if (fileSystem.statPath(file)?.type !== 'file') return undefined;
     const manifest = JSON.parse(fileSystem.readFile(file) ?? '{}');
     const bin = manifest.bin;
-    if (typeof bin === 'string') {
-        if (exact && String(manifest.name ?? '').split('/').pop() !== binName) return undefined;
-        return normalizeAbsolute(joinPaths(packageDir, bin));
-    }
+    if (typeof bin === 'string') return normalizeAbsolute(joinPaths(packageDir, bin));
     if (bin && typeof bin === 'object') {
         const entries = Object.entries(bin as Record<string, string>);
-        const chosen = entries.find(([name]) => name === binName) ?? (exact ? undefined : (entries.length === 1 ? entries[0] : undefined));
+        const chosen = entries.find(([name]) => name === binName) ?? (entries.length === 1 ? entries[0] : undefined);
         if (chosen) return normalizeAbsolute(joinPaths(packageDir, chosen[1]));
     }
     return undefined;

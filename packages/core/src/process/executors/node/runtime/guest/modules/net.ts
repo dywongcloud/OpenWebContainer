@@ -26,14 +26,6 @@ export const SRC = String.raw`
 (function () {
 var NET_REASON_TEXT = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'address not available', EINVAL: 'invalid argument' };
 
-/* node's own diagnostics channels: the publish path lives in the diagnostics_channel family,
-   whose snippet is an IIFE of its own, so it reaches this one through a global name. */
-function dcPublish(name, data) {
-  var publish = globalThis.__owcDcPublish;
-  if (publish !== undefined) publish(name, data);
-}
-
-
 /** What a loopback socket absorbs before a write is still in flight when it is destroyed: Node's SO_SNDBUF. */
 var NET_SNDBUF = 262144;
 
@@ -440,28 +432,8 @@ function netRefresh(owner) {
  * dual-stack host and Node attempts each in turn, so connecting to 'localhost' -- or to no host at
  * all, which means 'localhost' -- is two attempts, and failing both is an AggregateError.
  */
-/** The name a connect asks about: a host that is not named at all is 'localhost', as Node's own default is. */
-/**
- * One 'lookup' event, the announcement Node makes between resolving a name and dialling it: the
- * address and the family that address is of, or the error when the name answered none, and the
- * host that was asked for either way. A host makes it from the DNS callback, so it never lands
- * in the turn that asked for it -- a listener attached after createConnection() returns still
- * hears it.
- */
-function netEmitLookup(socket, address, family, name) {
-  netDefer(function () { socket.emit('lookup', null, address, family, name); });
-}
-function netEmitLookupMiss(socket, failure, name) {
-  netDefer(function () { socket.emit('lookup', failure, null, null, name); });
-}
-
-function netConnectHost(host) {
-  var name = host === undefined || host === null || host === '' ? 'localhost' : String(host);
-  return name;
-}
-
 function netConnectList(host, family) {
-  var name = netConnectHost(host);
+  var name = host === undefined || host === null || host === '' ? 'localhost' : String(host);
   if (netIsIP(name)) return [name];
   if (name.toLowerCase() !== 'localhost') return null;
   if (family === 6) return ['::1'];
@@ -488,21 +460,8 @@ function netOwnAddress(address) {
   return address === '0.0.0.0' || address.indexOf('127.') === 0;
 }
 
-/* Host node builds its resolver channel the first time anything asks the resolver for an address --
-   before it takes the IP-literal fast path, which is why a listen on '127.0.0.1' alone is enough to
-   make one -- and reports it once as a DNSCHANNEL. It is one channel for the life of the process, so
-   it is made once and never closed here: a host destroys its own at the exit of the process, and this
-   container reports nothing of that. */
-var netDnsChannelMade = false;
-function netDnsChannel() {
-  if (netDnsChannelMade) return;
-  netDnsChannelMade = true;
-  asyncOpenResource('DNSCHANNEL', {});
-}
-
 /** Resolves a host to an address: IP literals and the name table synchronously, other names via dns.lookup. */
 function netResolve(host, family, done, lookup) {
-  netDnsChannel();
   var name = host === undefined || host === null || host === '' ? 'localhost' : String(host);
   if (netIsIP(name)) {
     done(null, name);
@@ -873,41 +832,13 @@ BF['net'] = function () {
         netDefer(function () { dialler._doConnectPath(dialled); });
         return this;
       }
-      /* A host's TCP socket is one TCPWRAP: node reports it when the socket is made and destroys it
-         when the socket is destroyed. A pipe path is no TCP socket at all, so it reports none. */
-      this._owcAsync = asyncOpenResource('TCPWRAP', this);
-      /* net.client.socket: the TCP socket a dial is about to be made on, once per connect. */
-      dcPublish('net.client.socket', { socket: this });
       var port = netPortOf(args.port);
       var self = this;
       /* A name with two addresses is tried on both, as Node's happy-eyeballs does: only the caller's
          own lookup changes that, since it is the caller who says which addresses a name has. */
       var listed = typeof args.lookup === 'function' ? null : netConnectList(args.host, args.family);
-      /* The resolution a connect announces before it dials, as host Node 24.15 does: one 'lookup'
-         per address the name answered, in the order the addresses are tried, and one carrying the
-         error when the name answered none -- 'localhost' announces ::1 and then 127.0.0.1 before
-         the ECONNREFUSED, an unknown name announces the ENOTFOUND, and an IP literal announces
-         nothing at all because nothing was ever looked up. A caller's own lookup is not announced:
-         Node asks it instead of the resolver and reports nothing of what it answered. */
-      /* ... nothing at all for an IP literal, which no resolver was ever asked about. A caller's
-         own lookup is not announced either: Node asks it instead of the resolver and reports
-         nothing of what it answered. */
-      var asked = netConnectHost(args.host);
-      var told = typeof args.lookup === 'function' || netIsIP(asked) !== 0;
-      var announce = function (failure, addresses) {
-        if (told) return;
-        told = true;
-        if (failure) {
-          netEmitLookupMiss(self, failure, asked);
-          return;
-        }
-        for (var i = 0; i < addresses.length; i++) {
-          netEmitLookup(self, addresses[i], netIsIP(addresses[i]) === 6 ? 6 : 4, asked);
-        }
-      };
       var begin = function (failure, address) {
         if (failure) {
-          announce(failure, null);
           self.destroy(failure);
           return;
         }
@@ -924,9 +855,7 @@ BF['net'] = function () {
             return;
           }
         }
-        var dialled = listed || [address];
-        announce(null, dialled);
-        self._doConnect(dialled, port, args.localPort);
+        self._doConnect(listed || [address], port, args.localPort);
       };
       try {
         netResolve(args.host, args.family, begin, args.lookup);
@@ -1514,11 +1443,6 @@ BF['net'] = function () {
     Socket.prototype._destroy = function (error, callback) {
       var unread = this._unreadBytes();
       this._dead = true;
-      /* The handle goes with the socket, as a host's does. */
-      if (this._owcAsync) {
-        this._owcAsync();
-        this._owcAsync = null;
-      }
       this._hadError = !!error;
       this.connecting = false;
       this._readQueue = [];
@@ -1824,10 +1748,6 @@ BF['net'] = function () {
          is read as a port and refused there, which is what this runtime answered before a path
          was carried at all. */
       var usePath = path !== undefined && args.port === undefined;
-      /* A host resolves the host a listen names before it binds -- an IP literal included, which is
-         why a listen on '127.0.0.1' alone is enough to make its resolver channel. A unix path is
-         never resolved, so it makes none. */
-      if (!usePath) netDnsChannel();
       var port = usePath
         ? 0
         : netPortOf(args.port !== undefined ? args.port : (named !== undefined ? named : 0), true);
@@ -1974,18 +1894,13 @@ BF['net'] = function () {
     }
 
     _makeSocket() {
-      var made = new Socket({ allowHalfOpen: this._serverOpts.allowHalfOpen });
-      /* A connection a server accepted is a TCPWRAP of its own, made when the accept happens. */
-      made._owcAsync = asyncOpenResource('TCPWRAP', made);
-      return made;
+      return new Socket({ allowHalfOpen: this._serverOpts.allowHalfOpen });
     }
 
     _emitAccepted(socket) {
       /* The server an accepted socket came from is an own property of it, as host Node 24.15
          answers it: socket.server is the listener that accepted it, enumerable on the socket. */
       socket.server = this;
-      /* net.server.socket: one publish per connection a server accepts, with the socket it made. */
-      dcPublish('net.server.socket', { socket: socket });
       this.emit('connection', socket);
     }
 

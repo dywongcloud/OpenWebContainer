@@ -50,12 +50,6 @@ export interface HostBridgeDeps {
     /** Evaluates an ES module synchronously for require(); returns '' or the failure text. */
     loadEsm: (file: string, token: number) => string;
     /**
-     * Called once when a program registers module customization hooks, so the host knows there is a
-     * resolve and a load hook to ask on every resolution from then on. A program that registers none
-     * pays nothing for them.
-     */
-    onHooksChanged: () => void;
-    /**
      * Called on every call the guest makes into the host. A guest that reaches the host is not
      * running a runaway loop, so the runaway guard's clock starts again here.
      */
@@ -189,26 +183,6 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         requireParentDirectory(file);
         if (deps.fileSystem.statPath(file)?.type === 'dir') throw new FsCodeError('EISDIR');
         deps.fileSystem.writeBytes(file, base64ToBytes(text(data)), optionalMode(mode));
-    })));
-    /*
-     * The append half of the pair: the guest sends only the bytes to add, and the file system puts
-     * them after the ones already there. Without it the guest read the file back and wrote the
-     * whole of it, so an append cost the file's whole size and a log that grows by appends took
-     * minutes where a host takes milliseconds.
-     */
-    define('appendBase64', (path, data, mode) => context.newString(guardFs(() => {
-        const file = text(path);
-        if (deps.fileSystem.statPath(file)?.type === 'dir') throw new FsCodeError('EISDIR');
-        const bytes = base64ToBytes(text(data));
-        if (deps.fileSystem.appendBytes) {
-            deps.fileSystem.appendBytes(file, bytes, optionalMode(mode));
-            return;
-        }
-        const existing = deps.fileSystem.readBytes(file) ?? new Uint8Array(0);
-        const merged = new Uint8Array(existing.length + bytes.length);
-        merged.set(existing, 0);
-        merged.set(bytes, existing.length);
-        deps.fileSystem.writeBytes(file, merged, optionalMode(mode));
     })));
     define('mkdir', (path, mode) => context.newString(guardFs(() => {
         deps.fileSystem.createDirectory(text(path), optionalMode(mode));
@@ -351,12 +325,6 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         return result.value;
     });
     define('esmLoad', (file, token) => context.newString(deps.loadEsm(text(file), context.getNumber(token))));
-    /* Module customization hooks: the guest has just been given a resolve hook, a load hook or both,
-       and from here every resolution and every load asks it. */
-    define('hooksChanged', () => {
-        deps.onHooksChanged();
-        return context.undefined;
-    });
     define('ref', (delta) => {
         deps.holdRef(context.getNumber(delta));
         return context.undefined;

@@ -1,6 +1,0 @@
-WITNESS PASS (judge, shard guest, 2026-10-23, HEAD f5d5931)
-Input: scan PATH for an executable named node / sh / ls / definitely-not-a-binary, as node-which does.
-Container: node -> "/usr/local/bin/node", sh -> "/bin/sh", ls -> "/bin/ls", missing -> null; NODEFILE true
-Host     : node -> "/Users/dylanwong/.nvm/versions/node/v24.15.0/bin/node", sh -> "/bin/sh", ls -> "/bin/ls", missing -> null
-A string on both sides, and a missing binary is null on both. The path differs because the container's node
-lives at /usr/local/bin, which is where it should be. Machine: load 23.77 (1-min), 5.2 GB free. Row closed.

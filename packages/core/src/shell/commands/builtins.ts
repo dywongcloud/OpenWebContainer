@@ -1436,7 +1436,7 @@ interface VarRef {
 type Part =
     | { t: 'lit'; v: string }
     | { t: 'sq'; v: string }
-    | { t: 'dq'; parts: Part[]; assign?: boolean }
+    | { t: 'dq'; parts: Part[] }
     | { t: 'var'; ref: VarRef }
     | { t: 'cmd'; script: string }
     | { t: 'arith'; expr: string };
@@ -1538,17 +1538,7 @@ class ShellSyntaxError extends Error {
     }
 }
 
-/**
- * A variable `set -u` will not let a line read. The status the shell leaves behind it is 127 -- the
- * status of a command that never ran -- for every form but one: counting an array that is not there
- * is `1` on a host, `set -u; echo ${#ARR[@]}` ending a subshell that way leaving 1 behind it where
- * `set -u; echo ${ARR[@]}` leaves 127.
- */
-class UnsetVariableError extends Error {
-    constructor(message: string, readonly status: number = 127) {
-        super(message);
-    }
-}
+class UnsetVariableError extends Error {}
 
 /**
  * A substitution this shell's bash 3.2 cannot read -- `${v^^}`, `${v^}`, `${v@Q}` -- which a host
@@ -1683,8 +1673,7 @@ function parseVarRefBody(body: string): VarRef {
 function rawText(word: Word): string {
     let out = '';
     for (const part of word) {
-        if (part.t === 'lit') out += stripMarks(part.v);
-        else if (part.t === 'sq') out += part.v;
+        if (part.t === 'lit' || part.t === 'sq') out += part.v;
         else if (part.t === 'dq') out += rawText(part.parts);
         else if (part.t === 'var') out += part.ref.raw;
         else if (part.t === 'arith') out += `$((${part.expr}))`;
@@ -1696,7 +1685,7 @@ function rawText(word: Word): string {
 function wordSourceText(word: Word, keepQuotes: boolean): string {
     let out = '';
     for (const part of word) {
-        if (part.t === 'lit') out += stripMarks(part.v);
+        if (part.t === 'lit') out += part.v;
         else if (part.t === 'sq') out += keepQuotes ? `'${part.v}'` : part.v;
         else if (part.t === 'dq') {
             if (keepQuotes) out += '"';
@@ -1720,16 +1709,9 @@ function dequotedSourceText(word: Word): string {
     return wordSourceText(word, false);
 }
 
-/**
- * Re-lexes the right-hand side of an assignment, which was split off at the `=`.
- *
- * The value is lexed as if it stood inside a pair of double quotes -- an assignment is never
- * field-split and never globbed, `v=*.txt` holding the two characters a `*` and a `.` are -- and the
- * mark says it is a value and not quoted text, which is the one thing a host still does to it: `v=~`
- * is the home directory, and `PATH=~/a:~/b` is two of them.
- */
+/** Re-lexes the right-hand side of an assignment, which was split off at the `=`. */
 function parseValueWord(text: string): Word {
-    return [{ t: 'dq', parts: lexParts(text), assign: true }];
+    return [{ t: 'dq', parts: lexParts(text) }];
 }
 
 /** Lexes a bare text into word parts (no operator handling): used for assignment values. */
@@ -2467,17 +2449,6 @@ class Parser {
                    goes in its place: `echo a\{b,c\}d` is one word, `a{b,c}d`. */
                 if (next === '{' || next === '}') {
                     literal += ESCAPED_BRACE + next;
-                    this.pos += 2;
-                    continue;
-                }
-                /* A pattern character the backslash escaped is one pathname expansion must read as a
-                   literal: `echo \*` prints `*` and `echo \[ab].txt` prints `[ab].txt`, which is what
-                   a host's /bin/sh does, where a `\*` no mark was left for was expanded as a pattern
-                   and grew into every name the directory holds. The mark is put in front of the
-                   character and not in the word's quoting, because a word holding one is not a quoted
-                   word to anything else: `[[ abc == \a* ]]` is still true, the `*` a pattern. */
-                if (next === '*' || next === '?' || next === '[' || next === '~' || next === ':') {
-                    literal += ESCAPED_META + next;
                     this.pos += 2;
                     continue;
                 }
@@ -3641,31 +3612,6 @@ const FIELD_MARK = ' ';
  */
 const ESCAPED_BRACE = '\u0001';
 
-/**
- * The word a `\*`, a `\?` and a `\[` read as, so pathname expansion knows the character was escaped
- * and is a literal to match and not a pattern: `echo \*` is the `*` it was written as, where a
- * quoted `*` was the only kind this shell left alone.
- *
- * The mark goes in front of the character for the same reason the brace's does -- the backslash is
- * gone by the time the word is expanded -- and it is taken out where the literal is read, leaving
- * the character behind it marked as quoted, which is what a quoted metacharacter is to a pattern.
- */
-const ESCAPED_META = '\u0005';
-
-/** The text of a literal with the marks the lexer left in it taken out. */
-function stripMarks(text: string): string {
-    return text.split(ESCAPED_BRACE).join('').split(ESCAPED_META).join('');
-}
-
-/**
- * True where a literal opens with a mark, so the character behind it was escaped: the `\~` of
- * `echo \~` is not the tilde tilde expansion reads, and neither is the `\{` of `echo \{a`.
- */
-function startsMarked(marked: string): boolean {
-    const ch = marked[0];
-    return ch === ESCAPED_BRACE || ch === ESCAPED_META;
-}
-
 interface Expanded {
     text: string;
     quoted: boolean[];
@@ -3683,26 +3629,6 @@ function appendText(target: Expanded, text: string, quoted: boolean, split = !qu
         target.text += ch;
         target.quoted.push(quoted);
         target.split.push(split);
-    }
-}
-
-/**
- * Appends the text a literal part holds, with the marks the lexer left in it taken out: a `\` that
- * escaped a brace is gone, and one that escaped a pattern character leaves the character behind it,
- * marked as quoted, so pathname expansion reads it as the literal it is.
- */
-function appendLiteral(target: Expanded, marked: string, quoted: boolean): void {
-    let escaped = false;
-    for (const ch of marked) {
-        if (ch === ESCAPED_META) {
-            escaped = true;
-            continue;
-        }
-        if (ch === ESCAPED_BRACE) continue;
-        target.text += ch;
-        target.quoted.push(quoted || escaped);
-        target.split.push(false);
-        escaped = false;
     }
 }
 
@@ -3808,19 +3734,10 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
             if (value !== undefined) return value;
             if (state.options.nounset) throw new UnsetVariableError(`${name}: unbound variable`);
             return '';
-        case 'len': {
+        case 'len':
             if (name === '@' || name === '*' || name === '#') return String(state.positional.length);
-            const bare = name.replace(/\[[@*]\]$/, '');
-            const counted = arrayElements(state, `${bare}[0]`);
-            if (counted.length > 0) return String(counted.length);
-            /* Counting a variable `set -u` will not read names the bare name and no subscript behind
-               it, for an array as for a scalar: `set -u; echo ${#NOPE}` is `NOPE: unbound variable`
-               and `set -u; echo ${#ARR[@]}` is `ARR: unbound variable`. */
-            if (counted.length === 0 && state.options.nounset && value === undefined) {
-                throw new UnsetVariableError(`${bare}: unbound variable`, 1);
-            }
+            if (ARRAY_ALL_RE.test(name)) return String(arrayElements(state, name.replace(/\[[@*]\]$/, '[0]')).length);
             return String((value ?? '').length);
-        }
         case 'substr': {
             const parts = arg.split(':');
             const text = value ?? '';
@@ -3874,111 +3791,19 @@ function applyModifier(state: ShellState, ref: VarRef, value: string | undefined
 }
 
 /**
- * The parts of an assignment's value with the tilde expansion a host does to it already done, so the
- * ordinary expansion behind this one -- which reads the whole value as quoted text, and so leaves a
- * `~` alone -- has nothing left to do.
- *
- * A `~` opens a place it is expanded in at the start of the value and behind every colon that was
- * written unquoted: `v=~` is the home directory, and `PATH=~/bin:~/bin` is two of them. One behind a
- * quoted colon, or behind anything an expansion produced, is the character it was written as -- a
- * host reads `v="a:"~` as `a:~`.
- */
-function tildeParts(state: ShellState, parts: Part[], atStart: boolean): Part[] {
-    const out: Part[] = [];
-    let start = atStart;
-    for (const part of parts) {
-        /* Only the text that was written out is looked at: what a variable, a substitution or an
-           arithmetic expression produced is never a tilde prefix, and neither is what stands behind
-           a quoted string, whose colon is a quoted colon. */
-        if (part.t !== 'lit') {
-            out.push(part);
-            start = false;
-            continue;
-        }
-        out.push({ t: 'lit', v: tildeLiteral(state, part.v, start, true) });
-        start = false;
-    }
-    return out;
-}
-
-/**
- * One literal with its tilde prefixes expanded. `atStart` is true where the literal opens the word,
- * or stands behind a colon the last part ended on, and `colonStarts` is what says a colon opens a
- * place a `~` is expanded in -- true in the value of an assignment, where `PATH=~/a:~/b` is two of
- * them, and false in the word of a command, where `echo a:~` prints the two characters it was given.
- */
-function tildeLiteral(state: ShellState, marked: string, atStart: boolean, colonStarts: boolean): string {
-    let out = '';
-    let start = atStart;
-    let i = 0;
-    while (i < marked.length) {
-        const ch = marked[i];
-        /* An escaped character is the character it is, and it opens no tilde of its own: `v=\~` is
-           the `~` a host keeps. */
-        if (ch === ESCAPED_META || ch === ESCAPED_BRACE) {
-            out += ESCAPED_META + (marked[i + 1] ?? '');
-            i += 2;
-            start = false;
-            continue;
-        }
-        if (start && ch === '~') {
-            /* The prefix is the `~` and every character behind it up to the next unquoted `/` or
-               `:` -- an escaped one among them, which is why `v=~\*` is the `~*` a host keeps: the
-               `*` is part of the login name the prefix names, and no such user is in the table. */
-            let end = i + 1;
-            let prefix = '~';
-            while (end < marked.length) {
-                const at = marked[end];
-                if (at === ESCAPED_META || at === ESCAPED_BRACE) {
-                    prefix += marked[end + 1] ?? '';
-                    end += 2;
-                    continue;
-                }
-                if (at === '/' || at === ':') break;
-                prefix += at;
-                end++;
-            }
-            out += expandTilde(prefix, state);
-            i = end;
-            start = false;
-            continue;
-        }
-        out += ch;
-        start = colonStarts && ch === ':';
-        i++;
-    }
-    return out;
-}
-
-/**
  * Tilde expansion of the word a literal part opened: `~` and `~/rest` are the home directory, with
  * the rest of the word kept after it. A `~` that names a user -- `~root` -- is left as it was
  * written: the container holds no passwd table to answer a login name with a home directory, and a
- * path invented for one would be a path no file has. `~+` is the directory the shell stands in and
- * `~-` the one it stood in before, where this shell keeps one.
+ * path invented for one would be a path no file has.
  */
 function expandTilde(text: string, state: ShellState): string {
     if (!text.startsWith('~')) return text;
     const slash = text.indexOf('/');
     const name = slash === -1 ? text.slice(1) : text.slice(1, slash);
-    if (name !== '') {
-        /* `~+` is the directory the shell stands in and `~-` the one it stood in before, which is
-           what a host's `$PWD` and `$OLDPWD` hold; a shell that has not moved keeps no `~-`, and a
-           host leaves the two characters there as it was written. */
-        if (name === '+') return tildeDirectory(state, 'PWD', text, slash);
-        if (name === '-') return tildeDirectory(state, 'OLDPWD', text, slash);
-        return text;
-    }
+    if (name !== '') return text;
     const home = getVar(state, 'HOME');
     if (home === undefined || home === '') return text;
     return home + (slash === -1 ? '' : text.slice(slash));
-}
-
-/** A `~+` or a `~-` as the directory the name holds, or the word as it was written where it has none. */
-function tildeDirectory(state: ShellState, name: string, text: string, slash: number): string {
-    const dir = getVar(state, name);
-    if (dir === undefined || dir === '') return text;
-    return dir + (slash === -1 ? '' : text.slice(slash));
 }
 
 /**
@@ -4008,9 +3833,6 @@ function arrayElementsFor(state: ShellState, name: string, ref: VarRef): string[
     const arg = rawArg === '' ? '' : expandToString(ref.op === 'substr' ? arithText(rawArg) : modifierText(rawArg), state);
     switch (ref.op) {
         case 'len':
-            /* Counting an array `set -u` will not read names the array and no subscript behind it:
-               `set -u; echo ${#ARR[@]}` is `ARR: unbound variable`. */
-            if (elements.length === 0 && state.options.nounset) throw new UnsetVariableError(`${name}: unbound variable`, 1);
             return [String(elements.length)];
         case 'substr': {
             const parts = arg.split(':');
@@ -4048,22 +3870,17 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
     for (let index = 0; index < parts.length; index++) {
         const part = parts[index];
         if (part.t === 'lit') {
-            /* The marks a `\{` and a `\*` left are not text, and they go out here -- everywhere the
-               literal is read, including the tilde expansion a word opening with `~` gets. A `~` a
-               backslash escaped is no tilde at all: `echo \~` is the `~` a host prints, where the
-               mark being invisible to the test below made it the home directory. */
-            const marked = part.v;
+            /* The mark a `\{` left is not text, and it goes out here -- everywhere the literal is
+               read, including the tilde expansion a word opening with `~` gets. */
+            const literal = part.v.split(ESCAPED_BRACE).join('');
             /* Tilde expansion is the first expansion a word gets, and only where the word opens with
-               an unquoted `~`: `echo ~` is the home directory, `echo a~b`, `echo "~"` and `echo \~`
-               are not. Only its own prefix is taken out of the literal, so the marks behind it --
-               the `\*` of `echo ~\*`, a `*` to print and not a pattern to expand -- still reach the
-               expansion behind this one. */
-            if (index === 0 && !quoted && target.text.length === 0 && !startsMarked(marked) && stripMarks(marked).startsWith('~')) {
-                appendLiteral(target, tildeLiteral(state, marked, true, false), quoted);
+               an unquoted `~`: `echo ~` is the home directory, `echo a~b` and `echo "~"` are not. */
+            if (index === 0 && !quoted && target.text.length === 0) {
+                appendText(target, expandTilde(literal, state), quoted, false);
                 continue;
             }
             /* Literal text is never field-split: only what an expansion produced is. */
-            appendLiteral(target, marked, quoted);
+            appendText(target, literal, quoted, false);
             continue;
         }
         if (part.t === 'sq') {
@@ -4071,16 +3888,6 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
             continue;
         }
         if (part.t === 'dq') {
-            /* The value of an assignment carries the mark `parseValueWord` put on it. It is expanded
-               as quoted text is -- no field splitting, no pathname expansion -- and then given the
-               one expansion a host still does to it, which the quotes would otherwise have taken
-               away: `v=~` is the home directory, and `PATH=~/a:~/b` is two of them. */
-            if (part.assign === true && index === 0 && target.text.length === 0) {
-                const value: Expanded = { text: '', quoted: [], split: [] };
-                expandParts(state, tildeParts(state, part.parts, true), true, value, dequotedSourceText(part.parts));
-                appendText(target, value.text.split(FIELD_MARK).join(' '), true, false);
-                continue;
-            }
             /* A substitution a host meets inside a pair of double quotes is one it names by the
                quoted text with the quotes taken out, and not by the whole word around it, so what
                the parts inside are given to report is that text and not the word they stand in. */
@@ -4157,12 +3964,6 @@ function expandParts(state: ShellState, parts: Part[], quoted: boolean, target: 
         const allElements = ARRAY_ALL_RE.exec(ref.name);
         if (allElements !== null && !DEFAULT_OPS.has(ref.op)) {
             const elements = arrayElementsFor(state, allElements[1], ref);
-            /* An array `set -u` will not read is named with the subscript it was written with --
-               `ARR[@]: unbound variable` -- and one declared with no elements in it is an array it
-               will not read either. */
-            if (elements.length === 0 && state.options.nounset && ref.op === '') {
-                throw new UnsetVariableError(`${ref.name}: unbound variable`);
-            }
             const joiner = ref.name.endsWith('[*]') ? ifsJoiner(state) : quoted ? FIELD_MARK : ' ';
             for (let i = 0; i < elements.length; i++) {
                 if (i > 0) appendText(target, joiner, quoted, !quoted);
@@ -4656,14 +4457,7 @@ function runSubstitution(state: ShellState, script: string): string {
         status = runCommandList(state, nodes, null);
     } catch (error) {
         if (error instanceof ExitSignal || error instanceof ReturnSignal) status = error.code;
-        else if (error instanceof UnsetVariableError) {
-            /* A substitution is a subshell of its own, so a variable `set -u` will not read ends the
-               substitution and the shell behind it goes on: `x=$(set -u; echo $NOPE); echo $?` is
-               the complaint and then the 1 the substitution left, with the line behind it still
-               running. */
-            writeErr(state, `${plainPrefix(state)}${error.message}\n`);
-            status = 1;
-        } else if (!(error instanceof BreakSignal) && !(error instanceof ContinueSignal)) {
+        else if (!(error instanceof BreakSignal) && !(error instanceof ContinueSignal)) {
             writeErr(state, errorMessage(error) + '\n');
         }
     } finally {
@@ -4908,12 +4702,11 @@ function runParsed(state: ShellState, script: string): number {
             return 2;
         }
         if (error instanceof UnsetVariableError) {
-            /* The complaint about a variable `set -u` will not read names the shell and the line the
-               expansion stands on -- no line at all on the one the string `sh -c` was handed opens
-               on, `line N` behind it -- and the shell a line was handed to with `-c` ends on it,
-               leaving 127. */
-            writeErr(state, `${plainPrefix(state)}${error.message}\n`);
-            return error.status;
+            /* The complaint about a variable `set -u` will not read is one a host writes without the
+               line it stands on -- `$0: nope: unbound variable` -- and the shell a line was handed
+               to with `-c` ends on it, leaving 127. */
+            writeErr(state, `${state.shellName}: ${error.message}\n`);
+            return 127;
         }
         if (error instanceof BadSubstitutionError) {
             /* `${v^^}` is the text a host names and not a variable's: `$0: ${v^^}: bad substitution`,
@@ -5180,19 +4973,11 @@ function runNode(state: ShellState, node: Node, input: string | null): number {
                 /* A word that will not expand ends the stage it stands in. Where stages stand behind
                    it, they still run and the pipeline takes the last one's status: `echo ${v^^} |
                    cat` is a host's `sh: ${v^^}: bad substitution` and then the 0 of the `cat`, where
-                   letting the error out of the pipeline ran nothing behind it. A variable `set -u`
-                   will not read is the same: the stage ends on it with 127 and the stages behind it
-                   still run. Where none stands behind it -- a plain `echo ${v^^}`, or a bare
-                   `echo $NOPE` -- the error still ends the script, as on a host. */
-                if (error instanceof UnsetVariableError) {
-                    if (node.commands.length < 2) throw error;
-                    writeErr(state, `${plainPrefix(state)}${error.message}\n`);
-                    status = error.status;
-                } else if (!(error instanceof BadSubstitutionError) || node.commands.length < 2) throw error;
-                else {
-                    writeErr(state, `${plainPrefix(state)}${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
-                    status = 1;
-                }
+                   letting the error out of the pipeline ran nothing behind it. Where none does --
+                   a plain `echo ${v^^}` -- the error still ends the script, as on a host. */
+                if (!(error instanceof BadSubstitutionError) || node.commands.length < 2) throw error;
+                writeErr(state, `${plainPrefix(state)}${error.word ?? `\${${error.raw}}`}: bad substitution\n`);
+                status = 1;
             } finally {
                 const captured = state.io;
                 state.io = savedIo;
@@ -5246,35 +5031,6 @@ function setPipeStatus(state: ShellState, statuses: number[]): void {
 }
 
 /**
- * The files a compound's own redirections name, opened where the operators stand: before a single
- * command of the body runs, which is where a host opens them. `{ printf 'B\n' >> f; } > f` truncates
- * `f` and the body's append lands in the emptied file, so `f` holds `B` -- where a file opened only
- * to write into it the output collected at the end was emptied *after* the body had written into it,
- * and the line the body had put there was gone.
- *
- * Every target is open by the time the body runs, so what the body collects is written behind what
- * the body put there itself: the two writes here append from now on. A file the redirection cannot
- * open -- one no directory of the path holds -- ends the construct before the body runs, as it does
- * on a host, and its message comes back instead of being thrown.
- */
-function openCompoundRedirects(state: ShellState, plan: RedirectPlan): string | undefined {
-    try {
-        for (const opened of plan.opened) writeOutputFile(state, opened.file, '', Boolean(opened.append));
-        for (const target of [plan.stdoutTo, plan.stderrTo]) {
-            if (target.kind === 'file' && target.file !== undefined) {
-                writeOutputFile(state, target.file, '', Boolean(target.append));
-            }
-        }
-    } catch (error) {
-        return `${errorMessage(error)}\n`;
-    }
-    plan.opened = [];
-    if (plan.stdoutTo.kind === 'file') plan.stdoutTo = { ...plan.stdoutTo, append: true };
-    if (plan.stderrTo.kind === 'file') plan.stderrTo = { ...plan.stderrTo, append: true };
-    return undefined;
-}
-
-/**
  * Redirections on a compound command: the file becomes the input of the whole construct, and the
  * construct's output is written to the file afterwards, as a shell does.
  */
@@ -5293,27 +5049,13 @@ function runCompoundRedirected(state: ShellState, command: Command, input: strin
     if (!needsInput && !needsOutput) return body();
     const savedBuffer = state.inputBuffer;
     const savedCursor = state.inputCursor;
-    let given = '';
-    /* A redirection the shell cannot open is the failure of the one command it stands on and not of
-       the shell: a host names the file, leaves the construct unrun and goes on, where the throw a
-       read of the missing file made ended the whole script at 1 with nothing behind it. */
-    try {
-        given = plan.inputFd !== undefined ? readFdAt(state, plan.inputFd) : '';
-        if (needsInput) {
-            if (!fromFile && (input !== null || state.openFds?.get(0)?.kind !== 'input')) state.inputIsDirectory = false;
-            state.inputBuffer = fromFile
-                ? (plan.inputFd !== undefined ? given : readInputFile(state, plan.inputFile as string))
-                : plan.inputText ?? (input as string);
-            state.inputCursor = 0;
-        }
-    } catch (error) {
-        if (plan.error === undefined) plan.error = `${errorMessage(error)}\n`;
-        return finish(state, plan, '', '', 1);
-    }
-    const openError = openCompoundRedirects(state, plan);
-    if (openError !== undefined) {
-        if (plan.error === undefined) plan.error = openError;
-        return finish(state, plan, '', '', 1);
+    const given = plan.inputFd !== undefined ? readFdAt(state, plan.inputFd) : '';
+    if (needsInput) {
+        if (!fromFile && (input !== null || state.openFds?.get(0)?.kind !== 'input')) state.inputIsDirectory = false;
+        state.inputBuffer = fromFile
+            ? (plan.inputFd !== undefined ? given : readInputFile(state, plan.inputFile as string))
+            : plan.inputText ?? (input as string);
+        state.inputCursor = 0;
     }
     const savedIo = state.io;
     state.io = { stdout: '', stderr: '' };
@@ -5816,15 +5558,6 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
             } catch (error) {
                 // `exit` inside ( ) leaves the subshell, not the script
                 if (error instanceof ExitSignal) return error.code;
-                /* A variable `set -u` will not read ends the subshell a host gives the line and not
-                   the shell behind it: `( set -u; echo $NOPE ) 2>&1; echo $?` is the complaint and
-                   then the 127 the subshell left, with every line behind it still running. It is
-                   written here, where the subshell's own redirection still stands, so the `2>&1` on
-                   the parens catches it instead of the shell's error stream behind them. */
-                if (error instanceof UnsetVariableError) {
-                    writeErr(state, `${plainPrefix(state)}${error.message}\n`);
-                    return error.status;
-                }
                 throw error;
             } finally {
                 /* A subshell is its own exit, so the EXIT trap it set for itself runs here -- before
@@ -6806,22 +6539,12 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
         && (input !== null || state.openFds?.get(0)?.kind !== 'input')) {
         state.inputIsDirectory = false;
     }
-    /* An input redirection the shell cannot open fails the one command it stands on: a host names
-       the file, leaves the command behind it unrun and carries on with the line -- `cat < /nodir/x;
-       echo AFTER` is the diagnostic and then `AFTER` -- where the throw the read made ended the
-       whole script at 1 with nothing behind the failure ever running. */
-    let commandInput: string | null = input;
-    try {
-        commandInput = ownStdin
-            ? input
-            : plan.inputText !== undefined
-            ? plan.inputText
-            : plan.inputFd !== undefined ? readFdAt(state, plan.inputFd)
-            : plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
-    } catch (error) {
-        if (plan.error === undefined) plan.error = `${errorMessage(error)}\n`;
-        return finish(state, plan, '', '', 1);
-    }
+    const commandInput = ownStdin
+        ? input
+        : plan.inputText !== undefined
+        ? plan.inputText
+        : plan.inputFd !== undefined ? readFdAt(state, plan.inputFd)
+        : plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
     /**
      * What a command with no input of its own reads: the rest of the input of the compound command
      * it stands in. `runCompoundRedirected` put that input in `state.inputBuffer` for the whole
@@ -7846,23 +7569,12 @@ function shiftBuiltin(ctx: CommandContext): CommandResult {
 }
 
 function aliasList(state: ShellState): string {
-    return joinLines([...state.aliases.keys()].sort().map((name) => `${name}='${state.aliases.get(name) ?? ''}'`));
-}
-
-/**
- * The listing `alias -p` asks for: the same names in the same order, each behind the `alias ` a
- * host puts there. A bare `alias` drops that prefix -- a POSIX shell's listing has no room for it,
- * which is why `alias ll` answers `ll='echo aliased'` and `alias -p` answers `alias ll='echo
- * aliased'` on one and the same host.
- */
-function aliasPrintList(state: ShellState): string {
     return joinLines([...state.aliases.keys()].sort().map((name) => `alias ${name}='${state.aliases.get(name) ?? ''}'`));
 }
 
 function aliasBuiltin(ctx: CommandContext): CommandResult {
     const state = stateOf(ctx);
-    if (ctx.args.length === 0) return ok(aliasList(state), state);
-    if (ctx.args[0] === '-p') return ok(aliasPrintList(state), state);
+    if (ctx.args.length === 0 || ctx.args[0] === '-p') return ok(aliasList(state), state);
     for (const arg of ctx.args) {
         /* An option `alias` does not know is the two lines a host writes and the 2 it leaves, and
            not the `not found` a name no alias answers to gets: `alias -x` is `alias: -x: invalid
@@ -7874,7 +7586,7 @@ function aliasBuiltin(ctx: CommandContext): CommandResult {
         if (eq === -1) {
             const value = state.aliases.get(arg);
             if (value === undefined) return failDiag(state, `alias: ${arg}: not found`, 1);
-            return ok(`${arg}='${value}'\n`, state);
+            return ok(`alias ${arg}='${value}'\n`, state);
         }
         state.aliases.set(arg.slice(0, eq), arg.slice(eq + 1));
     }

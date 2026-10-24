@@ -39,14 +39,6 @@ export interface IFileSystem {
     readdirNames(path: string): string[] | undefined;
     readBytes(path: string): Uint8Array | undefined;
     writeBytes(path: string, data: Uint8Array, mode?: number): void;
-    /**
-     * Adds bytes to the end of a file, which is what `fs.appendFileSync` asks for. `writeBytes`
-     * rewrites the whole file, so an append built on it costs the file's whole size every call and
-     * a log that grows by appends never finishes; a file system that appends writes only the bytes
-     * it was given. One without a way to do it leaves this out, and the caller writes the file
-     * whole.
-     */
-    appendBytes?(path: string, data: Uint8Array, mode?: number): void;
     removePath(path: string, recursive?: boolean): void;
     renamePath(from: string, to: string): void;
     /**

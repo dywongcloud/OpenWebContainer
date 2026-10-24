@@ -27,41 +27,22 @@ function formatErrorStack(err) {
      a stack -- carries that report with it, and it goes out as it stands: no name and colon go
      in front of a report that already holds the line Node opens with. */
   if (err && typeof err.__owcWhole === 'string') return err.__owcWhole;
-  /* 'class Z extends Error {}' prints 'Z [Error]: s' on host node 24.15: the constructor's name in
-     front and the name in brackets behind it. What decides it is node's 'improveStack', and it asks
-     three things and not one: that the name ends in 'Error', that the stack opens with that very
-     name, and that what follows it is the end of the stack, a colon or a newline. A name that ends
-     in something else is printed alone -- 'NotARealName: m', and 'Foo: x' for an 'e.name = "Foo"'
-     of the caller's -- and so is a name the stack does not open with. Whether 'name' is the error's
-     own property is not one of the three: a caller's own 'e.name = "TypeError"' on a plain Error
-     prints 'Error [TypeError]: x' there, own property and all.
-     The third of them is the one the guest's DOMException failed on: its name was an own property
-     of every instance where host node 24.15 reaches it on the prototype, so the test that used to
-     stand here -- own-ness -- is what opened its report with 'AbortError: d' and not with
-     'DOMException [AbortError]: d'. */
+  /* 'class Z extends Error {}' prints 'Z [Error]: s' on host node 24.15: the constructor's name
+     in front and the error's own 'name' in brackets, because that name is the one Z inherited and
+     not one the error carries. A name the error *does* carry -- 'e.name = "Foo"', or a subclass
+     that sets its own -- is printed alone, as 'Foo: x', so what decides it is whether 'name' is
+     the error's own property and not whether it differs from the constructor's. */
   var nameText = err.name === undefined || err.name === null ? 'Error' : String(err.name);
   var header = nameText;
   var ctorText = constructorNameOf(err);
-  var rawStack = '';
-  try { rawStack = err.stack === undefined || err.stack === null ? '' : String(err.stack); } catch (noStack) { rawStack = ''; }
   var subbed = false;
-  if (ctorText && ctorText !== 'Object' && stackOpensWith(rawStack, nameText)) {
-    var prefix = constructorPrefixOf(ctorText, utilTag(err));
-    if (nameText !== prefix) {
-      if (prefix.indexOf(nameText) >= 0) {
-        /* 'class MyError extends Error {}' prints 'MyError: s' and not 'MyError [Error]: s': the
-           name it inherited is the tail of the constructor's own, so node writes the constructor's
-           alone and drops the name rather than bracketing it. */
-        header = prefix;
-        subbed = true;
-      } else {
-        header = prefix + ' [' + nameText + ']';
-        subbed = true;
-      }
-    }
+  if (ctorText && ctorText !== nameText && ctorText !== 'Object' &&
+      !Object.prototype.hasOwnProperty.call(err, 'name')) {
+    header = ctorText + ' [' + nameText + ']';
+    subbed = true;
   }
   if (err.message) header += header === '' ? String(err.message) : ': ' + err.message;
-  var stack = rawStack;
+  var stack = err.stack ? String(err.stack) : '';
   var lines = stack === '' ? [] : guestFramesOf(stack.split('\n'));
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   var body = lines.join('\n');
@@ -89,42 +70,6 @@ function formatErrorStack(err) {
   return body.indexOf(header) >= 0 ? body : header + '\n' + body;
 }
 
-/* Whether node's 'improveStack' will put a constructor's name in front of this stack at all, which
-   is the three things it asks: that the name ends in 'Error', that the stack opens with that very
-   name, and that what comes behind it is the end of the stack, a colon or a newline. A stack that
-   opens with something else -- one the caller wrote by hand, or one out of a 'vm' realm, whose
-   frames are all it has -- gets no name in front of it. */
-function stackOpensWith(stack, name) {
-  if (!/Error$/.test(name)) return false;
-  if (stack.length < name.length || stack.indexOf(name) !== 0) return false;
-  return stack.length === name.length || stack.charAt(name.length) === ':' || stack.charAt(name.length) === '\n';
-}
-
-/* The name node writes in front of a stack it took the header off: the constructor's own, with the
-   value's tag in brackets behind it when it carries one of its own and the constructor's name does
-   not already have it -- 'Dom2 [DOMException]' for a 'class Dom2 extends DOMException {}', and
-   'Tagged [Boom]' for a class tagged 'Boom' -- and with no brackets when it does, which is why
-   'MyError' and 'TypeError' get none. A value carrying no tag of its own answers '' for it -- the
-   '[object Error]' and '[object Object]' of an untagged one -- and that is what keeps a 'class Q
-   extends Error {}' with a 'get name()' of its own at 'Q [QuotaExceededError]: q' and not at
-   'Q [Error] [QuotaExceededError]: q'. */
-function constructorPrefixOf(ctorText, tagText) {
-  var tag = tagText === 'Error' || tagText === 'Object' ? '' : tagText;
-  var result = ctorText + ' ';
-  if (tag !== '') {
-    var position = ctorText.indexOf(tag);
-    if (position === -1) {
-      result += '[' + tag + '] ';
-    } else {
-      var endPos = position + tag.length;
-      if (endPos !== ctorText.length && ctorText.charAt(endPos) === ctorText.charAt(endPos).toLowerCase()) {
-        result += '[' + tag + '] ';
-      }
-    }
-  }
-  return result.slice(0, -1);
-}
-
 function hexByte(b) {
   return (b < 16 ? '0' : '') + b.toString(16);
 }
@@ -149,174 +94,12 @@ function nullPrototypeTagOf(obj) {
    an ordinary object of the same shape would print nothing at all. */
 var INSPECT_CUSTOM = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.inspect.custom') : undefined;
 
-/* The other well-known symbol 'util' carries: the one a function puts on itself to say how it is
-   to be promisified, which 'util.promisify' reads before it builds a promisified form of its own.
-   It is a property of 'promisify' and not a value of its own so that a program can reach it the
-   one way node exposes it, 'util.promisify.custom'. */
-var PROMISIFY_CUSTOM = typeof Symbol.for === 'function' ? Symbol.for('nodejs.util.promisify.custom') : undefined;
-
 /* The 'fmt' of the 'inspectValue' walk now printing, so a value read out of a promise can be
    printed at the depth the walk is at. One walk at a time, so one is all there is to remember. */
 var INSPECT_FMT = null;
 
-/*
- * The colours 'util.inspect' writes when its 'colors' option is on, which is the one option this
- * walk had no answer to at all: it printed the same text for 'colors: true' as for no option,
- * where host node 24.15 wraps every value it prints in the SGR codes its own 'stylize' keeps --
- * 33 for a number, a bigint and a boolean, 32 for a string and a symbol, 1 with 22 for 'null',
- * 90 for 'undefined', 35 for a date, 31 for a regexp, and 36 for the things it names in brackets
- * rather than prints: a function, a class, '[Object]', '[Array]', '[Circular *n]', '<ref *n>',
- * '<pending>', '<items unknown>', '[Getter]'. A colour closes with 39, and 'null' with 22, because
- * that is the code that undoes the one that opened it. Nothing else in the output is coloured:
- * not a brace, not an identifier key, not the '... 3 more items' line, not the bytes of a Buffer.
- * The flag is a property of the walk now printing, like 'INSPECT_FMT' above it, so a walk with no
- * 'colors' in its options -- every 'console.log', every assertion message -- is untouched by it.
- */
-var INSPECT_COLORS = false;
-var INSPECT_ESCAPE = String.fromCharCode(27);
-
-function stylizeWith(text, open, close) {
-  if (!INSPECT_COLORS) return text;
-  return INSPECT_ESCAPE + '[' + open + 'm' + text + INSPECT_ESCAPE + '[' + (close === undefined ? '39' : close) + 'm';
-}
-/* A number, a bigint and a boolean: 33. 'NaN', 'Infinity' and '-0' are numbers to it too. */
-function styleNumber(text) {
-  return stylizeWith(text, '33');
-}
-/* A string, and the symbol that prints as one -- 'Symbol(k)' is written in a string's colour
-   whether it is the value of a key or the key itself. */
-function styleString(text) {
-  return stylizeWith(text, '32');
-}
-/* 'null' alone: bold, which is what opens with 1 and closes with 22 rather than 39. */
-function styleNull(text) {
-  return stylizeWith(text, '1', '22');
-}
-function styleUndefined(text) {
-  return stylizeWith(text, '90');
-}
-function styleDate(text) {
-  return stylizeWith(text, '35');
-}
-function styleRegExp(text) {
-  return stylizeWith(text, '31');
-}
-/* Everything node names in brackets: a function, a class, '[Object]', '[Array]', '[Getter]',
-   '[Circular *n]', '<ref *n>', '<pending>', '<items unknown>'. */
-function styleBracketed(text) {
-  return stylizeWith(text, '36');
-}
-
-/*
- * What a coloured entry measures as. Node asks the width the terminal shows -- its 'getStringWidth'
- * strips the SGR codes before it counts -- so whether a value fits on one line is decided by the
- * text without them and not by the text with them: a value that fits with 'colors' off fits with
- * 'colors' on, and the escapes that carry the colour are never what pushes it over 'breakLength'.
- * A padding that is added back the number of characters the codes took is what lines the columns
- * up in spite of them.
- */
-var INSPECT_ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
-function styledWidth(text) {
-  var s = String(text);
-  return INSPECT_COLORS ? s.replace(INSPECT_ANSI, '').length : s.length;
-}
-
-/*
- * The options that shape what a walk prints, read off the options object the way node reads them:
- * 'maxArrayLength' (100), 'maxStringLength' (10000), 'breakLength' (80) and 'numericSeparator'
- * (off). 'null' for either limit is no limit at all -- that is what node turns it into before the
- * walk starts, and it is why 'maxStringLength: null' leaves a string whole -- and a limit below
- * none is none, which is what makes 'maxArrayLength: -1' print no item at all. A limit node is
- * handed as a string counts as the number it reads as, because node compares against it and slices
- * with it without converting it first.
- */
-function optNumber(opts, name, fallback) {
-  var raw = opts === undefined || opts === null ? undefined : opts[name];
-  if (raw === null) return Infinity;
-  if (raw === undefined) return fallback;
-  var n = Number(raw);
-  return n === n ? n : fallback;
-}
-
-function maxArrayLengthOf(opts) {
-  return Math.max(0, optNumber(opts, 'maxArrayLength', 100));
-}
-
-function breakLengthOf(opts) {
-  return optNumber(opts, 'breakLength', 80);
-}
-
-function numericSeparatorOf(opts) {
-  return !!(opts && opts.numericSeparator);
-}
-
-/* Node groups the digits of a number in threes outwards from the point: the integer part from the
-   right, so '123456789' is '123_456_789', and the fraction from the left, so '1.5678' is
-   '1.567_8'. A text that is not digits and one point -- an exponent, an Infinity, a NaN -- is not
-   a number whose digits can be grouped and is left as it stands. */
-function groupDigitsRight(text) {
-  var out = '';
-  var seen = 0;
-  for (var i = text.length - 1; i >= 0; i--) {
-    out = text.charAt(i) + out;
-    seen++;
-    if (seen % 3 === 0 && i !== 0) out = '_' + out;
-  }
-  return out;
-}
-
-function groupDigitsLeft(text) {
-  var out = '';
-  for (var i = 0; i < text.length; i++) {
-    out += text.charAt(i);
-    if (i % 3 === 2 && i !== text.length - 1) out += '_';
-  }
-  return out;
-}
-
-function withNumericSeparators(text) {
-  if (!/^-?\d+(\.\d+)?$/.test(text)) return text;
-  var minus = text.charAt(0) === '-';
-  if (minus) text = text.slice(1);
-  var point = text.indexOf('.');
-  var intPart = point < 0 ? text : text.slice(0, point);
-  var fracPart = point < 0 ? '' : text.slice(point + 1);
-  var out = groupDigitsRight(intPart);
-  if (point >= 0) out += '.' + groupDigitsLeft(fracPart);
-  return (minus ? '-' : '') + out;
-}
-
-/* A string longer than 'maxStringLength' is cut there, and what is left over is said in node's own
-   words BEHIND the closing quote -- "'abc'... 5 more characters", and "... 1 more character" for
-   one character left over. A key is never cut: only a value is. */
-function stringInspectText(s, opts) {
-  var max = optNumber(opts, 'maxStringLength', 10000);
-  if (!(s.length > max)) return { text: s, trailer: '' };
-  var rest = s.length - max;
-  return {
-    text: String.prototype.slice.call(s, 0, max),
-    trailer: '... ' + rest + ' more character' + (rest > 1 ? 's' : '')
-  };
-}
-
 function inspectValue(value, opts) {
-  /*
-   * Node copies every own key of the options object it was handed over its own defaults, and it
-   * copies the VALUE, so a 'depth' a caller passed as 'undefined' is the depth the walk runs at and
-   * not the default that key would have got had it been left out. 'undefined' and 'null' both answer
-   * false to every 'level > depth' test they are put to, which is why '{ depth: undefined }' prints
-   * a value five levels deep on host node 24.15 exactly as 'depth: null' and 'depth: Infinity' do,
-   * while no option at all stops at two. Which of the two it was still matters after the test,
-   * because it is what a custom inspect is handed as its depth argument: 'null' for 'depth: null',
-   * and NaN -- what 'undefined - 0' is -- for 'depth: undefined'.
-   */
-  var depthGiven = opts !== undefined && opts !== null &&
-    Object.prototype.hasOwnProperty.call(opts, 'depth');
-  var depthGivenAs = depthGiven ? opts.depth : 2;
-  var customInspect = !(opts !== undefined && opts !== null && opts.customInspect === false);
-  var getters = gettersOf(opts);
-  var depthUnbounded = depthGiven && (depthGivenAs === null || depthGivenAs === undefined);
-  var maxDepth = depthUnbounded ? Infinity : (typeof depthGivenAs === 'number' ? depthGivenAs : 2);
+  var maxDepth = opts && typeof opts.depth === 'number' ? opts.depth : 2;
   var stack = [];
   /* The objects a circular reference points back at, numbered from 1 in the order one was met.
      Cleared for every walk, so the count starts again and '<ref *1>' belongs to this value. */
@@ -328,29 +111,15 @@ function inspectValue(value, opts) {
   var SUB_MAX = 0;
 
   function fmt(v, depth, indent) {
-    if (v === null) return styleNull('null');
+    if (v === null) return 'null';
     var t = typeof v;
-    if (t === 'string') {
-      var asString = stringInspectText(v, opts);
-      /* The colour closes in front of the trailer and not behind it: "'abcd'... 6 more characters"
-         is a green string followed by six words about it. */
-      return styleString(quoteStringLiteral(asString.text)) + asString.trailer;
-    }
-    if (t === 'number') {
-      if (Object.is(v, -0)) return styleNumber('-0');
-      var asNumber = String(v);
-      return styleNumber(numericSeparatorOf(opts) ? withNumericSeparators(asNumber) : asNumber);
-    }
-    if (t === 'bigint') {
-      var asBigInt = String(v) + 'n';
-      return styleNumber(numericSeparatorOf(opts) ? withNumericSeparators(String(v)) + 'n' : asBigInt);
-    }
-    if (t === 'boolean') return styleNumber(String(v));
-    if (t === 'undefined') return styleUndefined(String(v));
-    if (t === 'symbol') return styleString(String(v));
+    if (t === 'string') return quoteStringLiteral(v);
+    if (t === 'number') return Object.is(v, -0) ? '-0' : String(v);
+    if (t === 'bigint') return String(v) + 'n';
+    if (t === 'boolean' || t === 'undefined' || t === 'symbol') return String(v);
     if (t === 'function') {
       var name = v.name ? v.name : '';
-      if (/^class[\s{]/.test(Function.prototype.toString.call(v))) return styleBracketed('[class ' + (name || '(anonymous)') + ']');
+      if (/^class[\s{]/.test(Function.prototype.toString.call(v))) return '[class ' + (name || '(anonymous)') + ']';
       /* The three families node names by what they are: '[AsyncFunction: foo]',
          '[GeneratorFunction: foo]' and '[AsyncGeneratorFunction: foo]', where a plain function is
          '[Function: foo]'. The value's own prototype is what says which of the four it is -- its
@@ -367,7 +136,7 @@ function inspectValue(value, opts) {
       /* A function with no name is '[Function (anonymous)]' and not '[Function: (anonymous)]':
          the colon belongs to the name that follows it, and node writes none when there is no name
          to write -- which is what 'util.inspect(function () {})' prints on host node 24.15. */
-      return name ? styleBracketed('[' + fnKind + ': ' + name + ']') : styleBracketed('[' + fnKind + ' (anonymous)]');
+      return name ? '[' + fnKind + ': ' + name + ']' : '[' + fnKind + ' (anonymous)]';
     }
     /* A value the walk is already inside. Node numbers the objects a '[Circular *n]' marker points
        back at -- in the order it meets them, from 1 -- and writes '<ref *n> ' in front of the one
@@ -376,7 +145,7 @@ function inspectValue(value, opts) {
     if (stack.indexOf(v) >= 0) {
       var seen = REF_IDS.get(v);
       if (seen === undefined) { seen = REF_NEXT++; REF_IDS.set(v, seen); }
-      return styleBracketed('[Circular *' + seen + ']');
+      return '[Circular *' + seen + ']';
     }
     /* The tag and not 'instanceof': a value out of a 'vm' context is of another realm, so
        'instanceof' answers false for it on host Node 24.15 too, and what 'util.inspect' reads
@@ -384,33 +153,21 @@ function inspectValue(value, opts) {
        out of a context print 'Error {}' where the host prints 'Error: boom', and a promise
        'Promise {}' where the host prints 'Promise { 1 }'. */
     var vTag = utilTag(v);
-    /* A DOMException carries '[object DOMException]' and not '[object Error]', as it does on host
-       node 24.15, and node's inspect still writes the report of an error for it -- the header and
-       the frames -- because a DOMException is one of the native errors there. Reading only 'Error'
-       here would print 'DOMException {}' for it and lose its message and its frames. */
-    if (vTag === 'Error' || vTag === 'DOMException') return errorInspectOf(v, fmt, depth, indent, opts);
-    if (vTag === 'Date') return styleDate(isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString());
-    if (vTag === 'RegExp') return styleRegExp(String(v));
+    if (vTag === 'Error') return errorInspectOf(v, fmt, depth, indent, opts);
+    if (vTag === 'Date') return isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
+    if (vTag === 'RegExp') return String(v);
     if (vTag === 'Promise') return promiseInspectOf(v, depth, indent);
 
     /* The one thing a weak collection shows of what it holds: nothing, and that word. Node prints
        'WeakMap { <items unknown> }' and 'WeakSet { <items unknown> }' for every one, empty or not,
        where this walk would reach them as plain objects with no keys and print 'WeakMap {}'. */
-    if (utilBrandCheck(WeakMap.prototype.has, v)) return 'WeakMap { ' + styleBracketed('<items unknown>') + ' }';
-    if (utilBrandCheck(WeakSet.prototype.has, v)) return 'WeakSet { ' + styleBracketed('<items unknown>') + ' }';
+    if (utilBrandCheck(WeakMap.prototype.has, v)) return 'WeakMap { <items unknown> }';
+    if (utilBrandCheck(WeakSet.prototype.has, v)) return 'WeakSet { <items unknown> }';
 
     /* A value that writes its own output wins: Node asks the custom function before it looks at
-       the object's own keys, which is the whole of what a Response or a Headers prints. Unless the
-       caller asked for the keys instead, which is what 'customInspect: false' is and what
-       console.dir passes: a class carrying a [util.inspect.custom] then prints its own keys, as it
-       does on host node 24.15. */
-    if (INSPECT_CUSTOM !== undefined && customInspect && typeof v[INSPECT_CUSTOM] === 'function') {
-      /* The depth a custom inspect is handed is the depth the walk has left, and for a 'depth' that
-         was given as 'undefined' that is NaN and not 'Infinity': node subtracts the level it is at
-         from the depth it was given and gets NaN from 'undefined', which is what a function that
-         prints its own output sees as its first argument there. */
-      var customDepth = depthUnbounded ? (depthGivenAs === null ? null : NaN) : maxDepth - depth;
-      var written = v[INSPECT_CUSTOM](customDepth, opts, function (inner) { return inspectValue(inner, opts); });
+       the object's own keys, which is the whole of what a Response or a Headers prints. */
+    if (INSPECT_CUSTOM !== undefined && typeof v[INSPECT_CUSTOM] === 'function') {
+      var written = v[INSPECT_CUSTOM](maxDepth - depth, opts, function (inner) { return inspectValue(inner, opts); });
       return typeof written === 'string' ? written : String(written);
     }
 
@@ -429,8 +186,8 @@ function inspectValue(value, opts) {
     var isTyped = !isArr && ArrayBuffer.isView(v) && vTag !== 'DataView';
     var bare = Object.getPrototypeOf(v) === null;
     if (depth > maxDepth) {
-      if (isArr) return styleBracketed('[Array]');
-      return styleBracketed('[' + (bare ? nullPrototypeTagOf(v) + ': null prototype' : (ctor || 'Object')) + ']');
+      if (isArr) return '[Array]';
+      return '[' + (bare ? nullPrototypeTagOf(v) + ': null prototype' : (ctor || 'Object')) + ']';
     }
     /* An ArrayBuffer, a SharedArrayBuffer and a DataView print what no walk of own keys can reach:
        node gives them the pseudo-entries '[Uint8Contents]' and '[byteLength]' -- and '[byteOffset]'
@@ -456,59 +213,36 @@ function inspectValue(value, opts) {
     var open = '{';
     var close = '}';
     var prefix = '';
-    /* How many items of a collection 'maxArrayLength' lets the walk print, and the line it writes
-       for the rest -- "... 3 more items", and "... 1 more item" for one. Node measures the same
-       bound over the entries of a typed array, of a Set and of a Map as over the elements of an
-       ordinary array, which is why all four of them answer their length and then what is left. */
-    var maxArr = maxArrayLengthOf(opts);
-    var moreItems = null;
     var i;
     if (isArr) {
       open = '[';
       close = ']';
       if (ctor && ctor !== 'Array') prefix = ctor + '(' + v.length + ') ';
-      var limit = Math.min(v.length, maxArr);
+      var limit = Math.min(v.length, 100);
       for (i = 0; i < limit; i++) entries.push(fmt(v[i], depth + 1, indent + 2));
-      if (v.length > limit) moreItems = moreItemsText(v.length - limit);
+      if (v.length > 100) entries.push('... ' + (v.length - 100) + ' more item' + (v.length - 100 > 1 ? 's' : ''));
     } else if (isTyped) {
       open = '[';
       close = ']';
       prefix = ctor + '(' + v.length + ') ';
-      var typedLimit = Math.min(v.length, maxArr);
-      for (i = 0; i < typedLimit; i++) entries.push(styleNumber(String(v[i])));
+      for (i = 0; i < v.length && i < 100; i++) entries.push(String(v[i]));
       /* What is left over past the hundred node prints of a typed array is said in the same words
          it says the items of an ordinary array in: '... 1 more item', singular, and '... 2 more
          items' past that. */
-      if (v.length > typedLimit) moreItems = moreItemsText(v.length - typedLimit);
+      if (v.length > 100) entries.push('... ' + (v.length - 100) + ' more item' + (v.length - 100 > 1 ? 's' : ''));
     } else if (utilBrandCheck(Map.prototype.has, v)) {
       prefix = 'Map(' + v.size + ') ';
-      var mapShown = 0;
       v.forEach(function (val, key) {
-        if (mapShown >= maxArr) return;
-        mapShown++;
         entries.push(fmt(key, depth + 1, indent + 2) + ' => ' + fmt(val, depth + 1, indent + 2));
       });
-      if (v.size > mapShown) moreItems = moreItemsText(v.size - mapShown);
     } else if (utilBrandCheck(Set.prototype.has, v)) {
       prefix = 'Set(' + v.size + ') ';
-      var setShown = 0;
       v.forEach(function (val) {
-        if (setShown >= maxArr) return;
-        setShown++;
         entries.push(fmt(val, depth + 1, indent + 2));
       });
-      if (v.size > setShown) moreItems = moreItemsText(v.size - setShown);
     } else {
       if (bare) prefix = '[' + nullPrototypeTagOf(v) + ': null prototype] ';
       else if (ctor && ctor !== 'Object') prefix = ctor + ' ';
-    }
-    /* The line for what a bound left out goes behind the entries the bound let through and in front
-       of the extra keys a collection carries, and it is not one of the entries the packing groups --
-       the hundred node packs is a hundred of the items it printed. */
-    var trailerAt = -1;
-    if (moreItems !== null) {
-      entries.push(moreItems);
-      trailerAt = entries.length - 1;
     }
 
     /* The keys node reads: every own property name and every own symbol under 'showHidden', and
@@ -523,14 +257,14 @@ function inspectValue(value, opts) {
     for (i = 0; i < keys.length; i++) {
       if (isArr && /^\d+$/.test(keys[i])) continue;
       if (isTyped && /^\d+$/.test(keys[i])) continue;
-      entries.push(inspectEntryOf(fmt, v, keys[i], depth + 1, indent + 2, getters));
+      entries.push(inspectEntryOf(fmt, v, keys[i], depth + 1, indent + 2));
     }
     /* The own SYMBOL keys, after the string ones and in the order they were put on. Node writes one
        where a string key goes, as 'Symbol(k): 1' -- no brackets and no quotes -- for an ordinary
        object, for an array and for a Map alike, and it brackets the ones that are not enumerable,
        which is what 'showHidden' asks for. */
     for (var si = 0; si < syms.length; si++) {
-      entries.push(inspectEntryOf(fmt, v, syms[si], depth + 1, indent + 2, getters));
+      entries.push(inspectEntryOf(fmt, v, syms[si], depth + 1, indent + 2));
     }
     var subDepth = SUB_MAX - depth;
     SUB_MAX = savedMax > SUB_MAX ? savedMax : SUB_MAX;
@@ -546,7 +280,7 @@ function inspectValue(value, opts) {
     /* Read after the walk of the children and not before: a value is only a '<ref *n>' once a
        circular reference inside it has been met, which happens while its entries are printed. */
     var refNo = REF_IDS.get(v);
-    var head = refNo === undefined ? '' : styleBracketed('<ref *' + refNo + '>') + ' ';
+    var head = refNo === undefined ? '' : '<ref *' + refNo + '> ';
     prefix = head + prefix;
 
     if (entries.length === 0) return prefix + open + close;
@@ -565,34 +299,27 @@ function inspectValue(value, opts) {
     var packed = false;
     var shown = entries;
     if ((isArr || isTyped) && entries.length > 6 && groupable(opts)) {
-      shown = groupArrayElements(entries, v, indent, compactOf(opts), trailerAt, breakLengthOf(opts));
+      shown = groupArrayElements(entries, v, indent, compactOf(opts));
       packed = shown.length !== entries.length;
     }
-    var width = breakLengthOf(opts);
-    var start = entries.length + indent + open.length + styledWidth(prefix) + 10;
+    var start = entries.length + indent + open.length + prefix.length + 10;
     var totalLength = entries.length + start;
     /* 'compact: false' is one entry per line and never a fit test: node's own inspect writes
        '[1,2,3,4,5,6,7,8]' on one line by default and one number to a line under that option. So is
        a 'compact' below one, and so is a value that nests as deep as a number 'compact' lower than
        that: '{ a: { b: 1 } }' is one line at the default 3 and three lines at 'compact: 1'. */
-    var fits = !multiline && !packed && compactAllowsOneLine(opts, subDepth) && totalLength + entries.length <= width;
+    var fits = !multiline && !packed && compactAllowsOneLine(opts, subDepth) && totalLength + entries.length <= 80;
     for (var s = 0; fits && s < entries.length; s++) {
-      totalLength += styledWidth(entries[s]);
-      if (totalLength > width) fits = false;
+      totalLength += entries[s].length;
+      if (totalLength > 80) fits = false;
     }
     if (fits) return prefix + open + ' ' + entries.join(', ') + ' ' + close;
     var pad = ' '.repeat(indent + 2);
     return prefix + open + '\n' + shown.map(function (entry) { return pad + entry; }).join(',\n') + '\n' + ' '.repeat(indent) + close;
   }
 
-  var savedFmt = INSPECT_FMT;
-  var savedColors = INSPECT_COLORS;
   INSPECT_FMT = fmt;
-  INSPECT_COLORS = !!(opts && opts.colors);
-  var printed = fmt(value, 0, 0);
-  INSPECT_FMT = savedFmt;
-  INSPECT_COLORS = savedColors;
-  return printed;
+  return fmt(value, 0, 0);
 }
 
 function padBy(order, text, width) {
@@ -613,31 +340,20 @@ function groupable(opts) {
   return compact !== true && typeof compact === 'number' && compact >= 1;
 }
 
-/* The entry a walk writes for the items 'maxArrayLength' left out of one. */
-function moreItemsText(rest) {
-  return '... ' + rest + ' more item' + (rest > 1 ? 's' : '');
-}
-
 /* How node packs the entries of an array too long for one line: the 'groupArrayElements' of its
    own inspect, ports and all, in the terms of this walk. 'output' is the entries as they print,
    'value' the array they came from -- only whether each of its items is a number or a bigint is
    asked of it, because that is what decides which way the entries are padded -- and 'indent' the
-   indent the array itself is printed at. 'trailerAt' is where the "... n more items" line sits
-   when the walk printed one, or -1 when it did not: that line is not an item and is never packed.
-   80 is 'breakLength' and 3 is 'compact', both node's defaults, and the limit that decided how
-   many items there are is 'maxArrayLength'. */
-function groupArrayElements(output, value, indent, compact, trailerAt, breakLength) {
-  if (breakLength === undefined) breakLength = 80;
-  if (trailerAt === undefined) trailerAt = -1;
+   indent the array itself is printed at. 80 is 'breakLength' and 3 is 'compact', both node's
+   defaults, and 100 is 'maxArrayLength', whose '... n more items' is not an entry to pack. */
+function groupArrayElements(output, value, indent, compact) {
   var totalLength = 0;
   var maxLength = 0;
-  var outputLength = trailerAt >= 0 ? trailerAt : output.length;
+  var outputLength = output.length;
+  if (100 < output.length) outputLength--;
   var dataLen = new Array(outputLength);
   for (var i = 0; i < outputLength; i++) {
-    /* The width the entry shows and not the width its string has: the SGR codes of a coloured
-       entry are not columns it takes up, and 'output[k].length - dataLen[k]' below is exactly
-       how many characters they add, which is what the padding puts back to line the columns up. */
-    var len = styledWidth(output[i]);
+    var len = output[i].length;
     dataLen[i] = len;
     totalLength += len + 2;
     if (maxLength < len) maxLength = len;
@@ -646,13 +362,13 @@ function groupArrayElements(output, value, indent, compact, trailerAt, breakLeng
   /* At least three entries have to fit next to each other, and an array whose entries are of very
      different lengths is left alone -- one entry longer than a fifth of all of them would leave
      an enormous gap beside the short ones. */
-  if (actualMax * 3 + indent >= breakLength ||
+  if (actualMax * 3 + indent >= 80 ||
       (totalLength / actualMax <= 5 && maxLength > 6)) return output;
   var averageBias = Math.sqrt(actualMax - totalLength / output.length);
   var biasedMax = Math.max(actualMax - 3 - averageBias, 1);
   var columns = Math.min(
     Math.round(Math.sqrt(2.5 * biasedMax * outputLength) / biasedMax),
-    Math.floor((breakLength - indent) / actualMax),
+    Math.floor((80 - indent) / actualMax),
     compact * 4,
     15
   );
@@ -686,19 +402,8 @@ function groupArrayElements(output, value, indent, compact, trailerAt, breakLeng
     else line += output[k];
     tmp.push(line);
   }
-  if (trailerAt >= 0) tmp.push(output[trailerAt]);
+  if (100 < output.length) tmp.push(output[outputLength]);
   return tmp;
-}
-
-/* The JSON of a value for '%j'. A structure that closes on itself is the one case node answers
-   instead of throwing, and it answers it with the word '[Circular]'. */
-function jsonTextOf(value) {
-  try {
-    return JSON.stringify(value);
-  } catch (err) {
-    if (err && /circular/i.test(String(err.message))) return '[Circular]';
-    throw err;
-  }
 }
 
 function formatLogArgs(args) {
@@ -720,19 +425,10 @@ function formatLogArgs(args) {
         if (argIndex < args.length && 'sdifjoOc'.indexOf(spec) >= 0) {
           var a = args[argIndex++];
           j++;
-          /* A BigInt keeps the 'n' node writes behind it for every specifier that prints one as a
-             number -- '%d', '%i' and '%s' alike -- because node asks the type before it converts:
-             'util.format("%d", 10n)' is "10n" and not "10". '%f' is the one that does not: it
-             floats the value, and a float has no 'n'. */
-          if (typeof a === 'bigint' && (spec === 'd' || spec === 'i' || spec === 's')) {
-            text += String(a) + 'n';
-          } else if (spec === 's') text += typeof a === 'string' ? a : (typeof a === 'object' && a !== null ? inspectValue(a, { depth: 1 }) : String(a));
+          if (spec === 's') text += typeof a === 'string' ? a : (typeof a === 'object' && a !== null ? inspectValue(a, { depth: 1 }) : String(a));
           else if (spec === 'd' || spec === 'i') text += String(spec === 'i' ? parseInt(a, 10) : Number(a));
           else if (spec === 'f') text += String(parseFloat(a));
-          /* '%j' of a value that cannot be written as JSON: node answers the one word it answers
-             for a structure that closes on itself, and rethrows everything else -- a BigInt's "Do
-             not know how to serialize a BigInt" reaches the caller on host node 24.15. */
-          else if (spec === 'j') text += jsonTextOf(a);
+          else if (spec === 'j') text += JSON.stringify(a);
           else if (spec === 'o' || spec === 'O') text += inspectValue(a);
           continue;
         }
@@ -748,79 +444,10 @@ function formatLogArgs(args) {
   return out.join(' ');
 }
 
-/*
- * Node's own list from lib/internal/util/comparisons.js: a strict deep comparison answers a pair of
- * objects by their constructor when the left one's constructor is one of these, or when it is
- * inherited rather than own, and by their prototype only otherwise. That is why {} is strictly
- * deep-equal to Object.create({ q: 1 }) -- both answer Object, so a prototype of its own that
- * is not Object.prototype is not what the comparison looks at -- while {} against
- * Object.create(null) is unequal, because a null-prototype object answers no constructor at all
- * and so falls to the prototype test, and a class instance against a plain object is unequal,
- * because the two answer different constructors.
- */
-var DEEP_WELL_KNOWN_CTORS = [
-  Array, ArrayBuffer, BigInt, Boolean, DataView, Date, Error, Function, Map, Number, Object,
-  Promise, RegExp, Set, String, Symbol, WeakMap, WeakSet,
-  Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array,
-  Float32Array, Float64Array
-];
-if (typeof BigInt64Array === 'function') DEEP_WELL_KNOWN_CTORS.push(BigInt64Array);
-if (typeof BigUint64Array === 'function') DEEP_WELL_KNOWN_CTORS.push(BigUint64Array);
-if (typeof Float16Array === 'function') DEEP_WELL_KNOWN_CTORS.push(Float16Array);
-if (typeof Buffer !== 'undefined') DEEP_WELL_KNOWN_CTORS.push(Buffer);
-
-function deepWellKnownCtor(v) {
-  if (v === null || v === undefined) return false;
-  for (var i = 0; i < DEEP_WELL_KNOWN_CTORS.length; i++) {
-    if (DEEP_WELL_KNOWN_CTORS[i] === v) return true;
-  }
-  return false;
-}
-
-/* Node's objectComparisonStart, verbatim in what it answers. */
-function deepObjectsStart(a, b) {
-  var ca = undefined;
-  try { ca = a.constructor; } catch (e) { ca = undefined; }
-  var cb = undefined;
-  try { cb = b.constructor; } catch (e) { cb = undefined; }
-  if (deepWellKnownCtor(ca) || (ca !== undefined && !Object.prototype.hasOwnProperty.call(a, 'constructor'))) {
-    return ca === cb;
-  }
-  return Object.getPrototypeOf(a) === Object.getPrototypeOf(b);
-}
-
-/*
- * A loose comparison will not pair an object of one built-in kind with an object of another: node
- * rejects {} against a Date, a RegExp, a Map, a Set, an Error or a typed array even though none
- * of them carries an own enumerable key, while it accepts {} against Object.create({ q: 1 }).
- */
-function deepLooseKindOf(v) {
-  if (Array.isArray(v)) return 'array';
-  if (v instanceof Date) return 'date';
-  if (v instanceof RegExp) return 'regexp';
-  if (v instanceof Map) return 'map';
-  if (v instanceof Set) return 'set';
-  if (v instanceof Error) return 'error';
-  if (typeof ArrayBuffer !== 'undefined' && (v instanceof ArrayBuffer || ArrayBuffer.isView(v))) return 'buffer';
-  return 'object';
-}
-
 function deepEqualValues(a, b, strict) {
-  var aIsObj = a !== null && typeof a === 'object';
-  var bIsObj = b !== null && typeof b === 'object';
-  if (strict) {
-    if (Object.is(a, b)) return true;
-  } else {
-    /*
-     * A loose comparison of a primitive against an object is not the '==' of the two: node answers
-     * false for 1 against 'new Uint8Array([1])', which '1 == u8' would call true, and false for
-     * 'new Number(1)' against 1. Only a pair of primitives is compared with '=='.
-     */
-    if (aIsObj !== bIsObj) return false;
-    if (a == b || (a !== a && b !== b)) return true;
-  }
-  if (!aIsObj || !bIsObj) return false;
-  if (!strict && deepLooseKindOf(a) !== deepLooseKindOf(b)) return false;
+  if (strict ? Object.is(a, b) : (a == b || (a !== a && b !== b))) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
   if (Array.isArray(a) !== Array.isArray(b)) return false;
   if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
   if (a instanceof RegExp && b instanceof RegExp) return String(a) === String(b);
@@ -848,7 +475,6 @@ function deepEqualValues(a, b, strict) {
     });
     return setOk;
   }
-  if (strict && !deepObjectsStart(a, b)) return false;
   var ka = Object.keys(a);
   var kb = Object.keys(b);
   if (ka.length !== kb.length) return false;
@@ -1225,44 +851,6 @@ function utilArgError(code, message) {
   return err;
 }
 
-/* How node names the value an argument of the wrong type received: null and undefined bare, a
-   string quoted, every other primitive as its type and its value, and anything else as an
-   instance of the constructor it came from. It is the whole of what follows 'Received type' in
-   "The "err" argument must be of type number. Received type string ('x')". */
-function utilReceivedAs(value) {
-  if (value === null) return 'null';
-  if (value === undefined) return 'undefined';
-  if (typeof value === 'string') return "string ('" + value + "')";
-  if (typeof value !== 'object' && typeof value !== 'function') return typeof value + ' (' + String(value) + ')';
-  var name = value.constructor && value.constructor.name;
-  return 'an instance of ' + (typeof name === 'string' && name !== '' ? name : 'Object');
-}
-
-/*
- * The warning 'util.deprecate' emits, written the way the host writes it: on the next tick, to
- * stderr, as '(node:<pid>) [<code>] DeprecationWarning: <message>' -- the code in brackets only when
- * one was given, because a deprecation that carries no code of its own is one node names by no code
- * at all. The message is what the host's 'process.emitWarning' is asked to emit and validates before
- * it emits anything, so the error a caller sees for a message that is neither a string nor an Error
- * is that function's own TypeError and not one 'deprecate' writes: 'The "warning" argument must be
- * of type string or an instance of Error. Received undefined'.
- */
-function emitDeprecationWarning(msg, code) {
-  if (typeof msg !== 'string' && !(msg instanceof Error)) {
-    var bad = new TypeError('The "warning" argument must be of type string or an instance of Error. Received ' +
-      (msg === null || msg === undefined ? utilReceivedAs(msg) : 'type ' + utilReceivedAs(msg)));
-    bad.code = 'ERR_INVALID_ARG_TYPE';
-    throw bad;
-  }
-  var proc = globalThis.process;
-  if (!proc || !proc.stderr || typeof proc.nextTick !== 'function') return;
-  var text = msg instanceof Error ? String(msg.message === undefined ? msg : msg.message) : msg;
-  proc.nextTick(function () {
-    proc.stderr.write('(node:' + proc.pid + ') ' + (typeof code === 'string' ? '[' + code + '] ' : '') +
-      'DeprecationWarning: ' + text + '\n');
-  });
-}
-
 function utilGetterOf(proto, name) {
   var desc = Object.getOwnPropertyDescriptor(proto, name);
   return desc && typeof desc.get === 'function' ? desc.get : null;
@@ -1439,9 +1027,9 @@ function promiseInspectOf(v, depth, indent) {
   var ctorText = constructorNameOf(v);
   var head = (ctorText && ctorText !== 'Promise' && ctorText !== 'Object') ? ctorText + ' [Promise]' : 'Promise';
   var cell = PROMISE_CELLS.get(v);
-  if (cell === undefined || cell.state === 0) return head + ' { ' + styleBracketed('<pending>') + ' }';
+  if (cell === undefined || cell.state === 0) return head + ' { <pending> }';
   var inner = fmtPromiseValue(cell.value, depth, indent);
-  var body = (cell.state === 2 ? styleBracketed('<rejected>') + ' ' : '') + inner;
+  var body = (cell.state === 2 ? '<rejected> ' : '') + inner;
   /* A value that prints on more than one line -- an error, whose stack is part of what it prints --
      opens the braces instead of sitting inside them: host node 24.15 writes
      'Promise {\n  <rejected> Error: r\n      at ...\n}' and not one line with a stack hanging off
@@ -1468,34 +1056,12 @@ function fmtPromiseValue(value, depth, indent) {
    reading it would produce: node asks the descriptor before it reads, so '{ get a() { return 1 } }'
    is '{ a: [Getter] }' under the default options and not '{ a: 1 }', a setter alone is '[Setter]'
    and the pair is '[Getter/Setter]'. Only a plain data property is printed as its value. */
-/* What 'getters' the walk was asked for, in the one shape the entry writer reads it in. */
-function gettersOf(opts) {
-  var given = opts === undefined || opts === null ? undefined : opts.getters;
-  return given === 'get' || given === 'set' ? given : !!given;
-}
-function inspectEntryOf(fmt, value, key, depth, indent, getters) {
+function inspectEntryOf(fmt, value, key, depth, indent) {
   var desc = undefined;
   try { desc = Object.getOwnPropertyDescriptor(value, key); } catch (e) { desc = undefined; }
   var text;
-  /* What an object's own value is printed as when the entry is a getter and the walk was asked for
-     what it returns: the value goes behind the marker for a primitive -- "[Getter: 1]", and the
-     string one quotes -- and *after* the marker for an object, which is why '{ get g() { return {} } }'
-     is '{ g: [Getter] { a: 1 } }' on host node 24.15 and not '{ g: [Getter: { a: 1 }] }'. */
-  var behind = '';
   if (desc !== undefined && (desc.get !== undefined || desc.set !== undefined)) {
-    var marker = desc.get !== undefined ? (desc.set !== undefined ? 'Getter/Setter' : 'Getter') : 'Setter';
-    var shown = '';
-    if (desc.get !== undefined && (getters === true || getters === 'get')) {
-      var read = undefined;
-      var readOk = false;
-      try { read = desc.get.call(value); readOk = true; } catch (getterThrew) { readOk = false; }
-      if (readOk) {
-        var printed = fmt(read, depth, indent);
-        if (read !== null && (typeof read === 'object' || typeof read === 'function')) behind = ' ' + printed;
-        else shown = ': ' + printed;
-      }
-    }
-    text = styleBracketed('[' + marker + shown + ']');
+    text = desc.get !== undefined ? (desc.set !== undefined ? '[Getter/Setter]' : '[Getter]') : '[Setter]';
   } else if (desc !== undefined && 'value' in desc) {
     text = fmt(desc.value, depth, indent);
   } else {
@@ -1504,13 +1070,8 @@ function inspectEntryOf(fmt, value, key, depth, indent, getters) {
   var name;
   if (typeof key === 'symbol') name = String(key);
   else name = isIdentifierKey(key) ? key : quoteStringLiteral(key);
-  /* A key node has to quote -- 'a-b', '1', '' -- is a string and is written in a string's colour,
-     and so is a symbol; an identifier is written bare and in no colour at all. One that is not
-     enumerable goes in brackets, and the brackets take the colour the key would have had away:
-     '[h]: 1' is a plain key in front of a coloured value. */
-  if (desc === undefined || desc.enumerable === false) return '[' + name + ']: ' + text + behind;
-  if (typeof key === 'symbol' || !isIdentifierKey(key)) return styleString(name) + ': ' + text + behind;
-  return name + ': ' + text + behind;
+  if (desc === undefined || desc.enumerable === false) name = '[' + name + ']';
+  return name + ': ' + text;
 }
 
 /* The entries of an object-like value, one line when node's own fit test lets them be and one per
@@ -1521,10 +1082,10 @@ function inspectEntryOf(fmt, value, key, depth, indent, getters) {
 function joinInspectEntries(prefix, entries, indent, opts, subDepth) {
   if (entries.length === 0) return prefix + '{}';
   var width = opts && typeof opts.breakLength === 'number' ? opts.breakLength : 80;
-  var totalLength = entries.length + (entries.length + indent + 1 + styledWidth(prefix) + 10);
+  var totalLength = entries.length + (entries.length + indent + 1 + prefix.length + 10);
   var fits = compactAllowsOneLine(opts, subDepth);
   for (var i = 0; fits && i < entries.length; i++) {
-    totalLength += styledWidth(entries[i]);
+    totalLength += entries[i].length;
     if (totalLength > width) fits = false;
   }
   /* A prefix that already carries a line break -- the stack of an error, which is where its own
@@ -1585,7 +1146,7 @@ function errorInspectOf(err, fmt, depth, indent, opts) {
   if (keys.length === 0) return head;
   var entries = [];
   for (var i = 0; i < keys.length; i++) {
-    entries.push(inspectEntryOf(fmt, err, keys[i], depth + 1, indent + 2, gettersOf(opts)));
+    entries.push(inspectEntryOf(fmt, err, keys[i], depth + 1, indent + 2));
   }
   if (opts && opts.sorted) entries.sort(typeof opts.sorted === 'function' ? opts.sorted : undefined);
   return joinInspectEntries(head + ' ', entries, indent, opts, 0);
@@ -1625,11 +1186,7 @@ function bufferInspectOf(v, indent, opts) {
   var length = 0;
   try { length = v.byteLength; } catch (e) { /* detached */ }
   /* Nothing nests inside a buffer, so 'compact' is measured against a depth of 0. */
-  /* A pseudo-key is written in a string's colour -- '[byteLength]' opens and closes with the green
-     of one -- but '[Uint8Contents]' is the one pseudo-entry node writes in the colour it writes
-     the things it names in brackets with, and the bytes it names are in no colour at all. */
-  return joinInspectEntries(prefix, [styleBracketed('[Uint8Contents]') + ': ' + bufferBytesText(v, opts),
-    styleString('[byteLength]') + ': ' + styleNumber(String(length))], indent, opts, 0);
+  return joinInspectEntries(prefix, ['[Uint8Contents]: ' + bufferBytesText(v, opts), '[byteLength]: ' + length], indent, opts, 0);
 }
 
 /* What 'util.inspect' writes for a DataView: the three things about it, the buffer it views last
@@ -1645,9 +1202,7 @@ function dataViewInspectOf(v, depth, indent, opts) {
     buffer = INSPECT_FMT === null ? '[ArrayBuffer]' : INSPECT_FMT(v.buffer, depth + 1, indent + 2);
   } catch (e) { /* detached */ }
   /* The buffer it views is one level of nesting, so 'compact' is measured against a depth of 1. */
-  return joinInspectEntries(prefix, [styleString('[byteLength]') + ': ' + styleNumber(String(length)),
-    styleString('[byteOffset]') + ': ' + styleNumber(String(offset)),
-    styleString('[buffer]') + ': ' + buffer], indent, opts, 1);
+  return joinInspectEntries(prefix, ['[byteLength]: ' + length, '[byteOffset]: ' + offset, '[buffer]: ' + buffer], indent, opts, 1);
 }
 
 /* the element type name of a typed array (Uint8Array and the rest), or undefined for any other value */
@@ -1712,10 +1267,7 @@ function utilTypes() {
     isMap: function (v) { return utilBrandCheck(Map.prototype.has, v); },
     isMapIterator: function (v) { return utilTag(v) === 'Map Iterator'; },
     isModuleNamespaceObject: function (v) { return utilTag(v) === 'Module'; },
-    /* A DOMException is a native error to node on every test it applies: host node 24.15 answers
-       true to util.types.isNativeError(new DOMException('d', 'AbortError')), and the tag is the
-       test, so the one it carries has to be read here as well. */
-    isNativeError: function (v) { var t = utilTag(v); return t === 'Error' || t === 'DOMException'; },
+    isNativeError: function (v) { return utilTag(v) === 'Error'; },
     isNumberObject: function (v) { return utilBrandCheck(Number.prototype.valueOf, v); },
     /* The tag and not 'instanceof': a promise out of a 'vm' context is of another realm, so
        'instanceof Promise' is false for it on host Node 24.15 as well, and 'util.types.isPromise'
@@ -1941,27 +1493,12 @@ BF.util = function () {
     inspect: function (value, opts) {
       return inspectValue(value, opts);
     },
-    /*
-     * Node's inheritance is one line and it is the prototype of the SUBCLASS's 'prototype':
-     * 'Object.setPrototypeOf(ctor.prototype, superCtor.prototype)'. It is what makes an instance
-     * answer the superclass's methods and it touches nothing else -- in particular the constructor
-     * itself stays a function whose prototype is 'Function.prototype', so no static of the
-     * superclass is reachable through the subclass and 'Object.getPrototypeOf(B) === A' is false,
-     * which is what host node 24.15 answers. Setting 'B' itself made every static of 'A' a static
-     * of 'B' and 'B instanceof A' true, which no host does.
-     */
     inherits: function (ctor, superCtor) {
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
+      Object.setPrototypeOf(ctor, superCtor);
       ctor.super_ = superCtor;
     },
     promisify: function (fn) {
-      /* A function that promisifies itself wins: node answers the value of
-         'fn[util.promisify.custom]' itself, so the promisified call is the function the author
-         wrote and not a wrapper around a callback form. */
-      if (PROMISIFY_CUSTOM !== undefined && fn !== null && fn !== undefined &&
-          typeof fn[PROMISIFY_CUSTOM] === 'function') {
-        return fn[PROMISIFY_CUSTOM];
-      }
       return function () {
         var self = this;
         var args = Array.prototype.slice.call(arguments);
@@ -1981,32 +1518,8 @@ BF.util = function () {
         fn.apply(this, args).then(function (value) { cb(null, value); }, function (err) { cb(err); });
       };
     },
-    /*
-     * The wrapper 'util.deprecate' hands back. Host node 24.15 gives the message to
-     * 'process.emitWarning' the first time it is called and not before, which is why
-     * 'util.deprecate(fn)' with no message is a function that answers -- and whose FIRST call
-     * throws 'ERR_INVALID_ARG_TYPE: The "warning" argument must be of type string or an instance
-     * of Error. Received undefined'. The warning the host fails to emit is one it counts as
-     * emitted all the same: 'warned' is set before the call, so the second call goes straight
-     * through to the function and answers 5 where the first threw. A message that is a string or
-     * an Error is written on the next tick, as node's own is, in front of the value the function
-     * returns and behind the output the synchronous part of the program has already made.
-     */
-    deprecate: function (fn, msg, code) {
-      if (code !== undefined && typeof code !== 'string') {
-        throw utilArgError('ERR_INVALID_ARG_TYPE',
-          'The "code" argument must be of type string. Received type ' + utilReceivedAs(code));
-      }
-      var warned = false;
-      function deprecated() {
-        var proc = globalThis.process;
-        if (!warned && !(proc && proc.noDeprecation)) {
-          warned = true;
-          emitDeprecationWarning(msg, code);
-        }
-        return fn.apply(this, arguments);
-      }
-      return deprecated;
+    deprecate: function (fn) {
+      return fn;
     },
     debuglog: function () {
       return function () {};
@@ -2031,7 +1544,7 @@ BF.util = function () {
      */
     getSystemErrorName: function (err) {
       if (typeof err !== 'number') {
-        var typeError = new TypeError('The "err" argument must be of type number. Received type ' + utilReceivedAs(err));
+        var typeError = new TypeError('The "err" argument must be of type number. Received type ' + typeof err);
         typeError.code = 'ERR_INVALID_ARG_TYPE';
         throw typeError;
       }
@@ -2041,128 +1554,19 @@ BF.util = function () {
         throw rangeError;
       }
       var errname = globalThis.__owcErrname;
-      /* An errno the table does not hold is not named by the word libuv keeps for one it cannot
-         name: node answers the number it was asked about, "Unknown system error -4058", so a
-         caller that prints the name of an errno it has not seen still sees which one it was. */
-      var name = typeof errname === 'function' ? errname(err) : '';
-      return name === undefined || name === null || name === '' ? 'Unknown system error ' + err : name;
+      return typeof errname === 'function' ? errname(err) : 'UNKNOWN';
     },
     types: utilTypes(),
     parseArgs: parseArgsImpl,
     TextEncoder: TextEncoderImpl,
     TextDecoder: TextDecoderImpl
   };
-  /* The two well-known symbols are reachable off 'util' itself -- 'util.inspect.custom' and
-     'util.promisify.custom' -- which is the only way a program can put the hook on a value: a
-     guest that wrote '{ [util.inspect.custom]: fn }' built an object keyed "undefined" while the
-     symbol was missing, and no custom inspect was ever called. */
-  if (INSPECT_CUSTOM !== undefined) util.inspect.custom = INSPECT_CUSTOM;
-  if (PROMISIFY_CUSTOM !== undefined) util.promisify.custom = PROMISIFY_CUSTOM;
   return util;
 };
 
 BF['util/types'] = function () {
   return requireBuiltin('util').types;
 };
-
-/*
- * '+ actual - expected', as node's own assert prints a pair of values it cannot show side by side:
- * one line per line of the two inspections, '  ' where they agree, '+ ' for a line only the actual
- * has and '- ' for a line only the expected has. Two lines that differ by nothing but the trailing
- * separator the last entry of a collection carries -- '  a: 1' against '  a: 1,' -- are one line,
- * and are printed with it: that is why a value with an entry added at the end shows one '-' line
- * and no '+' line at all.
- */
-function deepSameDiffLine(a, b) {
-  return a === b || a + ',' === b || a === b + ',';
-}
-
-/*
- * Node's own pointer row -- getStackedDiff in lib/internal/assert/assertion_error.js. Under a pair
- * that is one line each it writes a third line of spaces with a '^' in the column at which the two
- * inspections first differ, counting the two columns the '+ ' and '- ' take, which is why it is
- * padded with two more spaces than that index, and it writes none at all while the first
- * difference falls inside the first three columns, where the pair already reads as different at a
- * glance, while that difference is past the end of the shorter of the two lines, once the two
- * lines are together longer than a terminal is wide -- 80 where the standard error is not one --
- * and for a pair of objects, which node shows through its line diff and not through this one.
- */
-function deepDiffCaret(a, b, aText, bText) {
-  if (a !== null && typeof a === 'object' && b !== null && typeof b === 'object') return '';
-  if (aText.indexOf('\n') >= 0 || bText.indexOf('\n') >= 0) return '';
-  if (aText.length + bText.length > 80) return '';
-  var indicatorIdx = -1;
-  var i = 0;
-  for (; i < aText.length; i++) {
-    if (aText.charAt(i) !== bText.charAt(i)) {
-      if (i >= 3) indicatorIdx = i;
-      break;
-    }
-  }
-  if (indicatorIdx === -1) return '';
-  var pad = '';
-  for (i = 0; i < indicatorIdx + 2; i++) pad += ' ';
-  return pad + '^';
-}
-
-/*
- * Node's own choice between the two shapes -- isSimpleDiff and getSimpleDiff in the same file. A
- * pair of objects is never shown side by side, and neither is a pair either side of which
- * inspects to more than one line: both go through node's line diff, with the '+ actual - expected'
- * header. What is left is written 'a !== b' while it is still short enough to read on one line:
- * node's own bound, kMaxShortStringLength, less the two quotes each side that is a string is
- * written with. Everything else is the stacked pair, and it carries the pointer row.
- */
-function deepDiffable(a, b, aText, bText) {
-  var aObj = a !== null && typeof a === 'object';
-  var bObj = b !== null && typeof b === 'object';
-  if (aObj && bObj) return true;
-  if (aText.indexOf('\n') >= 0 || bText.indexOf('\n') >= 0) return true;
-  var stringsLen = aText.length + bText.length;
-  if (typeof a === 'string') stringsLen -= 2;
-  if (typeof b === 'string') stringsLen -= 2;
-  if (stringsLen <= 12 && (a !== 0 || b !== 0)) return false;
-  return true;
-}
-
-function deepDiffLines(aText, bText, caret) {
-  var a = aText.split('\n');
-  var b = bText.split('\n');
-  var n = a.length;
-  var m = b.length;
-  var out = [];
-  var i, j;
-  if (n * m > 40000) {
-    for (i = 0; i < n; i++) out.push('+ ' + a[i]);
-    for (j = 0; j < m; j++) out.push('- ' + b[j]);
-    return out.join('\n') + '\n' + (caret ? caret + '\n' : '');
-  }
-  /* L[i][j]: the longest common subsequence of a[i..] and b[j..]. */
-  var L = [];
-  for (i = 0; i <= n; i++) { L.push(new Array(m + 1)); L[i][m] = 0; }
-  for (j = 0; j <= m; j++) L[n][j] = 0;
-  for (i = n - 1; i >= 0; i--) {
-    for (j = m - 1; j >= 0; j--) {
-      L[i][j] = deepSameDiffLine(a[i], b[j]) ? 1 + L[i + 1][j + 1] : Math.max(L[i + 1][j], L[i][j + 1]);
-    }
-  }
-  i = 0;
-  j = 0;
-  while (i < n || j < m) {
-    if (i < n && j < m && deepSameDiffLine(a[i], b[j])) {
-      out.push('  ' + (a[i].length >= b[j].length ? a[i] : b[j]));
-      i++;
-      j++;
-    } else if (j === m || (i < n && L[i + 1][j] >= L[i][j + 1])) {
-      out.push('+ ' + a[i]);
-      i++;
-    } else {
-      out.push('- ' + b[j]);
-      j++;
-    }
-  }
-  return out.join('\n') + '\n' + (caret ? caret + '\n' : '');
-}
 
 BF.assert = function () {
   var util = requireBuiltin('util');
@@ -2199,76 +1603,36 @@ BF.assert = function () {
   };
   assert.ok = assertOk;
   assert.AssertionError = function (options) { return AssertionError(options); };
-  /* The name a host's AssertionError answers to: node names the constructor in
-     'Missing expected exception (AssertionError).', and an anonymous function answers none. */
-  Object.defineProperty(assert.AssertionError, 'name', { value: 'AssertionError', configurable: true });
   assert.fail = function (message) {
     fail(undefined, undefined, message === undefined ? 'Failed' : message, 'fail', 'Failed');
   };
-  /*
-   * How node's own assert writes a value into a message: one entry per line, however short the
-   * value, and as deep as the value goes -- 'compact: false' and a depth no walk reaches, both of
-   * which util.inspect at its defaults does not do.
-   */
-  function assertInspect(v) {
-    return inspectValue(v, { compact: false, depth: 1000 });
-  }
-
-  function deepStrictMessage(actual, expected) {
-    var a = assertInspect(actual);
-    var b = assertInspect(expected);
-    if (deepDiffable(actual, expected, a, b)) {
-      return 'Expected values to be strictly deep-equal:\n+ actual - expected\n\n'
-        + deepDiffLines(a, b, deepDiffCaret(actual, expected, a, b));
-    }
-    return 'Expected values to be strictly deep-equal:\n\n' + a + ' !== ' + b + '\n';
-  }
-
-  function notDeepStrictMessage(expected) {
-    var b = assertInspect(expected);
-    /* One line sits on the header's own line; anything longer is a block of its own. */
-    return 'Expected "actual" not to be strictly deep-equal to:' + (b.indexOf('\n') >= 0 ? '\n\n' + b + '\n' : ' ' + b);
-  }
-
   assert.equal = function (actual, expected, message) {
     if (!(actual == expected || (actual !== actual && expected !== expected))) {
-      fail(actual, expected, message, '==', assertInspect(actual) + ' == ' + assertInspect(expected));
+      fail(actual, expected, message, '==', inspectValue(actual) + ' == ' + inspectValue(expected));
     }
   };
   assert.notEqual = function (actual, expected, message) {
-    if (actual == expected) fail(actual, expected, message, '!=', assertInspect(actual) + ' != ' + assertInspect(expected));
+    if (actual == expected) fail(actual, expected, message, '!=', inspectValue(actual) + ' != ' + inspectValue(expected));
   };
   assert.strictEqual = function (actual, expected, message) {
-    if (Object.is(actual, expected)) return;
-    var aObj = actual !== null && (typeof actual === 'object' || typeof actual === 'function');
-    var bObj = expected !== null && (typeof expected === 'object' || typeof expected === 'function');
-    if (!aObj || !bObj) {
-      fail(actual, expected, message, 'strictEqual', 'Expected values to be strictly equal:\n\n' + assertInspect(actual) + ' !== ' + assertInspect(expected) + '\n');
+    if (!Object.is(actual, expected)) {
+      fail(actual, expected, message, 'strictEqual', 'Expected values to be strictly equal:\n\n' + inspectValue(actual) + ' !== ' + inspectValue(expected) + '\n');
     }
-    /* Two values that a strict deep comparison would call equal, and that are not the same value:
-       node names that case on its own, and shows only the actual. */
-    if (util.__isDeepEqual(actual, expected, true)) {
-      fail(actual, expected, message, 'strictEqual', 'Values have same structure but are not reference-equal:\n\n' + assertInspect(actual) + '\n');
-    }
-    var a = assertInspect(actual);
-    var b = assertInspect(expected);
-    fail(actual, expected, message, 'strictEqual', 'Expected "actual" to be reference-equal to "expected":\n+ actual - expected\n\n'
-      + deepDiffLines(a, b, deepDiffCaret(actual, expected, a, b)));
   };
   assert.notStrictEqual = function (actual, expected, message) {
-    if (Object.is(actual, expected)) fail(actual, expected, message, 'notStrictEqual', 'Expected "actual" to be strictly unequal to: ' + assertInspect(expected));
+    if (Object.is(actual, expected)) fail(actual, expected, message, 'notStrictEqual', 'Expected "actual" to be strictly unequal to: ' + inspectValue(expected));
   };
   assert.deepEqual = function (actual, expected, message) {
-    if (!util.__isDeepEqual(actual, expected, false)) fail(actual, expected, message, 'deepEqual', 'Expected values to be loosely deep-equal:\n\n' + assertInspect(actual) + '\n\nshould loosely deep-equal\n\n' + assertInspect(expected));
+    if (!util.__isDeepEqual(actual, expected, false)) fail(actual, expected, message, 'deepEqual', 'Expected values to be loosely deep-equal:\n\n' + inspectValue(actual) + '\n\nshould loosely deep-equal\n\n' + inspectValue(expected));
   };
   assert.deepStrictEqual = function (actual, expected, message) {
-    if (!util.__isDeepEqual(actual, expected, true)) fail(actual, expected, message, 'deepStrictEqual', deepStrictMessage(actual, expected));
+    if (!util.__isDeepEqual(actual, expected, true)) fail(actual, expected, message, 'deepStrictEqual', 'Expected values to be strictly deep-equal:\n' + inspectValue(actual) + '\n\nshould equal\n\n' + inspectValue(expected));
   };
   assert.notDeepStrictEqual = function (actual, expected, message) {
-    if (util.__isDeepEqual(actual, expected, true)) fail(actual, expected, message, 'notDeepStrictEqual', notDeepStrictMessage(expected));
+    if (util.__isDeepEqual(actual, expected, true)) fail(actual, expected, message, 'notDeepStrictEqual', 'Expected "actual" not to be strictly deep-equal to: ' + inspectValue(expected));
   };
   assert.notDeepEqual = function (actual, expected, message) {
-    if (util.__isDeepEqual(actual, expected, false)) fail(actual, expected, message, 'notDeepEqual', 'Expected "actual" not to be loosely deep-equal to:\n\n' + assertInspect(expected));
+    if (util.__isDeepEqual(actual, expected, false)) fail(actual, expected, message, 'notDeepEqual', 'Expected "actual" not to be loosely deep-equal to: ' + inspectValue(expected));
   };
   assert.throws = function (fn, expected, message) {
     var threw = false;
@@ -2279,10 +1643,7 @@ BF.assert = function () {
       threw = true;
       error = e;
     }
-    if (!threw) {
-      fail(undefined, expected, typeof expected === 'string' ? expected : message, 'throws',
-        'Missing expected exception' + (typeof expected === 'function' ? ' (' + (expected.name || '') + ').' : '.'));
-    }
+    if (!threw) fail(undefined, expected, typeof expected === 'string' ? expected : message, 'throws', 'Missing expected exception.');
     if (typeof expected === 'function' && expected.prototype !== undefined && !(error instanceof expected)) throw error;
     if (expected instanceof RegExp && !expected.test(String(error && error.message !== undefined ? error.message : error))) throw error;
   };
@@ -2293,29 +1654,16 @@ BF.assert = function () {
       fail(e, undefined, message, 'doesNotThrow', 'Got unwanted exception.\nActual message: "' + (e && e.message) + '"');
     }
   };
-  assert.rejects = function (promiseOrFn, expected, message) {
+  assert.rejects = function (promiseOrFn) {
     var promise = typeof promiseOrFn === 'function' ? promiseOrFn() : promiseOrFn;
     return promise.then(function () {
-      fail(undefined, expected, undefined, 'rejects', 'Missing expected rejection.');
-    }, function (error) {
-      if (expected === undefined) return undefined;
-      /* A rejection is matched the way assert.match matches a string and the way assert.throws
-         matches a constructor: over String(error), which is why 'Error: boom' and not 'boom'. */
-      if (expected instanceof RegExp) {
-        var text = String(error);
-        if (!expected.test(text)) {
-          fail(text, expected, message, 'match', 'The input did not match the regular expression ' + String(expected) + '. Input:\n\n' + assertInspect(text) + '\n');
-        }
-        return undefined;
-      }
-      if (typeof expected === 'function' && expected.prototype !== undefined && !(error instanceof expected)) {
-        fail(error, expected, message, 'rejects', 'The error is expected to be an instance of "' + (expected.name || '') + '". Received "' + (error && error.name) + '"\n\nError message:\n\n' + (error && error.message));
-      }
+      fail(undefined, undefined, undefined, 'rejects', 'Missing expected rejection.');
+    }, function () {
       return undefined;
     });
   };
   assert.match = function (string, regexp, message) {
-    if (!regexp.test(string)) fail(string, regexp, message, 'match', 'The input did not match the regular expression ' + String(regexp) + '. Input:\n\n' + assertInspect(string) + '\n');
+    if (!regexp.test(string)) fail(string, regexp, message, 'match', 'The input did not match the regular expression ' + String(regexp));
   };
   assert.strict = assert;
   return assert;

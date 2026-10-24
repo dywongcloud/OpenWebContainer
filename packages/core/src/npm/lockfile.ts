@@ -16,8 +16,6 @@ export interface LockTreeNode {
     dev: boolean;
     /** Reached through an optionalDependencies entry. */
     optional: boolean;
-    /** Installed out of a directory rather than fetched from the registry: npm records `link: true`. */
-    link?: boolean;
     manifest: Record<string, any>;
 }
 
@@ -96,8 +94,6 @@ function packageEntry(node: LockTreeNode, previous: LockPackage | undefined): Lo
     const integrity = node.integrity ?? asString(previous?.integrity);
     if (resolved !== undefined) entry.resolved = resolved;
     if (integrity !== undefined) entry.integrity = integrity;
-    /* A link the tree already carried keeps its `link`: the copy on disk is still the directory's. */
-    if (node.link === true || previous?.link === true) entry.link = true;
     if (node.dev) entry.dev = true;
     if (node.optional) entry.optional = true;
     if (hasInstallScript(manifest)) entry.hasInstallScript = true;

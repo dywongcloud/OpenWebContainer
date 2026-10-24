@@ -184,20 +184,6 @@ export class NodeResolver {
        synchronous, so a failure never outlives the resolution that set it. */
     private lastFailure: ResolveFailure | undefined;
 
-    /**
-     * The type stripper, handed in by the node executor. Node decides the format of a `.ts` from the
-     * source with its types already gone -- `getFileProtocolModuleFormat` in node's own
-     * lib/internal/modules/esm/get_format.js runs `stripTypeScriptModuleTypes(source)` first and
-     * `containsModuleSyntax` on what is left second, when the nearest package.json names no type --
-     * so a file whose only import is an `import type` has no import left and is CommonJS. The
-     * stripper lives beside the engine, so it is handed in rather than imported.
-     */
-    private tsStrip: ((source: string) => string) | undefined;
-
-    setTypeStripper(strip: (source: string) => string): void {
-        this.tsStrip = strip;
-    }
-
     resolve(specifier: string, fromDir: string, mode: ResolveMode): string | undefined {
         /* An absolute URL is its own module, not a package name: `file:` and `data:` are the two the
            default ESM loader reads. require() reads neither -- Node reports
@@ -327,15 +313,7 @@ export class NodeResolver {
             const packageType = this.nearestPackageType(dirnameOf(file));
             if (packageType === 'module') return true;
             if (packageType === 'commonjs') return false;
-            let code = this.fileSystem.readFile(file) ?? '';
-            /* Amaro's own rule, read from node's source: a `.ts` is detected as the type-stripped
-               source reads, not as it is written. What Node refuses to strip -- an `enum`, a
-               `namespace` -- refuses before any detection, so a source that raises falls back to the
-               raw text and is judged as it stands. */
-            if (file.endsWith('.ts') && this.tsStrip !== undefined) {
-                try { code = this.tsStrip(code); } catch { /* refused: judge the raw source */ }
-            }
-            code = withoutLiterals(code);
+            const code = withoutLiterals(this.fileSystem.readFile(file) ?? '');
             return MODULE_IMPORT.test(code) || MODULE_EXPORT.test(code)
                 || MODULE_IMPORT_META.test(code) || hasTopLevelAwait(code);
         }

@@ -206,22 +206,9 @@ function owcBuildStreamCore() {
     return v;
   }
 
-  /* Node 24 refuses any highWaterMark that is not a non-negative integer, in the Readable and the
-     Writable constructor and on either side of a Duplex, with ERR_INVALID_ARG_VALUE naming the
-     option it read: 'options.highWaterMark' on a one-sided stream, 'options.readableHighWaterMark'
-     or 'options.writableHighWaterMark' on a duplex side. A fractional or negative mark used to be
-     stored as it was given, so a stream answered readableHighWaterMark 1.5, or -1, where the host
-     throws, and every later comparison against the mark was made against a number no host allows. */
   function pickHighWaterMark(opts, duplexKey, objectMode) {
     var v = duplexKey && opts[duplexKey] !== undefined && opts[duplexKey] !== null ? opts[duplexKey] : opts.highWaterMark;
-    if (v !== undefined && v !== null) {
-      if (!Number.isInteger(v) || v < 0) {
-        throw owcErr(TypeError, 'ERR_INVALID_ARG_VALUE',
-          "The property '" + (duplexKey ? 'options.' + duplexKey : 'options.highWaterMark')
-          + "' is invalid. Received " + inspectValue(v));
-      }
-      return Math.floor(v);
-    }
+    if (v !== undefined && v !== null) return v;
     return objectMode ? defaultObjectHighWaterMark : defaultHighWaterMark;
   }
 
@@ -641,15 +628,6 @@ function owcBuildStreamCore() {
       if (typeof cb === 'function') cb();
       return this;
     }
-    /* Node's Writable.prototype.destroy (internal/streams/writable.js) invokes the pending callbacks
-       before it hands the stream to destroy.js: one destroyed with writes still buffered -- the
-       corked one, which clearBuffer refuses to touch -- has every buffered chunk dropped and its
-       callback called with ERR_STREAM_DESTROYED on the next tick, so writableLength reads 0
-       afterwards. Skipping it left a destroyed corked stream still reporting the chunk it held.
-       The tick is queued before checkErrored, as it is on the host, so a buffered write's callback
-       still runs before 'close'. errorBuffer stands down while a write is in flight, which leaves
-       the uncorked mid-write shape to afterWrite exactly as it was. */
-    if (w && w.buffered.length > 0) process.nextTick(errorBuffer, w);
     checkErrored(err, w, r);
     if (w) w.destroyed = true;
     if (r) r.destroyed = true;
@@ -3783,56 +3761,24 @@ function owcBuildStreamCore() {
     return argTypeError(what, 'an instance of ' + what, value);
   }
 
-  /* Node bridges a readable to the web with its flowing mode and not with its async iterator: a
-     'data' listener enqueues ONE web chunk per chunk the readable emits, pull resumes the readable,
-     and a pause once the web queue is full stops it again. The iterator hands a pull whatever the
-     readable has buffered, which under a consumer slower than the producer is every chunk pushed
-     since the last pull coalesced into one -- 5 web chunks here against the host's 30, and 6
-     against 300 -- so a web consumer saw fewer, larger chunks than any host gives it, and one that
-     counts records, splits lines or parses NDJSON over a web stream read a different stream. */
   Readable.toWeb = function (stream) {
     if (typeof ReadableStream !== 'function') throw webStreamsMissing('ReadableStream', stream);
+    var it = createReadableIterator(stream, null);
     var objectMode = !!(stream && stream._readableState && stream._readableState.objectMode);
-    var controller = null;
-    var settled = false;
-
-    function detach() {
-      offListener(stream, 'data', onData);
-      offListener(stream, 'end', onEnd);
-      offListener(stream, 'error', onError);
-    }
-    function onData(chunk) {
-      if (settled || controller === null) return;
-      controller.enqueue(webChunkOf(chunk, objectMode));
-      /* The web queue is full: stop the readable until the consumer asks for more, which is what
-         Node's own adapter does on a desiredSize that has run out. */
-      if (controller.desiredSize <= 0) stream.pause();
-    }
-    function onEnd() {
-      if (settled || controller === null) return;
-      settled = true;
-      detach();
-      controller.close();
-    }
-    function onError(err) {
-      if (settled || controller === null) return;
-      settled = true;
-      detach();
-      controller.error(err);
-    }
-
-    stream.on('data', onData);
-    stream.on('end', onEnd);
-    stream.on('error', onError);
-    stream.pause();
-
+    var ended = false;
     return new ReadableStream({
-      start: function (c) { controller = c; },
-      pull: function () { stream.resume(); },
-      cancel: function (reason) {
-        settled = true;
-        detach();
-        if (!stream.destroyed && typeof stream.destroy === 'function') stream.destroy(reason);
+      pull: function (controller) {
+        return it.next().then(function (step) {
+          if (step.done) {
+            ended = true;
+            controller.close();
+            return;
+          }
+          controller.enqueue(webChunkOf(step.value, objectMode));
+        }, function (err) { controller.error(err); });
+      },
+      cancel: function () {
+        if (!ended && typeof it.return === 'function') it.return();
         return undefined;
       }
     });
@@ -4969,24 +4915,21 @@ function owcBuildStreamCore() {
     if (s.length > 0) this._insertString(s);
   };
 
-  /* A key handed to write() is the line editor's, as it is on a host: Node's write() sends every
-     write a terminal interface is given straight to _ttyWrite, so rl.write(null, { name: 'up' })
-     walks the history, rl.write(null, { name: 'left' }) moves the cursor and rl.write('f',
-     { ctrl: true, name: 'u' }) kills the line. A write that carries no key at all stays on the
-     path that decodes and echoes what the call brought in, which is the host's own split: text
-     without a key is not a keypress, and a host inserts it without asking the editor. */
+  /* A control or meta key handed to write() is the line editor's, as it is on a host: rl.write('f',
+     { ctrl: true, name: 'u' }) kills the line it was given and leaves nothing behind. Text without
+     such a key stays on the path that echoes what the call brought in. */
   OwcRlBase.prototype.write = function (data, key) {
     if (this.closed) throw errUseAfterClose();
-    if (this.paused) this.resume();
-    if (this.terminal && key !== null && key !== undefined) {
-      this._ttyWrite(data, key);
-      return;
-    }
     /* A non-terminal interface writes bytes, and Node says so before it looks at the key or the
        output: anything that is neither a string nor a view over bytes is refused with
        ERR_INVALID_ARG_TYPE under the name 'buf'. A terminal one takes the same values without
        complaint, so only the path that decodes carries the check. */
     if (!this.terminal) checkWriteBuf(data);
+    if (this.paused) this.resume();
+    if (this.terminal && key !== null && key !== undefined && (!!key.ctrl || !!key.meta)) {
+      this._ttyWrite(data, key);
+      return;
+    }
     normalWrite(this, data, key);
   };
 

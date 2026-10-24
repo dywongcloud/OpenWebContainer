@@ -1,8 +1,0 @@
-WITNESS PASS (judge, shard guest, 2026-10-23, HEAD f5d5931)
-Input: require chalk@4.1.2, picocolors@1.1.1, supports-color@7.2.0 from a real node_modules tree, print
-chalk.level / chalk.red('x') / picocolors.isColorSupported / picocolors.red('x') / supports-color.stdout.level.
-Container: {"chalkLevel":0,"chalkRed":"\"x\"","pcSupported":false,"pcRed":"\"x\"","sc7":"falsey","term":"xterm","colorterm":"truecolor","isatty1":false}  exit 0
-Host     : {"chalkLevel":0,"chalkRed":"\"x\"","pcSupported":false,"pcRed":"\"x\"","sc7":"falsey","term":"xterm-ghostty","colorterm":"truecolor","clicolor":"1","isatty1":false}  exit 0
-Every value a colour library reads agrees. What still differs is values no tested library reads: 9 env keys
-(COLORTERM HOME LANG LOGNAME PATH PWD TERM TMPDIR USER) against the host's 66, TERM xterm against
-xterm-ghostty, and no CLICOLOR. Machine: load 23.41 (1-min), 3.1 GB free. Row closed.

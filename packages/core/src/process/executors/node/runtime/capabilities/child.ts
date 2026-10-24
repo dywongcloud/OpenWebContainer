@@ -31,7 +31,6 @@ import type { CommandContext, CommandResult, ShellCommand } from '../../../../..
 import {
     LIFECYCLE_COMMANDS,
     NPM_VERSION,
-    effectiveScripts,
     findPackageRoot,
     missingScriptMessage,
     parseScriptArgs,
@@ -3044,14 +3043,11 @@ function npmCommand(shell: SyncShell, args: string[]): ShellStep {
         return { stdout: '', stderr: diagnostic(`npm error code ENOENT\nnpm error enoent Could not read package.json in ${packageDir}`), exitCode: 1 };
     }
     const label = scriptLabel(manifest, packageDir);
-    const declared = (manifest.scripts ?? {}) as Record<string, unknown>;
-    /* `npm run` lists the scripts the package declares; a command *runs* npm's own stop-then-start
-       in place of a restart script the package does not have. */
-    const scripts = effectiveScripts(declared);
-    if (name === undefined) return { stdout: scriptList(label, declared), stderr: '', exitCode: 0 };
+    const scripts = (manifest.scripts ?? {}) as Record<string, unknown>;
+    if (name === undefined) return { stdout: scriptList(label, scripts), stderr: '', exitCode: 0 };
     if (typeof scripts[name] !== 'string') {
         if (ifPresent) return EMPTY_STEP;
-        return { stdout: '', stderr: diagnostic(missingScriptMessage(name, manifest)), exitCode: 1 };
+        return { stdout: '', stderr: diagnostic(missingScriptMessage(name)), exitCode: 1 };
     }
     const PATH = scriptPath(shell.ctx.fileSystem, packageDir, shell.env.PATH);
     let stdout = '';

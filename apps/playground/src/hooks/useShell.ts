@@ -14,13 +14,10 @@ export function useShell(container: ContainerManager | null, options: UseShellOp
     // Initialize shell process when container is available
     useEffect(() => {
         if (!container) return;
-        const promptTimers: ReturnType<typeof setTimeout>[] = [];
 
         async function initShell(container: ContainerManager) {
             try {
                 const args = osc ? ['--osc'] : [];
-                let received = false;
-
                 const process = await container.spawn('sh', args);
 
                 if (!(process instanceof VirtualProcess)) {
@@ -32,7 +29,6 @@ export function useShell(container: ContainerManager | null, options: UseShellOp
 
                 // Set up process event listeners
                 process.on(ProcessEvent.OUTPUT, (data) => {
-                    received = true;
                     setOutput((prev: string[]) => [...prev, data.output || '']);
                 });
 
@@ -46,25 +42,6 @@ export function useShell(container: ContainerManager | null, options: UseShellOp
                 });
 
                 setReady(true);
-
-                /* The prompt the shell writes as it starts is written inside the container, before
-                   the process this page holds exists to receive it, so it never arrives: the pane
-                   opened blank -- no banner, no prompt -- and stayed blank until something was
-                   typed into it. A bare newline runs nothing and asks the shell for the line it
-                   is waiting on, which is what puts its own prompt on screen on load. The line is
-                   worth sending more than once: written in the same moment the process is handed
-                   back, it can arrive before the shell has reached the read that takes it. */
-                for (const delay of [0, 400, 1500]) {
-                    const timer = setTimeout(() => {
-                        if (received) return;
-                        try {
-                            process.write('\r');
-                        } catch {
-                            /* the shell ended before the line reached it */
-                        }
-                    }, delay);
-                    promptTimers.push(timer);
-                }
 
                 // Execute initial commands if any
                 for (const cmd of initialCommands) {
@@ -80,7 +57,6 @@ export function useShell(container: ContainerManager | null, options: UseShellOp
 
         // Cleanup
         return () => {
-            for (const timer of promptTimers) clearTimeout(timer);
             const process = processRef.current;
             if (process) {
                 process.kill();

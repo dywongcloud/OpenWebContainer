@@ -551,13 +551,6 @@ BF['http'] = function () {
     this.connection = null;
   };
 
-  /* node's own diagnostics channels: the publish path lives in the diagnostics_channel family,
-     whose snippet is an IIFE of its own, so it reaches this one through a global name. */
-  function dcPublish(name, data) {
-    var publish = globalThis.__owcDcPublish;
-    if (publish !== undefined) publish(name, data);
-  }
-
   class ClientRequest extends OutgoingMessage {
     constructor(target, callback) {
       super({ autoDestroy: false });
@@ -590,8 +583,6 @@ BF['http'] = function () {
       }
       if (typeof callback === 'function') this.once('response', callback);
       if (target.timeout) this.setTimeout(target.timeout);
-      /* http.client.request.created: the moment the request object exists, before it has a socket. */
-      dcPublish('http.client.request.created', { request: this });
       if (this._virtual) this._connect();
     }
     /* The agent owns the socket: it hands over an idle one, opens one while the pool is under
@@ -729,8 +720,6 @@ BF['http'] = function () {
       if (this._res) {
         this._res.complete = true;
         this._res.push(null);
-        /* http.client.response.finish: the response has been read to its end. */
-        dcPublish('http.client.response.finish', { request: this, response: this._res });
       }
       // settled on a later tick, so the response's 'end' reaches its listeners before this request closes
       var req = this;
@@ -800,9 +789,6 @@ BF['http'] = function () {
     _sendHead(length) {
       if (this._headSent) return;
       this._headSent = true;
-      /* http.client.request.start: the head is about to go out, which is as far as a request gets
-         here before there is a socket under it. */
-      dcPublish('http.client.request.start', { request: this });
       var hdr = this._hdr;
       var bodyAllowed = !NO_BODY_METHODS[this.method];
       var lines = [this.method + ' ' + this.path + ' HTTP/1.1'];
@@ -1270,19 +1256,11 @@ BF['http'] = function () {
       res._keepAliveSeconds = Math.round(server.keepAliveTimeout / 1000) || 5;
       state.res = res;
       state.responding = true;
-      /* http.server.response.created: the response object for this request, before it is handed out. */
-      dcPublish('http.server.response.created', { request: req, response: res });
-      res.on('finish', function () {
-        /* http.server.response.finish: the response has been written to its end. */
-        dcPublish('http.server.response.finish', { request: req, response: res, server: server, socket: socket });
-        onResponseDone(res);
-      });
+      res.on('finish', function () { onResponseDone(res); });
       var expectation = pairValue(head.pairs, 'expect');
       if (expectation !== undefined && expectation.toLowerCase() === '100-continue') {
         socket.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1'));
       }
-      /* http.server.request.start: the request is about to reach the server's 'request' listener. */
-      dcPublish('http.server.request.start', { request: req, response: res, server: server, socket: socket });
       server.emit('request', req, res);
     }
 

@@ -58,27 +58,11 @@ interface GuestThrowDetail {
     name: string;
     message: string;
     code?: string;
-    /** Set when the guest threw a wasm exception rather than an error: the host exception's id. */
-    exc?: number;
 }
-
-/** The exception-handling constructors, which a host without the proposal does not carry. */
-interface WasmExceptionLike {
-    is(tag: unknown): boolean;
-    getArg(tag: unknown, index: number): number | bigint;
-}
-type WasmTagDescriptor = { parameters: string[] };
 
 class GuestThrow extends Error {
     constructor(readonly detail: GuestThrowDetail) {
         super(detail.message);
-    }
-}
-
-/** A wasm exception the guest threw. It is not an error: a handler in the module may catch it. */
-class GuestException extends Error {
-    constructor(readonly exceptionId: number) {
-        super('WebAssembly.Exception');
     }
 }
 
@@ -89,60 +73,11 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
     const memories = new Map<number, WebAssembly.Memory>();
     const tables = new Map<number, WebAssembly.Table>();
     const globals = new Map<number, WebAssembly.Global>();
-    const hostFns = new Map<number, (...args: Array<number | bigint | string>) => unknown>();
-    const tags = new Map<number, unknown>();
-    const tagParams = new Map<number, string[]>();
-    const exceptions = new Map<number, WasmExceptionLike>();
-    /** The tag an exception was built with, when it was built here. */
-    const exceptionTag = new Map<number, number>();
+    const hostFns = new Map<number, (...args: Array<number | bigint>) => unknown>();
     /** Guest values the host must keep: a handle argument dies with the call that received it. */
     const retained = context.newObject();
     let nextId = 1;
     const freshId = () => nextId++;
-
-    const WasmTag = (WebAssembly as unknown as { Tag?: new (descriptor?: unknown) => unknown }).Tag;
-    const WasmException = (WebAssembly as unknown as {
-        Exception?: new (tag: unknown, payload?: Array<number | bigint>) => WasmExceptionLike;
-    }).Exception;
-
-    /**
-     * The class the host itself raised.
-     *
-     * The bridge used to classify by where a failure happened -- a link-time failure became a
-     * LinkError, a failure inside a call a RuntimeError -- which is not what the host does. A bad
-     * import object and a Number for an i64 parameter are both bad *arguments*, and node raises
-     * TypeError for both, while a link against an import that is present but not callable is the
-     * one case that really is a LinkError. So the host's own class travels with the message and
-     * the guest rebuilds it.
-     */
-    const errorNameOf = (error: unknown): string => {
-        if (error instanceof WebAssembly.CompileError) return 'CompileError';
-        if (error instanceof WebAssembly.LinkError) return 'LinkError';
-        if (error instanceof WebAssembly.RuntimeError) return 'RuntimeError';
-        if (error instanceof TypeError) return 'TypeError';
-        if (error instanceof RangeError) return 'RangeError';
-        if (error instanceof SyntaxError) return 'SyntaxError';
-        return 'Error';
-    };
-    /** A host failure that carries the host's own class name, not one the bridge picks. */
-    const hostFail = (code: string, error: unknown, message?: string) =>
-        fail(code, message ?? (error instanceof Error ? error.message : String(error)), {
-            name: errorNameOf(error)
-        });
-
-    /**
-     * The API name inside a host message.
-     *
-     * The host builds these messages at the call site, so they name `WebAssembly.Instance()` --
-     * that is the constructor this bridge links through -- while the guest may have reached it
-     * through `WebAssembly.instantiate()`, whose message node names `WebAssembly.instantiate()`.
-     * Only the prefix is rewritten; the rest of the sentence is the host's own.
-     */
-    const INSTANCE_PREFIX = 'WebAssembly.Instance()';
-    const relabel = (message: string, label: string) =>
-        message.slice(0, INSTANCE_PREFIX.length) === INSTANCE_PREFIX
-            ? 'WebAssembly.' + label + '()' + message.slice(INSTANCE_PREFIX.length)
-            : message;
 
     const api = context.newObject();
     const define = (name: string, impl: (...args: QuickJSHandle[]) => QuickJSHandle) => {
@@ -191,19 +126,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             prop.dispose();
             return value;
         };
-        const readNumber = (name: string): number | undefined => {
-            const prop = context.getProp(handle, name);
-            const value = context.typeof(prop) === 'number' ? context.getNumber(prop) : undefined;
-            prop.dispose();
-            return value;
-        };
-        const detail: GuestThrowDetail = {
-            name: read('name') ?? 'Error',
-            message: read('message') ?? 'the import threw',
-            code: read('code'),
-            exc: readNumber('__exc')
-        };
-        return detail;
+        return { name: read('name') ?? 'Error', message: read('message') ?? 'the import threw', code: read('code') };
     };
 
     /** Calls a retained guest function. Throws GuestThrow when the guest itself throws. */
@@ -216,8 +139,6 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         if (result.error) {
             const detail = detailOf(result.error);
             result.error.dispose();
-            /* A wasm exception is not an error: it goes to the module, which may catch it. */
-            if (detail.exc !== undefined) throw new GuestException(detail.exc);
             throw new GuestThrow(detail);
         }
         const handle = result.value;
@@ -236,21 +157,16 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
      *
      * The JS API takes a BigInt for an i64 and a Number for everything else, and JSON has no
      * BigInt, so a BigInt travels as a string with a NUL and a 'b' in front -- no argument a
-     * caller means as a number looks like that -- and is rebuilt here. A string the caller really
-     * passed travels as a string with a NUL and an 's': it is handed to the API as it is, so the
-     * API does its own conversion and raises its own error for a string that is not a number
-     * ('x' for an i64 is a SyntaxError, not 'Cannot convert 0 to a BigInt'). Anything else is
+     * caller means as a number looks like that -- and is rebuilt here. Anything else is
      * coerced the way the JS API coerces it.
      */
-    const wasmValue = (value: unknown): number | bigint | string => {
-        if (typeof value === 'string' && value.charCodeAt(0) === 0) {
-            return value.charCodeAt(1) === 98 ? BigInt(value.slice(2)) : value.slice(2);
-        }
+    const wasmValue = (value: unknown): number | bigint => {
+        if (typeof value === 'string' && value.charCodeAt(0) === 0) return BigInt(value.slice(2));
         return typeof value === 'number' ? value : Number(value);
     };
 
     /** The arguments of a wasm call, decoded from the guest's JSON. */
-    const numberArgs = (args: unknown): Array<number | bigint | string> =>
+    const numberArgs = (args: unknown): Array<number | bigint> =>
         Array.isArray(args) ? args.map((value) => wasmValue(value)) : [];
 
     /**
@@ -418,7 +334,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
                 continue;
             }
             const id = freshId();
-            hostFns.set(id, entry as (...args: Array<number | bigint | string>) => unknown);
+            hostFns.set(id, entry as (...args: Array<number | bigint>) => unknown);
             entries.push({ i, k: 'fn', id });
         }
         return JSON.stringify(entries);
@@ -428,11 +344,11 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
      * A wasm import that is a function: it may be a guest function (call back into the VM, syncing
      * memory either side of the call) or a function the host took out of a table.
      */
-    const resolveImportFunction = (id: number): ((...args: Array<number | bigint | string>) => unknown) => {
+    const resolveImportFunction = (id: number): ((...args: Array<number | bigint>) => unknown) => {
         const hostFn = hostFns.get(id);
         if (hostFn) return hostFn;
-        return (...args: Array<number | bigint | string>) => {
-            const handles = args.map((value) => valueHandle(value as number | bigint));
+        return (...args: Array<number | bigint>) => {
+            const handles = args.map((value) => valueHandle(value));
             return callGuest(id, handles);
         };
     };
@@ -460,7 +376,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             modules.set(id, new WebAssembly.Module(source));
             return ok(id);
         } catch (error) {
-            return hostFail('ERR_WASM_COMPILE', error);
+            return fail('ERR_WASM_COMPILE', error instanceof Error ? error.message : String(error));
         }
     });
 
@@ -475,15 +391,10 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         return module ? context.newString(describeModule(module)) : fail('ERR_WASM', 'no such module');
     });
 
-    define('instantiate', (moduleId, importsJson, pull, push, label) => {
+    define('instantiate', (moduleId, importsJson, pull, push) => {
         const module = modules.get(number(moduleId));
         if (!module) return fail('ERR_WASM', 'no such module');
-        /* 'null' means no import object at all, which the host reports in its own words. */
-        const rawImports = text(importsJson);
-        const descriptor = rawImports === 'null'
-            ? null
-            : (parse(importsJson) as Record<string, Record<string, { k: string; id?: number; v?: number }>> | undefined);
-        const api = context.typeof(label) === 'string' ? text(label) : 'Instance';
+        const descriptor = parse(importsJson) as Record<string, Record<string, { k: string; id?: number; v?: number }>> | undefined;
         const record: InstanceRecord = {
             instance: undefined as unknown as WebAssembly.Instance,
             memories: new Set(),
@@ -516,12 +427,9 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
 
         let instance: WebAssembly.Instance;
         try {
-            instance = descriptor === null
-                ? new WebAssembly.Instance(module)
-                : new WebAssembly.Instance(module, imports as WebAssembly.Imports);
+            instance = new WebAssembly.Instance(module, imports as WebAssembly.Imports);
         } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            return hostFail('ERR_WASM_LINK', error, relabel(message, api));
+            return fail('ERR_WASM_LINK', error instanceof Error ? error.message : String(error));
         }
         record.instance = instance;
 
@@ -578,12 +486,6 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
                 value = callGuest(id, args.map((arg) => valueHandle(arg)));
             } catch (error) {
                 syncIn(record);
-                /*
-                 * The guest threw a wasm exception. The module must be handed the exception and
-                 * not an error, or a handler in the module cannot catch it; an error here would
-                 * travel out of the module uncaught instead.
-                 */
-                if (error instanceof GuestException) throw exceptions.get(error.exceptionId) ?? error;
                 throw error;
             }
             syncIn(record);
@@ -600,23 +502,14 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         if (typeof target !== 'function') return fail('ERR_WASM', 'no such export: ' + text(name));
         try {
             syncIn(record);
-            const value = (target as (...args: Array<number | bigint | string>) => unknown)(...numberArgs(parse(argsJson)));
+            const value = (target as (...args: Array<number | bigint>) => unknown)(...numberArgs(parse(argsJson)));
             syncOut(record);
-            /*
-             * An export the module declared as i64 answers a BigInt, the way the JS API gives it to
-             * a caller, and JSON has no BigInt -- so it travels as the tagged string encodeValue
-             * makes and the guest rebuilds it there. A Number here would lose every value past
-             * 2**53 the moment the module handed it over, which is what an i64 export used to do.
-             */
-            return ok(value === undefined ? null : encodeValue(value));
+            return ok(typeof value === 'bigint' ? Number(value) : (value ?? null));
         } catch (error) {
             if (error instanceof GuestThrow) {
                 return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
             }
-            if (WasmException && error instanceof WasmException) {
-                return fail('ERR_WASM_EXCEPTION', 'WebAssembly.Exception', exceptionProps(error as WasmExceptionLike));
-            }
-            return hostFail('ERR_WASM_TRAP', error);
+            return fail('ERR_WASM_TRAP', error instanceof Error ? error.message : String(error));
         }
     });
 
@@ -630,7 +523,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             memories.set(id, new WebAssembly.Memory(descriptor));
             return ok(id);
         } catch (error) {
-            return hostFail('ERR_WASM', error);
+            return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
         }
     });
     define('memoryPages', (id) => {
@@ -645,7 +538,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             memory.grow(Math.max(0, Math.floor(number(delta))));
             return ok(before);
         } catch (error) {
-            return hostFail('ERR_WASM', error);
+            return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
         }
     });
     /**
@@ -681,7 +574,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             tables.set(id, new WebAssembly.Table(descriptor));
             return ok(id);
         } catch (error) {
-            return hostFail('ERR_WASM', error);
+            return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
         }
     });
     define('tableLength', (id) => {
@@ -694,7 +587,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         try {
             return ok(table.grow(Math.max(0, Math.floor(number(delta)))));
         } catch (error) {
-            return hostFail('ERR_WASM', error);
+            return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
         }
     });
     define('tableGet', (id, index) => {
@@ -703,7 +596,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         const entry = table.get(Math.floor(number(index)));
         if (typeof entry !== 'function') return ok({ k: 'null' });
         const fnId = freshId();
-        hostFns.set(fnId, entry as (...args: Array<number | bigint | string>) => unknown);
+        hostFns.set(fnId, entry as (...args: Array<number | bigint>) => unknown);
         return ok({ k: 'fn', id: fnId });
     });
     define('tableSet', (id, index, value) => {
@@ -724,7 +617,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             if (typeof wanted === 'function' && !hostFns.has(entry!.id!)) {
                 return fail('ERR_WASM_TABLE_JSFN', error instanceof Error ? error.message : String(error));
             }
-            return hostFail('ERR_WASM', error);
+            return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
         }
     });
     define('tableDump', (id) => {
@@ -740,14 +633,13 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             globals.set(id, global);
             return ok(id);
         } catch (error) {
-            return hostFail('ERR_WASM', error);
+            return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
         }
     });
     define('globalGet', (id) => {
         const global = globals.get(number(id));
         if (!global) return fail('ERR_WASM', 'no such global');
-        /* An i64 global's value is a BigInt on a host, and it travels tagged like any other i64. */
-        return ok(encodeValue(global.value));
+        return ok(typeof global.value === 'bigint' ? Number(global.value) : Number(global.value));
     });
     define('globalSet', (id, value) => {
         const global = globals.get(number(id));
@@ -756,114 +648,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             global.value = typeof global.value === 'bigint' ? BigInt(Math.trunc(number(value))) : number(value);
             return ok(null);
         } catch (error) {
-            return hostFail('ERR_WASM', error);
-        }
-    });
-
-    // --- exception handling --------------------------------------------------------------
-
-    /** A value for the guest: JSON has no BigInt, so a BigInt goes over as a tagged string. */
-    const encodeValue = (value: unknown): unknown =>
-        typeof value === 'bigint' ? '\u0000b' + value.toString() : value;
-
-    /**
-     * Everything the guest needs to hold an exception that came out of a module: its id, the tag
-     * it answers `is` for when that tag was made here, and its payload -- which cannot be read
-     * without the tag, so for an exception whose tag is the module's own the payload is left out
-     * and the guest's `getArg` answers for itself.
-     */
-    const exceptionProps = (exception: WasmExceptionLike): Record<string, unknown> => {
-        let id = 0;
-        for (const [key, value] of exceptions) {
-            if (value === exception) { id = key; break; }
-        }
-        if (id === 0) {
-            id = freshId();
-            exceptions.set(id, exception);
-        }
-        let tagId = exceptionTag.get(id) ?? 0;
-        if (tagId === 0) {
-            for (const [key, tag] of tags) {
-                try {
-                    if (exception.is(tag)) { tagId = key; break; }
-                } catch { /* not this one */ }
-            }
-        }
-        const props: Record<string, unknown> = { id, tag: tagId };
-        const tag = tags.get(tagId);
-        const params = tagParams.get(tagId);
-        if (tag !== undefined && params !== undefined) {
-            try {
-                props.args = params.map((_type, index) => encodeValue(exception.getArg(tag, index)));
-            } catch { /* the payload is not readable; the guest gets an empty one */ }
-        }
-        return props;
-    };
-
-    /** One payload value: an i64 wants a BigInt and everything else a Number, NaN becoming 0. */
-    const payloadValue = (value: unknown): number | bigint => {
-        if (typeof value === 'string' && value.charCodeAt(0) === 0) {
-            return value.charCodeAt(1) === 98
-                ? BigInt(value.slice(2))
-                : (Number(value.slice(2)) || 0);
-        }
-        const number = Number(value);
-        return Number.isNaN(number) ? 0 : number;
-    };
-
-    define('tagNew', (json) => {
-        if (!WasmTag) return fail('ERR_WASM', 'WebAssembly.Tag: this host has no exception handling');
-        const raw = text(json);
-        const descriptor = raw === 'null' ? undefined : parse(json) as WasmTagDescriptor | undefined;
-        try {
-            /* Without a descriptor the call has no argument at all, which the host refuses in its
-               own words; a descriptor goes through untouched, so every refusal is the host's. */
-            const tag = descriptor === undefined ? new WasmTag() : new WasmTag(descriptor);
-            const id = freshId();
-            tags.set(id, tag);
-            tagParams.set(id, descriptor !== undefined && Array.isArray(descriptor.parameters) ? descriptor.parameters : []);
-            return ok(id);
-        } catch (error) {
-            return hostFail('ERR_WASM', error);
-        }
-    });
-
-    define('exceptionNew', (tagId, argsJson) => {
-        if (!WasmException) return fail('ERR_WASM', 'WebAssembly.Exception: this host has no exception handling');
-        const id = Math.floor(number(tagId));
-        const tag = tags.get(id);
-        const raw = text(argsJson);
-        const payload = raw === 'null'
-            ? undefined
-            : ((parse(argsJson) as unknown[] | undefined) ?? []).map((value) => payloadValue(value));
-        try {
-            /* A tag id of 0 stands for a first argument that is not a tag, which the host refuses
-               in its own words, and no payload at all is the call it refuses as well. */
-            const exception = payload === undefined
-                ? new WasmException(tag ?? 0)
-                : new WasmException(tag ?? 0, payload);
-            const exceptionId = freshId();
-            exceptions.set(exceptionId, exception);
-            if (tag !== undefined) exceptionTag.set(exceptionId, id);
-            return ok(exceptionId);
-        } catch (error) {
-            return hostFail('ERR_WASM', error);
-        }
-    });
-
-    define('exceptionIs', (id, tagId) => {
-        const exception = exceptions.get(number(id));
-        if (!exception) return fail('ERR_WASM', 'no such exception');
-        return ok(exception.is(tags.get(number(tagId)) ?? 0));
-    });
-
-    define('exceptionArg', (id, tagId, index) => {
-        const exception = exceptions.get(number(id));
-        if (!exception) return fail('ERR_WASM', 'no such exception');
-        try {
-            return ok(encodeValue(exception.getArg(tags.get(number(tagId)) ?? 0, Math.floor(number(index)))));
-        } catch (error) {
-            return hostFail('ERR_WASM', error);
+            return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
         }
     });
 
@@ -874,36 +659,25 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         const record = instanceId ? instances.get(number(instanceId)) : undefined;
         if (!hostFn) {
             try {
-                const guest = callGuest(fnId, numberArgs(parse(argsJson)).map((value) => valueHandle(value as number | bigint)));
-                /* Same as an export: a BigInt a guest function answered travels tagged, not as a
-                   Number, so a value past 2**53 survives the boundary. */
-                return ok(guest === undefined ? null : encodeValue(guest));
+                const guest = callGuest(fnId, numberArgs(parse(argsJson)).map((value) => valueHandle(value)));
+                return ok(typeof guest === 'bigint' ? Number(guest) : guest);
             } catch (error) {
                 if (error instanceof GuestThrow) {
                     return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
                 }
-                if (error instanceof GuestException) {
-                    const thrown = exceptions.get(error.exceptionId);
-                    if (thrown) return fail('ERR_WASM_EXCEPTION', 'WebAssembly.Exception', exceptionProps(thrown));
-                }
-                return hostFail('ERR_WASM', error);
+                return fail('ERR_WASM', error instanceof Error ? error.message : String(error));
             }
         }
         try {
             if (record) syncIn(record);
             const value = hostFn(...numberArgs(parse(argsJson)));
             if (record) syncOut(record);
-            /* A function taken out of a table is a wasm function: one the module declared as
-               returning an i64 answers a BigInt, and it travels tagged for the same reason. */
-            return ok(value === undefined ? null : encodeValue(value));
+            return ok(typeof value === 'bigint' ? Number(value) : (value ?? null));
         } catch (error) {
             if (error instanceof GuestThrow) {
                 return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
             }
-            if (WasmException && error instanceof WasmException) {
-                return fail('ERR_WASM_EXCEPTION', 'WebAssembly.Exception', exceptionProps(error as WasmExceptionLike));
-            }
-            return hostFail('ERR_WASM_TRAP', error);
+            return fail('ERR_WASM_TRAP', error instanceof Error ? error.message : String(error));
         }
     });
 
@@ -925,10 +699,6 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         tables.delete(key);
         globals.delete(key);
         hostFns.delete(key);
-        tags.delete(key);
-        tagParams.delete(key);
-        exceptions.delete(key);
-        exceptionTag.delete(key);
         return context.undefined;
     });
 

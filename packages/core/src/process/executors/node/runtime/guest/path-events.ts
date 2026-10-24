@@ -704,62 +704,16 @@ BF.events = function () {
     }
   }
 
-  /* captureRejections: whether a listener that returns a promise is watched, so its rejection is
-     routed to the emitter's error listener instead of being dropped. The flag is read once, when
-     the emitter is made -- from the option where it was given and from the module's own flag where
-     it was not -- which is why a host's EventEmitter.captureRejections = true behind an emitter
-     that already exists leaves that one alone. */
-  var kCapture = Symbol('kCapture');
-
-  function captureOption(opts) {
-    var value = opts === undefined || opts === null ? undefined : opts.captureRejections;
-    if (!value) return EventEmitter.captureRejections === true;
-    if (value !== true) {
-      var err = new TypeError('The "options.captureRejections" property must be of type boolean. Received ' + specificTypeOf(value));
-      err.code = 'ERR_INVALID_ARG_TYPE';
-      throw err;
-    }
-    return true;
+  function EventEmitter() {
+    EventEmitter.init.call(this);
   }
 
-  /*
-   * A rejection a captured listener left behind, handed to the emitter on the next tick: to its
-   * error listener as the one argument a host gives it, or to the handler standing behind
-   * captureRejectionSymbol where the emitter carries one. The capture is off while the error is
-   * emitted, so an error listener that rejects does not come back here for a second time.
-   */
-  function emitUnhandledRejection(ee, err) {
-    var rejection = ee[EventEmitter.captureRejectionSymbol];
-    if (typeof rejection === 'function') {
-      rejection.call(ee, err);
-      return;
-    }
-    var prev = ee[kCapture];
-    ee[kCapture] = false;
-    ee.emit('error', err);
-    ee[kCapture] = prev;
-  }
-
-  function addCatch(that, result) {
-    if (result === undefined || result === null || that[kCapture] !== true) return;
-    var then = result.then;
-    if (typeof then !== 'function') return;
-    then.call(result, undefined, function (err) {
-      requireBuiltin('process').nextTick(emitUnhandledRejection, that, err);
-    });
-  }
-
-  function EventEmitter(opts) {
-    EventEmitter.init.call(this, opts);
-  }
-
-  EventEmitter.init = function (opts) {
+  EventEmitter.init = function () {
     if (this._events === undefined) {
       this._events = Object.create(null);
       this._eventsCount = 0;
     }
     this._maxListeners = this._maxListeners || undefined;
-    this[kCapture] = captureOption(opts);
   };
   EventEmitter.prototype._events = undefined;
   EventEmitter.prototype._eventsCount = 0;
@@ -872,10 +826,10 @@ BF.events = function () {
     var handler = events[type];
     if (handler === undefined) return false;
     if (typeof handler === 'function') {
-      addCatch(this, handler.apply(this, args));
+      handler.apply(this, args);
     } else {
       var list = handler.slice();
-      for (var i = 0; i < list.length; i++) addCatch(this, list[i].apply(this, args));
+      for (var i = 0; i < list.length; i++) list[i].apply(this, args);
     }
     return true;
   };
@@ -919,83 +873,19 @@ BF.events = function () {
     if (value === null) return 'null';
     return 'type ' + typeof value + ' (' + String(value) + ')';
   }
-  /* Node's determineSpecificType: the tail ERR_INVALID_ARG_TYPE writes after "Received". */
-  function specificTypeOf(value) {
-    if (value === undefined) return 'undefined';
-    if (value === null) return 'null';
-    if (typeof value === 'function') return 'function ' + (value.name || '');
-    if (typeof value === 'object') {
-      var ctor = value.constructor;
-      if (ctor && ctor.name) return 'an instance of ' + ctor.name;
-      return String(value);
-    }
-    if (typeof value === 'string') {
-      /* inspect() quotes a string in single quotes unless it carries one of its own */
-      return 'type string (' + (value.indexOf("'") === -1 ? "'" + value + "'" : JSON.stringify(value)) + ')';
-    }
-    return 'type ' + typeof value + ' (' + String(value) + ')';
-  }
-  function invalidArgType(name, expected, value) {
-    var ofType = expected === 'object' || expected === 'string' || expected === 'function' ||
-      expected === 'number' || expected === 'boolean' || expected === 'symbol' || expected === 'bigint';
-    var err = new TypeError('The "' + name + (name.indexOf('.') === -1 ? '" argument must be ' : '" property must be ') +
-      (ofType ? 'of type ' + expected : 'an instance of ' + expected) + '. Received ' + specificTypeOf(value));
-    err.code = 'ERR_INVALID_ARG_TYPE';
-    return err;
-  }
-  /*
-   * The error an aborted signal rejects with is not an Error.prototype object: Node's is an instance
-   * of a subclass -- getPrototypeOf(err) is that subclass's prototype and err.constructor.name is
-   * 'AbortError', while err instanceof Error still holds. 'name' and 'code' are own and enumerable
-   * and 'message' is not, which is what a host's own property list shows.
-   */
-  var ABORT_ERROR = (function () {
-    function AbortError(message) {
-      var err = new Error(message);
-      Object.setPrototypeOf(err, AbortError.prototype);
-      return err;
-    }
-    AbortError.prototype = Object.create(Error.prototype);
-    Object.defineProperty(AbortError.prototype, 'constructor', {
-      value: AbortError, writable: true, configurable: true
-    });
-    return AbortError;
-  })();
-  function isAbortSignalLike(signal) {
-    return typeof signal.addEventListener === 'function' &&
-      typeof signal.removeEventListener === 'function' && typeof signal.aborted === 'boolean';
-  }
   function abortErrorFor(signal) {
-    var err = ABORT_ERROR('The operation was aborted');
+    var err = new Error('The operation was aborted');
+    err.name = 'AbortError';
+    err.code = 'ABORT_ERR';
     try {
       var reason = signal === undefined || signal === null ? undefined : signal.reason;
       if (reason !== undefined) err.cause = reason;
     } catch (e) { /* a reason getter that throws is not the error's business */ }
-    err.code = 'ABORT_ERR';
-    err.name = 'AbortError';
     return err;
   }
   EventEmitter.once = function (emitter, name, options) {
-    /* Node reads options.signal first and validates it, then options, then the emitter: a caller
-       passing two bad arguments is told about the signal, not about the emitter. */
     var signal = options === undefined || options === null ? undefined : options.signal;
-    if (signal !== undefined && (signal === null || !isAbortSignalLike(signal))) {
-      return Promise.reject(invalidArgType('options.signal', 'AbortSignal', signal));
-    }
-    if (options !== undefined && (typeof options !== 'object' || options === null)) {
-      return Promise.reject(invalidArgType('options', 'object', options));
-    }
     return new Promise(function (resolve, reject) {
-      /* V8 words these two itself and QuickJS does not, so this module says them: a null emitter is
-         a property read that fails, and an emitter with an on but no once fails on the call. */
-      if (emitter === null || emitter === undefined) {
-        throw new TypeError("Cannot read properties of " + String(emitter) + " (reading 'on')");
-      }
-      if (typeof emitter.on !== 'function') {
-        reject(invalidArgType('emitter', 'EventEmitter', emitter));
-        return;
-      }
-      if (typeof emitter.once !== 'function') throw new TypeError('emitter.once is not a function');
       if (signal !== undefined && signal !== null && signal.aborted) {
         reject(abortErrorFor(signal));
         return;
@@ -1026,37 +916,12 @@ BF.events = function () {
       if (name !== 'error') emitter.once('error', onError);
     });
   };
-  /*
-   * events.on: an async iterator of argument arrays; break or return() removes its listeners.
-   *
-   * options.signal is the way out of an iteration that would otherwise never end. Node throws its
-   * AbortError from on() itself when the signal is already aborted, and when the abort comes while
-   * the iteration is waiting it rejects the promise the for-await is suspended on -- so the loop
-   * throws, the statement after it runs, and the listeners come off the emitter. Taking no notice
-   * of the signal left a for-await hanging for as long as the process ran: it had read one event
-   * and printed it, and neither an abort nor the end of the program settled it.
-   */
-  EventEmitter.on = function (emitter, name, options) {
-    /* Node reads options first and validates it, then options.signal: a caller passing two bad
-       arguments is told about the options, not about the signal. */
-    if (options !== undefined && (typeof options !== 'object' || options === null)) {
-      throw invalidArgType('options', 'object', options);
-    }
-    var signal = options === undefined || options === null ? undefined : options.signal;
-    if (signal !== undefined && (signal === null || !isAbortSignalLike(signal))) {
-      throw invalidArgType('options.signal', 'AbortSignal', signal);
-    }
-    /* An aborted signal is refused before any listener goes on: the iterator never exists, and a
-       for-await over the call throws here rather than at its first next(). */
-    if (signal !== undefined && signal !== null && signal.aborted) throw abortErrorFor(signal);
+  /* events.on: an async iterator of argument arrays; break or return() removes its listeners */
+  EventEmitter.on = function (emitter, name) {
     var queued = [];
     var waiting = [];
     var failure = null;
     var finished = false;
-    var onAbort = undefined;
-    function detachAbort() {
-      if (onAbort !== undefined) { signal.removeEventListener('abort', onAbort); onAbort = undefined; }
-    }
     function onEvent() {
       var args = Array.prototype.slice.call(arguments);
       if (waiting.length > 0) waiting.shift().resolve({ value: args, done: false });
@@ -1067,29 +932,15 @@ BF.events = function () {
       else failure = err;
       close();
     }
-    /* An abort is an error with a name of its own: it rejects the promise the iteration is
-       suspended on, or waits as the iterator's failure for the next() that comes for it, and then
-       closes the iterator so no listener of this call is left on the emitter. */
-    function onAbortHandler() {
-      var err = abortErrorFor(signal);
-      if (waiting.length > 0) waiting.shift().reject(err);
-      else failure = err;
-      close();
-    }
     function close() {
       if (finished) return;
       finished = true;
-      detachAbort();
       emitter.removeListener(name, onEvent);
       if (name !== 'error') emitter.removeListener('error', onError);
       while (waiting.length > 0) waiting.shift().resolve({ value: undefined, done: true });
     }
     emitter.on(name, onEvent);
     if (name !== 'error') emitter.on('error', onError);
-    if (signal !== undefined && signal !== null) {
-      onAbort = onAbortHandler;
-      signal.addEventListener('abort', onAbort);
-    }
     var iterator = {
       next: function () {
         if (queued.length > 0) return Promise.resolve({ value: queued.shift(), done: false });
@@ -1119,23 +970,7 @@ BF.events = function () {
   var kErrorMonitor = Symbol('events.errorMonitor');
   EventEmitter.errorMonitor = kErrorMonitor;
   EventEmitter.captureRejectionSymbol = Symbol.for('nodejs.rejection');
-  /* The module's own flag, which every emitter made behind it reads: setting it is a host's way of
-     turning the capture on for all of them at once. Anything but a boolean is the
-     ERR_INVALID_ARG_TYPE a host gives. */
-  var captureRejections = false;
-  Object.defineProperty(EventEmitter, 'captureRejections', {
-    get: function () { return captureRejections; },
-    set: function (value) {
-      if (typeof value !== 'boolean') {
-        var err = new TypeError('The "captureRejections" property must be of type boolean. Received ' + specificTypeOf(value));
-        err.code = 'ERR_INVALID_ARG_TYPE';
-        throw err;
-      }
-      captureRejections = value;
-    },
-    enumerable: true,
-    configurable: true
-  });
+  EventEmitter.captureRejections = false;
   EventEmitter.getEventListeners = function (emitter, name) {
     return emitter.listeners(name);
   };
@@ -1158,23 +993,6 @@ BF.events = function () {
    * inside an AsyncResource of its own, so async context survives an emit the way it does on a host.
    */
   EventEmitter.usingDomains = false;
-  /* The two names a host's events module carries beside usingDomains that Object.keys does not see:
-     the symbol keys its cap on the listeners of one event target is kept under. Both are data
-     properties worth a symbol and both are frozen -- writable, enumerable and configurable are
-     false -- so they stand in Object.getOwnPropertyNames, which is 22 on a host and was 20 here.
-     row owc-events-async-resource-missing. */
-  var EVENT_TARGET_CAP_NAMES = [
-    ['kMaxEventTargetListeners', 'events.maxEventTargetListeners'],
-    ['kMaxEventTargetListenersWarned', 'events.maxEventTargetListenersWarned']
-  ];
-  for (var capAt = 0; capAt < EVENT_TARGET_CAP_NAMES.length; capAt++) {
-    var capName = EVENT_TARGET_CAP_NAMES[capAt][0];
-    if (Object.prototype.hasOwnProperty.call(EventEmitter, capName)) continue;
-    Object.defineProperty(EventEmitter, capName, {
-      value: typeof Symbol === 'function' ? Symbol(EVENT_TARGET_CAP_NAMES[capAt][1]) : EVENT_TARGET_CAP_NAMES[capAt][1],
-      writable: false, enumerable: false, configurable: false
-    });
-  }
   EventEmitter.addAbortListener = function (signal, listener) {
     if (signal === undefined || signal === null || typeof signal.addEventListener !== 'function') {
       var bad = new TypeError('The "signal" argument must be an instance of AbortSignal. Received ' + receivedAs(signal));

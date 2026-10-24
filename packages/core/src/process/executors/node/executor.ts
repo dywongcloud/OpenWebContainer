@@ -34,14 +34,7 @@ export class NodeProcessExecutor implements ProcessExecutor {
                 ...(command.stackTraceLimit === undefined ? {} : { stackTraceLimit: command.stackTraceLimit }),
                 ...(command.evalScript === undefined ? {} : { evalScript: command.evalScript }),
                 ...(command.inputType === undefined ? {} : { inputType: command.inputType }),
-                ...(command.title === undefined ? {} : { title: command.title }),
-                ...(command.interactive === undefined ? {} : { interactive: command.interactive }),
-                ...(command.test === undefined ? {} : { test: command.test }),
-                ...(command.watch === undefined ? {} : { watch: command.watch }),
-                watchPaths: command.watchPaths ?? [],
-                envFiles: command.envFiles ?? [],
-                envFilesIfExists: command.envFilesIfExists ?? [],
-                ...(command.run === undefined ? {} : { run: command.run })
+                ...(command.title === undefined ? {} : { title: command.title })
             };
             return new NodeProcess(
                 pid,

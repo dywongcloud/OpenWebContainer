@@ -9,7 +9,6 @@ import { CRYPTO_CAPABILITIES } from './crypto';
 import { TLS_CRYPTO_CAPABILITIES } from './tls-crypto';
 import { QUIC_CRYPTO_CAPABILITIES } from './quic-crypto';
 import { INTL_CAPABILITIES } from './intl';
-import { SHARED_CAPABILITIES } from './shared';
 import { VM_CAPABILITIES } from './vm';
 
 /** Every host operation a guest may call, by name. Each area file owns its own operations. */
@@ -24,6 +23,5 @@ export const CAPABILITIES: Record<string, CapabilityHandler> = {
     ...TLS_CRYPTO_CAPABILITIES,
     ...QUIC_CRYPTO_CAPABILITIES,
     ...INTL_CAPABILITIES,
-    ...SHARED_CAPABILITIES,
     ...VM_CAPABILITIES
 };
