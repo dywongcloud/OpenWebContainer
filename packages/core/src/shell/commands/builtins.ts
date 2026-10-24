@@ -5031,6 +5031,35 @@ function setPipeStatus(state: ShellState, statuses: number[]): void {
 }
 
 /**
+ * The files a compound's own redirections name, opened where the operators stand: before a single
+ * command of the body runs, which is where a host opens them. `{ printf 'B\n' >> f; } > f` truncates
+ * `f` and the body's append lands in the emptied file, so `f` holds `B` -- where a file opened only
+ * to write into it the output collected at the end was emptied *after* the body had written into it,
+ * and the line the body had put there was gone.
+ *
+ * Every target is open by the time the body runs, so what the body collects is written behind what
+ * the body put there itself: the two writes here append from now on. A file the redirection cannot
+ * open -- one no directory of the path holds -- ends the construct before the body runs, as it does
+ * on a host, and its message comes back instead of being thrown.
+ */
+function openCompoundRedirects(state: ShellState, plan: RedirectPlan): string | undefined {
+    try {
+        for (const opened of plan.opened) writeOutputFile(state, opened.file, '', Boolean(opened.append));
+        for (const target of [plan.stdoutTo, plan.stderrTo]) {
+            if (target.kind === 'file' && target.file !== undefined) {
+                writeOutputFile(state, target.file, '', Boolean(target.append));
+            }
+        }
+    } catch (error) {
+        return `${errorMessage(error)}\n`;
+    }
+    plan.opened = [];
+    if (plan.stdoutTo.kind === 'file') plan.stdoutTo = { ...plan.stdoutTo, append: true };
+    if (plan.stderrTo.kind === 'file') plan.stderrTo = { ...plan.stderrTo, append: true };
+    return undefined;
+}
+
+/**
  * Redirections on a compound command: the file becomes the input of the whole construct, and the
  * construct's output is written to the file afterwards, as a shell does.
  */
@@ -5049,13 +5078,27 @@ function runCompoundRedirected(state: ShellState, command: Command, input: strin
     if (!needsInput && !needsOutput) return body();
     const savedBuffer = state.inputBuffer;
     const savedCursor = state.inputCursor;
-    const given = plan.inputFd !== undefined ? readFdAt(state, plan.inputFd) : '';
-    if (needsInput) {
-        if (!fromFile && (input !== null || state.openFds?.get(0)?.kind !== 'input')) state.inputIsDirectory = false;
-        state.inputBuffer = fromFile
-            ? (plan.inputFd !== undefined ? given : readInputFile(state, plan.inputFile as string))
-            : plan.inputText ?? (input as string);
-        state.inputCursor = 0;
+    let given = '';
+    /* A redirection the shell cannot open is the failure of the one command it stands on and not of
+       the shell: a host names the file, leaves the construct unrun and goes on, where the throw a
+       read of the missing file made ended the whole script at 1 with nothing behind it. */
+    try {
+        given = plan.inputFd !== undefined ? readFdAt(state, plan.inputFd) : '';
+        if (needsInput) {
+            if (!fromFile && (input !== null || state.openFds?.get(0)?.kind !== 'input')) state.inputIsDirectory = false;
+            state.inputBuffer = fromFile
+                ? (plan.inputFd !== undefined ? given : readInputFile(state, plan.inputFile as string))
+                : plan.inputText ?? (input as string);
+            state.inputCursor = 0;
+        }
+    } catch (error) {
+        if (plan.error === undefined) plan.error = `${errorMessage(error)}\n`;
+        return finish(state, plan, '', '', 1);
+    }
+    const openError = openCompoundRedirects(state, plan);
+    if (openError !== undefined) {
+        if (plan.error === undefined) plan.error = openError;
+        return finish(state, plan, '', '', 1);
     }
     const savedIo = state.io;
     state.io = { stdout: '', stderr: '' };
@@ -6539,12 +6582,22 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
         && (input !== null || state.openFds?.get(0)?.kind !== 'input')) {
         state.inputIsDirectory = false;
     }
-    const commandInput = ownStdin
-        ? input
-        : plan.inputText !== undefined
-        ? plan.inputText
-        : plan.inputFd !== undefined ? readFdAt(state, plan.inputFd)
-        : plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
+    /* An input redirection the shell cannot open fails the one command it stands on: a host names
+       the file, leaves the command behind it unrun and carries on with the line -- `cat < /nodir/x;
+       echo AFTER` is the diagnostic and then `AFTER` -- where the throw the read made ended the
+       whole script at 1 with nothing behind the failure ever running. */
+    let commandInput: string | null = input;
+    try {
+        commandInput = ownStdin
+            ? input
+            : plan.inputText !== undefined
+            ? plan.inputText
+            : plan.inputFd !== undefined ? readFdAt(state, plan.inputFd)
+            : plan.inputFile !== undefined ? readInputFile(state, plan.inputFile) : input;
+    } catch (error) {
+        if (plan.error === undefined) plan.error = `${errorMessage(error)}\n`;
+        return finish(state, plan, '', '', 1);
+    }
     /**
      * What a command with no input of its own reads: the rest of the input of the compound command
      * it stands in. `runCompoundRedirected` put that input in `state.inputBuffer` for the whole

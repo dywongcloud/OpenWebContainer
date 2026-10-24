@@ -410,6 +410,14 @@ and diffing stdout, stderr and the exit code. Where the two cannot agree, the re
   where the host writes `/bin/sh: /nodir/f: No such file or directory`. Both leave status 1 and write
   nothing. The new-file case itself is fixed: `echo hi >> newfile` creates the file and writes to it,
   as the host does.
+- **An input redirection the shell cannot open fails the command it stands on, and not the script.**
+  `printf 'B\n'; cat < /nodir/x; printf 'AFTER\n'` is `B`, then `sh: /nodir/x: No such file or
+  directory`, then `AFTER`, ending 0 -- the `cat` behind the operator never runs and the next command
+  does, which is what this host's `/bin/sh` leaves.
+- **A compound's own redirection is opened where the operator stands, before its body runs.** `{ printf
+  'B\n' >> f; } > f` leaves `B` in `f` -- the `>` empties `f` first and the body's append lands in it -- and
+  `while read z; do printf 'loop=[%s]\n' "$z" >> j; done > j 2> j2 <<EOF` over two lines leaves both
+  `loop=[1]` and `loop=[2]` in `j`, as a host does.
 - **`command -v` answers with the path or the bare name, as a host does** -- `/bin/ls`, `/bin/sh`, `echo`,
   `cd` -- and `command -V` and `type` keep the wording that describes (`ls is /bin/ls`, `cd is a shell
   builtin`). Every command the container runs as one of its own built-ins also has a file on `PATH`, the way
