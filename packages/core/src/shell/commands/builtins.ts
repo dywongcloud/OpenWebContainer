@@ -1935,6 +1935,10 @@ class Parser {
     private readonly keepParens: boolean;
     private static readonly STOP = new Set([' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>']);
     private heredocs: { delimiter: string; strip: boolean; expand: boolean; target: Redirect }[] = [];
+    /** True when the delimiter line of a here-document was never read: set by `readHeredocs`. */
+    private heredocUnterminated = false;
+    /** True when a `\` was the last character of the input: set by `readWord`. */
+    private backslashAtEnd = false;
     private expandedAliases = new Set<string>();
 
     constructor(src: string, state: ShellState | null, keepSpaces = false, keepParens = false) {
@@ -1978,6 +1982,20 @@ class Parser {
             throw new ShellSyntaxError(`syntax error near unexpected token \`${token}'`);
         }
         return nodes;
+    }
+
+    /**
+     * True when the input ran out behind something the parser was still owed the end of, and no
+     * syntax error was thrown for it: the delimiter line of a here-document, or the character a
+     * trailing `\` was escaping.
+     *
+     * Both parse clean as they stand -- `cat <<EOF` is a command carrying an empty body, and a `\`
+     * at the very end escapes nothing and is dropped from the word -- so neither is a complaint
+     * the parser can make. On a terminal they are two more things a host asks for the rest of
+     * behind `> `, which is why they are recorded here rather than reported as errors.
+     */
+    inputRanOut(): boolean {
+        return this.heredocUnterminated || this.backslashAtEnd;
     }
 
     /** Public wrapper so `lexParts` can read one word from a bare string. */
@@ -2415,6 +2433,13 @@ class Parser {
             if (Parser.STOP.has(ch) && !this.keepParens && !(this.keepSpaces && (ch === ' ' || ch === '\t'))) break;
             if (ch === '\\') {
                 const next = this.src[this.pos + 1];
+                /* A `\` the input ran out behind is the escape of the character that would have
+                   come next, and on a terminal that character is the newline the Enter wrote: the
+                   line is continued, not ended. `echo a \` is half a command, and the line typed
+                   behind it is the rest of it -- which is why the flag is set here, where the
+                   parser knows it is the last character there is, rather than guessed from the
+                   text: `echo a \\` is the escaped backslash it ends on, and is complete. */
+                if (next === undefined) this.backslashAtEnd = true;
                 if (next === '\n') {
                     this.pos += 2;
                     continue;
@@ -2446,6 +2471,13 @@ class Parser {
                 let text = '';
                 while (this.pos < this.src.length && this.src[this.pos] !== '"') {
                     const cur = this.src[this.pos];
+                    /* A `\` before the newline continues the line inside a quoted string as it does
+                       outside one: `echo "a \` newline `b"` is `a b` on a host, and not the `a \`
+                       and `b` the backslash and the newline left behind as text. */
+                    if (cur === '\\' && this.src[this.pos + 1] === '\n') {
+                        this.pos += 2;
+                        continue;
+                    }
                     if (cur === '\\' && '"\\$`'.includes(this.src[this.pos + 1] ?? '')) {
                         text += this.src[this.pos + 1];
                         this.pos += 2;
@@ -2605,15 +2637,24 @@ class Parser {
                `\n\na\n\nEOF` printed `a\n\n` where a host printed `\na\n\n`. */
             const bodyStart = this.pos;
             const lines: string[] = [];
+            let found = false;
             while (!this.eof()) {
                 const end = this.src.indexOf('\n', this.pos);
                 const line = end === -1 ? this.src.slice(this.pos) : this.src.slice(this.pos, end);
                 this.pos = end === -1 ? this.src.length : end + 1;
                 const candidate = entry.strip ? line.replace(/^\t+/, '') : line;
-                if (candidate === entry.delimiter) break;
+                if (candidate === entry.delimiter) {
+                    found = true;
+                    break;
+                }
                 lines.push(entry.strip ? candidate : line);
                 if (end === -1) break;
             }
+            /* The delimiter line is part of the command: a here-document whose body stops at the
+               end of the input was never closed, so on a terminal the lines behind it are the body
+               and not commands of their own. Read as a whole script it parses clean -- the parser
+               simply finds no body -- which is why what is owed is recorded rather than thrown. */
+            if (!found) this.heredocUnterminated = true;
             const text = lines.length === 0 ? '' : lines.join('\n') + '\n';
             /* The source of the body, kept for a job's sake: a `&` ends the command line before the
                body starts, so the source a job is handed stops at the `&` and the body behind it is
@@ -4750,7 +4791,8 @@ export function checkSyntax(state: ShellState, script: string): { ok: boolean; m
 /**
  * True when `script` is a command the input ran out in the middle of, so a line typed after it is
  * the rest of it and not a command of its own: a construct whose `done`, `fi`, `esac` or `}` has
- * not been typed, or a quote, a `$(`, a `${` or a backquote that has not been closed.
+ * not been typed, a quote, a `$(`, a `${` or a backquote that has not been closed, a here-document
+ * whose delimiter line has not been typed, or a `\` the input ends on.
  *
  * A shell reading a terminal does not run such a line and does not report it: it asks for the rest
  * of it behind its secondary prompt and runs the whole thing once the line that closes it arrives.
@@ -4761,14 +4803,19 @@ export function checkSyntax(state: ShellState, script: string): { ok: boolean; m
  * and is left to be reported as one.
  */
 export function isIncompleteSource(state: ShellState, script: string): boolean {
+    const parser = new Parser(script, state);
     try {
-        new Parser(script, state).parse();
-        return false;
+        parser.parse();
     } catch (error) {
         if (!(error instanceof ShellSyntaxError)) return false;
         return error.message === 'syntax error: unexpected end of file'
             || error.message.startsWith('unexpected EOF while looking for matching');
     }
+    /* A source that parses can still be one the input ran out in the middle of, and the two ways
+       it can are ones the parser has no complaint to make about, so they are asked for here:
+       `cat <<EOF` is a command carrying an empty body until the line that closes it is typed, and
+       `echo a \` is a command whose last character is escaping the newline behind it. */
+    return parser.inputRanOut();
 }
 
 function runCommandList(state: ShellState, nodes: Node[], input: string | null, top = false): number {

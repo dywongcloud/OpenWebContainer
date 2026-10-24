@@ -618,10 +618,20 @@ export class ShellProcess extends Process {
     private async handleEnterKey(): Promise<void> {
         this.emitOutput('\n');
 
-        const typed = this.currentLine.trim();
+        /* The line as it was typed, whitespace and all: what a line holds behind a construct that
+           is still open is text of the command, not layout around it -- the four spaces a
+           continuation line of `echo "hello` starts with are four spaces of the string it prints,
+           the two `echo "a  ` ends on are two of theirs, and so are the three of a line that is
+           nothing but spaces. A host's shell keeps every one of them, so this one keeps them too
+           and trims only a line it runs as it stands: see `commandLine` below. */
+        const typed = this.currentLine;
         /* What this shell has of the command so far: the lines a construct that is still open was
            typed on, and the one just typed behind them. */
         const source = this.pendingSource === '' ? typed : `${this.pendingSource}\n${typed}`;
+        /* A line typed at the top level, and only one, is the whole of the command: the whitespace
+           around it is nothing the grammar reads, so it is trimmed before it runs. A construct is
+           run exactly as it was typed. */
+        const single = this.pendingSource === '';
         /* A construct that is still open is not a command yet: a host's shell asks for the rest of
            it behind `> ` and runs it only once the line that closes it arrives. `sh -c <line>` is
            never asked -- its input is over the moment the line is, and a host reports what it was
@@ -640,7 +650,7 @@ export class ShellProcess extends Process {
         }
         this.pendingSource = '';
 
-        const commandLine = source;
+        const commandLine = single ? source.trim() : source;
         if (commandLine) {
             // Add to history
             this.commandHistory.push({
