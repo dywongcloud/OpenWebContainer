@@ -937,7 +937,10 @@ BF.fs = function () {
 
   /* The descriptor layer's path based view has no inodes, so a symlink is recorded against the
      path it was created at: lstat reports the link, stat follows it, and readlink names its target.
-     The link itself holds a copy of the target's bytes, so a read through it sees the same data. */
+     The link is a name in the tree of its own -- the node a readdir of the directory holding it
+     lists -- and what that node carries is a copy of its target's bytes, so a read that does not
+     resolve it still sees data. Every call below that acts on the target resolves first: on a
+     host, the link is the target for all but the five calls that name the link itself. */
   var SYMLINKS = {};
   /* readlink hands back the target exactly as symlink wrote it, which is not always the path stat
      follows: a relative target is written verbatim and resolved beside the link. */
@@ -963,21 +966,31 @@ BF.fs = function () {
   }
 
   /*
-   * The name a symbolic link stands for: itself, unless it is recorded as one, in which case the
-   * name the chain of links ends at. A read, a write, an open and a truncate of a link are all of
-   * the file the link names, because that is the file the kernel opens: the bytes a link was given
-   * when it was made are not the ones a caller reaches, so a write that is not resolved here lands
-   * on the link's own name and the target keeps the bytes it had before the call.
+   * The name a path resolves to: every part of it that is a link is replaced by the name that link
+   * carries, the way a kernel walks a path -- a link met part of the way along one is followed as
+   * surely as the one the path ends at. It is the walk realpath makes, and it is the one every call
+   * that acts on what a name points at has to make. Without it a path under a link to a directory is
+   * handed to the file system as a name under the link, which is a file, and every question about
+   * it is answered ENOENT: an existsSync, a readdirSync, an accessSync and a statfsSync of a link to
+   * a directory were all refused, where a host answers for the directory.
    */
-  function linkTargetOf(file) {
-    var at = file;
-    for (var hop = 0; SYMLINKS[at] !== undefined && hop < 32; hop++) at = SYMLINKS[at];
-    return at;
+  function resolvePath(file) {
+    return realPathOf(file).path;
+  }
+
+  /*
+   * The same walk stopped before the last part: the name an entry has in the directory it really
+   * sits in. A rename, a unlink, a rm, an lstat, a lutimes and a readdir entry are all of the entry
+   * and not of what it points at -- a host's rename of a link renames the link, and its readdir
+   * lists the link -- so those are given this and not resolvePath.
+   */
+  function resolveParentPath(file) {
+    return P.join(resolvePath(P.dirname(file)), P.basename(file));
   }
 
   /* The name whose bytes a path carries: a link's are the ones its target carries. */
   function bytesNameOf(file) {
-    return canonicalOf(linkTargetOf(file));
+    return canonicalOf(resolvePath(file));
   }
 
   function inoOf(file) {
@@ -995,12 +1008,11 @@ BF.fs = function () {
     return count;
   }
 
-  /* stat follows a link to the name it points at, the way the kernel does: a path whose last part is
-     a link is read as the target, and so is a directory met part of the way along one. */
+  /* stat follows every link a path goes through to the name it ends at, the way the kernel does: a
+     path whose last part is a link is read as the target, and so is a directory met part of the way
+     along one. */
   function statFollowingLinks(file) {
-    var at = file;
-    for (var hop = 0; SYMLINKS[at] !== undefined && hop < 32; hop++) at = SYMLINKS[at];
-    return statOf(at);
+    return statOf(resolvePath(file));
   }
 
   /*
@@ -1177,7 +1189,7 @@ BF.fs = function () {
     var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
     // With bigint every numeric field is a BigInt; the four date fields stay Date objects.
     var num = bigint ? function (value) { return BigInt(value); } : function (value) { return value; };
-    var mode = st.mode !== undefined ? st.mode : (st.type === 'dir' ? 16877 : (isLink ? 41471 : 33188));
+    var mode = st.mode !== undefined ? st.mode : (st.type === 'dir' ? 16877 : (isLink ? 41453 : 33188));
     var out = {
       dev: num(0),
       mode: num(mode),
@@ -1221,8 +1233,9 @@ BF.fs = function () {
 
   // A path recorded as a symlink is reported as one by readdir and opendir, as Node does.
   function direntStatsOf(abs) {
-    var st = statOf(abs) || { type: 'file', size: 0, mtimeMs: 0 };
-    return SYMLINKS[abs] !== undefined ? { type: 'link', size: st.size, mtimeMs: st.mtimeMs } : st;
+    var at = resolveParentPath(abs);
+    var st = statOf(at) || { type: 'file', size: 0, mtimeMs: 0 };
+    return SYMLINKS[at] !== undefined ? { type: 'link', size: st.size, mtimeMs: st.mtimeMs } : st;
   }
 
   /* The kind the file system recorded is only dir or file; what makes a device a device is the
@@ -1249,7 +1262,7 @@ BF.fs = function () {
     var file = toPathString(p);
     /* The file a read opens is the one the link names, not the link: its type and its access bits
        are the target's, and so are the bytes that come back. */
-    var st = statOf(linkTargetOf(file));
+    var st = statFollowingLinks(file);
     if (!st) throw fsError('ENOENT', 'open', String(p));
     if (st.type === 'dir') throw fsError('EISDIR', 'read', file);
     requireAccess(file, 4, 'open');
@@ -1288,7 +1301,7 @@ BF.fs = function () {
     var file = toPathString(p);
     var type = opts && typeof opts === 'object' && typeof opts.type === 'string' ? opts.type : '';
     return new Promise(function (resolve, reject) {
-      var st = statOf(linkTargetOf(file));
+      var st = statFollowingLinks(file);
       if (!st) { reject(fsError('ENOENT', 'open', String(p))); return; }
       if (st.type === 'dir') { reject(fsError('EISDIR', 'open', file)); return; }
       resolve(blobOf(readBytesOf(file), type));
@@ -1332,7 +1345,7 @@ BF.fs = function () {
        a log that grows by appends paid for every byte it had already written, again, on every
        call, so a 2 MiB log in 512 pieces took minutes where a host takes milliseconds. The file
        system appends, so nothing already written is read or written again. */
-    if (flag.charAt(0) === 'a' && statOf(linkTargetOf(file))) {
+    if (flag.charAt(0) === 'a' && statFollowingLinks(file)) {
       check(host.appendBase64(bytesNameOf(file), encodeBase64(bytes)), 'open', file);
       return;
     }
@@ -1348,7 +1361,9 @@ BF.fs = function () {
 
   fs.existsSync = function (p) {
     try {
-      return statOf(toPathString(p)) !== null;
+      /* Whether a name is there is whether what it names is there: a link whose target was never
+         made is not, which is what a host answers for a dangling one. */
+      return statFollowingLinks(toPathString(p)) !== null;
     } catch (err) {
       return false;
     }
@@ -1360,8 +1375,7 @@ BF.fs = function () {
     /* A stat walks the path, so it is the directories above the name that are checked: a name under
        a directory with no search bit is EACCES however readable the name is. */
     requireTraverse(file, 'stat');
-    for (var hop = 0; SYMLINKS[file] !== undefined && hop < 32; hop++) file = SYMLINKS[file];
-    var st = statOf(file);
+    var st = statFollowingLinks(file);
     if (!st) {
       if (opts && opts.throwIfNoEntry === false) return undefined;
       throw fsError('ENOENT', 'stat', toPathString(p));
@@ -1373,15 +1387,25 @@ BF.fs = function () {
     var file = toPathString(p);
     var st = statOf(file);
     var linked = SYMLINKS[file] !== undefined;
-    /* A link whose target is not there yet has no bytes of its own, and Node still reports the
-       link: its size is the length of the target it names. */
-    if (!st) {
-      if (!linked) {
-        if (opts && opts.throwIfNoEntry === false) return undefined;
-        throw fsError('ENOENT', 'lstat', file);
-      }
+    /*
+     * A link is reported as itself, whatever its target is: its size is the length of the target it
+     * names -- the text symlink was handed, which is not always the path stat follows -- and its
+     * mode is the one a host's own lstat of a link reads, 0o120755, until an lchmod gives it
+     * another. A link whose target is not there yet has no bytes of its own and Node still reports
+     * the link.
+     */
+    if (linked) {
       var named = LINKTARGETS[file] !== undefined ? LINKTARGETS[file] : SYMLINKS[file];
-      st = { type: 'file', size: String(named).length, mtimeMs: 0 };
+      st = {
+        type: 'file',
+        size: String(named).length,
+        mtimeMs: st ? st.mtimeMs : 0,
+        mode: MODES[file] !== undefined ? MODES[file] : 41453
+      };
+    }
+    if (!st) {
+      if (opts && opts.throwIfNoEntry === false) return undefined;
+      throw fsError('ENOENT', 'lstat', file);
     }
     return makeStats(st, opts, linked);
   };
@@ -1425,13 +1449,18 @@ BF.fs = function () {
     /* The link is a name made in the directory it is put in, and a host refuses one in a directory
        with no write bit for it. */
     requireDirWrite(to, 'symlink', raw, to);
-    /* A link is a name, not a copy, and a host lets it name a target that is not there yet: that is
-       a dangling link, and it is what a link to a file another step creates looks like. Only a
-       target that is a file carries bytes across, since a directory has none. */
-    var targetStat = statOf(linkTargetOf(from));
-    if (targetStat && targetStat.type === 'file') {
-      check(host.writeBase64(to, encodeBase64(readBytesOf(from))), 'symlink', to);
-    }
+    /*
+     * The link is a name in the tree whether or not its target is there: the node is what a readdir
+     * of the directory holding it lists, what a mkdir or a symlink of the same name is refused for
+     * with EEXIST, and what a unlink or a rm takes away. What it carries is a copy of its target's
+     * bytes, since that is what a read that does not resolve -- a shell's cat, say -- has always
+     * seen; a directory has none, and a target that is not there yet leaves the node empty, which
+     * is what a dangling link is. Nothing below reads the target through that copy: every call
+     * resolves the link first, so the copy is never what a caller reaches.
+     */
+    var targetStat = statFollowingLinks(from);
+    var carried = targetStat && targetStat.type === 'file' ? readBytesOf(from) : new Uint8Array(0);
+    check(host.writeBase64(to, encodeBase64(carried), 0o755), 'symlink', to);
     SYMLINKS[to] = from;
     LINKTARGETS[to] = raw;
   };
@@ -1448,14 +1477,14 @@ BF.fs = function () {
   fs.linkSync = function (existingPath, newPath) {
     var from = toPathString(existingPath);
     var to = toPathString(newPath);
-    var st = statOf(from);
+    var st = statFollowingLinks(from);
     if (!st) throw fsError('ENOENT', 'link', String(existingPath));
     if (st.type === 'dir') throw fsError('EPERM', 'link', String(existingPath));
     if (statOf(to)) throw fsError('EEXIST', 'link', String(newPath));
     /* The second name is made in the directory it is put in, so it is that directory's write bit a
        host checks rather than the bits of the name being linked. */
     requireDirWrite(to, 'link', from, to);
-    var canonical = canonicalOf(from);
+    var canonical = bytesNameOf(from);
     var raw = host.readBase64(canonical);
     if (raw === null) throw fsError('ENOENT', 'link', String(existingPath));
     check(host.writeBase64(to, raw, 0o644), 'link', to);
@@ -1478,7 +1507,10 @@ BF.fs = function () {
 
   fs.readdirSync = function (p, opts) {
     var file = toPathString(p);
-    var st = statOf(file);
+    /* A listing of a link is a listing of the directory it names: the names it hands back are the
+       target's, and the entries carry the link's name above them. */
+    var at = resolvePath(file);
+    var st = statOf(at);
     if (!st) throw fsError('ENOENT', 'scandir', file);
     if (st.type !== 'dir') throw fsError('ENOTDIR', 'scandir', file);
     /* Listing a directory reads it, so a directory with no read bit is EACCES here the way it is on
@@ -1488,15 +1520,15 @@ BF.fs = function () {
     var recursive = !!(opts && typeof opts === 'object' && opts.recursive);
     var base = typeof p === 'string' ? p : file;
     if (!recursive) {
-      var names = sortedEntries(file);
+      var names = sortedEntries(at);
       if (!withTypes) return names;
       return names.map(function (name) {
-        return makeDirent(name, direntStatsOf(P.join(file, name)), base);
+        return makeDirent(name, direntStatsOf(P.join(at, name)), base);
       });
     }
     // Node's recursive listing is breadth first: one directory's entries in sorted order, then the next level.
     var out = [];
-    var queue = [{ abs: file, str: base, rel: '' }];
+    var queue = [{ abs: at, str: base, rel: '' }];
     for (var q = 0; q < queue.length; q++) {
       var cur = queue[q];
       var kids = sortedEntries(cur.abs);
@@ -1505,7 +1537,10 @@ BF.fs = function () {
         var childSt = direntStatsOf(childAbs);
         var childRel = cur.rel === '' ? kids[k] : cur.rel + '/' + kids[k];
         out.push(withTypes ? makeDirent(kids[k], childSt, cur.str) : childRel);
-        if (childSt.type === 'dir') queue.push({ abs: childAbs, str: P.join(cur.str, kids[k]), rel: childRel });
+        /* A link to a directory is listed as a link, and Node's walk still descends into it: the
+           names it hands back carry the link's name above the target's. */
+        var followed = statFollowingLinks(childAbs);
+        if (followed && followed.type === 'dir') queue.push({ abs: resolvePath(childAbs), str: P.join(cur.str, kids[k]), rel: childRel });
       }
     }
     return out;
@@ -1516,11 +1551,14 @@ BF.fs = function () {
     var recursive = !!(opts && typeof opts === 'object' && opts.recursive);
     var existing = statOf(file);
     if (existing) {
-      if (recursive && existing.type === 'dir') return undefined;
+      /* A recursive mkdir of a name that is already there is the one case that is not a failure,
+         and it is not a failure of a link to a directory either: the directory the link names is
+         the one mkdir -p was asked for. */
+      if (recursive && (existing.type === 'dir' || (statFollowingLinks(file) || {}).type === 'dir')) return undefined;
       throw fsError('EEXIST', 'mkdir', file);
     }
     directoryToCreateIn(file, recursive, 'mkdir');
-    check(host.mkdir(file, newMode(opts, 0o777)), 'mkdir', file);
+    check(host.mkdir(resolvePath(file), newMode(opts, 0o777)), 'mkdir', file);
     return recursive ? file : undefined;
   };
 
@@ -1549,6 +1587,9 @@ BF.fs = function () {
       throw err;
     }
     check(host.rm(file, recursive), 'rm', file);
+    /* The link's record goes with the name the rm took away; what it pointed at stays. */
+    delete SYMLINKS[file];
+    delete LINKTARGETS[file];
   };
 
   fs.rmdirSync = function (p, opts) {
@@ -1572,28 +1613,41 @@ BF.fs = function () {
     /* A second name of a file is dropped from the table when its own name goes; the bytes it was
        sharing stay under the name they were written to. */
     delete LINKS[file];
+    /* So is the record of a link: what the name pointed at stays, the link itself does not. */
+    delete SYMLINKS[file];
+    delete LINKTARGETS[file];
   };
 
   fs.renameSync = function (from, to) {
     var a = toPathString(from);
     var b = toPathString(to);
-    if (!statOf(a)) throw fsError('ENOENT', 'rename', a);
+    /* A rename moves the name and not what it points at, so a link is renamed as the link: the walk
+       stops before the last part of the path, which is the name being moved. */
+    var at = resolveParentPath(a);
+    var bt = resolveParentPath(b);
+    if (!statOf(at)) throw fsError('ENOENT', 'rename', a);
     /* A rename takes a name out of the directory it is in and puts one into the directory it is
        moved to, and a host checks the write bit of both. */
-    requireDirWrite(a, 'rename', a, b);
-    requireDirWrite(b, 'rename', a, b);
-    check(host.rename(a, b), 'rename', a);
+    requireDirWrite(at, 'rename', a, b);
+    requireDirWrite(bt, 'rename', a, b);
+    check(host.rename(at, bt), 'rename', a);
+    /* The record follows the name: a link renamed is the same link, at the name it was moved to. */
+    if (SYMLINKS[at] !== undefined) { SYMLINKS[bt] = SYMLINKS[at]; delete SYMLINKS[at]; }
+    if (LINKTARGETS[at] !== undefined) { LINKTARGETS[bt] = LINKTARGETS[at]; delete LINKTARGETS[at]; }
+    if (LINKS[at] !== undefined) { LINKS[bt] = LINKS[at]; delete LINKS[at]; }
   };
 
   fs.copyFileSync = function (from, to) {
     var src = toPathString(from);
     var dest = toPathString(to);
-    if (!statOf(src)) throw fsError('ENOENT', 'copyfile', src);
+    if (!statFollowingLinks(src)) throw fsError('ENOENT', 'copyfile', src);
     /* A copy reads one name and writes the other, so both modes are checked: a 0444 destination is
        EACCES the way a host answers it, even though the bytes of it are what the copy replaces. */
     requireAccess(src, 4, 'copyfile', src, dest);
     requireAccess(dest, 2, 'copyfile', src, dest);
-    check(host.writeBase64(dest, encodeBase64(readBytesOf(src))), 'copyfile', src);
+    /* The bytes go into what the destination names, not into the link standing there: a copy onto a
+       link writes the target and leaves the link a link. */
+    check(host.writeBase64(bytesNameOf(dest), encodeBase64(readBytesOf(src))), 'copyfile', src);
   };
 
   /*
@@ -1606,16 +1660,16 @@ BF.fs = function () {
    */
   function cpOne(src, dest, opts, seen) {
     if (typeof opts.filter === 'function' && !opts.filter(src, dest)) return;
-    var st = statOf(src);
+    var st = statFollowingLinks(src);
     if (!st) throw fsError('ENOENT', 'cp', src);
     if (st.type === 'dir') {
       if (!opts.recursive) throw eisdirError('cp', src);
       if (statOf(dest)) {
         if (opts.errorOnExist) throw fsError('EEXIST', 'cp', dest);
       } else {
-        check(host.mkdir(dest, opts.mode === undefined ? newMode(null, 0o777) : opts.mode), 'cp', dest);
+        check(host.mkdir(resolvePath(dest), opts.mode === undefined ? newMode(null, 0o777) : opts.mode), 'cp', dest);
       }
-      var names = sortedEntries(src);
+      var names = sortedEntries(resolvePath(src));
       for (var i = 0; i < names.length; i++) {
         cpOne(P.join(src, names[i]), P.join(dest, names[i]), opts, seen);
       }
@@ -1628,7 +1682,7 @@ BF.fs = function () {
       return;
     }
     if (!opts.force && statOf(dest)) throw fsError('EEXIST', 'cp', dest);
-    check(host.writeBase64(dest, encodeBase64(readBytesOf(src)), 0o644), 'cp', src);
+    check(host.writeBase64(bytesNameOf(dest), encodeBase64(readBytesOf(src)), 0o644), 'cp', src);
   }
 
   fs.cpSync = function (src, dest, opts) {
@@ -1654,7 +1708,8 @@ BF.fs = function () {
    */
   fs.accessSync = function (p, mode) {
     var file = toPathString(p);
-    var st = statOf(file);
+    /* access asks about what the name points at, not about the link standing there. */
+    var st = statFollowingLinks(file);
     if (!st) throw fsError('ENOENT', 'access', file);
     var want = mode === undefined || mode === null ? 0 : Number(mode);
     if (want === 0) return;
@@ -1876,8 +1931,10 @@ BF.fs = function () {
     var given = toPathString(p);
     /* An open of a link opens the file the link names, as a host's open(2) does: the descriptor
        that comes back is one on the target, so a write through it reaches the target and the bytes
-       it was opened with are the target's. Errors still name the path the caller handed over. */
-    var file = linkTargetOf(given);
+       it was opened with are the target's. Every part of the path is resolved, so a name under a
+       link to a directory opens the file the directory holds. Errors still name the path the caller
+       handed over. */
+    var file = resolvePath(given);
     var letter = flagLetter(f);
     var creates = letter === 'w' || letter === 'a';
     var st = statOf(file);
@@ -2100,7 +2157,7 @@ BF.fs = function () {
    * for the comparison to be made against.
    */
   function resizeDescriptors(file, size) {
-    var canonical = canonicalOf(file);
+    var canonical = canonicalOf(resolvePath(file));
     var fds = Object.keys(DESCRIPTORS);
     for (var i = 0; i < fds.length; i++) {
       var rec = DESCRIPTORS[fds[i]];
@@ -2157,8 +2214,11 @@ BF.fs = function () {
 
   fs.utimesSync = function (p, atime, mtime) {
     var file = toPathString(p);
-    if (!statOf(file)) throw fsError('ENOENT', 'utime', file);
-    MTIMES[file] = timeToMs(mtime);
+    /* Like a chmod, a utimes is of what the name points at: the times go on the target, and the
+       link keeps the ones it was made with until a lutimes moves them. */
+    var at = resolvePath(file);
+    if (!statOf(at)) throw fsError('ENOENT', 'utime', file);
+    MTIMES[at] = timeToMs(mtime);
   };
 
   // One read across several buffers: the descriptor's position runs on through all of them, and
@@ -2222,7 +2282,10 @@ BF.fs = function () {
 
   fs.chmodSync = function (p, mode) {
     var file = toPathString(p);
-    if (!setModeOf(file, mode, 'chmod')) throw fsError('ENOENT', 'chmod', file);
+    /* A chmod acts on what the name points at, so the mode is recorded against the target: a chmod
+       of a link moves the target's bits and leaves the link's own alone, the way a host's does.
+       The error still names the path the caller handed over. */
+    if (!setModeOf(resolvePath(file), mode, 'chmod')) throw fsError('ENOENT', 'chmod', file);
   };
 
   fs.fchmodSync = function (fd, mode) {
@@ -2234,7 +2297,7 @@ BF.fs = function () {
 
   fs.chownSync = function (p, uid, gid) {
     var file = toPathString(p);
-    if (!statOf(file)) throw fsError('ENOENT', 'chown', file);
+    if (!statFollowingLinks(file)) throw fsError('ENOENT', 'chown', file);
   };
 
   /* The five calls Node has beside utimes, chown and chmod for the two targets those do not reach:
@@ -2357,7 +2420,7 @@ BF.fs = function () {
     if (options.encoding) stream.setEncoding(options.encoding);
     // like Node, the file is opened when the stream is created: a missing file is an 'error' even with no reader
     settleIO(function () {
-      if (!statOf(file)) {
+      if (!statFollowingLinks(file)) {
         stream.destroy(fsError('ENOENT', 'open', file));
         return;
       }
@@ -2613,12 +2676,13 @@ BF.fs = function () {
 
   fs.opendirSync = function (p) {
     var file = toPathString(p);
-    var st = statOf(file);
+    var at = resolvePath(file);
+    var st = statOf(at);
     if (!st) throw fsError('ENOENT', 'opendir', file);
     if (st.type !== 'dir') throw fsError('ENOTDIR', 'opendir', file);
     var base = typeof p === 'string' ? p : file;
-    var entries = sortedEntries(file).map(function (name) {
-      return makeDirent(name, direntStatsOf(P.join(file, name)), base);
+    var entries = sortedEntries(at).map(function (name) {
+      return makeDirent(name, direntStatsOf(P.join(at, name)), base);
     });
     return new Dir(base, entries);
   };
@@ -2834,7 +2898,7 @@ BF.fs = function () {
    */
   fs.statfsSync = function (p, opts) {
     var file = toPathString(p === undefined ? '/' : p);
-    if (!statOf(file)) throw fsError('ENOENT', 'statfs', file);
+    if (!statFollowingLinks(file)) throw fsError('ENOENT', 'statfs', file);
     var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
     var num = bigint ? function (value) { return BigInt(value); } : function (value) { return value; };
     return {
