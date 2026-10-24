@@ -1,4 +1,4 @@
-import { CapabilityHandler } from './types';
+import { CapabilityContext, CapabilityHandler } from './types';
 import { base64ToBytes, bytesToBase64 } from '../../../../../utils/bytes';
 
 /*
@@ -15,6 +15,13 @@ import { base64ToBytes, bytesToBase64 } from '../../../../../utils/bytes';
  * on it -- the wasm stack unwinds, the notifying thread runs, and the guest resumes inside the
  * statement that called, which is what lets one process wake another. The guest half is the Atomics
  * wrap in ../guest/modules/child.ts.
+ *
+ * Host half of the two message routes that leave a process: a BroadcastChannel name, and the link a
+ * transferred MessagePort keeps. Two container processes share no heap and no descriptor, so the
+ * only place they meet is here. An endpoint opens a key (busOpen), a post on that key (busPost)
+ * reaches every other endpoint open on it, and the frames posted inside one turn travel together,
+ * one delivery per process, so a receiving process hands them out in the order its endpoints were
+ * made -- the order node hands them out in. The guest half is the bus in ../guest/modules/child.ts.
  */
 
 interface Waiter {
@@ -160,11 +167,111 @@ const waitOnSlab: CapabilityHandler = (args) => {
     });
 };
 
+/*
+ * The bus: one endpoint of one BroadcastChannel or of one transferred port's link, as the pid and the
+ * guest target the host reaches it on. `id` is unique across the container (the guest makes it out of
+ * its own pid), so a post reaches every other endpoint on the key and never the one that posted.
+ */
+interface BusEntry {
+    pid: number;
+    target: number;
+    key: string;
+    id: number;
+}
+
+interface BusFrame {
+    key: string;
+    from: number;
+    frame: unknown;
+}
+
+interface Bus {
+    entries: BusEntry[];
+    pending: BusFrame[];
+    timer: ReturnType<typeof setTimeout> | undefined;
+    nextLink: number;
+}
+
+/** One bus per container: the services object is the container's own, so no two share a channel. */
+const buses = new WeakMap<object, Bus>();
+
+function busFor(ctx: CapabilityContext): Bus {
+    const key = ctx.services as unknown as object;
+    let bus = buses.get(key);
+    if (bus === undefined) {
+        bus = { entries: [], pending: [], timer: undefined, nextLink: 1 };
+        buses.set(key, bus);
+    }
+    return bus;
+}
+
+/**
+ * The frames one turn posted, handed on: grouped by the process each is going to, so a process gets
+ * one delivery for the whole turn and hands its own out in the order its endpoints were made.
+ */
+function flushBus(ctx: CapabilityContext, bus: Bus): void {
+    bus.timer = undefined;
+    const frames = bus.pending.splice(0);
+    const groups = new Map<number, { target: number; items: unknown[] }>();
+    for (const frame of frames) {
+        for (const entry of bus.entries) {
+            if (entry.key !== frame.key || entry.id === frame.from) continue;
+            let group = groups.get(entry.pid);
+            if (group === undefined) {
+                group = { target: entry.target, items: [] };
+                groups.set(entry.pid, group);
+            }
+            group.items.push([entry.id, frame.frame]);
+        }
+    }
+    for (const [pid, group] of groups) {
+        const payload = { items: group.items };
+        /* Own process: ctx.deliver, which is the route that also works inside a synchronous run. */
+        if (pid === ctx.pid) {
+            ctx.deliver(group.target, 'bus', payload);
+            continue;
+        }
+        ctx.services.sinkFor(pid)?.deliver(group.target, 'bus', payload);
+    }
+}
+
+const busOpen: CapabilityHandler = (args, ctx) => {
+    const bus = busFor(ctx);
+    const id = Number(args.id);
+    bus.entries = bus.entries.filter((entry) => entry.id !== id);
+    bus.entries.push({ pid: ctx.pid, target: Number(args.target), key: String(args.key), id });
+    return true;
+};
+
+const busClose: CapabilityHandler = (args, ctx) => {
+    const bus = busFor(ctx);
+    const id = Number(args.id);
+    bus.entries = bus.entries.filter((entry) => entry.id !== id);
+    return true;
+};
+
+const busPost: CapabilityHandler = (args, ctx) => {
+    const bus = busFor(ctx);
+    bus.pending.push({ key: String(args.key), from: Number(args.from), frame: args.frame });
+    if (bus.timer === undefined) bus.timer = setTimeout(() => flushBus(ctx, bus), 0);
+    return true;
+};
+
+/** The id a transferred port's link gets: one number no other link in this container has. */
+const busLink: CapabilityHandler = (_args, ctx) => {
+    const bus = busFor(ctx);
+    return { id: bus.nextLink++ };
+};
+
 export const SHARED_CAPABILITIES: Record<string, CapabilityHandler> = {
     'shared.create': createSlab,
     'shared.read': readSlab,
     'shared.write': writeSlab,
     'shared.release': releaseSlab,
     'shared.notify': notifyWaiters,
-    'shared.wait': waitOnSlab
+    'shared.wait': waitOnSlab,
+    'shared.busOpen': busOpen,
+    'shared.busClose': busClose,
+    'shared.busPost': busPost,
+    'shared.busLink': busLink
 };

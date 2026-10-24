@@ -23,8 +23,10 @@
  * stepped there, so the call reports ERR_NOT_SUPPORTED with the output written so far.
  *
  * Known gaps. A child's stdout and stderr are read as a whole after the child ends, not streamed as
- * they are written. There is no SCM_RIGHTS handle passing, no cluster networking (servers are not
- * shared between workers), and BroadcastChannel is in-process only.
+ * they are written. There is no SCM_RIGHTS handle passing and no cluster networking (servers are not
+ * shared between workers). A BroadcastChannel name reaches the workers of one process and not the
+ * channels of another, as it does on a host; a MessagePort transferred to a worker keeps working on
+ * the link the two ends share.
  */
 export const SRC = String.raw`
 var cpState = {
@@ -39,7 +41,14 @@ var cpState = {
   tokenCount: 0,
   channels: [],
   portClass: null,
-  childClass: null
+  childClass: null,
+  broadcastClass: null,
+  /* The value handed to a transferList while it is being encoded, so a port inside it crosses as the
+     link it names and one outside it is refused the way node refuses it. */
+  transfer: null,
+  /* The set of threads one BroadcastChannel name reaches: a worker shares its parent's, a forked or
+     clustered child has one of its own, which is what node gives a channel in another process. */
+  bcDomain: null
 };
 
 var cpSignalNames = { 1: 'SIGHUP', 2: 'SIGINT', 9: 'SIGKILL', 15: 'SIGTERM' };
@@ -185,6 +194,16 @@ function cpEncode(value) {
     return { $t: 'SB', id: slabId, n: value.byteLength };
   }
   if (value instanceof ArrayBuffer) return { $t: 'AB', v: Buffer.from(value).toString('base64') };
+  /* A MessagePort is not a value a clone copies, it is one a clone moves. Named in the transferList
+     it crosses as the link its two ends share and the port itself is left detached, as on the host;
+     not named there, node refuses the whole message with the words it uses for that refusal, and
+     not with the text of some function the port happens to hold. */
+  if (value instanceof cpPortClass()) {
+    if (cpState.transfer !== null && cpState.transfer.indexOf(value) >= 0) return cpPortTransfer(value);
+    var untransferred = cpError('Object that needs transfer was found in message but not listed in transferList', 'ERR_DATA_CLONE');
+    untransferred.name = 'DataCloneError';
+    throw untransferred;
+  }
   if (Array.isArray(value)) {
     return value.map(function (item) {
       return cpEncode(item);
@@ -242,6 +261,13 @@ function cpDecode(value) {
         new Uint8Array(shared).set(slabBytes);
         return shared;
       }
+      /* A transferred port arrives as the link it was sent on: the port built here is the other end
+         of the one that was transferred, and what either posts on it reaches the other. */
+      case 'P': {
+        var linked = new (cpPortClass())();
+        cpPortJoin(linked, Number(value.id));
+        return linked;
+      }
       case 'AB': {
         var decoded = Buffer.from(value.v, 'base64');
         var buffer = new ArrayBuffer(decoded.length);
@@ -267,6 +293,87 @@ function cpDecode(value) {
   return plain;
 }
 
+/* The value a transferList holds while it is being encoded, so a port inside it crosses as a link
+   and one outside it is refused: cpEncode reads it, and it is put back when the encode ends. */
+function cpEncodeWith(value, list) {
+  var previous = cpState.transfer;
+  cpState.transfer = Array.isArray(list) ? list : null;
+  try {
+    return cpEncode(value);
+  } finally {
+    cpState.transfer = previous;
+  }
+}
+
+/* The bus: what a BroadcastChannel name and a transferred port's link are on the host, which is the
+   only place two container processes meet -- they share no heap and no descriptor, and a worker is a
+   process of its own here. An endpoint opens a key and every other endpoint open on it is reached by
+   a post, in this process or in another. The frames one turn posted travel together in one delivery
+   per process, and a process hands its own out in the order it made them, which is the order node
+   hands them out in. */
+var cpBus = { target: 0, sinks: Object.create(null), order: [], next: 1, flush: false };
+
+/* Endpoint ids are made out of the pid so that two processes never make the same one: the host tells
+   one post from another by this number alone. */
+function cpBusNext() {
+  return Number(proc.pid) * 1000000 + cpBus.next++;
+}
+
+function cpBusTarget() {
+  if (cpBus.target === 0) cpBus.target = createTarget(cpOnBusFrame);
+  return cpBus.target;
+}
+
+function cpBusOpen(key, id, sink) {
+  cpBus.sinks[id] = sink;
+  cpBus.order.push(id);
+  callCap('shared.busOpen', { key: key, id: id, target: cpBusTarget() });
+}
+
+function cpBusClose(id) {
+  if (cpBus.sinks[id] === undefined) return;
+  delete cpBus.sinks[id];
+  var at = cpBus.order.indexOf(id);
+  if (at >= 0) cpBus.order.splice(at, 1);
+  callCap('shared.busClose', { id: id });
+}
+
+function cpBusPost(key, id, frame) {
+  callCap('shared.busPost', { key: key, from: id, frame: frame });
+}
+
+function cpBusFlush() {
+  cpBus.flush = false;
+  for (var i = 0; i < cpBus.order.length; i++) {
+    var sink = cpBus.sinks[cpBus.order[i]];
+    if (sink && typeof sink._flush === 'function') sink._flush();
+  }
+}
+
+function cpOnBusFrame(name, payload) {
+  if (name !== 'bus' || !payload || !Array.isArray(payload.items)) return;
+  var items = payload.items;
+  for (var i = 0; i < items.length; i++) {
+    if (!Array.isArray(items[i])) continue;
+    var sink = cpBus.sinks[items[i][0]];
+    if (sink && typeof sink._receive === 'function') sink._receive(items[i][1]);
+  }
+  /* Everything this turn brought is queued now, so one flush hands it out: a channel's own messages
+     in the order it was given them, and every channel before the one made after it. */
+  if (!cpBus.flush) {
+    cpBus.flush = true;
+    queueMicrotask(cpBusFlush);
+  }
+}
+
+/* The set of threads one BroadcastChannel name is open across: a worker shares its parent's, and a
+   forked or clustered child has one of its own -- which is what node has, where a channel reaches the
+   threads of one process and not the channels of another. */
+function cpBusDomain() {
+  if (cpState.bcDomain === null) cpState.bcDomain = String(proc.pid);
+  return cpState.bcDomain;
+}
+
 /* MessagePort: messages are delivered asynchronously (setImmediate), and a port with 'message' listeners
    holds a ref until it is closed or unref'd, as Node does. A port with a _remote sender sends over IPC. */
 function cpPortClass() {
@@ -279,6 +386,9 @@ function cpPortClass() {
     this._closed = false;
     this._peer = null;
     this._remote = null;
+    this._link = null;
+    this._eid = 0;
+    this._detached = false;
     this._refed = true;
     this._held = false;
     this._scheduled = false;
@@ -319,15 +429,28 @@ function cpPortClass() {
       }
     });
   };
-  MessagePort.prototype.postMessage = function (value) {
-    if (this._closed) return;
-    var encoded = cpEncode(value);
+  MessagePort.prototype.postMessage = function (value, transferList) {
+    /* A detached port is the one that was transferred away: it has no end to reach any more, and on
+       the host using it is silently nothing rather than an error. */
+    if (this._closed || this._detached) return;
+    var encoded = cpEncodeWith(value, transferList);
+    /* A link is ahead of the peer: a transferred port's messages travel over the host, which is the
+       only place this process and the one holding the other end meet. */
+    if (this._link !== null) {
+      cpBusPost('port:' + this._link, this._eid, encoded);
+      return;
+    }
     if (this._remote) {
       this._remote(encoded);
       return;
     }
     var peer = this._peer;
     if (peer && !peer._closed) peer._enqueue(cpDecode(encoded));
+  };
+  /* A frame the host handed this end of a link: queued, and handed out when the port is started, as
+     a message from the port's own peer is. */
+  MessagePort.prototype._receive = function (frame) {
+    this._enqueue(cpDecode(frame));
   };
   MessagePort.prototype.start = function () {
     if (this._closed) return;
@@ -373,30 +496,152 @@ function cpMakeChannel() {
   return { port1: a, port2: b };
 }
 
-function cpBroadcastClass() {
-  var Port = cpPortClass();
-  function BroadcastChannel(name) {
-    Port.call(this);
-    this.name = String(name);
-    cpState.channels.push(this);
+/* A transferred port crosses as a link: an id on the host's bus that both the end it reaches and the
+   end that stayed behind are open on, so what either posts arrives at the other. The port that
+   crosses is detached -- it has no end of its own any more, which is what node leaves behind -- and
+   the peer it had here, if it had one, moves onto the link in its place. */
+function cpPortTransfer(port) {
+  var id = port._link;
+  if (id === null) {
+    id = Number(callCap('shared.busLink', {}).id);
+    var peer = port._peer;
+    if (peer && !peer._closed) {
+      peer._peer = null;
+      peer._link = id;
+      peer._eid = cpBusNext();
+      cpBusOpen('port:' + id, peer._eid, peer);
+    }
   }
-  BroadcastChannel.prototype = Object.create(Port.prototype);
-  BroadcastChannel.prototype.constructor = BroadcastChannel;
-  BroadcastChannel.prototype.postMessage = function (value) {
-    if (this._closed) return;
-    var encoded = cpEncode(value);
+  cpPortDetach(port);
+  return { $t: 'P', id: id };
+}
+
+function cpPortDetach(port) {
+  if (port._eid !== 0) cpBusClose(port._eid);
+  port._eid = 0;
+  port._link = null;
+  port._peer = null;
+  port._remote = null;
+  port._q = [];
+  port._detached = true;
+  port._sync(false);
+}
+
+/* The end a transferred port is where it arrives: open on the link it came over. */
+function cpPortJoin(port, id) {
+  port._link = id;
+  port._eid = cpBusNext();
+  cpBusOpen('port:' + id, port._eid, port);
+}
+
+/* BroadcastChannel: a message posted on a name reaches every other channel open on that name and not
+   the one that posted it, in this process or in a worker of it -- which is what node delivers across
+   the threads of one process, and a worker is a process of its own here. Node's channel is an
+   EventTarget and not an emitter: 'message' reaches onmessage and addEventListener as a MessageEvent,
+   and an open channel holds a ref until it is closed or unref'd, which is why a host waits for one. */
+function cpBroadcastClass() {
+  if (cpState.broadcastClass) return cpState.broadcastClass;
+  function cpBusKey(name) {
+    return 'bc:' + cpBusDomain() + ':' + name;
+  }
+  function cpBusRef(state) {
+    var want = !state.closed && state.refed;
+    if (want === state.held) return;
+    state.held = want;
+    holdRef(want ? 1 : -1);
+  }
+  function BroadcastChannel(name) {
+    if (!(this instanceof BroadcastChannel)) throw new TypeError("Constructor BroadcastChannel requires 'new'");
     var self = this;
-    cpState.channels.forEach(function (other) {
-      if (other !== self && other.name === self.name && !other._closed) {
-        other._enqueue(cpDecode(encoded));
+    var eid = cpBusNext();
+    var state = {
+      name: String(name),
+      closed: false,
+      refed: true,
+      held: false,
+      queue: [],
+      target: typeof EventTarget === 'function' ? new EventTarget() : null,
+      onmessage: null,
+      onmessageerror: null
+    };
+    Object.defineProperty(this, '_bcState', { value: state, enumerable: false });
+    Object.defineProperty(this, '_bcId', { value: eid, enumerable: false });
+    state._receive = function (frame) {
+      if (state.closed) return;
+      state.queue.push(frame);
+    };
+    state._flush = function () {
+      while (state.queue.length > 0) {
+        var data = cpDecode(state.queue.shift());
+        if (state.closed) return;
+        var event = null;
+        if (typeof MessageEvent === 'function') {
+          try {
+            event = new MessageEvent('message', { data: data });
+          } catch (ignored) {
+            event = null;
+          }
+        }
+        if (event === null) event = { type: 'message', data: data };
+        if (typeof state.onmessage === 'function') state.onmessage.call(self, event);
+        if (state.target !== null) state.target.dispatchEvent(event);
       }
-    });
+    };
+    cpBusOpen(cpBusKey(state.name), eid, state);
+    cpBusRef(state);
+  }
+  BroadcastChannel.prototype.constructor = BroadcastChannel;
+  Object.defineProperty(BroadcastChannel.prototype, 'name', {
+    get: function () { return this._bcState.name; },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(BroadcastChannel.prototype, 'onmessage', {
+    get: function () { return this._bcState.onmessage; },
+    set: function (fn) { this._bcState.onmessage = typeof fn === 'function' ? fn : null; },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(BroadcastChannel.prototype, 'onmessageerror', {
+    get: function () { return this._bcState.onmessageerror; },
+    set: function (fn) { this._bcState.onmessageerror = typeof fn === 'function' ? fn : null; },
+    enumerable: true, configurable: true
+  });
+  BroadcastChannel.prototype.postMessage = function (value) {
+    var state = this._bcState;
+    if (state.closed) throw new DOMException('This BroadcastChannel is already closed', 'InvalidStateError');
+    cpBusPost(cpBusKey(state.name), this._bcId, cpEncode(value));
   };
   BroadcastChannel.prototype.close = function () {
-    var index = cpState.channels.indexOf(this);
-    if (index >= 0) cpState.channels.splice(index, 1);
-    Port.prototype.close.call(this);
+    var state = this._bcState;
+    if (state.closed) return;
+    state.closed = true;
+    state.queue = [];
+    cpBusClose(this._bcId);
+    cpBusRef(state);
   };
+  BroadcastChannel.prototype.ref = function () {
+    this._bcState.refed = true;
+    cpBusRef(this._bcState);
+    return this;
+  };
+  BroadcastChannel.prototype.unref = function () {
+    this._bcState.refed = false;
+    cpBusRef(this._bcState);
+    return this;
+  };
+  /* Node reads these off EventTarget's prototype; this channel is not one, so they sit here. */
+  BroadcastChannel.prototype.addEventListener = function () {
+    var target = this._bcState.target;
+    return target === null ? undefined : target.addEventListener.apply(target, arguments);
+  };
+  BroadcastChannel.prototype.removeEventListener = function () {
+    var target = this._bcState.target;
+    return target === null ? undefined : target.removeEventListener.apply(target, arguments);
+  };
+  BroadcastChannel.prototype.dispatchEvent = function () {
+    var target = this._bcState.target;
+    return target === null ? false : target.dispatchEvent.apply(target, arguments);
+  };
+  cpState.broadcastClass = BroadcastChannel;
   return BroadcastChannel;
 }
 
@@ -807,7 +1052,7 @@ function cpKill(child, signal) {
   return ok === true;
 }
 
-function cpSendToChild(child, message, callback) {
+function cpSendToChild(child, message, callback, transferList) {
   if (!child.connected) {
     var closed = cpError('Channel closed', 'ERR_IPC_CHANNEL_CLOSED');
     if (typeof callback === 'function') proc.nextTick(callback, closed);
@@ -816,7 +1061,7 @@ function cpSendToChild(child, message, callback) {
     });
     return false;
   }
-  var frame = { t: 'm', v: cpEncode(message) };
+  var frame = { t: 'm', v: cpEncodeWith(message, transferList) };
   cpPost(child, function () {
     callCap('child.sendToChild', { pid: child.pid, frame: frame });
   });
@@ -944,15 +1189,17 @@ function cpWorkerClass() {
       ipcKind: 'worker',
       ipcData: {
         threadId: threadId,
-        workerData: cpEncode(opts.workerData === undefined ? null : opts.workerData),
-        envData: cpEnvDataSnapshot()
+        workerData: cpEncodeWith(opts.workerData === undefined ? null : opts.workerData, opts.transferList),
+        envData: cpEnvDataSnapshot(),
+        /* The set of threads a BroadcastChannel name reaches: a worker shares its parent's. */
+        bcDomain: cpBusDomain()
       }
     });
   }
   Worker.prototype = Object.create(Child.prototype);
   Worker.prototype.constructor = Worker;
-  Worker.prototype.postMessage = function (value) {
-    cpSendToChild(this, value, null);
+  Worker.prototype.postMessage = function (value, transferList) {
+    cpSendToChild(this, value, null, transferList);
   };
   Worker.prototype.terminate = function () {
     var self = this;
@@ -1712,6 +1959,10 @@ BF['cluster'] = function () {
     /* The environment data its parent held when it started it: a worker reads the keys its parent
        had, and a key it sets of its own is its own, as on host node 24.15. */
     cpEnvDataSeed(cpState.data.envData);
+    /* The threads one BroadcastChannel name is open across: a worker shares its parent's set. A
+       forked or clustered child keeps its own, which is what node gives a channel in a process of
+       its own -- a name does not reach across processes there. */
+    cpState.bcDomain = cpState.data.bcDomain === undefined ? String(proc.pid) : String(cpState.data.bcDomain);
     var Port = cpPortClass();
     cpState.port = new Port();
     cpState.port._remote = function (encoded) {
@@ -1726,4 +1977,9 @@ BF['cluster'] = function () {
     token: cpState.data.token === undefined ? null : cpState.data.token
   });
 })();
+
+/* BroadcastChannel without a require: node's global and worker_threads' are the same class, and the
+   one above is it -- a channel open on a name reaches the workers of this process, not only the
+   channels open in it. */
+globalThis.BroadcastChannel = cpBroadcastClass();
 `;
