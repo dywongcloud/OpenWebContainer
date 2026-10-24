@@ -1043,7 +1043,34 @@ BF.fs = function () {
    * it is answered ENOENT: an existsSync, a readdirSync, an accessSync and a statfsSync of a link to
    * a directory were all refused, where a host answers for the directory.
    */
-  function resolvePath(file) {
+  function resolvePath(file, syscall, name) {
+    var resolved = realPathOf(file);
+    /*
+     * A walk that cannot finish is refused here and not handed back: one that comes back on itself,
+     * and one that meets more links than a host follows. Handing the cyclic name back instead, which
+     * this did, left a read, a stat, a realpath, an access, an open and a readdir all answering for
+     * the link's own empty node -- an empty regular file that is simply there -- where host node
+     * 24.15 answers ELOOP for every one of them and false for an exists.
+     *
+     * The two names after the path are the syscall and the path of the call that asked, and they are
+     * the ones the error carries, since a host names both: 'open' for a read, 'scandir' for a
+     * listing, 'access' for an access, 'stat' for a stat and for realpath's own walk. A caller that
+     * names neither gets 'stat' and the normalised path, which is what every walk above a call raises.
+     */
+    if (resolved.loop) {
+      throw fsError('ELOOP', syscall === undefined ? 'stat' : syscall, name === undefined ? file : name);
+    }
+    return resolved.path;
+  }
+
+  /*
+   * The same walk with no refusal in it, for the four callers a host does not resolve on its way to
+   * an answer: the module resolver names the path it was given when the walk changes nothing, the
+   * diagnostic behind an absent name only asks what the name stands beside, a recursive listing
+   * decides whether to descend from the entry and not from what it points at, and a symlink of a
+   * name that does not resolve is still made -- a host's own ln -s of a loop is not refused.
+   */
+  function resolveQuiet(file) {
     return realPathOf(file).path;
   }
 
@@ -1053,13 +1080,13 @@ BF.fs = function () {
    * and not of what it points at -- a host's rename of a link renames the link, and its readdir
    * lists the link -- so those are given this and not resolvePath.
    */
-  function resolveParentPath(file) {
-    return P.join(resolvePath(P.dirname(file)), P.basename(file));
+  function resolveParentPath(file, syscall, name) {
+    return P.join(resolvePath(P.dirname(file), syscall, name), P.basename(file));
   }
 
   /* The name whose bytes a path carries: a link's are the ones its target carries. */
-  function bytesNameOf(file) {
-    return canonicalOf(resolvePath(file));
+  function bytesNameOf(file, syscall, name) {
+    return canonicalOf(resolvePath(file, syscall, name));
   }
 
   /*
@@ -1142,8 +1169,14 @@ BF.fs = function () {
   /* stat follows every link a path goes through to the name it ends at, the way the kernel does: a
      path whose last part is a link is read as the target, and so is a directory met part of the way
      along one. */
-  function statFollowingLinks(file) {
-    return statOf(resolvePath(file));
+  function statFollowingLinks(file, syscall, name) {
+    return statOf(resolvePath(file, syscall, name));
+  }
+
+  /* The same stat with no refusal in it, for the callers a host does not resolve on its way to
+     an answer -- see resolveQuiet. */
+  function statResolved(file) {
+    return statOf(resolveQuiet(file));
   }
 
   /*
@@ -1184,12 +1217,12 @@ BF.fs = function () {
 
   function directoryToCreateIn(file, recursive, syscall, name) {
     var at = P.dirname(file);
-    var dir = statFollowingLinks(at);
+    var dir = statFollowingLinks(at, syscall, nameOrPath(name, file));
     while (!dir && recursive) {
       var up = P.dirname(at);
       if (up === at) break;
       at = up;
-      dir = statFollowingLinks(at);
+      dir = statFollowingLinks(at, syscall, nameOrPath(name, file));
     }
     if (!dir) throw fsError('ENOENT', syscall, nameOrPath(name, file));
     if (dir.type !== 'dir') throw fsError('ENOTDIR', syscall, nameOrPath(name, file));
@@ -1211,7 +1244,7 @@ BF.fs = function () {
       var part = parts[i];
       if (part === '' || part === '.') continue;
       if (part === '..') {
-        var st = statFollowingLinks(at);
+        var st = statResolved(at);
         if (!st || st.type !== 'dir') return null;
         at = P.dirname(at);
         continue;
@@ -1231,7 +1264,7 @@ BF.fs = function () {
     var at = literal;
     for (var hop = 0; hop < 64; hop++) {
       var reached = reachOf(at);
-      if (reached !== null && statFollowingLinks(reached)) break;
+      if (reached !== null && statResolved(reached)) break;
       chain.push(at);
       var up = P.dirname(at);
       if (up === at) break;
@@ -1255,7 +1288,7 @@ BF.fs = function () {
   function requireTraverse(file, syscall, name) {
     var at = P.dirname(toPathString(file));
     for (var hop = 0; hop < 64; hop++) {
-      var st = statFollowingLinks(at);
+      var st = statFollowingLinks(at, syscall, nameOrPath(name, file));
       if (!st || st.type !== 'dir') return;
       if (at !== DEVICE_DIR && (modeBitsOf(st) & 0o100) === 0) throw fsError('EACCES', syscall, nameOrPath(name, file));
       var up = P.dirname(at);
@@ -1274,7 +1307,7 @@ BF.fs = function () {
    */
   function requireDirWrite(file, syscall, from, to, name) {
     var dirPath = P.dirname(toPathString(file));
-    var dir = statFollowingLinks(dirPath);
+    var dir = statFollowingLinks(dirPath, syscall, nameOrPath(name, file));
     if (!dir) throw from === undefined ? fsError('ENOENT', syscall, nameOrPath(name, file)) : twoEndError('ENOENT', syscall, from, to);
     if (dir.type !== 'dir') throw from === undefined ? fsError('ENOTDIR', syscall, nameOrPath(name, file)) : twoEndError('ENOTDIR', syscall, from, to);
     if (dirPath !== DEVICE_DIR && (modeBitsOf(dir) & 0o200) === 0) {
@@ -1292,7 +1325,7 @@ BF.fs = function () {
   function absentCode(file) {
     var at = P.dirname(toPathString(file));
     for (var hop = 0; hop < 64; hop++) {
-      var st = statFollowingLinks(at);
+      var st = statResolved(at);
       if (st) return st.type === 'dir' ? 'ENOENT' : 'ENOTDIR';
       var up = P.dirname(at);
       if (up === at) break;
@@ -1303,7 +1336,7 @@ BF.fs = function () {
 
   function requireAccess(file, want, syscall, from, to, name) {
     requireTraverse(file, syscall, name);
-    var st = statFollowingLinks(file);
+    var st = statFollowingLinks(file, syscall, nameOrPath(name, file));
     var denied = function () {
       return from === undefined ? fsError('EACCES', syscall, nameOrPath(name, file)) : twoEndError('EACCES', syscall, from, to);
     };
@@ -1314,7 +1347,7 @@ BF.fs = function () {
       return;
     }
     var dirPath = P.dirname(file);
-    var dir = statFollowingLinks(dirPath);
+    var dir = statFollowingLinks(dirPath, syscall, nameOrPath(name, file));
     if (!dir) throw from === undefined ? fsError('ENOENT', syscall, nameOrPath(name, file)) : twoEndError('ENOENT', syscall, from, to);
     if (dirPath === DEVICE_DIR) return;
     var dirBits = modeBitsOf(dir);
@@ -1483,7 +1516,7 @@ BF.fs = function () {
     var file = toPathString(p);
     /* The file a read opens is the one the link names, not the link: its type and its access bits
        are the target's, and so are the bytes that come back. */
-    var st = statFollowingLinks(file);
+    var st = statFollowingLinks(file, 'open', pathName(p));
     if (!st) throw fsError('ENOENT', 'open', pathName(p));
     /* A read of a directory is EISDIR on host node 24.15, and the error it raises carries the
        syscall alone: no path, and none in its sentence either, where every other rejection this
@@ -1491,7 +1524,7 @@ BF.fs = function () {
     if (st.type === 'dir') throw noPathError('EISDIR', 'read');
     requireAccess(file, 4, 'open', undefined, undefined, pathName(p));
     var enc = optionsEncoding(opts);
-    if (enc && normalizeEncoding(enc) === 'utf8') return host.readText(bytesNameOf(file));
+    if (enc && normalizeEncoding(enc) === 'utf8') return host.readText(bytesNameOf(file, 'open', pathName(p)));
     var bytes = readBytesOf(file);
     if (enc) return decodeBytes(bytes, enc);
     return Buf.from(bytes);
@@ -1525,7 +1558,7 @@ BF.fs = function () {
     var file = toPathString(p);
     var type = opts && typeof opts === 'object' && typeof opts.type === 'string' ? opts.type : '';
     return new Promise(function (resolve, reject) {
-      var st = statFollowingLinks(file);
+      var st = statFollowingLinks(file, 'open', pathName(p));
       if (!st) { reject(fsError('ENOENT', 'open', pathName(p))); return; }
       if (st.type === 'dir') { reject(fsError('EISDIR', 'open', pathName(p))); return; }
       resolve(blobOf(readBytesOf(file), type));
@@ -1569,14 +1602,14 @@ BF.fs = function () {
        a log that grows by appends paid for every byte it had already written, again, on every
        call, so a 2 MiB log in 512 pieces took minutes where a host takes milliseconds. The file
        system appends, so nothing already written is read or written again. */
-    if (flag.charAt(0) === 'a' && statFollowingLinks(file)) {
-      check(host.appendBase64(bytesNameOf(file), encodeBase64(bytes)), 'open', file, pathName(p));
+    if (flag.charAt(0) === 'a' && statFollowingLinks(file, 'open', pathName(p))) {
+      check(host.appendBase64(bytesNameOf(file, 'open', pathName(p)), encodeBase64(bytes)), 'open', file, pathName(p));
       return;
     }
     /* A write of a link is a write of what it names: a host opens the target, so the bytes land
        there and the target's own name is the one that carries them, whether or not it was there
        before the call -- a link to a name nothing has made yet is what makes that name. */
-    check(host.writeBase64(bytesNameOf(file), encodeBase64(bytes), mode), 'open', file, pathName(p));
+    check(host.writeBase64(bytesNameOf(file, 'open', pathName(p)), encodeBase64(bytes), mode), 'open', file, pathName(p));
   };
 
   fs.appendFileSync = function (p, data, opts) {
@@ -1599,7 +1632,7 @@ BF.fs = function () {
     /* A stat walks the path, so it is the directories above the name that are checked: a name under
        a directory with no search bit is EACCES however readable the name is. */
     requireTraverse(file, 'stat', pathName(p));
-    var st = statFollowingLinks(file);
+    var st = statFollowingLinks(file, 'stat', pathName(p));
     if (!st) {
       if (opts && opts.throwIfNoEntry === false) return undefined;
       throw fsError(absentCode(file), 'stat', pathName(p));
@@ -1705,7 +1738,7 @@ BF.fs = function () {
      * is what a dangling link is. Nothing below reads the target through that copy: every call
      * resolves the link first, so the copy is never what a caller reaches.
      */
-    var targetStat = statFollowingLinks(from);
+    var targetStat = statResolved(from);
     var carried = targetStat && targetStat.type === 'file' ? readBytesOf(from) : new Uint8Array(0);
     var symlinkCode = host.writeBase64(to, encodeBase64(carried), 0o755);
     if (symlinkCode) throw symlinkError(symlinkCode, fromName, toName);
@@ -1728,7 +1761,7 @@ BF.fs = function () {
     /* A link names both of its ends as the call wrote them, exactly as a rename and a copyfile do. */
     var fromName = pathName(existingPath);
     var toName = pathName(newPath);
-    var st = statFollowingLinks(from);
+    var st = statFollowingLinks(from, 'link', fromName);
     if (!st) throw twoEndError('ENOENT', 'link', fromName, toName);
     if (st.type === 'dir') throw twoEndError('EPERM', 'link', fromName, toName);
     if (statOf(to)) throw twoEndError('EEXIST', 'link', fromName, toName);
@@ -1761,7 +1794,7 @@ BF.fs = function () {
     var file = toPathString(p);
     /* A listing of a link is a listing of the directory it names: the names it hands back are the
        target's, and the entries carry the link's name above them. */
-    var at = resolvePath(file);
+    var at = resolvePath(file, 'scandir', pathName(p));
     var st = statOf(at);
     if (!st) throw fsError('ENOENT', 'scandir', pathName(p));
     if (st.type !== 'dir') throw fsError('ENOTDIR', 'scandir', pathName(p));
@@ -1791,8 +1824,8 @@ BF.fs = function () {
         out.push(withTypes ? makeDirent(kids[k], childSt, cur.str) : childRel);
         /* A link to a directory is listed as a link, and Node's walk still descends into it: the
            names it hands back carry the link's name above the target's. */
-        var followed = statFollowingLinks(childAbs);
-        if (followed && followed.type === 'dir') queue.push({ abs: resolvePath(childAbs), str: P.join(cur.str, kids[k]), rel: childRel });
+        var followed = statResolved(childAbs);
+        if (followed && followed.type === 'dir') queue.push({ abs: resolveQuiet(childAbs), str: P.join(cur.str, kids[k]), rel: childRel });
       }
     }
     return out;
@@ -1806,7 +1839,7 @@ BF.fs = function () {
     if (!recursive) {
       if (statOf(file)) throw fsError('EEXIST', 'mkdir', literal);
       directoryToCreateIn(file, false, 'mkdir', literal);
-      check(host.mkdir(resolvePath(file), mode), 'mkdir', file, literal);
+      check(host.mkdir(resolvePath(file, 'mkdir', literal), mode), 'mkdir', file, literal);
       return undefined;
     }
     /*
@@ -1830,10 +1863,10 @@ BF.fs = function () {
     for (var i = chain.length - 1; i >= 0; i--) {
       var name = chain[i];
       var reached = reachOf(name);
-      if (reached !== null && statFollowingLinks(reached)) continue;
+      if (reached !== null && statResolved(reached)) continue;
       var at = toPathString(name);
       directoryToCreateIn(at, true, 'mkdir', name);
-      check(host.mkdir(resolvePath(at), mode), 'mkdir', at, name);
+      check(host.mkdir(resolvePath(at, 'mkdir', name), mode), 'mkdir', at, name);
     }
     /*
      * What a recursive mkdir hands back is the first directory it made -- the shallowest name on the
@@ -1967,7 +2000,7 @@ BF.fs = function () {
        so a source that is not there is refused with the pair and not with the source alone. */
     var srcName = pathName(from);
     var destName = pathName(to);
-    if (!statFollowingLinks(src)) throw twoEndError('ENOENT', 'copyfile', srcName, destName);
+    if (!statFollowingLinks(src, 'copyfile', srcName)) throw twoEndError('ENOENT', 'copyfile', srcName, destName);
     /* A copy reads one name and writes the other, so both modes are checked: a 0444 destination is
        EACCES the way a host answers it, even though the bytes of it are what the copy replaces. */
     requireAccess(src, 4, 'copyfile', srcName, destName, srcName);
@@ -1988,7 +2021,7 @@ BF.fs = function () {
    */
   function cpOne(src, dest, opts, seen) {
     if (typeof opts.filter === 'function' && !opts.filter(src, dest)) return;
-    var st = statFollowingLinks(src);
+    var st = statFollowingLinks(src, 'lstat', src);
     if (!st) throw fsError('ENOENT', 'cp', src);
     if (st.type === 'dir') {
       if (!opts.recursive) throw eisdirError('cp', src);
@@ -2037,7 +2070,7 @@ BF.fs = function () {
   fs.accessSync = function (p, mode) {
     var file = toPathString(p);
     /* access asks about what the name points at, not about the link standing there. */
-    var st = statFollowingLinks(file);
+    var st = statFollowingLinks(file, 'access', pathName(p));
     if (!st) throw fsError('ENOENT', 'access', pathName(p));
     var want = mode === undefined || mode === null ? 0 : Number(mode);
     if (want === 0) return;
@@ -2054,12 +2087,21 @@ BF.fs = function () {
    * under it and a link to a link is followed to the end. A path with no link in it is the path it
    * was given, normalised, which is all toPathString has already left.
    */
+  /*
+   * How many links a host's own walk of a name follows before it refuses the next one: node 24.15 on
+   * this machine's kernel resolves a chain of 32 plain links and answers ELOOP for 33, measured with
+   * the chain in this row's own witness, which is the MAXSYMLINKS that kernel carries. A container
+   * whose walk had no bound at all answered for the far end of a chain of 62.
+   */
+  var MAX_SYMLINKS = 32;
+
   function realPathOf(file) {
     var out = file;
     var seen = {};
     var linked = false;
     var loop = false;
-    for (var pass = 0; pass < 64; pass++) {
+    var hops = 0;
+    for (var pass = 0; pass < MAX_SYMLINKS + 2; pass++) {
       /* A cycle of links is a walk that comes back to a path it already stood on: a host stops there
          with ELOOP rather than going round until the pass count runs out. */
       if (seen['p' + out] !== undefined) { loop = true; break; }
@@ -2069,6 +2111,15 @@ BF.fs = function () {
       for (var i = 0; i < parts.length; i++) {
         var link = SYMLINKS['/' + parts.slice(0, i + 1).join('/')];
         if (link === undefined) continue;
+        /*
+         * A walk that is not a cycle can still be too long: a host's kernel follows MAXSYMLINKS of
+         * them and refuses the next one, so a chain of plain links that never comes back on itself
+         * is ELOOP from the thirty-third link on and not a file that happens to sit at the end of a
+         * long walk. Counting what a walk goes through, which this did not, is what makes the two
+         * the same refusal: 32 links resolve here, as they do on the host, and 33 do not.
+         */
+        if (hops === MAX_SYMLINKS) { loop = true; break; }
+        hops++;
         var target = P.resolve(link);
         var tail = parts.slice(i + 1);
         out = tail.length > 0 ? P.resolve(target, tail.join('/')) : target;
@@ -2076,7 +2127,7 @@ BF.fs = function () {
         linked = true;
         break;
       }
-      if (!replaced) break;
+      if (loop || !replaced) break;
     }
     return { path: out, linked: linked, loop: loop };
   }
@@ -2096,7 +2147,14 @@ BF.fs = function () {
   function realPathSync(p, native) {
     var file = toPathString(p);
     var resolved = realPathOf(file);
-    if (statOf(resolved.path)) return resolved.path;
+    /*
+     * A cycle, and a chain longer than a host follows, are refused before the name the walk ended on
+     * is looked at: it ends on a name the tree really holds -- the link's own node -- so a realpath
+     * that looked first handed the loop back as a path that is simply there, where host node 24.15
+     * answers ELOOP. Which of the two refusals it is, and the syscall each names, is what
+     * realPathError reads off the walk.
+     */
+    if (!resolved.loop && statOf(resolved.path)) return resolved.path;
     var err = realPathError(resolved, native);
     /*
      * Which of the two names the error carries is which entry point raised it: the binding form hands
@@ -2270,7 +2328,7 @@ BF.fs = function () {
        it was opened with are the target's. Every part of the path is resolved, so a name under a
        link to a directory opens the file the directory holds. Errors still name the path the caller
        handed over: given is that name, and file is what it resolves to. */
-    var file = resolvePath(given);
+    var file = resolvePath(given, 'open', pathName(p));
     var name = pathName(p);
     var letter = flagLetter(f);
     var creates = letter === 'w' || letter === 'a';
@@ -2553,7 +2611,7 @@ BF.fs = function () {
     var file = toPathString(p);
     /* Like a chmod, a utimes is of what the name points at: the times go on the target, and the
        link keeps the ones it was made with until a lutimes moves them. */
-    var at = resolvePath(file);
+    var at = resolvePath(file, 'utime', pathName(p));
     if (!statOf(at)) throw fsError('ENOENT', 'utime', pathName(p));
     MTIMES[at] = timeToMs(mtime);
   };
@@ -2622,7 +2680,7 @@ BF.fs = function () {
     /* A chmod acts on what the name points at, so the mode is recorded against the target: a chmod
        of a link moves the target's bits and leaves the link's own alone, the way a host's does.
        The error still names the path the caller handed over. */
-    if (!setModeOf(resolvePath(file), mode, 'chmod', pathName(p))) throw fsError('ENOENT', 'chmod', pathName(p));
+    if (!setModeOf(resolvePath(file, 'chmod', pathName(p)), mode, 'chmod', pathName(p))) throw fsError('ENOENT', 'chmod', pathName(p));
   };
 
   fs.fchmodSync = function (fd, mode) {
@@ -3016,7 +3074,7 @@ BF.fs = function () {
 
   fs.opendirSync = function (p) {
     var file = toPathString(p);
-    var at = resolvePath(file);
+    var at = resolvePath(file, 'opendir', pathName(p));
     var st = statOf(at);
     if (!st) throw fsError('ENOENT', 'opendir', pathName(p));
     if (st.type !== 'dir') throw fsError('ENOTDIR', 'opendir', pathName(p));
@@ -3250,7 +3308,7 @@ BF.fs = function () {
   fs.statfsSync = function (p, opts) {
     var arg = p === undefined ? '/' : p;
     var file = toPathString(arg);
-    if (!statFollowingLinks(file)) throw fsError('ENOENT', 'statfs', pathName(arg));
+    if (!statFollowingLinks(file, 'statfs', pathName(arg))) throw fsError('ENOENT', 'statfs', pathName(arg));
     var bigint = !!(opts && typeof opts === 'object' && opts.bigint);
     var num = bigint ? function (value) { return BigInt(value); } : function (value) { return value; };
     return {
