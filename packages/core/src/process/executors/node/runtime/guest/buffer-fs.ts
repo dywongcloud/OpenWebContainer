@@ -828,6 +828,7 @@ BF.fs = function () {
     ENOTDIR: 'not a directory',
     ENOTEMPTY: 'directory not empty',
     EINVAL: 'invalid argument',
+    ENOTSUP: 'operation not supported',
     EBADF: 'bad file descriptor',
     ELOOP: 'too many symbolic links encountered'
   };
@@ -845,6 +846,7 @@ BF.fs = function () {
     EISDIR: -21,
     EINVAL: -22,
     EBADF: -9,
+    ENOTSUP: -45,
     ENOTEMPTY: -66,
     EPERM: -1,
     ELOOP: -62
@@ -1792,6 +1794,49 @@ BF.fs = function () {
   var DESCRIPTORS = {};
 
   /*
+   * The three descriptors every process starts with, and why they are in the table at all: the
+   * table held only the descriptors this file system had opened by name, and no name is ever opened
+   * for fd 0, 1 or 2, so a program whose synchronous-output idiom is fs.writeSync(1, text) was
+   * answered EBADF -- bad file descriptor -- where a host writes the text to its standard output.
+   * A host's own three are what the process was started with, which is a pipe here: a write to 1 or
+   * 2 goes out through the same sink process.stdout and process.stderr write to, and a read of 0
+   * asks a pipe nobody has filled, which is end of input and not an error. None of them names a
+   * file, so every call below that would resolve rec.path skips a stdio descriptor instead.
+   *
+   * A pipe is what libuv hands a child for its stdio, and the mode fstatSync reads off one carries
+   * S_IFSOCK in it because libuv backs that pipe with a socketpair: measured against host node
+   * 24.15, fstatSync(1) and fstatSync(2) read 49590 (0o140666) and fstatSync(0) 49298 (0o140222).
+   */
+  var STDIO_MODES = [49298, 49590, 49590];
+  /* A stdio descriptor is born with the process, so the four dates its stat reports are one stamp
+     read now rather than four that move under a program that stats it twice. */
+  var STDIO_BORN = Date.now();
+
+  function stdioDescriptor(fd) {
+    return {
+      path: null,
+      stdio: fd,
+      flags: fd === 0 ? 'r' : 'w',
+      device: false,
+      bytes: new Uint8Array(0),
+      position: 0,
+      writable: fd !== 0,
+      readable: fd === 0,
+      isDir: false,
+      dirty: false
+    };
+  }
+
+  for (var stdioAt = 0; stdioAt <= 2; stdioAt++) DESCRIPTORS[stdioAt] = stdioDescriptor(stdioAt);
+
+  /* The sink a write to fd 1 or fd 2 reaches, which is the one process.stdout and process.stderr
+     write to: the two are the same channel, and a byte written through either comes out in order. */
+  function stdioWrite(fd, bytes) {
+    var text = Buf.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8');
+    if (fd === 1) host.stdout(text); else host.stderr(text);
+  }
+
+  /*
    * Node hands back the lowest descriptor that is free: a close puts its number back in the pool and
    * the next open takes it again, so a program that opens and closes in a loop stays at one number
    * instead of walking up without bound. A monotonic counter handed out a new number every time and
@@ -1888,6 +1933,13 @@ BF.fs = function () {
       explicit = typeof arguments[4] === 'number';
     }
     if (bytes.length === 0) return 0;
+    /* A stdio descriptor is the channel and not a buffer over one: the bytes go out as they are
+       written, at no position and with nothing kept behind them, which is what a host's write(2) to
+       a pipe does with them. */
+    if (rec.stdio !== undefined) {
+      stdioWrite(rec.stdio, bytes);
+      return bytes.length;
+    }
     if (at + bytes.length > rec.bytes.length) {
       var grown = new Uint8Array(at + bytes.length);
       grown.set(rec.bytes, 0);
@@ -1903,6 +1955,11 @@ BF.fs = function () {
     var rec = descriptorOf(fd, 'read');
     if (!rec.readable) throw badFdError('read');
     if (rec.isDir) throw fsError('EISDIR', 'read', rec.path);
+    /* A read of fd 0 asks the pipe the process was started with, and there is nothing in it a
+       synchronous read could take: a host's read of a pipe nobody has written to reports end of
+       input -- 0 bytes -- rather than the EBADF an unopened number would give. Input fed to the
+       process reaches process.stdin, which is a stream and not something a read can wait on. */
+    if (rec.stdio !== undefined) return 0;
     var opts = offset && typeof offset === 'object' ? offset : null;
     var off = opts ? opts.offset || 0 : typeof offset === 'number' ? offset : 0;
     var len = opts ? (opts.length === undefined ? buffer.length - off : opts.length)
@@ -1944,7 +2001,11 @@ BF.fs = function () {
   }
 
   fs.fsyncSync = function (fd) {
-    flushDescriptor(descriptorOf(fd, 'fsync'), 'fsync');
+    /* A sync of a pipe is not a thing a host can do for it, and it says so: ENOTSUP here, where a
+       sync of a file this file system holds is the flush of the buffer behind the descriptor. */
+    var rec = descriptorOf(fd, 'fsync');
+    if (rec.stdio !== undefined) throw noPathError('ENOTSUP', 'fsync');
+    flushDescriptor(rec, 'fsync');
   };
 
   fs.closeSync = function (fd) {
@@ -1962,13 +2023,20 @@ BF.fs = function () {
    */
   function noPathError(code, syscall) {
     var err = new Error(code + ': ' + (DESCRIPTIONS[code] || code) + ', ' + syscall);
-    err.errno = -1;
+    /* The errno a host pairs the code with, which is the one ERRNOS keeps; -1 remains the answer for
+       a code the table has none of, as it was. */
+    err.errno = ERRNOS[code] !== undefined ? ERRNOS[code] : -1;
     err.code = code;
     err.syscall = syscall;
     return err;
   }
 
   function descriptorStats(rec) {
+    /* A stdio descriptor names no path, so there is no stat of one to fall back on: what it reports
+       is the pipe it is, in the one mode a host's fstat of its own stdio reads. */
+    if (rec.stdio !== undefined) {
+      return makeStats({ type: 'sock', size: 0, mtimeMs: STDIO_BORN, mode: STDIO_MODES[rec.stdio] });
+    }
     var st = statOf(rec.path);
     /*
      * A descriptor of a device holds the one chunk a read of it yields -- 4096 bytes of zeroes or of
@@ -2013,14 +2081,16 @@ BF.fs = function () {
    * descriptor of the name is resized with it -- a grow fills with zero bytes, the way ftruncate
    * does -- so the read that follows ends where the host's ends, and a descriptor that is dirty
    * pushes the shortened bytes rather than the ones it held. A device has no bytes for a truncate
-   * to resize and a directory is not truncated at all, so neither is touched here.
+   * to resize and a directory is not truncated at all, so neither is touched here. A stdio
+   * descriptor is skipped for the same reason: it holds no bytes of a file's, and it has no name
+   * for the comparison to be made against.
    */
   function resizeDescriptors(file, size) {
     var canonical = canonicalOf(file);
     var fds = Object.keys(DESCRIPTORS);
     for (var i = 0; i < fds.length; i++) {
       var rec = DESCRIPTORS[fds[i]];
-      if (rec.isDir || rec.device || canonicalOf(rec.path) !== canonical) continue;
+      if (rec.isDir || rec.device || rec.stdio !== undefined || canonicalOf(rec.path) !== canonical) continue;
       rec.bytes = resizedBytes(rec.bytes, size);
       if (rec.position > size) rec.position = size;
     }
@@ -2029,6 +2099,9 @@ BF.fs = function () {
   fs.ftruncateSync = function (fd, len) {
     var rec = descriptorOf(fd, 'ftruncate');
     if (!rec.writable) throw noPathError('EINVAL', 'ftruncate');
+    /* A host refuses to set the length of a pipe: ftruncate of one is EINVAL, and its error carries
+       the syscall and no path, which is the shape noPathError makes. */
+    if (rec.stdio !== undefined) throw noPathError('EINVAL', 'ftruncate');
     var size = truncateLength(len);
     resizeDescriptors(rec.path, size);
     rec.dirty = true;
@@ -2054,7 +2127,9 @@ BF.fs = function () {
   };
 
   fs.fdatasyncSync = function (fd) {
-    flushDescriptor(descriptorOf(fd, 'fdatasync'), 'fdatasync');
+    var rec = descriptorOf(fd, 'fdatasync');
+    if (rec.stdio !== undefined) throw noPathError('ENOTSUP', 'fdatasync');
+    flushDescriptor(rec, 'fdatasync');
   };
 
   // Node takes a Date, a number of seconds or a numeric string; anything it cannot read is now.
@@ -2138,6 +2213,8 @@ BF.fs = function () {
 
   fs.fchmodSync = function (fd, mode) {
     var rec = descriptorOf(fd, 'fchmod');
+    /* The mode of a pipe is not one a caller sets, and a host's fchmod of one is EINVAL. */
+    if (rec.stdio !== undefined) throw noPathError('EINVAL', 'fchmod');
     if (!setModeOf(rec.path, mode, 'fchmod')) throw fsError('ENOENT', 'fchmod', rec.path);
   };
 
@@ -2159,12 +2236,16 @@ BF.fs = function () {
 
   fs.futimesSync = function (fd, atime, mtime) {
     var rec = descriptorOf(fd, 'futime');
+    /* The times of a pipe are not a caller's to set either, and a host's futimens of one is EINVAL. */
+    if (rec.stdio !== undefined) throw noPathError('EINVAL', 'futime');
     if (!statOf(rec.path)) throw fsError('ENOENT', 'futime', rec.path);
     MTIMES[rec.path] = timeToMs(mtime);
   };
 
   fs.fchownSync = function (fd, uid, gid) {
     var rec = descriptorOf(fd, 'fchown');
+    /* A pipe has an owner and a mode a caller cannot change; a host's fchown of one is EINVAL. */
+    if (rec.stdio !== undefined) throw noPathError('EINVAL', 'fchown');
     if (!statOf(rec.path)) throw fsError('ENOENT', 'fchown', rec.path);
   };
 
@@ -2291,12 +2372,22 @@ BF.fs = function () {
     var options = typeof opts === 'string' ? { encoding: opts } : (opts || {});
     var file = toPathString(p);
     var flags = options.flags || 'w';
+    /* A descriptor in the options is what makes this a stream over a number the caller already has:
+       createWriteStream(null, { fd: 1 }) is the stream a host hands back for the process's own
+       standard output, so there is no name to open or to truncate and every chunk goes through
+       fs.writeSync on that number. Answering it with a stream over a file called 'null' -- which is
+       what a path built out of the null name is -- wrote the chunk into the file system instead. */
+    var onFd = typeof options.fd === 'number' ? options.fd : null;
     var opened = false;
     var waiting = [];
     function writeChunk(chunk, encoding, callback) {
       try {
-        fs.appendFileSync(file, chunk);
-        stream.bytesWritten += chunk.length;
+        if (onFd !== null) {
+          stream.bytesWritten += fs.writeSync(onFd, chunk);
+        } else {
+          fs.appendFileSync(file, chunk);
+          stream.bytesWritten += chunk.length;
+        }
         callback();
       } catch (err) {
         callback(err);
@@ -2314,21 +2405,31 @@ BF.fs = function () {
         writeChunk(chunk, encoding, callback);
       }
     });
-    stream.path = file;
+    stream.path = onFd !== null ? undefined : file;
     stream.bytesWritten = 0;
+    /* autoClose is on unless a caller turns it off, so ending a stream over a descriptor closes the
+       number behind it, as a host's does: a later write through that number is EBADF. */
+    if (onFd !== null && options.autoClose !== false) {
+      stream.on('finish', function () {
+        try { fs.closeSync(onFd); } catch (err) { stream.destroy(err); }
+      });
+    }
     /* Like Node, the file is opened when the stream is created and not on the first write: a name the
        mode forbids is an 'error' then, so a caller waiting on 'error' or 'open' is answered instead
-       of left waiting on a stream that never opens. */
+       of left waiting on a stream that never opens. A stream over a descriptor has nothing to open,
+       because the caller opened it, but the events a caller waits on are still 'open' and 'ready'. */
     settleIO(function () {
       try {
-        if (flags.charAt(0) === 'w') fs.writeFileSync(file, '');
-        else requireAccess(file, 2, 'open');
+        if (onFd === null) {
+          if (flags.charAt(0) === 'w') fs.writeFileSync(file, '');
+          else requireAccess(file, 2, 'open');
+        }
       } catch (err) {
         stream.destroy(err);
         return;
       }
       opened = true;
-      stream.emit('open', 3);
+      stream.emit('open', onFd === null ? 3 : onFd);
       stream.emit('ready');
       /* the writes the open was waited for: answered in the turn after it, as the file's own
          requests are, so a caller's 'close' follows the immediate armed with the stream */

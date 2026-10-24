@@ -665,6 +665,17 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
     counted 12 where a host counts 8, and `dd if=/dev/zero bs=1 count=4` reads 0 where a host reads 4.
   `/dev/tty` is the one a guest reaches for that is not
   there: `fs.existsSync('/dev/tty')` is false and `test -e /dev/tty` leaves 1, where a host leaves 0.
+- **The descriptors 0, 1 and 2 are in `fs`'s descriptor table, and a write through one is the process's
+  stdio.** `fs.writeSync(1, 'A')` writes `A` to stdout and answers 1, `fs.writeSync(2, 'B')` writes to
+  stderr, `fs.write(fd, buf, cb)` and `fs.createWriteStream(null, { fd: 1 })` reach the same sink
+  `process.stdout` and `process.stderr` reach, and `fs.fstatSync(1)` answers `isFile()` false with
+  `mode` 49590 (0o140666), which is the mode a host's own `fstatSync(1)` reports for the socketpair-backed
+  pipe libuv handed the child; `fs.fstatSync(0)` answers 49298, as a host's does for its stdin.
+  `fs.readSync(0, buf)` reports 0 -- end of input -- because nothing has been written to the pipe, and
+  `ftruncate`, `fchmod`, `fchown` and `futimes` of one are `EINVAL` and `fsync`/`fdatasync` `ENOTSUP`, all
+  of them the codes a host gives for a pipe. What still differs: a read of fd 0 cannot wait for input the
+  host feeds `process.stdin` later, and the `/dev/stdin`, `/dev/stdout` and `/dev/stderr` *names* above are
+  still absent, so `fs.writeFileSync('/dev/stdout', ...)` is still `EPERM` where the number now works.
 - **The files on `PATH` are scripts, not binaries.** `/bin/sh`, `/bin/ls`, `/bin/cat`, `/bin/echo` and
   `/usr/bin/env` are created at boot beside `/usr/local/bin/node`, as executable files holding the script
   that runs the command, so `which ls`, `which cat`, `which env` and `command -v sh` all answer where they
