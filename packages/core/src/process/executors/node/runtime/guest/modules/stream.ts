@@ -206,9 +206,22 @@ function owcBuildStreamCore() {
     return v;
   }
 
+  /* Node 24 refuses any highWaterMark that is not a non-negative integer, in the Readable and the
+     Writable constructor and on either side of a Duplex, with ERR_INVALID_ARG_VALUE naming the
+     option it read: 'options.highWaterMark' on a one-sided stream, 'options.readableHighWaterMark'
+     or 'options.writableHighWaterMark' on a duplex side. A fractional or negative mark used to be
+     stored as it was given, so a stream answered readableHighWaterMark 1.5, or -1, where the host
+     throws, and every later comparison against the mark was made against a number no host allows. */
   function pickHighWaterMark(opts, duplexKey, objectMode) {
     var v = duplexKey && opts[duplexKey] !== undefined && opts[duplexKey] !== null ? opts[duplexKey] : opts.highWaterMark;
-    if (v !== undefined && v !== null) return v;
+    if (v !== undefined && v !== null) {
+      if (!Number.isInteger(v) || v < 0) {
+        throw owcErr(TypeError, 'ERR_INVALID_ARG_VALUE',
+          "The property '" + (duplexKey ? 'options.' + duplexKey : 'options.highWaterMark')
+          + "' is invalid. Received " + inspectValue(v));
+      }
+      return Math.floor(v);
+    }
     return objectMode ? defaultObjectHighWaterMark : defaultHighWaterMark;
   }
 
@@ -628,6 +641,15 @@ function owcBuildStreamCore() {
       if (typeof cb === 'function') cb();
       return this;
     }
+    /* Node's Writable.prototype.destroy (internal/streams/writable.js) invokes the pending callbacks
+       before it hands the stream to destroy.js: one destroyed with writes still buffered -- the
+       corked one, which clearBuffer refuses to touch -- has every buffered chunk dropped and its
+       callback called with ERR_STREAM_DESTROYED on the next tick, so writableLength reads 0
+       afterwards. Skipping it left a destroyed corked stream still reporting the chunk it held.
+       The tick is queued before checkErrored, as it is on the host, so a buffered write's callback
+       still runs before 'close'. errorBuffer stands down while a write is in flight, which leaves
+       the uncorked mid-write shape to afterWrite exactly as it was. */
+    if (w && w.buffered.length > 0) process.nextTick(errorBuffer, w);
     checkErrored(err, w, r);
     if (w) w.destroyed = true;
     if (r) r.destroyed = true;
