@@ -1,6 +1,6 @@
 import { IFileSystem } from '../filesystem';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../process/executors/node/runtime/resolver';
-import { readManifest } from './scripts';
+import { localSpecLabel, readManifest } from './scripts';
 
 /**
  * `npm ls`: the dependency tree of the package at a directory, drawn with npm's own branch
@@ -142,7 +142,13 @@ function treeChildren(
                 pending.node.children.push({ text: `${entry.name}@${version} deduped`, children: [] });
                 continue;
             }
-            const node: TreeNode = { text: `${entry.name}@${version}`, children: [] };
+            /* A dependency installed out of a directory is drawn with the directory after it, which
+               is how npm says the package is the one there and not a copy from the registry. */
+            const local = localSpecLabel(entry.range);
+            const node: TreeNode = {
+                text: `${entry.name}@${version}${local === undefined ? '' : ` -> ${local}`}`,
+                children: []
+            };
             seen.set(dir, node);
             pending.node.children.push(node);
             queue.push({ dir, levels: pending.levels - 1, manifest: installed, includeDev: false, node });

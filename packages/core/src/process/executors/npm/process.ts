@@ -1,6 +1,8 @@
 import { IFileSystem } from '../../../filesystem';
-import { InstallSpec, NpmInstaller, parseInstallSpec, ScriptRunResult } from '../../../npm/installer';
+import { InstallSpec, NpmInstaller, localSpecTarget, parseInstallSpec, ScriptRunResult } from '../../../npm/installer';
 import { NpmRegistry } from '../../../npm/registry';
+import { runPkgCommand } from '../../../npm/pkg';
+import { didYouMean } from '../../../npm/didyoumean';
 import {
     LIFECYCLE_COMMANDS,
     NPM_VERSION,
@@ -30,6 +32,7 @@ const USAGE = [
     '  npm run [<script> [-- <args>]] [--if-present]                 alias: run-script',
     '  npm test | npm start | npm stop | npm restart',
     '  npm exec [<pkg>[@range>] [-- <args>]] [-p|--package <pkg>]    alias: x',
+    '  npm pkg get|set|delete [<key>...] | npm pkg fix',
     '',
     'npx [-y] [-p <pkg>] <command|pkg[@range]> [args...]',
     ''
@@ -108,10 +111,35 @@ export class NpmProcess extends Process {
             case 'exec':
             case 'x':
                 return this.runExec(rest, registry, log);
+            case 'pkg':
+                return this.runPkg(rest);
             default:
-                this.emitError(`Unknown command: "${command}"\n`);
-                return 1;
+                return this.unknownCommand(command);
         }
+    }
+
+    /** `npm pkg get|set|delete|fix`: the subcommand that reads and writes package.json as data. */
+    private runPkg(args: string[]): number {
+        const result = runPkgCommand(this.fileSystem, args, this.cwd ?? '/');
+        if (result.stdout !== '') this.emitOutput(result.stdout);
+        if (result.stderr !== '') this.emitError(result.stderr);
+        return result.exitCode;
+    }
+
+    /**
+     * A command npm does not have. npm answers it on stdout, not on stderr -- an unknown command is
+     * a question about npm's own names, and it suggests the ones that were meant.
+     */
+    private unknownCommand(command: string): number {
+        const packageDir = findPackageRoot(this.fileSystem, this.cwd ?? '/');
+        const suggestions = didYouMean(packageDir === undefined ? undefined : readManifest(this.fileSystem, packageDir), command);
+        this.emitOutput([
+            `Unknown command: "${command}"`,
+            suggestions,
+            'To see a list of supported npm commands, run:',
+            '  npm help'
+        ].join('\n') + '\n');
+        return 1;
     }
 
     private async install(args: string[], registry: NpmRegistry, log: (line: string) => void): Promise<number> {
@@ -123,7 +151,12 @@ export class NpmProcess extends Process {
             else if (arg === '--no-save') save = 'none';
             else if (arg === '-g' || arg === '--global') throw new Error('Global installs are not supported by this runtime');
             else if (arg.startsWith('-')) continue;
-            else specs.push(parseInstallSpec(arg));
+            else {
+                /* A spec that names a directory -- `./localpkg`, `file:./localpkg`, an absolute
+                   path -- is a package already on this file system, and is installed from there. */
+                const local = localSpecTarget(arg, this.cwd ?? '/');
+                specs.push(local === undefined ? parseInstallSpec(arg) : { name: '', localPath: local });
+            }
         }
 
         const projectDir = this.cwd ?? '/';
@@ -177,7 +210,7 @@ export class NpmProcess extends Process {
         }
         if (typeof scripts[name] !== 'string') {
             if (ifPresent) return 0;
-            this.emitError(missingScriptMessage(name));
+            this.emitError(missingScriptMessage(name, manifest));
             return 1;
         }
 
@@ -299,6 +332,18 @@ export class NpmProcess extends Process {
     ): Promise<number> {
         let shim = explicitPackage ? undefined : findLocalBinShim(this.fileSystem, cwd, binName);
 
+        if (shim === undefined && !explicitPackage) {
+            /* The package in the directory itself declares bins, and `npm exec` runs one of them
+               before it looks anywhere else: it is this project's command, not a package's. npm
+               reaches it the same way, which is why `npm exec -- rootbin` never leaves the machine
+               even when no install has linked one into node_modules/.bin. */
+            const packageDir = findPackageRoot(this.fileSystem, cwd);
+            const own = packageDir === undefined
+                ? undefined
+                : binFromPackage(this.fileSystem, packageDir, binName, true);
+            if (own !== undefined) shim = own;
+        }
+
         if (shim === undefined) {
             const spec = parseInstallSpec(requested);
             /* The package is taken from the tree when the tree already has it, and fetched into the
@@ -405,15 +450,25 @@ function npxCacheDir(requested: string): string {
     return normalizeAbsolute(`/.npm/_npx/${hashString(requested)}`);
 }
 
-function binFromPackage(fileSystem: IFileSystem, packageDir: string, binName: string): string | undefined {
+/**
+ * The bin file of `binName` in the package at `packageDir`. `exact` is what resolving a command
+ * against the package in the directory needs: a name the package does not declare is not this
+ * package's command, however few bins it has, so `npm exec -- somethingelse` is left to the
+ * registry instead of being handed the one bin there is. Without it the single bin of a package
+ * answers for any name, which is how `npx cowsay` finds `cowsay` in a package that ships one.
+ */
+function binFromPackage(fileSystem: IFileSystem, packageDir: string, binName: string, exact = false): string | undefined {
     const file = joinPaths(packageDir, 'package.json');
     if (fileSystem.statPath(file)?.type !== 'file') return undefined;
     const manifest = JSON.parse(fileSystem.readFile(file) ?? '{}');
     const bin = manifest.bin;
-    if (typeof bin === 'string') return normalizeAbsolute(joinPaths(packageDir, bin));
+    if (typeof bin === 'string') {
+        if (exact && String(manifest.name ?? '').split('/').pop() !== binName) return undefined;
+        return normalizeAbsolute(joinPaths(packageDir, bin));
+    }
     if (bin && typeof bin === 'object') {
         const entries = Object.entries(bin as Record<string, string>);
-        const chosen = entries.find(([name]) => name === binName) ?? (entries.length === 1 ? entries[0] : undefined);
+        const chosen = entries.find(([name]) => name === binName) ?? (exact ? undefined : (entries.length === 1 ? entries[0] : undefined));
         if (chosen) return normalizeAbsolute(joinPaths(packageDir, chosen[1]));
     }
     return undefined;
