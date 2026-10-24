@@ -10,12 +10,12 @@ import {
     readManifest,
     scriptCommandLine,
     scriptEvents,
-    scriptFailureMessage,
     scriptHeader,
     scriptLabel,
     scriptList,
     scriptPath
 } from '../../../npm/scripts';
+import { dependencyTree, parseListArgs } from '../../../npm/tree';
 import { Process, ProcessType } from '../../base';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../node/runtime/resolver';
 
@@ -25,6 +25,7 @@ const USAGE = [
     'Commands supported by this runtime:',
     '  npm install [<pkg>[@range] ...] [-D|--save-dev] [--no-save]   aliases: i, add',
     '  npm init [-y]',
+    '  npm ls [--depth=<n>] [--all]                                      aliases: list',
     '  npm run [<script> [-- <args>]] [--if-present]                 alias: run-script',
     '  npm test | npm start | npm stop | npm restart',
     '  npm exec [<pkg>[@range>] [-- <args>]] [-p|--package <pkg>]    alias: x',
@@ -32,6 +33,14 @@ const USAGE = [
     'npx [-y] [-p <pkg>] <command|pkg[@range]> [args...]',
     ''
 ].join('\n');
+
+/** What npm writes when the package it was handed has no bin of the name it was asked to run. */
+const NPX_EXECUTABLE_MESSAGE = 'npm error could not determine executable to run';
+
+/** npm's own duration in a summary line: milliseconds under a second, whole seconds above it. */
+function elapsedDuration(ms: number): string {
+    return ms < 1000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 1000)}s`;
+}
 
 /**
  * `npm` and `npx` implemented on the host: packages are fetched from the registry and
@@ -74,6 +83,9 @@ export class NpmProcess extends Process {
                 return this.install(rest, registry, log);
             case 'init':
                 return this.init();
+            case 'ls':
+            case 'list':
+                return this.listDependencies(rest);
             case undefined:
             case 'help':
             case '--help':
@@ -118,11 +130,12 @@ export class NpmProcess extends Process {
         const report = specs.length > 0
             ? await installer.addPackages(this.cwd ?? '/', specs, save)
             : await installer.installManifest(this.cwd ?? '/');
-        const seconds = ((performance.now() - started) / 1000).toFixed(1);
+        const duration = elapsedDuration(performance.now() - started);
+        /* npm's summary lines start on a line of their own, whichever one it is. */
         if (report.added.length === 0) {
-            this.emitOutput(`up to date in ${seconds}s\n`);
+            this.emitOutput(`\nup to date in ${duration}\n`);
         } else {
-            this.emitOutput(`\nadded ${report.added.length} package${report.added.length === 1 ? '' : 's'} in ${seconds}s\n`);
+            this.emitOutput(`\nadded ${report.added.length} package${report.added.length === 1 ? '' : 's'} in ${duration}\n`);
         }
         return 0;
     }
@@ -155,7 +168,6 @@ export class NpmProcess extends Process {
 
         const PATH = scriptPath(this.fileSystem, packageDir, Object.fromEntries(this.env).PATH);
         for (const step of scriptEvents(name, scripts)) {
-            const command = String(scripts[step]);
             const line = scriptCommandLine(scripts, step, name, extra);
             this.emitOutput(scriptHeader(label, step, line));
             const result = await this.spawnChild('sh', ['-c', line], {
@@ -167,10 +179,18 @@ export class NpmProcess extends Process {
                 npm_lifecycle_event: step
             }, packageDir);
             const exitCode = result.exitCode ?? 1;
+            /* npm reports a failing script with its status alone: the script's own output already
+               reached the terminal, and the ELIFECYCLE block npm 6 wrote is gone from npm 7+. */
             if (exitCode === 0) continue;
-            this.emitError(scriptFailureMessage(label, step, command, exitCode));
             return exitCode;
         }
+        return 0;
+    }
+
+    /** `npm ls`: the installed tree of the package here, as `npm ls` draws it. */
+    private listDependencies(args: string[]): number {
+        const packageDir = findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/');
+        this.emitOutput(dependencyTree(this.fileSystem, packageDir, parseListArgs(args)));
         return 0;
     }
 
@@ -236,20 +256,27 @@ export class NpmProcess extends Process {
 
         if (shim === undefined) {
             const spec = parseInstallSpec(requested);
-            const cacheDir = normalizeAbsolute(`/.npm/_npx/${hashString(requested)}`);
-            const packageDir = joinPaths(cacheDir, 'node_modules', spec.name);
-            if (this.fileSystem.statPath(packageDir)?.type !== 'dir') {
+            /* The package is taken from the tree when the tree already has it, and fetched into the
+               npx cache when it does not: only the fetch is an install npm has anything to report. */
+            const localDir = explicitPackage ? undefined : findLocalPackageDir(this.fileSystem, cwd, spec.name);
+            const packageDir = localDir ?? joinPaths(npxCacheDir(requested), 'node_modules', spec.name);
+            if (localDir === undefined && this.fileSystem.statPath(packageDir)?.type !== 'dir') {
                 log(`Need to install the following packages:\n${requested}`);
                 const installer = new NpmInstaller(this.fileSystem, registry, log, (args, cwd, env) => this.runLifecycleScript(args, cwd, env));
-                await installer.addPackages(cacheDir, [spec], 'none');
+                await installer.addPackages(npxCacheDir(requested), [spec], 'none');
             }
-            if (binFromPackage(this.fileSystem, packageDir, binName) === undefined) {
-                throw new Error(`npx: could not find a bin named '${binName}' in ${spec.name}`);
+            const file = binFromPackage(this.fileSystem, packageDir, binName);
+            if (file === undefined) {
+                /* A package that ships no bin of that name leaves npm nothing to run, however the
+                   package was found: the tree's own copy is not reinstalled to say so. */
+                throw new Error(NPX_EXECUTABLE_MESSAGE);
             }
-            shim = joinPaths(cacheDir, 'node_modules', '.bin', binName);
+            const linked = joinPaths(binDirectoryOf(packageDir), binName);
+            /* The shim, not the target, runs when the install linked one: the program sees the name
+               it was invoked by in argv[1]. */
+            shim = this.fileSystem.statPath(linked)?.type === 'file' ? linked : file;
         }
 
-        // the shim, not the target, runs: the program sees the name it was invoked by in argv[1]
         const result = await this.spawnChild('node', [shim, ...args], Object.fromEntries(this.env), cwd);
         return result.exitCode;
     }
@@ -304,6 +331,33 @@ function findLocalBinShim(fileSystem: IFileSystem, startDir: string, name: strin
         if (dir === '/') return undefined;
         dir = dirnameOf(dir);
     }
+}
+
+/** The nearest installed copy of `name` at or above `startDir`, as npm resolves it. */
+function findLocalPackageDir(fileSystem: IFileSystem, startDir: string, name: string): string | undefined {
+    let dir = normalizeAbsolute(startDir);
+    while (true) {
+        if (!dir.endsWith('/node_modules')) {
+            const candidate = joinPaths(dir, 'node_modules', name);
+            if (fileSystem.statPath(candidate)?.type === 'dir') return candidate;
+        }
+        if (dir === '/') return undefined;
+        dir = dirnameOf(dir);
+    }
+}
+
+/** The `.bin` directory beside a package: the one its owning node_modules holds, scope included. */
+function binDirectoryOf(packageDir: string): string {
+    const marker = '/node_modules/';
+    const absolute = normalizeAbsolute(packageDir);
+    const at = absolute.lastIndexOf(marker);
+    if (at < 0) return joinPaths(absolute, 'node_modules', '.bin');
+    return joinPaths(absolute.slice(0, at + marker.length - 1), '.bin');
+}
+
+/** Where npx keeps the copy it fetches for a spec it was asked to run. */
+function npxCacheDir(requested: string): string {
+    return normalizeAbsolute(`/.npm/_npx/${hashString(requested)}`);
 }
 
 function binFromPackage(fileSystem: IFileSystem, packageDir: string, binName: string): string | undefined {

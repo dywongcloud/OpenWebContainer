@@ -290,7 +290,6 @@ export class NpmInstaller {
 
                 const target = this.placementFor(root, edge, plan.isRootRequest, claimed);
                 claimed.set(target, version.version);
-                this.log(`+ ${edge.name}@${version.version}`);
                 added.push(`${edge.name}@${version.version}`);
                 installedDirs.push(target);
                 installs.push({ target, version });

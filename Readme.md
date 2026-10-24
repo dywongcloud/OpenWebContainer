@@ -69,6 +69,7 @@ The architecture consists of three main layers:
   - `npx <bin>` runs a project bin, or installs a package into a cache and runs its bin
   - `npm exec <bin> [-- <args>]` (alias `npm x`) is the same command under npm's own name
   - `npm run <script>` runs a `package.json` script with its `pre`/`post` lifecycle scripts, and `npm install` writes `package-lock.json` at lockfileVersion 3. Global installs are refused
+  - `npm ls [--depth=<n>]` prints the installed tree with npm's own branch characters, `npm install` reports `added N packages in <ms>` with no `+ <pkg>@<version>` lines, a script that exits non-zero ends `npm run` with the script's own status and nothing on stderr, and `npx` over a package that ships no bin writes nothing to stdout and `npm error could not determine executable to run` to stderr — all four matched against host npm 11.12.1
 
 ### ⚠️ What a WebAssembly call costs, and why it is proportional to the memory
 
