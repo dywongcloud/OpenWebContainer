@@ -154,6 +154,16 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
     const text = (handle: QuickJSHandle) => context.getString(handle);
     const json = (value: unknown) => context.newString(JSON.stringify(value));
     const ok = (value: unknown) => json({ ok: true, value: value === undefined ? null : value });
+    /**
+     * The answer of one wasm call, which a caller sees as it is.
+     *
+     * JSON has no `undefined` -- it comes back as `null` -- and the difference is one a caller
+     * sees: an export the module declared with no result answers `undefined` on a host, where an
+     * export declared as returning a nullable reference answers `null`. So `undefined` travels as
+     * a flag of its own and the guest rebuilds it there, instead of both arriving as null.
+     */
+    const okValue = (value: unknown): QuickJSHandle =>
+        value === undefined ? json({ ok: true, value: null, undef: true }) : ok(encodeValue(value));
     const fail = (code: string, message: string, props?: Record<string, unknown>) =>
         json({ ok: false, code, message, props });
     const parse = (handle: QuickJSHandle): unknown => {
@@ -355,6 +365,14 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
     const hostMemoryBytes = (memory: WebAssembly.Memory): Uint8Array => new Uint8Array(memory.buffer);
 
     /**
+     * Whether a memory is a shared one, which is only visible through its buffer: a host's
+     * `WebAssembly.Memory` carries no flag of its own, but a shared memory's buffer is a
+     * SharedArrayBuffer and an unshared one's is not.
+     */
+    const isSharedMemory = (memory: WebAssembly.Memory): boolean =>
+        typeof SharedArrayBuffer === 'function' && memory.buffer instanceof SharedArrayBuffer;
+
+    /**
      * One piece of the memory, as bytes the host can hand to the guest. A piece that is the whole
      * memory needs no copy: `newArrayBuffer` reads the bytes itself. Anything smaller does, since
      * a view over part of the buffer would carry the whole buffer with it.
@@ -525,14 +543,14 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         }
         record.instance = instance;
 
-        const exports: Array<{ name: string; kind: string; id?: number }> = [];
+        const exports: Array<{ name: string; kind: string; id?: number; shared?: boolean }> = [];
         for (const entry of WebAssembly.Module.exports(module)) {
             const value = (instance.exports as Record<string, unknown>)[entry.name];
             if (value instanceof WebAssembly.Memory) {
                 const id = freshId();
                 memories.set(id, value);
                 record.memories.add(id);
-                exports.push({ name: entry.name, kind: 'memory', id });
+                exports.push({ name: entry.name, kind: 'memory', id, shared: isSharedMemory(value) });
             } else if (value instanceof WebAssembly.Table) {
                 const id = freshId();
                 tables.set(id, value);
@@ -608,7 +626,7 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
              * makes and the guest rebuilds it there. A Number here would lose every value past
              * 2**53 the moment the module handed it over, which is what an i64 export used to do.
              */
-            return ok(value === undefined ? null : encodeValue(value));
+            return okValue(value);
         } catch (error) {
             if (error instanceof GuestThrow) {
                 return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
@@ -620,11 +638,13 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         }
     });
 
-    define('memoryNew', (initial, maximum) => {
+    define('memoryNew', (initial, maximum, shared) => {
         const pages = Math.max(0, Math.floor(number(initial)));
         const limit = Math.floor(number(maximum));
+        /* A shared memory needs a maximum, and the refusal is the host's own, in its own words. */
+        const isShared = shared !== undefined && context.typeof(shared) === 'boolean' && context.dump(shared) === true;
         try {
-            const descriptor: WebAssembly.MemoryDescriptor = { initial: pages };
+            const descriptor: WebAssembly.MemoryDescriptor = { initial: pages, shared: isShared };
             if (limit >= 0) descriptor.maximum = limit;
             const id = freshId();
             memories.set(id, new WebAssembly.Memory(descriptor));
@@ -641,9 +661,9 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         const memory = memories.get(number(id));
         if (!memory) return fail('ERR_WASM', 'no such memory');
         try {
-            const before = memory.buffer.byteLength / 65536;
-            memory.grow(Math.max(0, Math.floor(number(delta))));
-            return ok(before);
+            /* A negative delta is the host's own refusal, not a grow of zero: clamping it here
+               used to answer the unchanged size where node raises a TypeError. */
+            return ok(memory.grow(Math.floor(number(delta))));
         } catch (error) {
             return hostFail('ERR_WASM', error);
         }
@@ -675,7 +695,15 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
     define('tableNew', (element, initial, maximum) => {
         const limit = Math.floor(number(maximum));
         try {
-            const descriptor: WebAssembly.TableDescriptor = { element: text(element) as 'anyfunc', initial: Math.max(0, Math.floor(number(initial))) };
+            /*
+             * The element is passed through as it came, including its absence: a host requires the
+             * descriptor's own `element` property and raises its own TypeError for a descriptor
+             * without one, where defaulting it here used to build a table anyway.
+             */
+            const descriptor: WebAssembly.TableDescriptor = {
+                element: (context.typeof(element) === 'string' ? text(element) : undefined) as 'anyfunc',
+                initial: Math.max(0, Math.floor(number(initial)))
+            };
             if (limit >= 0) descriptor.maximum = limit;
             const id = freshId();
             tables.set(id, new WebAssembly.Table(descriptor));
@@ -709,8 +737,14 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
     define('tableSet', (id, index, value) => {
         const table = tables.get(number(id));
         if (!table) return fail('ERR_WASM', 'no such table');
-        const entry = parse(value) as { k: string; id?: number } | undefined;
-        const wanted = entry?.k === 'fn' && entry.id !== undefined ? resolveImportFunction(entry.id) : null;
+        const entry = parse(value) as { k: string; id?: number; v?: unknown } | undefined;
+        /*
+         * 'ext' is an externref: such a table holds any JavaScript value, so the value itself is
+         * set where a function-typed table takes null or a wasm function and nothing else.
+         */
+        const wanted = entry?.k === 'fn' && entry.id !== undefined
+            ? resolveImportFunction(entry.id)
+            : entry?.k === 'ext' && entry.v !== undefined && entry.v !== null ? entry.v : null;
         try {
             table.set(Math.floor(number(index)), wanted);
             return ok(null);
@@ -875,9 +909,12 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
         if (!hostFn) {
             try {
                 const guest = callGuest(fnId, numberArgs(parse(argsJson)).map((value) => valueHandle(value as number | bigint)));
-                /* Same as an export: a BigInt a guest function answered travels tagged, not as a
-                   Number, so a value past 2**53 survives the boundary. */
-                return ok(guest === undefined ? null : encodeValue(guest));
+                /*
+                 * Same as an export: a BigInt a guest function answered travels tagged, not as a
+                 * Number, so a value past 2**53 survives the boundary, and a function declared
+                 * with no result answers undefined rather than null.
+                 */
+                return okValue(guest);
             } catch (error) {
                 if (error instanceof GuestThrow) {
                     return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });
@@ -894,8 +931,9 @@ export function installWasmBridge(context: QuickJSContext): WasmBridge {
             const value = hostFn(...numberArgs(parse(argsJson)));
             if (record) syncOut(record);
             /* A function taken out of a table is a wasm function: one the module declared as
-               returning an i64 answers a BigInt, and it travels tagged for the same reason. */
-            return ok(value === undefined ? null : encodeValue(value));
+               returning an i64 answers a BigInt, and it travels tagged for the same reason, while
+               one declared with no result answers undefined. */
+            return okValue(value);
         } catch (error) {
             if (error instanceof GuestThrow) {
                 return fail('ERR_WASM_GUEST', error.detail.message, { name: error.detail.name, code: error.detail.code });

@@ -50,6 +50,16 @@ export const WASM_SRC = String.raw`
     return value.value;
   }
   /*
+   * The answer of one wasm call. JSON has no undefined, so the host flags it instead of answering
+   * null: an export the module declared with no result answers undefined on a host, where one
+   * declared as returning a nullable reference answers null, and a caller sees the difference.
+   */
+  function unwrapCall (text) {
+    var value = JSON.parse(text);
+    if (value && value.ok === false) throw buildError(value);
+    return value.undef === true ? undefined : value.value;
+  }
+  /*
    * An error the host raised, rebuilt in the class the host raised it in. The class travels with
    * the message: a bad import object and a Number where an i64 is wanted are both bad arguments
    * and are a TypeError on a host, while an import that is present but not callable is the one
@@ -151,10 +161,17 @@ export const WASM_SRC = String.raw`
    * Resizing a memory's shadow. It is a plain function and not a method on the prototype, because
    * a host's Memory.prototype owns only buffer, constructor and grow -- a fourth own name there is
    * the sort of thing a package that enumerates the prototype trips over.
+   *
+   * A shared memory's shadow is a SharedArrayBuffer, as a host's is: the constructor of the bytes
+   * a caller reads off memory.buffer is the only thing that tells the two apart.
    */
+  function shadowFor (bytes, shared) {
+    if (shared && typeof SharedArrayBuffer === 'function') return new SharedArrayBuffer(bytes);
+    return new ArrayBuffer(bytes);
+  }
   function resizeMemory (memory, bytes) {
     if (bytes === memory.__buffer.byteLength) return;
-    var next = new ArrayBuffer(bytes);
+    var next = shadowFor(bytes, memory.__shared);
     var view = new Uint8Array(next);
     var old = new Uint8Array(memory.__buffer);
     view.set(old.subarray(0, Math.min(old.length, view.length)));
@@ -167,9 +184,16 @@ export const WASM_SRC = String.raw`
       var d = descriptor || {};
       var initial = Math.max(0, Math.floor(d.initial || 0));
       var maximum = d.maximum === undefined ? -1 : Math.floor(d.maximum);
-      if (d.shared) throw new Error('WebAssembly.Memory: shared memory is not supported in the container');
-      this.__id = unwrap(W.memoryNew(initial, maximum));
-      this.__buffer = new ArrayBuffer(initial * 65536);
+      /*
+       * A shared memory is one the host builds as it builds any other: this engine carries
+       * SharedArrayBuffer, so the shadow is shared too and the bytes a caller reads are the host's
+       * kind. The refusals a host makes -- a shared memory with no maximum, or a maximum below the
+       * initial size -- are the host's own, in its own words.
+       */
+      var shared = d.shared === true;
+      this.__shared = shared;
+      this.__id = unwrap(W.memoryNew(initial, maximum, shared));
+      this.__buffer = shadowFor(initial * 65536, shared);
       MEM[this.__id] = this;
     }
     get buffer () { return this.__buffer; }
@@ -182,11 +206,12 @@ export const WASM_SRC = String.raw`
   }
 
   /** A memory the module created: same as a guest Memory, seeded with the module's bytes. */
-  function bindMemory (id) {
+  function bindMemory (id, shared) {
     var memory = Object.create(Memory.prototype);
     memory.__id = id;
+    memory.__shared = shared === true;
     var size = unwrap(W.memoryPages(id)) * 65536;
-    memory.__buffer = new ArrayBuffer(size);
+    memory.__buffer = shadowFor(size, memory.__shared);
     for (var off = 0; off < size; off += CHUNK) {
       var part = W.memoryRead(id, off, Math.min(CHUNK, size - off));
       if (!part || part.byteLength === 0) break;
@@ -211,40 +236,68 @@ export const WASM_SRC = String.raw`
      Both are declared ahead of the class, whose prototype is built at install time. */
   var SEED = Symbol('host');
 
+  /** A value an externref table can hold, in a form that crosses to the host. */
+  function externValue (value) {
+    if (value === undefined) return null;
+    try {
+      var text = JSON.stringify(value);
+      if (typeof text !== 'string') return null;
+      return JSON.parse(text);
+    } catch (error) {
+      return null;
+    }
+  }
+
   class Table {
     constructor (descriptor) {
       var d = descriptor || {};
-      this.__element = d.element || 'anyfunc';
+      /*
+       * A host requires the descriptor's own element property: a Table built from a descriptor with
+       * only an initial size is a TypeError there, so the property is handed over as it came --
+       * including its absence -- and the refusal is the host's own. 'anyfunc' is only what the
+       * guest remembers for itself.
+       */
+      var element = typeof d.element === 'string' ? d.element : undefined;
+      this.__element = element || 'anyfunc';
       var maximum = d.maximum === undefined ? -1 : Math.floor(d.maximum);
-      this.__id = unwrap(W.tableNew(this.__element, Math.max(0, Math.floor(d.initial || 0)), maximum));
+      this.__id = unwrap(W.tableNew(element, Math.max(0, Math.floor(d.initial || 0)), maximum));
       this.__entries = new Array(unwrap(W.tableLength(this.__id)));
       this.__ids = new Array(this.__entries.length);
       TAB[this.__id] = this;
     }
     get length () { return unwrap(W.tableLength(this.__id)); }
     get (index) {
-      var entry = this.__entries[index];
-      if (entry === undefined) {
+      if (!(index in this.__entries)) {
         var info = unwrap(W.tableGet(this.__id, index));
-        entry = info && info.k === 'fn' ? hostFunction(this.__id, info.id) : null;
+        var entry = info && info.k === 'fn'
+          ? hostFunction(this.__id, info.id)
+          /* A slot nothing was set into reads null on a function-typed table and undefined on an
+             externref one, which is the only place the two elements differ to a reader. */
+          : (this.__element === 'externref' ? undefined : null);
         this.__entries[index] = entry;
       }
-      return entry;
+      return this.__entries[index];
     }
     set (index, value) {
+      var wasmFn = typeof value === 'function' && value[WASMFN] === true;
       /*
        * A function-typed table takes null or a wasm function object and nothing else. An ordinary
        * JavaScript function is refused, in the host's own words, and the slot stays empty; the
        * same refusal covers undefined, an object, a number and a string, which the host does not
        * distinguish either.
+       *
+       * An externref table is the other case: it holds any JavaScript value at all -- an object,
+       * a number, a string, an ordinary function, null, undefined -- and refuses none of them.
        */
-      if (value !== null && !(typeof value === 'function' && value[WASMFN] === true)) {
+      if (this.__element !== 'externref' && value !== null && !wasmFn) {
         throw new TypeError('WebAssembly.Table.set(): Argument 1 is invalid for table: function-typed object must be null (if nullable) or a Wasm function object');
       }
       var previous = this.__ids[index];
       if (previous !== undefined) { W.drop(previous); this.__ids[index] = undefined; }
       var descriptor = { k: 'null' };
-      if (value !== null) {
+      if (this.__element === 'externref' && !wasmFn) {
+        descriptor = { k: 'ext', v: externValue(value) };
+      } else if (value !== null) {
         var held = value[WASMFN_ID];
         if (typeof held === 'number') descriptor = { k: 'fn', id: held };
         else {
@@ -313,7 +366,7 @@ export const WASM_SRC = String.raw`
     var call = function () {
       /* A wasm function the host ran answers a BigInt for an i64, and it crosses as a tagged
          string, so it is rebuilt here: a caller sees the BigInt the JS API would have given it. */
-      return decodeValue(unwrap(W.fnCall(fnId, wasmArgs(arguments), instanceId)));
+      return decodeValue(unwrapCall(W.fnCall(fnId, wasmArgs(arguments), instanceId)));
     };
     Object.defineProperty(call, 'name', { value: 'wasm-function', configurable: true });
     Object.defineProperty(call, WASMFN, { value: true });
@@ -463,7 +516,7 @@ export const WASM_SRC = String.raw`
       var fn = function () {
         /* An export the module declared as i64 answers a BigInt on a host, and the host sends it
            as a tagged string, so it is rebuilt here rather than arriving as a lossy Number. */
-        return decodeValue(unwrap(W.call(instanceId, entry.name, wasmArgs(arguments))));
+        return decodeValue(unwrapCall(W.call(instanceId, entry.name, wasmArgs(arguments))));
       };
       Object.defineProperty(fn, 'name', { value: entry.name, configurable: true });
       /* An export is a wasm function, so a host's Table.set takes it; only an ordinary JavaScript
@@ -471,7 +524,7 @@ export const WASM_SRC = String.raw`
       Object.defineProperty(fn, WASMFN, { value: true });
       return fn;
     }
-    if (entry.kind === 'memory') return bindMemory(entry.id);
+    if (entry.kind === 'memory') return bindMemory(entry.id, entry.shared);
     if (entry.kind === 'table') return bindTable(entry.id);
     if (entry.kind === 'global') return bindGlobal(entry.id);
     return undefined;
