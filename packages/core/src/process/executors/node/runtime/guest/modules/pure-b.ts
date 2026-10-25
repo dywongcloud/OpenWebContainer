@@ -1853,11 +1853,6 @@ export const SRC = String.raw`
 
     function notify(session, method, params) {
       try {
-        /* A host fires one notification on two channels: 'inspectorNotification' carries the
-           protocol's own envelope, and an event named after the method itself carries nothing but
-           its params -- which is the one a caller that writes
-           session.on('Runtime.consoleAPICalled', fn) is listening on, and which was the only channel
-           this runtime did not fire. row owc-inspector-returnbyvalue-notifications. */
         /* A host fires one notification on two channels, and both carry the protocol's own
            envelope -- { method, params }, not the params alone -- which is the one a caller that
            writes session.on('Runtime.consoleAPICalled', fn) is listening on as much as the one
@@ -2721,29 +2716,67 @@ export const SRC = String.raw`
         help: 'Sometimes you get stuck, this gets you out',
         action: function () { this._buffer = ''; this.displayPrompt(); }
       };
+      /* '.clear' is '.break''s alias in node 24.15: it drops what is being typed and keeps the
+         session's bindings, so a name made before it is still bound after it. */
       repl.commands['clear'] = {
-        help: 'Break, and also clear the local context',
-        action: function () {
-          this._buffer = '';
-          if (!this.useGlobal) {
-            this._writeOut('Clearing context...\n');
-            this._resetContext();
-          }
-          this.displayPrompt();
-        }
+        help: 'Alias for .break',
+        action: function () { this._buffer = ''; this.displayPrompt(); }
       };
       repl.commands['exit'] = { help: 'Exit the REPL', action: function () { this.close(); } };
       repl.commands['help'] = {
         help: 'Print this help message',
         action: function () { this._writeOut(helpText(this.commands)); this.displayPrompt(); }
       };
+      /* The argument of a command is the rest of the line it was typed on, with the blanks that
+         pad it taken off: '.save  a.txt' and '.save a.txt' name the same file. */
+      function commandFile(args) {
+        return typeof args === 'string' ? args.replace(/^\s+|\s+$/g, '') : '';
+      }
       repl.commands['load'] = {
         help: 'Load JS from a file into the REPL session',
-        action: function () { this.displayPrompt(); }
+        action: function (file) {
+          var name = commandFile(file);
+          if (name === '') {
+            this._writeOut('The "file" argument must be specified\n');
+            this.displayPrompt();
+            return;
+          }
+          var data;
+          try {
+            data = requireBuiltin('fs').readFileSync(name, 'utf8');
+          } catch (readErr) {
+            this._writeOut('Failed to load: ' + name + '\n');
+            this.displayPrompt();
+            return;
+          }
+          /* What a file holds is read as though it had been typed: its lines are the session's
+             next lines, in order, each answered as it arrives and each kept for a later '.save'.
+             A file that ends in a newline ends in an empty line, which is a prompt of its own, as
+             it is on a host. */
+          var fileLines = String(data).split('\n');
+          for (var li = 0; li < fileLines.length; li++) {
+            if (this._closed) return;
+            this._onLine(fileLines[li]);
+          }
+        }
       };
       repl.commands['save'] = {
         help: 'Save all evaluated commands in this REPL session to a file',
-        action: function () { this.displayPrompt(); }
+        action: function (file) {
+          var name = commandFile(file);
+          if (name === '') {
+            this._writeOut('The "file" argument must be specified\n');
+            this.displayPrompt();
+            return;
+          }
+          try {
+            requireBuiltin('fs').writeFileSync(name, this.lines.join('\n'));
+            this._writeOut('Session saved to: ' + name + '\n');
+          } catch (writeErr) {
+            this._writeOut('Failed to save: ' + name + '\n');
+          }
+          this.displayPrompt();
+        }
       };
     }
 
@@ -2760,6 +2793,19 @@ export const SRC = String.raw`
       this.writer = typeof options.writer === 'function' ? options.writer : replWriter;
       this.commands = Object.create(null);
       this.line = '';
+      /* Every line this session has read that was not a command, in the order it came -- a
+         continuation line as itself and a blank one too. This is what '.save' writes out. */
+      this.lines = [];
+      /* The history a session keeps, newest first, and the index a caller's arrow keys walk;
+         'setupHistory' fills them from a file when a caller names one. */
+      this.history = [];
+      this.historyIndex = -1;
+      this.crlfDelay = typeof options.crlfDelay === 'number' ? options.crlfDelay : 100;
+      /* A caller's own evaluator, when 'repl.start' was handed one: it answers for every line in
+         place of the engine this session would otherwise run them in. */
+      this.eval = typeof options.eval === 'function' ? options.eval : undefined;
+      /* What 'write()' has been given that no newline has ended yet. */
+      this._writePending = '';
       this._prompt = options.prompt !== undefined ? String(options.prompt) : '> ';
       this._buffer = '';
       this._closed = false;
@@ -2824,6 +2870,157 @@ export const SRC = String.raw`
 
     REPLServer.prototype.prompt = function () {
       this.displayPrompt();
+    };
+
+    /*
+     * What a script writes to a session: the characters go in as if they had been typed, and a
+     * newline among them is the Enter that submits the line it ends. Host node's 'write' is
+     * readline's, which is the same place a REPL's own input arrives, so a line a script writes
+     * is answered exactly as a line a person types is -- and nothing a script writes is echoed,
+     * because a session that is not a terminal echoes nothing it reads (host node 24.15, over
+     * 'r.write('1+1\n')' on a repl started with 'terminal: false').
+     */
+    REPLServer.prototype.write = function (data) {
+      if (this._closed) return false;
+      this._writePending += typeof data === 'string' ? data : String(data === undefined ? '' : data);
+      var idx = this._writePending.indexOf('\n');
+      while (idx >= 0) {
+        var line = this._writePending.slice(0, idx);
+        this._writePending = this._writePending.slice(idx + 1);
+        if (line.charAt(line.length - 1) === '\r') line = line.slice(0, -1);
+        this._onLine(line);
+        if (this._closed) return true;
+        idx = this._writePending.indexOf('\n');
+      }
+      return true;
+    };
+
+    /* The two shapes a completion is asked for: 'obj.pro' completes against the object named
+       before the dot, and a bare word against the session's own scope. */
+    var MEMBER_COMPLETION = /([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)?$/;
+    var WORD_COMPLETION = /([A-Za-z_$][\w$]*)$/;
+
+    /* Every name a value answers to, its own first and then the ones it inherits, each once. */
+    function completionNamesOf(value) {
+      var seen = Object.create(null);
+      var names = [];
+      var cur = value;
+      for (var depth = 0; depth < 8 && cur !== null && cur !== undefined; depth++) {
+        var own;
+        try { own = Object.getOwnPropertyNames(cur); } catch (probeErr) { break; }
+        for (var i = 0; i < own.length; i++) {
+          if (seen[own[i]] !== true) { seen[own[i]] = true; names.push(own[i]); }
+        }
+        cur = Object.getPrototypeOf(cur);
+      }
+      return names;
+    }
+
+    /*
+     * The names a bare word completes against: the ones the session's own scope holds, and not
+     * the ones the process behind it does. A REPL that was not started with 'useGlobal' runs in a
+     * context of its own, so a name the process holds and the session does not is not offered
+     * here -- which is also what a host answers for the same word.
+     */
+    REPLServer.prototype._scopeNames = function () {
+      if (!this.useGlobal) {
+        try {
+          var probe = vm.runInContext('Object.getOwnPropertyNames(this)', this.context);
+          if (probe !== null && probe !== undefined && typeof probe.length === 'number') {
+            var names = [];
+            for (var i = 0; i < probe.length; i++) names.push(String(probe[i]));
+            return names;
+          }
+        } catch (ctxErr) { /* a context that cannot be asked is asked the other way */ }
+      }
+      return completionNamesOf(this.useGlobal ? globalThis : this.context);
+    };
+
+    /*
+     * The names an object answers to, asked for inside the session's own context because that is
+     * where the name is bound: a sandbox's scope is not the same object as the 'globalThis' the
+     * code in it sees, so a name read out of the context is not always a name the context resolves.
+     */
+    REPLServer.prototype._memberNames = function (base) {
+      try {
+        var probe = vm.runInContext(
+          '(function () { try { return Object.getOwnPropertyNames(' + base + '); } catch (e) { return null; } })()',
+          this.context);
+        if (probe !== null && probe !== undefined && typeof probe.length === 'number') {
+          var names = [];
+          for (var i = 0; i < probe.length; i++) names.push(String(probe[i]));
+          return names;
+        }
+      } catch (ctxErr) { /* a context that cannot be asked is asked the other way */ }
+      var obj;
+      try {
+        obj = this.useGlobal ? (0, eval)(base) : vm.runInContext(base, this.context);
+      } catch (resolveErr) { obj = undefined; }
+      return completionNamesOf(obj);
+    };
+
+    /*
+     * Completion, in the shape host node answers with: [the names the word could become, the
+     * word itself]. A name with a dot in front of it is offered whole -- 'console.lo' completes
+     * to 'console.log' -- because that is the text that replaces what was typed.
+     */
+    REPLServer.prototype.complete = function (line, callback) {
+      if (typeof callback !== 'function') {
+        throw new TypeError('The "callback" argument must be of type function');
+      }
+      var text = typeof line === 'string' ? line : String(line === undefined ? '' : line);
+      var member = MEMBER_COMPLETION.exec(text);
+      var completeOn;
+      var prefix;
+      var filter;
+      var candidates;
+      if (member !== null) {
+        completeOn = member[0];
+        prefix = member[1] + '.';
+        filter = member[2] === undefined ? '' : member[2];
+        candidates = this._memberNames(member[1]);
+      } else {
+        var word = WORD_COMPLETION.exec(text);
+        if (word === null) { callback(null, [[], '']); return; }
+        completeOn = word[1];
+        prefix = '';
+        filter = word[1];
+        candidates = this._scopeNames();
+      }
+      var hits = [];
+      for (var n = 0; n < candidates.length; n++) {
+        if (candidates[n].length === 0 || candidates[n].indexOf(filter) !== 0) continue;
+        hits.push(prefix + candidates[n]);
+      }
+      hits.sort();
+      callback(null, [hits, completeOn]);
+    };
+
+    /*
+     * The file a session's history is kept in. Host node reads it into 'history' and writes each
+     * line back as it is entered; this one reads it, newest line first as host's 'history' holds
+     * them, and leaves the writing to the session that owns the file.
+     */
+    REPLServer.prototype.setupHistory = function (historyFile, callback) {
+      if (this.history === undefined) this.history = [];
+      if (this.historyIndex === undefined) this.historyIndex = -1;
+      this.historyFile = historyFile === undefined ? '' : String(historyFile);
+      if (this.historyFile !== '') {
+        try {
+          var lines = String(requireBuiltin('fs').readFileSync(this.historyFile, 'utf8')).split('\n');
+          for (var i = lines.length - 1; i >= 0; i--) {
+            if (lines[i] !== '') this.history.push(lines[i]);
+          }
+        } catch (readErr) { /* a history file that is not there is how every session starts */ }
+      }
+      if (typeof callback === 'function') callback(null, this);
+      return this;
+    };
+
+    /* Drop what is being typed without answering it, which is what '.break' and '.clear' do and
+       what a caller that has written half a line asks for. */
+    REPLServer.prototype.clearBufferedCommand = function () {
+      this._buffer = '';
     };
 
     REPLServer.prototype.defineCommand = function (keyword, cmd) {
@@ -2940,6 +3137,28 @@ export const SRC = String.raw`
        promise settles, so the prompt has to come after it and not now. */
     REPLServer.prototype._evaluate = function (src) {
       var result;
+      /* A caller's own evaluator, when 'repl.start' was given one, answers for the line: it is
+         called as node calls it -- the line, the session's context, the name the line comes from
+         and a callback -- and what it hands back is what the session prints. The prompt is this
+         answer's to write, so a session a script drives this way prompts when the answer lands
+         and not when the line arrives. */
+      if (typeof this.eval === 'function') {
+        var repl = this;
+        var answered = false;
+        var answer = function (err, value) {
+          if (answered) return;
+          answered = true;
+          if (err !== null && err !== undefined) repl._writeOut('Uncaught ' + replErrorHeader(err) + '\n');
+          else repl._showResult(value);
+          repl.displayPrompt();
+        };
+        try {
+          this.eval(src, this.context, '<repl>', answer);
+        } catch (thrown) {
+          answer(thrown);
+        }
+        return true;
+      }
       try {
         result = this._run(src);
       } catch (err) {
@@ -3009,6 +3228,9 @@ export const SRC = String.raw`
         }
         return;
       }
+      /* Every line that is not a command is one '.save' writes out, a continuation line as
+         itself and a blank one too, in the order it came. */
+      this.lines.push(line);
       this._buffer = this._buffer === '' ? line : this._buffer + '\n' + line;
       if (replIncomplete(this._buffer)) {
         this.displayPrompt();
