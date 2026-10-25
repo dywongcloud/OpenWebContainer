@@ -931,6 +931,9 @@ function cpOnEvent(child, ev) {
   } else if (ev.k === 'exit') {
     cpExit(child, ev.code, ev.signal, ev.timedOut === true);
   } else if (ev.k === 'error') {
+    /* A worker the parent has terminated reports nothing more: host node 24.15 emits no 'error' for
+       a thread it stopped, and the abort that ends a terminated worker is not the caller's event. */
+    if (child._cpWorker && child._cpTerminated) return;
     child.emit('error', cpErrorFrom(ev.e));
   } else if (ev.k === 'ipc') {
     cpIpc(child, ev.f);
@@ -986,10 +989,13 @@ function cpExit(child, code, signal, timedOut) {
   /* The spawn's own timeout ended this child on the host: the kill a caller reads on "killed"
      happened, even though the timer above never got a turn to make it. */
   if (timedOut) child.killed = true;
-  /* A terminated worker ends with status 1: the thread did not choose to exit, it was stopped. A
-     worker that ends on its own keeps the status it chose, and one with no status keeps 0. */
+  /* A worker that was stopped ends with status 1: the thread did not choose to exit. A worker that
+     ended on its own keeps the status it chose, and one with no status keeps 0 -- including one
+     'terminate()' reached only after its own end was already under way, which is why host node
+     24.15 answers 0 for a worker terminated the moment its message arrived. 'signal' is the mark of
+     the kill that landed: a worker no kill reached carries none. */
   var exitCode = child._cpWorker
-    ? (child._cpTerminated ? 1 : (code === null ? 0 : code))
+    ? (signal !== null && signal !== undefined ? 1 : (code === null ? 0 : code))
     : code;
   child.exitCode = exitCode;
   child.signalCode = signal;
@@ -1218,6 +1224,114 @@ function cpWorkerLimits(options) {
   return limits;
 }
 
+/* The 'execArgv' a Worker may be started with: the options of host node 24.15 that belong to a
+   thread rather than to the process, measured on that host -- one
+   'new Worker('', { eval: true, execArgv: [name + '=v'] })' for each of the 271 names
+   'process.allowedNodeEnvironmentFlags' reports, of which 195 are accepted and 76 are refused
+   with ERR_WORKER_INVALID_EXEC_ARGV. The refused ones are the options of the process and not of an
+   isolate: '--max-old-space-size', '--expose-gc', '--stack-trace-limit', '--use-largepages', and
+   '--title' among them although NODE_OPTIONS allows it -- which is why the set is not
+   'process.allowedNodeEnvironmentFlags' and had to be measured. */
+var CP_WORKER_EXEC_ARGV_ALLOWED = (
+  '--addons --allow-addons --allow-child-process --allow-fs-read --allow-fs-write --allow-inspector ' +
+  '--allow-wasi --allow-worker --async-context-frame --conditions --cpu-prof --debug-port ' +
+  '--deprecation --diagnostic-dir --disable-sigusr1 --disable-warning --dns-result-order ' +
+  '--enable-network-family-autoselection --enable-source-maps --entry-url ' +
+  '--es-module-specifier-resolution --experimental-abortcontroller --experimental-addon-modules ' +
+  '--experimental-detect-module --experimental-eventsource --experimental-fetch ' +
+  '--experimental-global-customevent --experimental-global-navigator --experimental-global-webcrypto ' +
+  '--experimental-import-meta-resolve --experimental-json-modules --experimental-loader ' +
+  '--experimental-modules --experimental-print-required-tla --experimental-quic ' +
+  '--experimental-repl-await --experimental-report --experimental-require-module ' +
+  '--experimental-specifier-resolution --experimental-sqlite --experimental-strip-types ' +
+  '--experimental-test-isolation --experimental-top-level-await --experimental-transform-types ' +
+  '--experimental-vm-modules --experimental-wasi-unstable-preview1 --experimental-wasm-modules ' +
+  '--experimental-websocket --experimental-webstorage --experimental-worker ' +
+  '--extra-info-on-fatal-exception --force-async-hooks-checks --force-context-aware ' +
+  '--force-node-api-uncaught-exceptions-policy --frozen-intrinsics --global-search-paths ' +
+  '--heap-prof --heapsnapshot-near-heap-limit --heapsnapshot-signal --http-parser --import ' +
+  '--insecure-http-parser --inspect --inspect-brk --inspect-port --inspect-wait --loader ' +
+  '--localstorage-file --max-http-header-size --napi-modules --network-family-autoselection ' +
+  '--network-family-autoselection-attempt-timeout --no-addons --no-allow-addons ' +
+  '--no-allow-child-process --no-allow-inspector --no-allow-wasi --no-allow-worker ' +
+  '--no-async-context-frame --no-cpu-prof --no-deprecation --no-disable-sigusr1 ' +
+  '--no-enable-source-maps --no-entry-url --no-experimental-addon-modules ' +
+  '--no-experimental-detect-module --no-experimental-eventsource ' +
+  '--no-experimental-global-navigator --no-experimental-import-meta-resolve ' +
+  '--no-experimental-print-required-tla --no-experimental-repl-await --no-experimental-require-module ' +
+  '--no-experimental-shadow-realm --no-experimental-sqlite --no-experimental-transform-types ' +
+  '--no-experimental-vm-modules --no-experimental-websocket --no-experimental-webstorage ' +
+  '--no-extra-info-on-fatal-exception --no-force-async-hooks-checks --no-force-context-aware ' +
+  '--no-force-node-api-uncaught-exceptions-policy --no-frozen-intrinsics --no-global-search-paths ' +
+  '--no-heap-prof --no-insecure-http-parser --no-network-family-autoselection ' +
+  '--no-pending-deprecation --no-permission --no-preserve-symlinks --no-preserve-symlinks-main ' +
+  '--no-report-exclude-env --no-report-exclude-network --no-report-on-signal ' +
+  '--no-report-uncaught-exception --no-require-module --no-strip-types --no-test-only ' +
+  '--no-throw-deprecation --no-tls-max-v1.2 --no-tls-max-v1.3 --no-tls-min-v1.0 --no-tls-min-v1.1 ' +
+  '--no-tls-min-v1.2 --no-tls-min-v1.3 --no-trace-deprecation --no-trace-env --no-trace-env-js-stack ' +
+  '--no-trace-env-native-stack --no-trace-exit --no-trace-promises --no-trace-sync-io --no-trace-tls ' +
+  '--no-trace-uncaught --no-trace-warnings --no-track-heap-objects --no-use-env-proxy ' +
+  '--no-verify-base-objects --no-warnings --no-watch --no-watch-preserve-output --pending-deprecation ' +
+  '--permission --preserve-symlinks --preserve-symlinks-main --prof-process --redirect-warnings ' +
+  '--report-exclude-env --report-exclude-network --report-on-signal --report-signal ' +
+  '--report-uncaught-exception --require --require-module --strip-types --test-coverage-branches ' +
+  '--test-coverage-exclude --test-coverage-functions --test-coverage-include --test-coverage-lines ' +
+  '--test-global-setup --test-isolation --test-name-pattern --test-only --test-reporter ' +
+  '--test-reporter-destination --test-rerun-failures --test-shard --test-skip-pattern ' +
+  '--throw-deprecation --tls-keylog --tls-max-v1.2 --tls-max-v1.3 --tls-min-v1.0 --tls-min-v1.1 ' +
+  '--tls-min-v1.2 --tls-min-v1.3 --trace-deprecation --trace-env --trace-env-js-stack ' +
+  '--trace-env-native-stack --trace-exit --trace-promises --trace-sync-io --trace-tls ' +
+  '--trace-uncaught --trace-warnings --track-heap-objects --use-env-proxy --verify-base-objects ' +
+  '--warnings --watch --watch-kill-signal --watch-path --watch-preserve-output'
+).split(' ');
+
+/* Of those, the ones a value belongs to: node refuses a bare '--require' -- one given without its
+   module -- in the same sentence it refuses a flag it does not allow. */
+var CP_WORKER_EXEC_ARGV_VALUED = (
+  '--allow-fs-read --allow-fs-write --conditions --debug-port --diagnostic-dir --disable-warning ' +
+  '--dns-result-order --experimental-loader --experimental-test-isolation ' +
+  '--heapsnapshot-near-heap-limit --heapsnapshot-signal --import --inspect-port --loader ' +
+  '--localstorage-file --max-http-header-size --network-family-autoselection-attempt-timeout ' +
+  '--redirect-warnings --report-signal --require --test-coverage-branches --test-coverage-exclude ' +
+  '--test-coverage-functions --test-coverage-include --test-coverage-lines --test-global-setup ' +
+  '--test-isolation --test-name-pattern --test-reporter --test-reporter-destination ' +
+  '--test-rerun-failures --test-shard --test-skip-pattern --tls-keylog --watch-kill-signal ' +
+  '--watch-path'
+).split(' ');
+
+/**
+ * The 'execArgv' of a Worker, as host node 24.15 reads it: a list of options it allows, every one of
+ * them refused before a thread is started, in the words and the order node writes them.
+ */
+function cpWorkerExecArgv(given) {
+  var list = [];
+  if (!Array.isArray(given)) return list;
+  var refused = [];
+  for (var i = 0; i < given.length; i++) {
+    var arg = String(given[i]);
+    var at = arg.indexOf('=');
+    var name = at < 0 ? arg : arg.slice(0, at);
+    if (CP_WORKER_EXEC_ARGV_ALLOWED.indexOf(name) < 0) {
+      refused.push(arg);
+      continue;
+    }
+    if (at < 0 && CP_WORKER_EXEC_ARGV_VALUED.indexOf(name) >= 0) {
+      refused.push(arg + ' requires an argument');
+      continue;
+    }
+    list.push(arg);
+  }
+  if (refused.length > 0) {
+    var err = cpError('Initiated Worker with invalid execArgv flags: ' + refused.join(', '));
+    err.code = 'ERR_WORKER_INVALID_EXEC_ARGV';
+    /* Node names an error it built with its own helper after the code it carries, and that name is
+       the line an uncaught one prints: "Error [ERR_WORKER_INVALID_EXEC_ARGV]: ...". */
+    err.name = 'Error [ERR_WORKER_INVALID_EXEC_ARGV]';
+    throw err;
+  }
+  return list;
+}
+
 function cpWorkerClass() {
   var Child = cpChildClass();
   function Worker(filename, options) {
@@ -1239,7 +1353,10 @@ function cpWorkerClass() {
         return { idle: 0, active: 0, utilization: 0 };
       }
     };
-    var argv = opts.eval === true ? ['-e', String(filename)] : [String(filename)];
+    /* The options the worker's own 'process.execArgv' is: validated here, where host node 24.15
+       validates them -- inside 'new Worker', before a thread exists to be given them. */
+    var execArgv = cpWorkerExecArgv(opts.execArgv);
+    var argv = execArgv.concat(opts.eval === true ? ['-e', String(filename)] : [String(filename)]);
     cpSpawnCore(this, 'node', argv, {
       cwd: opts.cwd,
       env: opts.env,
@@ -1252,6 +1369,11 @@ function cpWorkerClass() {
         threadId: threadId,
         workerData: cpEncodeWith(opts.workerData === undefined ? null : opts.workerData, opts.transferList),
         envData: cpEnvDataSnapshot(),
+        /* The options the worker reports as its own: the list above, in the words it was given. */
+        execArgv: execArgv,
+        /* An eval worker's source is its program and not one of the options of its line, and node
+           names it in 'process.argv' as '[worker eval]'. */
+        evalWorker: opts.eval === true,
         /* The set of threads a BroadcastChannel name reaches: a worker shares its parent's. */
         bcDomain: cpBusDomain()
       }
@@ -2017,6 +2139,34 @@ BF['cluster'] = function () {
   if (cpState.kind !== 'worker') proc.channel = new (cpEE())();
   cpState.target = createTarget(cpOnFrame);
   if (cpState.kind === 'worker') {
+    /* The 'process.execArgv' a worker reports is the list 'new Worker' was given, which this child
+       was spawned with ahead of its file or of its '-e'. An eval worker's source rides in the options
+       of the line this child was started with and is none of them: host node 24.15 reports '[]' for
+       a worker whose source came in 'new Worker', not the '-e' and the source. The options are
+       written onto the process after this bootstrap runs, so what is filtered is the array the host
+       hands over, through an accessor a program can still write to. */
+    var cpWorkerExecArgv = [];
+    function cpWorkerExecArgvTake(values) {
+      var list = [];
+      if (Array.isArray(values)) {
+        for (var eai = 0; eai < values.length; eai++) {
+          if (cpState.data.evalWorker === true && String(values[eai]) === '-e') { eai += 1; continue; }
+          list.push(String(values[eai]));
+        }
+      }
+      cpWorkerExecArgv = list;
+    }
+    Object.defineProperty(proc, 'execArgv', {
+      configurable: true,
+      enumerable: true,
+      get: function () { return cpWorkerExecArgv; },
+      set: cpWorkerExecArgvTake
+    });
+    cpWorkerExecArgvTake(proc.execArgv);
+    /* Node names an eval worker's source in 'process.argv' as '[worker eval]'. */
+    if (cpState.data.evalWorker === true && Array.isArray(proc.argv) && proc.argv.length < 2) {
+      proc.argv.push('[worker eval]');
+    }
     /* The environment data its parent held when it started it: a worker reads the keys its parent
        had, and a key it sets of its own is its own, as on host node 24.15. */
     cpEnvDataSeed(cpState.data.envData);
