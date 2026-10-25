@@ -418,8 +418,13 @@ function inspectValue(value, opts) {
     if (ctor === 'Buffer') {
       var shown = [];
       for (var b = 0; b < v.length && b < 50; b++) shown.push(hexByte(v[b]));
-      var more = v.length > 50 ? ' ... ' + (v.length - 50) + ' more bytes' : '';
-      return '<Buffer' + (shown.length ? ' ' + shown.join(' ') : '') + more + '>';
+      /* Singular for the one byte left over and plural past it, as node words it: a 51-byte buffer
+         ends '... 1 more byte' and a 64-byte one '... 14 more bytes'. */
+      var left = v.length - 50;
+      var more = left > 0 ? ' ... ' + left + ' more byte' + (left === 1 ? '' : 's') : '';
+      /* An empty one keeps the gap where its hex would have been: node prints '<Buffer >' and not
+         '<Buffer>', measured on host node 24.15 for both util.inspect and buf.inspect(). */
+      return '<Buffer ' + shown.join(' ') + more + '>';
     }
 
     var isArr = Array.isArray(v);

@@ -44,9 +44,28 @@ BF.buffer = function () {
     throw new TypeError('The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array');
   };
 
+  /*
+   * The size a Buffer is asked for, refused the way host node 24.15 refuses one: a value that is not
+   * a number is a TypeError naming it, and one below 0 or above kMaxLength -- NaN and either
+   * infinity among them, because no comparison holds for them -- is a RangeError carrying
+   * ERR_OUT_OF_RANGE. Left to the engine, Buffer.alloc(-1) answered RangeError 'invalid array
+   * length' with no code at all, and Buffer.alloc('8') and Buffer.alloc(undefined) were answered
+   * with a buffer instead of refused. A fractional size is allowed, as there: 1.5 is one byte.
+   */
+  function checkSize(size) {
+    if (typeof size !== 'number') {
+      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "size" argument must be of type number. Received ' + describeArg(size));
+    }
+    if (!(size >= 0 && size <= MAX_BUFFER_LENGTH)) {
+      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "size" is out of range. It must be >= 0 && <= ' + MAX_BUFFER_LENGTH + '. Received ' + receivedOf(size));
+    }
+    return size;
+  }
+
   Buffer.alloc = function (size, fill, encoding) {
-    var bytes = wrapBytes(new Uint8Array(size));
-    if (fill !== undefined && fill !== 0) bytes.fill(fill, 0, size, encoding);
+    var n = checkSize(size);
+    var bytes = wrapBytes(new Uint8Array(n));
+    if (fill !== undefined && fill !== 0) bytes.fill(fill, 0, n, encoding);
     return bytes;
   };
   Buffer.allocUnsafe = Buffer.alloc;
@@ -127,6 +146,15 @@ BF.buffer = function () {
   Buffer.prototype.equals = function (other) {
     return this.compare(other) === 0;
   };
+  /*
+   * Node's own Buffer.prototype.inspect: the very string util.inspect writes for the buffer, which is
+   * what buf.inspect() answers there -- '<Buffer 01 02 03>', fifty bytes and then '... N more bytes'
+   * -- and what it answered here only through util.inspect, the method itself being absent, so
+   * buf.inspect() threw 'not a function' where the host printed the buffer.
+   */
+  Buffer.prototype.inspect = function inspect(recurseTimes, ctx) {
+    return requireBuiltin('util').inspect(this);
+  };
   Buffer.prototype.compare = function (other) {
     var n = Math.min(this.length, other.length);
     for (var i = 0; i < n; i++) {
@@ -200,18 +228,18 @@ BF.buffer = function () {
     return -1;
   };
   Buffer.prototype.readUInt8 = function (offset) {
-    return this[offset || 0];
+    return this[checkOffset(this, offset, 1)];
   };
   Buffer.prototype.readInt8 = function (offset) {
-    var v = this[offset || 0];
+    var v = this[checkOffset(this, offset, 1)];
     return v > 127 ? v - 256 : v;
   };
   Buffer.prototype.readUInt16BE = function (offset) {
-    var o = offset || 0;
+    var o = checkOffset(this, offset, 2);
     return (this[o] << 8) | this[o + 1];
   };
   Buffer.prototype.readUInt16LE = function (offset) {
-    var o = offset || 0;
+    var o = checkOffset(this, offset, 2);
     return this[o] | (this[o + 1] << 8);
   };
   Buffer.prototype.readInt16BE = function (offset) {
@@ -224,14 +252,14 @@ BF.buffer = function () {
   };
   Buffer.prototype.writeUInt16BE = function (value, offset) {
     checkWriteValue(value, 0, 65535);
-    var o = offset || 0;
+    var o = checkOffset(this, offset, 2);
     this[o] = (value >>> 8) & 0xff;
     this[o + 1] = value & 0xff;
     return o + 2;
   };
   Buffer.prototype.writeUInt16LE = function (value, offset) {
     checkWriteValue(value, 0, 65535);
-    var o = offset || 0;
+    var o = checkOffset(this, offset, 2);
     this[o] = value & 0xff;
     this[o + 1] = (value >>> 8) & 0xff;
     return o + 2;
@@ -244,20 +272,21 @@ BF.buffer = function () {
   };
   Buffer.prototype.writeUInt8 = function (value, offset) {
     checkWriteValue(value, 0, 255);
-    this[offset || 0] = value & 0xff;
-    return (offset || 0) + 1;
+    var o = checkOffset(this, offset, 1);
+    this[o] = value & 0xff;
+    return o + 1;
   };
   Buffer.prototype.readUInt32BE = function (offset) {
-    var o = offset || 0;
+    var o = checkOffset(this, offset, 4);
     return ((this[o] << 24) >>> 0) + (this[o + 1] << 16) + (this[o + 2] << 8) + this[o + 3];
   };
   Buffer.prototype.readUInt32LE = function (offset) {
-    var o = offset || 0;
+    var o = checkOffset(this, offset, 4);
     return ((this[o + 3] << 24) >>> 0) + (this[o + 2] << 16) + (this[o + 1] << 8) + this[o];
   };
   Buffer.prototype.writeUInt32BE = function (value, offset) {
     checkWriteValue(value, 0, 4294967295);
-    var o = offset || 0;
+    var o = checkOffset(this, offset, 4);
     this[o] = (value >>> 24) & 0xff;
     this[o + 1] = (value >>> 16) & 0xff;
     this[o + 2] = (value >>> 8) & 0xff;
@@ -266,7 +295,7 @@ BF.buffer = function () {
   };
   Buffer.prototype.writeUInt32LE = function (value, offset) {
     checkWriteValue(value, 0, 4294967295);
-    var o = offset || 0;
+    var o = checkOffset(this, offset, 4);
     this[o] = value & 0xff;
     this[o + 1] = (value >>> 8) & 0xff;
     this[o + 2] = (value >>> 16) & 0xff;
@@ -290,7 +319,33 @@ BF.buffer = function () {
     if (typeof value === 'function') return 'function ' + value.name;
     if (typeof value === 'object') return 'an instance of ' + ((value.constructor && value.constructor.name) || 'Object');
     if (typeof value === 'string') return "type string ('" + value + "')";
+    /* Node writes a bigint with the n it is written with: 'Received type bigint (1n)'. */
+    if (typeof value === 'bigint') return 'type bigint (' + value + 'n)';
     return 'type ' + typeof value + ' (' + String(value) + ')';
+  }
+
+  /*
+   * Node groups the digits of the number a range error names, three from the right over the whole of
+   * the number's own string -- exponent included, so 1e+21 comes out '1e_+21' -- but only once the
+   * value is past 2 ** 32: -4294967296 is written plain and -4294967297 is '-4_294_967_297'. A NaN,
+   * either infinity and every value that is not an integer are left as they are, which is why
+   * '-1000' and 'Infinity' carry no separator. Measured on host node 24.15.
+   */
+  function separatedNumber(value) {
+    var str = String(value);
+    var i = str.length;
+    var start = str.charAt(0) === '-' ? 1 : 0;
+    var out = '';
+    while (i >= start + 4) {
+      i -= 3;
+      out = '_' + str.slice(i, i + 3) + out;
+    }
+    return str.slice(0, i) + out;
+  }
+
+  function receivedOf(value) {
+    if (typeof value === 'number' && value === Math.floor(value) && isFinite(value) && Math.abs(value) > 4294967296) return separatedNumber(value);
+    return String(value);
   }
 
   /*
@@ -311,10 +366,10 @@ BF.buffer = function () {
   function checkOffset(buf, offset, size) {
     var o = offset === undefined ? 0 : offset;
     if (typeof o !== 'number') throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "offset" argument must be of type number. Received ' + describeArg(o));
-    if (o !== Math.floor(o)) throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "offset" is out of range. It must be an integer. Received ' + o);
+    if (o !== Math.floor(o)) throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "offset" is out of range. It must be an integer. Received ' + receivedOf(o));
     if (buf.length - size < 0) throw bufErr(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS', 'Attempt to access memory outside buffer bounds');
     if (o < 0 || o > buf.length - size) {
-      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "offset" is out of range. It must be >= 0 and <= ' + (buf.length - size) + '. Received ' + o);
+      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "offset" is out of range. It must be >= 0 and <= ' + (buf.length - size) + '. Received ' + receivedOf(o));
     }
     return o;
   }
