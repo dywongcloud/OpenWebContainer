@@ -2797,6 +2797,27 @@ function urlGlobalOf(nodeUrl) {
     });
   }
   Object.defineProperty(URL.prototype, Symbol.toStringTag, { value: 'URL', configurable: true });
+  /*
+   * URL.parse is the constructor that answers null instead of throwing: the same read of an input
+   * and a base, and a string no URL can be made of is a null and not a TypeError, so a caller that
+   * only wants to know whether it parses -- and one that wants the URL without a try around it --
+   * needs no catch of its own. A call with no argument at all is not a bad string but a missing
+   * one, so it throws the ERR_MISSING_ARGS node throws rather than answering null for it.
+   */
+  URL.parse = function parse(input, base) {
+    if (arguments.length === 0) {
+      var missing = new TypeError('The "url" argument must be specified');
+      missing.code = 'ERR_MISSING_ARGS';
+      throw missing;
+    }
+    try {
+      return new URL(input, base);
+    } catch (err) {
+      return null;
+    }
+  };
+  /* Node declares one argument -- the base is optional -- so URL.parse.length answers 1. */
+  Object.defineProperty(URL.parse, 'length', { value: 1, configurable: true });
   URL.canParse = function (input, base) {
     try {
       new URL(input, base);
