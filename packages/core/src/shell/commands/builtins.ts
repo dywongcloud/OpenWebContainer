@@ -6882,6 +6882,18 @@ function callFunction(state: ShellState, fn: FunctionDef, args: string[]): numbe
     state.callStack.push({ name: fn.name, source: state.source, line: state.line });
     let status = 0;
     try {
+        /* On the way *into* a function a host runs the DEBUG trap one more time, over the call and
+           not over the definition behind it: `trap 'echo D' DEBUG; set -T; f() { echo body; }; f`
+           is its `D` behind `set -T`, one behind the call `f`, one more on the way in, and one
+           behind the `echo` of the body -- four, where this shell used to give three. A definition
+           is not a command a host fires it for at all: take the `set -T` away and the line is the
+           one `D` of the call and not the two a definition behind it would give. The frame is
+           already pushed, so the test is the one the body's own commands are given: a trap the
+           function set for itself fires here, and one from
+           outside it only comes in where `set -T` asks it to -- `trap 'echo D' DEBUG; o() { trap
+           'echo D' DEBUG; i() { echo x; }; i; }; o` is its `D` behind the `i` and nothing on the
+           way into either function. */
+        if (trapRunsForCommand(state, 'DEBUG')) runTrap(state, 'DEBUG');
         status = runCommandList(state, [{ bang: false, commands: [fn.body], op: null }], null);
     } catch (error) {
         if (error instanceof ReturnSignal) status = error.code;
