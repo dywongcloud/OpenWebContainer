@@ -3229,6 +3229,18 @@ function generateDh(bits: number, generator: bigint): IntKey {
     return { p, g: generator, x, y: modPow(generator, x, p) };
 }
 
+/**
+ * A key pair over a prime that was fixed rather than generated: a named MODP group, or a prime a
+ * caller handed in. OpenSSL keeps a `length` on such a group and draws the private exponent at
+ * that width, so generateKeyPairSync('dh', {group}) and {prime} both answer a PKCS#8 whose private
+ * value is 29 bytes at 2048 bits, where {primeLength} -- which generates the parameters and the
+ * key together -- answers a full-width one. Measured against host Node 24.15.
+ */
+function dhFromPrime(p: bigint, g: bigint): IntKey {
+    const x = randomExponent(p, true);
+    return { p, g, x, y: modPow(g, x, p) };
+}
+
 /** PKCS#1 RSAPublicKey: SEQUENCE { modulus, publicExponent }, the body an SPKI wraps. */
 const rsaPublicDer = (ints: IntKey): Uint8Array =>
     derSequence([derIntegerBig(ints.n as bigint), derIntegerBig(ints.e as bigint)]);
@@ -3382,10 +3394,47 @@ function emsaPssVerify(digest: Uint8Array, em: Uint8Array, emBits: number, saltL
 /** The salt length of a PSS signature: the digest width, unless the caller names one. */
 function pssSaltLength(saltLength: unknown, hLen: number): number {
     const asked = Number(saltLength);
-    if (saltLength === undefined || saltLength === null || !Number.isFinite(asked)) return hLen;
+    /* No salt length named at all is AUTO -- the longest salt that fits -- and not the digest's
+       own width: a host signature made with none verifies against 222 at 2048 bits and sha256 and
+       against nothing else, which is emLen - hLen - 2. */
+    if (saltLength === undefined) return -2;
+    if (saltLength === null || !Number.isFinite(asked)) return hLen;
     if (asked === -1) return hLen;
     if (asked === -2) return -2;
     return Math.trunc(asked);
+}
+
+/** How Node prints the value it refused at the end of an ERR_INVALID_ARG_VALUE: bare for a number,
+ *  quoted for text, and the object itself -- '{}' -- for anything with keys. */
+function invalidValueText(value: unknown): string {
+    if (typeof value === 'string') return `'${value}'`;
+    if (typeof value === 'object' && value !== null) {
+        try {
+            return JSON.stringify(value) ?? 'an instance of Object';
+        } catch {
+            return 'an instance of Object';
+        }
+    }
+    return String(value);
+}
+
+/**
+ * Node reads a salt length as an int32 whether or not the key or the padding has anything to do
+ * with PSS, and it reads it before it looks at either: a value that is not a whole number in that
+ * range is refused over an RSA key, over an Edwards one and over a public key alike.
+ */
+function saltLengthArg(saltLength: unknown): number | undefined {
+    if (saltLength === undefined) return undefined;
+    if (typeof saltLength !== 'number' || !Number.isInteger(saltLength) || saltLength < -2147483648 || saltLength > 2147483647) {
+        throw keyFail('ERR_INVALID_ARG_VALUE', "The property 'options.saltLength' is invalid. Received " + invalidValueText(saltLength), 'TypeError');
+    }
+    return saltLength;
+}
+
+/** The floor OpenSSL puts under a PSS salt length: -4 signs, and -5 does not. */
+function pssSaltFloor(salt: number | undefined, mode: number): void {
+    if (mode !== RSA_PKCS1_PSS_PADDING || salt === undefined || salt > -5) return;
+    throw keyFail('ERR_OSSL_INVALID_SALT_LENGTH', 'error:1C800070:Provider routines::invalid salt length');
 }
 
 /** Signs or verifies with an RSA key: the exponentiation is one BigInt modPow either way. */
@@ -3412,8 +3461,13 @@ function rsaSignWith(ints: IntKey, digest: Uint8Array, name: string, padding: nu
     const spec = DIGEST_SPECS[name];
     const hash = (message: Uint8Array): Uint8Array => spec.fn(message, 0);
     const emBits = n.toString(2).length - 1;
+    /* AUTO (-2) and MAX (-3) are the longest salt the block has room for, which is what OpenSSL
+       writes when a call named no salt length and what it checks when a check names AUTO. */
+    const salt = saltLength === -2 || saltLength === -3
+        ? Math.ceil(emBits / 8) - spec.out - 2
+        : saltLength < 0 ? spec.out : saltLength;
     const em = padding === RSA_PKCS1_PSS_PADDING
-        ? emsaPssEncode(digest, emBits, saltLength < 0 ? spec.out : saltLength, hash, spec.out)
+        ? emsaPssEncode(digest, emBits, salt, hash, spec.out)
         : emsaPkcs1(digestInfoDer(name, digest), size);
     const m = bigOf(em);
     if (m >= n) throw keyFail('ERR_OSSL_RSA_DATA_TOO_LARGE', 'error:0409D06A:rsa routines::data too large for modulus');
@@ -3756,11 +3810,51 @@ function generatePair(type: unknown, options: any): { public: number; private: n
         };
     }
     if (kind === 'dh') {
-        /* A group, a prime or a prime length: Node asks for one of the three before it generates. */
-        if (options?.primeLength === undefined || options?.primeLength === null) {
-            throw Object.assign(new Error('At least one of the group, prime, or primeLength options is required'), { code: 'ERR_MISSING_OPTION' });
+        /*
+         * A group, a prime or a prime length: Node asks for one of the three before it generates,
+         * and a group fixes the parameters outright, so a prime, a prime length or a generator
+         * beside it is refused rather than ignored.
+         */
+        const group = options?.group;
+        const prime = options?.prime;
+        const primeLength = options?.primeLength;
+        const hasGroup = group !== undefined && group !== null;
+        const hasPrime = prime !== undefined && prime !== null;
+        const hasPrimeLength = primeLength !== undefined && primeLength !== null;
+        if (hasGroup) {
+            if (typeof group !== 'string') {
+                throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.group" property must be of type string. Received ' + receivedLike(group), 'TypeError');
+            }
+            const clash = hasPrime ? 'prime'
+                : hasPrimeLength ? 'primeLength'
+                    : (options?.generator === undefined || options?.generator === null) ? null : 'generator';
+            if (clash !== null) {
+                throw keyFail('ERR_INCOMPATIBLE_OPTION_PAIR', 'Option "group" cannot be used in combination with option "' + clash + '"', 'TypeError');
+            }
+            const bits = DH_GROUP_NAMES[group];
+            if (bits === undefined) throw keyFail('ERR_CRYPTO_UNKNOWN_DH_GROUP', 'Unknown DH group');
+            /* A named group carries its own prime and generator, and a private exponent of the
+               width OpenSSL gives one: the short exponent, not a full-width draw over p. */
+            const ints = dhFromPrime(BigInt('0x' + MODP_GROUPS[bits]), 2n);
+            const size = modulusSize(ints.p as bigint);
+            return {
+                public: storeKey({ type: 'public', kind, ints, publicBytes: bytesOf(ints.y as bigint, size) }),
+                private: storeKey({ type: 'private', kind, ints, publicBytes: bytesOf(ints.y as bigint, size), privateBytes: minimalBytesOf(ints.x as bigint) })
+            };
         }
-        const primeLength = options.primeLength;
+        if (!hasPrime && !hasPrimeLength) {
+            throw keyFail('ERR_MISSING_OPTION', 'At least one of the group, prime, or primeLength options is required', 'TypeError');
+        }
+        if (hasPrime) {
+            /* A prime a caller named is bytes on the wire and a big integer here; a generator of 2
+               is the default, and the exponent is the short one a fixed prime gets. */
+            const ints = dhFromPrime(bigOf(bytesArg(prime)), options?.generator === undefined || options?.generator === null ? 2n : BigInt(String(options?.generator)));
+            const size = modulusSize(ints.p as bigint);
+            return {
+                public: storeKey({ type: 'public', kind, ints, publicBytes: bytesOf(ints.y as bigint, size) }),
+                private: storeKey({ type: 'private', kind, ints, publicBytes: bytesOf(ints.y as bigint, size), privateBytes: minimalBytesOf(ints.x as bigint) })
+            };
+        }
         if (typeof primeLength !== 'number') {
             throw keyFail('ERR_INVALID_ARG_TYPE', 'The "options.primeLength" property must be of type number. Received ' + receivedLike(primeLength), 'TypeError');
         }
@@ -4064,6 +4158,7 @@ function rsaModeFor(padding: unknown, kind: string): number {
 }
 
 function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown, fromSign = false): Uint8Array {
+    const salt = saltLengthArg(saltLength);
     const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'private') throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid key object type ' + key.type + ', expected private.', 'TypeError');
     /*
@@ -4083,7 +4178,8 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncod
          */
         const name = digestNameFor(algorithm === undefined || algorithm === null ? DEFAULT_DIGEST : algorithm);
         const spec = digestFor(name);
-        return rsaSignWith(key.ints as IntKey, spec.fn(data, 0), name, mode, pssSaltLength(saltLength, spec.out));
+        pssSaltFloor(salt, mode);
+        return rsaSignWith(key.ints as IntKey, spec.fn(data, 0), name, mode, pssSaltLength(salt, spec.out));
     }
     if (key.kind === 'dsa') {
         /* A null algorithm signs the data as it stands, which is the digest it would have fed in. */
@@ -4133,6 +4229,7 @@ function signWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, dsaEncod
 }
 
 function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signature: Uint8Array, dsaEncoding?: unknown, padding?: unknown, saltLength?: unknown, fromVerify = false): boolean {
+    const salt = saltLengthArg(saltLength);
     const encoding = dsaEncodingFor(dsaEncoding);
     if (key.type !== 'public' && key.type !== 'private') return false;
     if (key.kind === 'rsa' || key.kind === 'rsa-pss') {
@@ -4141,7 +4238,8 @@ function verifyWith(key: KeyRecord, algorithm: unknown, data: Uint8Array, signat
         const spec = DIGEST_SPECS[name];
         if (spec === undefined) return false;
         /* A PSS check the caller named no salt length for is AUTO, which accepts any salt. */
-        return rsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), name, signature, mode, saltLength === undefined || saltLength === null ? -2 : pssSaltLength(saltLength, spec.out));
+        pssSaltFloor(salt, mode);
+        return rsaVerifyWith(key.ints as IntKey, spec.fn(data, 0), name, signature, mode, salt === undefined ? -2 : pssSaltLength(salt, spec.out));
     }
     if (key.kind === 'dsa') {
         if (algorithm !== undefined && algorithm !== null && DIGEST_SPECS[digestNameFor(algorithm)] === undefined) return false;

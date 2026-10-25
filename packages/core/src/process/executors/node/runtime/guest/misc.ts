@@ -2848,6 +2848,9 @@ BF.crypto = function () {
     });
     if (encoding.format === 'jwk') return result.jwk;
     var bytes = Buf.from(result.bytes, 'base64');
+    /* A 'der' export is bytes and not text: Node answers a Buffer for it, and a string only for
+       the 'pem' spelling -- which is also what a format it was not asked for falls back to. */
+    if (encoding.format === 'der') return bytes;
     return typeof encoding.format === 'string' ? bytes.toString('utf8') : bytes;
   }
 
@@ -2914,8 +2917,26 @@ BF.crypto = function () {
     if (options.paramType !== undefined) out.paramType = options.paramType;
     /* DSA names the width of its subprime, and DH the width of its prime, each in its own option. */
     if (options.divisorLength !== undefined) out.divisorLength = widthOption(options, 'divisorLength');
-    if (options.primeLength !== undefined) out.primeLength = widthOption(options, 'primeLength');
+    if (options.primeLength !== undefined && options.primeLength !== null) out.primeLength = widthOption(options, 'primeLength');
     if (options.generator !== undefined) out.generator = options.generator;
+    /*
+     * 'dh' is the one kind that may name its parameters outright: a standard MODP group by name,
+     * or a prime as bytes. A group fixes the parameters on its own, so a prime, a prime length or
+     * a generator beside it is refused -- on the far side of this call, which names the pair.
+     */
+    if (options.group !== undefined && options.group !== null) {
+      if (typeof options.group !== 'string') throw invalidPropertyType('options.group', 'string', options.group);
+      out.group = options.group;
+    }
+    if (options.prime !== undefined && options.prime !== null) {
+      var givenPrime = options.prime;
+      if (!(Buf.isBuffer(givenPrime) || (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(givenPrime)))) {
+        var primeErr = new TypeError('The "options.prime" property must be an instance of Buffer, TypedArray, or DataView. Received ' + receivedAs(givenPrime));
+        primeErr.code = 'ERR_INVALID_ARG_TYPE';
+        throw primeErr;
+      }
+      out.prime = Buf.from(new Uint8Array(givenPrime.buffer, givenPrime.byteOffset, givenPrime.byteLength)).toString('base64');
+    }
     /*
      * 'rsa-pss' is the one kind that carries a digest and a salt of its own into the key, and
      * they are what asymmetricKeyDetails answers back: the hash, the MGF1 hash and the salt
@@ -2965,7 +2986,7 @@ BF.crypto = function () {
       data: Buf.concat(this._chunks).toString('base64'),
       dsaEncoding: privateKey !== null && typeof privateKey === 'object' ? privateKey.dsaEncoding : undefined,
       padding: privateKey !== null && typeof privateKey === 'object' ? privateKey.padding : undefined,
-      saltLength: privateKey !== null && typeof privateKey === 'object' ? privateKey.saltLength : undefined,
+      saltLength: privateKey !== null && typeof privateKey === 'object' ? saltLengthOption(privateKey.saltLength) : undefined,
       /* A Sign object always names a digest, and a pure key that is handed one answers
          "Unsupported crypto operation" where the one-shot crypto.sign names OpenSSL's digest. */
       fromSign: true
@@ -3007,7 +3028,7 @@ BF.crypto = function () {
       signature: toBytes(signature, typeof encoding === 'string' ? encoding : 'utf8', 'signature').toString('base64'),
       dsaEncoding: publicKey !== null && typeof publicKey === 'object' ? publicKey.dsaEncoding : undefined,
       padding: publicKey !== null && typeof publicKey === 'object' ? publicKey.padding : undefined,
-      saltLength: publicKey !== null && typeof publicKey === 'object' ? publicKey.saltLength : undefined,
+      saltLength: publicKey !== null && typeof publicKey === 'object' ? saltLengthOption(publicKey.saltLength) : undefined,
       fromVerify: true
     }) === true;
   };
@@ -3041,7 +3062,7 @@ BF.crypto = function () {
       data: bytes,
       dsaEncoding: key !== null && typeof key === 'object' ? key.dsaEncoding : undefined,
       padding: key !== null && typeof key === 'object' ? key.padding : undefined,
-      saltLength: key !== null && typeof key === 'object' ? key.saltLength : undefined
+      saltLength: key !== null && typeof key === 'object' ? saltLengthOption(key.saltLength) : undefined
     }), 'base64');
     if (typeof callback === 'function') {
       queueMicrotask(function () { callback(null, signature); });
@@ -3055,6 +3076,34 @@ BF.crypto = function () {
    * before the data and the signature are looked at, so a key that is missing fails here -- on
    * the property read, the way Node's own code does -- rather than on a type check of its own.
    */
+  /*
+   * Node reads a salt length as an int32 before it looks at the key, the digest or the padding, and
+   * it names the value it was handed. NaN and Infinity are values the wire between the guest and
+   * the capability cannot carry -- they arrive as null -- so the check is made here, where the
+   * value a caller wrote is still the value it was.
+   */
+  function invalidValueAs(value) {
+    if (typeof value === 'string') return "'" + value + "'";
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    try {
+      var text = JSON.stringify(value);
+      if (typeof text === 'string') return text;
+    } catch (e) { /* a value with no JSON form falls through to the inspect spelling */ }
+    return receivedAs(value);
+  }
+
+  function saltLengthOption(value) {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < -2147483648 || value > 2147483647) {
+      var err = new TypeError("The property 'options.saltLength' is invalid. Received " + invalidValueAs(value));
+      err.code = 'ERR_INVALID_ARG_VALUE';
+      throw err;
+    }
+    return value;
+  }
+
   function keyOptionsOf(key) {
     /*
      * Node reads the key's own options before it looks at the data or the signature, and it reads
@@ -3067,7 +3116,7 @@ BF.crypto = function () {
     }
     var padding = key.padding;
     var dsaEncoding = key.dsaEncoding;
-    var saltLength = key.saltLength;
+    var saltLength = saltLengthOption(key.saltLength);
     return { dsaEncoding: dsaEncoding, padding: padding, saltLength: saltLength };
   }
 
