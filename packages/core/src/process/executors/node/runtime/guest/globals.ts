@@ -677,23 +677,6 @@ function pidOf(pid) {
   }
   throw badPidFor(pid);
 }
-/* The two signals no program can catch: libuv refuses to start a watch for either, so registering a
-   listener for one throws instead of registering it. Measured against node 24.15, where all five
-   registration methods -- on, addListener, once, prependListener and prependOnceListener -- answer
-   the same Error (code EINVAL, errno -22, syscall 'uv_signal_start', message
-   'uv_signal_start EINVAL') and where the listener count for the name stays at 0, as it does for a
-   name nothing was ever registered for. What is refused is the name, not the signal: 9 numbers
-   SIGKILL and registers as it always did, and so does any other spelling node does not read as one
-   of those two names -- 'sigkill' among them. Taking a listener away and emitting the name are not
-   watches and are left as they were. */
-var UNCATCHABLE_SIGNALS = { SIGKILL: 1, SIGSTOP: 1 };
-function uvSignalStartEinvalid() {
-    var bad = new Error('uv_signal_start EINVAL');
-    bad.code = 'EINVAL';
-    bad.errno = -22;
-    bad.syscall = 'uv_signal_start';
-    return bad;
-}
 /* The names a listener has been registered for at some point, whether or not one is registered for
    them now. Registering one is what changes the signal's disposition on a host, and taking the last
    listener away does not put node's own disposition back but the host's -- see
@@ -708,7 +691,6 @@ var SIGNALS_LISTENED_FOR = Object.create(null);
       var inner = proc[method];
       Object.defineProperty(proc, method, {
         value: function (name) {
-          if (typeof name === 'string' && UNCATCHABLE_SIGNALS[name] === 1) throw uvSignalStartEinvalid();
           var named = nameOfSignal(name);
           if (named !== undefined) SIGNALS_LISTENED_FOR[named] = 1;
           return inner.apply(this, arguments);
@@ -832,8 +814,40 @@ proc.setgid = function () { throw epermFor('setgid'); };
 proc.setegid = function () { throw epermFor('setegid'); };
 proc.setgroups = function () { throw epermFor('setgroups'); };
 proc.initgroups = function () { throw epermFor('initgroups'); };
-proc.emitWarning = function (warning) {
-  host.stderr('(node) Warning: ' + (warning && warning.message ? warning.message : String(warning)) + '\n');
+/*
+ * process.emitWarning, the way a host does it. Two things are always true of a host's warning and
+ * were both missing here: it is delivered to the process's 'warning' listeners on the NEXT tick and
+ * never during the call that made it, and it is written to stderr whether or not anything is
+ * listening -- by a listener of the process's own, which is why a host's process answers 2 for
+ * process.listenerCount('warning') once a caller has added one. The line is
+ * '(node:<pid>) [code] Name: message', with the code in brackets only where the warning carries one
+ * and 'Warning' as the name where it was given none. The hint pointing at --trace-warnings is
+ * written once, after the first warning of the process, and never again.
+ */
+var traceWarningsHintWritten = false;
+function onProcessWarning(warning) {
+  if (!(warning instanceof Error)) return;
+  var name = typeof warning.name === 'string' && warning.name !== '' ? warning.name : 'Warning';
+  var code = typeof warning.code === 'string' && warning.code !== '' ? '[' + warning.code + '] ' : '';
+  var line = '(node:' + proc.pid + ') ' + code + name + ': ' + warning.message + '\n';
+  if (!traceWarningsHintWritten) {
+    traceWarningsHintWritten = true;
+    line += '(Use ' + '\x60' + 'node --trace-warnings ...' + '\x60' + ' to show where the warning was created)\n';
+  }
+  host.stderr(line);
+}
+proc.on('warning', onProcessWarning);
+proc.emitWarning = function (warning, type, code, ctor) {
+  var made;
+  if (warning instanceof Error) {
+    made = warning;
+  } else {
+    if (typeof ctor === 'function') made = new ctor(String(warning));
+    else made = new Error(String(warning));
+    made.name = typeof type === 'string' && type !== '' ? type : 'Warning';
+    if (typeof code === 'string' && code !== '') made.code = code;
+  }
+  proc.nextTick(function () { proc.emit('warning', made); });
 };
 /*
  * The chain a host's process.stdout has: SyncWriteStream over Writable over Stream over
@@ -1001,48 +1015,9 @@ function makeStdioStream(fd, writeText) {
     });
     /* The Writable surface a package reaches for, on the prototype as a host has it rather than as
        own properties of the stream: write, end, cork, uncork, destroy and setDefaultEncoding. */
-    /*
-     * A write after end(): the false a host answers with, the error it hands the callback and emits,
-     * and no bytes on the way out. The first one is ERR_STREAM_WRITE_AFTER_END; the end closed the
-     * pipe the stream writes to, so every one after it is an EPIPE -- 'write EPIPE', errno -32,
-     * syscall 'write' -- and a host emits that second kind once however many writes follow it. The
-     * callback of each is handed its own error in the order the writes were made, measured against
-     * node 24.15 with its stdout a pipe.
-     */
-    var writesAfterEnd = 0;
-    var epipeEmitted = false;
-    function afterEndError() {
-        if (writesAfterEnd === 0) {
-            var bad = new Error('write after end');
-            bad.code = 'ERR_STREAM_WRITE_AFTER_END';
-            return bad;
-        }
-        var gone = new Error('write EPIPE');
-        gone.code = 'EPIPE';
-        gone.errno = -32;
-        gone.syscall = 'write';
-        return gone;
-    }
     proto.write = function (chunk, encoding, callback) {
-        var done = typeof encoding === 'function' ? encoding : callback;
-        if (this._writableState.ended) {
-            var err = afterEndError();
-            var first = writesAfterEnd === 0;
-            writesAfterEnd = writesAfterEnd + 1;
-            var self = this;
-            queueMicrotask(function () {
-                if (typeof done === 'function') done(err);
-                if (first) self.emit('error', err);
-                else if (!epipeEmitted) {
-                    epipeEmitted = true;
-                    /* The pipe write that a host answers with EPIPE is not the microtask the
-                       callback rode in on: it comes back later, after the writes already queued. */
-                    setTimeout(function () { self.emit('error', err); }, 0);
-                }
-            });
-            return false;
-        }
         writeChunk(chunk);
+        var done = typeof encoding === 'function' ? encoding : callback;
         if (typeof done === 'function') queueMicrotask(function () { done(); });
         return true;
     };

@@ -700,7 +700,7 @@ BF['path/win32'] = function () {
 BF.events = function () {
   function checkListener(listener) {
     if (typeof listener !== 'function') {
-      throw new TypeError('The "listener" argument must be of type function. Received ' + typeof listener);
+      throw invalidArgType('listener', 'function', listener);
     }
   }
 
@@ -780,14 +780,45 @@ BF.events = function () {
     if (existing === undefined) {
       events[type] = listener;
       target._eventsCount++;
-    } else if (typeof existing === 'function') {
-      events[type] = prepend ? [listener, existing] : [existing, listener];
-    } else if (prepend) {
-      existing.unshift(listener);
     } else {
-      existing.push(listener);
+      if (typeof existing === 'function') {
+        events[type] = existing = prepend ? [listener, existing] : [existing, listener];
+      } else if (prepend) {
+        existing.unshift(listener);
+      } else {
+        existing.push(listener);
+      }
+      /*
+       * The leak check a host makes the moment an event takes on more listeners than the emitter's
+       * maximum: one warning per event, because the flag that says it has been given sits on the
+       * listener array itself and a new array starts without one. A maximum of 0 is Node's "no
+       * limit", so an emitter set to 0 never warns however many listeners it collects.
+       */
+      var max = target._maxListeners === undefined ? EventEmitter.defaultMaxListeners : target._maxListeners;
+      if (max > 0 && existing.length > max && !existing.warned) {
+        existing.warned = true;
+        var leak = new Error('Possible EventEmitter memory leak detected. ' + existing.length + ' ' +
+          String(type) + ' listeners added to ' + bracketNameOf(target) + '. MaxListeners is ' + max +
+          '. Use emitter.setMaxListeners() to increase limit');
+        leak.name = 'MaxListenersExceededWarning';
+        leak.emitter = target;
+        leak.type = type;
+        leak.count = existing.length;
+        var proc = requireBuiltin('process');
+        if (proc !== undefined && proc !== null && typeof proc.emitWarning === 'function') {
+          proc.emitWarning(leak);
+        }
+      }
     }
     return target;
+  }
+
+  /* What inspect(emitter, { depth: -1 }) writes into the leak warning: the constructor's own name in
+     brackets, so an emitter is '[EventEmitter]' and a subclass answers the name it was given. */
+  function bracketNameOf(target) {
+    var ctor = target === undefined || target === null ? undefined : target.constructor;
+    if (ctor && typeof ctor.name === 'string' && ctor.name !== '') return '[' + ctor.name + ']';
+    return '[EventEmitter]';
   }
 
   function wrapOnce(target, type, listener) {
@@ -799,6 +830,12 @@ BF.events = function () {
       return listener.apply(target, arguments);
     };
     wrapped.listener = listener;
+    /*
+     * A host builds this wrapper by binding its onceWrapper to the wrapper's state, so the function
+     * rawListeners hands back is named 'bound onceWrapper'; this one is a closure, which QuickJS
+     * names 'wrapped', so the name a host answers is put on it.
+     */
+    Object.defineProperty(wrapped, 'name', { value: 'bound onceWrapper', writable: false, enumerable: false, configurable: true });
     return wrapped;
   }
 
@@ -897,7 +934,22 @@ BF.events = function () {
   EventEmitter.prototype.eventNames = function () {
     return this._events === undefined ? [] : Reflect.ownKeys(this._events);
   };
+  /* The range error a host raises for a number the caller is not allowed to set: the value named
+     with what it had to be, and the number that was given. */
+  function outOfRange(name, range, value) {
+    var err = new RangeError('The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + String(value));
+    err.code = 'ERR_OUT_OF_RANGE';
+    return err;
+  }
+  /*
+   * setMaxListeners validates before it stores: anything that is not a number is the host's
+   * ERR_INVALID_ARG_TYPE, and a negative number or NaN is ERR_OUT_OF_RANGE. Everything else is
+   * kept exactly as it was given -- 0, a fraction and Infinity all stand, and getMaxListeners then
+   * answers whatever was set, which is why a fractional maximum is not rounded on either side.
+   */
   EventEmitter.prototype.setMaxListeners = function (n) {
+    if (typeof n !== 'number') throw invalidArgType('setMaxListeners', 'number', n);
+    if (n < 0 || n !== n) throw outOfRange('setMaxListeners', '>= 0', n);
     this._maxListeners = n;
     return this;
   };
