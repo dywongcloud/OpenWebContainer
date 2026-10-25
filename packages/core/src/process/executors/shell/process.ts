@@ -926,9 +926,13 @@ export class ShellProcess extends Process {
             const step = steps[i];
             if (step.op === '&&' && exitCode !== 0) continue;
             if (step.op === '||' && exitCode === 0) continue;
-            const stage = await this.runStep(step.text, step.op === '|' ? piped : (i === 0 ? this.lineInput : null));
-            exitCode = stage.exitCode;
             const next = steps[i + 1];
+            /* An operator other than `;` behind this step makes it a command that is not the last
+               of its list, and a host runs no ERR trap for a command in that place -- see
+               `executeFragment`. */
+            const operand = next !== undefined && next.op !== null && next.op !== ';';
+            const stage = await this.runStep(step.text, step.op === '|' ? piped : (i === 0 ? this.lineInput : null), operand);
+            exitCode = stage.exitCode;
             if (next !== undefined && next.op === '|') {
                 piped = stage.stdout;
                 stderr += stage.stderr;
@@ -971,7 +975,7 @@ export class ShellProcess extends Process {
      * before it wrote on its stdin, and its own output is read back rather than written to the
      * terminal, so a pipe takes it. Every other step is the engine's.
      */
-    private async runStep(text: string, input: string | null): Promise<ShellCommandResult> {
+    private async runStep(text: string, input: string | null, operand = false): Promise<ShellCommandResult> {
         const words = splitCommandLine(text);
         if (words.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
         const [head, ...args] = words;
@@ -992,7 +996,7 @@ export class ShellProcess extends Process {
         }
         /* A step is a fragment of the line and not the shell's exit, so the EXIT trap is not run at
            the end of one: see `exitTrapPending` and `executeCommand`. */
-        return this.runEngineLine(text, input, true);
+        return this.runEngineLine(text, input, true, operand);
     }
 
     /**
@@ -1008,9 +1012,11 @@ export class ShellProcess extends Process {
      * the line ends -- `sh -c 'echo A; sleep 2'` gave its caller 'A\n' two seconds late, where a
      * host gives it at once.
      */
-    private async runEngineLine(text: string, input: string | null, fragment = false): Promise<ShellCommandResult> {
+    private async runEngineLine(text: string, input: string | null, fragment = false, operand = false): Promise<ShellCommandResult> {
         const ms = sleepMsOf(text);
-        if (ms === null) return fragment ? this.shell.executeFragment(text, input) : this.shell.executeLine(text, input);
+        if (ms === null) {
+            return fragment ? this.shell.executeFragment(text, input, operand) : this.shell.executeLine(text, input);
+        }
         const left = this.killDeadlineAt > 0 ? this.killDeadlineAt - Date.now() : ms;
         if (left > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(ms, left)));
         /* An `exec` that was given its whole wait replaced the shell with the command it named, the

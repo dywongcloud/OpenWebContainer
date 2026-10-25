@@ -582,8 +582,23 @@ export class Shell implements IShell {
      * `trap 'echo BYE' EXIT; echo A; echo B` is `A`, `B` and then one `BYE`, not one behind each
      * command. `runExitTrap` below runs that one at the end of the line.
      */
-    executeFragment(line: string, input?: string | null): ShellCommandResult {
-        return this.runLine(line, input, true);
+    /**
+     * `operand` says this step is not the last command of the list it stands in -- a stage of a
+     * pipeline with one behind it, or an operand of an `&&` or a `||` with one behind it -- which
+     * is a place a host runs no ERR trap in and does not end the shell in: `trap 'echo E' ERR;
+     * false | true; echo after`, and the same behind `&&`, are its `after` and nothing else, where
+     * `false; echo after` behind either operator is its `E` and then `after`. The depth is what
+     * carries that into the engine, which is the same exemption a whole line's own `&&` gets.
+     */
+    executeFragment(line: string, input?: string | null, operand = false): ShellCommandResult {
+        if (!operand) return this.runLine(line, input, true);
+        const state = this.shellState;
+        state.protectedDepth++;
+        try {
+            return this.runLine(line, input, true);
+        } finally {
+            state.protectedDepth--;
+        }
     }
 
     /**

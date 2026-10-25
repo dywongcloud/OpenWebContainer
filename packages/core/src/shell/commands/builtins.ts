@@ -4734,6 +4734,20 @@ function trapRunsForCommand(state: ShellState, name: string): boolean {
  * `A`. `set -T` and `set -E` are the two options that pass the one they name into a child, so with
  * either on the entry stays.
  */
+/**
+ * True when the ERR trap is run for the pipeline this node stands for, once its status is known.
+ *
+ * A construct is not a command a host fires the trap for: `( false )` and `{ false; }` are the
+ * status their own last command left and no failure of their own, and what a host fires for is the
+ * failing simple command *inside* them -- one `E` for the group, and none at all for the subshell,
+ * whose traps are the ones `inheritedTraps` took away from it. `(( 0 ))` and `[[ -z x ]]` are
+ * constructs of the same kind and a host fires nothing for either, where `let 0` -- a command --
+ * fires. A pipeline of commands fires once, on the status of its last stage.
+ */
+function errTrapRunsForNode(node: Node): boolean {
+    return node.commands.every((command) => command.t === 'simple');
+}
+
 function inheritedTraps(state: ShellState): Map<string, TrapSpec> {
     const copy = new Map([...state.traps].map(([name, spec]) => [name, { ...spec }]));
     if (state.options.functrace !== true) copy.delete('DEBUG');
@@ -5165,7 +5179,7 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null, 
                    function's body one of the line: a host does not pass the ERR trap into a function
                    unless `set -E` asks it to, so `trap 'echo E' ERR; f() { false; }; f; echo after`
                    is one `E` and then `after`. */
-                if (trapRunsForCommand(state, 'ERR')) runTrap(state, 'ERR');
+                if (errTrapRunsForNode(node) && trapRunsForCommand(state, 'ERR')) runTrap(state, 'ERR');
                 if (state.options.errexit) throw new ExitSignal(status);
             }
         } catch (error) {
@@ -5814,6 +5828,11 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                     traceWrite(state, `for ${command.name} in ${written.map((word) => traceWord(word)).join(' ')}`);
                 }
                 setVar(state, command.name, item);
+                /* The DEBUG trap a host runs for a `for` is one it runs again on every pass and
+                   not once for the loop: `trap 'echo D' DEBUG; for i in 1 2; do echo A; done` is
+                   its `D`, `D`, `A`, `D`, `D`, `A` -- one behind the loop and one behind the
+                   command of the body, twice over. `set -x` traces the same pass, the same way. */
+                if (trapRunsForCommand(state, 'DEBUG')) runTrap(state, 'DEBUG');
                 try {
                     status = runCommandList(state, command.body, null);
                 } catch (error) {
@@ -5900,6 +5919,12 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                takes: `set -x; case a in a) echo hit;; esac` is a host's `+ case a in` and then
                `+ echo hit`, and not the `+ echo hit` alone. */
             if (state.options.xtrace) traceWrite(state, `case ${traceWord(subject)} in`);
+            /* A `case` is a command a host runs the DEBUG trap in front of, once, before the
+               commands of the branch it takes: `trap 'echo D' DEBUG; case a in a) echo m;; esac`
+               is its `D`, `D` and then `m`. An `if`, a `while` and a `until` are not, which is
+               what keeps the two `D` of `if true; then echo t; fi` the condition's and the
+               body's and not the construct's. */
+            if (trapRunsForCommand(state, 'DEBUG')) runTrap(state, 'DEBUG');
             for (const item of command.items) {
                 let matched = false;
                 for (const pattern of item.patterns) {
@@ -6956,6 +6981,11 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     const shellInput = commandInput === null ? stdin : null;
 
     if (words.length === 0) {
+        /* An assignment with no command behind it is a command of its own to a host, and one it
+           runs the DEBUG trap in front of like any other: `trap 'echo D' DEBUG; v=1; echo after`
+           is its `D`, `D` and then `after`, and not the one `D` an assignment that never reached
+           the call below left. */
+        if (trapRunsForCommand(state, 'DEBUG')) runTrap(state, 'DEBUG');
         /* An assignment with no command behind it is the substitution it carries: `x=$(false)` is 1
            and `x=$(exit 5)` is 5, the status the subshell ended with, and it is what makes `set -e`
            end the line -- a substitution whose own `set -e` stopped it early leaves that status too. */
@@ -6999,6 +7029,14 @@ function runSimple(state: ShellState, command: Extract<Command, { t: 'simple' }>
     if (name === 'kill' && args.some((arg) => arg.startsWith('%') || isPendingJobPid(state, arg))) {
         const killed = killJobSpecs(state, args);
         return finish(state, plan, killed.stdout, killed.stderr, killed.exitCode);
+    }
+
+    /* `exit`, `break`, `continue` and `return` are commands to a host, and it runs the DEBUG trap
+       in front of each of them before it does what the word asks: `trap 'echo D' DEBUG; for i in
+       1; do echo A; break; done` is its `D`, `D`, `A` and then one more `D` behind the `break`.
+       All four leave this function before the call below, which is why the trap is run here. */
+    if (name === 'exit' || name === 'break' || name === 'continue' || name === 'return') {
+        if (trapRunsForCommand(state, 'DEBUG')) runTrap(state, 'DEBUG');
     }
 
     // control flow: these are parsed as commands but never reach the runner
@@ -7513,8 +7551,10 @@ const SHORT_OPTIONS: Record<string, keyof ShellOptions> = {
     x: 'xtrace',
     B: 'braceexpand',
     C: 'noclobber',
+    E: 'errtrace',
     H: 'histexpand',
-    P: 'physical'
+    P: 'physical',
+    T: 'functrace'
 };
 
 function setBuiltin(ctx: CommandContext): CommandResult {
