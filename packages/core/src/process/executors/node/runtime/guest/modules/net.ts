@@ -1043,6 +1043,19 @@ BF['net'] = function () {
       this.connecting = false;
       netRefresh(this);
       this._armIdle();
+      /* The listener that accepted this dial announces the connection before the client hears of it,
+         as host node does -- while the client is being read. It is the resume a 'data' listener (or
+         resume() itself) asks for that puts the listener's 'connection' on the turn ahead of this
+         side's, so a socket nobody reads keeps the order the hub hands both announcements over in. */
+      if (this._flowing === true || this.listenerCount('data') > 0) {
+        var announced = this;
+        setTimeout(function () {
+          if (announced._dead) return;
+          announced.emit('connect');
+          announced.emit('ready');
+        }, 0);
+        return;
+      }
       this.emit('connect');
       this.emit('ready');
     }

@@ -24,11 +24,29 @@ var NO_BODY_METHODS = { GET: true, HEAD: true, DELETE: true, OPTIONS: true, TRAC
 var MAX_HEAD_BYTES = 16384;
 var DUPLICATE_DISCARDED = { age: true, authorization: true, 'content-length': true, 'content-type': true, etag: true, expires: true, from: true, host: true, 'if-modified-since': true, 'if-unmodified-since': true, 'last-modified': true, location: true, 'max-forwards': true, 'proxy-authorization': true, referer: true, 'retry-after': true, server: true, 'user-agent': true };
 var HTTP_CORE = null;
+/* Node's own test for the expectation a request may carry: '100-continue' as a whole token */
+var CONTINUE_EXPRESSION = /(?:^|\W)100-continue(?:$|\W)/i;
+
+/* True while a head's 'host' line stands inside the first limit header lines, which is what keeps a
+   head wider than maxHeadersCount servable: the header that has gone missing is the one an HTTP/1.1
+   request cannot do without, so a Host still within the limit means none has been dropped. */
+function hostWithinLimit(pairs, limit) {
+  for (var i = 0; i < pairs.length && i / 2 < limit; i += 2) {
+    if (pairs[i].toLowerCase() === 'host') return true;
+  }
+  return false;
+}
 
 function httpError(Ctor, code, message) {
   var err = new Ctor(message);
   err.code = code;
   return err;
+}
+
+/* The error a connection that went away gives a response that never read to its end: Node's
+   ConnResetException, an ECONNRESET whose message names the abort rather than the socket. */
+function connResetError() {
+  return httpError(Error, 'ECONNRESET', 'aborted');
 }
 
 function hasOwn(object, key) {
@@ -196,6 +214,7 @@ function MessageParser(isRequest, method, sink) {
   this.mode = 'none';
   this.remaining = 0;
   this.chunkState = 'size';
+  this.trailerPairs = [];
   this.done = false;
 }
 
@@ -214,6 +233,7 @@ MessageParser.prototype.finish = function () {
 MessageParser.prototype.complete = function () {
   if (this.done) return;
   this.done = true;
+  if (this.trailerPairs.length > 0 && this.sink.onTrailers) this.sink.onTrailers(this.trailerPairs);
   this.sink.onEnd();
 };
 
@@ -240,7 +260,12 @@ MessageParser.prototype.pump = function () {
         this.fail(httpError(Error, 'HPE_INVALID_CONSTANT', 'Parse Error: Expected HTTP/'));
         return;
       }
-      if (!this.isRequest && head.status >= 100 && head.status < 200 && head.status !== 101) continue;
+      if (!this.isRequest && head.status >= 100 && head.status < 200 && head.status !== 101) {
+        /* A provisional answer is not the response: it is announced on the request, a 100 as
+           'continue' as well, and the message goes on waiting for the real one. */
+        if (this.sink.onInformation) this.sink.onInformation(head);
+        continue;
+      }
       this.state = 'body';
       this.sink.onHead(head);
       var noBody = !this.isRequest && (this.method === 'HEAD' || head.status === 101 || head.status === 204 || head.status === 304);
@@ -323,7 +348,16 @@ MessageParser.prototype.chunkStep = function (buf) {
   if (trailerEnd < 0) return false;
   var trailer = buf.toString('latin1', 0, trailerEnd);
   this.buf = buf.length > trailerEnd + 2 ? buf.subarray(trailerEnd + 2) : null;
-  if (trailer === '') this.complete();
+  if (trailer === '') {
+    this.complete();
+    return true;
+  }
+  /* One trailer line, kept as a name and a value: the receiver reports them lower-cased in
+     trailers and exactly as they arrived in rawTrailers. */
+  var trailerColon = trailer.indexOf(':');
+  if (trailerColon > 0) {
+    this.trailerPairs.push(trailer.slice(0, trailerColon).trim(), trailer.slice(trailerColon + 1).trim());
+  }
   return true;
 };
 
@@ -435,6 +469,50 @@ BF['http'] = function () {
     return lines;
   };
 
+  /* Trailers are a second header block, written after the last chunk: an array of [name, value]
+     pairs or an object of them, as host Node takes either. They go out on a chunked message only --
+     a message with a Content-Length has no place to put them, so Node drops them there -- and only
+     while the message is still open, so a call after end() is simply never written. Node adds no
+     'Trailer' header of its own for them: the block arrives whether or not the head announced it. */
+  OutgoingMessage.prototype.addTrailers = function addTrailers(headers) {
+    if (headers === null || typeof headers !== 'object') {
+      throw httpError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "headers" argument must be of type object. Received ' + String(headers));
+    }
+    var pairs = [];
+    if (Array.isArray(headers)) {
+      for (var i = 0; i < headers.length; i++) {
+        var item = headers[i];
+        if (!Array.isArray(item) || item.length < 2) {
+          throw httpError(TypeError, 'ERR_INVALID_ARG_TYPE', 'Expected an array of [name, value] pairs');
+        }
+        validateHeaderName(item[0]);
+        pairs.push(String(item[0]), String(item[1]));
+      }
+    } else {
+      var names = Object.keys(headers);
+      for (var k = 0; k < names.length; k++) {
+        validateHeaderName(names[k]);
+        var value = headers[names[k]];
+        var many = Array.isArray(value) ? value : [value];
+        for (var v = 0; v < many.length; v++) pairs.push(String(names[k]), String(many[v]));
+      }
+    }
+    this._trailers = hasOwn(this, '_trailers') ? this._trailers.concat(pairs) : pairs;
+  };
+
+  /* The trailer block as wire lines: '0\r\n', one 'name: value' line each, then the empty line that
+     ends the block -- which is the '0\r\n\r\n' a chunked message without trailers ends on. */
+  OutgoingMessage.prototype._trailerBlock = function _trailerBlock() {
+    if (!this._chunked) return null;
+    var block = '0\r\n';
+    var pairs = hasOwn(this, '_trailers') ? this._trailers : null;
+    if (pairs) {
+      for (var i = 0; i < pairs.length; i += 2) block += pairs[i] + ': ' + pairs[i + 1] + '\r\n';
+    }
+    return Buffer.from(block + '\r\n', 'latin1');
+  };
+
   function ServerResponse(req) {
     OutgoingMessage.call(this, {});
     this.req = req || null;
@@ -525,7 +603,7 @@ BF['http'] = function () {
   };
   ServerResponse.prototype._final = function _final(callback) {
     var head = this._takeHead();
-    var tail = this._chunked ? Buffer.from('0\r\n\r\n', 'latin1') : null;
+    var tail = this._trailerBlock();
     if (head !== null) this.socket.write(tail === null ? head : Buffer.concat([head, tail]));
     else if (tail !== null) this.socket.write(tail);
     callback();
@@ -556,7 +634,7 @@ BF['http'] = function () {
     if (this.socket) this.socket.setTimeout(ms);
     return this;
   };
-  ServerResponse.prototype.addTrailers = function addTrailers() {};
+  /* addTrailers is OutgoingMessage's: a response's trailers are written by _final, above. */
   ServerResponse.prototype.assignSocket = function assignSocket(socket) {
     if (socket._httpMessage) throw httpError(Error, 'ERR_HTTP_SOCKET_ASSIGNED', 'Socket already assigned');
     socket._httpMessage = this;
@@ -679,7 +757,9 @@ BF['http'] = function () {
       this._released = false;
       this._parser = new MessageParser(false, this.method, {
         onHead: function (head) { req._onHead(head); },
+        onInformation: function (head) { req._onInformation(head); },
         onBody: function (chunk) { if (req._res) req._res.push(chunk); },
+        onTrailers: function (pairs) { if (req._res) req._onTrailers(pairs); },
         onEnd: function () { req._onEnd(); },
         onError: function (err) { req._fail(err); }
       });
@@ -735,6 +815,25 @@ BF['http'] = function () {
       this._res = res;
       this.emit('response', res);
     }
+    /* A provisional (1xx) answer: announced as 'information', and a 100 as 'continue' before it,
+       with the same shape host Node gives it -- status, message, version and the head's own headers. */
+    _onInformation(head) {
+      if (head.status === 100) this.emit('continue');
+      this.emit('information', {
+        statusCode: head.status,
+        statusMessage: head.statusText,
+        httpVersion: '1.1',
+        httpVersionMajor: 1,
+        httpVersionMinor: 1,
+        headers: headersFromPairs(head.pairs),
+        rawHeaders: head.pairs.slice()
+      });
+    }
+    /* The trailer block of a chunked response, once its last chunk has been read */
+    _onTrailers(pairs) {
+      this._res.rawTrailers = pairs.slice();
+      this._res.trailers = headersFromPairs(pairs);
+    }
     /* 'close' is delivered once: the stream's own emission on destroy must not repeat ours */
     emit(type) {
       if (type === 'close') {
@@ -783,15 +882,22 @@ BF['http'] = function () {
     _fail(err) {
       if (this._done || this._failed) return;
       this._failed = true;
+      /* A response cut short is aborted and then fails: 'aborted' first, then the ECONNRESET that
+         ends a reader still waiting on it, as host Node ends one. */
       if (this._res) {
-        this._res.aborted = true;
-        this._res.emit('aborted');
-        this._res.destroy();
+        this._abortResponse();
       } else {
         this.emit('error', err);
       }
       this._destroySocket();
       this._emitClose();
+    }
+    _abortResponse() {
+      var res = this._res;
+      if (!res || res.aborted) return;
+      res.aborted = true;
+      res.emit('aborted');
+      res.destroy(connResetError());
     }
     _onSocketClose() {
       if (!this._done && !this._failed) this._fail(httpError(Error, 'ECONNRESET', 'socket hang up'));
@@ -812,6 +918,7 @@ BF['http'] = function () {
       var failure = error || (hangUp ? httpError(Error, 'ECONNRESET', 'socket hang up') : null);
       this._failed = true;
       this._closeEmitted = true;
+      this._abortResponse();
       this._destroySocket();
       callback(failure);
     }
@@ -824,9 +931,12 @@ BF['http'] = function () {
       dcPublish('http.client.request.start', { request: this });
       var hdr = this._hdr;
       var bodyAllowed = !NO_BODY_METHODS[this.method];
-      var lines = [this.method + ' ' + this.path + ' HTTP/1.1'];
+      /* Host Node writes the caller's own headers first and adds Host after them: the head it puts on
+         the wire is 'Connection' last, 'Host' before it, and every header the caller set ahead of
+         both. The Connection line is written here rather than through setHeader, so it comes last
+         whichever order the others were set in. */
+      var lines = [this.method + ' ' + this.path + ' HTTP/1.1'].concat(this._headerLines());
       if (this._target.setHost !== false && !hasOwn(hdr, 'host')) lines.push('Host: ' + this._hostHeader);
-      lines = lines.concat(this._headerLines());
       if (hasOwn(hdr, 'connection')) lines.push('Connection: ' + String(hdr.connection.value));
       else lines.push(this._agentKeepsAlive() ? 'Connection: keep-alive' : 'Connection: close');
       var hasLength = hasOwn(hdr, 'content-length');
@@ -1297,10 +1407,32 @@ BF['http'] = function () {
         dcPublish('http.server.response.finish', { request: req, response: res, server: server, socket: socket });
         onResponseDone(res);
       });
+      /* An 'Expect: 100-continue' request is the server's to answer: with a 'checkContinue'
+         listener the request is handed to it and nothing is sent until it calls writeContinue(),
+         while with none the expectation is granted at once and the request goes on as usual. The
+         expectation only counts on an HTTP/1.1 request, as it does in Node. */
       var expectation = pairValue(head.pairs, 'expect');
-      if (expectation !== undefined && expectation.toLowerCase() === '100-continue') {
-        socket.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1'));
+      var wantsContinue = expectation !== undefined && CONTINUE_EXPRESSION.test(expectation)
+        && req.httpVersionMajor === 1 && req.httpVersionMinor === 1;
+      if (wantsContinue && server.listenerCount('checkContinue') > 0) {
+        /* http.server.request.start: the request is about to reach the server's listener. */
+        dcPublish('http.server.request.start', { request: req, response: res, server: server, socket: socket });
+        server.emit('checkContinue', req, res);
+        return;
       }
+      /* A head wider than server.maxHeadersCount is refused the way host Node refuses it: a plain
+         400 over a connection that closes, with no request handed out and no 'clientError'. The
+         limit is one host Node reads as a pair count, and what makes a wide head a refusal is the
+         header it then fails to read -- the Host an HTTP/1.1 request must carry -- so a head whose
+         Host is still inside the limit is served whole, however many headers follow it. */
+      if (typeof server.maxHeadersCount === 'number' && head.pairs.length / 2 > server.maxHeadersCount
+        && !hostWithinLimit(head.pairs, server.maxHeadersCount)) {
+        res.setHeader('Connection', 'close');
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+      if (wantsContinue) socket.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1'));
       /* http.server.request.start: the request is about to reach the server's 'request' listener. */
       dcPublish('http.server.request.start', { request: req, response: res, server: server, socket: socket });
       server.emit('request', req, res);
@@ -1389,6 +1521,9 @@ BF['http'] = function () {
 
     function onTimeout() {
       if (state.res) state.res.emit('timeout');
+      /* Node's own order: the response it is writing hears of it first, then the server, which is
+         left to close the socket -- and does it itself when nobody listens. */
+      if (!server.emit('timeout', socket)) socket.destroy();
     }
 
     /* A keep-alive socket with no request for keepAliveTimeout ms is closed; the timer does not keep the process alive */
@@ -1409,6 +1544,10 @@ BF['http'] = function () {
         state.idleTimer = null;
       }
     }
+
+    /* The server's own inactivity timeout, armed on the socket as Node arms it: every byte the
+       socket reads re-arms it, so only a connection that goes quiet reaches 'timeout'. */
+    if (server.timeout > 0) socket.setTimeout(server.timeout);
 
     socket.on('data', onData);
     socket.on('end', onEnd);
@@ -1437,6 +1576,9 @@ BF['http'] = function () {
       this._net = this._createNetServer(options);
       var server = this;
       this._net.on('connection', function (socket) {
+        /* An http.Server is the net.Server in Node, so the server an accepted socket names is the
+           http one -- the listener a 'timeout' handler is handed carries it. */
+        socket.server = server;
         server.emit('connection', socket);
         if (!server._secure) serveSocket(server, socket);
       });
@@ -1496,7 +1638,16 @@ BF['http'] = function () {
     setTimeout(ms, callback) {
       if (typeof callback === 'function') this.on('timeout', callback);
       this.timeout = Number(ms) || 0;
+      this._armConnectionTimeouts();
       return this;
+    }
+    /* A timeout set after a connection was accepted reaches it too, as Node's reaches the sockets
+       its server is already holding. */
+    _armConnectionTimeouts() {
+      var states = Array.from(this._connStates);
+      for (var i = 0; i < states.length; i++) {
+        if (!states[i].dead) states[i].socket.setTimeout(this.timeout);
+      }
     }
     ref() {
       this._net.ref();
@@ -1522,6 +1673,14 @@ BF['http'] = function () {
       this.emit('close');
     }
   }
+
+  /* server.timeout is the inactivity timeout of every connection this server accepts: carried as a
+     property, as Node carries it, and read by a connection at the moment it is accepted. */
+  Object.defineProperty(Server.prototype, 'timeout', {
+    get: function () { return this._timeout || 0; },
+    set: function (ms) { this._timeout = Number(ms) || 0; },
+    configurable: true
+  });
 
   function createServer(options, listener) {
     return new Server(options, listener);
