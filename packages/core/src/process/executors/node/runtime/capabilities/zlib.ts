@@ -105,12 +105,201 @@ function concatBytes(parts: Bytes[]): Bytes {
     return out;
 }
 
+/*
+ * fflate never compares the two length words of a stored block, and zlib always does: LEN and its
+ * complement NLEN, read straight after the block header. Where fflate takes a zero pair as an empty
+ * stored block and carries on into whatever follows, zlib stops there -- so a frame corrupted in its
+ * deflate body is reported as 'invalid stored block lengths' on the host and as something else here,
+ * different again depending on how far fflate got before it gave up.
+ *
+ * This walks the block structure the way zlib does -- bit by bit, blocks in order, Huffman blocks
+ * decoded far enough to find where each ends -- and answers whether a stored block whose two length
+ * words disagree is the first thing zlib would reject. It raises nothing else: an invalid block
+ * type, a bad Huffman code, a distance reaching back past the start of the output or an end of
+ * input is left to fflate, which already agrees with Node on all of them. It runs only once fflate
+ * has failed, so a stream that inflates costs nothing.
+ */
+const WALK_STOP = new Error('deflate walk abandoned');
+
+const LENGTH_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LENGTH_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DISTANCE_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DISTANCE_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const CODE_LENGTH_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+/** Bits of a deflate stream, least significant bit of each byte first, as zlib reads them. */
+class BitStream {
+    private readonly data: Bytes;
+    private at = 0;
+    private bit = 0;
+    /** Bytes of output the blocks so far have produced: how far back a distance may reach. */
+    written = 0;
+
+    constructor(data: Bytes) {
+        this.data = data;
+    }
+
+    bits(count: number): number {
+        let value = 0;
+        for (let i = 0; i < count; i++) {
+            if (this.at >= this.data.length) throw WALK_STOP;
+            value |= ((this.data[this.at] >> this.bit) & 1) << i;
+            if (++this.bit === 8) {
+                this.bit = 0;
+                this.at++;
+            }
+        }
+        return value;
+    }
+
+    /** Discards the rest of the current byte: a stored block starts on a byte boundary. */
+    align(): void {
+        if (this.bit !== 0) {
+            this.bit = 0;
+            this.at++;
+        }
+    }
+
+    skip(count: number): void {
+        this.align();
+        this.at += count;
+        if (this.at > this.data.length) throw WALK_STOP;
+    }
+}
+
+/** A canonical Huffman table: one symbol per code, ordered by code length as zlib builds it. */
+interface HuffmanTable {
+    counts: Int32Array;
+    symbols: Int32Array;
+}
+
+function huffmanTable(lengths: number[]): HuffmanTable {
+    const counts = new Int32Array(16);
+    for (const length of lengths) if (length > 0) counts[length]++;
+    let left = 1;
+    for (let len = 1; len <= 15; len++) {
+        left = (left << 1) - counts[len];
+        if (left < 0) throw WALK_STOP;
+    }
+    const offsets = new Int32Array(16);
+    for (let len = 1; len < 15; len++) offsets[len + 1] = offsets[len] + counts[len];
+    const symbols = new Int32Array(lengths.length);
+    for (let sym = 0; sym < lengths.length; sym++) if (lengths[sym] > 0) symbols[offsets[lengths[sym]]++] = sym;
+    return { counts, symbols };
+}
+
+function decodeSymbol(stream: BitStream, table: HuffmanTable): number {
+    let code = 0;
+    let first = 0;
+    let index = 0;
+    for (let len = 1; len <= 15; len++) {
+        code |= stream.bits(1);
+        const count = table.counts[len];
+        if (code - first < count) return table.symbols[index + (code - first)];
+        index += count;
+        first = (first + count) << 1;
+        code <<= 1;
+    }
+    throw WALK_STOP;
+}
+
+const FIXED_LITERALS = huffmanTable(
+    (() => {
+        const lengths = new Array(288).fill(8);
+        for (let sym = 0; sym < 144; sym++) lengths[sym] = 8;
+        for (let sym = 144; sym < 256; sym++) lengths[sym] = 9;
+        for (let sym = 256; sym < 280; sym++) lengths[sym] = 7;
+        for (let sym = 280; sym < 288; sym++) lengths[sym] = 8;
+        return lengths;
+    })()
+);
+const FIXED_DISTANCES = huffmanTable(new Array(30).fill(5));
+
+function dynamicTables(stream: BitStream): HuffmanTable[] {
+    const literals = stream.bits(5) + 257;
+    const distances = stream.bits(5) + 1;
+    const codeLengths = stream.bits(4) + 4;
+    const lengths = new Array(19).fill(0);
+    for (let i = 0; i < codeLengths; i++) lengths[CODE_LENGTH_ORDER[i]] = stream.bits(3);
+    const table = huffmanTable(lengths);
+    const all = new Array(literals + distances).fill(0);
+    let at = 0;
+    while (at < all.length) {
+        const sym = decodeSymbol(stream, table);
+        if (sym < 16) {
+            all[at++] = sym;
+        } else if (sym === 16) {
+            if (at === 0) throw WALK_STOP;
+            const repeat = 3 + stream.bits(2);
+            const value = all[at - 1];
+            for (let i = 0; i < repeat; i++) all[at++] = value;
+        } else if (sym === 17) {
+            for (let i = 0; i < 3 + stream.bits(3); i++) all[at++] = 0;
+        } else {
+            for (let i = 0; i < 11 + stream.bits(7); i++) all[at++] = 0;
+        }
+    }
+    if (at > all.length) throw WALK_STOP;
+    return [huffmanTable(all.slice(0, literals)), huffmanTable(all.slice(literals))];
+}
+
+/** Walks one Huffman-coded block to its end-of-block symbol, counting the output it stands for. */
+function walkBlock(stream: BitStream, literals: HuffmanTable, distances: HuffmanTable): void {
+    for (;;) {
+        const sym = decodeSymbol(stream, literals);
+        if (sym < 256) {
+            stream.written++;
+            continue;
+        }
+        if (sym === 256) return;
+        const index = sym - 257;
+        if (index >= LENGTH_BASE.length) throw WALK_STOP;
+        const length = LENGTH_BASE[index] + stream.bits(LENGTH_EXTRA[index]);
+        const distanceIndex = decodeSymbol(stream, distances);
+        if (distanceIndex >= DISTANCE_BASE.length) throw WALK_STOP;
+        const distance = DISTANCE_BASE[distanceIndex] + stream.bits(DISTANCE_EXTRA[distanceIndex]);
+        /* A match reaching back further than anything written is zlib's own error, and fflate's. */
+        if (distance > stream.written) throw WALK_STOP;
+        stream.written += length;
+    }
+}
+
+function storedBlockLengthMismatch(bytes: Bytes): boolean {
+    const stream = new BitStream(bytes);
+    try {
+        for (;;) {
+            const last = stream.bits(1);
+            const type = stream.bits(2);
+            if (type === 0) {
+                stream.align();
+                const length = stream.bits(16);
+                const complement = stream.bits(16);
+                if (length !== (~complement & 0xffff)) return true;
+                stream.written += length;
+                stream.skip(length);
+            } else if (type === 1) {
+                walkBlock(stream, FIXED_LITERALS, FIXED_DISTANCES);
+            } else if (type === 2) {
+                const tables = dynamicTables(stream);
+                walkBlock(stream, tables[0], tables[1]);
+            } else {
+                return false;
+            }
+            if (last !== 0) return false;
+        }
+    } catch (error) {
+        if (error === WALK_STOP) return false;
+        throw error;
+    }
+}
+
 /** Raw DEFLATE inflate. Empty input is an unexpected end, as zlib reports it. */
 function inflateRaw(bytes: Bytes, dictionary?: Bytes): Bytes {
     if (bytes.length === 0) throw eofError();
     try {
         return inflateSync(bytes, dictionary ? { dictionary } : undefined);
     } catch (error) {
+        if (storedBlockLengthMismatch(bytes)) throw dataError('invalid stored block lengths');
         throw mapFlateError(error);
     }
 }
@@ -265,7 +454,7 @@ function inflateBytes(format: string, data: Bytes, dictionary?: Bytes, params?: 
         case 'brotli':
             return brotliDecompress(data, params);
         case 'zstd':
-            return zstdDecompress(data, params);
+            return zstdDecompress(data, params, dictionary);
         default:
             throw new Error(`unknown zlib format: ${format}`);
     }
@@ -295,7 +484,7 @@ function deflateBytes(
         case 'brotli':
             return brotliCompress(data, params);
         case 'zstd':
-            return zstdCompress(data, params, chunkSize, streamed);
+            return zstdCompress(data, params, chunkSize, streamed, dictionary);
         default:
             throw new Error(`unknown zlib format: ${format}`);
     }
@@ -353,7 +542,7 @@ export const ZLIB_CAPABILITIES: Record<string, CapabilityHandler> = {
         if (format !== 'brotli' && format !== 'zstd') throw new Error(`unknown zlib stream format: ${format}`);
         const params = format === 'zstd' ? zstdParams(args.params, true) : paramPairs(args.params);
         const chunk = typeof args.chunkSize === 'number' && args.chunkSize > 0 ? Math.trunc(args.chunkSize) : 0;
-        return codecStreamOpen(format, params, chunk);
+        return codecStreamOpen(format, params, chunk, argDictionary(args.dictionary));
     },
     'zlib.streamWrite': (args) => bytesToBase64(codecStreamWrite(Number(args.id), argBytes(args.data), Number(args.op))),
     'zlib.streamClose': (args) => {

@@ -143,17 +143,31 @@ interface CallResult {
     detail: number;
 }
 
-/** One codec call: input and parameters into the module's memory, result block out, everything freed. */
+/**
+ * One codec call: input and parameters into the module's memory, result block out, everything freed.
+ *
+ * `takesDictionary` says whether the entry point carries the dictionary pair at all: zstd's do, and
+ * must be handed both words even when there is no dictionary, while brotli's take no such argument,
+ * so its call shape -- and so its module -- stays exactly as it was.
+ */
 function callCodec(
     exports: WasmExports,
     name: string,
     data: Uint8Array,
     params: CodecParams | undefined,
-    extra: number[] = []
+    extra: number[] = [],
+    dictionary?: Uint8Array,
+    takesDictionary = false
 ): CallResult {
     const count = params ? params.length : 0;
     const input = exports.malloc(data.length || 1);
     new Uint8Array(exports.memory.buffer).set(data, input);
+    let dictionaryAt = 0;
+    const dictionaryLength = dictionary && dictionary.length > 0 ? dictionary.length : 0;
+    if (dictionaryLength > 0) {
+        dictionaryAt = exports.malloc(dictionaryLength);
+        new Uint8Array(exports.memory.buffer).set(dictionary!, dictionaryAt);
+    }
     let parameters = 0;
     if (count > 0) {
         parameters = exports.malloc(count * 8);
@@ -164,11 +178,15 @@ function callCodec(
         }
     }
     const result = exports.malloc(12);
+    const head = takesDictionary
+        ? [input, data.length, dictionaryAt, dictionaryLength, parameters, count]
+        : [input, data.length, parameters, count];
     let code = 0;
     try {
-        code = (exports[name] as (...args: number[]) => number)(input, data.length, parameters, count, ...extra, result);
+        code = (exports[name] as (...args: number[]) => number)(...head, ...extra, result);
     } finally {
         exports.owc_free(input);
+        if (dictionaryAt !== 0) exports.owc_free(dictionaryAt);
         if (parameters !== 0) exports.owc_free(parameters);
     }
     /* A fresh view either side of the call: the module may have grown its memory while it ran. */
@@ -220,7 +238,9 @@ export function brotliDecompress(data: Uint8Array, params?: CodecParams): Uint8A
 }
 
 /**
- * Compresses with Zstandard. `params` holds ZSTD_c_* pairs.
+ * Compresses with Zstandard. `params` holds ZSTD_c_* pairs; `dictionary` is loaded into the context
+ * before any input, as Node's `dictionary` option is, so a frame compressed with one does not decode
+ * without it.
  *
  * Both `chunkSize` and `streamed` are visible in the bytes. `chunkSize` is the output buffer Node
  * hands zstd (its Z_DEFAULT_CHUNK, 16 KiB) and so decides where block boundaries fall. `streamed`
@@ -228,15 +248,21 @@ export function brotliDecompress(data: Uint8Array, params?: CodecParams): Uint8A
  * empty ZSTD_e_end, while the synchronous calls hand the whole input over with ZSTD_e_end, which is
  * what lets zstd write the content size into the frame header.
  */
-export function zstdCompress(data: Uint8Array, params?: CodecParams, chunkSize = 0, streamed = false): Uint8Array {
-    const result = callCodec(zstdModule(), 'owc_zstd_compress', data, params, [chunkSize, streamed ? 1 : 0]);
+export function zstdCompress(
+    data: Uint8Array,
+    params?: CodecParams,
+    chunkSize = 0,
+    streamed = false,
+    dictionary?: Uint8Array
+): Uint8Array {
+    const result = callCodec(zstdModule(), 'owc_zstd_compress', data, params, [chunkSize, streamed ? 1 : 0], dictionary, true);
     if (result.code === RES_OK) return result.out;
     throw zstdFailure(result.code, result.detail);
 }
 
-/** Decompresses a Zstandard frame. `params` holds ZSTD_d_* pairs. */
-export function zstdDecompress(data: Uint8Array, params?: CodecParams): Uint8Array {
-    const result = callCodec(zstdModule(), 'owc_zstd_decompress', data, params);
+/** Decompresses a Zstandard frame. `params` holds ZSTD_d_* pairs; `dictionary` is the one the frame was built with. */
+export function zstdDecompress(data: Uint8Array, params?: CodecParams, dictionary?: Uint8Array): Uint8Array {
+    const result = callCodec(zstdModule(), 'owc_zstd_decompress', data, params, [], dictionary, true);
     if (result.code === RES_OK) return result.out;
     throw zstdFailure(result.code, result.detail);
 }
@@ -376,8 +402,19 @@ const STREAM_FREE: Record<StreamKind, string> = {
 };
 
 /** Opens a stream and returns the id the guest drives it with. `params` are set before any input. */
-export function codecStreamOpen(kind: 'brotli' | 'zstd', params?: CodecParams, chunkSize = 0): number {
+export function codecStreamOpen(
+    kind: 'brotli' | 'zstd',
+    params?: CodecParams,
+    chunkSize = 0,
+    dictionary?: Uint8Array
+): number {
     const exports = moduleFor(kind);
+    const dictLength = kind === 'zstd' && dictionary && dictionary.length > 0 ? dictionary.length : 0;
+    let dict = 0;
+    if (dictLength > 0) {
+        dict = exports.malloc(dictLength);
+        new Uint8Array(exports.memory.buffer).set(dictionary!, dict);
+    }
     const count = params ? params.length : 0;
     let parameters = 0;
     if (count > 0) {
@@ -394,13 +431,16 @@ export function codecStreamOpen(kind: 'brotli' | 'zstd', params?: CodecParams, c
         handle =
             kind === 'brotli'
                 ? (exports.owc_brotli_stream_new as (p: number, n: number, c: number) => number)(parameters, count, chunkSize)
-                : (exports.owc_zstd_stream_new as (p: number, n: number, c: number, r: number) => number)(
+                : (exports.owc_zstd_stream_new as (d: number, dl: number, p: number, n: number, c: number, r: number) => number)(
+                      dict,
+                      dictLength,
                       parameters,
                       count,
                       chunkSize,
                       result
                   );
     } finally {
+        if (dict !== 0) exports.owc_free(dict);
         if (parameters !== 0) exports.owc_free(parameters);
     }
     if (handle === 0) {

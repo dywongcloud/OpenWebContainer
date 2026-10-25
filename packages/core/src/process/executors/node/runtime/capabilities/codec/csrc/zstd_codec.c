@@ -6,6 +6,12 @@
  * result layout (u32 words): [0] = output pointer, [1] = output length, [2] = detail
  * params: optional array of (key, value) u32 pairs applied with ZSTD_CCtx_setParameter /
  * ZSTD_DCtx_setParameter. The level, when given, is applied first as ZSTD_c_compressionLevel.
+ * dict / dict_len: an optional dictionary, loaded with ZSTD_CCtx_loadDictionary /
+ * ZSTD_DCtx_loadDictionary, which is what Node 24.15 does with zlib's `dictionary` option. A
+ * dictionary is part of the frame: bytes compressed with one do not decode without it, and decode
+ * to something else again under a different one. A raw dictionary carries no dictID, so zstd writes
+ * no Dictionary_ID field and a wrong dictionary is not caught -- it decodes to other bytes, as in
+ * Node. A zero-length or absent dictionary is no dictionary at all.
  * return: 0 ok, 1 compress error, 2 decode error, 3 out of memory, 5 unknown parameter,
  *         6 setting the parameter failed
  */
@@ -28,7 +34,8 @@ size_t owc_zstd_compress_bound(size_t in_len) {
     return ZSTD_compressBound(in_len);
 }
 
-int owc_zstd_compress(const uint8_t *in, size_t in_len, const uint32_t *params, size_t param_count,
+int owc_zstd_compress(const uint8_t *in, size_t in_len, const uint8_t *dict, size_t dict_len,
+                      const uint32_t *params, size_t param_count,
                       size_t chunk_size, size_t mode, uint32_t *result) {
     ZSTD_CCtx *ctx;
     size_t cap = ZSTD_compressBound(in_len);
@@ -46,6 +53,15 @@ int owc_zstd_compress(const uint8_t *in, size_t in_len, const uint32_t *params, 
     if (!ctx) {
         free(out);
         return RES_NOMEM;
+    }
+    if (dict != NULL && dict_len > 0) {
+        size_t rc = ZSTD_CCtx_loadDictionary(ctx, dict, dict_len);
+        if (ZSTD_isError(rc)) {
+            result[2] = (uint32_t)rc;
+            ZSTD_freeCCtx(ctx);
+            free(out);
+            return RES_COMPRESS;
+        }
     }
     for (i = 0; i < param_count; i++) {
         ZSTD_bounds bounds = ZSTD_cParam_getBounds((ZSTD_cParameter)params[i * 2]);
@@ -131,8 +147,8 @@ int owc_zstd_compress(const uint8_t *in, size_t in_len, const uint32_t *params, 
     return RES_OK;
 }
 
-int owc_zstd_decompress(const uint8_t *in, size_t in_len, const uint32_t *params, size_t param_count,
-                        uint32_t *result) {
+int owc_zstd_decompress(const uint8_t *in, size_t in_len, const uint8_t *dict, size_t dict_len,
+                        const uint32_t *params, size_t param_count, uint32_t *result) {
     ZSTD_DCtx *ctx;
     ZSTD_inBuffer input;
     uint8_t *out;
@@ -151,6 +167,15 @@ int owc_zstd_decompress(const uint8_t *in, size_t in_len, const uint32_t *params
     if (!ctx) {
         free(out);
         return RES_NOMEM;
+    }
+    if (dict != NULL && dict_len > 0) {
+        size_t rc = ZSTD_DCtx_loadDictionary(ctx, dict, dict_len);
+        if (ZSTD_isError(rc)) {
+            result[2] = (uint32_t)rc;
+            ZSTD_freeDCtx(ctx);
+            free(out);
+            return RES_DECODE;
+        }
     }
     for (i = 0; i < param_count; i++) {
         ZSTD_bounds bounds = ZSTD_dParam_getBounds((ZSTD_dParameter)params[i * 2]);
@@ -246,8 +271,8 @@ typedef struct {
     size_t used;
 } owc_zstd_stream;
 
-owc_zstd_stream *owc_zstd_stream_new(const uint32_t *params, size_t param_count, size_t chunk_size,
-                                    uint32_t *result) {
+owc_zstd_stream *owc_zstd_stream_new(const uint8_t *dict, size_t dict_len, const uint32_t *params,
+                                    size_t param_count, size_t chunk_size, uint32_t *result) {
     owc_zstd_stream *s;
     size_t i;
     result[0] = 0;
@@ -259,6 +284,15 @@ owc_zstd_stream *owc_zstd_stream_new(const uint32_t *params, size_t param_count,
     if (!s->cctx) {
         free(s);
         return 0;
+    }
+    if (dict != NULL && dict_len > 0) {
+        size_t rc = ZSTD_CCtx_loadDictionary(s->cctx, dict, dict_len);
+        if (ZSTD_isError(rc)) {
+            result[2] = (uint32_t)rc;
+            ZSTD_freeCCtx(s->cctx);
+            free(s);
+            return 0;
+        }
     }
     s->chunk = chunk_size == 0 ? OWC_ZSTD_DEFAULT_CHUNK : chunk_size;
     if (s->chunk < 64) s->chunk = 64;
