@@ -1230,6 +1230,58 @@ function utilArgError(code, message) {
   return err;
 }
 
+/*
+ * node's internal/errors determineSpecificType: the '. Received ...' clause that ends every
+ * ERR_INVALID_ARG_TYPE message. The host writes it and the guest did not, so a sentence that
+ * stopped at 'must be of type boolean' now stops where the host's stops.
+ */
+function utilReceivedType(value) {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+  var type = typeof value;
+  if (type === 'bigint') return 'type bigint (' + value + 'n)';
+  if (type === 'number') {
+    if (value === 0) return 1 / value === -Infinity ? 'type number (-0)' : 'type number (0)';
+    if (value !== value) return 'type number (NaN)';
+    if (value === Infinity) return 'type number (Infinity)';
+    if (value === -Infinity) return 'type number (-Infinity)';
+    return 'type number (' + value + ')';
+  }
+  if (type === 'boolean') return value ? 'type boolean (true)' : 'type boolean (false)';
+  if (type === 'symbol') return 'type symbol (' + String(value) + ')';
+  if (type === 'function') return 'function ' + value.name;
+  if (type === 'string') {
+    if (value.length > 28) value = value.slice(0, 25) + '...';
+    if (value.indexOf("'") === -1) return "type string ('" + value + "')";
+    return 'type string (' + JSON.stringify(value) + ')';
+  }
+  if (value.constructor && 'name' in value.constructor) return 'an instance of ' + value.constructor.name;
+  return inspectValue(value, { depth: -1 });
+}
+
+/* a dotted name is a property ('options.a.type'), a bare one an argument ('args') */
+function utilArgTypeError(name, expected, actual) {
+  var kind = name.indexOf('.') === -1 ? 'argument' : 'property';
+  return utilArgError('ERR_INVALID_ARG_TYPE',
+    'The "' + name + '" ' + kind + ' must be ' + expected + '. Received ' + utilReceivedType(actual));
+}
+
+function utilArgValueReceived(name, reason, value) {
+  var kind = name.indexOf('.') === -1 ? 'argument' : 'property';
+  return utilArgError('ERR_INVALID_ARG_VALUE',
+    'The ' + kind + " '" + name + "' " + reason + '. Received ' + inspectValue(value));
+}
+
+/* node's validateStringArray / validateBooleanArray over an option's default */
+function utilDefaultArray(name, value, wantBoolean) {
+  if (!Array.isArray(value)) throw utilArgTypeError(name, 'an instance of Array', value);
+  for (var i = 0; i < value.length; i++) {
+    if (wantBoolean ? (value[i] !== true && value[i] !== false) : typeof value[i] !== 'string') {
+      throw utilArgTypeError(name + '[' + i + ']', wantBoolean ? 'of type boolean' : 'of type string', value[i]);
+    }
+  }
+}
+
 /* How node names the value an argument of the wrong type received: null and undefined bare, a
    string quoted, every other primitive as its type and its value, and anything else as an
    instance of the constructor it came from. It is the whole of what follows 'Received type' in
@@ -1770,29 +1822,47 @@ function parseArgsImpl(config) {
   var strict = cfg.strict !== undefined ? cfg.strict : true;
   var allowPositionals = cfg.allowPositionals !== undefined ? cfg.allowPositionals : !strict;
   var returnTokens = cfg.tokens !== undefined ? cfg.tokens : false;
+  var allowNegative = cfg.allowNegative !== undefined ? cfg.allowNegative : false;
   var options = cfg.options !== undefined ? cfg.options : Object.create(null);
-  if (!Array.isArray(args)) throw utilArgError('ERR_INVALID_ARG_TYPE', 'The "args" argument must be an instance of Array.');
-  if (typeof strict !== 'boolean') throw utilArgError('ERR_INVALID_ARG_TYPE', 'The "strict" argument must be of type boolean.');
-  if (typeof allowPositionals !== 'boolean') throw utilArgError('ERR_INVALID_ARG_TYPE', 'The "allowPositionals" argument must be of type boolean.');
-  if (typeof returnTokens !== 'boolean') throw utilArgError('ERR_INVALID_ARG_TYPE', 'The "tokens" argument must be of type boolean.');
-  if (options === null || typeof options !== 'object') throw utilArgError('ERR_INVALID_ARG_TYPE', 'The "options" argument must be of type object.');
+  if (!Array.isArray(args)) throw utilArgTypeError('args', 'an instance of Array', args);
+  if (typeof strict !== 'boolean') throw utilArgTypeError('strict', 'of type boolean', strict);
+  if (typeof allowPositionals !== 'boolean') throw utilArgTypeError('allowPositionals', 'of type boolean', allowPositionals);
+  if (typeof returnTokens !== 'boolean') throw utilArgTypeError('tokens', 'of type boolean', returnTokens);
+  if (typeof allowNegative !== 'boolean') throw utilArgTypeError('allowNegative', 'of type boolean', allowNegative);
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw utilArgTypeError('options', 'of type object', options);
+  }
 
   var names = Object.keys(options);
   for (var n = 0; n < names.length; n++) {
     var conf = options[names[n]];
     var where = 'options.' + names[n];
-    if (conf === null || typeof conf !== 'object') {
-      throw utilArgError('ERR_INVALID_ARG_TYPE', 'The "' + where + '" argument must be of type object.');
+    if (conf === null || typeof conf !== 'object' || Array.isArray(conf)) {
+      throw utilArgTypeError(where, 'of type object', conf);
     }
+    /* node's validateUnion: one ERR_INVALID_ARG_TYPE naming the union, not one listing its members */
     if (conf.type !== 'string' && conf.type !== 'boolean') {
-      throw utilArgError('ERR_INVALID_ARG_VALUE', "The property '" + where + ".type' must be one of: 'string', 'boolean'.");
+      throw utilArgTypeError(where + '.type', "('string|boolean')", conf.type);
     }
+    var multipleOption = conf.multiple;
     if (conf.short !== undefined) {
-      if (typeof conf.short !== 'string') throw utilArgError('ERR_INVALID_ARG_TYPE', 'The "' + where + '.short" property must be of type string.');
-      if (conf.short.length !== 1) throw utilArgError('ERR_INVALID_ARG_VALUE', "The property '" + where + ".short' must be a single character.");
+      if (typeof conf.short !== 'string') throw utilArgTypeError(where + '.short', 'of type string', conf.short);
+      if (conf.short.length !== 1) throw utilArgValueReceived(where + '.short', 'must be a single character', conf.short);
     }
     if (conf.multiple !== undefined && typeof conf.multiple !== 'boolean') {
-      throw utilArgError('ERR_INVALID_ARG_TYPE', 'The "' + where + '.multiple" property must be of type boolean.');
+      throw utilArgTypeError(where + '.multiple', 'of type boolean', conf.multiple);
+    }
+    /* node validates an option's default against its type, and the array form when multiple */
+    var defaultValue = conf.default;
+    if (defaultValue !== undefined) {
+      if (conf.type === 'string') {
+        if (multipleOption) utilDefaultArray(where + '.default', defaultValue, false);
+        else if (typeof defaultValue !== 'string') throw utilArgTypeError(where + '.default', 'of type string', defaultValue);
+      } else if (multipleOption) {
+        utilDefaultArray(where + '.default', defaultValue, true);
+      } else if (typeof defaultValue !== 'boolean') {
+        throw utilArgTypeError(where + '.default', 'of type boolean', defaultValue);
+      }
     }
   }
 
@@ -1808,8 +1878,9 @@ function parseArgsImpl(config) {
   }
 
   function unknownOption(rawName) {
+    /* the host's hint ends on the quoted option, with no closing apostrophe after it */
     var hint = allowPositionals
-      ? ". To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- " + JSON.stringify(rawName) + "'"
+      ? ". To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- " + JSON.stringify(rawName)
       : '';
     return utilArgError('ERR_PARSE_ARGS_UNKNOWN_OPTION', "Unknown option '" + rawName + "'" + hint);
   }
