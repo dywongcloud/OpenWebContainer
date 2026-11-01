@@ -1,0 +1,49 @@
+owc-esm-uncaughtexception-ends-the-run resolved 1793564561351-11624-3b16abf3b86cfa3 2026-11-01T20:32:17.310Z
+Row: owc-esm-uncaughtexception-ends-the-run
+Witness: 1793564561351-11624-3b16abf3b86cfa3
+Status: resolved
+
+Symptom
+  An ES module entry that installs process.on('uncaughtException', ...) and then throws never ran
+  that handler here: the process wrote the fatal report -- 'file:///app/w.mjs:2', the line, the caret,
+  'Error: top boom', the frame, the ESM loader frames, 'Node.js v24.15.0' -- and exited 1, where host
+  node 24.15 gives the error to the handler, prints what the handler prints and exits 0. It is the
+  entry's own body alone: the same handler over a throw out of a timer agreed with the host, and the
+  same handler in a CommonJS entry agreed, which is what said the module kind was what decided it.
+
+Cause
+  runEsmEntry (process.ts) raised the failure of the entry's evaluation at the host level --
+  `throw this.guestFailure(...)` over the rejected evaluation promise, and over a result.error the
+  engine answered with -- so it never reached the guest at all and no listener was ever asked. A
+  CommonJS entry goes through guestCall('runMain', [file]), whose error the guest hands to its own
+  uncaught route before it throws it back: emitUncaught in guest/loader.ts counts the listeners when
+  the error is in hand, gives them the error and lets the run go on, and only with none does it throw,
+  which is what leaves the host's report. That is the whole of the difference between the two kinds.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/loader.ts
+    api.esmEntryFailure -- the route a CommonJS entry's failure takes, for the failure of an ES module
+    entry's own body: the error is handed to emitUncaught, which gives it to an 'uncaughtException'
+    listener and leaves the run to it, and throws it back when there is none. A listener registered at
+    the top of the module is therefore a listener the error finds, as it does on the host.
+  packages/core/src/process/executors/node/process.ts
+    runEsmEntry answers with the guest's route instead of raising the failure itself, in both shapes
+    the failure comes in -- an error the engine answered the evaluation with, and a rejected evaluation
+    promise -- and hands the handle over on the way, on every way out of the call: one the host still
+    held when the runtime was freed is what QuickJS asserts on at teardown. startEntry takes the
+    promise of a run that suspended inside a listener as the run's own. A failure of the graph and not
+    of the body -- a specifier that resolves to nothing, a module no loader can read, one that will not
+    parse -- is left to the report it has always had: host node 24.15 writes such a one itself and
+    hands it to no listener, which is what a listener a module the entry imports first had already
+    registered measured on host node 24.15.
+
+Witness
+  dispatch 1793564561351-11624-3b16abf3b86cfa3, session verify-esm-uncaught, on a fresh export of
+  origin/main 0f0b6abb35ac30ed8726ccb0039f8861d0f7903b (git archive, pnpm build in packages/core),
+  host node v24.15.0 on the other side, one fresh container boot per run, stdout + stderr + exit code
+  compared, at two memory points (load 13.81 with 2.36 GB free, load 15.88 with 3.24 GB free):
+  esm-uncaught-top AGREE (exit 0, 'HANDLED top boom'), cjs-uncaught-top AGREE, esm-uncaught-timer
+  AGREE, and esm-dep-throw-after-reg -- a module the entry imports throwing after a module imported
+  first registered the handler -- AGREE, where before the fix the container exited 1 with the report.
+  esm-badimport-handler and esm-badimport-after-reg still report the resolution failure as they did,
+  with no listener called, which is what the host does.

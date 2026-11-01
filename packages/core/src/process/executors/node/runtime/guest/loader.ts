@@ -1931,6 +1931,18 @@ var api = {
     PENDING_UNCAUGHT = null;
     return api.formatUncaught(pending.error);
   },
+  /*
+   * The failure of an ES module entry's own body, on the route a CommonJS entry's failure takes: an
+   * 'uncaughtException' listener is given it and the run goes on, which is what host node 24.15
+   * does with a top-level throw out of the module a run started with -- the handler prints and the
+   * exit is 0 -- and with no listener the error goes out of the module and off the end of the
+   * process, which is the fatal path that ends it with status 1. A failure the engine raised
+   * compiling or linking the entry is not one of these: host node reports such a one itself and
+   * hands it to no listener, so it never comes here.
+   */
+  esmEntryFailure: function (err) {
+    if (!emitUncaught(err)) throw err;
+  },
   runMain: function (filename) {
     /*
      * An exception that reaches the top of the main module ends the process -- but only after an
@@ -1941,7 +1953,7 @@ var api = {
      * and off the end of the process, which is the fatal path that ends it with status 1.
      */
     try {
-      loadCJS(filename, null, true);
+        loadCJS(filename, null, true);
     } catch (err) {
       /* The listener is counted when the error is in hand, not when the module starts: a program
          registers it at the top and throws at the bottom, so at the start there is none. The

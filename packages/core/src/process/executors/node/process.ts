@@ -3103,8 +3103,12 @@ export class NodeProcess extends Process {
             this.startRepl();
             started = this.drainJobs();
         } else if (entryPath !== undefined && this.resolver.isESM(entryPath)) {
-            this.runEsmEntry(entryPath);
-            started = this.drainJobs();
+            /* The failure of the entry's own body is the guest's to hand out, so what comes back is
+               the promise of a run that suspended inside an 'uncaughtException' listener -- one the
+               listener's own host work left unwound -- and the jobs behind it are the caller's to
+               drain only when nothing suspended. */
+            const running = this.runEsmEntry(entryPath);
+            started = running instanceof Promise ? running : this.drainJobs();
         } else {
             const file = this.context!.newString(entryPath!);
             started = this.guestCall('runMain', [file]);
@@ -3326,7 +3330,7 @@ export class NodeProcess extends Process {
         }
     }
 
-    private runEsmEntry(entryPath: string): void {
+    private runEsmEntry(entryPath: string): void | Promise<void> {
         const context = this.context!;
         const raw = this.fileSystem.readFile(entryPath) ?? '';
         const source = this.esmSource(raw, entryPath, true);
@@ -3349,6 +3353,13 @@ export class NodeProcess extends Process {
                 result.error.dispose();
                 throw new GuestFailure(report, true);
             }
+            /* A failure of the graph the entry imports -- a specifier that resolves to nothing, a
+               module no loader can read -- is one host node 24.15 reports itself: an
+               'uncaughtException' listener registered before it is never given it, measured on
+               host node 24.15 with the listener registered by a module the entry imports first.
+               What is left is the failure of the entry's own body, which takes the route a
+               CommonJS entry's failure takes: see esmEntryFailure. */
+            if (!this.esmLoadFailure(result.error)) return this.esmEntryFailure(result.error);
             throw this.guestFailure(result.error);
         }
         const promise = result.value;
@@ -3362,12 +3373,71 @@ export class NodeProcess extends Process {
         try {
             this.drainJobs();
             const state = context.getPromiseState(promise);
-            if (state.type === 'rejected') throw this.guestFailure(state.error);
+            /* A rejected evaluation is the module's own body having failed, and it is handed to the
+               guest the way a CommonJS entry's failure is: see esmEntryFailure. */
+            if (state.type === 'rejected') return this.esmEntryFailure(state.error);
             if (state.type === 'fulfilled' && state.notAPromise !== true && state.value.alive) state.value.dispose();
         } catch (error) {
             if (error instanceof GuestFailure) throw error;
         } finally {
             promise.dispose();
+        }
+    }
+
+    /**
+     * The failure of an ES module entry's own body, on the route the failure of a CommonJS entry
+     * takes: the guest's 'uncaughtException' listener is given the error and the run goes on, and
+     * with no listener the guest throws it back, which is what leaves this call as the report the
+     * host writes over it. Raised here -- at the host level, as a GuestFailure the guest never saw
+     * -- no listener was ever given it and every such run ended in that report, where host node
+     * 24.15 hands a top-level throw of an ES module entry to a listener that was registered before
+     * it and leaves the run to the handler.
+     */
+    private esmEntryFailure(errorHandle: QuickJSHandle): void | Promise<void> {
+        /* The handle is the host's, and it is freed here on every way out of the call: one the host
+           still holds when the runtime is freed keeps the error alive on the engine's list, which
+           is what QuickJS asserts on at teardown (`list_empty(&rt->gc_obj_list)`). The call hands
+           it to the guest, which throws it back when no listener took it, and the error the host
+           reads out of that throw is a second handle to the same error and not this one. */
+        let sent: MaybeAsync<QuickJSHandle>;
+        try {
+            sent = this.callApiMaybe('esmEntryFailure', [errorHandle]);
+        } catch (error) {
+            errorHandle.dispose();
+            throw error;
+        }
+        if (sent instanceof Promise) {
+            return sent.then((value) => {
+                value.dispose();
+                errorHandle.dispose();
+                return this.drainJobs();
+            }, (error) => {
+                errorHandle.dispose();
+                throw error;
+            });
+        }
+        sent.dispose();
+        errorHandle.dispose();
+        return this.drainJobs();
+    }
+
+    /**
+     * Whether the error is one of the graph's own and not of the entry's body: the code node's ES
+     * module loader puts on a failure to resolve, read or link a module before any of it ran. Such
+     * a failure never reaches an 'uncaughtException' listener -- host node 24.15 writes its report
+     * and ends the run -- so it is not one the guest's uncaught route is given.
+     */
+    private esmLoadFailure(error: QuickJSHandle): boolean {
+        const context = this.context!;
+        try {
+            const handle = context.getProp(error, 'code');
+            const code = context.typeof(handle) === 'string' ? context.getString(handle) : '';
+            handle.dispose();
+            return ESM_LOAD_FAILURE_CODES.has(code);
+        } catch {
+            /* A thrown value that is not an object has no code to read, and it is not one of the
+               loader's: what the body threw is the body's. */
+            return false;
         }
     }
 
@@ -5312,6 +5382,30 @@ function jsonModuleFailureText(source: string, file: string, detail: string, isM
     return `${JSON_ANONYMOUS_SCRIPT}:${line}\n${shown}\n${caret === undefined ? '' : `${caret}\n`}` +
         `\nSyntaxError: ${file}: ${detail}\n${jsonModuleFrames(isMain)}\n\nNode.js ${NODE_VERSION}`;
 }
+
+/**
+ * The codes node's ES module loader puts on a failure of the graph's own -- a specifier that
+ * resolves to nothing, a module no loader can read, a subpath no "exports" map defines. Host node
+ * 24.15 reports every one of these itself and hands it to no 'uncaughtException' listener, so they
+ * are the codes that say an error out of the entry's evaluation is not the entry's own failure.
+ */
+const ESM_LOAD_FAILURE_CODES = new Set([
+    'ERR_MODULE_NOT_FOUND',
+    'ERR_UNSUPPORTED_DIR_IMPORT',
+    'ERR_PACKAGE_PATH_NOT_EXPORTED',
+    'ERR_PACKAGE_IMPORT_NOT_DEFINED',
+    'ERR_UNKNOWN_FILE_EXTENSION',
+    'ERR_UNKNOWN_MODULE_FORMAT',
+    'ERR_UNSUPPORTED_ESM_URL_SCHEME',
+    'ERR_UNKNOWN_BUILTIN_MODULE',
+    'ERR_INVALID_MODULE_SPECIFIER',
+    'ERR_INVALID_PACKAGE_CONFIG',
+    'ERR_UNSUPPORTED_RESOLVE_REQUEST',
+    'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX',
+    'ERR_IMPORT_ATTRIBUTE_UNSUPPORTED',
+    'ERR_IMPORT_ATTRIBUTE_MISSING',
+    'ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE'
+]);
 
 /**
  * A module that does not compile, as node reports it: the file URL and the line, the line of the
