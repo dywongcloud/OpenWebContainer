@@ -1884,6 +1884,17 @@ function cpOnFrame(name, frame) {
   }
 }
 
+/* The name of every file the host compiles as an ES module, asked of the guest so a frame the engine
+   names in it can be rendered the way node renders one, as a file URL. The guest has never answered
+   it, so the call failed with the engine's bare 'not a function' once per module compiled, and a
+   failure the engine raises is one the host formats through api.formatUncaught: in a worker that
+   formatter is also the thread's reporter, so a Worker whose entry was an ES module emitted one
+   'error' event per module in its graph -- before it ran, and for a run that then succeeded. The
+   guest has no frame marker to hand the name to, so it answers the call and keeps nothing. */
+if (typeof api.markEsmFile !== 'function') {
+  api.markEsmFile = function () { return undefined; };
+}
+
 /* a worker thread reports an uncaught error to its parent before the error text ends the thread */
 function cpWireWorkerErrors() {
   var base = api.formatUncaught;
