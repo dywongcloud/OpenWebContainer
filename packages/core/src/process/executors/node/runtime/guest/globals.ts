@@ -436,9 +436,10 @@ function siteOf(text) {
   for (var i = 0; i < lines.length; i++) {
     if (lines[i].indexOf('owc-bootstrap.js:') >= 0) continue;
     /* A frame with no name in front of it -- the body of a listener, or of a module -- is written
-       with the bare place and no parentheses at all, so both shapes are read. */
-    var found = /\(?(\/[^\s()]+):(\d+):(\d+)\)?/.exec(lines[i]);
-    if (found !== null) return found[1] + ':' + found[2] + ':' + found[3];
+       with the bare place and no parentheses at all, so both shapes are read. A file compiled as an
+       ES module is named by its URL, and the note this container keeps names the file behind it. */
+    var found = /\(?(file:\/\/[^\s()]+|\/[^\s()]+):(\d+):(\d+)\)?/.exec(lines[i]);
+    if (found !== null) return frameFilePathOf(found[1]) + ':' + found[2] + ':' + found[3];
   }
   return '';
 }
@@ -1462,6 +1463,62 @@ var CJS_REQUIRE_TAIL = [
 var BOOTSTRAP_MARK = 'owc-bootstrap.js:';
 var CJS_CALL_FRAME = '    at call (native)';
 
+/*
+ * The files this process compiled as ES modules, and of those the ones it compiled as part of the
+ * graph the run's entry loaded: host node names a frame in one by the file's URL and not by its
+ * path, and puts the frames of its own ESM loader behind the module the entry ran. Which files they
+ * are is what the host says as it compiles them, one call per module -- a .js file is a module
+ * here or not by the package it sits in, which only the resolver on the host knows.
+ */
+var ESM_FILES = Object.create(null);
+var ESM_ENTRY_FILES = Object.create(null);
+/* The frames host node writes behind the body of the module a run started with: the module job that
+   ran it and the two of the loader's own behind that. Captured from the build NODE_VERSION names,
+   as the frames of a module that is not there are. */
+var ESM_MAIN_FRAMES = [
+  '    at ModuleJob.run (node:internal/modules/esm/module_job:437:25)',
+  '    at async node:internal/modules/esm/loader:639:26',
+  '    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)'
+];
+/* One frame of a file: the "at" in front, the name in front of the location when it has one, the
+   file, then "path:line:column" in parentheses behind a name and bare without one -- the two shapes
+   a frame of a file has are the one a named function gets and the one a module body gets. */
+var FRAME_AT_FILE = /^(\s*at )(?:(.*) \()?(\/[^\s()]*)(:\d+:\d+)(\))?\s*$/;
+
+/* The file a frame names, '' when it names none: one of node's own internals, an eval, a body no
+   file stands behind. */
+function frameFileOf(text) {
+  var parsed = FRAME_AT_FILE.exec(text);
+  return parsed === null ? '' : parsed[3];
+}
+
+/* The file behind the name a frame shows: an ES module is named by its URL, and the path is what
+   that URL carries. */
+function frameFilePathOf(name) {
+  if (name.indexOf('file://') !== 0) return name;
+  try { return decodeURI(name.slice('file://'.length)); } catch (bad) { return name; }
+}
+
+/* The frame as host node writes one in a file compiled as an ES module: the same name, line and
+   column, with the file named by its URL and not by its path. A frame in any other file -- a
+   CommonJS body, one of node's own internals -- is the frame it already was. */
+function esmFrameOf(text) {
+  var parsed = FRAME_AT_FILE.exec(text);
+  if (parsed === null || ESM_FILES[parsed[3]] !== true) return text;
+  return parsed[1] + (parsed[2] === undefined ? '' : parsed[2] + ' (') +
+    fileUrlOf(parsed[3]) + parsed[4] + (parsed[5] === undefined ? '' : parsed[5]);
+}
+
+/* The host's answer to the module it is about to compile: the second argument says the module is one
+   the run's own entry loaded, which is what puts the loader's frames behind the frames it gives. */
+api.markEsmFile = function (file, entry) {
+  if (typeof file === 'string' && file !== '') {
+    ESM_FILES[file] = true;
+    if (entry) ESM_ENTRY_FILES[file] = true;
+  }
+  return undefined;
+};
+
 /* One frame of this container's own: every frame the bootstrap puts on a stack names its file. */
 function isBootstrapFrame(text) {
   return typeof text === 'string' && text.indexOf(BOOTSTRAP_MARK) >= 0;
@@ -1541,6 +1598,14 @@ function guestFramesOf(lines) {
     at++;
   }
   for (var n = 0; n < out.length; n++) out[n] = anonymousFrameName(frameColumnUnwrapped(out[n]));
+  /* Behind the frames of the module the run started with, host node names the frames of its own ESM
+     loader, the way it names the CommonJS loader's behind a body it compiled. Which module that is
+     is one the host named as it compiled it; a run of frames that ends anywhere else -- an eval, a
+     require, a module a later dynamic import loaded -- gets none. */
+  if (out.length > 0 && ESM_ENTRY_FILES[frameFileOf(out[out.length - 1])] === true) {
+    for (var e = 0; e < ESM_MAIN_FRAMES.length; e++) out.push(ESM_MAIN_FRAMES[e]);
+  }
+  for (var k = 0; k < out.length; k++) out[k] = esmFrameOf(out[k]);
   return out;
 }
 

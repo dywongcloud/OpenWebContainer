@@ -868,21 +868,41 @@ function evalFailureText(message: string, source: string, options: EvalFailureOp
     return `${block}\n${first}\n${kept.join('\n')}${trailer}`;
 }
 
+/** What a frame names a file as: its path, or its URL for a file compiled as an ES module. */
+const SITE_FILE = String.raw`(?:file:\/\/[^\s()]*|\/[^\s()]*)`;
+
 /**
- * The `path:line:column` a frame of a script file names, read out of the line the guest wrote.
+ * The `path:line:column` a frame of a script file names, read out of the line the guest wrote, with
+ * the name the frame shows the file under.
  *
  * A frame with no name in front of it -- the body of an anonymous callback, the shape host node
  * writes for a `process.nextTick` callback -- names the place with no parentheses at all, so both
  * shapes are read; `bare` says which one it was, because only a named one is rewritten in place.
+ *
+ * The name is the file's URL for a file the guest compiled as an ES module -- the way host node
+ * names one -- and its path for every other file, so `shown` is what a report prints and `path` is
+ * what the source of the line is read through.
  */
 function scriptSiteOf(text: string):
-    { path: string; line: number; column: number; bare: boolean } | undefined {
-    const match = /^\s*at (?:(?:.*?) )?\((\/[^\s()]*):(\d+):(\d+)\)\s*$/.exec(text);
-    const at = match === null ? /^\s*at (\/[^\s()]*):(\d+):(\d+)\s*$/.exec(text) : match;
+    { path: string; shown: string; line: number; column: number; bare: boolean } | undefined {
+    const match = new RegExp(`^\\s*at (?:(?:.*?) )?\\((${SITE_FILE}):(\\d+):(\\d+)\\)\\s*$`).exec(text);
+    const at = match === null
+        ? new RegExp(`^\\s*at (${SITE_FILE}):(\\d+):(\\d+)\\s*$`).exec(text)
+        : match;
     if (at === null) return undefined;
-    const site = parseSite(`${at[1]}:${at[2]}:${at[3]}`);
+    const site = parseSite(`${pathOfFileUrl(at[1])}:${at[2]}:${at[3]}`);
     if (site === undefined) return undefined;
-    return { path: site.path, line: site.line, column: site.column, bare: match === null };
+    return { path: site.path, shown: at[1], line: site.line, column: site.column, bare: match === null };
+}
+
+/** The path inside a `file:` URL, and the name itself for a frame that names a path. */
+function pathOfFileUrl(name: string): string {
+    if (!name.startsWith('file://')) return name;
+    try {
+        return decodeURI(name.slice('file://'.length));
+    } catch {
+        return name;
+    }
 }
 
 /**
@@ -897,8 +917,11 @@ function nodeFrame(text: string, sourceOf: (at: string) => string | undefined): 
     if (source === undefined) return text;
     const shown = (source.split('\n')[site.line - 1] ?? '').replace(/\t/g, ' ');
     const column = nodeColumn(shown, site.column);
-    if (site.bare) return `    at ${site.path}:${site.line}:${column}`;
-    return text.replace(/\((\/[^\s()]*):(\d+):(\d+)\)\s*$/, `(${site.path}:${site.line}:${column})`);
+    if (site.bare) return `    at ${site.shown}:${site.line}:${column}`;
+    return text.replace(
+        new RegExp(`\\((${SITE_FILE}):(\\d+):(\\d+)\\)\\s*$`),
+        `(${site.shown}:${site.line}:${column})`
+    );
 }
 
 /**
@@ -931,10 +954,13 @@ function scriptFailureText(message: string, sourceOf: (at: string) => string | u
         if (source === undefined) return undefined;
         const shown = (source.split('\n')[site.line - 1] ?? '').replace(/\t/g, ' ');
         const column = nodeColumn(shown, site.column);
-        const marked = caretColumn(shown, column);
+        /* A `throw` in a file compiled as an ES module is marked where the frame names it and not
+           where the statement starts: what node points at there is the place the error came from,
+           which is the column of the trace and not of the `throw` in front of it. */
+        const marked = site.shown.startsWith('file://') ? column : caretColumn(shown, column);
         /* Node points past the end of a line with spaces and no caret, as it does for `-e`. */
         const caret = marked > shown.length ? ' '.repeat(shown.length) : ' '.repeat(marked - 1) + '^';
-        const block = `${site.path}:${site.line}\n${shown}\n${caret}\n`;
+        const block = `${site.shown}:${site.line}\n${shown}\n${caret}\n`;
         const frames = lines.slice(1).map((text) => nodeFrame(text, sourceOf));
         return `${block}\n${lines[0]}\n${frames.join('\n')}${REPORT_TRAILER}`;
     }
