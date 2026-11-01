@@ -1,0 +1,47 @@
+owc-stack-column-of-a-call resolved 1793564624605-11648-74c9789b75a531ff 2026-11-01T20:32:17.310Z
+Row: owc-stack-column-of-a-call
+Witness: 1793564624605-11648-74c9789b75a531ff
+Status: resolved
+
+Symptom
+  A stack a program read for itself named a column this engine chose and not the one V8 names:
+  'Error.captureStackTrace(e)' at '  Error.captureStackTrace(e);' is 3:9 on the host and 3:26 here,
+  and the 'new Error(' of '  return new Error(\'stack boom\').stack;' is 2:10 there and 2:19 here; the
+  frame of the call behind each is 6:13 / 4:13 on the host and 6:14 / 4:14 here. The same in a
+  CommonJS body as in an ES module.
+
+Cause
+  V8 names the start of the call expression -- the 'new' of a construct, the property a call is read
+  off, the name of a plain call -- where this engine names the parenthesis behind the callee, so 26 is
+  the '(' of 'captureStackTrace(', 19 the '(' of 'Error(' and 14 the '(' of 'g('. The host already
+  moves a frame's column onto the character V8 would have named, in nodeColumn, but only over the
+  frames of its own report: a stack the guest builds for a program -- err.stack, and what
+  Error.captureStackTrace wrote -- is built on the guest's side and never passes through it.
+
+Fix
+  packages/core/src/process/executors/node/runtime/host-bridge.ts
+    host.columnOf(path, line, column) -- the host's own nodeColumn over one frame, for the guest to
+    ask. The host is the side that holds the source of the line, which is what the callee's start is
+    read out of; a file no source stands behind is answered with the column it was given.
+  packages/core/src/process/executors/node/process.ts
+    The dep that answers it, and nodeColumn itself extended: a call that is the whole expression of a
+    'return' is a column the engine named at the keyword -- 'return a()' is named at the 'return' --
+    and there the parenthesis is looked for from there, walked back over the callee and over the 'new'
+    in front of it. A 'return' whose statement holds two calls keeps the column it has, because which
+    of them is in flight is not something the line says.
+  packages/core/src/process/executors/node/runtime/guest/globals.ts
+    programFramesOf -- guestFramesOf with every frame's column moved through host.columnOf -- is what
+    builds the two stacks a program reads for itself, err.stack and Error.captureStackTrace, and
+    nothing else: the host's own report puts its frames through nodeColumn already, and a column the
+    move has made is one the move leaves alone.
+
+Witness
+  dispatch 1793564624605-11648-74c9789b75a531ff, session verify-stack-column, on a fresh export of
+  origin/main 0f0b6abb35ac30ed8726ccb0039f8861d0f7903b (git archive, pnpm build in packages/core),
+  host node v24.15.0 on the other side, one fresh container boot per run, stdout + stderr + exit code
+  compared, at two memory points (load 12.09 with 2.76 GB free, load 16.57 with 3.22 GB free): the
+  four cases the row names -- esm-capture, esm-stack-prop, cjs-capture, cjs-stack-prop -- AGREE with
+  the host, byte for byte, where all four differed before the fix. esm-deep-stack, esm-return-throw,
+  cjs-return-throw, esm-fn-call-throw, cjs-fn-call-throw, esm-stack-limit, esm-prepare-stack and
+  esm-uncaught-handler agree too; the sweeps were run against a build of the same tree without the fix,
+  and no case that agreed with the host before disagrees after.

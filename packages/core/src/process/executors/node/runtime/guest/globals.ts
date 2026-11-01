@@ -1392,7 +1392,7 @@ if (!Error.captureStackTrace) {
     /* The frame of this call is one of the container's own, and the engine has taken it out on the
        way in more often than not; it is dropped again only where it is still there, because a frame
        dropped here is a frame of the caller's lost, which is what left a captured trace one short. */
-    var frames = guestFramesOf(lines);
+    var frames = programFramesOf(lines);
     while (frames.length > 0 && (isBootstrapFrame(frames[0]) || frames[0].indexOf('captureStackTrace') >= 0)) {
       frames = frames.slice(1);
     }
@@ -1563,7 +1563,39 @@ function frameColumnUnwrapped(text) {
 }
 
 /*
- * A guest's frames with this container's own taken out and node's put in their place: the call into
+ * The column of one frame as host node 24.15 names it, which is not the column this engine names for
+ * the same frame: V8 names the start of a call -- the 'new' of a construct, the property a call is
+ * read off, the name of a plain one -- where the engine names the parenthesis behind the callee, so a
+ * stack a program reads for itself is a column or two wide of the one node reads on the same line.
+ * Which character that is comes out of the source of the line, which is the host's to read, so the
+ * host is asked; a frame whose file is not one -- an internal of node's, an eval, a body no file
+ * stands behind -- and one whose line the host cannot read keep the column the engine gave.
+ */
+function nodeColumnOf(frame) {
+  if (typeof host.columnOf !== 'function') return frame;
+  var parsed = FRAME_AT_COLUMN.exec(frame);
+  if (parsed === null) return frame;
+  var file = frameFilePathOf(parsed[3]);
+  if (file.charAt(0) !== '/') return frame;
+  var line = parseInt(parsed[4], 10);
+  var column = parseInt(parsed[5], 10);
+  var moved = host.columnOf(file, line, column);
+  if (!(moved > 0) || moved === column) return frame;
+  return parsed[1] + parsed[2] + parsed[3] + ':' + parsed[4] + ':' + moved + (parsed[6] === undefined ? '' : parsed[6]);
+}
+
+/*
+ * The frames of a stack a program reads for itself, on the columns host node names: err.stack and
+ * what Error.captureStackTrace wrote are the only stacks this container keeps that the host's own
+ * report never puts its frames through, so the move is made here and nowhere else.
+ */
+function programFramesOf(lines) {
+  var frames = guestFramesOf(lines);
+  for (var p = 0; p < frames.length; p++) frames[p] = nodeColumnOf(frames[p]);
+  return frames;
+}
+
+/* the call into
  * a compiled CommonJS body, the loader that made it and the require or the entry behind it are one
  * run of frames of ours, and a host node names the frames of its own loader there and nothing of
  * ours. A run that names neither the entry nor a require -- the eval path, the REPL -- is dropped
@@ -1635,7 +1667,7 @@ function framesOfEngineStack(stack, ownFrame) {
   /* The bound the host keeps on Error.stackTraceLimit is a bound on the whole trace, the frames of
      node's own loader behind a guest's included, so it is put on the frames once node's are among
      them and not on the frames the engine handed over before that. */
-  var frames = guestFramesOf(lines.slice(at));
+  var frames = programFramesOf(lines.slice(at));
   var limit = Error.stackTraceLimit;
   if (typeof limit === 'number' && limit >= 0 && frames.length > limit) frames = frames.slice(0, limit);
   return frames.join('\n');

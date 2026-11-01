@@ -60,6 +60,14 @@ export interface HostBridgeDeps {
      * running a runaway loop, so the runaway guard's clock starts again here.
      */
     onHostCall?: () => void;
+    /**
+     * The column host node names for a frame of the source of `path` at `line`, which is not the
+     * column this engine names: V8 names the start of a call -- the `new` of a construct, the
+     * property a call is read off, the name of a plain one -- where the engine names the parenthesis
+     * behind the callee. The start is read out of the source of that line, which is the host's to
+     * read, and a line no source stands behind is answered with the column it was given.
+     */
+    columnOf: (path: string, line: number, column: number) => number;
 }
 
 class FsCodeError extends Error {
@@ -248,6 +256,14 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         return context.undefined;
     });
     define('now', () => context.newNumber(deps.now()));
+    /**
+     * One frame's column, moved onto the character V8 would have named. A stack a program reads for
+     * itself -- `err.stack`, `Error.captureStackTrace` -- is built on the guest's side, so its frames
+     * are the ones the host's own report never passes through, and the host is asked here for the
+     * column it would have written over them.
+     */
+    define('columnOf', (pathArg, lineArg, columnArg) =>
+        context.newNumber(deps.columnOf(text(pathArg), context.getNumber(lineArg), context.getNumber(columnArg))));
     define('cpuCount', () => context.newNumber(CPU_COUNT));
     define('randomBase64', (size) => {
         /* getRandomValues refuses more than 64 KiB at a call, so a larger ask is filled in pieces. */

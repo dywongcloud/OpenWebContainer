@@ -604,6 +604,42 @@ function callRootedReceiver(receiver: string): boolean {
     return false;
 }
 
+/**
+ * The `(` of the one call a `return` starting at `at` hands back, and undefined when the statement
+ * holds none or more than one: `return a()` is a call the engine names at the `return` -- the
+ * position of the opcode that ran it -- and V8 at the `a`, while which of the two calls of
+ * `return a() + b()` is the one in flight is not something the line says, so such a line keeps the
+ * column it was given. A word that merely begins with the keyword -- a name `returned` -- is not
+ * one, and neither is a `return` inside a string.
+ */
+function returnedCallParen(text: string, at: number): number | undefined {
+    if (text.slice(at, at + 6) !== 'return') return undefined;
+    if (/[A-Za-z0-9_$]/.test(text[at + 6] ?? '')) return undefined;
+    if (at > 0 && /[A-Za-z0-9_$.]/.test(text[at - 1] ?? '')) return undefined;
+    const quoted = literalSpans(text);
+    const inside = (index: number): boolean => quoted.some(([from, to]) => index >= from && index <= to);
+    let depth = 0;
+    let found = -1;
+    for (let i = at + 6; i < text.length; i++) {
+        const ch = text[i] ?? '';
+        if (inside(i)) continue;
+        if (ch === ';') break;
+        if (ch === '(') {
+            /* A call is a `(` with something callable in front of it; a grouping one has nothing. */
+            if (depth === 0 && /[A-Za-z0-9_$)\]]/.test(text[i - 1] ?? '')) {
+                if (found >= 0) return undefined;
+                found = i;
+            }
+            depth++;
+            continue;
+        }
+        if (ch === ')') { depth--; continue; }
+        if (ch === '[' || ch === '{') { depth++; continue; }
+        if (ch === ']' || ch === '}') { depth--; continue; }
+    }
+    return found < 0 ? undefined : found;
+}
+
 function nodeColumn(text: string, column: number): number {
     const at = column - 1;
     const ch = text[at];
@@ -612,8 +648,11 @@ function nodeColumn(text: string, column: number): number {
         /* The property of a read off a name or a literal, or the dot of one off a call. */
         return callRootedReceiver(text.slice(receiverStart(text, at), at)) ? column : column + 1;
     }
-    if (ch !== '(') return column;
-    let end = at - 1;
+    /* A call that is the whole expression of a `return` is a column the engine named at the
+       keyword and not at the parenthesis, so the parenthesis is looked for from there. */
+    const paren = ch === '(' ? at : returnedCallParen(text, at);
+    if (paren === undefined) return column;
+    let end = paren - 1;
     while (end >= 0 && /\s/.test(text[end] ?? '')) end--;
     if (end < 0 || text[end] === ')') return column;
     /* The callee: a name, or names read off one another -- `a.b.c()` -- walked backwards. */
@@ -2648,6 +2687,14 @@ export class NodeProcess extends Process {
             /* A program just registered module customization hooks: every resolve and every load
                asks the guest from here on. */
             onHooksChanged: () => { this.hooksArmed = true; },
+            /* The column of a frame of a stack a program reads for itself, which the guest builds
+               and this report never sees: the one V8 would have named, read out of the source of
+               the line the frame names. A file this process cannot read keeps the column it has. */
+            columnOf: (path, line, column) => {
+                const source = this.fileSystem.readFile(path);
+                if (source === undefined) return column;
+                return nodeColumn((source.split('\n')[line - 1] ?? '').replace(/\t/g, ' '), column);
+            },
             onHostCall: () => {
                 yieldVmSlice(this.capabilityContext);
                 // the deadline is a moment in time, not a stretch: what is left of it is rearmed here
