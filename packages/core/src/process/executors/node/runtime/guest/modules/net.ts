@@ -170,15 +170,18 @@ function netFamilyName(address) {
   return netIsIPv6(address) ? 'IPv6' : 'IPv4';
 }
 
-function netPortOf(value, listen) {
+/* 'positive' is a dgram connect's own reading of a port: host Node 24.15 refuses 0 there --
+   'Port should be > 0 and < 65536. Received type number (0)' -- where a bind takes 0 as the
+   ephemeral port, and the message carries '> 0' rather than '>= 0'. */
+function netPortOf(value, listen, positive) {
   var port = typeof value === 'string' && value !== '' ? Number(value) : value;
-  if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535) {
+  if (typeof port !== 'number' || !Number.isInteger(port) || port < (positive ? 1 : 0) || port > 65535) {
     /* A server's own refusal names the option it was given, where every other caller -- a connect,
        a dgram bind -- names the port itself: 'options.port should be >= 0 and < 65536. Received
        type string ('')' against 'Port should be >= 0 and < 65536. Received type number (70000).' */
     throw netError(RangeError, 'ERR_SOCKET_BAD_PORT',
-      (listen ? 'options.port' : 'Port') + ' should be >= 0 and < 65536. Received '
-      + netDescribe(value) + '.');
+      (listen ? 'options.port' : 'Port') + ' should be ' + (positive ? '> 0' : '>= 0')
+      + ' and < 65536. Received ' + netDescribe(value) + '.');
   }
   return port;
 }
@@ -2647,6 +2650,14 @@ BF['dgram'] = function () {
       this._refed = true;
       this._holding = false;
       this._remote = null;
+      /* Whether a connect is under way, which is not the same as being connected: host Node 24.15
+         sets its connect state before anything in connect() can fail, so a second connect answers
+         ERR_SOCKET_DGRAM_IS_CONNECTED while the first is still resolving, and after one that died
+         on a closed handle. */
+      this._connecting = false;
+      /* Whether the socket ever reached listening. A close clears _bound, where a host's close
+         leaves its bind state behind, so this is what connect() on a closed socket reads. */
+      this._wasBound = false;
       this._recvBufferSize = undefined;
       this._sendBufferSize = undefined;
       /* The groups this socket has joined, and the source-specific ones. A group a socket joined
@@ -2663,8 +2674,8 @@ BF['dgram'] = function () {
          a dgram socket's in a native handle, so Object.keys of one is its own type and nothing
          else. This socket reads them by name, so hiding them changes nothing else. */
       var hidden = ['_family', '_hubId', '_targetId', '_bound', '_binding', '_dead', '_address',
-        '_refed', '_holding', '_remote', '_recvBufferSize', '_sendBufferSize', '_joined', '_sources',
-        '_sourceGroups'];
+        '_refed', '_holding', '_remote', '_connecting', '_wasBound', '_recvBufferSize',
+        '_sendBufferSize', '_joined', '_sources', '_sourceGroups'];
       for (var h = 0; h < hidden.length; h++) {
         Object.defineProperty(this, hidden[h], {
           value: this[hidden[h]], writable: true, enumerable: false, configurable: true
@@ -2755,6 +2766,9 @@ BF['dgram'] = function () {
         if (listeningSocket._dead || !listeningSocket._binding) return;
         listeningSocket._binding = false;
         listeningSocket._bound = true;
+        /* Remembered past a close, which clears _bound: a host's close leaves its bind state
+           behind, and connect() on the closed socket is answered from it. */
+        listeningSocket._wasBound = true;
         listeningSocket.emit('listening');
       });
       return this;
@@ -2880,14 +2894,30 @@ BF['dgram'] = function () {
 
     connect() {
       var args = netBindArgs(arguments);
-      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
-      if (this._remote !== null) throw netError(Error, 'ERR_SOCKET_DGRAM_IS_CONNECTED', 'Already connected');
-      var port = netPortOf(args.port);
+      /* The order host Node 24.15 reads these in, which is what a caller sees: the port is refused
+         before the socket's own state is looked at, so a closed socket handed a port it would
+         refuse answers ERR_SOCKET_BAD_PORT and not the error its state gives. */
+      var port = netPortOf(args.port, false, true);
+      /* The connect state a host keeps is set before anything in connect() can fail, so a second
+         connect answers ERR_SOCKET_DGRAM_IS_CONNECTED while the first is still resolving, and
+         after one that died on a closed handle. A failed lookup and a disconnect are what clear
+         it; a close is not, which is why a socket connected before its close still answers this. */
+      if (this._remote !== null || this._connecting) {
+        throw netError(Error, 'ERR_SOCKET_DGRAM_IS_CONNECTED', 'Already connected');
+      }
+      this._connecting = true;
+      /* A closed socket has no handle, and what that costs depends on whether it was ever bound:
+         one that was not falls into connect()'s own bind and answers that bind's
+         ERR_SOCKET_DGRAM_NOT_RUNNING, while one that was gets as far as the handle's lookup and
+         fails there, as host Node 24.15 does, on a TypeError that carries no code. */
+      if (this._dead && !this._wasBound) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
+      if (this._dead) throw new TypeError("Cannot read properties of null (reading 'lookup')");
       if (!this._bound && !this._binding) this.bind(0);
       if (typeof args.cb === 'function') this.once('connect', args.cb);
       var self = this;
       netResolve(args.address, this._family === 'IPv6' ? 6 : 4, function (failure, resolved) {
         if (failure) {
+          self._connecting = false;
           self.emit('error', failure);
           return;
         }
@@ -2900,9 +2930,14 @@ BF['dgram'] = function () {
     disconnect() {
       if (this._remote === null) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_CONNECTED', 'Not connected');
       this._remote = null;
+      this._connecting = false;
     }
 
     remoteAddress() {
+      /* A host asks its handle first: a closed socket is not running whether or not it ever
+         connected, and ERR_SOCKET_DGRAM_NOT_CONNECTED is what a live socket that never did
+         answers -- so the two are told apart by the state the host reads first. */
+      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
       if (this._remote === null) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_CONNECTED', 'Not connected');
       return { address: this._remote.address, family: this._remote.family, port: this._remote.port };
     }
