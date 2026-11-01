@@ -62,8 +62,13 @@ function formatErrorStack(err) {
   }
   if (err.message) header += header === '' ? String(err.message) : ': ' + err.message;
   var stack = rawStack;
-  var lines = stack === '' ? [] : guestFramesOf(stack.split('\n'));
-  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  /* A stack the engine built ends with an empty line of its own, and the frames of the ESM loader
+     go behind the last frame of the run's entry -- which is the empty line while it is still there,
+     so an error the engine raised itself came out of this with no loader frames behind it and, one
+     frame being no stack at all, as a bare line in brackets with no header in front of it. */
+  var raw = stack === '' ? [] : stack.split('\n');
+  while (raw.length > 0 && raw[raw.length - 1] === '') raw.pop();
+  var lines = guestFramesOf(raw);
   var body = lines.join('\n');
   /* The header the error's own stack carries is the one node prints for a plain error and the one
      it drops when it prints 'Z [Error]: s' instead: the stack of a subclass opens with 'Error: s',

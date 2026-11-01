@@ -1,0 +1,50 @@
+owc-esm-engine-error-no-block resolved 1793564588784-11638-5591b5c7f73a7ec5 2026-11-01T20:26:15.321Z
+Row: owc-esm-engine-error-no-block
+Witness: 1793564588784-11638-5591b5c7f73a7ec5
+Status: resolved
+
+Symptom
+  An error the engine raised itself in an ES module -- `const o = null; o.x = 1;`, `notDefined();` --
+  came out of this container as one bare line: '[    at file:///app/w.mjs:2:2]' for the TypeError and
+  '[    at file:///app/w.mjs:1:1]' for the ReferenceError. No banner, no source line, no caret, no
+  name or message, no frames of the loader behind it, and exit 1. Host node 24.15 writes the whole
+  block: 'file:///app/w.mjs:2', the line 'o.x = 1;', a caret, 'TypeError: Cannot set properties of
+  null (setting 'x')', the frame, the three frames of its ESM loader and 'Node.js v24.15.0'. The same
+  body in a CommonJS file was reported with a block here, so it was not the shape of a report that
+  was missing but the frames the shape is built from.
+
+Cause
+  A stack the engine built ends with an empty line of its own, and formatErrorStack (guest
+  util-assert.ts) hands that split -- trailing empty line and all -- to guestFramesOf, which puts the
+  frames of node's ESM loader behind the LAST frame of the list. The last of the list is the empty
+  line, so none were put behind anything, and a body of one frame is no stack at all to
+  formatErrorStack: it prints such a one in brackets, as node prints a stack no frame stands in, and
+  the header it would have written in front of it goes with it. An error the guest constructed never
+  met it, because framesOfEngineStack drops the empty line before it calls guestFramesOf -- which is
+  why a `throw new Error()` in the same module was reported in full and an engine-raised one was not.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/util-assert.ts
+    formatErrorStack drops the empty line the engine ends a stack with before it asks for the frames,
+    the way framesOfEngineStack already did. An error the engine raised in the module a run started
+    with is then a stack whose last frame is that module's, so the three frames of node's ESM loader
+    go behind it as they do behind any other, and what the host reads is a header and frames and not a
+    single line in brackets -- which is the block, the caret, the message and the version trailer it
+    has always written over one.
+
+Witness
+  dispatch 1793564588784-11638-5591b5c7f73a7ec5, session verify-esm-noblock, on a fresh export of
+  origin/main 0f0b6abb35ac30ed8726ccb0039f8861d0f7903b (git archive, pnpm build in packages/core),
+  host node v24.15.0 on the other side, one fresh container boot per run, stdout + stderr + exit code
+  compared, at two memory points (load 13.88 with 3.24 GB free, load 10.93 with 2.09 GB free):
+  esm-typeerror and esm-reference, which were '[    at file:///app/w.mjs:2:2]' and
+  '[    at file:///app/w.mjs:1:1]' before the fix, are now the block the host writes -- file URL and
+  line, source line, caret, message, the frame as a file URL, the three ESM loader frames, the version
+  line. Measured against a build of the same tree without the fix in the same runs: both differed
+  there and differ here only in what is left below.
+
+Residual, not this row
+  What still differs is the engine's wording and the column the engine names: 'cannot set property
+  'x' of null' at 2:3 where host node writes 'Cannot set properties of null (setting 'x')' at 2:5,
+  and "'notDefined' is not defined" where it writes 'notDefined is not defined'. The same two
+  differences the CommonJS control has had all along, and a class of their own.
