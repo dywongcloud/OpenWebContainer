@@ -4167,8 +4167,12 @@ export class NodeProcess extends Process {
         }
         if (answer === '') return undefined;
         const hooked = JSON.parse(answer) as { source: string | null; format: string | null };
-        if (hooked.format === 'commonjs') return { value: this.syntheticModule(file, false) };
         const text = typeof hooked.source === 'string' ? hooked.source : source;
+        if (hooked.format === 'commonjs') return { value: this.syntheticModule(file, false) };
+        /* A format of 'json' is a JSON module, which is compiled as one and not as the ES module
+           every other answer is compiled as: a hook that answers a JSON source has answered a
+           JSON module, the way the file behind one is. */
+        if (hooked.format === 'json') return { value: this.jsonModuleSource(text, file) };
         return { value: this.esmSource(text, file, false, suffix, dynamic) };
     }
 

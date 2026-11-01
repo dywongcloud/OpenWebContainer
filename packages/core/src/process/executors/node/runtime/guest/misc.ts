@@ -5744,7 +5744,7 @@ BF.module = function () {
      hook that hands the call on, like one that was never registered, answers nothing, and the
      loader resolves as it always has. */
   function unsupportedResolveRequest(specifier, base) {
-    var err = new Error('Failed to resolve module specifier "' + specifier + '" from "' + base
+    var err = new TypeError('Failed to resolve module specifier "' + specifier + '" from "' + base
       + '": Invalid relative URL or base scheme is not hierarchical.');
     err.code = 'ERR_UNSUPPORTED_RESOLVE_REQUEST';
     return err;
@@ -5752,21 +5752,76 @@ BF.module = function () {
 
   /* Node declares one parameter and reads the other two off its arguments -- the parent URL and the
      options both default -- so a caller that reads register.length sees 1 there. */
+  /* Node resolves the specifier as a URL against the parent URL -- against 'data:', which is not
+     hierarchical, when there is none -- so what decides a registration is whether the specifier
+     names a URL and not whether a file stands behind it: 'node:fs' resolves there as it does here,
+     and a relative specifier with no parent fails in both. */
+  var REGISTER_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+  function schemePartOf(url) {
+    var at = url.indexOf(':');
+    return at < 0 ? '' : url.slice(0, at + 1).toLowerCase();
+  }
+  /* Whether a relative specifier can be resolved against this base: 'data:', the one node falls
+     back to when no parent URL was given, is not hierarchical and cannot carry one. */
+  function hierarchicalBase(base) {
+    var scheme = schemePartOf(base);
+    if (scheme === '') return false;
+    if (scheme === 'file:') return true;
+    return base.indexOf('://') === scheme.length - 1;
+  }
+  function pathOfFileUrl(url) {
+    var hash = url.indexOf('#');
+    var query = url.indexOf('?');
+    var at = hash < 0 ? query : query < 0 ? hash : Math.min(hash, query);
+    var path = (at < 0 ? url : url.slice(0, at)).slice('file://'.length);
+    try { return decodeURIComponent(path); } catch (decodeErr) { return path; }
+  }
+  function pathOfUrl(url) {
+    return url.indexOf('file://') === 0 ? pathOfFileUrl(url) : url;
+  }
+  function packageNotFound(spec, from) {
+    var err = new Error("Cannot find package '" + spec + "' imported from " + from);
+    err.code = 'ERR_MODULE_NOT_FOUND';
+    return err;
+  }
+  function unsupportedUrlScheme(url) {
+    var err = new Error('Only URLs with a scheme in: file and data are supported by the default ESM'
+      + ' loader. Received protocol ' + "'" + schemePartOf(url) + "'");
+    err.code = 'ERR_UNSUPPORTED_ESM_URL_SCHEME';
+    return err;
+  }
   Module.register = function register(specifier) {
     var parentURL = arguments[1];
     var options = arguments[2];
     var spec = typeof specifier === 'string' ? specifier : String(specifier);
     var base = typeof parentURL === 'string' && parentURL.length > 0 ? parentURL : 'data:';
-    var resolved = '';
-    if (base !== 'data:') {
-      var from = base.indexOf('file://') === 0 ? base.slice(7) : base;
-      var cut = from.lastIndexOf('/');
-      resolved = host.resolve(spec, cut > 0 ? from.slice(0, cut) : '/', 'require');
-    } else if (spec.charAt(0) !== '.' && spec.charAt(0) !== '/') {
-      resolved = host.resolve(spec, host.cwd(), 'require');
+    var hierarchical = hierarchicalBase(base);
+    var url = '';
+    if (REGISTER_SCHEME.test(spec)) url = spec;
+    /* A built-in name is a URL of its own, which is why register('fs') is not a failure where
+       register('nope') is one: node resolves the one and cannot resolve the other. */
+    else if (isBuiltinName(spec)) url = 'node:' + stripNodePrefix(spec);
+    else if (spec.charAt(0) === '.' || spec.charAt(0) === '/') {
+      if (hierarchical) { try { url = new URL(spec, base).href; } catch (urlErr) { url = ''; } }
+    } else if (hierarchical) {
+      /* A bare specifier against a file is a package name, which the host looks up as one. */
+      var from = dirnameOf(pathOfUrl(base));
+      var found = host.resolve(spec, from, 'import');
+      if (!found) throw packageNotFound(spec, pathOfUrl(base));
+      url = fileUrlOf(found);
     }
-    if (!resolved) throw unsupportedResolveRequest(spec, base);
-    adoptLoaderModule(resolved);
+    /* Any other bare specifier is one no base can carry: a URL that does not resolve, which is
+       the failure register() reports. */
+    if (url === '') throw unsupportedResolveRequest(spec, base);
+    var scheme = schemePartOf(url);
+    /* The schemes the default loader reads a module from: a URL under any other is one it names as
+       unsupported, which is the failure register() raises for it. */
+    if (scheme !== 'file:' && scheme !== 'data:' && scheme !== 'node:') throw unsupportedUrlScheme(url);
+    /* Only a file the loader can evaluate carries hooks: every other URL -- 'node:fs', a data:
+       URL -- is one node hands to a thread that finds no hooks in it either. */
+    if (scheme === 'file:') adoptLoaderModule(pathOfFileUrl(url));
+    else setModuleHooks(null, null, false);
+    host.hooksChanged();
     return undefined;
   };
   Module.registerHooks = function registerHooks(hooks) {
@@ -5776,10 +5831,8 @@ BF.module = function () {
       err.code = 'ERR_INVALID_ARG_TYPE';
       throw err;
     }
-    hookResolveFn = typeof hooks.resolve === 'function' ? hooks.resolve : null;
-    hookLoadFn = typeof hooks.load === 'function' ? hooks.load : null;
-    hookForRequire = true;
-    hooksChanged();
+    setModuleHooks(hooks.resolve, hooks.load, true);
+    host.hooksChanged();
     /* Node hands back a ModuleHooks carrying the two hooks a caller gave, as own keys worth
        undefined where it gave none. */
     return { resolve: hooks.resolve, load: hooks.load };

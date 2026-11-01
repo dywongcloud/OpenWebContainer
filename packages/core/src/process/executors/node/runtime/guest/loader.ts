@@ -445,6 +445,109 @@ function makeRequire(mod) {
   return req;
 }
 
+/* Module customization hooks. Module.register and Module.registerHooks -- both in misc.ts -- record
+   what a caller gives them here, and nothing else in the loader knows a hook was registered except
+   through these three names. hookForRequire is the difference between the two: the hooks
+   registerHooks() takes run on this thread, so a require() asks them too, while the loader module
+   register() names runs where node runs it -- off the CommonJS path, over the ES module graph,
+   which the host asks about through api.hooksResolve and api.hooksLoad. */
+var hookResolveFn = null;
+var hookLoadFn = null;
+var hookForRequire = false;
+
+function setModuleHooks(resolveFn, loadFn, forRequire) {
+  hookResolveFn = typeof resolveFn === 'function' ? resolveFn : null;
+  hookLoadFn = typeof loadFn === 'function' ? loadFn : null;
+  hookForRequire = forRequire === true;
+}
+
+/* A hook that answers a promise is asked and not awaited, the way node asks one: a resolution this
+   loader makes is synchronous, and a promise cannot change what it resolves to. */
+function hookAnswerOf(answer) {
+  if (answer === null || typeof answer !== 'object') return undefined;
+  if (typeof answer.then === 'function') return undefined;
+  return answer;
+}
+
+/* The file behind a url a hook answered, or undefined for one no file stands behind -- a 'virtual:'
+   name, the way a module a hook makes up is one in node. */
+function hookPathOf(url) {
+  if (typeof url !== 'string' || url.indexOf('file://') !== 0) return undefined;
+  var hash = url.indexOf('#');
+  var query = url.indexOf('?');
+  var at = hash < 0 ? query : query < 0 ? hash : Math.min(hash, query);
+  var path = (at < 0 ? url : url.slice(0, at)).slice('file://'.length);
+  try { return decodeURIComponent(path); } catch (e) { return path; }
+}
+
+/* What a registered resolve hook answers for 'spec': the url it resolves to, or undefined when the
+   loader is to resolve it as it always has. */
+function hooksResolveFor(spec, parentURL, defaultURL, baseDir, mode) {
+  if (hookResolveFn === null) return undefined;
+  var context = Object.create(null);
+  context.conditions = mode === 'require' ? ['node', 'require'] : ['node', 'import'];
+  context.importAttributes = Object.create(null);
+  context.parentURL = typeof parentURL === 'string' && parentURL !== '' ? parentURL : undefined;
+  var nextResolve = function nextResolve(nextSpec) {
+    var wanted = typeof nextSpec === 'string' ? nextSpec : spec;
+    if (wanted === spec) return { url: defaultURL, format: null, shortCircuit: true };
+    var base = typeof baseDir === 'string' && baseDir !== '' ? baseDir : host.cwd();
+    var found = host.resolve(wanted, base, mode === 'require' ? 'require' : 'import');
+    return { url: found ? fileUrlOf(found) : '', format: null, shortCircuit: true };
+  };
+  var answer = hookAnswerOf(hookResolveFn(spec, context, nextResolve));
+  if (answer === undefined) return undefined;
+  return typeof answer.url === 'string' && answer.url !== '' ? answer.url : undefined;
+}
+
+/* What a registered load hook answers for the module named 'url': the source it is compiled from
+   and the format it is compiled as, or undefined when the loader is to read the file itself. */
+function hooksLoadFor(url, source, defaultFormat, mode) {
+  if (hookLoadFn === null) return undefined;
+  var context = Object.create(null);
+  context.conditions = mode === 'require' ? ['node', 'require'] : ['node', 'import'];
+  context.importAttributes = Object.create(null);
+  context.format = defaultFormat;
+  var nextLoad = function nextLoad(nextUrl, nextContext) {
+    var format = nextContext !== null && typeof nextContext === 'object' && typeof nextContext.format === 'string'
+      ? nextContext.format : defaultFormat;
+    return { format: format, source: source, shortCircuit: true };
+  };
+  var answer = hookAnswerOf(hookLoadFn(url, context, nextLoad));
+  if (answer === undefined) return undefined;
+  /* A hook that hands the call on -- one answering the source it was given under the format it
+     was given it under -- has changed nothing, and the module is read and compiled as it always
+     has: a JSON module stays a JSON module and a CommonJS one a CommonJS one, neither of which
+     the answer of a hook is what makes them. */
+  if (answer.source === source && answer.format === defaultFormat) return undefined;
+  var out = { source: null, format: null };
+  if (typeof answer.source === 'string') out.source = answer.source;
+  if (typeof answer.format === 'string') out.format = answer.format;
+  return out;
+}
+
+/* The loader module register() named, evaluated as an ES module for the hooks it exports, which are
+   its own 'resolve' and its own 'load'. It is evaluated on this thread, so a failure evaluating it
+   is the failure register() throws -- the hooks thread node starts reports the same error, at the
+   same call. Node's other form, a default export it calls as initialize() for the hooks that call
+   hands back, is one this node never calls: measured against host node 24.15 with a load hook that
+   would have changed a module it loaded, and with a wait long enough for the thread to have run,
+   initialize() is not called and those hooks are never asked -- so a module written that way
+   registers no hooks here either. */
+function adoptLoaderModule(file) {
+  var token = nextEsmToken++;
+  var failure = host.esmLoad(file, token);
+  if (failure) throw requireEsmFailureOf(failure);
+  var registry = globalThis.__owc_esm_registry || {};
+  var namespace = registry[token];
+  delete registry[token];
+  /* A graph with a top-level await: the module is not finished, so there are no hooks to ask. */
+  if (namespace === undefined) return undefined;
+  if (namespace === null || typeof namespace !== 'object') return undefined;
+  setModuleHooks(namespace.resolve, namespace.load, false);
+  return undefined;
+}
+
 function requireFrom(parent, id) {
   if (typeof id !== 'string') {
     throw new TypeError('The "id" argument must be of type string. Received ' + typeof id);
@@ -462,6 +565,12 @@ function requireFrom(parent, id) {
   var base = parent && parent.path ? parent.path : host.cwd();
   var filename = host.resolve(id, base, 'require');
   if (!filename) throw notFoundError(id, base, parent);
+  /* A resolve hook registered through registerHooks(): the url it answers is the file required. */
+  if (hookForRequire) {
+    var hooked = hookPathOf(hooksResolveFor(id, parent && parent.filename ? fileUrlOf(parent.filename) : '',
+      fileUrlOf(filename), base, 'require'));
+    if (hooked !== undefined) filename = hooked;
+  }
   return loadCJS(filename, parent, false).exports;
 }
 
@@ -722,6 +831,12 @@ function loadCJS(filename, parent, isMain) {
         return loadEsmFromRequire(filename, mod);
       }
       var src = stripHashbang(readSource(filename));
+      /* A load hook registered through registerHooks(): the source it answers is what the module is
+         compiled from, and a hook that hands the call on is given the file's own. */
+      if (hookForRequire) {
+        var hookedLoad = hooksLoadFor(fileUrlOf(filename), src, 'commonjs', 'require');
+        if (hookedLoad !== undefined && typeof hookedLoad.source === 'string') src = hookedLoad.source;
+      }
       var wrapper = compileCjsWrapper(src, filename);
       /* The body runs as this file, so a new Function it builds -- and a dynamic import in that
          body -- is resolved from here, as it is in Node. */
@@ -1872,6 +1987,18 @@ var api = {
   },
   uptimeMs: function () {
     return host.now() - startedAt;
+  },
+  /* Module customization hooks, asked by the host on behalf of the ES module graph: it resolves and
+     loads every module of that graph itself, so a hook is asked there as it is asked here for a
+     require(). '' is the loader's own answer -- no hook, one that handed the call on, one that
+     answered a promise -- and an answer is the url, or the source and format, the hook gave. */
+  hooksResolve: function (spec, parentURL, defaultURL) {
+    var url = hooksResolveFor(spec, parentURL, defaultURL, undefined, 'import');
+    return url === undefined ? '' : url;
+  },
+  hooksLoad: function (url, source, defaultFormat) {
+    var answer = hooksLoadFor(url, source, defaultFormat, 'import');
+    return answer === undefined ? '' : JSON.stringify(answer);
   }
 };
 `;

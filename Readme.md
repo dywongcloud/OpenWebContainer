@@ -1941,7 +1941,7 @@ Rows this shard carried, each with its witness:
   `Buffer`), shell `;` and `|`, `WebSocket` handshakes, and RSA, DSA and `dh` key generation, and `process.kill(process.pid, 'SIGUSR1')` running the handler -- and, with no handler registered for it, answering `true` and leaving the process running, as host Node does when it opens its inspector. What is left is
   carried by its own row each: `getCiphers()` 55 against 130 with `aria`, `camellia`, `des-ede*`,
   `sm4`, `aes-128-ccm` and `aes-128-ocb` still refused, `zlib`'s `maxOutputLength`,
-  `v8.serialize`'s JSON text, `module.register`/`registerHooks`/`stripTypeScriptTypes`/
+  `v8.serialize`'s JSON text, `stripTypeScriptTypes`/
   `enableCompileCache`, `inspector` beyond `Runtime.enable` -- `Runtime.evaluate` itself ignores `returnByValue` (an object answers `{type:'object',className:'Object',description:'{ a: 1 }'}` here against `{type:'object',value:{a:1}}` on the host, though `1+1` is host-identical), no `inspectorNotification` is ever emitted (host Node emits `Runtime.executionContextCreated` and `Runtime.consoleAPICalled`), and an unknown method is refused with the same `Inspector protocol is not available in this runtime` an unimplemented one gets, where the host says `Inspector error -32601: 'Bogus.method' wasn't found`,
   `fs.glob`/`globSync`/`Utf8Stream`, the `zlib` native-handle internals, `tls.getCiphers()` 3
   against 62 with no root certificates, and the rejection of an `async function`'s own promise.
@@ -2027,6 +2027,17 @@ source}` is what that module is compiled from, and a `resolve` answering a url n
 shapes stay with the default loader as they do on host Node 24.15: a hook that hands back a promise, which node would
 await in its own loader thread, and a `register` hook over a `require()` of a name it would rewrite (row
 `owc-module-hooks-never-invoked`).
+
+Both registrations answer what host node 24.15 answers. `module.register` returns `undefined` for a
+specifier it resolves and raises `ERR_UNSUPPORTED_RESOLVE_REQUEST` for one it does not: the specifier
+is resolved as a URL against the parent URL, and against `data:` -- which is not hierarchical -- when
+there is none, so `register('node:fs')` and `register('./loader.mjs', import.meta.url)` are
+registrations where `register('./loader.mjs')` is not, and a bare name is resolved as a package is.
+The loader module it names is evaluated as an ES module for the hooks it exports, and a failure
+evaluating it -- a module that throws, a file that is not there -- is what `register` throws.
+`module.registerHooks` hands back a `ModuleHooks` whose own keys are `resolve` and `load`, worth
+`undefined` where the caller gave none. Rows `owc-module-register-referenceerror` and
+`owc-module-registerhooks-referenceerror`.
 
 Still measured and not fixed, each with its site: five of the 72 `builtinModules` are not requirable
 though `Module.isBuiltin` answers `true` for them, each because there is nothing here to put behind the name --
