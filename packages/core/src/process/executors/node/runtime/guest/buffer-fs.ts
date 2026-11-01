@@ -2297,6 +2297,79 @@ BF.fs = function () {
     return f.charAt(0) === 'r' || f.charAt(0) === 'w' || f.charAt(0) === 'a' ? f.charAt(0) : f.charAt(1);
   }
 
+  /*
+   * A number is a set of flags and not the name of one, and Node hands it to open(2) as it stands:
+   * fs.openSync(dir, fs.constants.O_DIRECTORY) and fs.openSync(link, fs.constants.O_NOFOLLOW) are
+   * both ordinary opens on host node 24.15, and were REFUSED here with "The argument 'flags' is
+   * invalid. Received '1048576'" -- the error a string that is not in the table above gets -- because
+   * every flag that was not a string was turned into one and looked up in that table.
+   *
+   * The two low bits are the access mode -- 0 reads, 1 writes, 2 does both, and 3 is not a mode a
+   * host will take, which is the EINVAL it answers -- and the rest are the options a program ORs
+   * into it: O_CREAT makes a name that is not there, O_EXCL refuses one that already is, O_TRUNC
+   * empties it, O_APPEND writes at its end, O_DIRECTORY asks for a directory and nothing else, and
+   * O_NOFOLLOW refuses a last part that is a link. A bit no flag stands for is the EINVAL of an
+   * open(2) that will not take it either, which is what 3, 999999 and -1 all are. These are the
+   * numbers this platform's fs.constants carries -- O_APPEND 8, O_CREAT 512, O_TRUNC 1024,
+   * O_EXCL 2048, O_NOFOLLOW 256, O_DIRECTORY 1048576 -- and the table above is their names.
+   *
+   * Neither O_WRONLY nor O_CREAT alone is the 'w' of the string table: 'w' both makes a name and
+   * empties it, and a host's O_WRONLY does neither, so what each of the two asks for is read out of
+   * the number separately rather than by mapping the number onto a string.
+   */
+  var O_APPEND = 8;
+  var O_CREAT = 512;
+  var O_TRUNC = 1024;
+  var O_EXCL = 2048;
+  var O_NOFOLLOW = 256;
+  var O_DIRECTORY = 1048576;
+  var O_SYMLINK = 2097152;
+  var O_KNOWN_BITS = 3 | 4 | O_APPEND | 16 | 32 | 64 | 128 | O_NOFOLLOW | O_CREAT | O_TRUNC | O_EXCL | 131072 | O_DIRECTORY | O_SYMLINK | 4194304;
+
+  function parseFlags(flags, name) {
+    var f = flags === undefined || flags === null ? 'r' : flags;
+    if (typeof f !== 'number') {
+      var s = String(f);
+      if (VALID_FLAGS.indexOf(s) < 0) throw badFlagError(flags);
+      var letter = flagLetter(s);
+      return {
+        text: s,
+        letter: letter,
+        plus: s.indexOf('+') >= 0,
+        creates: letter === 'w' || letter === 'a',
+        truncates: letter === 'w',
+        appends: letter === 'a',
+        exclusive: s.indexOf('x') >= 0,
+        directory: false,
+        nofollow: false,
+        writes: letter !== 'r',
+        symlink: false
+      };
+    }
+    /* A fraction is not a set of flags at all, and Node says so in its own words before it asks the
+       kernel anything: "The value of "flags" is out of range. It must be an integer. Received 1.5". */
+    if (f !== f || f === Infinity || f === -Infinity || f !== Math.floor(f)) {
+      throw fsArgErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "flags" is out of range. It must be an integer. Received ' + f);
+    }
+    if ((f & 3) === 3 || (f & ~O_KNOWN_BITS) !== 0) throw fsError('EINVAL', 'open', name);
+    var access = f & 3;
+    return {
+      text: String(f),
+      letter: access === 0 ? 'r' : access === 1 ? 'w' : 'r+',
+      plus: access === 2,
+      creates: (f & O_CREAT) !== 0,
+      truncates: (f & O_TRUNC) !== 0,
+      appends: (f & O_APPEND) !== 0,
+      exclusive: (f & O_EXCL) !== 0,
+      directory: (f & O_DIRECTORY) !== 0,
+      nofollow: (f & O_NOFOLLOW) !== 0,
+      /* O_WRONLY and O_RDWR are the two access modes that write; O_RDONLY is the one that does not.
+         O_SYMLINK names the link itself rather than the name behind it. */
+      writes: (f & 3) !== 0,
+      symlink: (f & O_SYMLINK) !== 0
+    };
+  }
+
   var DESCRIPTORS = {};
 
   /*
@@ -2375,49 +2448,77 @@ BF.fs = function () {
   }
 
   fs.openSync = function (p, flags, mode) {
-    var f = flags === undefined || flags === null ? 'r' : String(flags);
-    if (VALID_FLAGS.indexOf(f) < 0) throw badFlagError(flags);
+    var name = pathName(p);
+    var f = parseFlags(flags, name);
     var given = toPathString(p);
     /* An open of a link opens the file the link names, as a host's open(2) does: the descriptor
        that comes back is one on the target, so a write through it reaches the target and the bytes
        it was opened with are the target's. Every part of the path is resolved, so a name under a
        link to a directory opens the file the directory holds. Errors still name the path the caller
        handed over: given is that name, and file is what it resolves to. */
-    var file = resolvePath(given, 'open', pathName(p));
-    var name = pathName(p);
-    var letter = flagLetter(f);
-    var creates = letter === 'w' || letter === 'a';
+    var file = resolvePath(given, 'open', name);
+    /* O_NOFOLLOW is a refusal to open a link: the last part of the name is one, so the open stops
+       there with the ELOOP a host's open(2) raises, and the name it prints is the one the caller
+       wrote. A name whose last part is not a link is opened as it is, which is why O_NOFOLLOW is no
+       refusal of a plain file or of a directory. */
+    if (f.nofollow && SYMLINKS[given] !== undefined) throw fsError('ELOOP', 'open', name);
     var st = statOf(file);
     var isDir = !!(st && st.type === 'dir');
+    /* O_SYMLINK opens the link itself and not the name it points at: what the descriptor holds is the
+       link's own bytes -- the target written inside it, one byte a character -- so a link opened this
+       way is as long as the name in it, where the same link opened any other way is as long as the
+       file behind it. A host's open(2) does the same, and its fstat answers the link's own size. */
+    var linkTarget = f.symlink && SYMLINKS[given] !== undefined
+      ? (LINKTARGETS[given] !== undefined ? LINKTARGETS[given] : SYMLINKS[given])
+      : undefined;
+    /* O_DIRECTORY asks for a directory and for nothing else: a name that is there and is not one is
+       the ENOTDIR a host answers, and a name that is not there at all is still the ENOENT below. */
+    if (f.directory && st && !isDir && linkTarget === undefined) throw fsError('ENOTDIR', 'open', name);
+    /* A directory takes an open that reads it and refuses every one that would change it: O_WRONLY
+       and O_RDWR ask to write it and O_TRUNC asks to empty it, and a host answers EISDIR to all
+       three rather than hand back a descriptor it will not let be written through. */
+    if (isDir && (f.writes || f.truncates)) throw fsError('EISDIR', 'open', name);
     /* What the flags ask for is what the mode is checked against, at the open: 'r' needs the read
        bit, 'w' and 'a' the write bit, and a '+' both. A name that is not there yet is checked
        against the directory it would be made in. */
-    requireAccess(file, (letter === 'r' || f.indexOf('+') >= 0 ? 4 : 0) | (letter === 'r' && f.indexOf('+') < 0 ? 0 : 2), 'open', undefined, undefined, name);
+    requireAccess(file, (f.letter === 'r' || f.plus ? 4 : 0) | (f.letter === 'r' && !f.plus ? 0 : 2), 'open', undefined, undefined, name);
     /* An 'x' in the flags is O_EXCL: the open is the creation of the name and fails when the name is
        already there, which is how a lock file and a cache write both ask for one writer. */
-    if (creates && f.indexOf('x') >= 0 && st) throw fsError('EEXIST', 'open', name);
-    if (creates) {
-      if (isDir) throw fsError('EISDIR', 'open', name);
+    if (f.creates && f.exclusive && st) throw fsError('EEXIST', 'open', name);
+    if (f.creates) {
       /* A mode belongs to the creation and to nothing else: the name a 'w' truncates keeps the bits
          it already has, the way a host's open(2) applies O_CREAT's mode only when it makes the name.
          The default is the one a host leaves -- 0o666 for a file, masked with the umask. */
       if (!st) check(host.writeBase64(file, encodeBase64(new Uint8Array(0)), newMode(mode, 0o666)), 'open', file, name);
-      else if (letter === 'w') check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file, name);
+      else if (f.truncates) check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file, name);
     } else if (!st) {
       throw fsError('ENOENT', 'open', name);
     }
-    var bytes = letter === 'w' || !st || isDir ? new Uint8Array(0) : readBytesOf(file);
+    /* O_TRUNC empties the name whatever else the number carried: the bit is a request of its own and
+       a host honours it on a name that is already there as it does on one O_CREAT has just made. */
+    if (f.truncates && !f.creates && st && !isDir && linkTarget === undefined) {
+      check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file, name);
+    }
+    var bytes = linkTarget !== undefined ? writeBytes(linkTarget)
+      : f.truncates || !st || isDir ? new Uint8Array(0) : readBytesOf(file);
+    /* A descriptor opened for reading is not one opened for writing, whatever else its number
+       carried: O_WRONLY writes though it named no O_CREAT, and O_RDONLY does not write though it
+       named every other bit there is. */
+    var writable = f.letter !== 'r';
     var fd = allocateDescriptor();
     DESCRIPTORS[fd] = {
       path: file,
-      flags: f,
+      flags: f.text,
       device: !isDir && !!st && isCharacterDevice(st),
       bytes: bytes,
-      position: letter === 'a' ? bytes.length : 0,
-      writable: creates || f.indexOf('+') >= 0,
-      readable: letter === 'r' || f.indexOf('+') >= 0,
+      /* An append starts at the end of what is already there, and only when the open was for
+         writing: O_APPEND on a descriptor opened for reading leaves a read at the beginning, which
+         is where host node 24.15 leaves it. */
+      position: f.appends && writable ? bytes.length : 0,
+      writable: writable,
+      readable: f.letter === 'r' || f.plus,
       isDir: isDir,
-      dirty: creates || f.indexOf('+') >= 0
+      dirty: writable
     };
     return fd;
   };
@@ -3387,8 +3488,23 @@ BF.fs = function () {
     this.fd = fd;
   }
 
-  function handleCall(work) {
+  /*
+   * The words a host puts on an operation asked of a handle whose close() has already run: the
+   * descriptor is -1 and host node 24.15 answers "file closed" -- EBADF, with the syscall of the
+   * operation that was asked for and no path and no errno on it -- where this used to answer the
+   * "bad file descriptor, <syscall>" of a number that was never open. The two are different errors
+   * to a caller and only one of them is what a host says.
+   */
+  function closedError(syscall) {
+    var err = new Error('file closed');
+    err.code = 'EBADF';
+    err.syscall = syscall;
+    return err;
+  }
+
+  function handleCall(handle, syscall, work) {
     try {
+      if (handle !== null && handle !== undefined && handle.fd === -1) throw closedError(syscall);
       return Promise.resolve(work());
     } catch (err) {
       return Promise.reject(err);
@@ -3407,7 +3523,7 @@ BF.fs = function () {
     var len = opts ? (opts.length === undefined ? buf.length - off : opts.length)
       : (typeof length === 'number' ? length : buf.length - off);
     var at = opts ? opts.position : position;
-    return handleCall(function () {
+    return handleCall(self, 'read', function () {
       var n = at === undefined || at === null
         ? fs.readSync(self.fd, buf, off, len)
         : fs.readSync(self.fd, buf, off, len, at);
@@ -3417,7 +3533,7 @@ BF.fs = function () {
 
   FileHandle.prototype.readv = function (buffers, position) {
     var self = this;
-    return handleCall(function () {
+    return handleCall(self, 'readv', function () {
       var n = position === undefined || position === null
         ? fs.readvSync(self.fd, buffers)
         : fs.readvSync(self.fd, buffers, position);
@@ -3431,7 +3547,7 @@ BF.fs = function () {
       var enc = typeof offset === 'string' ? offset : typeof length === 'string' ? length : undefined;
       var strAt = typeof offset === 'number' ? offset : typeof length === 'number' ? length
         : typeof position === 'number' ? position : undefined;
-      return handleCall(function () {
+      return handleCall(self, 'write', function () {
         var n = strAt === undefined ? fs.writeSync(self.fd, buffer, undefined, enc)
           : fs.writeSync(self.fd, buffer, strAt, enc);
         return { bytesWritten: n, buffer: buffer };
@@ -3439,7 +3555,7 @@ BF.fs = function () {
     }
     var off = typeof offset === 'number' ? offset : 0;
     var len = typeof length === 'number' ? length : viewFor(buffer).length - off;
-    return handleCall(function () {
+    return handleCall(self, 'write', function () {
       var n = position === undefined || position === null
         ? fs.writeSync(self.fd, buffer, off, len)
         : fs.writeSync(self.fd, buffer, off, len, position);
@@ -3449,7 +3565,7 @@ BF.fs = function () {
 
   FileHandle.prototype.writev = function (buffers, position) {
     var self = this;
-    return handleCall(function () {
+    return handleCall(self, 'writev', function () {
       var written = 0;
       var rec = descriptorOf(self.fd, 'write');
       var at = typeof position === 'number' ? position : rec.position;
@@ -3464,7 +3580,7 @@ BF.fs = function () {
 
   FileHandle.prototype.writeFile = function (data, options) {
     var self = this;
-    return handleCall(function () {
+    return handleCall(self, 'writeFile', function () {
       var bytes = writeBytes(data, optionsEncoding(options));
       // Writes from the handle's position and leaves it past what was written, as Node does.
       fs.writeSync(self.fd, bytes, 0, bytes.length);
@@ -3474,7 +3590,7 @@ BF.fs = function () {
 
   FileHandle.prototype.readFile = function (options) {
     var self = this;
-    return handleCall(function () {
+    return handleCall(self, 'readFile', function () {
       var rec = descriptorOf(self.fd, 'read');
       /* A handle opened on a directory reads EISDIR, as a read of one does: the error names the
          read and carries no path. */
@@ -3488,7 +3604,7 @@ BF.fs = function () {
 
   FileHandle.prototype.appendFile = function (data, options) {
     var self = this;
-    return handleCall(function () {
+    return handleCall(self, 'writeFile', function () {
       var rec = descriptorOf(self.fd, 'write');
       var bytes = writeBytes(data, optionsEncoding(options));
       fs.writeSync(self.fd, bytes, 0, bytes.length, rec.bytes.length);
@@ -3499,7 +3615,12 @@ BF.fs = function () {
 
   FileHandle.prototype.close = function () {
     var self = this;
-    return handleCall(function () {
+    /* A close of a handle that has already been closed is the no-op a host's is, as many times as
+       it is asked: it resolves, the descriptor stays -1, and it is the one operation a closed handle
+       still answers rather than the "file closed" every other one is -- measured against host node
+       24.15, whose second and third close() resolve. */
+    return handleCall(null, 'close', function () {
+      if (self.fd === -1) return undefined;
       fs.closeSync(self.fd);
       self.fd = -1;
       return undefined;
@@ -3508,37 +3629,37 @@ BF.fs = function () {
 
   FileHandle.prototype.stat = function (opts) {
     var self = this;
-    return handleCall(function () { return fs.fstatSync(self.fd, opts); });
+    return handleCall(self, 'fstat', function () { return fs.fstatSync(self.fd, opts); });
   };
 
   FileHandle.prototype.truncate = function (len) {
     var self = this;
-    return handleCall(function () { fs.ftruncateSync(self.fd, len === undefined ? 0 : len); });
+    return handleCall(self, 'ftruncate', function () { fs.ftruncateSync(self.fd, len === undefined ? 0 : len); });
   };
 
   FileHandle.prototype.datasync = function () {
     var self = this;
-    return handleCall(function () { fs.fdatasyncSync(self.fd); });
+    return handleCall(self, 'fdatasync', function () { fs.fdatasyncSync(self.fd); });
   };
 
   FileHandle.prototype.sync = function () {
     var self = this;
-    return handleCall(function () { fs.fsyncSync(self.fd); });
+    return handleCall(self, 'fsync', function () { fs.fsyncSync(self.fd); });
   };
 
   FileHandle.prototype.chmod = function (mode) {
     var self = this;
-    return handleCall(function () { fs.fchmodSync(self.fd, mode); });
+    return handleCall(self, 'fchmod', function () { fs.fchmodSync(self.fd, mode); });
   };
 
   FileHandle.prototype.chown = function (uid, gid) {
     var self = this;
-    return handleCall(function () { fs.chownSync(descriptorOf(self.fd, 'fchown').path, uid, gid); });
+    return handleCall(self, 'fchown', function () { fs.chownSync(descriptorOf(self.fd, 'fchown').path, uid, gid); });
   };
 
   FileHandle.prototype.utimes = function (atime, mtime) {
     var self = this;
-    return handleCall(function () { fs.utimesSync(descriptorOf(self.fd, 'futimes').path, atime, mtime); });
+    return handleCall(self, 'futimes', function () { fs.utimesSync(descriptorOf(self.fd, 'futimes').path, atime, mtime); });
   };
 
   /*
