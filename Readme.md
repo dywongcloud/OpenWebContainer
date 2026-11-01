@@ -5,6 +5,11 @@ A browser-based virtual container runtime that enables server-like JavaScript ex
 [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
+## The `lane-parseargs29` lane: the three `util.parseArgs` sentences, re-verified at the tip
+
+- **re-verified `owc-parseargs-argtype-received-tail`** (witness 1793504937013-1277-4fcd2c2befd3d92d): on one fresh container boot per case against host node v24.15.0 at load 7.4-8.4, with 23.1 GB and again with 12.7 GB of memory free, the seven `ERR_INVALID_ARG_TYPE` paths (`args`, `options`, `strict`, `allowPositionals`, `tokens`, `options.a.short` and `options.a.multiple`) end on node's own `. Received type <t> (<v>)` clause byte for byte, and the two controls (`bad-option-name` and `bad-single-char-option`) keep agreeing: 9 of 9 labels agree with the host on stdout, stderr and exit code at both memory points.
+- **re-verified `owc-parseargs-options-table-validation`**: a `type` outside the union is `ERR_INVALID_ARG_TYPE` naming it -- `The "options.a.type" property must be ('string|boolean'). Received type string ('nope')` -- and an option's `default` is checked against the option's own type at last, so `{ type: 'string', default: 5 }` is refused with `The "options.a.default" property must be of type string. Received type number (5)` instead of being parsed: 4 of 4 labels agree with host node v24.15.0 on stdout, stderr and exit code, on one fresh container boot per case at two memory points.
+- **re-verified `owc-parseargs-unknown-option-hint-quote`**: the hint behind `Unknown option '-1'` ends where host node v24.15.0's ends -- `place it at the end of the command after '--', as in '-- "-1"` -- with the closing apostrophe the container used to append gone: 3 of 3 labels agree with the host on stdout, stderr and exit code, on one fresh container boot per case at two memory points.
 ## 🗺️ Architecture Overview
 
 ![OpenWebContainer Architecture](./images/architecture.png)
