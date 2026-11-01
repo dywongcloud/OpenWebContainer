@@ -1471,6 +1471,26 @@ export const SRC = String.raw`
     return entry;
   }
 
+  /*
+   * A timerified call's entry is one no timeline keeps: a host's getEntries() answers without it,
+   * and an observer that asked for what was buffered before it attached is handed none of it
+   * either, so it is made only while an observer for 'function' is attached -- the only time a
+   * host is seen to hand one over -- and goes straight to that observer's pending list.
+   */
+  function perfWatched(type) {
+    for (var i = 0; i < perfObservers.length; i++) {
+      if (perfObservers[i].types.indexOf(type) >= 0) return true;
+    }
+    return false;
+  }
+
+  function perfFunctionEntry(name, startTime, duration) {
+    if (!perfWatched('function')) return;
+    var entry = Object.create(PerformanceEntry.prototype);
+    perfInit(entry, String(name), 'function', startTime, duration, null);
+    perfNotifyObservers(entry);
+  }
+
   function perfScheduleDelivery(st) {
     if (st.scheduled) return;
     st.scheduled = true;
@@ -1855,6 +1875,9 @@ export const SRC = String.raw`
    * sentence it throws. A histogram that is handed in is the one the durations are recorded in,
    * in nanoseconds -- the unit node's own records are kept in -- and an async function's duration
    * runs to the settle of the promise it returned, not to the moment it handed that promise back.
+   * Each call reports itself as a 'function' entry to the observers watching that type and to
+   * nothing else, which is what a host does: the timeline getEntries() walks keeps no 'function'
+   * entry, so a call made while no observer is attached is a call nothing hears of again.
    */
   PerformanceProto.timerify = function (fn, options) {
     if (typeof fn !== 'function') throw invalidArgType('fn', 'of type function', fn);
@@ -1869,20 +1892,25 @@ export const SRC = String.raw`
           'The "options.histogram" property must be an instance of RecordableHistogram. ' + receivedText(histogram));
       }
     }
+    function perfTimerifyRecord(start) {
+      var duration = perfNow() - start;
+      if (histogram !== undefined) histogram.record(duration * 1e6);
+      perfFunctionEntry(fn.name, start, duration);
+    }
     var timerified = function () {
       var start = perfNow();
       var result;
       try {
         result = fn.apply(this, arguments);
       } catch (err) {
-        if (histogram !== undefined) histogram.record((perfNow() - start) * 1e6);
+        perfTimerifyRecord(start);
         throw err;
       }
       if (histogram !== undefined && result !== null && typeof result === 'object' && typeof result.then === 'function') {
-        var record = function () { histogram.record((perfNow() - start) * 1e6); };
-        return result.then(function (value) { record(); return value; }, function (err) { record(); throw err; });
+        return result.then(function (value) { perfTimerifyRecord(start); return value; },
+          function (err) { perfTimerifyRecord(start); throw err; });
       }
-      if (histogram !== undefined) histogram.record((perfNow() - start) * 1e6);
+      perfTimerifyRecord(start);
       return result;
     };
     Object.defineProperty(timerified, 'name', { value: 'timerified ' + fn.name, configurable: true });
