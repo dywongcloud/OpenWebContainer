@@ -30,7 +30,8 @@
  *   'tlsClientError' (once) and a client through 'error'; a peer that ends the stream first gives a
  *   tls.connect client 'end' then ECONNRESET. After it completes, a TLS failure (bad record, fatal
  *   alert) is the socket's 'error' event, once, and the socket then waits for the peer to close
- *   ('end', then close with hadError false).
+ *   ('end', then close with hadError false). An SSL failure's message carries OpenSSL's error queue
+ *   as host Node's does ('<queue>:error:<code>:SSL routines:<function>:<reason>:<file>:<line>:').
  * - SNI: the client sends options.servername only (as Node does; https sends the host name). Servers
  *   take SNICallback or addContext() contexts. ALPN: ALPNProtocols on both sides, or a server
  *   ALPNCallback({ servername, protocols }).

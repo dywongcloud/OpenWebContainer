@@ -156,10 +156,34 @@ function reasonCode(reason) {
   return 'ERR_SSL_' + reason.toUpperCase().replace(/ /g, '_');
 }
 
+/*
+ * Node reports an SSL failure with OpenSSL's error queue in the message, one entry per line:
+ *   "<queue>:error:<code>:<library>:<function>:<reason>:<file>:<line>:<data>\n"
+ * The queue's leading field is one value for a Node build (measured on host Node 24.15); the rest
+ * names the entry OpenSSL raised where the failure happened. A reason measured against host Node
+ * 24.15 has its site below and is reported with the queue; a reason not measured yet keeps the bare
+ * reason, so no error is given a queue it was never measured to carry.
+ */
+var OSSL_QUEUE = '003151F401000000';
+var OSSL_SITES = {
+  'no application protocol': ['0A0000EB', 'tls_handle_alpn', '../deps/openssl/openssl/ssl/statem/statem_srvr.c', '2291'],
+  'peer did not return a certificate': ['0A0000C7', 'tls_process_client_certificate', '../deps/openssl/openssl/ssl/statem/statem_srvr.c', '3752'],
+  'tlsv1 alert no application protocol': ['0A000460', 'ssl3_read_bytes', '../deps/openssl/openssl/ssl/record/rec_layer_s3.c', '918'],
+  'tlsv13 alert certificate required': ['0A00045C', 'ssl3_read_bytes', '../deps/openssl/openssl/ssl/record/rec_layer_s3.c', '918']
+};
+
+function sslQueue(reason, data, library) {
+  var site = OSSL_SITES[reason];
+  if (!site) return reason;
+  return OSSL_QUEUE + ':error:' + site[0] + ':' + (library || 'SSL routines') + ':' + site[1] +
+    ':' + reason + ':' + site[2] + ':' + site[3] + ':' + (data || '') + '\n';
+}
+
 /* An OpenSSL-style SSL error: code ERR_SSL_<REASON>, the alert to send (or null) */
-function sslErr(alert, reason, library) {
-  var e = errWithCode(reasonCode(reason), reason);
-  e.library = library || 'SSL routines';
+function sslErr(alert, reason, library, data) {
+  var lib = library || 'SSL routines';
+  var e = errWithCode(reasonCode(reason), sslQueue(reason, data, lib));
+  e.library = lib;
   e.reason = reason;
   e.alert = alert;
   return e;
@@ -2164,8 +2188,8 @@ Engine.prototype._content = function (type, content) {
     if (desc === 90) return;
     var info = ALERTS[desc] || ['unknown_' + desc, 'tlsv1 alert unknown alert ' + desc];
     this.dead = true;
-    var e = sslErr(null, info[1]);
-    this.events.push({ type: 'error', code: e.code, message: info[1], reason: info[1], library: 'SSL routines', alert: desc, received: true });
+    var e = sslErr(null, info[1], 'SSL routines', 'SSL alert number ' + desc);
+    this.events.push({ type: 'error', code: e.code, message: e.message, reason: info[1], library: 'SSL routines', alert: desc, received: true });
     return;
   }
   if (type === CT_HANDSHAKE) {
