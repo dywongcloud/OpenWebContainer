@@ -168,21 +168,27 @@ var OSSL_QUEUE = '003151F401000000';
 var OSSL_SITES = {
   'no application protocol': ['0A0000EB', 'tls_handle_alpn', '../deps/openssl/openssl/ssl/statem/statem_srvr.c', '2291'],
   'peer did not return a certificate': ['0A0000C7', 'tls_process_client_certificate', '../deps/openssl/openssl/ssl/statem/statem_srvr.c', '3752'],
+  'packet length too long': ['0A0000C6', 'tls_get_more_records', '../deps/openssl/openssl/ssl/record/methods/tls_common.c', '661'],
   'tlsv1 alert no application protocol': ['0A000460', 'ssl3_read_bytes', '../deps/openssl/openssl/ssl/record/rec_layer_s3.c', '918'],
   'tlsv13 alert certificate required': ['0A00045C', 'ssl3_read_bytes', '../deps/openssl/openssl/ssl/record/rec_layer_s3.c', '918']
 };
 
-function sslQueue(reason, data, library) {
-  var site = OSSL_SITES[reason];
-  if (!site) return reason;
-  return OSSL_QUEUE + ':error:' + site[0] + ':' + (library || 'SSL routines') + ':' + site[1] +
-    ':' + reason + ':' + site[2] + ':' + site[3] + ':' + (data || '') + '\n';
+/* The site measured for a reason OpenSSL raises at more than one place, passed by that one call site, so no
+   other call site gains a queue it was never measured to carry */
+var SITE_RECORD_UNEXPECTED_MESSAGE = ['0A0000F4', 'ssl3_read_bytes', '../deps/openssl/openssl/ssl/record/rec_layer_s3.c', '855'];
+var SITE_CLIENT_HELLO_TOO_SHORT = ['0A0000A0', 'tls_process_client_hello', '../deps/openssl/openssl/ssl/statem/statem_srvr.c', '1578'];
+
+function sslQueue(reason, data, library, site) {
+  var at = site || OSSL_SITES[reason];
+  if (!at) return reason;
+  return OSSL_QUEUE + ':error:' + at[0] + ':' + (library || 'SSL routines') + ':' + at[1] +
+    ':' + reason + ':' + at[2] + ':' + at[3] + ':' + (data || '') + '\n';
 }
 
 /* An OpenSSL-style SSL error: code ERR_SSL_<REASON>, the alert to send (or null) */
-function sslErr(alert, reason, library, data) {
+function sslErr(alert, reason, library, data, site) {
   var lib = library || 'SSL routines';
-  var e = errWithCode(reasonCode(reason), sslQueue(reason, data, lib));
+  var e = errWithCode(reasonCode(reason), sslQueue(reason, data, lib, site));
   e.library = lib;
   e.reason = reason;
   e.alert = alert;
@@ -1646,14 +1652,18 @@ function orderExts(list, order) {
 
 /* ---------- bounds-checked message reader ---------- */
 
-function Reader(u, start, end) {
+function Reader(u, start, end, shortSite) {
   this.u = u;
   this.p = start || 0;
   this.e = end === undefined ? u.length : end;
+  /* the site measured for a read that runs past the end of this message, when one was measured for it */
+  this.short = shortSite || null;
 }
 
 Reader.prototype.need = function (n) {
-  if (this.p + n > this.e) throw decodeErr();
+  if (this.p + n > this.e) {
+    throw this.short ? sslErr(50, 'length too short', 'SSL routines', undefined, this.short) : decodeErr();
+  }
 };
 Reader.prototype.u8 = function () {
   this.need(1);
@@ -2149,7 +2159,11 @@ Engine.prototype._record = function (type, header, body) {
     return;
   }
   if (!this.rd || (type === CT_ALERT && body.length === 2)) {
-    if (type !== CT_HANDSHAKE && type !== CT_ALERT) throw sslErr(10, 'unexpected record');
+    /* a record that is neither a handshake nor an alert before the read keys are in: host Node 24.15 reports
+       "unexpected message" at ssl3_read_bytes, where a record after the keys are in stays "unexpected record" */
+    if (type !== CT_HANDSHAKE && type !== CT_ALERT) {
+      throw sslErr(10, 'unexpected message', 'SSL routines', undefined, SITE_RECORD_UNEXPECTED_MESSAGE);
+    }
     if (type === CT_HANDSHAKE && this.rd) throw sslErr(10, 'unexpected message');
     if (body.length > MAX_PLAIN) throw sslErr(22, 'data length too long');
     if (type === CT_HANDSHAKE && body.length === 0) throw sslErr(10, 'unexpected message');
@@ -2664,7 +2678,9 @@ Engine.prototype._cTicket = function (body) {
 /* ---------- server: ClientHello, HelloRetryRequest, flight ---------- */
 
 Engine.prototype._sClientHello = function (body, raw) {
-  var r = new Reader(body);
+  /* a ClientHello that ends inside the field being read is "length too short" at tls_process_client_hello for
+     host Node 24.15, where a message with bytes left over is "length mismatch" */
+  var r = new Reader(body, 0, body.length, this.role === 'server' ? SITE_CLIENT_HELLO_TOO_SHORT : null);
   var legacy = r.u16();
   var random = r.bytes(32);
   var sid = r.vec8();

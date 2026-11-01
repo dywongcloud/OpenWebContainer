@@ -94,6 +94,17 @@ BF['tls'] = function () {
     return err;
   }
 
+  /* Node reports a write OpenSSL failed as the write's own EPROTO, with the SSL error's message after it */
+  function tlsWriteErr(message) {
+    var e = new Error(message ? 'write EPROTO ' + message : 'write EPROTO');
+    /* libuv's EPROTO, the errno host Node 24.15 pairs with a write it failed, not os.constants.errno's */
+    var uv = typeof process !== 'undefined' && process.binding ? process.binding('uv') : null;
+    e.errno = uv && typeof uv.UV_EPROTO === 'number' ? uv.UV_EPROTO : -100;
+    e.code = 'EPROTO';
+    e.syscall = 'write';
+    return e;
+  }
+
   function u8Of(value) {
     if (typeof value === 'string') return new Uint8Array(Buffer.from(value, 'utf8'));
     if (value && value.buffer && typeof value.byteLength === 'number') {
@@ -885,12 +896,7 @@ BF['tls'] = function () {
         /* after its own fatal alert Node's TLSWrap fails a write with EPROTO, and the stream is destroyed with it; after a
            received fatal alert Node's write never completes, which is not reproduced: the write is dropped */
         if (this._tlsSentAlert) {
-          var eproto = new Error('write EPROTO');
-          var errno = requireBuiltin('os').constants;
-          eproto.errno = -((errno && errno.errno && errno.errno.EPROTO) || 71);
-          eproto.code = 'EPROTO';
-          eproto.syscall = 'write';
-          callback(eproto);
+          callback(tlsWriteErr(''));
           return;
         }
         callback();
@@ -928,6 +934,9 @@ BF['tls'] = function () {
      * emits 'error' once and is not destroyed: 'end' and close(hadError=false) follow when the peer closes.
      */
     _tlsProtocolError(err, received) {
+      /* An OpenSSL failure on a socket that still has a write waiting for the handshake is that write's EPROTO for
+         host Node 24.15, carrying the SSL error's message; measured against a plain peer and a bad record */
+      if (err && err.reason && this._tlsWaiting && this._tlsWaiting.length > 0) err = tlsWriteErr(err.message);
       if (!this._tlsSecure) {
         this._tlsFail(err);
         return;
