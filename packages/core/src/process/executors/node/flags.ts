@@ -60,6 +60,18 @@ export interface NodeCommand {
     envFilesIfExists?: string[];
     /** `--run <script>`: the script of the nearest package.json the line names. */
     run?: string;
+    /** `--cpu-prof`: the run writes a CPU profile to disk before it leaves. */
+    cpuProf?: boolean;
+    /** `--cpu-prof-dir=<dir>`: where that profile is written; the working directory when unset. */
+    cpuProfDir?: string;
+    /** `--cpu-prof-name=<name>`: the name it is written under, in place of node's own default. */
+    cpuProfName?: string;
+    /** `--heap-prof`: the run writes a heap profile to disk before it leaves. */
+    heapProf?: boolean;
+    /** `--heap-prof-dir=<dir>`: where that profile is written; the working directory when unset. */
+    heapProfDir?: string;
+    /** `--heap-prof-name=<name>`: the name it is written under, in place of node's own default. */
+    heapProfName?: string;
     /** The answer for a run that never reaches the guest; set exactly when `file` is `[flags]`. */
     flagAnswer?: NodeFlagAnswer;
 }
@@ -83,6 +95,18 @@ export interface NodeRunOptions {
     envFilesIfExists?: string[];
     /** `--run <script>`: the script of the nearest package.json the line names. */
     run?: string;
+    /** `--cpu-prof`: the run writes a CPU profile to disk before it leaves. */
+    cpuProf?: boolean;
+    /** `--cpu-prof-dir=<dir>`: where that profile is written; the working directory when unset. */
+    cpuProfDir?: string;
+    /** `--cpu-prof-name=<name>`: the name it is written under, in place of node's own default. */
+    cpuProfName?: string;
+    /** `--heap-prof`: the run writes a heap profile to disk before it leaves. */
+    heapProf?: boolean;
+    /** `--heap-prof-dir=<dir>`: where that profile is written; the working directory when unset. */
+    heapProfDir?: string;
+    /** `--heap-prof-name=<name>`: the name it is written under, in place of node's own default. */
+    heapProfName?: string;
 }
 
 /** The status node exits with when it refuses its own arguments. */
@@ -171,7 +195,8 @@ const PRINT_WITH_ESM_INPUT =
 const BOOLEAN_LONG_OPTIONS = new Set((
     /* boolean: `--no-<name>` is accepted too */
     '--abort-on-uncaught-exception --addons --allow-addons --allow-child-process ' +
-    '--allow-inspector --allow-wasi --allow-worker --async-context-frame --completion-bash ' +
+    '--allow-inspector --allow-wasi --allow-worker --async-context-frame --build-snapshot ' +
+    '--completion-bash ' +
     '--cpu-prof --debug-arraybuffer-allocations --deprecation --disable-sigusr1 ' +
     '--disable-wasm-trap-handler --disallow-code-generation-from-strings ' +
     '--enable-etw-stack-walking --enable-network-family-autoselection --enable-source-maps ' +
@@ -214,7 +239,7 @@ const FLAG_LONG_OPTIONS = new Set((
 
 const VALUED_LONG_OPTIONS = new Set((
     /* valued: the value comes behind an `=`, or as the next argument */
-    '--allow-fs-read --allow-fs-write --build-snapshot --build-snapshot-config --conditions ' +
+    '--allow-fs-read --allow-fs-write --build-snapshot-config --conditions ' +
     '--cpu-prof-dir --cpu-prof-interval --cpu-prof-name --debug --debug-brk --debug-port ' +
     '--diagnostic-dir --disable-proto --disable-warning --dns-result-order --enable-fips ' +
     '--env-file --env-file-if-exists --experimental-config-file ' +
@@ -443,6 +468,20 @@ export function nodeCommand(args: string[]): NodeCommand {
     const envFilesIfExists: string[] = [];
     /** `--run <script>`: the script of the nearest package.json the line names. */
     let run: string | undefined;
+    /** `--cpu-prof`: the run writes a CPU profile to disk before it leaves. */
+    let cpuProf = false;
+    /** `--cpu-prof-dir=<dir>`: the directory that profile is written into. */
+    let cpuProfDir: string | undefined;
+    /** `--cpu-prof-name=<name>`: the name it is written under. */
+    let cpuProfName: string | undefined;
+    /** `--heap-prof`: the run writes a heap profile to disk before it leaves. */
+    let heapProf = false;
+    /** `--heap-prof-dir=<dir>`: the directory that profile is written into. */
+    let heapProfDir: string | undefined;
+    /** `--heap-prof-name=<name>`: the name it is written under. */
+    let heapProfName: string | undefined;
+    /** `--build-snapshot`: a snapshot blob was asked for, which needs an entry point script. */
+    let buildSnapshot = false;
     /** `--title=<name>`: what `process.title` reads once the guest is up. */
     let title: string | undefined;
     /** The options of the line, in node's own words: what `process.execArgv` is. */
@@ -522,6 +561,15 @@ export function nodeCommand(args: string[]): NodeCommand {
                 if (name === '--env-file') envFiles.push(value ?? known.words[1]!);
                 if (name === '--env-file-if-exists') envFilesIfExists.push(value ?? known.words[1]!);
                 if (name === '--run') run = value ?? known.words[1]!;
+                /* The four profiling options a run answers with a file on its way out: whether a
+                   profile is written at all, the directory it goes into, and its name. */
+                if (name === '--cpu-prof') cpuProf = true;
+                if (name === '--heap-prof') heapProf = true;
+                if (name === '--cpu-prof-dir') cpuProfDir = value ?? known.words[1]!;
+                if (name === '--cpu-prof-name') cpuProfName = value ?? known.words[1]!;
+                if (name === '--heap-prof-dir') heapProfDir = value ?? known.words[1]!;
+                if (name === '--heap-prof-name') heapProfName = value ?? known.words[1]!;
+                if (name === '--build-snapshot') buildSnapshot = true;
                 i = known.at;
                 continue;
             }
@@ -529,7 +577,12 @@ export function nodeCommand(args: string[]): NodeCommand {
                 /* `--no-<name>` is the false of a boolean option, and only of one: node answers an
                    option that is not boolean with the negation it refuses, not with `bad option`. */
                 const base = '--' + name.slice('--no-'.length);
-                if (BOOLEAN_LONG_OPTIONS.has(base)) { execArgv.push(arg); continue; }
+                if (BOOLEAN_LONG_OPTIONS.has(base)) {
+                    if (base === '--cpu-prof') cpuProf = false;
+                    if (base === '--heap-prof') heapProf = false;
+                    execArgv.push(arg);
+                    continue;
+                }
                 if (isKnownOption(base)) {
                     errors.push({ text: `${name} is an invalid negation because it is not a boolean option`, badOption: true });
                     continue;
@@ -650,6 +703,17 @@ export function nodeCommand(args: string[]): NodeCommand {
     if (help) return answered({ stdout: NODE_HELP_TEXT, exitCode: 0 });
 
     const trailing = args.slice(i);
+    /* `--build-snapshot` writes a snapshot blob for an entry point script, and node refuses the
+       line that names none -- a `-e` source, or a bare `node` -- with this and status 9. A line
+       that does name one runs it, as the host does; what the host writes beside it, a blob, is
+       not something this runtime can build. */
+    if (buildSnapshot && (script !== undefined || trailing.length === 0)) {
+        return answered({
+            stderr: '--build-snapshot must be used with an entry point script.\n' +
+                'Usage: node --build-snapshot /path/to/entry.js\n',
+            exitCode: BAD_OPTION_EXIT
+        });
+    }
     /* What every run carries from the line, whatever it runs: the options node read, and the bound
        one of them put on a stack trace. */
     const carry = {
@@ -663,7 +727,13 @@ export function nodeCommand(args: string[]): NodeCommand {
         ...(interactive ? { interactive } : {}),
         ...(test ? { test } : {}),
         ...(watch ? { watch } : {}),
-        ...(run === undefined ? {} : { run })
+        ...(run === undefined ? {} : { run }),
+        ...(cpuProf ? { cpuProf } : {}),
+        ...(cpuProfDir === undefined ? {} : { cpuProfDir }),
+        ...(cpuProfName === undefined ? {} : { cpuProfName }),
+        ...(heapProf ? { heapProf } : {}),
+        ...(heapProfDir === undefined ? {} : { heapProfDir }),
+        ...(heapProfName === undefined ? {} : { heapProfName })
     };
     /* `node --run <script>` runs no file of the line: what runs is the script the nearest
        package.json keeps under that name, handed to a shell the way npm hands one. */
