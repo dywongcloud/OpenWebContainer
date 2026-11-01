@@ -1,0 +1,31 @@
+owc-dgram-remoteaddress-after-close resolved 1793534182209-5699-c5f9d976d70a08ca 2026-11-01T11:59:31.001Z
+
+Symptom
+  remoteAddress() on a closed dgram socket answered ERR_SOCKET_DGRAM_NOT_CONNECTED Not
+    connected here, where host node v24.15.0 answers ERR_SOCKET_DGRAM_NOT_RUNNING Not
+    running, because the getter tested the socket's remote before it tested whether the
+    socket was running. A host asks its handle first: a closed socket is not running whether
+    or not it ever connected, and ERR_SOCKET_DGRAM_NOT_CONNECTED is what a live socket that
+    never did answers, so the running test is now first.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/net.ts
+  Pushed as e97b259bb413c4f12e91bd225f4fe39b0990575e, built on origin/main 3c69b9109ecac0b68697bad97ef381b5ec229904 with a temporary index.
+
+Witness
+  dispatch 1793534182209-5699-c5f9d976d70a08ca, session verify-owc-dgram-remoteaddress-after-close,
+  the built net.ts proven byte-identical to the blob in e97b259bb413c4f12e91bd225f4fe39b0990575e
+  (sha256 3481be98813c91302f18d017aea75338eb045c9fa67bcc0f6e142748a12331d9),
+  then one fresh container boot per run against host node v24.15.0, stdout + stderr + exit
+  code compared, two runs per case.
+
+Sweeps
+  14 cases (the 11-case dgram sweep plus a closed-with-callback case, a never-bound case
+  and a connect-on-a-dead-socket case), two runs each, host node v24.15.0 on the other
+  side, at two memory points before the fix (load 8.5-15.9, free 367-3591 MB) and three
+  after it (load 9.0-25.0, free 314-5517 MB): the 11-case sweep is line-identical on both
+  sides after the fix, the two rows closed at a25710e included, and no case that agreed
+  with the host before disagrees after.
+
+Readme
+  Two lines in "The dns and dgram shard" section, in the same commit as the fix.
