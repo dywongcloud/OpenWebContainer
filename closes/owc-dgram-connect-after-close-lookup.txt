@@ -1,0 +1,37 @@
+owc-dgram-connect-after-close-lookup resolved 1793534152230-5684-c982e92be916b260 2026-11-01T11:59:30.711Z
+
+Symptom
+  connect() on a dgram socket that had bound and was then closed threw
+    ERR_SOCKET_DGRAM_NOT_RUNNING Not running here, where host node v24.15.0 throws
+    TypeError: Cannot read properties of null (reading 'lookup') carrying no code. A host
+    asks its handle first only where it must: a socket never bound falls into connect()'s
+    own bind and answers that bind's error, while one that had bound gets as far as the
+    handle's lookup and fails there. connect() now reads the port first (a closed socket
+    handed a port it refuses answers ERR_SOCKET_BAD_PORT, and a dgram connect refuses 0
+    with "Port should be > 0 and < 65536"), then the connect state a host sets before
+    anything in connect() can fail, then the socket, and _wasBound survives the close that
+    clears _bound.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/net.ts
+  Pushed as e97b259bb413c4f12e91bd225f4fe39b0990575e, built on origin/main 3c69b9109ecac0b68697bad97ef381b5ec229904 with a temporary index.
+
+Witness
+  dispatch 1793534152230-5684-c982e92be916b260, session verify-owc-dgram-connect-after-close-lookup,
+  the built net.ts proven byte-identical to the blob in e97b259bb413c4f12e91bd225f4fe39b0990575e
+  (sha256 3481be98813c91302f18d017aea75338eb045c9fa67bcc0f6e142748a12331d9),
+  then one fresh container boot per run against host node v24.15.0, stdout + stderr + exit
+  code compared, two runs per case.
+
+Sweeps
+  14 cases (the 11-case dgram sweep plus a closed-with-callback case, a never-bound case
+  and a connect-on-a-dead-socket case), two runs each, host node v24.15.0 on the other
+  side, at two memory points before the fix (load 8.5-15.9, free 367-3591 MB) and three
+  after it (load 9.0-25.0, free 314-5517 MB): the 11-case sweep is line-identical on both
+  sides after the fix, the two rows closed at a25710e included, and no case that agreed
+  with the host before disagrees after.
+
+Readme
+  Two lines in "The dns and dgram shard" section, in the same commit as the fix.
+Store
+  close record committed with Row:/Witness:/Status: on their own lines, on top of local HEAD.
