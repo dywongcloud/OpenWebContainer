@@ -1623,8 +1623,12 @@ export const SRC = String.raw`
   PerformanceObserver.prototype.observe = function (options) {
     var st = perfObserverState(this);
     var requested = null;
+    var viaType = false;
     if (options && options.entryTypes !== undefined) requested = Array.isArray(options.entryTypes) ? options.entryTypes : [options.entryTypes];
-    else if (options && options.type !== undefined) requested = [options.type];
+    else if (options && options.type !== undefined) {
+      requested = [options.type];
+      viaType = true;
+    }
     if (requested === null) {
       throw paError(TypeError, 'ERR_MISSING_ARGS', 'The "options.entryTypes" and "options.type" arguments must be specified');
     }
@@ -1636,7 +1640,10 @@ export const SRC = String.raw`
     st.types = types;
     st.connected = true;
     if (perfObservers.indexOf(st) < 0) perfObservers.push(st);
-    if (options && options.buffered) {
+    /* Only the single-type form replays: an observer attached with 'entryTypes' and
+       'buffered' is given the entries made after it attached alone, where 'type' and
+       'buffered' is handed the ones the timeline already holds as well (host node 24.15). */
+    if (viaType && options && options.buffered) {
       var existing = perfTimeline.filter(function (e) { return types.indexOf(perfEntryOf(e).entryType) >= 0; });
       if (existing.length > 0) {
         st.pending = st.pending.concat(existing);
