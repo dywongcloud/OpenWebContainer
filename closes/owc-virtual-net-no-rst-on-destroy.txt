@@ -1,1 +1,35 @@
-owc-virtual-net-no-rst-on-destroy resolved 1793551205854-6431-47ab4ea52c8e77eb 2026-11-01T16:44:52.079Z
+owc-virtual-net-no-rst-on-destroy resolved 1793568553657-13199-bf5c835ec9b9ca87 2026-11-01T21:32:00.000Z
+
+Row: owc-virtual-net-no-rst-on-destroy
+Witness: 1793568553657-13199-bf5c835ec9b9ca87
+Status: resolved
+
+Symptom
+  A plain (non-TLS) server socket in the container was never told that its peer's socket went away
+  when that peer destroyed it. On host node v24.15.0 a destroy whose socket still holds unread bytes
+  is a RST and the server's read fails ECONNRESET (errno -54, syscall 'read'), while a destroy with
+  no unread bytes is a FIN, and a FIN leaves the server's socket half-open: it hears 'end' and can
+  still write, the first write after the peer is gone being the one that draws a RST back and every
+  write after it failing EPIPE (errno -32, syscall 'write'). The virtual hub closed the surviving
+  peer on every destroy, so the server got a clean 'close' the host never emits and its write came
+  back ERR_STREAM_DESTROYED: the server never learned.
+
+Fix
+  packages/core/src/network/virtual/hub.ts: destroy() now reads what kind of close it was. Only a
+  reset (unread bytes), or a peer that has already ended its own half, finishes the surviving side;
+  any other close is a FIN and leaves that side half-open, with its record kept so it can still
+  write, and tells it 'gone' -- that its peer's socket is really gone.
+  packages/core/src/process/executors/node/runtime/guest/modules/net.ts: a 'gone' delivery sets
+  _peerGone, and Socket.prototype._write settles the first write past it as sent -- it is the one
+  that draws the RST back -- and fails every write after it with EPIPE.
+
+Measurement
+  Re-witnessed at origin/main tip 3689aa7 against host node v24.15.0 on a build exported from that
+  tip (/tmp/lane-rst37/base), one fresh container boot per case, stdout, stderr and exit code
+  compared, at two memory points (13.1 GB and 13.0 GB free of 36 GB; load 10.4 and 12.1). The row's
+  four cases agree with the host 4/4: a client destroy with no error, a destroy carrying an error,
+  a half-open close, and a server write after the peer is gone.
+  Before and after, on the same tip with only this row's hunks reverted (/tmp/lane-rst37/before):
+  rst 1/4 -> 4/4, net 6/8 -> 6/8, http 4/8 -> 4/8, tls 7/9 -> 7/9, with the same cases differing in
+  each set -- no case that agreed with the host before disagrees after, and the dgram, listen-path
+  and TLS fixes still hold.
