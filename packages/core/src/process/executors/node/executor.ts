@@ -41,7 +41,13 @@ export class NodeProcessExecutor implements ProcessExecutor {
                 watchPaths: command.watchPaths ?? [],
                 envFiles: command.envFiles ?? [],
                 envFilesIfExists: command.envFilesIfExists ?? [],
-                ...(command.run === undefined ? {} : { run: command.run })
+                ...(command.run === undefined ? {} : { run: command.run }),
+                ...(command.cpuProf === undefined ? {} : { cpuProf: command.cpuProf }),
+                ...(command.cpuProfDir === undefined ? {} : { cpuProfDir: command.cpuProfDir }),
+                ...(command.cpuProfName === undefined ? {} : { cpuProfName: command.cpuProfName }),
+                ...(command.heapProf === undefined ? {} : { heapProf: command.heapProf }),
+                ...(command.heapProfDir === undefined ? {} : { heapProfDir: command.heapProfDir }),
+                ...(command.heapProfName === undefined ? {} : { heapProfName: command.heapProfName })
             };
             return new NodeProcess(
                 pid,

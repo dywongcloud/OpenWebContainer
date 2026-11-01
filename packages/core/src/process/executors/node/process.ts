@@ -216,6 +216,35 @@ let lastQuickJs: QuickJSAsyncWASMModule | undefined;
  */
 const DEFAULT_GUEST_BUDGET_MS = 30_000;
 
+/** Microseconds on the clock V8 writes a profile's timestamps in: whole microseconds since the epoch. */
+function profileMicros(): number {
+    return Date.now() * 1000;
+}
+
+/** The stamp of node's own default profile name -- `20261101.121241`: local date, then local time. */
+function profileStamp(now: number = Date.now()): string {
+    const at = new Date(now);
+    const pad = (value: number) => String(value).padStart(2, '0');
+    return `${at.getFullYear()}${pad(at.getMonth() + 1)}${pad(at.getDate())}.` +
+        `${pad(at.getHours())}${pad(at.getMinutes())}${pad(at.getSeconds())}`;
+}
+
+/**
+ * The heap profile node writes: the root of a tree with no samples under it, which is what a run
+ * too short for one sampling interval to elapse in leaves behind, and what node writes for one.
+ */
+const HEAP_PROFILE_TEXT = '{"head":{"callFrame":{"functionName":"(root)","scriptId":"0","url":"","lineNumber":-1,' +
+    '"columnNumber":-1},"selfSize":0,"id":1,"children":[]},"samples":[]}';
+
+/** The CPU profile node writes: the root and `(program)`, the span of the run, and no samples. */
+function cpuProfileText(startUs: number, endUs: number): string {
+    return '{"nodes":[' +
+        '{"id":1,"callFrame":{"functionName":"(root)","scriptId":"0","url":"","lineNumber":-1,"columnNumber":-1},' +
+        '"hitCount":0,"children":[2]},' +
+        '{"id":2,"callFrame":{"functionName":"(program)","scriptId":"0","url":"","lineNumber":-1,"columnNumber":-1},"hitCount":0}' +
+        `],"startTime":${startUs},"endTime":${endUs},"samples":[],"timeDeltas":[]}`;
+}
+
 /** What Node 24 says when require() is asked for an ES module graph with top-level await. */
 const REQUIRE_ASYNC_MESSAGE = 'require() cannot be used on an ESM graph with top-level await. Use import() instead.' +
     ' To see where the top-level await comes from, use --experimental-print-required-tla.';
@@ -1588,6 +1617,20 @@ export class NodeProcess extends Process {
     private readonly flagAnswer?: NodeFlagAnswer;
     /** The module a synchronous child boots on; see the constructor. Undefined for every other process. */
     private readonly bootModule?: QuickJSAsyncWASMModule;
+    /**
+     * `--cpu-prof` / `--heap-prof`: the profile this run writes to disk as it leaves, and the
+     * directory and name the line asked for. Nothing here samples the guest -- see `writeProfiles`.
+     */
+    private cpuProf = false;
+    private cpuProfDir?: string;
+    private cpuProfName?: string;
+    private heapProf = false;
+    private heapProfDir?: string;
+    private heapProfName?: string;
+    /** Set once a guest has been booted for this run: only such a run has a profile to write. */
+    private guestRan = false;
+    /** Microseconds on the monotonic clock when this process started: a profile's `startTime`. */
+    private readonly profileStartUs = profileMicros();
 
     constructor(
         pid: number,
@@ -1632,6 +1675,13 @@ export class NodeProcess extends Process {
         this.envFiles = run.envFiles ?? [];
         this.envFilesIfExists = run.envFilesIfExists ?? [];
         this.runScript = run.run;
+        /* `--cpu-prof` and `--heap-prof`: what the run writes on its way out, and where. */
+        this.cpuProf = run.cpuProf === true;
+        this.cpuProfDir = run.cpuProfDir;
+        this.cpuProfName = run.cpuProfName;
+        this.heapProf = run.heapProf === true;
+        this.heapProfDir = run.heapProfDir;
+        this.heapProfName = run.heapProfName;
         /* A pipe on fd 0 is a writer, not a person: what it carries is a program, or data for one,
            and it ends when the writer closes it. A terminal is the only thing a REPL prompts at. */
         this.stdinFromPipe = env.OWC_STDIN === 'pipe';
@@ -1737,6 +1787,9 @@ export class NodeProcess extends Process {
                     const inherited = this.deadlineFromParent();
                     if (inherited !== undefined) this.armKillDeadline(inherited.ms, inherited.signal);
                     this.claimParentTerminal();
+                    /* A profile is a record of a run, so only a run that boots a guest writes one:
+                       `node --cpu-prof --version` leaves nothing behind, as the host leaves nothing. */
+                    this.guestRan = true;
                     const entryPath = await this.bootGuest();
                     this.installRunOptions();
                     /* Watch mode builds its watcher before it runs anything, as node does: a path it
@@ -1785,6 +1838,8 @@ export class NodeProcess extends Process {
             this.services.network.releaseOwner(this.pid);
             this.disposeGuest();
         }
+        /* The profile is written as the process leaves, the way node writes it before exit. */
+        this.writeProfiles();
         if (!this.stopped) {
             this._exitCode = code;
             this._state = code === 0 ? ProcessState.COMPLETED : ProcessState.FAILED;
@@ -1819,6 +1874,75 @@ export class NodeProcess extends Process {
         if (answer.stdout !== undefined) this.emitOutput(answer.stdout);
         if (answer.stderr !== undefined) this.emitError(answer.stderr);
         return answer.check === undefined ? answer.exitCode : this.checkSyntax(quickJs, answer.check);
+    }
+
+    /**
+     * `--cpu-prof` / `--heap-prof`: what the run writes as it leaves, into the directory the line
+     * named -- or the working directory, which is where node puts a profile no `--cpu-prof-dir`
+     * was given for -- under the name the line named, or node's own default,
+     * `CPU.<date>.<time>.<pid>.0.001.cpuprofile` and `Heap.<…>.heapprofile`.
+     *
+     * This runtime has no sampler: V8's profiler is not here, and nothing reads the guest's stack
+     * while it runs. So what the file carries is the span of the run -- the two timestamps V8
+     * writes, measured here -- and no samples, which is also what a host run too short for one
+     * sampling interval to elapse in leaves behind.
+     */
+    private writeProfiles(): void {
+        if (!this.guestRan) return;
+        const endUs = profileMicros();
+        if (this.cpuProf) {
+            this.writeProfile(this.cpuProfDir, this.cpuProfName, 'CPU', 'cpuprofile', cpuProfileText(this.profileStartUs, endUs));
+        }
+        if (this.heapProf) {
+            this.writeProfile(this.heapProfDir, this.heapProfName, 'Heap', 'heapprofile', HEAP_PROFILE_TEXT);
+        }
+    }
+
+    /** Writes one profile, making the directory it goes into when that directory is not there. */
+    private writeProfile(dir: string | undefined, name: string | undefined, prefix: string, extension: string, text: string): void {
+        const directory = this.profileDirectory(dir);
+        if (directory === undefined) return;
+        const file = name === undefined || name === ''
+            ? `${prefix}.${profileStamp()}.${this.pid}.0.001.${extension}`
+            : name;
+        try {
+            this.fileSystem.writeFile(`${directory}/${file}`, text);
+        } catch {
+            /* A path nothing can be written at -- one a file stands at -- leaves no profile, which
+               is what the host leaves when the write fails. */
+        }
+    }
+
+    /** The directory a profile goes into: the one the line named, resolved against the working one. */
+    private profileDirectory(dir: string | undefined): string | undefined {
+        const raw = dir === undefined || dir === ''
+            ? this.currentCwd
+            : dir.startsWith('/') ? dir : `${this.currentCwd.replace(/\/+$/, '')}/${dir}`;
+        const path = normalizeAbsolute(raw);
+        if (this.directoryThere(path)) return path;
+        /* Made a name at a time, the way `--cpu-prof-dir` on a host makes it: one call creates no
+           directory whose parent is not there either. */
+        let made = '';
+        for (const piece of path.split('/').filter((part) => part !== '')) {
+            made += `/${piece}`;
+            if (this.directoryThere(made)) continue;
+            try {
+                this.fileSystem.createDirectory(made);
+            } catch {
+                return undefined;
+            }
+            if (!this.directoryThere(made)) return undefined;
+        }
+        return path;
+    }
+
+    /** True for a path a directory stands at: this file system throws for one nothing stands at. */
+    private directoryThere(path: string): boolean {
+        try {
+            return this.fileSystem.isDirectory(path);
+        } catch {
+            return false;
+        }
     }
 
     /**
