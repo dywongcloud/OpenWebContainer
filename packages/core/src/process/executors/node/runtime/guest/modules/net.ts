@@ -2649,16 +2649,22 @@ BF['dgram'] = function () {
       this._remote = null;
       this._recvBufferSize = undefined;
       this._sendBufferSize = undefined;
-      /* The groups this socket has joined, and the source-specific ones: a group joined without a
-         source is what makes a later source-specific join of it EINVAL, as a host's kernel
-         answers it, so the membership is kept to answer that. */
+      /* The groups this socket has joined, and the source-specific ones. A group a socket joined
+         without a source is what the kernel keeps as an any-source membership: a source-specific
+         join of that group is accepted -- host Node 24.15 answers undefined for it, and a second
+         ask for the same source is the kernel's EADDRNOTAVAIL -- but what it leaves cannot be
+         left by source, so a dropSourceSpecificMembership of it is EADDRNOTAVAIL until the plain
+         membership is dropped. _sourceGroups keeps the groups whose membership is a source one,
+         which is the state a leave by source answers from. */
       this._joined = [];
       this._sources = [];
+      this._sourceGroups = [];
       /* Kept out of what an instance enumerates, as a host's own state is: host Node 24.15 holds
          a dgram socket's in a native handle, so Object.keys of one is its own type and nothing
          else. This socket reads them by name, so hiding them changes nothing else. */
       var hidden = ['_family', '_hubId', '_targetId', '_bound', '_binding', '_dead', '_address',
-        '_refed', '_holding', '_remote', '_recvBufferSize', '_sendBufferSize', '_joined', '_sources'];
+        '_refed', '_holding', '_remote', '_recvBufferSize', '_sendBufferSize', '_joined', '_sources',
+        '_sourceGroups'];
       for (var h = 0; h < hidden.length; h++) {
         Object.defineProperty(this, hidden[h], {
           value: this[hidden[h]], writable: true, enumerable: false, configurable: true
@@ -2835,7 +2841,11 @@ BF['dgram'] = function () {
 
     close(callback) {
       if (typeof callback === 'function') this.once('close', callback);
-      if (this._dead) return this;
+      /* Closing one that is already closed is the ERR_SOCKET_DGRAM_NOT_RUNNING every other entry
+         point of a closed socket raises, as host Node 24.15 raises it, and it is raised after the
+         callback is taken, as Node takes it first: a callback handed to the refused close still
+         hears the one 'close' this socket emits. */
+      if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
       this._dead = true;
       this._bound = false;
       if (this._hubId !== undefined) {
@@ -3009,9 +3019,9 @@ BF['dgram'] = function () {
     }
 
     /* Joining a group binds the socket if it was not bound yet, as Node's does, and keeps the
-       group: a group it is already in is what makes a source-specific join of it EINVAL. An IPv6
-       group reaches the kernel and comes back EADDRNOTAVAIL (-49) -- no interface of this host
-       carries IPv6 multicast, so there is nothing to join it on. */
+       group: a group it is already in is the kernel's own EADDRINUSE. An IPv6 group reaches the
+       kernel and comes back EADDRNOTAVAIL (-49) -- no interface of this host carries IPv6
+       multicast, so there is nothing to join it on. */
     addMembership(multicastAddress, multicastInterface) {
       if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
       /* A group that is not there at all -- undefined, '', 0, null or false -- is the
@@ -3062,10 +3072,15 @@ BF['dgram'] = function () {
       var at = this._joined.indexOf(multicastAddress);
       if (at === -1) throw netDgramUvError('dropMembership', 'EADDRNOTAVAIL', -49);
       this._joined.splice(at, 1);
+      /* Leaving it leaves what the kernel held for the group, so the group is no longer one a
+         leave by source is refused for: host Node 24.15 answers the source-specific leave of a
+         group it had refused a moment earlier, once the plain membership is gone. */
+      var source = this._sourceGroups.indexOf(multicastAddress);
+      if (source !== -1) this._sourceGroups.splice(source, 1);
     }
 
     /* A source-specific join names the source a group is joined for, so both are read as strings
-       before either is looked at; a group this socket is already in without a source is EINVAL. */
+       before either is looked at. */
     addSourceSpecificMembership(sourceAddress, groupAddress) {
       if (this._dead) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running');
       netDgramArg(sourceAddress, 'sourceAddress', 'string');
@@ -3078,16 +3093,19 @@ BF['dgram'] = function () {
         throw netDgramUvError('addSourceSpecificMembership', 'EINVAL', -22);
       }
       if (want6) throw netDgramUvError('addSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
-      if (this._joined.indexOf(groupAddress) !== -1) {
-        throw netDgramUvError('addSourceSpecificMembership', 'EINVAL', -22);
-      }
       /* Joining the same source and group twice is the kernel's EADDRNOTAVAIL (-49), the way a
-         second plain join of one group is its EADDRINUSE. */
+         second plain join of one group is its EADDRINUSE. Asked for a group this socket already
+         holds without a source, the kernel takes the ask -- host Node 24.15 answers undefined --
+         and leaves the membership it already had, an any-source one, so the group is remembered
+         as joined but not as a source membership a leave by source can find. */
       var key = sourceAddress + '|' + groupAddress;
       if (this._sources.indexOf(key) !== -1) {
         throw netDgramUvError('addSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
       }
       this._sources.push(key);
+      if (this._joined.indexOf(groupAddress) === -1 && this._sourceGroups.indexOf(groupAddress) === -1) {
+        this._sourceGroups.push(groupAddress);
+      }
     }
 
     /* Leaving one: a group this socket never joined that way is the kernel's EADDRNOTAVAIL. */
@@ -3104,10 +3122,17 @@ BF['dgram'] = function () {
       }
       /* Leaving a group this socket is not a source-specific member of is the kernel's
          EADDRNOTAVAIL (-49) on a host, whatever the join before it answered; one it joined that
-         way leaves, so the pair a host answers -- join then leave -- is answered here as there. */
+         way leaves, so the pair a host answers -- join then leave -- is answered here as there.
+         A group held as an any-source membership, joined without a source before this join was
+         asked for, is one the kernel cannot leave by source: host Node 24.15 answers
+         EADDRNOTAVAIL for the leave while the plain membership stands, and answers it once that
+         one is dropped. */
       var key = sourceAddress + '|' + groupAddress;
       var at = this._sources.indexOf(key);
       if (at === -1) throw netDgramUvError('dropSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
+      if (this._sourceGroups.indexOf(groupAddress) === -1 && this._joined.indexOf(groupAddress) !== -1) {
+        throw netDgramUvError('dropSourceSpecificMembership', 'EADDRNOTAVAIL', -49);
+      }
       this._sources.splice(at, 1);
     }
 
