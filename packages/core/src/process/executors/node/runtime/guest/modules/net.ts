@@ -715,6 +715,8 @@ BF['net'] = function () {
       this._wFinished = false;
       this._hubClosed = false;
       this._closePending = false;
+      this._peerGone = false;
+      this._peerGoneSent = false;
       /* Set when the peer's own end-of-stream is what ended this side (allowHalfOpen false), which is
          the one case in which Node replaces socket.write: a write past that end is EPIPE, while a
          write past an end this side asked for is the stream's own 'write after end'. */
@@ -865,6 +867,8 @@ BF['net'] = function () {
         this._hubId = undefined;
         this._hubClosed = false;
         this._closePending = false;
+        this._peerGone = false;
+        this._peerGoneSent = false;
         this._rEnded = false;
         this._wEnded = false;
         this._wFinished = false;
@@ -1078,6 +1082,7 @@ BF['net'] = function () {
       else if (name === 'connect') this._onConnectEvent();
       else if (name === 'end') this._onRemoteEnd();
       else if (name === 'reset') this._onRemoteReset(payload);
+      else if (name === 'gone') this._onRemoteGone();
       else if (name === 'close') this._onRemoteClose();
     }
 
@@ -1144,6 +1149,15 @@ BF['net'] = function () {
       this._readQueue.push({ end: true });
       if (batched) this._scheduleRead();
       else this._drainReadQueue();
+    }
+
+    /**
+     * The peer's socket is gone, not merely ended: as on a host, this side is half-open and may
+     * still write, but the write it makes now is the one that draws a RST back.
+     */
+    _onRemoteGone() {
+      if (this._dead) return;
+      this._peerGone = true;
     }
 
     _onRemoteClose() {
@@ -1584,6 +1598,21 @@ BF['net'] = function () {
     Socket.prototype._write = function (chunk, encoding, callback) {
       this.bytesWritten += chunk.length;
       this._armIdle();
+      /* Writing to a peer whose socket is gone: as on a host, the first such write still leaves --
+         it is the one that draws the RST back -- and every write after it is refused with EPIPE. */
+      if (this._peerGone) {
+        if (!this._peerGoneSent) {
+          this._peerGoneSent = true;
+          this._settleWrite(callback, chunk.length);
+          return;
+        }
+        var failure = netError(Error, 'EPIPE', 'write EPIPE');
+        failure.errno = -32;
+        failure.syscall = 'write';
+        callback(failure);
+        this.destroy(failure);
+        return;
+      }
       this._sendChunk(chunk);
       this._settleWrite(callback, chunk.length);
     };

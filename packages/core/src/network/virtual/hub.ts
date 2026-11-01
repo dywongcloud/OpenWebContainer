@@ -427,11 +427,16 @@ export class VirtualNetwork {
     }
 
     /**
-     * Closes both ends. The peer gets EOF first (unless it already has it), then 'close', unless this
-     * side still holds unread data: that is the reset Node sends, so the peer gets 'reset' (an
-     * ECONNRESET error) and 'close' with no EOF at all. A peer that may still be attached (its
-     * 'connection' event is not delivered yet, or it is claimable) keeps its record, with those events
-     * queued, for that attach; its owner can still destroy it, which only removes it.
+     * Closes this end. What the peer hears depends on how this side went. A close that still held
+     * unread data is the reset Node sends, so the peer gets 'reset' (an ECONNRESET error) and
+     * 'close' with no EOF at all: no half-open state survives a reset. Any other close is a FIN,
+     * and a FIN leaves the peer's own socket open, as a host's is left by its peer's close: that
+     * side is half-open and may still write. It hears 'end', and then 'gone' -- that its peer's
+     * socket is really gone, so the write it makes now is the one that draws a RST back and every
+     * write after it is refused with EPIPE. Only a peer that has already ended its own half is
+     * finished by this FIN, and so closed. A peer that may still be attached (its 'connection'
+     * event is not delivered yet, or it is claimable) keeps its record, with those events queued,
+     * for that attach; its owner can still destroy it, which only removes it.
      */
     destroy(connectionId: number, options?: { unread?: boolean }): void {
         const connection = this.connections.get(connectionId);
@@ -441,14 +446,20 @@ export class VirtualNetwork {
         connection.closed = true;
         const peer = connection.remote;
         if (peer && !peer.closed) {
-            peer.closed = true;
             if (options?.unread) {
                 this.emitToPeer(connection, 'reset', { code: 'ECONNRESET' });
             } else if (!connection.writeEnded) {
                 this.emitToPeer(connection, 'end', undefined);
             }
-            if (peer.local.targetId !== undefined || !(peer.offerPending || peer.claimable)) this.connections.delete(peer.id);
-            this.schedule(peer.local.ownerPid, peer.local.targetId, 'close', undefined, peer.local);
+            if (options?.unread || peer.writeEnded) {
+                peer.closed = true;
+                if (peer.local.targetId !== undefined || !(peer.offerPending || peer.claimable)) this.connections.delete(peer.id);
+                this.schedule(peer.local.ownerPid, peer.local.targetId, 'close', undefined, peer.local);
+            } else {
+                /* The peer stays half-open, so its record stays too: it can still write, and only
+                   its own end or its own destroy finishes it. */
+                this.emitToPeer(connection, 'gone', undefined);
+            }
         }
         this.schedule(connection.local.ownerPid, connection.local.targetId, 'close', undefined, connection.local);
     }
