@@ -1425,11 +1425,16 @@ BF['net'] = function () {
       return this;
     }
 
-    setNoDelay() {
+    /* The arity host Node 24.15's own setters carry, which is the only thing a caller can read off
+       them: setNoDelay(enable) is one parameter long and setKeepAlive(enable, initialDelayMsec) is
+       two, so the two are declared with the parameters Node declares them with. Neither does
+       anything with what it is handed -- this virtual network carries no TCP header to put a Nagle
+       or a keepalive in -- and each still answers with the socket, as the host's does. */
+    setNoDelay(enable) {
       return this;
     }
 
-    setKeepAlive() {
+    setKeepAlive(enable, initialDelayMsec) {
       return this;
     }
 
