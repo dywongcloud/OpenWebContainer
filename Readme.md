@@ -1121,6 +1121,11 @@ Known limits, measured rather than claimed:
   container suppresses it for the primitive and no-export shapes and not for the object one; the
   residual is recorded rather than fixed. (`owc-esm-loader-divergences-blocker-56080`.)
 
+
+## The `http29` lane, continued: a CONNECT that reaches both ends
+
+- **`owc-http-connect-unsupported` -- fixed**: a `CONNECT` now reaches both ends. `http.request({method:'CONNECT', path:'example.test:443'})` against an `http` server on the loopback makes the server emit `'connect'` with the request's method, its url and a head of length 0, and the client emit `'connect'` with the status the server wrote -- 200 and 403 alike -- carrying the nine bytes that followed the head, where the container handed that answer to `'response'` instead and reported nothing. A `CONNECT` nobody listens for is dropped the same way on both sides: the server destroys the connection and the client reports `ECONNRESET`, and a client with no `'connect'` listener of its own still hears the socket's `'close'`, as a host's does. The mechanism is the hand-over in `packages/core/src/process/executors/node/runtime/guest/modules/http.ts`: `_onHead` treated only a 101 as a tunnel, so the 200 and the 403 that answer a `CONNECT` were parsed as ordinary responses; it now names the tunnel `'connect'` for a `CONNECT` and `'upgrade'` for a 101, `_onUpgrade` emits under that name and drops the socket when nothing listens for it, and `_detach` keeps the socket's `'close'` listener, which is what lets a request that has handed its socket to a tunnel still report that socket's close. Measured on one fresh container boot per run against host node v24.15.0, stdout + stderr + exit code on both sides: 17 of 17 lines agree after the fix, where five cases diverged before it, at two memory points (26% and 4% of memory free).
+
 ## 🚀 Features
 
 - **Virtual File System**
