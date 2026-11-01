@@ -1015,6 +1015,14 @@ BF.fs = function () {
     var mode = MODES[file];
     var out = mode === undefined ? withTime
       : { type: withTime.type, size: withTime.size, mtimeMs: withTime.mtimeMs, mode: mode };
+    /* A file with a hole in it is the parts it was written as: what the file system holds under the
+       name is the empty file the open left, so the size and the blocks a stat of it reports are the
+       parts', read here the way a mode and a time set on the name already are. */
+    var sparse = sparseAt(file);
+    if (sparse !== undefined) {
+      out.size = sparse.size;
+      out.blocks = sparseBlocks(sparse.parts);
+    }
     out.ino = inoOf(file);
     out.nlink = nlinkOf(file);
     return out;
@@ -1416,6 +1424,144 @@ BF.fs = function () {
     return Math.ceil(size / 4096) * 8;
   }
 
+  /*
+   * A hole -- the bytes a write at an offset past the end of a file leaves unwritten -- is a thing
+   * a host fills or keeps by its size: measured on the host this engine is compared against, a hole
+   * of 16 MiB is filled (its stat charges the file 32776 blocks, the whole of the 16 MiB) and a hole
+   * of 17 MiB is kept (40 blocks, the two 4 KiB the writes landed in and no more). The cut is that
+   * host's own, and it is the line this file keeps with it: a gap up to it is filled with zero
+   * bytes, and a gap past it is left unwritten instead, which is what makes a sparse file cost the
+   * bytes written and not the size of the hole. Growing one buffer to the end of the file and then
+   * encoding it, which is what this did, is what exhausted the container at the close of a 5-byte
+   * write at a 1 GiB offset, where the host wrote the file at once.
+   */
+  var HOLE_CUT = 16 * 1024 * 1024;
+
+  /*
+   * The content of a file with a hole in it: the parts that were written, each carrying the offset
+   * it was written at, and the size the file answers to, which is the end of the last of them. Only
+   * the bytes written are held -- the gaps between the parts are never held at all -- so a read of
+   * a gap answers zero bytes, the way a read of a hole in a host's file does. The file system's own
+   * file stays as the open left it, which is empty, and every stat and read of the name reads the
+   * parts instead.
+   */
+  var SPARSE = {};
+
+  function sparseAt(file) {
+    return SPARSE[canonicalOf(file)];
+  }
+
+  function sparseSet(file, content) {
+    SPARSE[canonicalOf(file)] = content;
+  }
+
+  /* The parts go when the name does, and so does everything held under a name that is a directory. */
+  function sparseDrop(file) {
+    delete SPARSE[canonicalOf(file)];
+    var under = canonicalOf(file) + '/';
+    for (var key in SPARSE) if (key.indexOf(under) === 0) delete SPARSE[key];
+  }
+
+  /* The size a descriptor's file answers to, and the bytes it holds from an offset. */
+  function sizeOf(rec) {
+    return rec.sparse ? rec.size : rec.bytes.length;
+  }
+
+  function rangeOf(rec, at, n) {
+    return rec.sparse ? partsRead(rec.parts, at, n) : rec.bytes.subarray(at, at + n);
+  }
+
+  function partsEnd(parts) {
+    var end = 0;
+    for (var i = 0; i < parts.length; i++) {
+      var e = parts[i].at + parts[i].bytes.length;
+      if (e > end) end = e;
+    }
+    return end;
+  }
+
+  /* Bytes out of parts, zero where no part covers the range: a hole reads as zeroes. */
+  function partsRead(parts, at, n) {
+    var out = new Uint8Array(n);
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      var from = p.at > at ? p.at : at;
+      var to = p.at + p.bytes.length < at + n ? p.at + p.bytes.length : at + n;
+      for (var j = from; j < to; j++) out[j - at] = p.bytes[j - p.at];
+    }
+    return out;
+  }
+
+  /*
+   * Bytes written into parts: what the range covers of them is replaced, a part the write lands
+   * inside is cut around it, and parts that end up touching are one part again, so the parts stay
+   * sorted, disjoint and few however the writes arrive.
+   */
+  function partsWrite(parts, at, bytes) {
+    var data = new Uint8Array(bytes.length);
+    data.set(bytes);
+    var kept = [];
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      var end = p.at + p.bytes.length;
+      if (end <= at || p.at >= at + bytes.length) { kept.push(p); continue; }
+      if (p.at < at) kept.push({ at: p.at, bytes: p.bytes.subarray(0, at - p.at) });
+      if (end > at + bytes.length) kept.push({ at: at + bytes.length, bytes: p.bytes.subarray(at + bytes.length - p.at) });
+    }
+    kept.push({ at: at, bytes: data });
+    kept.sort(function (a, b) { return a.at - b.at; });
+    var out = [];
+    for (var k = 0; k < kept.length; k++) {
+      var last = out.length > 0 ? out[out.length - 1] : undefined;
+      if (last !== undefined && last.at + last.bytes.length === kept[k].at) {
+        var joined = new Uint8Array(last.bytes.length + kept[k].bytes.length);
+        joined.set(last.bytes, 0);
+        joined.set(kept[k].bytes, last.bytes.length);
+        out[out.length - 1] = { at: last.at, bytes: joined };
+      } else {
+        out.push(kept[k]);
+      }
+    }
+    return out;
+  }
+
+  /* A new length: what lies past it is gone, and a part it cuts through is shortened to it. */
+  function partsResize(parts, size) {
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p.at >= size) continue;
+      out.push(p.at + p.bytes.length > size ? { at: p.at, bytes: p.bytes.subarray(0, size - p.at) } : p);
+    }
+    return out;
+  }
+
+  /*
+   * What a host charges a file whose hole it kept: the 4 KiB each part landed in, and three more
+   * 4 KiB for every hole between two of them. Measured on that host: 5 bytes at each end of a hole
+   * of a gigabyte is 40 blocks, a third part makes it 72, one part alone is 8, and a head of
+   * 100000 bytes with a 5-byte tail past a hole is 232.
+   */
+  function sparseBlocks(parts) {
+    var blocks = 0;
+    var holes = 0;
+    var covered = 0;
+    for (var i = 0; i < parts.length; i++) {
+      blocks += Math.ceil(parts[i].bytes.length / 4096) * 8;
+      if (i === 0) { if (parts[i].at > 0) holes++; }
+      else if (parts[i].at > covered) holes++;
+      covered = parts[i].at + parts[i].bytes.length;
+    }
+    return blocks + holes * 24;
+  }
+
+  /* Whether parts cover a file whole, from its first byte to its last: a file with no hole left in
+     it is an ordinary file again, and is kept as one. */
+  function partsAreWhole(parts, size) {
+    if (parts.length === 0) return size === 0;
+    return parts.length === 1 && parts[0].at === 0 && parts[0].bytes.length === size;
+  }
+
   /* Node exports fs.Stats, and packages test a stat with instanceof fs.Stats, so a stat is an
      instance of it. Its own properties are the fourteen numeric fields alone, as on host Node
      24.15: the four dates are getters on fs.Stats.prototype above it, and the seven kind tests on
@@ -1496,7 +1642,7 @@ BF.fs = function () {
       blksize: num(4096),
       ino: num(st.ino !== undefined ? st.ino : 0),
       size: num(st.size),
-      blocks: num(blocksOf(st.size)),
+      blocks: num(st.blocks !== undefined ? st.blocks : blocksOf(st.size)),
       atimeMs: num(st.mtimeMs),
       mtimeMs: num(st.mtimeMs),
       ctimeMs: num(st.mtimeMs),
@@ -1545,6 +1691,10 @@ BF.fs = function () {
   }
 
   function readBytesOf(file) {
+    /* A host's readFileSync of a sparse file hands back its size in bytes, zeroes where nothing was
+       written, so a whole read of one here is the file and not the parts it is held as. */
+    var sparse = sparseAt(file);
+    if (sparse !== undefined) return partsRead(sparse.parts, 0, sparse.size);
     return decodeBase64(host.readBase64(bytesNameOf(file)));
   }
 
@@ -1658,12 +1808,28 @@ BF.fs = function () {
        call, so a 2 MiB log in 512 pieces took minutes where a host takes milliseconds. The file
        system appends, so nothing already written is read or written again. */
     if (flag.charAt(0) === 'a' && statFollowingLinks(file, 'open', pathName(p))) {
-      check(host.appendBase64(bytesNameOf(file, 'open', pathName(p)), encodeBase64(bytes)), 'open', file, pathName(p));
+      var at = bytesNameOf(file, 'open', pathName(p));
+      var held = sparseAt(at);
+      /* An append puts its bytes at the end the file answers to, which for one held as parts is the
+         end its parts give it and not the end of the empty file the system holds. */
+      if (held === undefined) {
+        check(host.appendBase64(at, encodeBase64(bytes)), 'open', file, pathName(p));
+        return;
+      }
+      var grown = { size: held.size + bytes.length, parts: partsWrite(held.parts, held.size, bytes) };
+      if (partsAreWhole(grown.parts, grown.size)) {
+        sparseDrop(at);
+        check(host.writeBase64(at, encodeBase64(grown.parts[0].bytes), mode), 'open', file, pathName(p));
+      } else {
+        sparseSet(at, grown);
+      }
       return;
     }
     /* A write of a link is a write of what it names: a host opens the target, so the bytes land
        there and the target's own name is the one that carries them, whether or not it was there
        before the call -- a link to a name nothing has made yet is what makes that name. */
+    /* The bytes are the whole of the file, so a hole the name had is gone with them. */
+    sparseDrop(bytesNameOf(file, 'open', pathName(p)));
     check(host.writeBase64(bytesNameOf(file, 'open', pathName(p)), encodeBase64(bytes), mode), 'open', file, pathName(p));
   };
 
@@ -1996,6 +2162,8 @@ BF.fs = function () {
     check(host.rm(file, false), 'unlink', file, pathName(p));
     /* A second name of a file is dropped from the table when its own name goes; the bytes it was
        sharing stay under the name they were written to. */
+    /* The parts go with the name too: a file with a hole in it is held here and nowhere else. */
+    sparseDrop(file);
     delete LINKS[file];
     /* So is the record of a link: what the name pointed at stays, the link itself does not. */
     delete SYMLINKS[file];
@@ -2045,6 +2213,8 @@ BF.fs = function () {
     if (SYMLINKS[at] !== undefined) { SYMLINKS[bt] = SYMLINKS[at]; delete SYMLINKS[at]; }
     if (LINKTARGETS[at] !== undefined) { LINKTARGETS[bt] = LINKTARGETS[at]; delete LINKTARGETS[at]; }
     if (LINKS[at] !== undefined) { LINKS[bt] = LINKS[at]; delete LINKS[at]; }
+    var movedSparse = sparseAt(at);
+    if (movedSparse !== undefined) { sparseSet(bt, movedSparse); sparseDrop(at); }
   };
 
   fs.copyFileSync = function (from, to) {
@@ -2062,6 +2232,7 @@ BF.fs = function () {
     requireAccess(dest, 2, 'copyfile', srcName, destName, destName);
     /* The bytes go into what the destination names, not into the link standing there: a copy onto a
        link writes the target and leaves the link a link. */
+    sparseDrop(bytesNameOf(dest));
     var copyCode = host.writeBase64(bytesNameOf(dest), encodeBase64(readBytesOf(src)));
     if (copyCode) throw twoEndError(copyCode, 'copyfile', srcName, destName);
   };
@@ -2098,6 +2269,7 @@ BF.fs = function () {
       return;
     }
     if (!opts.force && statOf(dest)) throw fsError('EEXIST', 'cp', dest);
+    sparseDrop(bytesNameOf(dest));
     check(host.writeBase64(bytesNameOf(dest), encodeBase64(readBytesOf(src)), 0o644), 'cp', src);
   }
 
@@ -2443,7 +2615,20 @@ BF.fs = function () {
 
   function flushDescriptor(rec, syscall) {
     if (!rec.dirty) return;
-    check(host.writeBase64(rec.path, encodeBase64(rec.bytes)), syscall, rec.path);
+    if (rec.sparse) {
+      /* Parts that cover the file whole leave no hole in it, so its bytes are the file's and the
+         file system takes them; a file that still has a hole is kept as its parts, and the name the
+         file system holds stays as the open left it. */
+      if (partsAreWhole(rec.parts, rec.size)) {
+        var whole = rec.parts.length === 1 ? rec.parts[0].bytes : new Uint8Array(0);
+        sparseDrop(rec.path);
+        check(host.writeBase64(rec.path, encodeBase64(whole)), syscall, rec.path);
+      } else {
+        sparseSet(rec.path, { size: rec.size, parts: rec.parts });
+      }
+    } else {
+      check(host.writeBase64(rec.path, encodeBase64(rec.bytes)), syscall, rec.path);
+    }
     rec.dirty = false;
   }
 
@@ -2499,8 +2684,14 @@ BF.fs = function () {
     if (f.truncates && !f.creates && st && !isDir && linkTarget === undefined) {
       check(host.writeBase64(file, encodeBase64(new Uint8Array(0))), 'open', file, name);
     }
+    /* A truncate empties the name, and whatever hole it had goes with the bytes it emptied. */
+    if (f.truncates) sparseDrop(file);
+    /* A file held as parts is not read whole to open it: the parts are the content, and reading a
+       hole of a gigabyte back in to hold it as bytes is the thing the parts are here to avoid. */
+    var held = linkTarget === undefined && !f.truncates && st && !isDir ? sparseAt(file) : undefined;
     var bytes = linkTarget !== undefined ? writeBytes(linkTarget)
-      : f.truncates || !st || isDir ? new Uint8Array(0) : readBytesOf(file);
+      : f.truncates || !st || isDir ? new Uint8Array(0)
+      : held !== undefined ? new Uint8Array(0) : readBytesOf(file);
     /* A descriptor opened for reading is not one opened for writing, whatever else its number
        carried: O_WRONLY writes though it named no O_CREAT, and O_RDONLY does not write though it
        named every other bit there is. */
@@ -2514,12 +2705,17 @@ BF.fs = function () {
       /* An append starts at the end of what is already there, and only when the open was for
          writing: O_APPEND on a descriptor opened for reading leaves a read at the beginning, which
          is where host node 24.15 leaves it. */
-      position: f.appends && writable ? bytes.length : 0,
+      position: f.appends && writable ? (held !== undefined ? held.size : bytes.length) : 0,
       writable: writable,
       readable: f.letter === 'r' || f.plus,
       isDir: isDir,
       dirty: writable
     };
+    if (held !== undefined) {
+      DESCRIPTORS[fd].sparse = true;
+      DESCRIPTORS[fd].parts = held.parts;
+      DESCRIPTORS[fd].size = held.size;
+    }
     return fd;
   };
 
@@ -2550,12 +2746,28 @@ BF.fs = function () {
       stdioWrite(rec.stdio, bytes);
       return bytes.length;
     }
-    if (at + bytes.length > rec.bytes.length) {
-      var grown = new Uint8Array(at + bytes.length);
-      grown.set(rec.bytes, 0);
-      rec.bytes = grown;
+    /* A write past the end leaves the bytes in between unwritten. A gap the size of the cut or
+       smaller is filled with zero bytes, the way a host fills it; one past it is left a hole, and
+       the file becomes the parts it was written as rather than a buffer the size of its end. */
+    if (rec.sparse || at - (rec.sparse ? rec.size : rec.bytes.length) > HOLE_CUT) {
+      if (!rec.sparse) {
+        rec.sparse = true;
+        rec.parts = rec.bytes.length > 0 ? [{ at: 0, bytes: rec.bytes }] : [];
+        rec.size = rec.bytes.length;
+        rec.bytes = new Uint8Array(0);
+      }
+      rec.parts = partsWrite(rec.parts, at, bytes);
+      var end = partsEnd(rec.parts);
+      if (end > rec.size) rec.size = end;
+      if (at + bytes.length > rec.size) rec.size = at + bytes.length;
+    } else {
+      if (at + bytes.length > rec.bytes.length) {
+        var grown = new Uint8Array(at + bytes.length);
+        grown.set(rec.bytes, 0);
+        rec.bytes = grown;
+      }
+      rec.bytes.set(bytes, at);
     }
-    rec.bytes.set(bytes, at);
     if (!explicit) rec.position = at + bytes.length;
     rec.dirty = true;
     return bytes.length;
@@ -2608,11 +2820,11 @@ BF.fs = function () {
       if (!explicitRead(offset, length, position)) rec.position = at + got;
       return got;
     }
-    var available = rec.bytes.length - at;
+    var available = sizeOf(rec) - at;
     if (available <= 0 || len <= 0) return 0;
     var n = Math.min(len, available, buffer.length - off);
     var target = ArrayBuffer.isView(buffer) ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength) : buffer;
-    for (var i = 0; i < n; i++) target[off + i] = rec.bytes[at + i];
+    if (n > 0) target.set(rangeOf(rec, at, n), off);
     if (!explicitRead(offset, length, position)) rec.position = at + n;
     return n;
   };
@@ -2666,10 +2878,11 @@ BF.fs = function () {
      * fstat of an open /dev/zero says 0, and this file system's own statSync of the same path says 0
      * with it. Saying 4096 for one and 0 for the other made the pair contradict each other.
      */
-    var size = isCharacterDevice(st) ? st.size : rec.bytes.length;
+    var size = isCharacterDevice(st) ? st.size : sizeOf(rec);
     return makeStats({
       type: st ? st.type : (rec.isDir ? 'dir' : 'file'),
       size: size,
+      blocks: rec.sparse ? sparseBlocks(rec.parts) : undefined,
       mtimeMs: st ? st.mtimeMs : 0,
       mode: st ? st.mode : undefined
     });
@@ -2713,7 +2926,19 @@ BF.fs = function () {
     for (var i = 0; i < fds.length; i++) {
       var rec = DESCRIPTORS[fds[i]];
       if (rec.isDir || rec.device || rec.stdio !== undefined || canonicalOf(rec.path) !== canonical) continue;
-      rec.bytes = resizedBytes(rec.bytes, size);
+      /* A length that grows past the cut leaves a hole behind it: a truncate to a gigabyte is a
+         sparse file on a host, and not a gigabyte of memory here. */
+      if (rec.sparse) {
+        rec.parts = partsResize(rec.parts, size);
+        rec.size = size;
+      } else if (size - rec.bytes.length > HOLE_CUT) {
+        rec.sparse = true;
+        rec.parts = rec.bytes.length > 0 ? [{ at: 0, bytes: rec.bytes }] : [];
+        rec.size = size;
+        rec.bytes = new Uint8Array(0);
+      } else {
+        rec.bytes = resizedBytes(rec.bytes, size);
+      }
       if (rec.position > size) rec.position = size;
     }
   }
@@ -2783,10 +3008,10 @@ BF.fs = function () {
     for (var i = 0; i < buffers.length; i++) {
       var buf = buffers[i];
       var target = ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : buf;
-      var available = rec.bytes.length - (at + total);
+      var available = sizeOf(rec) - (at + total);
       if (available <= 0) break;
       var n = Math.min(target.length, available);
-      for (var j = 0; j < n; j++) target[j] = rec.bytes[at + total + j];
+      if (n > 0) target.set(rangeOf(rec, at + total, n), 0);
       total += n;
     }
     if (typeof position !== 'number') rec.position = at + total;
@@ -3595,8 +3820,8 @@ BF.fs = function () {
       /* A handle opened on a directory reads EISDIR, as a read of one does: the error names the
          read and carries no path. */
       if (rec.isDir) throw noPathError('EISDIR', 'read');
-      var bytes = rec.bytes.subarray(rec.position);
-      rec.position = rec.bytes.length;
+      var bytes = rangeOf(rec, rec.position, Math.max(0, sizeOf(rec) - rec.position));
+      rec.position = sizeOf(rec);
       var enc = optionsEncoding(options);
       return enc ? decodeBytes(bytes, enc) : Buf.from(bytes);
     });
@@ -3607,8 +3832,8 @@ BF.fs = function () {
     return handleCall(self, 'writeFile', function () {
       var rec = descriptorOf(self.fd, 'write');
       var bytes = writeBytes(data, optionsEncoding(options));
-      fs.writeSync(self.fd, bytes, 0, bytes.length, rec.bytes.length);
-      rec.position = rec.bytes.length;
+      fs.writeSync(self.fd, bytes, 0, bytes.length, sizeOf(rec));
+      rec.position = sizeOf(rec);
       return undefined;
     });
   };
