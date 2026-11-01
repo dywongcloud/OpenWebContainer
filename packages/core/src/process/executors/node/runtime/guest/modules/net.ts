@@ -2922,6 +2922,16 @@ BF['dgram'] = function () {
           return;
         }
         self._remote = { address: resolved, port: port, family: netFamilyName(resolved) };
+        /* The local address a connect leaves behind. A socket the host's kernel binds for the
+           connect -- one that never bound, and one bound to the family's own wildcard -- is given
+           the source address the route to the peer picks, which on this network is the peer's own
+           address, and which is what host Node 24.15's getsockname then answers; a socket bound to
+           an address of its own keeps that address, and a plain bind(0) with no address and no
+           connect still answers the wildcard. */
+        if (self._address !== null
+          && (self._address.address === '0.0.0.0' || self._address.address === '::')) {
+          self._address = { address: resolved, family: self._address.family, port: self._address.port };
+        }
         netDefer(function () { self.emit('connect'); });
       });
       return this;
