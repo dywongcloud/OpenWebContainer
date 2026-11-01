@@ -1622,15 +1622,32 @@ export const SRC = String.raw`
 
   PerformanceObserver.prototype.observe = function (options) {
     var st = perfObserverState(this);
+    var opts = options || {};
+    var entryTypes = opts.entryTypes;
+    var type = opts.type;
     var requested = null;
     var viaType = false;
-    if (options && options.entryTypes !== undefined) requested = Array.isArray(options.entryTypes) ? options.entryTypes : [options.entryTypes];
-    else if (options && options.type !== undefined) {
-      requested = [options.type];
-      viaType = true;
-    }
-    if (requested === null) {
+    if (entryTypes === undefined && type === undefined) {
       throw paError(TypeError, 'ERR_MISSING_ARGS', 'The "options.entryTypes" and "options.type" arguments must be specified');
+    }
+    /* The two forms are alternatives, not one a fallback for the other: host node 24.15 refuses a
+       call that sets both, naming the value it was handed the way ERR_INVALID_ARG_VALUE names one
+       ('Received [ 'mark' ]'), and refuses a non-array 'entryTypes' before it looks inside it.
+       A null 'entryTypes' is no entryTypes to the first two, so 'type' alongside it is the
+       single-type form and nothing is refused. */
+    if (entryTypes != null && type != null) {
+      throw paError(TypeError, 'ERR_INVALID_ARG_VALUE',
+        "The property 'options.entryTypes' options.entryTypes can not set with options.type together. Received " +
+        inspectValue(entryTypes));
+    }
+    if (type !== undefined) {
+      requested = [type];
+      viaType = true;
+    } else if (Array.isArray(entryTypes)) {
+      requested = entryTypes;
+    } else {
+      throw paError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "options.entryTypes" property must be string[]. ' + receivedText(entryTypes));
     }
     var types = [];
     for (var i = 0; i < requested.length; i++) {
