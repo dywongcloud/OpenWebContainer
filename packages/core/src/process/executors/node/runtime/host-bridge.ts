@@ -317,9 +317,13 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
      * wrapper, or the compile failure's message as a string when the source does not parse.
      */
     define('compileCjs', (src, file) => {
+        const name = text(file);
+        /* A `.ts` is compiled as the source Node compiles: its types are erased first, in require()
+           as in import. Every other name is compiled exactly as it was written. */
+        const body = deps.resolver.stripTypes(text(src), name);
         const result = context.evalCode(
-            '(function (exports, require, module, __filename, __dirname) {' + text(src) + '\n})',
-            text(file),
+            '(function (exports, require, module, __filename, __dirname) {' + body + '\n})',
+            name,
             { type: 'global' }
         );
         if (result.error) {

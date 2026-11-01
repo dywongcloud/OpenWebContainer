@@ -198,6 +198,23 @@ export class NodeResolver {
         this.tsStrip = strip;
     }
 
+    /**
+     * The source a CommonJS compile of `file` reads: a `.ts` Node compiles is one whose types it
+     * erased first -- in require() as in import -- so require('./m.ts') holding `interface P {}` and
+     * `module.exports = 1` compiles here as the JavaScript Node compiles. A file that is not a `.ts`,
+     * one no loader handed a stripper to, and one the stripper refuses are handed back as they are
+     * written: the last because the compile of such a file is what fails then, and it fails in the
+     * words a compile of TypeScript it cannot read fails in.
+     */
+    stripTypes(source: string, file: string): string {
+        if (file.endsWith('.ts') && this.tsStrip !== undefined) {
+            try {
+                return this.tsStrip(source);
+            } catch { /* refused: compile the source as it is written */ }
+        }
+        return source;
+    }
+
     resolve(specifier: string, fromDir: string, mode: ResolveMode): string | undefined {
         /* An absolute URL is its own module, not a package name: `file:` and `data:` are the two the
            default ESM loader reads. require() reads neither -- Node reports
