@@ -2934,7 +2934,6 @@ BF['dgram'] = function () {
         }
         netDefer(function () { self.emit('connect'); });
       });
-      return this;
     }
 
     disconnect() {
