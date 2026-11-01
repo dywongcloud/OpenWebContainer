@@ -604,32 +604,53 @@ var NET_UNIX_PATH_MAX = 104;
 
 function netPathBindFault(path) {
   if (path.length > NET_UNIX_PATH_MAX) return { code: 'EINVAL', errno: -22 };
+  /* The root is a directory, not a name a socket can be bound at, and host Node 24.15 refuses a
+     bind of '/' the way it refuses any path an entry already stands at: EEXIST (-17), syscall
+     'listen'. It was bound here before, because the root was the one path never looked up. */
+  if (path === '/') return { code: 'EEXIST', errno: -17 };
   var fsModule;
   try { fsModule = requireBuiltin('fs'); } catch (failure) { return undefined; }
   if (!fsModule || typeof fsModule.statSync !== 'function') return undefined;
   var at = path.lastIndexOf('/');
-  /* A name with no separator binds where the process stands, and the root is bound as it always was,
-     so neither is looked up here. */
-  if (at < 0 || path === '/') return undefined;
+  /* A name with no separator binds where the process stands, so there is nothing to look up. */
+  if (at < 0) return undefined;
+  /* A trailing separator names a directory, and no socket is bound at one: a host's bind of
+     '/tmp/x.sock/' is EACCES (-13), which is what looking the path up as a name never says. */
+  if (at === path.length - 1) return { code: 'EACCES', errno: -13 };
+  /* Every directory on the way is asked for in the order the path names it, '..' included: a
+     segment a later '..' pops was still a directory the host's kernel had to walk through, so a
+     bind of '/a/missing/../x' is the EACCES the missing directory earns and not a bind at all,
+     where reading the text as one name (or folding the '..' out of it first) let it through. */
+  var segs = path.split('/');
+  var absolute = path.charAt(0) === '/';
+  var stack = [];
+  for (var i = 0; i < segs.length - 1; i++) {
+    var seg = segs[i];
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (stack.length > 0 && stack[stack.length - 1] !== '..') stack.pop();
+      else if (!absolute) stack.push('..');
+      continue;
+    }
+    stack.push(seg);
+    var walk = (absolute ? '/' : '') + stack.join('/');
+    var dir;
+    try { dir = fsModule.statSync(walk === '' ? '.' : walk); }
+    catch (failure) {
+      /* A parent that is not there is the EACCES a host reports, and one a file stands in the way
+         of is its ENOTDIR: both name a path the filesystem cannot reach. */
+      if (failure && failure.code === 'ENOTDIR') return { code: 'ENOTDIR', errno: -20 };
+      return { code: 'EACCES', errno: -13 };
+    }
+    if (dir && typeof dir.isDirectory === 'function' && !dir.isDirectory()) return { code: 'ENOTDIR', errno: -20 };
+  }
   try {
     if (fsModule.statSync(path) !== undefined) return { code: 'EADDRINUSE', errno: -48 };
   } catch (failure) {
     // Nothing is at the path, which is what a bind needs.
   }
-  var parent = at === 0 ? '/' : path.slice(0, at);
-  try {
-    var dir = fsModule.statSync(parent);
-    if (dir && typeof dir.isDirectory === 'function' && !dir.isDirectory()) return { code: 'ENOTDIR', errno: -20 };
-    return undefined;
-  } catch (failure) {
-    /* A parent that is not there is the EACCES a host reports, and one a file stands in the way of
-       is its ENOTDIR: both name a path the filesystem cannot reach, which is the whole of what a
-       host's bind refuses for a name it was never given. */
-    if (failure && failure.code === 'ENOTDIR') return { code: 'ENOTDIR', errno: -20 };
-    return { code: 'EACCES', errno: -13 };
-  }
+  return undefined;
 }
-
 function netListenArgs(args) {
   var list = Array.prototype.slice.call(args);
   var cb = typeof list[list.length - 1] === 'function' ? list.pop() : undefined;
@@ -2777,6 +2798,15 @@ BF['dgram'] = function () {
           mismatch.syscall = 'send';
           if (typeof callback === 'function') netDefer(function () { callback(mismatch); });
           else self.emit('error', mismatch);
+          return;
+        }
+        /* A datagram addressed to the unspecified address of its own family is one host Node 24.15
+           drops without a word: measured on both families, send() completes with no error and
+           nothing arrives at the port it named, where this runtime raised EHOSTUNREACH (-65) for
+           it. The hub keeps its own answer for a destination no socket has a route to, so the
+           address is what is held back here. */
+        if (destination === '0.0.0.0' || destination === '::') {
+          if (typeof callback === 'function') netDefer(function () { callback(null, datagram.length); });
           return;
         }
         if (self._hubId !== undefined) {
