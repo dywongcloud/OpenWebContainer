@@ -2938,6 +2938,11 @@ BF['dgram'] = function () {
 
     disconnect() {
       if (this._remote === null) throw netError(Error, 'ERR_SOCKET_DGRAM_NOT_CONNECTED', 'Not connected');
+      /* The handle a host asks to disconnect, read after the connect state: a socket that connected
+         and was then closed has no handle to ask, so it is the TypeError reading 'disconnect' on
+         null -- while one that never connected is still ERR_SOCKET_DGRAM_NOT_CONNECTED, closed or
+         not, because that is the answer the connect state gives first. */
+      if (this._dead) throw new TypeError("Cannot read properties of null (reading 'disconnect')");
       this._remote = null;
       this._connecting = false;
     }
