@@ -712,7 +712,13 @@ BF['http'] = function () {
     onSocket(socket) {
       if (this._socket === socket) return;
       this._attach(socket);
-      if (this._timeoutMs) socket.setTimeout(this._timeoutMs);
+      /* Host Node's Agent hands a request a socket that already carries a timeout: the request's
+         own when it set one, the agent's otherwise. The default agent asks for 5000 ms, so a
+         request whose socket goes quiet that long emits 'timeout', as host Node's does. */
+      var pool = this._target.agent;
+      var poolTimeout = pool && pool.options ? Number(pool.options.timeout) || 0 : 0;
+      var idleMs = this._timeoutMs || poolTimeout;
+      if (idleMs) socket.setTimeout(idleMs);
       var waiting = this._pendingWrites;
       this._pendingWrites = [];
       for (var i = 0; i < waiting.length; i++) socket.write(waiting[i]);
@@ -776,19 +782,29 @@ BF['http'] = function () {
       var listeners = this._listeners;
       this._listeners = null;
       if (!listeners || !this._socket) return;
-      for (var name in listeners) this._socket.removeListener(name, listeners[name]);
+      for (var name in listeners) {
+        /* 'close' stays: a request that has handed its socket to a tunnel still reports that
+           socket's close, as host Node's request does. */
+        if (name === 'close') continue;
+        this._socket.removeListener(name, listeners[name]);
+      }
     }
-    /* 101 Switching Protocols: the socket leaves HTTP and goes to the 'upgrade' listener, with the bytes after the head */
-    _onUpgrade(head) {
+    /* 101 Switching Protocols, and the answer to a CONNECT: the socket leaves HTTP and goes to its
+       'connect' or 'upgrade' listener, with the bytes that followed the head. */
+    _onUpgrade(head, tunnelName) {
+      var name = tunnelName || 'upgrade';
+      /* Nothing is listening for the tunnel: host Node drops the socket and reports nothing. */
+      if (this.listenerCount(name) === 0) {
+        this._done = true;
+        this._detach();
+        this._destroySocket();
+        return;
+      }
       var socket = this._socket;
       var rest = this._parser ? this._parser.buf : null;
       if (this._parser) {
         this._parser.buf = null;
         this._parser.done = true;
-      }
-      if (this.listenerCount('upgrade') === 0) {
-        this._destroySocket();
-        return;
       }
       var res = new IncomingMessage(socket);
       res.statusCode = head.status;
@@ -799,11 +815,14 @@ BF['http'] = function () {
       res.upgrade = true;
       this._done = true;
       this._detach();
-      this.emit('upgrade', res, socket, rest || Buffer.from(''));
+      this.emit(name, res, socket, rest || Buffer.from(''));
     }
     _onHead(head) {
-      if (head.status === 101) {
-        this._onUpgrade(head);
+      /* The answer to a CONNECT is a tunnel on this side too, whatever status it carries: host Node
+         hands every response to a CONNECT to 'connect', and only a 101 to 'upgrade'. */
+      var tunnelName = this.method === 'CONNECT' ? 'connect' : (head.status === 101 ? 'upgrade' : '');
+      if (tunnelName !== '') {
+        this._onUpgrade(head, tunnelName);
         return;
       }
       var res = new IncomingMessage(this._socket);
@@ -1339,9 +1358,26 @@ BF['http'] = function () {
       upgraded: false,
       dead: false,
       peerEnded: false,
-      idleTimer: null
+      idleTimer: null,
+      /* What the request timeout is measured from: the moment this connection began waiting for a
+         request, re-armed for each request on a socket a keep-alive response hands back. */
+      requestStart: Date.now(),
+      headDone: false,
+      requestDone: false,
+      timeout408: timeout408
     };
     server._connStates.add(state);
+
+    /* A request that never arrived whole is answered the way host Node answers it: a plain 408 over
+       a connection that closes, with no request handed out and no 'clientError' raised. */
+    function timeout408() {
+      if (state.dead) return;
+      state.dead = true;
+      cancelIdle();
+      server._connStates.delete(state);
+      socket.write(Buffer.from('HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n', 'latin1'));
+      closeSocket(socket);
+    }
 
     function makeSink() {
       return {
@@ -1352,6 +1388,9 @@ BF['http'] = function () {
             state.req.complete = true;
             state.req.push(null);
           }
+          /* The request has been received whole: from here on it is the response that is owed, and
+             no request timeout can answer it. */
+          state.requestDone = true;
         },
         onError: function (err) { rejectRequest(err); }
       };
@@ -1374,7 +1413,12 @@ BF['http'] = function () {
       req.rawHeaders = head.pairs.slice();
       req.headers = headersFromPairs(head.pairs);
       state.req = req;
-      if (isUpgradeHead(head) && server.listenerCount('upgrade') > 0) {
+      state.headDone = true;
+      /* A CONNECT request asks for a tunnel whether or not it carries an Upgrade header: host
+         Node hands it to 'connect' and never to 'request', and drops the connection outright
+         when nobody listens. An Upgrade head reaches 'upgrade' the same way. */
+      var tunnelName = head.method === 'CONNECT' ? 'connect' : (isUpgradeHead(head) ? 'upgrade' : '');
+      if (tunnelName !== '' && server.listenerCount(tunnelName) > 0) {
         req.upgrade = true;
         var parts = [];
         if (state.parser.buf) parts.push(state.parser.buf);
@@ -1389,7 +1433,20 @@ BF['http'] = function () {
         socket.removeListener('error', onSocketError);
         socket.removeListener('close', onClose);
         socket.removeListener('timeout', onTimeout);
-        server.emit('upgrade', req, socket, parts.length > 0 ? Buffer.concat(parts) : Buffer.from(''));
+        server.emit(tunnelName, req, socket, parts.length > 0 ? Buffer.concat(parts) : Buffer.from(''));
+        return;
+      }
+      if (head.method === 'CONNECT') {
+        /* Nobody is listening for the tunnel: host Node drops the connection, and no request
+           is handed out, no 'clientError' is raised and no answer is written. */
+        cancelIdle();
+        server._connStates.delete(state);
+        socket.removeListener('data', onData);
+        socket.removeListener('end', onEnd);
+        socket.removeListener('error', onSocketError);
+        socket.removeListener('close', onClose);
+        socket.removeListener('timeout', onTimeout);
+        socket.destroy();
         return;
       }
       var res = new ServerResponse(req);
@@ -1462,6 +1519,11 @@ BF['http'] = function () {
       cancelIdle();
       var queued = state.pending;
       state.pending = [];
+      /* The next request on this socket starts waiting now, whether it is the first or one a
+         keep-alive response handed the socket back for. */
+      state.requestStart = Date.now();
+      state.headDone = false;
+      state.requestDone = false;
       state.parser = new MessageParser(true, null, makeSink());
       for (var i = 0; i < queued.length; i++) {
         if (state.parser.done) state.pending.push(queued[i]);
@@ -1567,8 +1629,10 @@ BF['http'] = function () {
       this.keepAliveTimeout = 5000;
       this.headersTimeout = 60000;
       this.requestTimeout = 300000;
+      this.connectionsCheckingInterval = 30000;
       this.maxHeadersCount = null;
       this.maxRequestsPerSocket = 0;
+      this._checkTimer = null;
       this._notifiedPort = null;
       this._connStates = new Set();
       this._closing = false;
@@ -1610,7 +1674,35 @@ BF['http'] = function () {
       var callback = typeof args[args.length - 1] === 'function' ? args.pop() : undefined;
       if (typeof callback === 'function') this.once('listening', callback);
       this._net.listen.apply(this._net, args);
+      this._armRequestCheck();
       return this;
+    }
+    /* Host Node looks at the connections it holds every connectionsCheckingInterval ms, and a request
+       that is not whole by then is answered 408: the head has its own bound (headersTimeout, from the
+       first byte of the request) and the whole request has the other (requestTimeout), and a bound
+       set to 0 is a bound never reached. The look does not keep the process alive. */
+    _armRequestCheck() {
+      if (this._checkTimer) return;
+      var server = this;
+      var interval = this.connectionsCheckingInterval > 0 ? this.connectionsCheckingInterval : 30000;
+      this._checkTimer = setTimeout(function () {
+        server._checkTimer = null;
+        server._checkRequestTimeouts();
+        if (server.listening) server._armRequestCheck();
+      }, interval);
+      if (this._checkTimer && typeof this._checkTimer.unref === 'function') this._checkTimer.unref();
+    }
+    _checkRequestTimeouts() {
+      var now = Date.now();
+      var states = Array.from(this._connStates);
+      for (var i = 0; i < states.length; i++) {
+        var state = states[i];
+        if (state.dead || state.upgraded || state.requestDone) continue;
+        var limit = state.headDone
+          ? this.requestTimeout
+          : Math.min(this.headersTimeout, this.requestTimeout);
+        if (limit > 0 && now - state.requestStart >= limit) state.timeout408();
+      }
     }
     close(callback) {
       this._closing = true;
@@ -1665,6 +1757,10 @@ BF['http'] = function () {
       this.emit('listening');
     }
     _onClosed() {
+      if (this._checkTimer) {
+        clearTimeout(this._checkTimer);
+        this._checkTimer = null;
+      }
       if (this._notifiedPort !== null) {
         var port = this._notifiedPort;
         this._notifiedPort = null;

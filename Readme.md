@@ -1292,6 +1292,11 @@ if (shell instanceof ShellProcess) {
 }
 ```
 
+
+## The `http29` lane: a CONNECT that reaches both ends, and the 408 a request never received whole is answered with
+
+- **`owc-http-request-timeout-never-fires` -- fixed**: what was still wrong was the server's answer, not the client's `'timeout'`. Against a server that accepts the connection and never answers, a client request does emit `'timeout'`, and the container agrees with host node v24.15.0 on that: the event arrives five seconds in, from the default agent's 5000 ms socket timeout, and `requestTimeout` has nothing to do with it -- `http.request({requestTimeout: 60})` leaves `req.requestTimeout` `undefined` on a host too, and the same `'timeout'` arrives with the option left out, while `req.setTimeout(60)` brings it on at once. What did not agree was a request whose body never arrives: the host writes `HTTP/1.1 408 Request Timeout` over a connection that closes and the client sees `["response 408","close"]`, with and without an `Expect: 100-continue`, which the host grants first as `'continue'` and `'information'` and the container granted and then left hanging. Fixed in `packages/core/src/process/executors/node/runtime/guest/modules/http.ts`: a server now looks at the connections it holds every `connectionsCheckingInterval` ms -- 30000 by default, as a host's is, and a bound a host's own 60 ms cannot reach until it elapses -- and answers one whose request is not whole with that 408 and a close, `requestTimeout` bounding the whole request and `headersTimeout` its head, a bound set to 0 never reached, and a request already received whole never timed out at all. Measured on one fresh container boot per run against host node v24.15.0, stdout + stderr + exit code on both sides: two of six lines diverged before the fix (the 408, and the 408 after a 100-continue) and none diverge after it, at load 8.2-17.7 with 26% of memory free before and 4% and 1% after.
+
 ## 🧪 Development Commands
 
 ```bash
