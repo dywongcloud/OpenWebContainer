@@ -4479,8 +4479,28 @@ function circularStructureText(value, replacer) {
   proc._linkedBinding = function (name) { throw new Error('No such module: ' + name); };
   proc.debugPort = 9229;
   proc.domain = null;
-  proc.sourceMapsEnabled = false;
-  proc.setSourceMapsEnabled = function (enabled) { proc.sourceMapsEnabled = Boolean(enabled); };
+  /*
+   * 'sourceMapsEnabled' is an accessor on a host and not a data property: a write in sloppy mode is
+   * silently dropped, a write in strict mode raises, and only 'setSourceMapsEnabled' -- which takes
+   * a boolean and refuses anything else -- moves the flag. Measured against host node 24.15, whose
+   * descriptor for the name carries a getter and no setter at all, so that a write of true leaves
+   * the flag false and a write of 'yes' leaves it false as well.
+   * row owc-process-sourcemapsenabled-writable.
+   */
+  var sourceMapsEnabled = false;
+  Object.defineProperty(proc, 'sourceMapsEnabled', {
+    get: function () { return sourceMapsEnabled; },
+    enumerable: true,
+    configurable: true
+  });
+  proc.setSourceMapsEnabled = function setSourceMapsEnabled(enabled) {
+    if (typeof enabled !== 'boolean') {
+      var bad = new TypeError('The "enabled" argument must be of type boolean. Received ' + specificTypeOf(enabled));
+      bad.code = 'ERR_INVALID_ARG_TYPE';
+      throw bad;
+    }
+    sourceMapsEnabled = enabled;
+  };
   /* A host's 'abort' writes a core dump and leaves 134; there is nothing here to dump, so it
      leaves the same status without one. */
   proc.abort = function () { host.exit(134); throw EXIT_SIGNAL; };

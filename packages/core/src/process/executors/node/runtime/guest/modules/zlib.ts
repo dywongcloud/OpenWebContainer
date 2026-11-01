@@ -142,6 +142,8 @@ BF['zlib'] = function () {
     if (value === null) return 'null';
     if (typeof value === 'function') return 'function ' + value.name;
     if (typeof value === 'object') return 'an instance of ' + ((value.constructor && value.constructor.name) || 'Object');
+    /* A bigint is named the way the engine names it in a stack: with the n it was written with. */
+    if (typeof value === 'bigint') return 'type bigint (' + String(value) + 'n)';
     return 'type ' + typeof value + ' (' + (typeof value === 'string' ? "'" + value + "'" : String(value)) + ')';
   }
 
@@ -222,8 +224,20 @@ BF['zlib'] = function () {
         (format === 'brotli' && (numeric < 0 || numeric > BROTLI_PARAM_MAX));
       if (unknown) throw failure(RangeError, invalid, key + ' is not a valid ' + label + ' parameter');
       var value = params[key];
-      if (typeof value !== 'number') throw argTypeError('options.params[key]', 'of type number', value);
-      pairs.push([numeric, value]);
+      if (typeof value !== 'number' && typeof value !== 'boolean') {
+        throw argTypeError('options.params[key]', 'of type number', value);
+      }
+      /*
+       * A parameter value is a uint32 by the time the codec reads it, which is how node hands it
+       * over: a value that lands on 0xFFFFFFFF -- every spelling of -1 -- is one node never sets,
+       * leaving that parameter at its own default, so the pair is dropped here rather than sent as
+       * the bottom of the range. Measured against host node 24.15, where quality -1 compresses at
+       * the default 11 and not at 0, and a window of -1 is the default 22 and not 10.
+       * row owc-zlib-brotli-quality-minus-one.
+       */
+      var raw = value >>> 0;
+      if (raw === 4294967295) continue;
+      pairs.push([numeric, raw]);
     }
     return pairs.length > 0 ? pairs : undefined;
   }
