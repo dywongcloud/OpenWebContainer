@@ -1846,10 +1846,44 @@ export const SRC = String.raw`
   PerformanceProto.eventLoopUtilization = function () {
     return { idle: 0, active: 0, utilization: 0 };
   };
-  PerformanceProto.timerify = function (fn) {
+  /*
+   * Both arguments are validated, 'fn' first and 'options' second, the way host node 24.15 does
+   * it: 'options' has to be an object -- which an array, a function, a symbol and null are not,
+   * while a null-prototype object is -- and undefined is no options at all, because node takes it
+   * through a default parameter. 'options.histogram' is then checked on its own and has to be one
+   * of this module's own recordable histograms: node names the property, not the argument, in the
+   * sentence it throws. A histogram that is handed in is the one the durations are recorded in,
+   * in nanoseconds -- the unit node's own records are kept in -- and an async function's duration
+   * runs to the settle of the promise it returned, not to the moment it handed that promise back.
+   */
+  PerformanceProto.timerify = function (fn, options) {
     if (typeof fn !== 'function') throw invalidArgType('fn', 'of type function', fn);
+    if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) {
+      throw invalidArgType('options', 'of type object', options);
+    }
+    var histogram = options === undefined ? undefined : options.histogram;
+    if (histogram !== undefined) {
+      var histData = perfHistData.get(histogram);
+      if (histData === undefined || !histData.recordable) {
+        throw paError(TypeError, 'ERR_INVALID_ARG_TYPE',
+          'The "options.histogram" property must be an instance of RecordableHistogram. ' + receivedText(histogram));
+      }
+    }
     var timerified = function () {
-      return fn.apply(this, arguments);
+      var start = perfNow();
+      var result;
+      try {
+        result = fn.apply(this, arguments);
+      } catch (err) {
+        if (histogram !== undefined) histogram.record((perfNow() - start) * 1e6);
+        throw err;
+      }
+      if (histogram !== undefined && result !== null && typeof result === 'object' && typeof result.then === 'function') {
+        var record = function () { histogram.record((perfNow() - start) * 1e6); };
+        return result.then(function (value) { record(); return value; }, function (err) { record(); throw err; });
+      }
+      if (histogram !== undefined) histogram.record((perfNow() - start) * 1e6);
+      return result;
     };
     Object.defineProperty(timerified, 'name', { value: 'timerified ' + fn.name, configurable: true });
     Object.defineProperty(timerified, 'length', { value: fn.length, configurable: true });
@@ -1976,8 +2010,8 @@ export const SRC = String.raw`
         return PerformanceProto.eventLoopUtilization();
       },
       performance: globalThis.performance,
-      timerify: function (fn) {
-        return PerformanceProto.timerify(fn);
+      timerify: function (fn, options) {
+        return PerformanceProto.timerify(fn, options);
       }
     };
   };
@@ -2252,6 +2286,172 @@ export const SRC = String.raw`
     return Cls;
   }
 
+  /*
+   * promiseHooks has no engine counterpart to lean on: this runtime exposes no promise hook of
+   * its own, so the four callbacks are driven from the two pieces of the promise surface a
+   * program actually reaches -- 'Promise.prototype.then', which every reaction and every 'await'
+   * goes through (QuickJS, unlike V8, does call 'then' for an await), and the Promise
+   * constructor, which every promise a program makes for itself goes through. Between them they
+   * report what node reports: 'init' for the promise a 'then' derives, with the promise it was
+   * derived from as the parent, and for the promise a constructor call makes; 'settled' when that
+   * constructor's resolve or reject runs and when a reaction has run, which is what settles the
+   * promise the reaction derived; 'before' and 'after' around the reaction itself.
+   *
+   * Nothing of it is installed until a hook is registered, so a program that never asks for one
+   * keeps the engine's own 'then' and its own Promise. The Promise that is installed then is a
+   * subclass, so 'x instanceof Promise' still answers true for an async function's promise, which
+   * the engine builds from its intrinsic rather than from the global, and 'Symbol.species' is
+   * pinned to the intrinsic so a 'then' derives an engine promise -- the one this module reports
+   * as init, with its parent -- instead of a second subclass instance the constructor would
+   * report a second time.
+   */
+  var V8_HOOK_ARG_NAMES = { init: 'initHook', before: 'beforeHook', after: 'afterHook', settled: 'settledHook' };
+  var v8Hooks = { init: [], before: [], after: [], settled: [] };
+  var v8HookNativeThen = null;
+  var v8HookInstalled = false;
+
+  function v8HooksLive() {
+    return v8Hooks.init.length !== 0 || v8Hooks.before.length !== 0 ||
+      v8Hooks.after.length !== 0 || v8Hooks.settled.length !== 0;
+  }
+
+  function v8FireHooks(kind, promise, parent) {
+    var list = v8Hooks[kind];
+    for (var i = 0; i < list.length; i++) list[i](promise, parent);
+  }
+
+  function v8HookArgName(kind) {
+    return V8_HOOK_ARG_NAMES[kind];
+  }
+
+  function v8HookReaction(cb, box) {
+    if (typeof cb !== 'function') return cb;
+    return function (value) {
+      var derived = box.derived;
+      v8FireHooks('before', derived);
+      var result;
+      try {
+        result = cb(value);
+      } catch (err) {
+        v8FireHooks('settled', derived);
+        v8FireHooks('after', derived);
+        throw err;
+      }
+      v8FireHooks('settled', derived);
+      v8FireHooks('after', derived);
+      return result;
+    };
+  }
+
+  function v8InstallPromiseHooks() {
+    if (v8HookInstalled) return;
+    v8HookInstalled = true;
+    v8HookNativeThen = Promise.prototype.then;
+    Promise.prototype.then = function (onFulfilled, onRejected) {
+      if (!v8HooksLive()) return v8HookNativeThen.call(this, onFulfilled, onRejected);
+      var box = { derived: null };
+      var derived = v8HookNativeThen.call(this, v8HookReaction(onFulfilled, box), v8HookReaction(onRejected, box));
+      box.derived = derived;
+      v8FireHooks('init', derived, this);
+      return derived;
+    };
+    var Native = globalThis.Promise;
+    if (typeof Reflect !== 'function' || typeof Reflect.construct !== 'function') return;
+    if (typeof Native !== 'function') return;
+    function OWCPromise(executor) {
+      if (typeof executor !== 'function') return Reflect.construct(Native, arguments, OWCPromise);
+      var box = {};
+      var made = Reflect.construct(Native, [function (resolve, reject) {
+        box.resolve = resolve;
+        box.reject = reject;
+      }], OWCPromise);
+      v8FireHooks('init', made, undefined);
+      var settled = false;
+      function settle(kind) {
+        return function (value) {
+          if (!settled) {
+            settled = true;
+            v8FireHooks('settled', made);
+          }
+          box[kind](value);
+        };
+      }
+      try {
+        executor(settle('resolve'), settle('reject'));
+      } catch (err) {
+        settle('reject')(err);
+      }
+      return made;
+    }
+    OWCPromise.prototype = Object.create(Native.prototype);
+    Object.defineProperty(OWCPromise.prototype, 'constructor', { value: OWCPromise, writable: true, configurable: true });
+    Object.setPrototypeOf(OWCPromise, Native);
+    Object.defineProperty(OWCPromise, Symbol.species, { configurable: true, get: function () { return Native; } });
+    // An async function's promise is the engine's own, so 'instanceof Promise' has to keep
+    // answering true for it after the global has been swapped for the subclass.
+    Object.defineProperty(OWCPromise, Symbol.hasInstance, {
+      configurable: true,
+      value: function (value) { return value instanceof Native; }
+    });
+    Object.defineProperty(globalThis, 'Promise', { value: OWCPromise, writable: true, configurable: true });
+  }
+
+  function v8HookAdd(kind, fn) {
+    if (typeof fn !== 'function') throw invalidArgType(v8HookArgName(kind), 'of type function', fn);
+    v8InstallPromiseHooks();
+    v8Hooks[kind].push(fn);
+    var live = true;
+    return function disableHook() {
+      if (!live) return;
+      live = false;
+      var list = v8Hooks[kind];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  }
+
+  function v8PromiseHooks() {
+    function register(kind, callbacks) {
+      var fn = callbacks[kind];
+      if (fn === undefined) return null;
+      if (typeof fn !== 'function') throw invalidArgType(v8HookArgName(kind), 'of type function', fn);
+      return v8HookAdd(kind, fn);
+    }
+    return {
+      createHook: function (callbacks) {
+        if (callbacks === null || callbacks === undefined) {
+          if (callbacks === null) {
+            throw new TypeError("Cannot destructure property 'init' of '(intermediate value)' as it is null.");
+          }
+          callbacks = {};
+        }
+        var off = [
+          register('init', callbacks),
+          register('before', callbacks),
+          register('after', callbacks),
+          register('settled', callbacks)
+        ];
+        return function disableHooks() {
+          for (var i = 0; i < off.length; i++) {
+            if (off[i] !== null) off[i]();
+          }
+        };
+      },
+      onInit: function (fn) {
+        return v8HookAdd('init', fn);
+      },
+      onBefore: function (fn) {
+        return v8HookAdd('before', fn);
+      },
+      onAfter: function (fn) {
+        return v8HookAdd('after', fn);
+      },
+      onSettled: function (fn) {
+        return v8HookAdd('settled', fn);
+      }
+    };
+  }
+
   BF.v8 = function () {
     var cachedTag = 1147835408;
     return {
@@ -2295,13 +2495,7 @@ export const SRC = String.raw`
       startCpuProfile: function () {
         throw v8NotSupported('startCpuProfile');
       },
-      promiseHooks: {
-        createHook: function () { return function () {}; },
-        onInit: function () { return function () {}; },
-        onSettled: function () { return function () {}; },
-        onBefore: function () { return function () {}; },
-        onAfter: function () { return function () {}; }
-      },
+      promiseHooks: v8PromiseHooks(),
       startupSnapshot: {
         isBuildingSnapshot: function () { return false; },
         addSerializeCallback: function () {},
