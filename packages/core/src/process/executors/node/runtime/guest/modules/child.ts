@@ -1207,8 +1207,26 @@ function cpChildClass() {
    read; what is read off them is carried to the parent's own output too unless the option that stops
    that was given, which is the same two places a worker's console.log reaches on a host. */
 var CP_WORKER_LIMIT_NAMES = ['maxYoungGenerationSizeMb', 'maxOldGenerationSizeMb', 'codeRangeSizeMb', 'stackSizeMb'];
-var CP_WORKER_LIMITS = { maxYoungGenerationSizeMb: -1, maxOldGenerationSizeMb: -1, codeRangeSizeMb: -1, stackSizeMb: 4 };
+/* The four numbers a thread reads as its own when its parent asked for none of them: the heap the
+   runtime gives a worker of its own accord, measured on host node 24.15 -- 192 MB of young
+   generation, 4096 MB of old, a code range it does not cap and a 4 MB stack. */
+var CP_WORKER_LIMITS = { maxYoungGenerationSizeMb: 192, maxOldGenerationSizeMb: 4096, codeRangeSizeMb: 0, stackSizeMb: 4 };
+/* What a parent's handle reads on the turn it started the worker, before the thread has answered
+   for itself: the limits it asked for are the ones it knows, the ones it did not ask for are -1,
+   and the stack is the one the thread was given, because node gives a thread its stack as it
+   starts it. Measured on host node 24.15, where the same handle reads the four numbers from the
+   next turn on and '{}' once the thread is gone. */
+var CP_WORKER_LIMITS_UNKNOWN = { maxYoungGenerationSizeMb: -1, maxOldGenerationSizeMb: -1, codeRangeSizeMb: -1, stackSizeMb: 4 };
 
+/* A stack is the one limit a host keeps a floor under: a 'stackSizeMb' of 0 or of -1 leaves the
+   4 MB default standing, where a heap limit of 0 is taken as it was given. */
+function cpWorkerStack(options) {
+  var asked = options && typeof options === 'object' ? options.stackSizeMb : undefined;
+  return typeof asked === 'number' && asked > 0 ? asked : CP_WORKER_LIMITS.stackSizeMb;
+}
+
+/* The four numbers the thread reports as its own: the defaults above, over which the limits the
+   parent asked for are written. */
 function cpWorkerLimits(options) {
   var limits = {};
   for (var i = 0; i < CP_WORKER_LIMIT_NAMES.length; i++) {
@@ -1218,9 +1236,31 @@ function cpWorkerLimits(options) {
   if (options && typeof options === 'object') {
     for (var j = 0; j < CP_WORKER_LIMIT_NAMES.length; j++) {
       var key = CP_WORKER_LIMIT_NAMES[j];
-      if (typeof options[key] === 'number') limits[key] = options[key];
+      if (typeof options[key] !== 'number') continue;
+      limits[key] = options[key];
     }
   }
+  limits.stackSizeMb = cpWorkerStack(options);
+  return limits;
+}
+
+/* The same four as the parent's handle reads them on the turn the worker started: the ones it
+   asked for, -1 beside them, and the stack the thread was given. */
+function cpWorkerLimitsPending(options) {
+  var limits = {};
+  for (var i = 0; i < CP_WORKER_LIMIT_NAMES.length; i++) {
+    var name = CP_WORKER_LIMIT_NAMES[i];
+    limits[name] = CP_WORKER_LIMITS_UNKNOWN[name];
+  }
+  if (options && typeof options === 'object') {
+    for (var j = 0; j < CP_WORKER_LIMIT_NAMES.length; j++) {
+      var key = CP_WORKER_LIMIT_NAMES[j];
+      if (key === 'stackSizeMb') continue;
+      if (typeof options[key] !== 'number') continue;
+      limits[key] = options[key];
+    }
+  }
+  limits.stackSizeMb = cpWorkerStack(options);
   return limits;
 }
 
@@ -1342,6 +1382,13 @@ function cpWorkerClass() {
     this._cpThreadId = threadId;
     this._cpThreadName = 'WorkerThread';
     this._cpLimits = cpWorkerLimits(opts.resourceLimits);
+    /* The handle's own reading changes with the thread: what the parent asked for and -1 beside
+       it on the turn the worker was started, the four numbers from the next turn on, and '{}'
+       once the thread has gone -- the three host node 24.15 answers, in that order. */
+    this._cpLimitsPending = cpWorkerLimitsPending(opts.resourceLimits);
+    this._cpLimitsKnown = false;
+    var limitsSelf = this;
+    proc.nextTick(function () { limitsSelf._cpLimitsKnown = true; });
     /* stdout: true and stderr: true are the two that stop the worker's output reaching the parent's
        own, and only those: every other shape leaves it reaching both, as on the host. */
     this._cpForwardOut = opts.stdout !== true;
@@ -1367,7 +1414,12 @@ function cpWorkerClass() {
       ipcKind: 'worker',
       ipcData: {
         threadId: threadId,
-        workerData: cpEncodeWith(opts.workerData === undefined ? null : opts.workerData, opts.transferList),
+        /* No 'workerData' at all is 'undefined' inside the thread, as on the host: it is the
+           undefined itself that crosses, and not a null standing in for it. */
+        workerData: cpEncodeWith(opts.workerData, opts.transferList),
+        /* The four numbers the thread reports as its own, computed here where 'new Worker' reads
+           the option they came from: the only place host node 24.15 reports them. */
+        resourceLimits: this._cpLimits,
         envData: cpEnvDataSnapshot(),
         /* The options the worker reports as its own: the list above, in the words it was given. */
         execArgv: execArgv,
@@ -1434,7 +1486,10 @@ function cpWorkerClass() {
     enumerable: true, configurable: true
   });
   Object.defineProperty(Worker.prototype, 'resourceLimits', {
-    get: function () { return this._cpLimits; },
+    get: function () {
+      if (this._cpExited) return {};
+      return this._cpLimitsKnown ? this._cpLimits : this._cpLimitsPending;
+    },
     enumerable: true, configurable: true
   });
   Worker.prototype.getHeapSnapshot = function () {
@@ -2007,7 +2062,10 @@ BF['worker_threads'] = function () {
     parentPort: isWorker ? cpState.port : null,
     workerData: isWorker ? cpDecode(cpState.data.workerData) : null,
     threadId: isWorker ? cpState.data.threadId : 0,
-    resourceLimits: {},
+    /* The limits this thread runs under: the ones its parent asked 'new Worker' for, written over
+       the runtime's own four, which is the only place host node 24.15 reports them. The main
+       thread has none to report and answers the empty object it answers there. */
+    resourceLimits: isWorker ? cpWorkerLimits(cpState.data.resourceLimits) : {},
     SHARE_ENV: typeof Symbol === 'function' ? Symbol('nodejs.worker_threads.SHARE_ENV') : {},
     Worker: Worker,
     MessageChannel: MessageChannel,
