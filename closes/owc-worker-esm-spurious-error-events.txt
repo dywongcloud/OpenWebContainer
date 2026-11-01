@@ -1,0 +1,77 @@
+owc-worker-esm-spurious-error-events resolved 1793529219293-4513-31cf6cd32c9709bf 2026-11-01T19:13:39.000Z
+Row: owc-worker-esm-spurious-error-events
+Witness: 1793529219293-4513-31cf6cd32c9709bf
+
+Symptom
+  A Worker whose entry is an ES module emitted 'error' events the host does not. `new Worker(entry)`
+  over an .mjs entry that imports another ES module and posts a message worked -- the parent received
+  {"esm":true,"tag":"ESMDEP","isMain":false} and exit 0 -- but only here did it also receive two
+  'error' events first, each a TypeError with no code and the engine's bare message 'not a function'.
+  It happened with no options, with {} and with {stdout:false}. A Worker whose entry was a .js file
+  got no error event on either side.
+
+Cause
+  One spurious error per ES module file in the worker's graph: the host names every file it compiles
+  as an ES module to the guest, in process.ts, through `this.callApi('markEsmFile', [file, entry])` --
+  and no guest source has ever defined api.markEsmFile. The call therefore failed every time with the
+  engine's TypeError 'not a function', and markEsmFile's own catch swallowed the failure, so nothing
+  was ever visible. What was not swallowed is what the host does with an error before it swallows it:
+  callApi hands it to guestFailure(), which formats it with the guest's own api.formatUncaught, and
+  in a worker thread that formatter is wrapped (cpWireWorkerErrors in
+  packages/core/src/process/executors/node/runtime/guest/modules/child.ts) to also report the error to
+  the parent. So a host call that had always failed silently became, inside a worker, one 'error'
+  event per module compiled: 1 for an entry with no imports, 1 for an entry importing a builtin, 2 for
+  an entry importing one file, and 1 before the real ERR_MODULE_NOT_FOUND for an entry whose import
+  does not resolve. The events arrived after 'online' and before the worker's own 'message'.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/child.ts
+    The guest answers the call: `api.markEsmFile` is installed when it is missing, so the host's
+    per-module question succeeds and there is no engine error left for guestFailure to format and for
+    a worker to report. Nothing else moves: an error the worker really raises still reaches the parent
+    through the same wire, in the same order.
+  Pushed as abd60258b5f94ab7b7a612c2338ae4dda8943c1b, built on origin/main with a temporary index.
+
+Witness
+  dispatch 1793529219293-4513-31cf6cd32c9709bf, session verify-owc-worker-esm-spurious-error-events,
+  on a fresh export of the pushed tree origin/main abd60258b5f94ab7b7a612c2338ae4dda8943c1b (git
+  archive, pnpm install --offline, pnpm build in packages/core), host node v24.15.0 on the other side,
+  one fresh container boot per run, stdout + stderr + exit code compared, every case run twice:
+  VERDICT NO_SPURIOUS_TYPEERROR. esm-mjs (no options / {} / {stdout:false}) is host-identical,
+  'online -> message -> exit 0' with no 'error' line; esm-typemodule (.js entry under
+  "type":"module") is host-identical; esm-tla (top-level await) is host-identical; esm-cjs-control
+  (.js CommonJS entry) is host-identical; esm-badimport gives one 'error', name Error,
+  code ERR_MODULE_NOT_FOUND, exit 1, as the host does (the two sides name their own directories in
+  the message: /app/... here, the host's temp directory there); esm-throw still reports
+  'online -> error name=Error msg=ctor boom -> exit 1' for both a .js and an .mjs entry, which is
+  what host node 24.15 emits. MEMORY_POINT_A load 11.00/11.45/10.44 with 3.76 GB free.
+
+Sweeps
+  The worker sweep -- SharedArrayBuffer with Atomics.add/exchange/compareExchange/wait/notify,
+  env data (SHARE_ENV, process.env.OWC_SWEEP_VAR), workerData (nested object and array, threadId),
+  BroadcastChannel in both directions, execArgv, resourceLimits on both sides (parent -1/-1/-1/4,
+  thread 192/4096/0/4), and terminate() -- run before the fix and after it, twice each, at two memory
+  points: identical before and after apart from the spurious 'error' lines, which are gone. Every
+  worker stage carried one before the fix (atomics, envdata, workerdata, broadcast, resourcelimits,
+  terminate) and none carries one after.
+  The ESM cases were measured on an export of origin/main 85544ade2288c3f01d67c3016b4d91569be5b03f
+  before the fix (free 4.01 GB then 3.97 GB, load 8.87-10.72) and on the pushed tree after it
+  (free 1.63-2.94 GB, load 10.66-12.48), i.e. at two memory points, with no case that agreed with the
+  host before disagreeing after.
+
+Residual, not this row
+  markEsmFile exists so a frame the engine names in an ES module can be rendered the way node renders
+  one, as a file URL, and the guest has no frame marker to hand the name to: it answers the call and
+  keeps nothing. The rendering is still the path -- an .mjs entry that throws prints
+  '/app/w-esm-throw.mjs:2:7' where host node 24.15 prints
+  'file:///private/var/folders/.../w-esm-throw.mjs:2:7', and the host's caret and its loader frames
+  behind the throw are absent here. Filed as row owc-esm-frame-not-a-file-url.
+  A second difference met on the way and not touched: an ESM *entry* whose import does not resolve is
+  reported by host node 24.15 as the engine's own report (a 'node:internal/modules/esm/resolve' frame
+  and the ERR_MODULE_NOT_FOUND with its url), while this container prints the short
+  'Error: Cannot find module ... imported from ...'; the same failure inside a Worker agrees with the
+  host on both sides.
+
+Readme
+  "The `lane-workeresm31` lane: an ES module Worker no longer reports the host's own failed call",
+  added to Readme.md in the working tree with this record.
