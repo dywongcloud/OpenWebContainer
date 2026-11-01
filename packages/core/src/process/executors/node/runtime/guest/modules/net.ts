@@ -17,14 +17,15 @@
  *   sockets cannot share a UDP port.
  * - Unix domain sockets are carried by path in the hub: `listen('/tmp/x')` and `connect('/tmp/x')`
  *   meet there and a unix connection reports no address at either end, as Node's does. No inode is
- *   created at the path, so the container's filesystem shows nothing there and a bind under a
- *   directory that does not exist is not the host's EACCES.
+ *   created at the path, so the container's filesystem shows nothing there -- but the filesystem is
+ *   what a bind is checked against, so a bind over a file is the host's EADDRINUSE and one under a
+ *   directory that does not exist is the host's EACCES, where a path the filesystem can hold binds.
  *
  * Plain JavaScript inside a String.raw snippet. Each family registers BF.net, BF.dgram.
  */
 export const SRC = String.raw`
 (function () {
-var NET_REASON_TEXT = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'address not available', EINVAL: 'invalid argument' };
+var NET_REASON_TEXT = { EACCES: 'permission denied', EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'address not available', EINVAL: 'invalid argument' };
 
 /* node's own diagnostics channels: the publish path lives in the diagnostics_channel family,
    whose snippet is an IIFE of its own, so it reaches this one through a global name. */
@@ -585,6 +586,48 @@ function netIsPath(value) {
   var asNumber = Number(value);
   if (!Number.isNaN(asNumber) && asNumber >= 0) return undefined;
   return value;
+}
+
+/**
+ * What a unix bind at a path is refused for before the hub ever sees the name, in the words host
+ * Node 24.15 uses: an entry already at the path is EADDRINUSE and a parent directory that is not
+ * there is EACCES, both with syscall 'listen', errno -48 and -13, and port -1. The hub holds the
+ * binding alone and makes no inode at the path, so the filesystem is what has to answer for the
+ * name -- without it a bind over a file or under a missing directory is accepted where a host's is
+ * not, and runs on with no error at all.
+ *
+ * The length the platform's sockaddr_un holds is checked first and is the hub's own figure, so a
+ * name too long to bind is still the EINVAL it already was and not an error about the directory.
+ * A name with no separator in it binds where the process stands and is not a path to look up.
+ */
+var NET_UNIX_PATH_MAX = 104;
+
+function netPathBindFault(path) {
+  if (path.length > NET_UNIX_PATH_MAX) return { code: 'EINVAL', errno: -22 };
+  var fsModule;
+  try { fsModule = requireBuiltin('fs'); } catch (failure) { return undefined; }
+  if (!fsModule || typeof fsModule.statSync !== 'function') return undefined;
+  var at = path.lastIndexOf('/');
+  /* A name with no separator binds where the process stands, and the root is bound as it always was,
+     so neither is looked up here. */
+  if (at < 0 || path === '/') return undefined;
+  try {
+    if (fsModule.statSync(path) !== undefined) return { code: 'EADDRINUSE', errno: -48 };
+  } catch (failure) {
+    // Nothing is at the path, which is what a bind needs.
+  }
+  var parent = at === 0 ? '/' : path.slice(0, at);
+  try {
+    var dir = fsModule.statSync(parent);
+    if (dir && typeof dir.isDirectory === 'function' && !dir.isDirectory()) return { code: 'ENOTDIR', errno: -20 };
+    return undefined;
+  } catch (failure) {
+    /* A parent that is not there is the EACCES a host reports, and one a file stands in the way of
+       is its ENOTDIR: both name a path the filesystem cannot reach, which is the whole of what a
+       host's bind refuses for a name it was never given. */
+    if (failure && failure.code === 'ENOTDIR') return { code: 'ENOTDIR', errno: -20 };
+    return { code: 'EACCES', errno: -13 };
+  }
 }
 
 function netListenArgs(args) {
@@ -1832,8 +1875,8 @@ BF['net'] = function () {
       /* A 'path' option names a unix domain socket, which the virtual hub carries by path: the
          socket binds, accepts and connects as the host's does, and reports no address, because a
          unix connection has none. What the hub does not do is put a file at the path -- no inode is
-         created there, and a bind under a directory that does not exist is not refused -- so the
-         path is the hub's own name for the binding, not an entry in the filesystem. */
+         created there -- so the path is the hub's own name for the binding, not an entry in the
+         filesystem, and what the filesystem holds at it is asked about when a server binds. */
       var named = args.path !== undefined && args.path !== null ? String(args.path) : undefined;
       var path = netIsPath(named);
       /* A port named alongside a path wins, as it does on host Node 24.15: a listen of
@@ -1865,6 +1908,12 @@ BF['net'] = function () {
           : netListenDisplay(args.host));
       var res;
       try {
+        /* A unix bind is refused for the path before it is refused for the name: the filesystem is
+           asked what is there, and a bind it cannot hold never reaches the hub. */
+        if (usePath) {
+          var bindFault = netPathBindFault(path);
+          if (bindFault !== undefined) throw bindFault;
+        }
         res = callCap('net.listen', { address: usePath ? path : netListenHub(shown), port: port, targetId: this._targetId });
       } catch (cause) {
         var failed = netSystemError(cause, 'listen', shown, usePath ? -1 : port);
