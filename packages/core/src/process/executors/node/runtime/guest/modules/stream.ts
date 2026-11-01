@@ -3033,6 +3033,12 @@ function owcBuildStreamCore() {
     /* A web stream is a link of its own: Node's pipeline takes a WritableStream as a destination and
        a ReadableStream as a source, bridging each with fromWeb. */
     if (isWebWritable(value)) return Writable.fromWeb(value);
+    /* A { readable, writable } pair of node streams is asked before a web transform is: a plain
+       object carrying both names is the pair Node's Duplex.from takes, one node stream per side, and
+       it is not a TransformStream, whose two halves answer to getReader and getWriter and to neither
+       read nor write. Asked in the other order a pair looks exactly like a web transform -- both of
+       its names are objects -- so it goes to fromWeb and is refused there for not being one. */
+    if (value && (isNodeStreamValue(value.readable) || isNodeStreamValue(value.writable))) return pairToDuplex(value);
     /* A web transform is a link of its own -- a TransformStream, and a TextDecoderStream is one --
        and Node pumps the link before it into its writable side and reads its readable side as the
        next link, which is what lets a decoder stand in the middle of a pipeline. */
