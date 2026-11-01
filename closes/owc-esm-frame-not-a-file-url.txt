@@ -1,0 +1,88 @@
+owc-esm-frame-not-a-file-url resolved 1793544109006-5523-18ebf92090115c52 2026-11-01T23:44:00.000Z
+Row: owc-esm-frame-not-a-file-url
+Witness: 1793544109006-5523-18ebf92090115c52
+
+Symptom
+  A frame in an ES module is a path here, where host node 24.15 writes a file URL. An entry that
+  imports ./dep.mjs and then throws printed '/app/w.mjs:2' in the caret banner and
+  '    at /app/w.mjs:2:7' as its one frame, where the host prints 'file:///app/w.mjs:2' and
+  '    at file:///app/w.mjs:2:7' and follows them with three frames of its own loader --
+  '    at ModuleJob.run (node:internal/modules/esm/module_job:437:25)',
+  '    at async node:internal/modules/esm/loader:639:26' and
+  '    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)' -- none of
+  which this container wrote. The same in a frame of a function the entry imported, in the frame of a
+  module whose own body threw while the entry imported it, and in a stack the program captured with
+  Error.captureStackTrace. The caret also stood under the 'throw', as it does for a CommonJS body,
+  where the host marks an ES module at the column the frame names. A CommonJS body was right.
+
+Cause
+  Host node names a file it compiled as an ES module by its URL, and which files those are is
+  something only its resolver knows -- a .js file is a module or not by the package it sits in -- so
+  the host names each one to the guest as it compiles it, in process.ts, through
+  this.callApi('markEsmFile', [file, entry]). No guest source answered that call at all before
+  abd6025, and since it the guest has answered it keeping nothing: that answer is what stopped a
+  worker from reporting the failed call as an 'error' event, and it is all that answer does. So the
+  guest's frame renderer, guestFramesOf in globals.ts, had no way to tell a frame in an ES module
+  from one in a CommonJS body, and named every file by its path; and the host's report -- which puts
+  the caret block in front of the guest's own stack and reads the file's source out of the frame --
+  knew nothing of a URL either, so it could not print one and could not point its caret at the
+  column an ES module is marked at.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/globals.ts
+    The guest keeps the mark: api.markEsmFile records the file, and whether it is one the run's entry
+    loaded, so the answer to the host's question is a fact the frame renderer can read. A frame in a
+    marked file is rendered with the file's URL and not its path, in both shapes a frame has -- named,
+    '    at boom (file:///app/dep.mjs:2:9)', and bare, '    at file:///app/w.mjs:2:1' -- and behind
+    the frames of a run whose outermost frame is the module the entry loaded, the three frames of
+    node's ESM loader are put, the way the CommonJS loader's are put behind a body it compiled. A
+    frame in any other file -- a CommonJS body, one of node's internals, a module a later dynamic
+    import loaded -- is the frame it was. The note this container keeps of the place an 'exit'
+    handler failed at reads the file behind the URL, so it names what it named before.
+  packages/core/src/process/executors/node/process.ts
+    The host's report reads a frame that names a file by its URL: scriptSiteOf takes a file: URL as a
+    frame's file as readily as a path, the banner and the frame print the name the frame shows -- the
+    URL for an ES module, the path for everything else -- and the source of the line is read through
+    the path the URL carries. The caret of a report over a file URL is put at the column the frame
+    names, which is where host node marks an ES module, and not at the 'throw' in front of it, which
+    is where a CommonJS body is marked.
+  Pushed as 1f596151ec6408d78ae6e98b6000862ec37904b6, built on origin/main with a temporary index.
+
+Witness
+  dispatch 1793544109006-5523-18ebf92090115c52 (and 1793544006679-5444-302cf2208fa1278c), session
+  verify-owc-esm-frame-not-a-file-url, on a fresh export of the pushed tree
+  1f596151ec6408d78ae6e98b6000862ec37904b6 (git archive, pnpm install --offline, pnpm build in
+  packages/core), host node v24.15.0 on the other side, one fresh container boot per run, stdout +
+  stderr + exit code compared, the whole sweep run twice at two memory points (load 13.49 with 0.08 GB
+  free, load 11.22 with 0.13 GB free): VERDICT 8_DIFFER, and every one of the eight is a difference
+  the same case had before the fix. The five the row names now agree with the host, byte for byte:
+  esm-throw (the entry's own frame), esm-imported-fn (a frame of a function it imported),
+  esm-import-throws (a module whose body threw while the entry imported it), esm-fn-throw, and the
+  caret banner and the three loader frames behind each of them.
+
+Sweeps
+  The script-failure sweep -- the four above plus esm-typeerror, cjs-typeerror, esm-reference,
+  esm-exit-bad-code, cjs-require-throws, esm-worker-throw, esm-dynamic-import, esm-meta-url -- and the
+  stack sweep -- esm-capture, esm-stack-prop, cjs-capture, cjs-stack-prop, esm-uncaught-handler --
+  were run against a build of origin/main 5637fd136a3584ac31402c1813885bbbf485d113 before the fix and
+  against the pushed tree after it, twice each: 6 agreed with the host before and 11 agree after, and
+  no case that agreed before disagrees after. cjs-control, cjs-fn-throw, cjs-require-throws,
+  esm-exit-bad-code, esm-dynamic-import and esm-meta-url are host-identical on both sides of the fix;
+  a Worker whose entry is an ES module and throws reports 'error Error worker boom' and 'exit 1' as
+  the host does, before and after.
+
+Residual, not this row
+  A captured stack names a column QuickJS chose and not the one V8 names: 'Error.captureStackTrace' at
+  '  Error.captureStackTrace(e);' is 3:9 on the host and 3:26 here, and 'new Error(' is 2:10 there and
+  2:19 here -- in a CommonJS body exactly as in an ES module, so it is not a thing the module kind
+  decides. It is why esm-capture and esm-stack-prop still differ after the fix, and cjs-capture and
+  cjs-stack-prop differ as they did before it.
+  Two more differences the sweep met and did not fix: an error the engine raises itself in an ES module
+  -- a TypeError off null, a ReferenceError -- is reported here as '[    at file:///app/w.mjs:2:2]',
+  with no source block and no message, where the host writes the block it writes for any other file;
+  and an ESM entry that installs an 'uncaughtException' handler still ends the run with the host's
+  report and exit 1, where host node 24.15 exits 0 after the handler printed the stack.
+
+Readme
+  "The `lane-workeresm31` lane, continued: a frame in an ES module is named by the file's URL", added
+  to Readme.md in the working tree with this record.
