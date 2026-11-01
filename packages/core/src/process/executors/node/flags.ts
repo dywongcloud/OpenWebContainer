@@ -72,6 +72,8 @@ export interface NodeCommand {
     heapProfDir?: string;
     /** `--heap-prof-name=<name>`: the name it is written under, in place of node's own default. */
     heapProfName?: string;
+    /** What node wrote on stderr for a value it read and went on with, in the order it read them. */
+    notes?: string[];
     /** The answer for a run that never reaches the guest; set exactly when `file` is `[flags]`. */
     flagAnswer?: NodeFlagAnswer;
 }
@@ -83,6 +85,8 @@ export interface NodeRunOptions {
     evalScript?: string;
     inputType?: string;
     title?: string;
+    /** What node wrote on stderr for a value it read and went on with, in the order it read them. */
+    notes?: string[];
     interactive?: boolean;
     test?: boolean;
     /** `--watch`: the line asked for watch mode, which runs the entry again when a file changes. */
@@ -267,6 +271,71 @@ const INPUT_TYPES = new Set(['module', 'commonjs', 'module-typescript', 'commonj
 /** The one of those with an effect here: the bound it puts on the frames of a stack trace. */
 const STACK_TRACE_LIMIT = '--stack-trace-limit';
 
+/**
+ * The valued options whose value is a number V8 reads, and the type it names in the lines it
+ * writes when it cannot read one: `size_t` for the options that bound a heap, `int` for the one
+ * that bounds a stack. Node hands these to V8 before it has a script at all -- before its own
+ * parser has said anything about the line -- so what refuses the value is V8's parser, and what
+ * it writes is its own lines and then the `bad option` one.
+ */
+const NUMERIC_LONG_OPTIONS = new Map<string, 'size_t' | 'int'>([
+    ['--max-old-space-size', 'size_t'],
+    ['--max-semi-space-size', 'size_t'],
+    ['--max-heap-size', 'size_t'],
+    ['--stack-size', 'int']
+]);
+
+/** The ceiling of a `size_t`: the bound V8 prints beside a value it read and would not take. */
+const SIZE_T_CEILING = '18446744073709551615';
+
+/** A whole number, with the sign node lets stand in front of one. */
+const INTEGER = /^[+-]?\d+$/;
+
+/** A number with a whole part and something left behind it: `1.5`, `1024abc`. */
+const NUMBER_PREFIX = /^[+-]?\d+/;
+
+/**
+ * The valued options an empty value is not `requires an argument` for, because node reads the
+ * file, the configuration or the mode out of it before it says anything about there being
+ * nothing there at all.
+ */
+const EMPTY_VALUE_OWN_WAY = new Set(['--env-file', '--env-file-if-exists', '--experimental-config-file',
+    '--experimental-default-config-file', '--enable-fips', '--force-fips', '--prof-process']);
+
+/**
+ * The options whose number node reads itself, before V8 is asked for anything, and the check it
+ * makes of it: a share of the heap has to be a share of it, a limit cannot be negative, a port
+ * has to be a port, and a secure heap is measured in powers of two. Each returns the one line
+ * node refuses the whole line with, or undefined for a number it takes as it stands.
+ */
+const NUMBER_CHECKS: Record<string, (value: string) => string | undefined> = {
+    '--max-old-space-size-percentage': (value) => {
+        const share = Number(value);
+        if (!isFinite(share) || share <= 0 || share > 100) {
+            return `--max-old-space-size-percentage must be greater than 0 and up to 100. Got: ${value}`;
+        }
+        return undefined;
+    },
+    '--heapsnapshot-near-heap-limit': (value) => {
+        const limit = Number(value);
+        if (isFinite(limit) && limit < 0) return '--heapsnapshot-near-heap-limit must not be negative';
+        return undefined;
+    },
+    '--debug-port': (value) => {
+        if (!/^\d+$/.test(value)) return undefined;
+        const port = Number(value);
+        if (port !== 0 && (port < 1024 || port > 65535)) return 'must be 0 or in range 1024 to 65535.';
+        return undefined;
+    },
+    '--secure-heap': (value) => {
+        if (!/^\d+$/.test(value)) return undefined;
+        const size = Number(value);
+        if (!Number.isSafeInteger(size)) return '--secure-heap must be a power of 2';
+        if (size !== 0 && !Number.isInteger(Math.log2(size))) return '--secure-heap must be a power of 2';
+        return undefined;
+    }
+};
+
 /** True for a name in node's own table, whatever it wants behind it. */
 function isKnownOption(name: string): boolean {
     return BOOLEAN_LONG_OPTIONS.has(name) || FLAG_LONG_OPTIONS.has(name) || VALUED_LONG_OPTIONS.has(name);
@@ -280,6 +349,13 @@ interface KnownOption {
     at: number;
     /** What node refuses the line with when the value the option wants is not there. */
     refusal?: string;
+    /**
+     * What node writes for the value the option was given: V8's own lines, which carry no
+     * `node:` of their own, and -- for a value that ends the line -- the `bad option` behind them.
+     */
+    valueErrors?: Refusal[];
+    /** True when the value ends the line: status 9, and nothing runs. */
+    refused?: boolean;
 }
 
 /**
@@ -290,13 +366,92 @@ interface KnownOption {
  */
 function knownOption(arg: string, name: string, value: string | undefined, args: string[], at: number): KnownOption | undefined {
     if (VALUED_LONG_OPTIONS.has(name)) {
-        if (value !== undefined) return { words: [arg], at };
+        /* An empty value behind an `=` is no value at all to node's own parser, whichever option it
+           was written for, and it refuses the line with `requires an argument` -- except for the
+           options V8 reads the value of itself, which read an empty one as a number and then say
+           what they make of it. */
+        if (value === '' && !NUMERIC_LONG_OPTIONS.has(name) && !EMPTY_VALUE_OWN_WAY.has(name)) {
+            return { words: [], at, refusal: `${name}= requires an argument` };
+        }
+        if (value !== undefined) {
+            const read = valueRead(name, arg, value);
+            if (read === undefined) return { words: [arg], at };
+            return { words: read.refused === true ? [] : [arg], at, ...read };
+        }
         const next = args[at + 1];
-        if (next === undefined || isOption(next)) return { words: [], at, refusal: `${name} requires an argument` };
+        if (next === undefined || isOption(next)) {
+            /* Nothing to take is not the same absence to every option: to node's own parser it is an
+               option left incomplete, and to V8 it is a value it cannot read, which is what
+               `node --stack-size` at the end of a line is told. */
+            const nothing = NUMERIC_LONG_OPTIONS.has(name) ? valueRead(name, name, undefined) : undefined;
+            if (nothing !== undefined) return { words: [], at, ...nothing };
+            return { words: [], at, refusal: `${name} requires an argument` };
+        }
+        const read = valueRead(name, name, next);
+        if (read !== undefined) return { words: [], at, ...read };
         return { words: [name, next], at: at + 1 };
     }
     if (BOOLEAN_LONG_OPTIONS.has(name) || FLAG_LONG_OPTIONS.has(name)) return { words: [arg], at };
     return undefined;
+}
+
+/**
+ * What node makes of the number behind a valued option: `valueErrors` are the lines it writes for
+ * the value, and `refused` is whether that value ends the line -- status 9 and nothing run -- or
+ * is only something node said on its way past it.
+ *
+ * Undefined for an option node reads no number out of, which is every one of them that names a
+ * path, a name or a mode: those are taken exactly as they were written, as they are today.
+ */
+function valueRead(name: string, arg: string, value: string | undefined): { valueErrors: Refusal[]; refused: boolean } | undefined {
+    const type = NUMERIC_LONG_OPTIONS.get(name);
+    if (type !== undefined) return v8ValueRead(arg, value, type);
+    if (value === undefined) return undefined;
+    const check = NUMBER_CHECKS[name];
+    if (check === undefined) return undefined;
+    const message = check(value);
+    if (message === undefined) return undefined;
+    return { valueErrors: [{ text: message, badOption: false }], refused: true };
+}
+
+/**
+ * What V8 makes of one number: a `size_t` it reads out of the value, or an `int`, and the lines it
+ * writes for one it will not take. Three shapes, every one of them read off the host:
+ *
+ * - a value that is not a number at all, and one that is a number with something left behind it,
+ *   are an `illegal value` and a refusal -- `1.5` is a `1` with `.5` left over, which is why it is
+ *   one, and so is `notanumber`;
+ * - a number outside the bounds of the type is `out of bounds`, which node says and then runs on
+ *   with the value V8 clamped to the bound it named: `-1`, `99999999999999999999` and an empty one;
+ * - a value that was never given at all is both at once, and it does end the line.
+ */
+function v8ValueRead(arg: string, value: string | undefined, type: 'size_t' | 'int'): { valueErrors: Refusal[]; refused: boolean } | undefined {
+    const outOfBounds: Refusal = { text: `Error: Value for flag ${arg} of type ${type} is out of bounds [0-${SIZE_T_CEILING}]`, badOption: false, bare: true };
+    const illegal: Refusal = { text: `Error: illegal value for flag ${arg} of type ${type}`, badOption: false, bare: true };
+    const tryHelp: Refusal = { text: 'Try --help for options', badOption: false, bare: true };
+    const bad: Refusal = { text: `bad option: ${arg}`, badOption: true };
+    if (value === undefined) {
+        return type === 'size_t'
+            ? { valueErrors: [outOfBounds, illegal, tryHelp, bad], refused: true }
+            : { valueErrors: [illegal, tryHelp, bad], refused: true };
+    }
+    if (value === '') {
+        /* An empty value behind an `=` is a number V8 reads as nothing at all, which is out of the
+           bounds of a `size_t` and nothing to an `int`: either way, a note and a run that goes on. */
+        return type === 'size_t' ? { valueErrors: [outOfBounds, tryHelp], refused: false } : undefined;
+    }
+    if (INTEGER.test(value)) {
+        if (type === 'int') return undefined;
+        const size = Number(value);
+        if (size >= 0 && size <= Number(SIZE_T_CEILING)) return undefined;
+        return { valueErrors: [outOfBounds, tryHelp], refused: false };
+    }
+    if (NUMBER_PREFIX.test(value)) {
+        return { valueErrors: [illegal, tryHelp, bad], refused: true };
+    }
+    return type === 'size_t'
+        ? { valueErrors: [outOfBounds, illegal, tryHelp, bad], refused: true }
+        : { valueErrors: [illegal, tryHelp, bad], refused: true };
 }
 
 /** An argument node reads as one of its own options: a dash that is not the stdin `-` or the `--` that ends them. */
@@ -417,11 +572,22 @@ export function parseNodeOptions(text: string): NodeOptionsRequest {
 interface Refusal {
     text: string;
     badOption: boolean;
+    /** True when `text` is a line node wrote as it stands: V8's own, which carry no `node:` of their own. */
+    bare?: boolean;
 }
 
 function refuse(errors: Refusal[]): NodeCommand {
-    const stderr = errors.map((error) => `node: ${error.text}\n`).join('');
+    const stderr = errors.map((error) => refusalLine(error)).join('');
     return { file: '[flags]', args: [], execArgv: [], flagAnswer: { stderr, exitCode: BAD_OPTION_EXIT } };
+}
+
+/**
+ * One refusal as node writes it, newline and all. Most of what node refuses a line with is named
+ * after it -- `node: bad option: --nope` -- but the lines V8 writes for a number it could not
+ * read are not: they are V8's own, and they stand as they were written.
+ */
+function refusalLine(error: Refusal): string {
+    return error.bare === true ? `${error.text}\n` : `node: ${error.text}\n`;
 }
 
 /** A line the flags answer on their own. */
@@ -482,6 +648,8 @@ export function nodeCommand(args: string[]): NodeCommand {
     let heapProfName: string | undefined;
     /** `--build-snapshot`: a snapshot blob was asked for, which needs an entry point script. */
     let buildSnapshot = false;
+    /** What node writes on stderr for a value it read and went on with. */
+    const notes: string[] = [];
     /** `--title=<name>`: what `process.title` reads once the guest is up. */
     let title: string | undefined;
     /** The options of the line, in node's own words: what `process.execArgv` is. */
@@ -543,6 +711,16 @@ export function nodeCommand(args: string[]): NodeCommand {
                 if (known.refusal !== undefined) {
                     errors.push({ text: known.refusal, badOption: false });
                     break;
+                }
+                if (known.valueErrors !== undefined) {
+                    /* A value that ends the line is a refusal like any other, and one that does not
+                       is a note node wrote on its way past it: the line runs, and what it said
+                       still goes to stderr before it does. */
+                    if (known.refused === true) {
+                        errors.push(...known.valueErrors);
+                        break;
+                    }
+                    notes.push(known.valueErrors.map((error) => refusalLine(error)).join(''));
                 }
                 execArgv.push(...known.words);
                 /* `--title` is the one option of node's table a script can read back: node changes
@@ -721,6 +899,7 @@ export function nodeCommand(args: string[]): NodeCommand {
         watchPaths,
         envFiles,
         envFilesIfExists,
+        ...(notes.length === 0 ? {} : { notes }),
         ...(stackTraceLimit === undefined ? {} : { stackTraceLimit }),
         ...(inputType === undefined ? {} : { inputType }),
         ...(title === undefined ? {} : { title }),

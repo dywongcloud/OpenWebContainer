@@ -1615,6 +1615,8 @@ export class NodeProcess extends Process {
      * run never reaches the guest: no QuickJS runtime is built for it, and no file is looked for.
      */
     private readonly flagAnswer?: NodeFlagAnswer;
+    /** What node wrote on stderr for a number it read and went on with: a note, not a refusal. */
+    private readonly flagNotes: string[] = [];
     /** The module a synchronous child boots on; see the constructor. Undefined for every other process. */
     private readonly bootModule?: QuickJSAsyncWASMModule;
     /**
@@ -1700,6 +1702,7 @@ export class NodeProcess extends Process {
         this.stackTraceLimit = run.stackTraceLimit;
         this.title = run.title;
         this.evalScript = run.evalScript;
+        this.flagNotes = run.notes ?? [];
         this.evalModule = evalSource !== undefined
             && (run.inputType === 'module' || (run.inputType === undefined && readsAsModule(evalSource)));
         this.currentCwd = cwd || CONTAINER_WORKDIR;
@@ -1780,6 +1783,10 @@ export class NodeProcess extends Process {
                        no guest of this process's own is booted for it. */
                     code = await this.runPackageScript();
                 } else {
+                    /* What node said on its way past a value it read: a number outside the bounds of
+                       its type is written and the run goes on, which is why it is a note here and not
+                       one of the refusals above. */
+                    for (const note of this.flagNotes) this.emitError(note);
                     /* What is left of the bound the process that started this one runs under: a shell
                        hands its command line to a child and then only waits, so the child is what holds
                        the host thread, and the caller's `timeout` is what has to end it -- see
