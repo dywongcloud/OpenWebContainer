@@ -73,6 +73,8 @@ export interface NodeCommand {
     /** `--heap-prof-name=<name>`: the name it is written under, in place of node's own default. */
     heapProfName?: string;
     /** What node wrote on stderr for a value it read and went on with, in the order it read them. */
+    /** `--snapshot-blob <file>`: the snapshot the run boots from, opened before anything runs. */
+    snapshotBlob?: string;
     notes?: string[];
     /** The answer for a run that never reaches the guest; set exactly when `file` is `[flags]`. */
     flagAnswer?: NodeFlagAnswer;
@@ -85,6 +87,8 @@ export interface NodeRunOptions {
     evalScript?: string;
     inputType?: string;
     title?: string;
+    /** `--snapshot-blob <file>`: the snapshot the run boots from, opened before anything runs. */
+    snapshotBlob?: string;
     /** What node wrote on stderr for a value it read and went on with, in the order it read them. */
     notes?: string[];
     interactive?: boolean;
@@ -648,6 +652,8 @@ export function nodeCommand(args: string[]): NodeCommand {
     let heapProfName: string | undefined;
     /** `--build-snapshot`: a snapshot blob was asked for, which needs an entry point script. */
     let buildSnapshot = false;
+    /** `--snapshot-blob <file>`: the snapshot the run boots from. */
+    let snapshotBlob: string | undefined;
     /** What node writes on stderr for a value it read and went on with. */
     const notes: string[] = [];
     /** `--title=<name>`: what `process.title` reads once the guest is up. */
@@ -748,6 +754,10 @@ export function nodeCommand(args: string[]): NodeCommand {
                 if (name === '--heap-prof-dir') heapProfDir = value ?? known.words[1]!;
                 if (name === '--heap-prof-name') heapProfName = value ?? known.words[1]!;
                 if (name === '--build-snapshot') buildSnapshot = true;
+                /* `--snapshot-blob` is the one valued option whose value this runtime opens: what it
+                   names is the snapshot the process boots from, and node opens it before anything
+                   else exists. */
+                if (name === '--snapshot-blob') snapshotBlob = value ?? known.words[1]!;
                 i = known.at;
                 continue;
             }
@@ -899,6 +909,7 @@ export function nodeCommand(args: string[]): NodeCommand {
         watchPaths,
         envFiles,
         envFilesIfExists,
+        ...(snapshotBlob === undefined ? {} : { snapshotBlob }),
         ...(notes.length === 0 ? {} : { notes }),
         ...(stackTraceLimit === undefined ? {} : { stackTraceLimit }),
         ...(inputType === undefined ? {} : { inputType }),

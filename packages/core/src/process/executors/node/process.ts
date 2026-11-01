@@ -33,6 +33,9 @@ const RESERVED_WORDS = new Set([
 /** The status node leaves with when it refuses its own options, or the ones `NODE_OPTIONS` carries. */
 const BAD_OPTION_EXIT = 9;
 
+/** The status node leaves with when the snapshot `--snapshot-blob` names is one it cannot open. */
+const SNAPSHOT_BLOB_EXIT = 14;
+
 /**
  * How often watch mode looks at the files it watches. Node's own watcher debounces a change by
  * 200 ms; this container has no watcher to be told by, so it looks, and the interval is what stands
@@ -1615,6 +1618,8 @@ export class NodeProcess extends Process {
      * run never reaches the guest: no QuickJS runtime is built for it, and no file is looked for.
      */
     private readonly flagAnswer?: NodeFlagAnswer;
+    /** `--snapshot-blob <file>`: the snapshot this run boots from, opened before anything runs. */
+    private readonly snapshotBlob?: string;
     /** What node wrote on stderr for a number it read and went on with: a note, not a refusal. */
     private readonly flagNotes: string[] = [];
     /** The module a synchronous child boots on; see the constructor. Undefined for every other process. */
@@ -1702,6 +1707,7 @@ export class NodeProcess extends Process {
         this.stackTraceLimit = run.stackTraceLimit;
         this.title = run.title;
         this.evalScript = run.evalScript;
+        this.snapshotBlob = run.snapshotBlob;
         this.flagNotes = run.notes ?? [];
         this.evalModule = evalSource !== undefined
             && (run.inputType === 'module' || (run.inputType === undefined && readsAsModule(evalSource)));
@@ -1774,10 +1780,14 @@ export class NodeProcess extends Process {
                 /* The environment the run starts from is settled before anything is run: `NODE_OPTIONS`
                    and the files `--env-file` names are read first, and either can refuse the whole
                    line -- with node's message and node's status 9 -- before a file is looked for. */
-                const refused = this.applyEnvironment();
+                /* A snapshot the line names is opened before anything else is read -- before the
+                   environment, before a file is looked for -- and a name that cannot be opened is
+                   the end of the line, with node's own message and node's own status. */
+                const unopened = this.snapshotBlobFailure();
+                const refused = unopened !== undefined ? unopened : this.applyEnvironment();
                 if (refused !== undefined) {
                     this.emitError(refused);
-                    code = BAD_OPTION_EXIT;
+                    code = unopened !== undefined ? SNAPSHOT_BLOB_EXIT : BAD_OPTION_EXIT;
                 } else if (this.runScript !== undefined) {
                     /* `node --run <script>`: what runs is a script out of package.json, in a shell, and
                        no guest of this process's own is booted for it. */
@@ -2157,6 +2167,26 @@ export class NodeProcess extends Process {
             this.context!.newString(JSON.stringify(meta === undefined ? null : meta)),
             this.context!.newArrayBuffer(exactArrayBuffer(bytes))
         ]);
+    }
+
+    /**
+     * `--snapshot-blob <file>`: the snapshot this run boots from, which node opens before anything
+     * else exists. A name that is not there, one that is a directory, and one under a path that is
+     * not a directory at all are all the same to it -- `Cannot open <name>` on stderr, status 14,
+     * and nothing of the line runs.
+     *
+     * A file that does open is left to the run: what the host does with one is boot from it, and a
+     * file that is not a snapshot is an abort of the host's own, which no container has.
+     */
+    private snapshotBlobFailure(): string | undefined {
+        if (this.snapshotBlob === undefined) return undefined;
+        const name = this.snapshotBlob;
+        try {
+            if (this.fileSystem.statPath(this.resolvePath(name))?.type === 'file') return undefined;
+        } catch {
+            /* A name this process cannot open at all, which is the refusal below. */
+        }
+        return `Cannot open ${name}`;
     }
 
     /**

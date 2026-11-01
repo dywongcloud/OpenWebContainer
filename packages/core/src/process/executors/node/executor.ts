@@ -35,6 +35,7 @@ export class NodeProcessExecutor implements ProcessExecutor {
                 ...(command.evalScript === undefined ? {} : { evalScript: command.evalScript }),
                 ...(command.inputType === undefined ? {} : { inputType: command.inputType }),
                 ...(command.title === undefined ? {} : { title: command.title }),
+                ...(command.snapshotBlob === undefined ? {} : { snapshotBlob: command.snapshotBlob }),
                 ...(command.notes === undefined ? {} : { notes: command.notes }),
                 ...(command.interactive === undefined ? {} : { interactive: command.interactive }),
                 ...(command.test === undefined ? {} : { test: command.test }),
