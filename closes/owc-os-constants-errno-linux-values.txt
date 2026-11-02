@@ -48,3 +48,4 @@ Witness
   count, availableParallelism, networkInterfaces, userInfo, getPriority,
   setPriority, dlopen, UV_UDP_REUSEADDR -- differs before and after in the errno
   table alone.
+owc-os-constants-errno-linux-values resolved 1793598480708-5406-c2776e1505b1576d 2026-11-02T05:50:57.383Z
