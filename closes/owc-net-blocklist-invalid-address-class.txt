@@ -44,3 +44,4 @@ Witness
   an over-long path EINVAL, a connect to an unbound path ENOENT, dgram
   bind/send/message, connect, autobind and disconnect after close, RST destroy
   and a plain TCP echo -- is byte-identical before and after.
+owc-net-blocklist-invalid-address-class resolved 1793598379173-5094-623cf3cbf2533c96 2026-11-02T05:50:33.634Z
