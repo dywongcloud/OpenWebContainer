@@ -1495,23 +1495,79 @@ const PROCESS_REPORT_SRC = `(function (fs, os) {
       host: ask(os, 'hostname', 'localhost')
     };
   }
+  /* The argument node's own 'getReport' takes: 'err' has to be an object that is not an array, and
+     anything else is refused with the ERR_INVALID_ARG_TYPE node writes for it, node's own words for
+     the value it was handed behind them. Measured on host node 24.15: 'true' is "Received type
+     boolean (true)", 'null' is "Received null", an array is "Received an instance of Array", a
+     function is "Received function " and its name, and 'undefined' is not refused at all -- it asks
+     for the synthetic callstack node makes when no error was handed in. */
+  function receivedOf(value) {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return 'an instance of Array';
+    var kind = typeof value;
+    if (kind === 'string') return "type string ('" + value + "')";
+    if (kind === 'function') return 'function ' + (typeof value.name === 'string' ? value.name : '');
+    if (kind === 'symbol') return 'type symbol (' + String(value) + ')';
+    if (kind === 'bigint') return 'type bigint (' + String(value) + 'n)';
+    return 'type ' + kind + ' (' + String(value) + ')';
+  }
+  function validateReportErr(err) {
+    if (typeof err === 'object' && err !== null && !Array.isArray(err)) return;
+    var bad = new TypeError('The "err" argument must be of type object. Received ' + receivedOf(err));
+    bad.code = 'ERR_INVALID_ARG_TYPE';
+    throw bad;
+  }
+  /* The line a report puts above the frames: what String(err) says, which for an Error is its name
+     and its message, and for one with no message is its name alone. */
+  function messageOf(err) {
+    var name = typeof err.name === 'string' ? err.name : '';
+    var text = typeof err.message === 'string' ? err.message : '';
+    if (name !== '' && text !== '') return name + ': ' + text;
+    if (name !== '') return name;
+    return String(err);
+  }
+  /* The stack of the error handed in -- its frames and nothing else, the line that names the error
+     being the message above them -- or the two words node writes for an object with no stack to
+     read: "No stack." over "Unavailable.", which is what host node 24.15 answers for a plain
+     object and for a Date. */
+  function stackOf(err) {
+    var raw = typeof err.stack === 'string' ? err.stack : '';
+    if (raw === '') return { message: 'No stack.', stack: ['Unavailable.'], errorProperties: {} };
+    var lines = raw.split('\\n');
+    var frames = [];
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].replace(/^\\s+/, '');
+      if (line.indexOf('at ') === 0) frames.push(line);
+    }
+    return { message: messageOf(err), stack: frames, errorProperties: {} };
+  }
   p.report = {
     writeReport: function (file) {
       var target = file === undefined || file === '' ? defaultName() : String(file);
       if (p.report.directory !== '' && target.charAt(0) !== '/') target = p.report.directory + '/' + target;
-      fs.writeFileSync(target, JSON.stringify(p.report.getReport(), null, 2));
+      /* One line when 'compact' asks for it, two spaces of indent when it does not -- and a newline
+         behind either, which is where host node 24.15's own report file ends. */
+      var body = p.report.getReport();
+      var text = p.report.compact ? JSON.stringify(body) + '\\n' : JSON.stringify(body, null, 2) + '\\n';
+      fs.writeFileSync(target, text);
       /* Node says what it wrote and where, on stderr, before the call returns the name. */
       p.stderr.write('\\nWriting Node.js report to file: ' + target + '\\nNode.js report completed\\n');
       return target;
     },
-    getReport: function () {
+    /* 'getReport([err])': one declared argument, as node's own has, validated as node validates it
+       and folded into the report -- the error's own message and frames stand where the synthetic
+       callstack stands for a call that named none. */
+    getReport: function (err) {
+      if (err !== undefined) validateReportErr(err);
       var mu = ask(p, 'memoryUsage', {});
       var cu = ask(p, 'cpuUsage', { user: 0, system: 0 });
       var userSeconds = (cu.user || 0) / 1e6;
       var systemSeconds = (cu.system || 0) / 1e6;
       return {
         header: header(),
-        javascriptStack: { message: 'Error [ERR_SYNTHETIC]: JavaScript Callstack', stack: [] },
+        javascriptStack: err === undefined
+          ? { message: 'Error [ERR_SYNTHETIC]: JavaScript Callstack', stack: [], errorProperties: {} }
+          : stackOf(err),
         javascriptHeap: {
           totalMemory: mu.heapTotal || 0,
           executableMemory: 0,
