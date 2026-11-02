@@ -945,7 +945,8 @@ BF.fs = function () {
     ENOTSUP: 'operation not supported',
     EBADF: 'bad file descriptor',
     ESPIPE: 'illegal seek',
-    ELOOP: 'too many symbolic links encountered'
+    ELOOP: 'too many symbolic links encountered',
+    ENOSYS: 'function not implemented'
   };
 
   /*
@@ -965,7 +966,8 @@ BF.fs = function () {
     ENOTEMPTY: -66,
     EPERM: -1,
     ESPIPE: -29,
-    ELOOP: -62
+    ELOOP: -62,
+    ENOSYS: -78
   };
 
   function fsError(code, syscall, path) {
@@ -2217,7 +2219,33 @@ BF.fs = function () {
     if (movedSparse !== undefined) { sparseSet(bt, movedSparse); sparseDrop(at); }
   };
 
-  fs.copyFileSync = function (from, to) {
+  /*
+   * The third argument of a copy: COPYFILE_EXCL, 1, refuses a destination that is already there;
+   * COPYFILE_FICLONE, 2, asks for a copy-on-write clone and takes a byte copy when there is none;
+   * COPYFILE_FICLONE_FORCE, 4, asks for one and refuses when there is none. Host node 24.15 calls
+   * the argument "mode" in the error it raises for a value it will not take, and takes only an
+   * int32 in 0..7: anything else that is not an int32 is a TypeError ERR_INVALID_ARG_TYPE, while
+   * an int32 out of that range -- -1, 8, 2**31 -- is a RangeError ERR_OUT_OF_RANGE, and a NaN or an
+   * Infinity is the same RangeError without the bounds the message names. 1.5 is inside the range
+   * and is taken as 1. The value is settled before a path is looked at, so it is refused even on a
+   * source that is not there.
+   */
+  function copyFlags(value) {
+    if (value === undefined || value === null) return 0;
+    if (typeof value !== 'number') {
+      throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'mode must be int32 or null/undefined');
+    }
+    var bounded = value === value && value !== Infinity && value !== -Infinity;
+    if (!bounded || value < 0 || value > 7) {
+      throw fsArgErr(RangeError, 'ERR_OUT_OF_RANGE', bounded
+        ? 'mode is out of range: >= 0 && <= 7'
+        : 'mode is out of range');
+    }
+    return value | 0;
+  }
+
+  fs.copyFileSync = function (from, to, flags) {
+    var mode = copyFlags(flags);
     var src = toPathString(from);
     var dest = toPathString(to);
     /* A copy is a two-ended call, and host node 24.15 names both of its arguments in the error it
@@ -2230,6 +2258,28 @@ BF.fs = function () {
        EACCES the way a host answers it, even though the bytes of it are what the copy replaces. */
     requireAccess(src, 4, 'copyfile', srcName, destName, srcName);
     requireAccess(dest, 2, 'copyfile', srcName, destName, destName);
+    /* COPYFILE_EXCL is the O_EXCL a host opens the destination with: a destination that is there is
+       refused with EEXIST and its bytes are left alone, and it is refused before the clone below is
+       asked for -- EXCL together with FICLONE_FORCE answers EEXIST when the destination is there and
+       ENOSYS when it is not, which is the order host node 24.15 answers them in. */
+    if (mode & fs.constants.COPYFILE_EXCL && statFollowingLinks(dest, 'copyfile', destName)) {
+      throw twoEndError('EEXIST', 'copyfile', srcName, destName);
+    }
+    /* COPYFILE_FICLONE_FORCE asks for a clone of the bytes rather than a copy of them. This file
+       system holds bytes of its own and has nothing to clone into, so the answer is the ENOSYS a
+       host gives, raised where the clone would have been attempted: after the source is read and
+       the destination opened, which is why a source that is not there is still ENOENT. */
+    if (mode & fs.constants.COPYFILE_FICLONE_FORCE) {
+      /* A host opens the destination before it asks for the clone and takes the name back out when
+         the answer is ENOSYS, so a clone that cannot be made leaves no destination behind: a file
+         that was there is gone afterwards, and one that was not is still not there. A name it can
+         take back out of its directory is the only case that shows, and ENOSYS is the answer even
+         where the directory refuses, so a removal that fails is not what the caller is told. */
+      if (statFollowingLinks(dest, 'copyfile', destName)) {
+        try { fs.unlinkSync(to); } catch (notRemoved) { }
+      }
+      throw twoEndError('ENOSYS', 'copyfile', srcName, destName);
+    }
     /* The bytes go into what the destination names, not into the link standing there: a copy onto a
        link writes the target and leaves the link a link. */
     sparseDrop(bytesNameOf(dest));
@@ -3979,6 +4029,23 @@ BF.fs = function () {
       };
     }
   });
+  /*
+   * A flag a host will not take is refused out of the call itself and not handed to the callback:
+   * node reads the argument before it starts the copy, so a copyFile asked for a flag it will not
+   * take throws where the caller made the call instead of answering cb with the error -- which is what wrapping the
+   * synchronous implementation does for every other refusal, and which is what the promise form
+   * still does, a promise having nowhere to throw to. The callback is read first: a third argument
+   * that is a function is the callback and not a flag, and a call with no callback at all is the
+   * missing-callback error and not a bad flag, whatever the flag in it was.
+   */
+  var copyFileGeneric = fs.copyFile;
+  fs.copyFile = function (from, to, flags, cb) {
+    if (typeof flags === 'function') { cb = flags; flags = undefined; }
+    if (typeof cb === 'function') copyFlags(flags);
+    return arguments.length > 2 && typeof arguments[2] !== 'function'
+      ? copyFileGeneric.call(fs, from, to, flags, cb)
+      : copyFileGeneric.call(fs, from, to, cb);
+  };
   promises.open = function (p, flags, mode) {
     return new Promise(function (resolve, reject) {
       try {

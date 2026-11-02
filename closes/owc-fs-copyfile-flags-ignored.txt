@@ -1,0 +1,55 @@
+owc-fs-copyfile-flags-ignored resolved lane-cp40-local-boot-pair 2026-11-02T11:20:00.000Z
+
+Symptom
+  fs.copyFileSync(src, dst, COPYFILE_EXCL) onto a destination that is there copied over it and
+  answered ok, where host node v24.15.0 refuses with EEXIST: file already exists, copyfile
+  'src.txt' -> 'dst.txt' (errno -17, syscall copyfile) and leaves the destination's bytes alone.
+  fs.copyFileSync(src, dst, COPYFILE_FICLONE_FORCE) copied and handed the contents back, where the
+  host answers ENOSYS: function not implemented, copyfile 'src.txt' -> 'dst.txt' (errno -78) on
+  this macOS host, which has no clone to make. The same on the callback and the promise form, both
+  of which this container derives from the synchronous one.
+
+Cause
+  fs.copyFileSync was written as function (from, to) -- two parameters, no third -- so the flags a
+  caller passed were never read. Nothing named them: fs.constants carried COPYFILE_EXCL 1,
+  COPYFILE_FICLONE 2 and COPYFILE_FICLONE_FORCE 4 all along. ENOSYS was in neither DESCRIPTIONS
+  nor ERRNOS, so there was no text and no errno to answer with.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts
+    copyFlags settles the argument the way host node v24.15.0 does: undefined and null are 0, a
+    value that is not a number is TypeError ERR_INVALID_ARG_TYPE ("mode must be int32 or null/
+    undefined"), a NaN or an Infinity is RangeError ERR_OUT_OF_RANGE ("mode is out of range") and
+    an int32 outside 0..7 the same RangeError with the bounds named; 1.5 is inside and is taken as
+    1. copyFileSync takes the flags and answers in the host's order -- the source is looked at
+    first, then COPYFILE_EXCL refuses a destination that is there with EEXIST, then
+    COPYFILE_FICLONE_FORCE answers ENOSYS and takes the destination back out, which is what a host
+    does with the name it opened before it asked for the clone. ENOSYS is added to DESCRIPTIONS
+    and to ERRNOS (-78). The callback form is wrapped so the flag error is thrown out of the call
+    and not handed to cb, the way node reads the argument before it starts the copy; the promise
+    form keeps rejecting, a promise having nowhere to throw to.
+  fs.copyFile and fs.promises.copyFile are derived from the synchronous implementation by the loop
+  at buffer-fs.ts, so all three forms read the flags through it.
+  packages/core/src/filesystem/** carries no copyFile: grep of 'copyfile|copyFile' over
+  packages/core/src with --exclude-dir=generated lists this file alone, and writeBase64 -- the call
+  a copy lands on -- is defined in process/executors/node/runtime/host-bridge.ts.
+
+Witness
+  One fresh container boot per case from a git-archive export of origin/main (installed and built
+  under /tmp/owc-confirm-16), the same script under host node v24.15.0 in a fresh directory,
+  stdout + stderr + exit code compared together: 89 of 89 labels agree, at two memory points
+  (free+speculative 834 MB then 739 MB before, 3421 MB and again at the second point after).
+  Cases: COPYFILE_EXCL, COPYFILE_FICLONE and COPYFILE_FICLONE_FORCE alone and combined (3, 5, 6
+  and 7), over a destination that exists and one that does not, in the synchronous, the callback
+  and the promise form, plus a destination in a directory that is not there and a source that is
+  not there; 13 flag values settled as the host settles them. No test file.
+  The fs sweeps are unchanged by it: sweep, fspromises, opendirflag and fhclose report the same
+  stdout diff sets before and after (5, 2, 0 and 0), and fs-sparse, fs-sparse-sweep and fs-1k exit
+  0 both times.
+
+Open, not this row
+  fs.promises.watch does not end its iterator on an AbortSignal abort here, and the guest process
+  then never exits: the control run prints endedOnAbort=false where host node v24.15.0 prints
+  true, and reaches the harness timeout. Different symptom, recorded rather than fixed.
+  A copy does not carry the source's mode to the destination: host node v24.15.0 creates the
+  destination with 0600 for a 0600 source, this container with the default 0644.
