@@ -39,3 +39,4 @@ Witness
   before the fix the object's own keys were `["categories","enabled"]` against the
   host's `[]` and after it every line is byte-identical. A seven-case sweep of the
   other modules of the same file answers identically before the fix and after it.
+owc-trace-events-tracing-own-props resolved 1793598611463-5471-502db3f939b68f51 2026-11-02T05:51:15.856Z
