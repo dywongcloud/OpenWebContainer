@@ -1,0 +1,37 @@
+owc-node-test-todo-and-after-hook-not-run resolved 1793610067350-5100-d006dd1da7ce61af 2026-11-02T09:09:16.000Z
+Row: owc-node-test-todo-and-after-hook-not-run
+Witness: 1793610067350-5100-d006dd1da7ce61af
+
+Symptom
+  A todo test's body never ran here and the module's own after hook never ran behind it: one
+  todo test printed HOOKLOG ["[before]"] where host node v24.15.0 prints
+  ["[before]","todo body","[after]"], and it was marked "⚠ todo (0ms) # TODO" where the host
+  marks a todo that held "✔ todo (0.223375ms) # TODO". A suite registered last, and a test that
+  was skipped, left the after hook unrun for the same reason.
+
+Cause
+  runTest short-circuited every todo before its body was called, and runAll ran the module's
+  after hook only as the tail of the last test -- so a suite registered last, a test that was
+  skipped and a todo all left it unrun.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/pure-b.ts
+    runTest keeps the short circuit for a skip alone, so a todo is called with the hooks around
+    it: one that held takes lineTodoOk and is counted a todo, one that did not keeps the warning
+    sign, joins the failures and is counted a todo rather than a fail, so its run still ends on
+    0 -- which is what the host does with a todo that does not hold. runAll runs the module's
+    after hook once behind its whole collection, whatever kind the last item is, and lets a hook
+    that throws keep the report.
+  Pushed as 73c49647eac8290661d4211bd49a1bd510a6f023, built on origin/main
+  cb55806073be26a015ea7e838c587d08537e8453.
+
+Witness
+  dispatch 1793610067350-5100-d006dd1da7ce61af, session verify-owc-node-test-todo-and-after-hook-not-run: c1.js on one fresh
+  container boot against host node v24.15.0, "c1.js agree=True exit host=0 container=0" -- the
+  hook log reads ["[before]","todo body","[after]"] on both sides and the mark is the tick on
+  both. c1/c11/c13 agree at two memory points (0.06 GB free at load 30-34, 0.58 GB at load
+  16.04), and 17 of 17 cases of the test-runner sweep agree, where 2 of 12 did before.
+
+Readme
+  "## node:test: a todo test's body and the module's own after hook run", added to Readme.md in
+  the pushed tree with this record.
