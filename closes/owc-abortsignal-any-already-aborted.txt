@@ -1,4 +1,4 @@
-owc-abortsignal-any-already-aborted resolved lane-abort40-file-entry-sweep-74x2 2026-11-02T02:30:29.732Z
+owc-abortsignal-any-already-aborted resolved 1793596720994-20120-dea7408e3424cacb 2026-11-02T05:45:21.932Z
 
 Symptom
   `AbortSignal.any([AbortSignal.abort()]).aborted` was `false` in the container and `true` on host
@@ -26,3 +26,18 @@ Witness
   After the fix the same 74 cases differ in 0 places, at both memory points, with no case drifting
   between them; the post-construction abort path, the listener path, `AbortSignal.any([])` and the
   whole `AbortSignal.timeout` ladder are unchanged. Published 796ab81c233f98753afe124639fb0f8451b50433.
+
+Re-verification (at origin/main 89804194c0fb072f8a4e1471e41e0a6f8c3cc223)
+  A fresh `git archive origin/main` export (/tmp/verify-abort41/export, installed and
+  built at the tip) re-runs the same 74 cases as file entries -- each written to
+  /app/<case>.js and spawned as `node /app/<case>.js`, never `node -e`, which is what
+  fails with ENOENT '/app/[eval]' -- against host node v24.15.0, comparing stdout +
+  stderr + exit code at two memory points. DIFFS=0, no case drifting between them.
+  Witness dispatch 1793596720994-20120-dea7408e3424cacb under session verify-owc-abortsignal-any-already-aborted. No test file.
+
+  Cases this row's acceptance turns on, host-identical after the fix:
+    any-abort-aborted true (host true, before false)
+    any-abort-reason 'Error: why' (host same, before undefined)
+    any-abort-reason-dom 'AbortError: This operation was aborted'
+    any-controller-pre true, any-controller-pre-reason 'Error: pre'
+    any-two-second-pre 'true,Error: second'; any-two-pre-both 'Error: a'
