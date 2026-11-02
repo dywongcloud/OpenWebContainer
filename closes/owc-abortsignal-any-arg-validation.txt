@@ -1,4 +1,4 @@
-owc-abortsignal-any-arg-validation resolved lane-abort40-file-entry-sweep-74x2 2026-11-02T02:30:29.732Z
+owc-abortsignal-any-arg-validation resolved 1793596745427-20121-7c2b70ce30d0afac 2026-11-02T05:45:37.422Z
 
 Symptom
   `AbortSignal.any([{}])` threw `TypeError: not a function` in the container where host node
@@ -26,3 +26,16 @@ Witness
   After the fix every one of those cases throws byte-identically to host node v24.15.0, and
   `AbortSignal.any` over a Set and over a generator (iterables a host accepts) still works.
   Published 796ab81c233f98753afe124639fb0f8451b50433.
+
+Re-verification (at origin/main 89804194c0fb072f8a4e1471e41e0a6f8c3cc223)
+  A fresh `git archive origin/main` export (/tmp/verify-abort41/export, installed and
+  built at the tip) re-runs the same 74 cases as file entries -- each written to
+  /app/<case>.js and spawned as `node /app/<case>.js`, never `node -e`, which is what
+  fails with ENOENT '/app/[eval]' -- against host node v24.15.0, comparing stdout +
+  stderr + exit code at two memory points. DIFFS=0, no case drifting between them.
+  Witness dispatch 1793596745427-20121-7c2b70ce30d0afac under session verify-owc-abortsignal-any-arg-validation. No test file.
+
+  Cases this row's acceptance turns on, host-identical after the fix:
+    any-elem-object TypeError: The "signals[0]" argument must be an instance of AbortSignal. Received an instance of Object
+    any-elem-second / any-abort-then-bad name signals[1] the same way
+    any-noniterable, any-noarg, any-null, any-string, any-number, any-arraylike: TypeError: signals can not be converted to sequence.
