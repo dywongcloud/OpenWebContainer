@@ -1,6 +1,7 @@
 import { blake2b, blake2s } from '@noble/hashes/blake2';
 import { md5 } from '@noble/hashes/legacy';
 import { ripemd160 } from '@noble/hashes/ripemd160';
+import { argon2d, argon2i, argon2id } from '@noble/hashes/argon2';
 import { pbkdf2 } from '@noble/hashes/pbkdf2';
 import { scrypt } from '@noble/hashes/scrypt';
 import { sha1 } from '@noble/hashes/sha1';
@@ -2705,7 +2706,7 @@ function fromBase64url(text: unknown, field: string): Uint8Array {
  * search, and the caller would still be waiting for it.
  * ------------------------------------------------------------------------------------------ */
 
-type KeyKind = 'ed25519' | 'x25519' | 'ed448' | 'x448' | 'ec' | 'rsa' | 'rsa-pss' | 'dsa' | 'dh';
+type KeyKind = 'ed25519' | 'x25519' | 'ed448' | 'x448' | 'ec' | 'rsa' | 'rsa-pss' | 'dsa' | 'dh' | 'mlkem';
 
 interface EcCurve {
     /** Node's name for the curve, and the JWK name a caller sees. */
@@ -2774,6 +2775,11 @@ interface KeyRecord {
     privateBytes?: Uint8Array;
     /** An 'rsa-pss' key generated with a digest or a salt length named: what its details answer. */
     pss?: { hashAlgorithm: string; mgf1HashAlgorithm: string; saltLength: number };
+    /* An ML-KEM key: its parameter set, and the DER it was imported from, which is what its export
+       hands back -- the encapsulation key and the decapsulation key are opaque byte strings here,
+       not arithmetic this runtime performs. */
+    mlkemMode?: string;
+    mlkemDer?: Uint8Array;
 }
 
 const KEY_STORE = new Map<number, KeyRecord>();
@@ -2897,6 +2903,7 @@ function paddedScalar(bytes: Uint8Array, size: number): Uint8Array {
 
 /** SubjectPublicKeyInfo, the encoding behind a public key's `spki` export. */
 function encodeSpki(key: KeyRecord): Uint8Array {
+    if (key.kind === 'mlkem') return key.mlkemDer as Uint8Array;
     const ints = intAlgorithmDer(key);
     if (ints !== undefined) {
         /* RSA wraps a PKCS#1 RSAPublicKey; DSA and DH carry their public value as one INTEGER. */
@@ -2913,6 +2920,7 @@ function encodeSpki(key: KeyRecord): Uint8Array {
 
 /** OneAsymmetricKey (PKCS#8), the default behind a private key's export. */
 function encodePkcs8(key: KeyRecord): Uint8Array {
+    if (key.kind === 'mlkem') return key.mlkemDer as Uint8Array;
     const ints = intAlgorithmDer(key);
     if (ints !== undefined) {
         /* RSA wraps a PKCS#1 RSAPrivateKey; DSA and DH carry x alone, since the domain is above. */
@@ -3931,7 +3939,14 @@ function oidOf(node: DerNode): string {
 }
 
 /** Pulls an AlgorithmIdentifier apart into the algorithm OID, the EC curve and the DSA/DH domain. */
-function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve; domain?: DerNode } {
+/** The three ML-KEM parameter sets, by the OID their AlgorithmIdentifier carries. */
+const MLKEM_OIDS: Record<string, string> = {
+    '2.16.840.1.101.3.4.4.1': 'ml-kem-512',
+    '2.16.840.1.101.3.4.4.2': 'ml-kem-768',
+    '2.16.840.1.101.3.4.4.3': 'ml-kem-1024'
+};
+
+function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve; domain?: DerNode; mlkemMode?: string } {
     const [oidNode, params] = node.children;
     if (oidNode === undefined || oidNode.tag !== DER_OID) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid key: no algorithm identifier');
     const algorithm = oidOf(oidNode);
@@ -3939,6 +3954,8 @@ function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve; domain?: 
         if (params === undefined || params.tag !== DER_OID) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid EC key: no curve');
         return { kind: 'ec', curve: curveForOid(oidOf(params)) };
     }
+    const mlkem = MLKEM_OIDS[algorithm];
+    if (mlkem !== undefined) return { kind: 'mlkem', mlkemMode: mlkem };
     /* DSA carries p, q and g and DH carries p and g, and both halves of a key need them. */
     if (algorithm === OID_DSA || algorithm === OID_DH) {
         if (params === undefined || params.tag !== DER_SEQUENCE) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid key: no domain parameters');
@@ -4018,6 +4035,9 @@ function importSpki(bytes: Uint8Array): KeyRecord {
         return { type: 'public', kind: found.kind, ints, publicBytes: bytesOf(ints.y as bigint, modulusSize(ints.p as bigint)) };
     }
     const pub = subject.content.subarray(1);
+    if (found.kind === 'mlkem') {
+        return { type: 'public', kind: 'mlkem', mlkemMode: found.mlkemMode, publicBytes: Uint8Array.from(pub), mlkemDer: Uint8Array.from(bytes) };
+    }
     if (found.kind === 'ec') {
         const curve = found.curve as EcCurve;
         if (pub.length !== 1 + 2 * curve.size) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid EC public key length');
@@ -4035,6 +4055,9 @@ function importPkcs8(bytes: Uint8Array): KeyRecord {
     const found = algorithmOf(root.children[1]);
     const wrapped = root.children[2];
     if (wrapped.tag !== DER_OCTET_STRING) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid PKCS#8: private key is not an OCTET STRING');
+    if (found.kind === 'mlkem') {
+        return { type: 'private', kind: 'mlkem', mlkemMode: found.mlkemMode, privateBytes: Uint8Array.from(wrapped.content), mlkemDer: Uint8Array.from(bytes) };
+    }
     if (found.kind === 'rsa' || found.kind === 'rsa-pss') {
         const inner = derRead(wrapped.content);
         const parts = inner.children;
@@ -4526,7 +4549,267 @@ function generatorOf(value: unknown, asNumber: unknown): bigint {
     throw dhFail('ERR_INVALID_ARG_TYPE', 'The "generator" argument must be of type number, string, Buffer, TypedArray, or DataView.');
 }
 
+
+/* ---------------------------------------------------------------------------------------------
+ * Netscape SPKAC -- the half of crypto.Certificate that is not a certificate. A <keygen> form
+ * posts one as base64: SEQUENCE { PublicKeyAndChallenge, sigAlg, signature }, where
+ * PublicKeyAndChallenge is SEQUENCE { SubjectPublicKeyInfo, IA5String challenge } and the
+ * signature is over the DER of that inner SEQUENCE. Node decodes the argument as base64 text
+ * whatever shape it comes in, so a Buffer holding DER bytes is not a SPKAC and answers nothing.
+ * ------------------------------------------------------------------------------------------ */
+
+interface DerNode { tag: number; header: number; end: number; content: Uint8Array; }
+
+function derNodeAt(bytes: Uint8Array, at: number): DerNode | null {
+    if (at + 2 > bytes.length) return null;
+    const tag = bytes[at];
+    const first = bytes[at + 1];
+    let length = 0;
+    let start = at + 2;
+    if (first < 0x80) {
+        length = first;
+    } else {
+        const count = first & 0x7f;
+        /* Indefinite length and a length that runs past the buffer are both "not DER here". */
+        if (count === 0 || count > 4 || at + 2 + count > bytes.length) return null;
+        for (let i = 0; i < count; i++) length = length * 256 + bytes[at + 2 + i];
+        start = at + 2 + count;
+    }
+    const end = start + length;
+    if (end > bytes.length) return null;
+    return { tag, header: at, end, content: bytes.subarray(start, end) };
+}
+
+function derChildren(content: Uint8Array): DerNode[] | null {
+    const out: DerNode[] = [];
+    let at = 0;
+    while (at < content.length) {
+        const node = derNodeAt(content, at);
+        if (node === null) return null;
+        out.push(node);
+        at = node.end;
+    }
+    return out;
+}
+
+function derHex(bytes: Uint8Array): string {
+    let out = '';
+    for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0');
+    return out;
+}
+
+/** A DER INTEGER as a big-endian field of exactly `size` bytes, or null when it will not fit. */
+function derIntegerFixed(content: Uint8Array, size: number): Uint8Array | null {
+    let at = 0;
+    while (at < content.length - 1 && content[at] === 0) at++;
+    const body = content.subarray(at);
+    if (body.length > size) return null;
+    const out = new Uint8Array(size);
+    out.set(body, size - body.length);
+    return out;
+}
+
+/** id-ecPublicKey, and the curve OIDs this container carries. */
+const OID_EC_PUBLIC_KEY = '2a8648ce3d0201';
+/** The signature algorithms a Netscape SPKAC is signed with, over the digests here. */
+const SPKAC_SIG_DIGESTS: Record<string, (bytes: Uint8Array) => Uint8Array> = {
+    '2a8648ce3d0401': sha1,
+    '2a8648ce3d040302': sha256,
+    '2a8648ce3d040303': sha384,
+    '2a8648ce3d040304': sha512
+};
+
+interface SpkacParts {
+    signed: Uint8Array;
+    spki: Uint8Array;
+    challenge: Uint8Array;
+    algOid: Uint8Array;
+    signature: Uint8Array;
+}
+
+function parseSpkac(der: Uint8Array): SpkacParts | null {
+    const outer = derNodeAt(der, 0);
+    if (outer === null || outer.tag !== 0x30 || outer.end !== der.length) return null;
+    const top = derChildren(outer.content);
+    if (top === null || top.length !== 3) return null;
+    if (top[0].tag !== 0x30 || top[1].tag !== 0x30 || top[2].tag !== 0x03) return null;
+    const inner = derChildren(top[0].content);
+    if (inner === null || inner.length !== 2) return null;
+    if (inner[0].tag !== 0x30 || inner[1].tag !== 0x16) return null;
+    const alg = derChildren(top[1].content);
+    if (alg === null || alg.length === 0 || alg[0].tag !== 0x06) return null;
+    const bitString = top[2].content;
+    if (bitString.length === 0 || bitString[0] !== 0) return null;
+    return {
+        /* The bytes the signature was made over: the PublicKeyAndChallenge as it stands inside
+           the outer SEQUENCE, whose header is part of it -- an offset from `der` would take the
+           outer header with it. */
+        signed: outer.content.subarray(top[0].header, top[0].end),
+        spki: top[0].content.subarray(inner[0].header, inner[0].end),
+        challenge: inner[1].content,
+        algOid: alg[0].content,
+        signature: bitString.subarray(1)
+    };
+}
+
+/** True when the signature over PublicKeyAndChallenge verifies under the key it carries. */
+function spkacVerify(parts: SpkacParts): boolean {
+    const digestFn = SPKAC_SIG_DIGESTS[derHex(parts.algOid)];
+    if (digestFn === undefined) return false;
+    const spki = derNodeAt(parts.spki, 0);
+    if (spki === null || spki.tag !== 0x30) return false;
+    const spkiKids = derChildren(spki.content);
+    if (spkiKids === null || spkiKids.length !== 2) return false;
+    if (spkiKids[0].tag !== 0x30 || spkiKids[1].tag !== 0x03) return false;
+    const algKids = derChildren(spkiKids[0].content);
+    if (algKids === null || algKids.length < 2 || algKids[0].tag !== 0x06) return false;
+    if (derHex(algKids[0].content) !== OID_EC_PUBLIC_KEY) return false;
+    const curve = ECDH_CURVES[derHex(algKids[1].content)];
+    if (curve === undefined) return false;
+    const point = spkiKids[1].content;
+    /* An uncompressed point: a BIT STRING whose unused-bits byte is 0 and whose first byte is
+       0x04. Anything else -- a compressed point, a hybrid one -- OpenSSL does not verify here. */
+    if (point.length < 2 || point[0] !== 0 || point[1] !== 0x04) return false;
+    const sig = derNodeAt(parts.signature, 0);
+    if (sig === null || sig.tag !== 0x30) return false;
+    const sigKids = derChildren(sig.content);
+    if (sigKids === null || sigKids.length !== 2) return false;
+    if (sigKids[0].tag !== 0x02 || sigKids[1].tag !== 0x02) return false;
+    const r = derIntegerFixed(sigKids[0].content, curve.size);
+    const s = derIntegerFixed(sigKids[1].content, curve.size);
+    if (r === null || s === null) return false;
+    const compact = new Uint8Array(curve.size * 2);
+    compact.set(r, 0);
+    compact.set(s, curve.size);
+    const hash = digestFn(parts.signed);
+    try {
+        /* The signature as it stands in the SPKAC is DER, which is what noble verifies: a
+           compact r||s would be read as DER and fail. */
+        return curve.curve.verify(parts.signature, hash, point.subarray(1)) === true;
+    } catch {
+        return false;
+    }
+}
+
+/** An SPKI as the PEM a caller of exportPublicKey is handed, in 64-character lines. */
+function spkiToPem(spki: Uint8Array): string {
+    const body = bytesToBase64(spki);
+    const lines: string[] = [];
+    for (let i = 0; i < body.length; i += 64) lines.push(body.slice(i, i + 64));
+    return '-----BEGIN PUBLIC KEY-----\n' + lines.join('\n') + '\n-----END PUBLIC KEY-----\n';
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * ECDH. The private scalar never leaves this side: the guest holds an integer handle, exactly as
+ * it does for every other key. The four curves are the ones generateKeyPair already carries --
+ * P-256, P-384, P-521 and secp256k1 -- and the secret is the x coordinate of the shared point,
+ * which is what Node hands back: noble gives the compressed point, so its first byte comes off.
+ * ------------------------------------------------------------------------------------------ */
+
+const ECDH_CURVES: Record<string, { curve: any; size: number }> = {
+    '2a8648ce3d030107': { curve: p256, size: 32 },
+    '2b81040022': { curve: p384, size: 48 },
+    '2b81040023': { curve: p521, size: 66 },
+    '2b8104000a': { curve: secp256k1, size: 32 }
+};
+
+const ECDH_BY_NAME: Record<string, { curve: any; size: number }> = {
+    prime256v1: ECDH_CURVES['2a8648ce3d030107'],
+    secp256r1: ECDH_CURVES['2a8648ce3d030107'],
+    secp384r1: ECDH_CURVES['2b81040022'],
+    secp521r1: ECDH_CURVES['2b81040023'],
+    secp256k1: ECDH_CURVES['2b8104000a']
+};
+
+interface EcdhState { curve: { curve: any; size: number }; priv?: Uint8Array; pub?: Uint8Array; }
+const ECDH_STATE: Map<number, EcdhState> = new Map();
+let ecdhNextId = 1;
+
+function ecdhCurveError(): Error {
+    return Object.assign(new TypeError('Invalid EC curve name'), { code: 'ERR_CRYPTO_INVALID_CURVE', owcErrorClass: 'TypeError' });
+}
+
 export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
+    /** Args {op, spkac}: one of Node's three Certificate operations over a base64 SPKAC.
+     *  op 'challenge' answers {bytes} or null, 'publickey' answers {bytes} of PEM or null, and
+     *  'verify' answers a boolean. Every failure -- not DER, not a SPKAC, a signature that does
+     *  not verify -- is the same nothing Node answers: an empty string, or false. */
+    'crypto.spkac': (args) => {
+        const der = base64ToBytes(String(args?.spkac ?? ''));
+        const parts = parseSpkac(der);
+        const op = String(args?.op);
+        if (parts === null) return op === 'verify' ? false : null;
+        if (op === 'verify') return spkacVerify(parts);
+        if (op === 'challenge') return { bytes: bytesToBase64(parts.challenge) };
+        return { bytes: bytesToBase64(Buffer.from(spkiToPem(parts.spki), 'utf8')) };
+    },
+    /** Args {curve}: a fresh ECDH handle. */
+    'crypto.ecdh.new': (args) => {
+        const curve = ECDH_BY_NAME[String(args?.curve)];
+        if (curve === undefined) throw ecdhCurveError();
+        const id = ecdhNextId++;
+        ECDH_STATE.set(id, { curve });
+        return { id };
+    },
+    /** Args {id}: a fresh key pair, answering both halves. */
+    'crypto.ecdh.generate': (args) => {
+        const state = ECDH_STATE.get(Number(args?.id));
+        if (state === undefined) throw ecdhCurveError();
+        const priv = state.curve.curve.utils.randomPrivateKey();
+        state.priv = priv;
+        state.pub = state.curve.curve.getPublicKey(priv, false);
+        return { public: bytesToBase64(state.pub), private: bytesToBase64(state.priv) };
+    },
+    /** Args {id}: the curve and whichever halves exist. */
+    'crypto.ecdh.info': (args) => {
+        const state = ECDH_STATE.get(Number(args?.id));
+        if (state === undefined) throw ecdhCurveError();
+        return {
+            public: state.pub === undefined ? null : bytesToBase64(state.pub),
+            private: state.priv === undefined ? null : bytesToBase64(state.priv)
+        };
+    },
+    /** Args {id, public}: the x coordinate of the shared point. */
+    'crypto.ecdh.secret': (args) => {
+        const state = ECDH_STATE.get(Number(args?.id));
+        if (state === undefined || state.priv === undefined) throw ecdhCurveError();
+        const shared = state.curve.curve.getSharedSecret(state.priv, base64ToBytes(String(args?.public)));
+        return bytesToBase64(shared.subarray(1, 1 + state.curve.size));
+    },
+    /** Args {id, private}: the scalar, and the point it stands for. */
+    'crypto.ecdh.setPrivate': (args) => {
+        const state = ECDH_STATE.get(Number(args?.id));
+        if (state === undefined) throw ecdhCurveError();
+        const priv = base64ToBytes(String(args?.private));
+        state.priv = priv;
+        state.pub = state.curve.curve.getPublicKey(priv, false);
+        return { public: bytesToBase64(state.pub) };
+    },
+    /** Args {id, public}: the other party's point, kept for computeSecret. */
+    'crypto.ecdh.setPublic': (args) => {
+        const state = ECDH_STATE.get(Number(args?.id));
+        if (state === undefined) throw ecdhCurveError();
+        state.pub = base64ToBytes(String(args?.public));
+        return { public: bytesToBase64(state.pub) };
+    },
+    /** Args {variant, message, nonce, memory, passes, parallelism, tagLength, secret,
+     *  associatedData}: Argon2, the three RFC 9106 variants over @noble/hashes. */
+    'crypto.argon2': (args) => {
+        const variant = String(args?.variant);
+        const fn = variant === 'argon2d' ? argon2d : variant === 'argon2i' ? argon2i : argon2id;
+        const opts: Record<string, unknown> = {
+            t: Number(args?.passes),
+            m: Number(args?.memory),
+            p: Number(args?.parallelism),
+            dkLen: Number(args?.tagLength)
+        };
+        if (args?.secret !== undefined && args?.secret !== null) opts.key = base64ToBytes(String(args?.secret));
+        if (args?.associatedData !== undefined && args?.associatedData !== null) {
+            opts.personalization = base64ToBytes(String(args?.associatedData));
+        }
+        return bytesToBase64(fn(base64ToBytes(String(args?.message)), base64ToBytes(String(args?.nonce)), opts));
+    },
+
     'crypto.digest': (args) => {
         const spec = digestFor(args?.algorithm);
         return bytesToBase64(spec.fn(bytesArg(args?.data), outputLengthFor(spec, args?.outputLength)));

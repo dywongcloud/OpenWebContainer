@@ -4200,6 +4200,395 @@ BF.crypto = function () {
     queueMicrotask(function () { done(null, prime); });
   }
 
+  /*
+   * Netscape SPKAC: crypto.Certificate. The argument is base64 text whatever shape it arrives in,
+   * so a Buffer carrying DER bytes is no more a SPKAC than a Buffer carrying the word "nope" is.
+   * Node answers the empty string for every failure and false for a signature it cannot verify,
+   * and it hands back a Buffer for the character encodings only -- hex, base64 and the UTF-16
+   * pair are not ones these two exports accept, and an encoding it does not know at all is a
+   * TypeError naming it.
+   */
+  var SPKAC_CHAR_ENCODINGS = { utf8: 1, 'utf-8': 1, latin1: 1, binary: 1, ascii: 1 };
+  function spkacInput(value) {
+    if (typeof value === 'string') return Buf.from(value, 'base64');
+    if (Buf.isBuffer(value)) return spkacInput(value.toString('utf8'));
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+      var bytes = ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : new Uint8Array(value);
+      return spkacInput(Buf.from(bytes).toString('utf8'));
+    }
+    throw invalidArgType('spkac', 'of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView', value);
+  }
+  function spkacCall(op, spkac, encoding) {
+    var name = encoding === undefined || encoding === null ? undefined : String(encoding);
+    if (name !== undefined && typeof Buf.isEncoding === 'function' && !Buf.isEncoding(name)) {
+      var unknownEncoding = new TypeError('Unknown encoding: ' + name);
+      unknownEncoding.code = 'ERR_UNKNOWN_ENCODING';
+      throw unknownEncoding;
+    }
+    var bytes = spkacInput(spkac);
+    /* An empty argument is its own answer, and Node gives the same one to all three: the empty
+       string, not false -- verifySpkac(Buffer.alloc(0)) is '' where a SPKAC it cannot read is
+       false. */
+    if (bytes.length === 0) return '';
+    var answer = cryptoCap('crypto.spkac', { op: op, spkac: bytes.toString('base64') });
+    if (op === 'verify') return answer === true;
+    if (answer === null || answer === undefined) return '';
+    var out = Buf.from(answer.bytes, 'base64');
+    if (name === undefined || SPKAC_CHAR_ENCODINGS[name.toLowerCase()] === 1) return out;
+    return '';
+  }
+  function CertificateImpl() {
+    /* Node's Certificate is a class a program cannot call without new -- but the constructor it
+       hands back answers an object either way, so a call without new builds one too. */
+    if (!(this instanceof CertificateImpl)) return new CertificateImpl();
+  }
+  CertificateImpl.prototype.verifySpkac = function (spkac, encoding) {
+    return spkacCall('verify', spkac, encoding);
+  };
+  CertificateImpl.prototype.exportPublicKey = function (spkac, encoding) {
+    return spkacCall('publickey', spkac, encoding);
+  };
+  CertificateImpl.prototype.exportChallenge = function (spkac, encoding) {
+    return spkacCall('challenge', spkac, encoding);
+  };
+  /* The name a program reads off the constructor is 'Certificate', and it takes no arguments,
+     which is the arity 0 a program reads. */
+  Object.defineProperty(CertificateImpl, 'name', { value: 'Certificate', configurable: true });
+
+  /*
+   * ECDH. The scalar lives on the host behind the handle this object carries, as every other key
+   * in this module does, so getPrivateKey hands back only what a caller already had. The shared
+   * secret is the x coordinate of the point, which is what Node answers: the whole uncompressed
+   * point would be 65 bytes where Node's is 32.
+   */
+  function ECDHImpl(curve) {
+    if (!(this instanceof ECDHImpl)) return new ECDHImpl(curve);
+    if (typeof curve !== 'string') throw invalidArgType('curve', 'of type string', curve);
+    this._id = cryptoCap('crypto.ecdh.new', { curve: curve }).id;
+  }
+  ECDHImpl.prototype.computeSecret = function (otherPublicKey, inputEncoding, outputEncoding) {
+    var other = toBytes(otherPublicKey, typeof inputEncoding === 'string' ? inputEncoding : undefined,
+      'otherPublicKey', 'string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer');
+    var secret = cryptoCap('crypto.ecdh.secret', { id: this._id, public: other.toString('base64') });
+    return outputStrict(Buf.from(secret, 'base64'), outputEncoding);
+  };
+  ECDHImpl.prototype.setPrivateKey = function (privateKey, encoding) {
+    var bytes = toBytes(privateKey, typeof encoding === 'string' ? encoding : undefined,
+      'privateKey', 'string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer');
+    cryptoCap('crypto.ecdh.setPrivate', { id: this._id, private: bytes.toString('base64') });
+    return undefined;
+  };
+  ECDHImpl.prototype.setPublicKey = function (publicKey, encoding) {
+    var bytes = toBytes(publicKey, typeof encoding === 'string' ? encoding : undefined,
+      'publicKey', 'string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer');
+    cryptoCap('crypto.ecdh.setPublic', { id: this._id, public: bytes.toString('base64') });
+    return undefined;
+  };
+  ECDHImpl.prototype.getPrivateKey = function (encoding) {
+    var info = cryptoCap('crypto.ecdh.info', { id: this._id });
+    if (info.private === null || info.private === undefined) return undefined;
+    return outputStrict(Buf.from(info.private, 'base64'), encoding);
+  };
+  ECDHImpl.prototype.generateKeys = function (encoding, format) {
+    var keys = cryptoCap('crypto.ecdh.generate', { id: this._id });
+    return outputStrict(Buf.from(keys.public, 'base64'), encoding);
+  };
+  ECDHImpl.prototype.getPublicKey = function (encoding, format) {
+    var info = cryptoCap('crypto.ecdh.info', { id: this._id });
+    if (info.public === null || info.public === undefined) return undefined;
+    return outputStrict(Buf.from(info.public, 'base64'), encoding);
+  };
+  Object.defineProperty(ECDHImpl, 'name', { value: 'ECDH', configurable: true });
+  function createECDH(curve) {
+    return new ECDHImpl(curve);
+  }
+
+  /*
+   * X509Certificate. The whole certificate is parsed on the host and the fields come back over
+   * the capability boundary, so what a program reads here is what host node 24.15 reads: the
+   * subject and issuer in Node's own attribute order, the SAN as one line of comma-separated
+   * entries, the three fingerprints, the serial in upper-case hex and publicKey a KeyObject
+   * built from the certificate's own SPKI. checkHost, checkEmail and checkIP match against the
+   * subjectAltName the certificate carries, and verify runs the guest's own verifier over the
+   * signed part with the algorithm the certificate names.
+   */
+  function x509Input(value) {
+    if (typeof value === 'string') return { der: value };
+    if (Buf.isBuffer(value)) return { der: value.toString('base64') };
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+      var bytes = ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : new Uint8Array(value);
+      return { der: Buf.from(bytes).toString('base64') };
+    }
+    var badType = new Error('The "der" argument must be of type string, Buffer, TypedArray, or DataView.');
+    badType.code = 'ERR_INVALID_ARG_TYPE';
+    throw badType;
+  }
+  function x509CertificateImpl(buffer) {
+    if (!(this instanceof x509CertificateImpl)) return new x509CertificateImpl(buffer);
+    var answer = cryptoCap('crypto.x509.parse', x509Input(buffer));
+    if (answer === null || answer === undefined || typeof answer.code === 'string') {
+      var failed = answer === null || answer === undefined ? { code: 'ERR_OSSL_PEM_NO_START_LINE', message: 'error:0480006C:PEM routines::no start line' } : answer;
+      var err = new Error(failed.message);
+      err.code = failed.code;
+      if (failed.library !== undefined && failed.library !== null) err.library = failed.library;
+      if (failed.reason !== undefined && failed.reason !== null) err.reason = failed.reason;
+      throw err;
+    }
+    this._f = answer;
+  }
+  function x509Get(name) {
+    return function () { return this._f[name]; };
+  }
+  /* The getters, in the order Node defines them, and the three date, raw and publicKey ones
+     among them: a program can read the names off the prototype and expect node's order. */
+  var X509_ACCESSORS = [
+    ['subject'], ['subjectAltName'], ['issuer'], ['issuerCertificate'], ['infoAccess'],
+    ['validFrom'], ['validTo'], ['validFromDate', 'date'], ['validToDate', 'date'],
+    ['fingerprint'], ['fingerprint256'], ['fingerprint512'], ['keyUsage'], ['serialNumber'],
+    ['signatureAlgorithm'], ['signatureAlgorithmOid'], ['raw', 'raw'], ['publicKey', 'key']
+  ];
+  for (var xa = 0; xa < X509_ACCESSORS.length; xa++) {
+    (function (entry) {
+      var name = entry[0];
+      Object.defineProperty(x509CertificateImpl.prototype, name, {
+        get: entry[1] === 'date'
+          ? function () { return new Date(this._f[name]); }
+          : entry[1] === 'raw'
+          ? function () { return Buf.from(this._f[name], 'base64'); }
+          : entry[1] === 'key'
+          ? function () {
+            return createPublicKey({ key: Buf.from(this._f.publicKey.spki, 'base64'), format: 'der', type: 'spki' });
+          }
+          : function () { return this._f[name]; },
+        enumerable: true, configurable: true
+      });
+    })(X509_ACCESSORS[xa]);
+  }
+  x509CertificateImpl.prototype.toString = function () { return this._f.pem; };
+  x509CertificateImpl.prototype.toJSON = function () { return this._f.toJSON; };
+  /* ca stands between toJSON and checkHost, where Node puts it. */
+  Object.defineProperty(x509CertificateImpl.prototype, 'ca', {
+    get: function () { return this._f.ca; }, enumerable: true, configurable: true
+  });
+  /* The four checks. subjectAltName is what decides all of them: a name the certificate did not
+     put in its SAN is not a name it answers for, even where it stands in the subject. */
+  function x509SanOf(cert, type) {
+    var san = cert._f.san;
+    if (san === undefined || san === null) return [];
+    var out = [];
+    for (var i = 0; i < san.length; i++) if (san[i].type === type) out.push(String(san[i].value).toLowerCase());
+    return out;
+  }
+  x509CertificateImpl.prototype.checkHost = function (name, options) {
+    var host = String(name).toLowerCase().replace(/\.$/, '');
+    var dns = x509SanOf(this, 'DNS');
+    for (var i = 0; i < dns.length; i++) {
+      var value = dns[i];
+      if (value === host) return host;
+      /* A wildcard answers for one label only, and never for a bare domain. */
+      if (value.indexOf('*.') === 0) {
+        var at = host.indexOf('.');
+        if (at > 0 && host.slice(at + 1) === value.slice(2)) return host;
+      }
+    }
+    var wantSubject = options !== undefined && options !== null ? options.subject : undefined;
+    if (wantSubject === 'always') {
+      var cn = /(?:^|,)CN=([^,]*)/.exec(this._f.subject);
+      if (cn !== null && cn[1].toLowerCase() === host) return host;
+    }
+    return undefined;
+  };
+  x509CertificateImpl.prototype.checkEmail = function (email, options) {
+    var want = String(email).toLowerCase();
+    var all = x509SanOf(this, 'email');
+    if (all.length === 0) {
+      var at = /(?:^|,)emailAddress=([^,]*)/.exec(this._f.subject);
+      if (at !== null && at[1].toLowerCase() === want) return want;
+      return undefined;
+    }
+    for (var i = 0; i < all.length; i++) if (all[i] === want) return want;
+    return undefined;
+  };
+  x509CertificateImpl.prototype.checkIP = function (ip) {
+    var want = String(ip).toLowerCase();
+    var all = x509SanOf(this, 'IP Address');
+    for (var i = 0; i < all.length; i++) if (all[i] === want) return want;
+    return undefined;
+  };
+  /* Issued by another certificate: its subject is this one's issuer. */
+  x509CertificateImpl.prototype.checkIssued = function (otherCert) {
+    if (otherCert === undefined || otherCert === null || otherCert._f === undefined) return false;
+    return otherCert._f.subject === this._f.issuer;
+  };
+  /* A private key belongs to this certificate when the public half it carries is the one the
+     certificate's own SPKI holds. */
+  x509CertificateImpl.prototype.checkPrivateKey = function (privateKey) {
+    if (privateKey === undefined || privateKey === null || typeof privateKey.export !== 'function') return false;
+    var mine = Buf.from(this._f.publicKey.spki, 'base64').toString('hex');
+    var theirs = createPublicKey(privateKey).export({ type: 'spki', format: 'der' }).toString('hex');
+    return mine === theirs;
+  };
+  /* The signature over the signed part, with the algorithm the certificate names. */
+  x509CertificateImpl.prototype.verify = function (publicKey) {
+    var verifier = createVerify(this._f.signatureAlgorithm);
+    verifier.update(Buf.from(this._f.tbs, 'base64'));
+    return verifier.verify(publicKey, Buf.from(this._f.signature, 'base64'));
+  };
+  x509CertificateImpl.prototype.toLegacyObject = function () { return this._f.toLegacyObject; };
+  Object.defineProperty(x509CertificateImpl, 'name', { value: 'X509Certificate', configurable: true });
+
+  /*
+   * ML-KEM: encapsulate and decapsulate, the two halves of the post-quantum KEM Node 24 carries.
+   * The key is a KeyObject and the bytes that travel are its DER -- SPKI for the public half and
+   * PKCS#8 for the private one -- so what the host does with a key it exports is exactly what it
+   * does here. Both take a trailing callback as their asynchronous form, as Node does, and both
+   * answer Buffers otherwise: {sharedKey, ciphertext} from one end and the shared key alone from
+   * the other, which is the shape a program reads off host node 24.15.
+   */
+  function kemDer(key, type, name) {
+    if (key === null || key === undefined || typeof key !== 'object' || typeof key.export !== 'function') {
+      var unsupported = new Error('error:1E08010C:DECODER routines::unsupported');
+      unsupported.code = 'ERR_OSSL_UNSUPPORTED';
+      throw unsupported;
+    }
+    return key.export({ type: type, format: 'der' });
+  }
+  function encapsulateSync(publicKey) {
+    var der = kemDer(publicKey, 'spki', 'publicKey');
+    var answer = cryptoCap('crypto.mlkem.encapsulate', { publicKey: Buf.from(der).toString('base64') });
+    return { sharedKey: Buf.from(answer.sharedKey, 'base64'), ciphertext: Buf.from(answer.ciphertext, 'base64') };
+  }
+  function decapsulateSync(privateKey, ciphertext) {
+    var der = kemDer(privateKey, 'pkcs8', 'privateKey');
+    var bytes = toBytes(ciphertext, undefined, 'ciphertext', 'string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer');
+    var answer = cryptoCap('crypto.mlkem.decapsulate', {
+      privateKey: Buf.from(der).toString('base64'),
+      ciphertext: bytes.toString('base64')
+    });
+    return Buf.from(answer.sharedKey, 'base64');
+  }
+  function encapsulateImpl(publicKey, callback) {
+    if (callback !== undefined && typeof callback !== 'function') {
+      throw invalidArgType('callback', 'of type function', callback);
+    }
+    if (typeof callback !== 'function') return encapsulateSync(publicKey);
+    var answer;
+    try {
+      answer = encapsulateSync(publicKey);
+    } catch (err) {
+      queueMicrotask(function () { callback(err); });
+      return undefined;
+    }
+    queueMicrotask(function () { callback(null, answer); });
+    return undefined;
+  }
+  function decapsulateImpl(privateKey, ciphertext, callback) {
+    if (callback !== undefined && typeof callback !== 'function') {
+      throw invalidArgType('callback', 'of type function', callback);
+    }
+    if (typeof callback !== 'function') return decapsulateSync(privateKey, ciphertext);
+    var answer;
+    try {
+      answer = decapsulateSync(privateKey, ciphertext);
+    } catch (err) {
+      queueMicrotask(function () { callback(err); });
+      return undefined;
+    }
+    queueMicrotask(function () { callback(null, answer); });
+    return undefined;
+  }
+
+  /*
+   * Argon2. Node names the three RFC 9106 variants in the algorithm argument and refuses any
+   * other with the list of the three; the rest of the call is one object, and 'nonce' is what
+   * every other KDF here calls a salt and 'tagLength' what it calls keylen. 'secret' and
+   * 'associatedData' are the optional input Argon2 hashes in alongside the message.
+   */
+  function argon2Sync(algorithm, parameters) {
+    var variant = argon2Variant(algorithm);
+    var args = argon2Parameters(parameters);
+    args.variant = variant;
+    return Buf.from(cryptoCap('crypto.argon2', args), 'base64');
+  }
+  /* argon2 on the host is the promise-free callback form: the derivation runs on the host and the
+     callback is called on the next tick with the bytes, as Node calls it. */
+  function argon2Async(algorithm, parameters, callback) {
+    var variant = argon2Variant(algorithm);
+    var args = argon2Parameters(parameters);
+    args.variant = variant;
+    if (typeof callback !== 'function') throw invalidArgType('callback', 'of type function', callback);
+    var out = Buf.from(cryptoCap('crypto.argon2', args), 'base64');
+    queueMicrotask(function () { callback(null, out); });
+    return undefined;
+  }
+
+  var ARGON2_VARIANTS = { argon2d: 1, argon2i: 1, argon2id: 1 };
+  function argon2ArgValueText(value) {
+    if (typeof value === 'string') return "'" + value + "'";
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+    return requireBuiltin('util').inspect(value);
+  }
+  function argon2Variant(value) {
+    var name = typeof value === 'string' ? value : String(value);
+    if (typeof value !== 'string' || ARGON2_VARIANTS[name] !== 1) {
+      var badVariant = new TypeError("The argument 'algorithm' must be one of: 'argon2d', 'argon2i', 'argon2id'. Received " + argon2ArgValueText(value));
+      badVariant.code = 'ERR_INVALID_ARG_VALUE';
+      throw badVariant;
+    }
+    return name;
+  }
+  function argon2PropType(name, value) {
+    var err = new TypeError('The "' + name + '" property must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' + specificTypeOf(value));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+  }
+  function argon2Number(name, value) {
+    if (typeof value !== 'number') {
+      var err = new TypeError('The "' + name + '" property must be of type number. Received ' + specificTypeOf(value));
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    return value;
+  }
+  function argon2Bytes(value, name, list) {
+    if (value === undefined || value === null || (typeof value !== 'string' && !Buf.isBuffer(value) && !ArrayBuffer.isView(value) && !(value instanceof ArrayBuffer))) {
+      throw argon2PropType(name, value);
+    }
+    return toBytes(value, undefined, name, list);
+  }
+  function argon2Parameters(value) {
+    if (value === null || typeof value !== 'object') {
+      throw invalidArgType('parameters', 'of type object', value);
+    }
+    var list = 'string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer';
+    var message = argon2Bytes(value.message, 'parameters.message', list);
+    var nonce = argon2Bytes(value.nonce, 'parameters.nonce', list);
+    if (nonce.length < 8) throw outOfRange('parameters.nonce.byteLength', '>= 8 && <= 4294967295', nonce.length);
+    var parallelism = argon2Number('parameters.parallelism', value.parallelism);
+    if (parallelism < 1 || parallelism > 16777215) throw outOfRange('parameters.parallelism', '>= 1 && <= 16777215', parallelism);
+    var tagLength = argon2Number('parameters.tagLength', value.tagLength);
+    if (tagLength < 4 || tagLength > 4294967295) throw outOfRange('parameters.tagLength', '>= 4 && <= 4294967295', tagLength);
+    var memory = argon2Number('parameters.memory', value.memory);
+    if (memory < 8 || memory > 4294967295) throw outOfRange('parameters.memory', '>= 8 && <= 4294967295', memory);
+    var passes = argon2Number('parameters.passes', value.passes);
+    if (passes < 1 || passes > 4294967295) throw outOfRange('parameters.passes', '>= 1 && <= 4294967295', passes);
+    var args = {
+      message: message.toString('base64'),
+      nonce: nonce.toString('base64'),
+      memory: memory,
+      passes: passes,
+      parallelism: parallelism,
+      tagLength: tagLength
+    };
+    if (value.secret !== undefined && value.secret !== null) args.secret = argon2Bytes(value.secret, 'parameters.secret', list).toString('base64');
+    if (value.associatedData !== undefined && value.associatedData !== null) {
+      args.associatedData = argon2Bytes(value.associatedData, 'parameters.associatedData', list).toString('base64');
+    }
+    return args;
+  }
+
   return {
     randomBytes: randomBytes,
     randomUUID: randomUUID,
@@ -4337,7 +4726,15 @@ BF.crypto = function () {
     checkPrime: checkPrime,
     checkPrimeSync: checkPrimeSync,
     generatePrime: generatePrime,
-    generatePrimeSync: generatePrimeSync
+    generatePrimeSync: generatePrimeSync,
+    Certificate: CertificateImpl,
+    ECDH: ECDHImpl,
+    createECDH: createECDH,
+    argon2: argon2Async,
+    argon2Sync: argon2Sync,
+    encapsulate: encapsulateImpl,
+    decapsulate: decapsulateImpl,
+    X509Certificate: x509CertificateImpl
   };
 };
 

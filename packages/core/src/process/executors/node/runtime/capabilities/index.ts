@@ -11,6 +11,8 @@ import { QUIC_CRYPTO_CAPABILITIES } from './quic-crypto';
 import { INTL_CAPABILITIES } from './intl';
 import { SHARED_CAPABILITIES } from './shared';
 import { VM_CAPABILITIES } from './vm';
+import { MLKEM_CAPABILITIES } from './mlkem';
+import { X509_CAPABILITIES } from './x509';
 
 /** Every host operation a guest may call, by name. Each area file owns its own operations. */
 export const CAPABILITIES: Record<string, CapabilityHandler> = {
@@ -25,5 +27,7 @@ export const CAPABILITIES: Record<string, CapabilityHandler> = {
     ...QUIC_CRYPTO_CAPABILITIES,
     ...INTL_CAPABILITIES,
     ...SHARED_CAPABILITIES,
-    ...VM_CAPABILITIES
+    ...VM_CAPABILITIES,
+    ...MLKEM_CAPABILITIES,
+    ...X509_CAPABILITIES
 };
