@@ -2646,13 +2646,19 @@ BF.crypto = function () {
      * key that is not RSA names the encoding instead. A JWK export carries no type: Node ignores it.
      */
     if (format !== 'jwk') {
-      var allowed = state.type === 'private' ? ['pkcs8', 'pkcs1'] : ['spki', 'pkcs1'];
+      var allowed = state.type === 'private' ? ['pkcs8', 'pkcs1', 'sec1'] : ['spki', 'pkcs1'];
       if (allowed.indexOf(opts.type) < 0) throw invalidArgValue('options.type', opts.type);
-      var kind = opts.type === 'pkcs1' ? keyInfo(this).asymmetricKeyType : undefined;
+      var kind = opts.type === 'pkcs1' || opts.type === 'sec1' ? keyInfo(this).asymmetricKeyType : undefined;
       if (opts.type === 'pkcs1' && kind !== 'rsa' && kind !== 'rsa-pss') {
         var unusable = new Error('The selected key encoding pkcs1 can only be used for RSA keys.');
         unusable.code = 'ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS';
         throw unusable;
+      }
+      /* SEC1 is the EC private key, so Node names the encoding a key of any other kind cannot take. */
+      if (opts.type === 'sec1' && kind !== 'ec') {
+        var notEc = new Error('The selected key encoding sec1 can only be used for EC keys.');
+        notEc.code = 'ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS';
+        throw notEc;
       }
     }
     var result = cryptoCap('crypto.key.export', { id: state.id, format: format, type: opts.type });
@@ -4434,7 +4440,25 @@ BF.crypto = function () {
     verifier.update(Buf.from(this._f.tbs, 'base64'));
     return verifier.verify(publicKey, Buf.from(this._f.signature, 'base64'));
   };
-  x509CertificateImpl.prototype.toLegacyObject = function () { return this._f.toLegacyObject; };
+  /*
+   * The legacy object Node answers. raw and pubkey are Buffers on Node -- bytes, not the base64
+   * they cross the capability boundary as -- and a field the certificate has no value for is still
+   * a key holding undefined, which no JSON round trip carries: both are rebuilt here.
+   */
+  var LEGACY_FIELDS = ['subject', 'issuer', 'subjectaltname', 'infoAccess', 'ca', 'modulus', 'exponent',
+    'pubkey', 'bits', 'valid_from', 'valid_to', 'fingerprint', 'fingerprint256', 'fingerprint512',
+    'ext_key_usage', 'serialNumber', 'raw', 'asn1Curve', 'nistCurve'];
+  x509CertificateImpl.prototype.toLegacyObject = function () {
+    var fields = this._f.toLegacyObject === undefined || this._f.toLegacyObject === null ? {} : this._f.toLegacyObject;
+    var out = {};
+    for (var i = 0; i < LEGACY_FIELDS.length; i++) {
+      var name = LEGACY_FIELDS[i];
+      var value = fields[name];
+      if ((name === 'raw' || name === 'pubkey') && typeof value === 'string') value = Buf.from(value, 'base64');
+      out[name] = value;
+    }
+    return out;
+  };
   Object.defineProperty(x509CertificateImpl, 'name', { value: 'X509Certificate', configurable: true });
 
   /*

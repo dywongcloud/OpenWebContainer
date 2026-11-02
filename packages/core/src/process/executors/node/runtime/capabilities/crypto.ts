@@ -2869,7 +2869,17 @@ function pemKindOf(text: string): string {
     if (label === null) return 'pkcs8';
     if (label[1] === 'EC PRIVATE KEY') return 'sec1';
     if (label[1] === 'PUBLIC KEY') return 'spki';
+    /* RSA's own two PKCS#1 labels: an RSAPrivateKey, and an RSAPublicKey of its own. */
+    if (label[1] === 'RSA PRIVATE KEY' || label[1] === 'RSA PUBLIC KEY') return 'pkcs1';
     return 'pkcs8';
+}
+
+/** The DER body of a PEM that carries any one of several labels, as PKCS#1 carries two. */
+function pemDerOf(text: string, labels: string[]): Uint8Array {
+    for (const label of labels) {
+        try { return pemDecode(text, label); } catch { /* the next label it may carry */ }
+    }
+    throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid PEM: no BEGIN/END block');
 }
 
 function keyFor(id: unknown, op: string): KeyRecord {
@@ -3022,6 +3032,8 @@ function curveFor(name: unknown): EcCurve {
 
 const OID_RSA = '1.2.840.113549.1.1.1';
 const OID_RSA_PSS = '1.2.840.113549.1.1.10';
+/** MGF1, the mask generation function RSASSA-PSS names inside its parameters. */
+const OID_MGF1 = '1.2.840.113549.1.1.8';
 const OID_DSA = '1.2.840.10040.4.1';
 const OID_DH = '1.2.840.113549.1.3.1';
 
@@ -3287,9 +3299,26 @@ function intAlgorithmOid(key: KeyRecord): string | undefined {
 function intAlgorithmDer(key: KeyRecord): Uint8Array | undefined {
     const oid = intAlgorithmOid(key);
     if (oid === undefined) return undefined;
+    /* An 'rsa-pss' key that carries parameters writes them, so the key they came from is the key
+       an export of it hands back; one named with none keeps the bare NULL it always wrote. */
+    if (oid === OID_RSA_PSS && key.pss !== undefined) return derSequence([derOid(oid), pssParamsDer(key.pss)]);
     const domain = domainDer(key);
     /* RSA names no parameters, so it writes NULL the way OpenSSL writes it. */
     return derSequence([derOid(oid), domain === undefined ? der(DER_NULL, new Uint8Array(0)) : domain]);
+}
+
+/** RSASSA-PSS-params (RFC 4055 3.1) as Node writes them: the digest, then MGF1 over the same or
+    another digest, then the salt length, each in its own explicitly tagged field. */
+function pssParamsDer(pss: { hashAlgorithm: string; mgf1HashAlgorithm: string; saltLength: number }): Uint8Array {
+    const hash = DIGEST_OIDS[pss.hashAlgorithm];
+    const mask = DIGEST_OIDS[pss.mgf1HashAlgorithm];
+    /* A digest this runtime cannot name is a key it cannot write parameters for. */
+    if (hash === undefined || mask === undefined) return der(DER_NULL, new Uint8Array(0));
+    return derSequence([
+        derContext(0, derSequence([derOid(hash), der(DER_NULL, new Uint8Array(0))])),
+        derContext(1, derSequence([derOid(OID_MGF1), derSequence([derOid(mask), der(DER_NULL, new Uint8Array(0))])])),
+        derContext(2, derIntegerFrom(pss.saltLength))
+    ]);
 }
 
 /** The DigestInfo an RSA signature really signs: SEQUENCE { AlgorithmIdentifier, OCTET STRING }. */
@@ -3726,6 +3755,46 @@ function pssParamsOf(options: any): { hashAlgorithm: string; mgf1HashAlgorithm: 
     };
 }
 
+/** The name Node answers for the digest OID an algorithm identifier carries. */
+function digestNameForOid(oid: string): string | undefined {
+    for (const name of Object.keys(DIGEST_OIDS)) {
+        if (DIGEST_OIDS[name] === oid) return name;
+    }
+    return undefined;
+}
+
+/** The digest a hash or a mask generation algorithm identifier names. */
+function algorithmDigest(node: DerNode | undefined): string | undefined {
+    if (node === undefined || node.children.length === 0) return undefined;
+    return digestNameForOid(oidOf(node.children[0]));
+}
+
+/*
+ * RSASSA-PSS-params: the digest, the MGF1 digest and the salt length, each in its own tagged field
+ * and each defaulted when it is left out -- sha1 for both digests and the digest's own width for
+ * the salt -- so key material whose parameters name nothing at all is a key with no parameters.
+ */
+function pssParamsOfDer(node: DerNode): { hashAlgorithm: string; mgf1HashAlgorithm: string; saltLength: number } | undefined {
+    const tagged: Record<number, DerNode> = {};
+    for (const child of node.children) {
+        if (child.tag >= 0xa0 && child.tag <= 0xa3 && child.children.length === 1) tagged[child.tag] = child.children[0];
+    }
+    const hashNode = tagged[0xa0];
+    const maskNode = tagged[0xa1];
+    const saltNode = tagged[0xa2];
+    if (hashNode === undefined && maskNode === undefined && saltNode === undefined) return undefined;
+    const hash = algorithmDigest(hashNode);
+    /* The mask generation algorithm is an AlgorithmIdentifier whose own parameters are the digest. */
+    const mask = algorithmDigest(maskNode === undefined ? undefined : maskNode.children[maskNode.children.length - 1]);
+    const name = hash ?? mask;
+    if (name === undefined && saltNode === undefined) return undefined;
+    return {
+        hashAlgorithm: name ?? 'sha1',
+        mgf1HashAlgorithm: mask ?? name ?? 'sha1',
+        saltLength: saltNode === undefined ? (DIGEST_SPECS[name ?? 'sha1']?.out ?? 20) : Number(intOf(saltNode))
+    };
+}
+
 function generatePair(type: unknown, options: any): { public: number; private: number } {
     /* Node reads the key type as text before it looks it up, so a number is a type error and not
        the 'supported key type' refusal a name it does not know answers. */
@@ -3946,7 +4015,7 @@ const MLKEM_OIDS: Record<string, string> = {
     '2.16.840.1.101.3.4.4.3': 'ml-kem-1024'
 };
 
-function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve; domain?: DerNode; mlkemMode?: string } {
+function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve; domain?: DerNode; mlkemMode?: string; pss?: KeyRecord['pss'] } {
     const [oidNode, params] = node.children;
     if (oidNode === undefined || oidNode.tag !== DER_OID) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid key: no algorithm identifier');
     const algorithm = oidOf(oidNode);
@@ -3960,6 +4029,13 @@ function algorithmOf(node: DerNode): { kind: KeyKind; curve?: EcCurve; domain?: 
     if (algorithm === OID_DSA || algorithm === OID_DH) {
         if (params === undefined || params.tag !== DER_SEQUENCE) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid key: no domain parameters');
         return { kind: algorithm === OID_DSA ? 'dsa' : 'dh', domain: params };
+    }
+    /* An 'rsa-pss' key names its digests and its salt length in the parameters beside the OID, and
+       Node answers those three on asymmetricKeyDetails, so an import reads them back out. */
+    if (algorithm === OID_RSA_PSS) {
+        const found: { kind: KeyKind; curve?: EcCurve; domain?: DerNode; mlkemMode?: string; pss?: KeyRecord['pss'] } = kindFromOid(algorithm);
+        if (params !== undefined && params.tag === DER_SEQUENCE) found.pss = pssParamsOfDer(params);
+        return found;
     }
     return kindFromOid(algorithm);
 }
@@ -3991,15 +4067,24 @@ function importKeyMaterial(args: any): { id: number } {
     const bytes = bytesArg(args?.bytes);
     const text = new TextDecoder().decode(bytes);
     const pem = text.includes('-----BEGIN');
-    /* Node reads the label when the caller names no format, so an EC PRIVATE KEY imports as sec1. */
-    const kind = String(args?.type ?? (pem ? pemKindOf(text) : (want === 'private' ? 'pkcs8' : 'spki'))).toLowerCase();
+    /*
+     * Node picks no decoder from the encoding a caller names: `options.type` is checked and then
+     * put aside, and the material goes to the decoders, which read what it is -- the label of a
+     * PEM, the shape of a DER -- so an EC PRIVATE KEY named 'pkcs8' imports as the EC key it is
+     * and a PKCS#8 body named 'sec1' or 'pkcs1' imports as its own kind. The name decides only
+     * for a DER whose shape says nothing, which is a body no decoder here can read anyway.
+     */
+    const named = args?.type === undefined || args?.type === null ? undefined : String(args?.type).toLowerCase();
+    const kind = pem ? pemKindOf(text) : (derKindOf(bytes) ?? named ?? (want === 'private' ? 'pkcs8' : 'spki'));
     const sealed = pem && /-----BEGIN ENCRYPTED PRIVATE KEY-----/.test(text);
     /*
      * A caller that asked for a private key and handed over a public one gets no key at all: Node's
      * decoder is asked for a private key and finds nothing it can decode, which is the same failure
-     * as handing it garbage rather than a usable-key-of-the-wrong-kind error.
+     * as handing it garbage rather than a usable-key-of-the-wrong-kind error. The name is honoured
+     * here too, since a caller that asks for a private key out of an SPKI is answered that way
+     * whatever the body holds.
      */
-    if (want === 'private' && kind === 'spki') throw decodeFail();
+    if (want === 'private' && (kind === 'spki' || named === 'spki')) throw decodeFail();
     if (kind === 'spki') return { id: storeKey(importSpki(pem ? pemDecode(text, 'PUBLIC KEY') : bytes)) };
     if (kind === 'pkcs8') {
         const plain = sealed ? decryptPkcs8(pemDecode(text, 'ENCRYPTED PRIVATE KEY'), args?.passphrase) : pem ? pemDecode(text, 'PRIVATE KEY') : bytes;
@@ -4012,7 +4097,63 @@ function importKeyMaterial(args: any): { id: number } {
         if (oidNode === undefined) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid SEC1 key: no curve');
         return { id: storeKey(importEcPrivateKey(der, curveForOid(oidOf(oidNode.children[0])))) };
     }
+    if (kind === 'pkcs1') {
+        const der = pem ? pemDerOf(text, ['RSA PRIVATE KEY', 'RSA PUBLIC KEY']) : bytes;
+        return { id: storeKey(importPkcs1(der, want === 'private' ? 'private' : 'public')) };
+    }
     throw keyFail('ERR_CRYPTO_INVALID_KEY_TYPE', 'Unsupported key format: ' + kind);
+}
+
+/*
+ * What a DER body is, read off its shape the way a decoder reads it: an SPKI is an algorithm
+ * beside a BIT STRING, a PKCS#8 is a version 0 beside an AlgorithmIdentifier, an ECPrivateKey is
+ * a version 1 beside an OCTET STRING, an RSAPrivateKey is a version 0 beside the modulus and an
+ * RSAPublicKey is a modulus and an exponent with no version at all.
+ */
+function derKindOf(bytes: Uint8Array): string | undefined {
+    let root: DerNode;
+    try { root = derRead(bytes); } catch { return undefined; }
+    if (root.tag !== DER_SEQUENCE || root.children.length === 0) return undefined;
+    const [first, second] = root.children;
+    if (second === undefined) return undefined;
+    if (first.tag === DER_SEQUENCE) {
+        if (second.tag === DER_BIT_STRING) return 'spki';
+        /* An encrypted PKCS#8: the algorithm of the seal beside the bytes it sealed. */
+        if (second.tag === DER_OCTET_STRING) return 'pkcs8';
+        return undefined;
+    }
+    if (first.tag !== DER_INTEGER) return undefined;
+    const version = intOf(first);
+    if (version === 0n && second.tag === DER_SEQUENCE) return 'pkcs8';
+    if (version === 1n && second.tag === DER_OCTET_STRING) return 'sec1';
+    /* PKCS#1: a version 0 ahead of the modulus, or the modulus and the exponent on their own. */
+    if (second.tag === DER_INTEGER) return 'pkcs1';
+    return undefined;
+}
+
+/** PKCS#1: an RSAPrivateKey of nine INTEGERs, or an RSAPublicKey of two (RFC 8017 A.1). */
+function importPkcs1(bytes: Uint8Array, want: 'public' | 'private'): KeyRecord {
+    const root = derRead(bytes);
+    if (root.tag !== DER_SEQUENCE) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid PKCS#1 key');
+    const parts = root.children;
+    if (parts.length === 2 && parts.every((part) => part.tag === DER_INTEGER)) {
+        /* A public key is no answer to a caller that asked for a private one. */
+        if (want === 'private') throw decodeFail();
+        const ints: IntKey = { n: intOf(parts[0]), e: intOf(parts[1]) };
+        return { type: 'public', kind: 'rsa', ints, publicBytes: bytesOf(ints.n as bigint, modulusSize(ints.n as bigint)) };
+    }
+    if (parts.length < 9 || parts.some((part) => part.tag !== DER_INTEGER)) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid RSA private key');
+    const ints: IntKey = {
+        n: intOf(parts[1]),
+        e: intOf(parts[2]),
+        d: intOf(parts[3]),
+        p: intOf(parts[4]),
+        q: intOf(parts[5]),
+        dp: intOf(parts[6]),
+        dq: intOf(parts[7]),
+        qi: intOf(parts[8])
+    };
+    return { type: 'private', kind: 'rsa', ints, publicBytes: bytesOf(ints.n as bigint, modulusSize(ints.n as bigint)), privateBytes: bytesOf(ints.d as bigint, modulusSize(ints.n as bigint)) };
 }
 
 /** SPKI: SEQUENCE { AlgorithmIdentifier, BIT STRING publicKey }. */
@@ -4028,7 +4169,7 @@ function importSpki(bytes: Uint8Array): KeyRecord {
         const inner = derRead(subject.content.subarray(1));
         if (inner.tag !== DER_SEQUENCE || inner.children.length !== 2) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Invalid RSA public key');
         const ints: IntKey = { n: intOf(inner.children[0]), e: intOf(inner.children[1]) };
-        return { type: 'public', kind: found.kind, ints, publicBytes: bytesOf(ints.n as bigint, modulusSize(ints.n as bigint)) };
+        return { type: 'public', kind: found.kind, pss: found.pss, ints, publicBytes: bytesOf(ints.n as bigint, modulusSize(ints.n as bigint)) };
     }
     if (found.kind === 'dsa' || found.kind === 'dh') {
         const ints: IntKey = { ...(domainOf(found.domain as DerNode)), y: intOf(derRead(subject.content.subarray(1))) };
@@ -4072,7 +4213,7 @@ function importPkcs8(bytes: Uint8Array): KeyRecord {
             dq: intOf(parts[7]),
             qi: intOf(parts[8])
         };
-        return { type: 'private', kind: found.kind, ints, publicBytes: bytesOf(ints.n as bigint, modulusSize(ints.n as bigint)), privateBytes: bytesOf(ints.d as bigint, modulusSize(ints.n as bigint)) };
+        return { type: 'private', kind: found.kind, pss: found.pss, ints, publicBytes: bytesOf(ints.n as bigint, modulusSize(ints.n as bigint)), privateBytes: bytesOf(ints.d as bigint, modulusSize(ints.n as bigint)) };
     }
     /* Inside PKCS#8 a DSA or DH private key is the bare INTEGER x, with the domain alongside it. */
     if (found.kind === 'dsa' || found.kind === 'dh') {
@@ -5043,7 +5184,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
             throw keyFail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', `Invalid key object type ${key.type}, expected private.`);
         }
         if (key.publicBytes === undefined) throw keyFail('ERR_CRYPTO_INVALID_KEYPAIR', 'Key has no public half');
-        return { id: storeKey({ type: 'public', kind: key.kind, curve: key.curve, ints: key.ints, publicBytes: Uint8Array.from(key.publicBytes) }) };
+        return { id: storeKey({ type: 'public', kind: key.kind, curve: key.curve, pss: key.pss, ints: key.ints, publicBytes: Uint8Array.from(key.publicBytes) }) };
     },
     /** Args {id, algorithm, data, dsaEncoding, padding, saltLength}: the signature; returns base64. */
     'crypto.key.sign': (args) => bytesToBase64(signWith(keyFor(args?.id, 'key.sign'), args?.algorithm, bytesArg(args?.data), args?.dsaEncoding, args?.padding, args?.saltLength, args?.fromSign === true)),
