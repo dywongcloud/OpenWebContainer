@@ -96,6 +96,95 @@ function cpEnvDataSeed(entries) {
   }
 }
 
+/* The one object 'env: SHARE_ENV' names. Host node 24.15 keeps it in the symbol registry --
+   'worker_threads.SHARE_ENV === Symbol.for('nodejs.worker_threads.SHARE_ENV')' is true there -- so a
+   symbol made with 'Symbol()' over the same words is not the one a program that looks the name up in
+   the registry finds, and not the one another realm or another bundle hands over either. A symbol
+   with no description of its own would also break the identity two requires of the module must see. */
+var CP_SHARE_ENV = typeof Symbol === 'function' ? Symbol.for('nodejs.worker_threads.SHARE_ENV') : {};
+
+/*
+ * The environment a worker started with 'env: SHARE_ENV' shares with its parent: one copy the host
+ * keeps, which both sides read and write through 'process.env'. The two are container processes with
+ * heaps of their own, so the host's copy is the only one both can reach -- the same reason a
+ * SharedArrayBuffer keeps its bytes there. A group is made from the environment the parent has when
+ * it starts its first SHARE_ENV worker, and every SHARE_ENV worker after it joins that one group, as
+ * a thread on a host shares the one object its parent has and not a copy per thread.
+ */
+var cpEnvShareId = 0;
+
+function cpEnvShareRead(id) {
+  var answer = callCap('shared.envRead', { id: id });
+  return answer && answer.entries ? answer.entries : {};
+}
+
+/* The environment, written back to the host as it is after an ordinary write: what a child this
+   process spawns later inherits, which is the same thing 'process.env.X = v' has always published. */
+function cpEnvSharePublish(id) {
+  host.setEnvJSON(JSON.stringify(cpEnvShareRead(id)));
+}
+
+function cpEnvShareInstall(id) {
+  var store = {};
+  var proto = Object.getPrototypeOf(proc.env);
+  if (proto && proto !== Object.prototype) Object.setPrototypeOf(store, proto);
+  var refresh = function () {
+    var entries = cpEnvShareRead(id);
+    Object.keys(store).forEach(function (key) { delete store[key]; });
+    Object.keys(entries).forEach(function (key) { store[key] = entries[key]; });
+  };
+  refresh();
+  proc.env = new Proxy(store, {
+    /* A read is a read of the shared copy: the other side may have written since this one last
+       looked. 'Reflect.get' keeps the prototype the environment already had, so the names an
+       ordinary object answers for are still answered here. */
+    get: function (target, name) {
+      if (typeof name === 'symbol') return Reflect.get(target, name);
+      refresh();
+      return Reflect.get(target, name);
+    },
+    set: function (target, name, value) {
+      if (typeof name === 'symbol') { target[name] = value; return true; }
+      callCap('shared.envSet', { id: id, name: String(name), value: String(value) });
+      target[String(name)] = String(value);
+      cpEnvSharePublish(id);
+      return true;
+    },
+    deleteProperty: function (target, name) {
+      if (typeof name === 'symbol') { delete target[name]; return true; }
+      callCap('shared.envDelete', { id: id, name: String(name) });
+      delete target[String(name)];
+      cpEnvSharePublish(id);
+      return true;
+    },
+    has: function (target, name) {
+      if (typeof name === 'symbol') return Reflect.has(target, name);
+      refresh();
+      return Reflect.has(target, name);
+    },
+    ownKeys: function (target) {
+      refresh();
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor: function (target, name) {
+      refresh();
+      return Reflect.getOwnPropertyDescriptor(target, name);
+    }
+  });
+}
+
+/* The group of the parent's own side: opened from the environment the process has now, and kept, so
+   that every SHARE_ENV worker it starts shares the one copy rather than a copy of its own. */
+function cpEnvShareGroup() {
+  if (cpEnvShareId === 0) {
+    var entries = {};
+    Object.keys(proc.env).forEach(function (key) { entries[key] = String(proc.env[key]); });
+    cpEnvShareId = Number(callCap('shared.envCreate', { entries: entries }).id);
+    cpEnvShareInstall(cpEnvShareId);
+  }
+  return cpEnvShareId;
+}
+
 /* A SharedArrayBuffer that crosses to another thread keeps sharing its memory there, so the bytes
    live on the host and both sides reach them through an id the buffer carries. A buffer that has
    never crossed answers for no id, and its atomics stay the local ones. */
@@ -1404,6 +1493,9 @@ function cpWorkerClass() {
        validates them -- inside 'new Worker', before a thread exists to be given them. */
     var execArgv = cpWorkerExecArgv(opts.execArgv);
     var argv = execArgv.concat(opts.eval === true ? ['-e', String(filename)] : [String(filename)]);
+    /* 'env: SHARE_ENV' is the parent's own environment and not a copy of it: the group is opened
+       here, where 'new Worker' reads the option, and the thread is told which one to join. */
+    var envGroup = opts.env === CP_SHARE_ENV ? cpEnvShareGroup() : 0;
     cpSpawnCore(this, 'node', argv, {
       cwd: opts.cwd,
       env: opts.env,
@@ -1421,6 +1513,9 @@ function cpWorkerClass() {
            the option they came from: the only place host node 24.15 reports them. */
         resourceLimits: this._cpLimits,
         envData: cpEnvDataSnapshot(),
+        /* 0 when the worker was not started with SHARE_ENV, and then the thread keeps an
+           environment of its own, as one does on the host. */
+        envGroup: envGroup,
         /* The options the worker reports as its own: the list above, in the words it was given. */
         execArgv: execArgv,
         /* An eval worker's source is its program and not one of the options of its line, and node
@@ -2077,7 +2172,8 @@ BF['worker_threads'] = function () {
        the runtime's own four, which is the only place host node 24.15 reports them. The main
        thread has none to report and answers the empty object it answers there. */
     resourceLimits: isWorker ? cpWorkerLimits(cpState.data.resourceLimits) : {},
-    SHARE_ENV: typeof Symbol === 'function' ? Symbol('nodejs.worker_threads.SHARE_ENV') : {},
+    /* The option 'env: SHARE_ENV' names, read out of the symbol registry as it is on the host. */
+    SHARE_ENV: CP_SHARE_ENV,
     Worker: Worker,
     MessageChannel: MessageChannel,
     MessagePort: Port,
@@ -2239,6 +2335,10 @@ BF['cluster'] = function () {
     /* The environment data its parent held when it started it: a worker reads the keys its parent
        had, and a key it sets of its own is its own, as on host node 24.15. */
     cpEnvDataSeed(cpState.data.envData);
+    /* The environment this thread shares with its parent, when it was started with SHARE_ENV. It is
+       opened after the bootstrap has taken its own two keys out of the environment, so the keys that
+       wired the channel up are not handed to the copy the two sides share. */
+    if (Number(cpState.data.envGroup) > 0) cpEnvShareInstall(Number(cpState.data.envGroup));
     /* The threads one BroadcastChannel name is open across: a worker shares its parent's set. A
        forked or clustered child keeps its own, which is what node gives a channel in a process of
        its own -- a name does not reach across processes there. */

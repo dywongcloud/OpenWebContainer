@@ -1,0 +1,47 @@
+owc-worker-share-env-not-shared resolved witness-e94e79cb2c34a25e 2026-11-02T01:33:20Z
+
+Symptom
+  The parent sets process.env.OWC_PROBE = 'from-parent', starts
+  new Worker(worker.js, { env: SHARE_ENV }), and the worker reads the probe back
+  and writes process.env.FROM_WORKER = 'yes'. After the worker exits the parent
+  reads 'yes' on host node v24.15.0 and null in the container: the environment a
+  SHARE_ENV worker was given was a copy per thread, not the one object the
+  option's name promises.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/child.ts: the
+  Worker constructor opens (or joins) one shared environment group when
+  opts.env === CP_SHARE_ENV and hands the group's id to the thread in its ipc
+  data; the worker bootstrap installs a proxy over process.env for that group,
+  installed after the bootstrap has taken its own two keys out of the
+  environment. A read refreshes from the host's copy, a write and a delete go
+  through shared.envSet / shared.envDelete and are published back with
+  host.setEnvJSON, so a child this process spawns later inherits what
+  process.env.X = v has always published.
+  packages/core/src/process/executors/node/runtime/capabilities/shared.ts: the
+  host half -- envCreate, envRead, envSet, envDelete over one group of pairs the
+  host holds. Two container processes share no heap, so the host is the only
+  place one copy can live, the same place a SharedArrayBuffer keeps the bytes a
+  wait is left on. A group is never dropped: a write a thread made has to still
+  be there for its parent to read after the thread has gone.
+
+Witness
+  witness-e94e79cb2c34a25e, session lane-shareenv41, output
+  /tmp/lane-shareenv41/witness.out (sha256 e94e79cb2c34a25ef3f4a8125cd30516
+  e7174f3f90e76fe2de52832d800e99be).
+
+  Measured from a git archive export of origin/main tip 2a62093e8f0b57e5f5a21eb
+  0d8742a1251b3d3f2, installed and built under /tmp/lane-shareenv40/fixed,
+  never the shared working tree, which is 441 commits behind and would revert
+  over a thousand published lines. Container dist sha256 d07a950ec817a0da1a4321
+  f434c683ab4f20f2cd9b7c205e9e7a3561a10136d4, host node v24.15.0 on the other
+  side, one fresh container boot per run, stdout + stderr + exit code compared,
+  two memory points (freemem 3.6 GB and, with 256 MB of live ballast, 0.4 GB;
+  machine load 16-20). Before the fix the same case against the pre-fix build
+  answers parent-sees null; after it, parent-sees "yes" on both sides, and the
+  reverse direction agrees (a parent write the worker sees). The seven-case
+  worker sweep -- SharedArrayBuffer, Atomics, environment data,
+  BroadcastChannel, execArgv, resourceLimits and the ESM entry -- is
+  byte-identical before and after: sweep-sab 34d54b76, sweep-atomics 3a4b0a65,
+  sweep-envdata ec0abba0, sweep-bc d4f150a3, sweep-execargv bb85f9fc,
+  sweep-limits 288f86ec, sweep-esm f331f462.

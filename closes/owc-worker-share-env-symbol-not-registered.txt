@@ -1,0 +1,36 @@
+owc-worker-share-env-symbol-not-registered resolved witness-e94e79cb2c34a25e 2026-11-02T01:33:20Z
+
+Symptom
+  String(worker_threads.SHARE_ENV) is 'Symbol(nodejs.worker_threads.SHARE_ENV)'
+  on both sides, but SHARE_ENV === Symbol.for('nodejs.worker_threads.SHARE_ENV')
+  is true on host node v24.15.0 and false in the container: the container's was a
+  fresh symbol made with Symbol() over the same words, so a symbol a program
+  looks up in the registry -- from another realm, another bundle, or a value
+  handed in -- never matched it.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/child.ts: the
+  SHARE_ENV export is now CP_SHARE_ENV, made once at module scope with
+  Symbol.for('nodejs.worker_threads.SHARE_ENV'), so the value the module exports,
+  the value the Worker constructor compares opts.env against, and the value a
+  second require of the module hands out are the one registered symbol. The
+  description is unchanged, so String(SHARE_ENV) still reads
+  'Symbol(nodejs.worker_threads.SHARE_ENV)'. The same symbol is what row
+  owc-worker-share-env-not-shared keys the shared environment group on.
+
+Witness
+  witness-e94e79cb2c34a25e, session lane-shareenv41, output
+  /tmp/lane-shareenv41/witness.out (sha256 e94e79cb2c34a25ef3f4a8125cd30516
+  e7174f3f90e76fe2de52832d800e99be).
+
+  Measured from a git archive export of origin/main tip 2a62093e8f0b57e5f5a21eb
+  0d8742a1251b3d3f2, installed and built under /tmp/lane-shareenv40/fixed,
+  never the shared working tree, which is 441 commits behind and would revert
+  over a thousand published lines. Container dist sha256 d07a950ec817a0da1a4321
+  f434c683ab4f20f2cd9b7c205e9e7a3561a10136d4, host node v24.15.0 on the other
+  side, one fresh container boot per run, stdout + stderr + exit code compared,
+  two memory points (freemem 3.6 GB and, with 256 MB of live ballast, 0.4 GB;
+  machine load 16-20). SHARE_ENV-symbol-for is false in the container before the
+  fix and true after it, on both memory points, with SHARE_ENV-string unchanged
+  at 'Symbol(nodejs.worker_threads.SHARE_ENV)' and SHARE_ENV-two-requires true.
+  The seven-case worker sweep is byte-identical before and after.

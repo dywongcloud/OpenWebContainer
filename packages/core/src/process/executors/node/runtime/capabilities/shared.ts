@@ -263,6 +263,61 @@ const busLink: CapabilityHandler = (_args, ctx) => {
     return { id: bus.nextLink++ };
 };
 
+/*
+ * Host half of the environment a worker started with 'env: SHARE_ENV' shares with its parent: one
+ * group of pairs the host holds, which the parent's 'process.env' and the worker's both read and
+ * write through. Two container processes share no heap, so the host is the only place one copy can
+ * live -- the same place a SharedArrayBuffer keeps the bytes a wait is left on. The guest half is
+ * the proxy over 'process.env' in ../guest/modules/child.ts.
+ *
+ * A group is never dropped: a write a thread made has to still be there for its parent to read after
+ * the thread has gone, which is the whole point of the option.
+ */
+interface EnvGroup {
+    entries: Record<string, string>;
+}
+
+const envGroups = new Map<number, EnvGroup>();
+let nextEnvGroup = 1;
+
+function envGroupOf(id: unknown): EnvGroup {
+    const found = envGroups.get(Number(id));
+    if (found === undefined) throw new Error('no such shared environment');
+    return found;
+}
+
+/** One group, seeded with the environment the process starting the worker has. */
+const createEnvGroup: CapabilityHandler = (args) => {
+    const entries: Record<string, string> = {};
+    const given = args.entries;
+    if (given !== null && typeof given === 'object') {
+        for (const name of Object.keys(given as Record<string, unknown>)) {
+            const value = (given as Record<string, unknown>)[name];
+            if (value === undefined || value === null) continue;
+            entries[name] = String(value);
+        }
+    }
+    const id = nextEnvGroup++;
+    envGroups.set(id, { entries });
+    return { id };
+};
+
+/** The pairs as they are now: what the other side may have written since this one last looked. */
+const readEnvGroup: CapabilityHandler = (args) => {
+    const group = envGroupOf(args.id);
+    return { entries: Object.assign({}, group.entries) };
+};
+
+const setEnvGroup: CapabilityHandler = (args) => {
+    envGroupOf(args.id).entries[String(args.name)] = String(args.value);
+    return true;
+};
+
+const deleteEnvGroup: CapabilityHandler = (args) => {
+    delete envGroupOf(args.id).entries[String(args.name)];
+    return true;
+};
+
 export const SHARED_CAPABILITIES: Record<string, CapabilityHandler> = {
     'shared.create': createSlab,
     'shared.read': readSlab,
@@ -273,5 +328,9 @@ export const SHARED_CAPABILITIES: Record<string, CapabilityHandler> = {
     'shared.busOpen': busOpen,
     'shared.busClose': busClose,
     'shared.busPost': busPost,
-    'shared.busLink': busLink
+    'shared.busLink': busLink,
+    'shared.envCreate': createEnvGroup,
+    'shared.envRead': readEnvGroup,
+    'shared.envSet': setEnvGroup,
+    'shared.envDelete': deleteEnvGroup
 };
