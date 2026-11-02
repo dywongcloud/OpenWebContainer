@@ -1670,6 +1670,22 @@ function stackHeaderOf(err) {
   } catch (ignored) {
     /* A message that throws when it is read: the host read it once, before it threw. */
   }
+  /* The code in brackets behind the name, which is how host node 24.15 opens the stack of an error
+     of its own: 'TypeError [ERR_INVALID_ARG_TYPE]: ...' where the name the error answers is still
+     the plain 'TypeError'. Node writes that code into the line as it builds the error -- the factory
+     internal/errors.js registers answers a toString of its own that names the code behind the name,
+     and V8 takes the line it opens a stack with from that -- so what it hangs on is that this
+     container raised the error with one of node's codes and not that a program built one and gave it
+     a code of its own: host node 24.15 prints 'TypeError: boom' for that one, with the code behind
+     it as a property and never in the line. The codes node writes that way are the ones it names
+     'ERR_...'; the 'ENOENT' and 'EBADF' of a file that would not open are another class of error of
+     its and carry no brackets. Both tests are the ones util-assert.ts puts on the line a report
+     opens with, and the mark is the same one: __owcRaised is what says this container built the
+     error, and it is asked here because the frames a stack carries by then are the frames a host
+     names and hold nothing of the bootstrap's. */
+  var code = '';
+  try { code = err.__owcRaised === true && typeof err.code === 'string' ? err.code : ''; } catch (alsoIgnored) { }
+  if (code.indexOf('ERR_') === 0) return name + ' [' + code + ']: ' + message;
   return message === '' ? name : name + ': ' + message;
 }
 

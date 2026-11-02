@@ -1,0 +1,60 @@
+owc-error-stack-code-decoration resolved 1793611140400-5277-dbc8f0d1a1d17dfe 2026-11-02T09:22:07.000Z
+Row: owc-error-stack-code-decoration
+Witness: 1793611140400-5277-dbc8f0d1a1d17dfe
+Status: resolved
+
+Symptom
+  The stack a program catches carries no code where host node 24.15's does. `Buffer.from(1)` caught
+  answers `TypeError: The first argument must be of type string or an instance of Buffer,
+  ArrayBuffer, or Array or an Array-like Object. Received type number (1)` on this container and
+  `TypeError [ERR_INVALID_ARG_TYPE]: The first argument must be of type string or an instance of
+  Buffer, ArrayBuffer, or Array or an Array-like Object. Received type number (1)` on host node
+  v24.15.0, and the same is true of `Buffer.alloc(-1)` (`ERR_OUT_OF_RANGE`),
+  `require('net').connect({ port: 'x' })` (`ERR_SOCKET_BAD_PORT`), `assert.ok(false)`
+  (`ERR_ASSERTION`), `process.kill(pid, 'NOPE')` (`ERR_UNKNOWN_SIGNAL`) and
+  `util.parseArgs({ args: 'nope' })` (`ERR_INVALID_ARG_TYPE`). The code is on the error as `code`,
+  and the uncaught report already wrote `[<CODE>]` in the line it opens with, so the gap is the
+  string `err.stack` answers and nothing else. Measured by the lane that closed
+  owc-buffer-from-report-sentence-and-banner at cfdfe2e and left this unfiled: buf-from-probe,
+  probe-alloc and probe-net differ before and after that fix, and what changes in them is the stack's
+  own text.
+
+Cause
+  packages/core/src/process/executors/node/runtime/guest/globals.ts built the line a stack opens
+  with out of the name and the message alone. Host node gets that line from the error's own
+  toString, and the factory internal/errors.js builds every error it registers with answers
+  `${this.name} [${key}]: ${this.message}` -- which is why `err.name` still reads the plain
+  `TypeError` and `Error.prototype.toString.call(err)` still reads `TypeError: ...` with no code
+  there, and why an error a program built and gave a code of its own and the ENOENT of a file that
+  would not open carry no brackets either: neither is one that factory made. util-assert.ts already
+  wrote that line into the report from the same two tests, the ERR_ prefix and the __owcRaised mark
+  globals.ts keeps on every error it builds, and the stack's own header asked neither.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/globals.ts
+    stackHeaderOf -- the line a stack opens with carries the code in brackets behind the name when
+    the error is one this container raised with one of node's own codes, the same ERR_ prefix and
+    __owcRaised the report already asks. Nothing else moves: the name the error answers, the
+    toString Error.prototype gives it, the frames behind the header, the internal sites, the ESM
+    file:// names and the columns are the ones they were.
+
+Witness
+  dispatch 1793611140400-5277-dbc8f0d1a1d17dfe, session verify-stackcode42, on a fresh export of origin/main (git archive, pnpm
+  build in packages/core), host node v24.15.0 on the other side, one fresh container boot per run,
+  stdout + stderr + exit code compared, the whole sweep -- the 13 decoration cases, util-sweep, the
+  three caught-error probes, the six uncaught coded-error cases and the seven stack cases -- run
+  before and after the fix at two memory points: Before the fix 12 of the 29 cases agree with host node v24.15.0 and 17 differ; after it 21 agree
+and 8 differ, and nothing that agreed disagrees. The nine that flip are the seven coded-error
+probes -- a caught Buffer.from (ERR_INVALID_ARG_TYPE), Buffer.alloc (ERR_OUT_OF_RANGE), a
+net.connect on a bad port (ERR_SOCKET_BAD_PORT), assert.ok (ERR_ASSERTION), a process.kill of a
+signal node does not know (ERR_UNKNOWN_SIGNAL), util.parseArgs and util.getSystemErrorName --
+util-sweep's nine inspected errors at once, and buf-from-probe's whole stack. The eight that still
+differ -- probe-alloc, whose host names 'at Buffer.alloc (node:buffer:439:3)' where the guest goes
+straight to main.js because Buffer.alloc is given no internal site, probe-net, whose guest writes
+'at apply (native)' against host's 'at lookupAndConnect (node:net:1389:5)', the four errcode
+reports whose banner names the program's line and not node's internal one, stack-subclass's extra
+'at MyError' frame and stack-getter's message getter that throws -- differ by the margin they did
+before, and none of them is this row's. The uncaught report's coded line, the builtin frames, the
+ESM file:// frames and the columns all still hold: errcode-buffer-from, errcode-fs-enoent,
+stack-cjs, stack-esm, stack-column, stack-capture and stack-limit agree with the host on both
+sides of the fix.
