@@ -4701,7 +4701,68 @@ function circularStructureText(value, replacer) {
   };
   proc.execve = function () { throw new Error('process.execve is not supported'); };
   proc.finalization = { register: noop, registerBeforeExit: noop, unregister: noop };
-  proc.getActiveResourcesInfo = function () { return []; };
+  /*
+   * What is keeping the event loop alive, named as host node 24.15 names it: a file request in
+   * flight is an FSReqCallback, a pipe being read is a PipeWrap, and every timer or immediate
+   * still standing is a Timeout or an Immediate. The order is node's -- the requests of the
+   * moment first, then the handles, oldest first -- measured on host node 24.15, where a readFile
+   * in flight beside a 500 ms timer answers ["FSReqCallback","Timeout"], a stdin being read beside
+   * one answers ["PipeWrap","Timeout"], and a promise that never settles answers nothing at all,
+   * which is what it answers here too. A socket is the one handle this container has nothing
+   * behind: host node names TCPServerWrap, TCPSocketWrap and ConnectWrap for one, and there is no
+   * list of the sockets this runtime made to read those names off, so it answers none.
+   */
+  var ioInFlight = 0;
+  var settleIOBase = settleIO;
+  /* Every file request settleIO settles is counted as it starts and uncounted as it lands, which
+     is the life of the request node names: settleIO is what a request in flight is waiting on. */
+  settleIO = function (fn, later) {
+    ioInFlight += 1;
+    var spent = false;
+    return settleIOBase(function () {
+      if (spent) return fn.apply(undefined, arguments);
+      spent = true;
+      ioInFlight -= 1;
+      return fn.apply(undefined, arguments);
+    }, later);
+  };
+  /* A timer host node 24.15 still names while the callback it is running is its own: a one-shot is
+     taken out of the table here before its callback runs, but node's own handle stands until the
+     callback returns, so a call made from inside one names it (measured: ["Timeout","Immediate"]
+     for a timer that had just queued an immediate). An immediate is the other way round -- node
+     drops it before its callback runs, and a call from inside one names no Immediate at all. */
+  var firingTimer = 0;
+  var runTimerEntryBase = runTimerEntry;
+  runTimerEntry = function (id) {
+    var entry = timers[id];
+    var previous = firingTimer;
+    firingTimer = entry !== undefined && entry.immediate !== true && entry.refed ? id : 0;
+    try {
+      return runTimerEntryBase(id);
+    } finally {
+      firingTimer = previous;
+    }
+  };
+  function activeResourceNames() {
+    var names = [];
+    var i;
+    for (i = 0; i < ioInFlight; i++) names.push('FSReqCallback');
+    /* A pipe node names is one it is reading: a stdio pipe with nothing to read and nothing to
+       write is not active, which is why a run with its output piped names no PipeWrap at all. */
+    if (stdinHeld) names.push('PipeWrap');
+    var ids = [];
+    for (var id in timers) ids.push(Number(id));
+    if (firingTimer !== 0 && timers[firingTimer] === undefined && ids.indexOf(firingTimer) < 0) ids.push(firingTimer);
+    ids.sort(function (a, b) { return a - b; });
+    for (i = 0; i < ids.length; i++) {
+      var t = timers[ids[i]];
+      if (t === undefined || t === null) { names.push('Timeout'); continue; }
+      if (!t.refed) continue;
+      names.push(t.immediate ? 'Immediate' : 'Timeout');
+    }
+    return names;
+  }
+  proc.getActiveResourcesInfo = function () { return activeResourceNames(); };
   proc.getBuiltinModule = function (name) {
     try {
       return requireBuiltin(name);
