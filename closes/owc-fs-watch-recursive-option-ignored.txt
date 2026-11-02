@@ -86,3 +86,4 @@ PUBLISHED
   built on origin/main with a temporary index and pushed by sha; the sha is in the
   commit this record rides in. Local main was not reset and the diverged local lineage
   was not pushed.
+owc-fs-watch-recursive-option-ignored resolved 1793607012289-7377-f1b700836b0a4747 2026-11-02T08:16:39.745Z
