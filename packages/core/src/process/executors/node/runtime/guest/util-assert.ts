@@ -91,6 +91,17 @@ function formatErrorStack(err) {
      thrown out of a 'vm' context open with the frame the host wrote, 'evalmachine.<anonymous>:1',
      and not with 'Error: th': that report holds its own 'Error: th' further down, and a header of
      ours in front would make the first line the one thing node does not print. */
+  /* An error the container raised with one of node's codes -- the Blob and File constructors among
+     them -- carries that code in the line its stack opens with, the way node's own errors do, while
+     the name the error answers stays the plain one behind it. What node prints for such an error is
+     that line and the frames behind it, so a header of the name and the message alone is not put in
+     front of a stack that already holds the one node writes. A stack with no such line in it -- one
+     the engine wrote, or one of an error a program gave a code of its own -- is reported as it
+     always was. */
+  if (typeof err.code === 'string' && err.code !== '') {
+    var coded = nameText + ' [' + err.code + ']' + (err.message ? ': ' + String(err.message) : '');
+    if (body.indexOf(coded) >= 0) return body;
+  }
   return body.indexOf(header) >= 0 ? body : header + '\n' + body;
 }
 

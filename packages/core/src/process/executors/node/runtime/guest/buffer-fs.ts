@@ -699,9 +699,61 @@ BF.buffer = function () {
     return Math.min(n, size);
   }
 
+  /* An error of the two constructors that carries a code, the way node's own do: the code is on the
+     error for a caller to read, and it is written into the line a stack opens with as well, which is
+     what an uncaught one is reported as -- "TypeError [ERR_INVALID_ARG_TYPE]: ..." -- while the
+     error's own name stays the plain one, as it does on the host. */
+  function blobErr(Kind, code, message) {
+    var err = new Kind(message);
+    err.code = code;
+    /* Node's own errors answer a toString of their own, one that carries the code where the name it
+       is written with does not: 'TypeError [ERR_INVALID_ARG_TYPE]: ...' is what String() gives for
+       one, and 'TypeError' is still what its name answers. */
+    Object.defineProperty(err, 'toString', {
+      value: function () {
+        return (this.name === undefined || this.name === null ? 'Error' : String(this.name)) + ' [' + code + ']: ' + String(this.message);
+      },
+      configurable: true, writable: true
+    });
+    var stack = typeof err.stack === 'string' ? err.stack : '';
+    var cut = stack.indexOf('\n');
+    var named = typeof err.name === 'string' && err.name !== '' ? err.name : 'Error';
+    var head = cut < 0 ? stack : stack.slice(0, cut);
+    if (head === named || head.indexOf(named + ': ') === 0) {
+      try { err.stack = named + ' [' + code + ']: ' + message + (cut < 0 ? '' : stack.slice(cut)); } catch (e) { }
+    }
+    return err;
+  }
+
+  /* What a Blob may be made of: nothing at all, or a sequence. A string iterates and is still
+     refused, and so is every value with no iterator behind it, each named by what it is. */
+  function blobSourcesOf(sources) {
+    if (sources === undefined) return [];
+    var iterable = typeof sources === 'object' && sources !== null && typeof sources[Symbol.iterator] === 'function';
+    if (!iterable) {
+      throw blobErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "sources" argument must be a sequence. Received ' + describeArg(sources));
+    }
+    return Array.from(sources);
+  }
+
+  /* The options dictionary: absent or null carries nothing, an object or a function is the only
+     other thing node will read, and a primitive is refused. Of what it carries, "endings" is either
+     of the two names or nothing. */
+  function blobOptionsOf(options) {
+    if (options === undefined || options === null) return undefined;
+    if (typeof options !== 'object' && typeof options !== 'function') {
+      throw blobErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "options" argument must be a dictionary. Received ' + describeArg(options));
+    }
+    if (options.endings !== undefined && options.endings !== 'transparent' && options.endings !== 'native') {
+      throw blobErr(TypeError, 'ERR_INVALID_ARG_VALUE', "The property 'options.endings' is invalid. Received '" + String(options.endings) + "'");
+    }
+    return options;
+  }
+
   class Blob {
     constructor(sources, options) {
-      var list = Array.from(sources === undefined ? [] : sources);
+      var list = blobSourcesOf(sources);
+      var given = blobOptionsOf(options);
       var parts = [];
       var total = 0;
       for (var i = 0; i < list.length; i++) {
@@ -710,6 +762,9 @@ BF.buffer = function () {
         if (item instanceof Blob) bytes = item[kBlobBytes];
         else if (ArrayBuffer.isView(item)) bytes = new Uint8Array(item.buffer, item.byteOffset, item.byteLength);
         else if (item instanceof ArrayBuffer) bytes = new Uint8Array(item);
+        /* A symbol is the one element a sequence can hold that no text can be made of: it is
+           refused, as it is on the host, and not written as the name it prints as. */
+        else if (typeof item === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
         else bytes = encodeString(String(item), 'utf8');
         parts.push(bytes);
         total += bytes.length;
@@ -722,7 +777,7 @@ BF.buffer = function () {
       }
       this[kBlobBytes] = out;
       this[kBlobParts] = parts.filter(function (part) { return part.length > 0; });
-      this[kBlobType] = options && options.type !== undefined ? blobType(options.type) : '';
+      this[kBlobType] = given !== undefined && given.type !== undefined ? blobType(given.type) : '';
     }
     get size() {
       return this[kBlobBytes].length;
@@ -753,6 +808,9 @@ BF.buffer = function () {
     }
   }
   Object.defineProperty(Blob.prototype, Symbol.toStringTag, { value: 'Blob', configurable: true });
+  /* Both of node's are made by webidl, which writes no arity onto a Blob -- a File takes three
+     arguments and answers two, the last of them carried by a default. */
+  Object.defineProperty(Blob, 'length', { value: 0, configurable: true });
 
   function makeBlob(bytes, type) {
     var blob = Object.create(Blob.prototype);
@@ -895,10 +953,19 @@ BF.buffer = function () {
 
   class File extends Blob {
     constructor(sources, fileName, options) {
+      /* The two arguments node insists on, counted before the bits are read: a File made with one is
+         refused even when the one it was given is a shape a Blob would have taken. */
+      if (arguments.length < 2) {
+        throw blobErr(TypeError, 'ERR_MISSING_ARGS', 'The "fileBits" and "fileName" arguments must be specified');
+      }
       super(sources, options);
+      if (typeof fileName === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
       this[kFileName] = String(fileName);
       var at = options === undefined || options === null ? undefined : options.lastModified;
-      this[kFileModified] = typeof at === 'number' && isFinite(at) ? Math.trunc(at) : Date.now();
+      /* What is given is read as a number, and a value no number can be made of leaves none at all;
+         a File that was handed nothing keeps the moment it was made. */
+      var given = at === undefined ? undefined : Number(at);
+      this[kFileModified] = given === undefined ? Date.now() : (given !== given ? 0 : given);
     }
     get name() {
       return this[kFileName];
@@ -908,6 +975,7 @@ BF.buffer = function () {
     }
   }
   Object.defineProperty(File.prototype, Symbol.toStringTag, { value: 'File', configurable: true });
+  Object.defineProperty(File, 'length', { value: 2, configurable: true });
 
   return {
     Buffer: Buffer,

@@ -1,0 +1,82 @@
+owc-blob-file-ctor-no-validation resolved witness-49b83355102cde66 2026-11-02T06:18:59Z
+
+Symptom
+  new Blob(1) and new File() are accepted where host node v24.15.0 refuses both:
+  the container answered a Blob of size 0 for every source that is not a
+  sequence -- a number, a string, a boolean, a bigint, a symbol, a function, a
+  plain object -- and a File of name 'undefined' for a File made with fewer than
+  two arguments, where the host throws
+  'The "sources" argument must be a sequence. Received type number (1)'
+  (ERR_INVALID_ARG_TYPE) and
+  'The "fileBits" and "fileName" arguments must be specified' (ERR_MISSING_ARGS).
+  A File made with no name threw its own message here -- 'The "fileName"
+  argument must be specified' -- and no code at all. The options object was
+  never checked either: new Blob(['ab'], 5) and { endings: 'bogus' } were both
+  accepted where the host raises 'The "options" argument must be a dictionary'
+  and "The property 'options.endings' is invalid".
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts: the Blob
+  constructor takes its sources through blobSourcesOf, which accepts undefined
+  and anything iterable behind an object and refuses the rest -- a string
+  iterates and is still refused -- naming what it was handed the way node names
+  it, and reads its options through blobOptionsOf, which accepts undefined,
+  null, an object and a function, refuses a primitive as not a dictionary, and
+  refuses an endings that is neither 'transparent' nor 'native' with
+  ERR_INVALID_ARG_VALUE. A symbol inside the sequence is refused with the
+  TypeError node raises rather than written as the name it prints as. File
+  counts its arguments before its bits are read, so a File made with one is
+  ERR_MISSING_ARGS even when the one is a shape a Blob would have taken, reads
+  a given lastModified as a number -- a value no number can be made of leaves
+  none -- and keeps the moment it was made for one that was handed nothing.
+  Blob.length is 0 and File.length 2, the arities the host answers. The two
+  errors are made by blobErr, which puts the code on the error and into the line
+  its stack opens with, as node does, and answers a toString carrying it, while
+  the name stays the plain one.
+  packages/core/src/process/executors/node/runtime/guest/globals.ts: the global
+  File is the one require('buffer') hands out, so the two are one class, and the
+  name and the date a File carries are its prototype's rather than fields
+  written onto each instance, which is what leaves Object.keys empty.
+  packages/core/src/process/executors/node/runtime/guest/util-assert.ts:
+  formatErrorStack reports a stack that already opens with the line node writes
+  -- one carrying the code -- as it stands, instead of putting a second header
+  of the name and the message in front of it. An error a program gave a code of
+  its own is untouched: its stack carries no such line.
+
+Witness
+  witness-49b83355102cde66, dispatch 1793600239234-6174-a1a83a0d6e7fe6f6,
+  session verify-owc-blob-file-ctor-no-validation, output
+  /tmp/owc-blob41/witness.out.
+
+  Measured from a git archive export of origin/main tip c0cf7562675ba92807f20d
+  2b9ac4c7c543dceb61, installed and built under /tmp/owc-blob41/export, never
+  the shared working tree, which is 441 commits behind and would revert over a
+  thousand published lines. Container dist sha256 9d2029271f131f1a96ac40575a98
+  40162e0490f608590b42e6e5ae759c99120f, host node v24.15.0 on the other side,
+  one fresh container boot per run, stdout + stderr + exit code compared
+  together, every case run twice and re-run at further memory points (machine
+  load 13-36, 0.09-3.6 GB free plus speculative). Before the fix the 148-label
+  sweep differs on 38 labels and the five uncaught cases leave exit 0 with no
+  stderr where the host leaves exit 1; after it all 148 labels are byte
+  identical, the five uncaught cases leave exit 1 with the host's own error line
+  -- 'TypeError [ERR_INVALID_ARG_TYPE]: The "sources" argument must be a
+  sequence. Received type number (1)' and 'TypeError [ERR_MISSING_ARGS]: The
+  "fileBits" and "fileName" arguments must be specified' -- and the error
+  surface agrees on name, code, message, String(e), err.stack, util.inspect,
+  Object.keys and the toStringTag, with a plain TypeError a program coded itself
+  still reported without a code. The fetch sweep keeps a Blob body, a File body
+  and a FormData body at 200 with the same lengths and content types, and the
+  controls -- size, type, text(), arrayBuffer(), slice, stream(), name,
+  lastModified, instanceof Blob and both Object.prototype.toString values --
+  are unchanged.
+
+Open
+  Two gaps this row measured and did not fix, both wider than the two
+  constructors: an error a container builtin raises with one of node's codes is
+  still reported without the [CODE] line -- Buffer.from(1) prints 'TypeError:
+  The first argument must be of type string or an instance of Buffer,
+  ArrayBuffer, or Array' where the host prints 'TypeError [ERR_INVALID_ARG_TYPE]
+  : ... Received type number (1)' -- and an error raised inside a builtin is
+  reported at the caller's line where the host reports node's own internal
+  source block and frame, 'node:internal/blob:148' and 'at new Blob
+  (node:internal/blob:148:13)'.

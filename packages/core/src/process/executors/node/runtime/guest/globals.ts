@@ -3017,18 +3017,10 @@ globalThis.queueMicrotask = queueMicrotaskImpl;
 globalThis.TextEncoder = nodeUtil.TextEncoder;
 globalThis.TextDecoder = nodeUtil.TextDecoder;
 globalThis.Blob = requireBuiltin('buffer').Blob;
-globalThis.File = (function () {
-  class File extends globalThis.Blob {
-    constructor(bits, name, options) {
-      super(bits, options);
-      if (arguments.length < 2) throw new TypeError('The "fileName" argument must be specified');
-      this.name = String(name);
-      this.lastModified = options && options.lastModified !== undefined ? Number(options.lastModified) : Date.now();
-    }
-  }
-  Object.defineProperty(File.prototype, Symbol.toStringTag, { value: 'File', configurable: true });
-  return File;
-})();
+/* One class seen from either side, as on the host: the File require('buffer') hands out and the
+   global are the same constructor, and the name and the date a File carries are its prototype's,
+   not fields written onto each one -- which is what leaves Object.keys empty on both. */
+globalThis.File = nodeBuffer.File;
 globalThis.URL = typeof nodeUrl.URL === 'function' ? urlGlobalOf(nodeUrl) : nodeUrl.URL;
 globalThis.URLSearchParams = nodeUrl.URLSearchParams;
 /*
