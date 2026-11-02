@@ -1,0 +1,88 @@
+owc-fs-watch-recursive-option-ignored resolved 1793607012289-7377-f1b700836b0a4747 2026-11-02T17:10:00.000Z
+Row: owc-fs-watch-recursive-option-ignored
+Witness: 1793607012289-7377-f1b700836b0a4747
+Status: resolved
+
+fs: a watch asked for recursive descends the tree it was given
+
+Measured on an export of origin/main, not the shared working tree: git archive of
+5818e646ab473ea858786bc5e3e1b20192888b36 into /tmp/lane-watch42/src2, pnpm install
+--offline, pnpm build in packages/core. Host node v24.15.0 on the other side, one fresh
+OpenWebContainer boot per case per run, stdout, stderr and exit code compared, load and
+free memory printed with every measurement.
+
+BEFORE, at the tip
+
+  w7 -- the row's own window with the tree settled before the watch is made: a rename
+  inside dir/sub (old.txt to new.txt), a new name inside it (other.txt) and a new name
+  in dir itself (top.txt), over 1.6 s -- the host answers
+  rename:sub/old.txt | rename:sub/new.txt | rename:sub/other.txt | rename:top.txt and
+  the container answers rename:top.txt: one of four, the one name in dir itself.
+
+  w2 -- the same over 0.7 s, the rename and the subdirectory write alone -- host three,
+  container none. w3 -- a new name three levels down, sub/a/b/f.txt -- host one,
+  container none. w1 -- the row's window with the watch made the moment the tree is
+  there -- host six of which four are the four above, container one.
+
+  So yes: recursive was accepted and the tree was never descended into.
+
+AFTER
+
+  w7 answers rename:sub/old.txt | rename:sub/new.txt | rename:sub/other.txt |
+  rename:top.txt -- four of four, the host's own types, names and order, byte-identical
+  on stdout, stderr and exit code -- at load 30.47 with 2.15 GB free and at load 35.31
+  with 4.68 GB free, the two memory points of the witness, and on three consecutive
+  boots on each side. w2 answers the host's three and w3 the host's one, likewise.
+
+  w4 -- a NON-recursive watch of a directory with a write inside a subdirectory of it --
+  still answers nothing on either side, and w8 -- a non-recursive watch with a new name
+  in the directory and one inside a subdirectory of it -- still answers rename:t.txt on
+  both: a watch that did not ask for the tree still watches one directory of it.
+  w6 -- a recursive watch over two new names in the directory itself -- answers
+  rename:top.txt | rename:sub2 on both, as it did before.
+
+  fs-sweep -- 53 lines over the open-flag, FileHandle, sparse, symlink and copyFile
+  surfaces, a 64 MiB hole among them -- answers 51 agreeing with the host before the
+  fix and 51 after, the same two lines disagreeing on both sides (an O_SYMLINK open of
+  a link, EPERM on the host and the link's bytes here, and a copyFile of a directory,
+  ENOTSUP there and a TypeError here). No line that agreed with the host before the
+  fix disagrees after it: of the nine comparable lines the eight watch cases carry,
+  three moved -- w2, w3 and w7 -- and none moved the wrong way.
+
+  One line still disagrees and is left: w5, a watch of a file renamed away, where the
+  host names the new name and the container the one it was given. That is the recorded
+  rename-name gap the line before this one records, and it is a file watch, not a
+  recursive one.
+
+KNOWN LIMIT, and why it is left
+
+  In w1 -- the row's window with the watch made the moment the tree is there -- the
+  host answers six and the container four. The two the container does not answer are
+  FSEvents replaying the creations made before the watcher existed (rename:sub and one
+  rename:sub/old.txt) and its doubling of a second one; the container's poll takes its
+  first snapshot when the watcher is made, so the tree it is handed is already there
+  and there is nothing before the watch for it to report. The same leakage is the
+  leading change:<the directory itself> the non-recursive line above records. With the
+  tree settled first (w7) the two agree exactly, which is the measurement above.
+
+CHANGED
+
+  packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts
+
+  fs.watch reads recursive out of the options it was handed -- the boolean true and
+  nothing else, as on a host -- and hands it to the watcher. watchSnapshotOf walks the
+  whole tree under the directory when it is set, into one flat table keyed by the path
+  relative to the directory watched, so a listener is named sub/old.txt and not
+  old.txt; a directory's own entry in that table is its type alone, so the names below
+  it are the change and the mtime a directory carries away from them is not a second
+  one. watchEmitDiff names every event of such a watch rename, because FSEvents does
+  not tell a name whose bytes moved from one that appeared, and names the name that is
+  no longer there before the one that came -- the order a host reports a rename in. The
+  walk stops 64 levels down, which is what keeps a link naming a directory above it
+  from walking round forever.
+
+PUBLISHED
+
+  built on origin/main with a temporary index and pushed by sha; the sha is in the
+  commit this record rides in. Local main was not reset and the diverged local lineage
+  was not pushed.

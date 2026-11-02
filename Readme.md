@@ -807,6 +807,21 @@ diffing stdout, stderr and the exit code. Where the two cannot agree, the reason
   is already there `rename` where this container names it `change`, and reports that event twice
   (`change:s10dir|rename:e.txt|rename:e.txt` against `change:e.txt`); the two agree on a brand new
   name and on a name that is removed, apart from that leading change and the doubling.
+- **A `fs.watch` given `{ recursive: true }` descends the whole tree under the directory, as host node
+  v24.15.0 on macOS does.** With `fs.watch('dir', { recursive: true })` and, over 1.6 s, a rename inside
+  `dir/sub` (`old.txt` to `new.txt`), a new name inside it (`other.txt`) and a new name in `dir` itself
+  (`top.txt`), this container reports `rename:sub/old.txt`, `rename:sub/new.txt`, `rename:sub/other.txt`
+  and `rename:top.txt` -- four of four, and the host's own types, names and order -- where it reported
+  `rename:top.txt` alone: `recursive` was read for the interval standing beside it and never for the
+  walk, so a watch that asked for the tree watched one directory of it. Only the boolean `true` is
+  recursive, as on a host, so a `recursive: 1`, a `recursive: 'true'` and a watch that never named it
+  all watch one level and the two cases above keep the behaviour they have. Fixed in
+  `packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts`: `watchSnapshotOf` walks the
+  tree into one flat table keyed by the path relative to the directory watched -- `sub/old.txt`, never
+  `old.txt`, which is the name a host hands a listener -- a directory's own entry in it is its type and
+  nothing else, so the names below it are the change and the directory's mtime moving with them is not
+  a second one, and `watchEmitDiff` names every event of such a watch `rename`, because FSEvents does
+  not tell a name whose bytes moved from one that appeared.
 
 ### ⚠️ `node` with no arguments: the REPL, and where it differs from host node
 

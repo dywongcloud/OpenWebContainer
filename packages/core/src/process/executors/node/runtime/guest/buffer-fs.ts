@@ -3655,6 +3655,10 @@ BF.fs = function () {
   var WATCH_FILE_INTERVAL_MS = 5007;
   var WATCH_FILES = {};
   var EMPTY_STAT = { type: 'file', size: 0, mtimeMs: 0 };
+  /* How deep a 'recursive: true' watch descends. The cap is what stops a link naming a directory
+     above it from walking round forever: a host's watcher stops at the mount it meets, and this one
+     stops at the depth. */
+  var WATCH_RECURSE_DEPTH = 64;
 
   function watchIntervalOf(opts, fallback) {
     var options = typeof opts === 'object' && opts !== null ? opts : {};
@@ -3672,13 +3676,14 @@ BF.fs = function () {
    * A watcher is an EventEmitter named FSWatcher with the close, ref and unref Node's own carries --
    * which is all a package reads of one. A host does not export the class on fs, so neither does this.
    */
-  function FSWatcher(target) {
+  function FSWatcher(target, recursive) {
     if (WATCH_EMITTER) WATCH_EMITTER.call(this);
     this._owcTarget = target;
+    this._owcRecursive = !!recursive;
     this._owcTimer = null;
     this._owcClosed = false;
     this._owcAsync = null;
-    this._owcLast = watchSnapshotOf(target);
+    this._owcLast = watchSnapshotOf(target, this._owcRecursive);
   }
   if (WATCH_EMITTER) {
     FSWatcher.prototype = Object.create(WATCH_EMITTER.prototype);
@@ -3690,7 +3695,7 @@ BF.fs = function () {
     self._owcTimer = setTimeout(function tick() {
       if (self._owcClosed) return;
       self._owcTimer = setTimeout(tick, interval);
-      var now = watchSnapshotOf(self._owcTarget);
+      var now = watchSnapshotOf(self._owcTarget, self._owcRecursive);
       if (watchSignatureOf(self._owcLast) !== watchSignatureOf(now)) watchEmitDiff(self, self._owcLast, now);
       self._owcLast = now;
     }, interval);
@@ -3712,17 +3717,52 @@ BF.fs = function () {
   /* What a watched path looks like, as something two polls can be told apart by. The mode is part of
      the signature because a host reports a chmod as a change: the bytes did not move, but the name
      did, and a watcher that waited for a write alone stayed silent through one. */
-  function watchSnapshotOf(file) {
+  function watchSnapshotOf(file, recursive) {
     var st = statFollowingLinks(file);
     if (!st) return null;
     if (st.type !== 'dir') return { dir: false, sig: st.size + '/' + st.mtimeMs + '/' + modeBitsOf(st), names: null, sigs: null };
-    var names = sortedEntries(file);
     var sigs = {};
-    for (var i = 0; i < names.length; i++) {
-      var child = statFollowingLinks(P.join(file, names[i]));
-      sigs[names[i]] = child ? child.type + '/' + child.size + '/' + child.mtimeMs + '/' + modeBitsOf(child) : '-';
+    var names;
+    if (recursive) {
+      /*
+       * A 'recursive: true' watch asks for the whole tree under the directory, so the snapshot is
+       * one entry for every name under it, keyed by the path relative to it -- sub/old.txt, never
+       * old.txt -- which is the shape a host hands a listener. A directory's own entry is its type
+       * and nothing else: what a host reports is the name that appeared or moved below it, and a
+       * directory whose mtime moved with that name alone is not a second change.
+       */
+      watchTreeInto(file, '', sigs, WATCH_RECURSE_DEPTH);
+      names = Object.keys(sigs).sort();
+    } else {
+      names = sortedEntries(file);
+      for (var i = 0; i < names.length; i++) {
+        var child = statFollowingLinks(P.join(file, names[i]));
+        sigs[names[i]] = child ? child.type + '/' + child.size + '/' + child.mtimeMs + '/' + modeBitsOf(child) : '-';
+      }
     }
     return { dir: true, sig: null, names: names, sigs: sigs };
+  }
+
+  /*
+   * Every name under a directory, walked depth first. A name that goes away between the stat that
+   * found it and the listing that reads it is '-', and a directory the walk cannot list is left as
+   * the type it was found to be: the poll after this one sees the tree as it is then.
+   */
+  function watchTreeInto(dir, prefix, sigs, depth) {
+    var names;
+    try { names = sortedEntries(dir); } catch (e) { return; }
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      var rel = prefix === '' ? name : prefix + '/' + name;
+      var child = statFollowingLinks(P.join(dir, name));
+      if (!child) { sigs[rel] = '-'; continue; }
+      if (child.type === 'dir') {
+        sigs[rel] = 'dir';
+        if (depth > 0) watchTreeInto(P.join(dir, name), rel, sigs, depth - 1);
+        continue;
+      }
+      sigs[rel] = child.type + '/' + child.size + '/' + child.mtimeMs + '/' + modeBitsOf(child);
+    }
   }
 
   function watchSignatureOf(snap) {
@@ -3740,18 +3780,32 @@ BF.fs = function () {
    * handed, and the filename, never the path it watched, is the second.
    */
   function watchEmitDiff(w, before, after) {
+    /* A recursive watch on a host is FSEvents, which does not tell a name whose bytes moved from a
+       name that appeared, so node names both 'rename'; a poll here can tell them apart, and names
+       them the host's own word when the watch was made with 'recursive: true'. */
+    var moved = w._owcRecursive ? 'rename' : 'change';
     if (!before || !after) { w.emit('change', 'rename', P.basename(w._owcTarget)); return; }
     if (!before.dir) { w.emit('change', 'change', P.basename(w._owcTarget)); return; }
     var i;
     var name;
+    if (moved === 'rename') {
+      /* The name that is no longer there goes first: a rename inside the tree is a name that went
+         and a name that came, and a host reports them in that order. */
+      for (i = 0; i < before.names.length; i++) {
+        name = before.names[i];
+        if (after.sigs[name] === undefined) w.emit('change', 'rename', name);
+      }
+    }
     for (i = 0; i < after.names.length; i++) {
       name = after.names[i];
       if (before.sigs[name] === undefined) w.emit('change', 'rename', name);
-      else if (before.sigs[name] !== after.sigs[name]) w.emit('change', 'change', name);
+      else if (before.sigs[name] !== after.sigs[name]) w.emit('change', moved, name);
     }
-    for (i = 0; i < before.names.length; i++) {
-      name = before.names[i];
-      if (after.sigs[name] === undefined) w.emit('change', 'rename', name);
+    if (moved !== 'rename') {
+      for (i = 0; i < before.names.length; i++) {
+        name = before.names[i];
+        if (after.sigs[name] === undefined) w.emit('change', 'rename', name);
+      }
     }
   }
 
@@ -3766,7 +3820,12 @@ BF.fs = function () {
        makes was never reached at all. */
     if (!statFollowingLinks(toPathString(raw))) throw fsError('ENOENT', 'watch', raw);
     var cb = typeof opts === 'function' ? opts : (typeof listener === 'function' ? listener : undefined);
-    var watcher = new FSWatcher(toPathString(raw));
+    /* The recursive option is a directory's, and only the boolean true is it, as on a host: a
+       recursive of 1, a recursive of the string true and a watch that never named it all watch
+       one level. A recursive watch of a file is a watch of the file, because that is what a host
+       makes of it -- the option is one a directory's watcher reads. */
+    var watchOptions = typeof opts === 'object' && opts !== null ? opts : {};
+    var watcher = new FSWatcher(toPathString(raw), watchOptions.recursive === true);
     if (cb) watcher.on('change', cb);
     /* A host's watcher is one FSEVENTWRAP, and node reports it the moment the watcher is made --
        before the first poll, which is why the handle is opened here and not by start. It is null
