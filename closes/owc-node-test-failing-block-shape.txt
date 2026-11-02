@@ -1,0 +1,36 @@
+owc-node-test-failing-block-shape resolved 1793610150599-5112-72f5c4a58ec959b2 2026-11-02T09:09:16.000Z
+Row: owc-node-test-failing-block-shape
+Witness: 1793610150599-5112-72f5c4a58ec959b2
+
+Symptom
+  A failing test's block named the test where host node v24.15.0 prints the place the test was
+  registered -- "test at c2.js:3:1" -- and it stopped after the stack, where the host closes the
+  block with the error's own properties in braces: generatedMessage, code, actual, expected,
+  operator and diff.
+
+Cause
+  report printed each failure as the test's bare name above its mark and then the error's stack
+  alone; nothing kept the site the test was registered at, and nothing printed the properties an
+  error carries of its own.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/pure-b.ts
+    addTest keeps the site of the call that registered the test, read off a fresh Error's stack
+    and printed from the working directory as the host prints one; report opens each failure with
+    "test at <file>:<line>:<col>" and prints the error through errorText, which indents the stack
+    two spaces and closes it with the properties the error carries of its own -- name, message
+    and stack are an error's everywhere and are not printed -- with the diff an assertion carries
+    behind its operator. A value a test threw that is not an Error stays quoted, as on the host.
+  Pushed as 8f09d5105b6cf7627f2654ef286506f1dbca393a, built on
+  73c49647eac8290661d4211bd49a1bd510a6f023.
+
+Witness
+  dispatch 1793610150599-5112-72f5c4a58ec959b2, session verify-owc-node-test-failing-block-shape: c2.js on one fresh container
+  boot against host node v24.15.0, "c2.js agree=True exit host=1 container=1" -- the block opens
+  with "test at c2.js:3:1" and closes with the property dump on both sides. c2/c3/c4 agree at two
+  memory points (0.14 GB free at load 18.70, 0.16 GB at load 16.51), and 17 of 17 cases of the
+  test-runner sweep agree, where 2 of 12 did before.
+
+Readme
+  "## node:test: a failing test's block is the host's", added to Readme.md in the pushed tree
+  with this record.
