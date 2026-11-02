@@ -1,0 +1,51 @@
+owc-buffer-from-report-sentence-and-banner resolved 1793607878587-7724-a9f65ccf09460e8f 2026-11-02T08:31:43.000Z
+Row: owc-buffer-from-report-sentence-and-banner
+Witness: 1793607878587-7724-a9f65ccf09460e8f
+Status: resolved
+
+Symptom
+  `Buffer.from(1)` writes a sentence that stops half way: `The first argument must be of type string
+  or an instance of Buffer, ArrayBuffer, or Array` -- no `or an Array-like Object` behind it and no
+  `Received type number (1)` clause at all -- where host node 24.15 writes the whole of `The first
+  argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like
+  Object. Received type number (1)`. Measured on a fresh export of origin/main
+  a611a6863ab6125c648702910cd0a7bd5a595123 against host node v24.15.0, one fresh container boot per
+  case, stdout + stderr + exit code on both sides, at two memory points (load 37.32 with 2.6 GB free,
+  load 31.28 with 3.1 GB free): all ten bad-argument cases -- `1`, `true`, `null`, `{}`,
+  `Symbol('s')`, `function () {}`, a named function, `1n`, `undefined` and `new Number(1)` -- are the
+  same report as the host's on both sides except for that one line. The rest of the report agreed
+  before the fix and agrees after it: the banner is `node:buffer:362` over
+  `  throw new ERR_INVALID_ARG_TYPE(` with the caret under the `throw`, the frames are
+  `at Buffer.from (node:buffer:362:9)` and the loader's, `code: 'ERR_INVALID_ARG_TYPE'` stands in
+  braces behind the last of them and the trailer is `Node.js v24.15.0`. So the half of the row that
+  named the caret block does not reproduce at this tip: that block names node's own line, byte for
+  byte the host's, for a CommonJS entry and for an ES module's, and it did before this fix. What is
+  left is the sentence.
+
+Cause
+  buffer-fs.ts wrote the refusal with the first half of node's sentence and nothing behind it. Node
+  builds the whole line in internal/errors.js, at the one `E('ERR_INVALID_ARG_TYPE', ...)` it
+  registers: the kinds the argument may be are joined with `or` -- `... or an instance of Buffer,
+  ArrayBuffer, or Array or an Array-like Object` -- and `determineSpecificType(actual)` is appended
+  behind `. Received `. The container wrote the list of kinds by hand and stopped at `or an Array`,
+  and never wrote a Received clause, while the buffer module's own `describeArg` already answered
+  every shape node names -- `type number (1)`, `null`, `an instance of Object`, `function named` and
+  `function ` for one with no name, `type symbol (Symbol(s))`, `type bigint (1n)` and `undefined`.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts
+    Buffer.from -- the refusal carries node's whole sentence and, behind it, the Received clause
+    `describeArg` writes for the value it was given. Nothing else moves: the error keeps
+    `ERR_INVALID_ARG_TYPE`, the site the report is attributed to is still `node:buffer:362:9`, and the
+    banner, the frames, the coded property behind them and the trailer are the ones they were.
+
+Witness
+  dispatch 1793607878587-7724-a9f65ccf09460e8f, session verify-bufrep42, on a fresh export of origin/main (git archive,
+  pnpm install, pnpm build in packages/core), host node v24.15.0 on the other side, one fresh
+  container boot per run, stdout + stderr + exit code compared, the whole sweep -- 12 `Buffer.from`
+  cases, the 8 coded-error cases, the 8 script-failure cases, the 3 caught-error probes and the 8
+  stack cases -- run at two memory points:  The cases that still differ -- `Buffer.from` reached
+  through `.call` or `.apply` (host names that frame `at from` and the guest `at Buffer.from`), an ES
+  module's caret column over an internal site, a caught error's own `stack`, which carries no
+  `[<code>]` here, a run whose frames pass node's stackTraceLimit of 10, and the engine-error and
+  loader cases -- differ by the same margin they did before, and none is this row's.

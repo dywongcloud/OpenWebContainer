@@ -68,9 +68,15 @@ BF.buffer = function () {
     }
     if (value && value.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
     /* The code host node's own error carries: an argument of no type Buffer.from takes is
-       ERR_INVALID_ARG_TYPE there, which is what puts it in the line the report opens with. */
+       ERR_INVALID_ARG_TYPE there, which is what puts it in the line the report opens with. The
+       sentence is node's whole one and not the half of it that stopped at 'or an Array': the kinds
+       a first argument may be end 'or Array or an Array-like Object', and node names what it was
+       given behind a 'Received' clause -- 'type number (1)', 'null', 'an instance of Object',
+       'function named', 'type symbol (Symbol(s))', 'type bigint (1n)' and 'undefined' among them.
+       Measured against host node 24.15 for a number, a boolean, a null, an object, a symbol, an
+       anonymous and a named function, a bigint and an undefined. */
     throw internalSiteOf(
-      bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array'),
+      bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received ' + describeArg(value)),
       [['Buffer.from', 'node:buffer', 362, 9]]);
   };
 
