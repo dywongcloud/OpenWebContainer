@@ -1,0 +1,53 @@
+owc-net-connect-stack-apply-native resolved 1793619999280-6379-6b5aef1f6f89e47b 2026-11-02T10:06:39.000Z
+Row: owc-net-connect-stack-apply-native
+Witness: 1793619999280-6379-6b5aef1f6f89e47b
+Status: resolved
+
+Symptom
+  A caught RangeError from require('net').connect({ port: 'x' }) named one native frame where host
+  node v24.15.0 names three of its own:
+
+    host   RangeError [ERR_SOCKET_BAD_PORT]: Port should be >= 0 and < 65536. Received type string ('x').
+             at lookupAndConnect (node:net:1389:5)
+             at Socket.connect (node:net:1344:5)
+             at Object.connect (node:net:249:17)
+             at Object.<anonymous> (/app/main.js:3:7)
+    guest  RangeError [ERR_SOCKET_BAD_PORT]: Port should be >= 0 and < 65536. Received type string ('x').
+             at apply (native)
+             at Object.<anonymous> (/app/main.js:3:7)
+
+  Host node also stops the stack at ten frames -- three of them its own -- where the container
+  carried eleven, and it ends the process: the container's kept the socket's target and never
+  exited at all.
+
+Cause
+  packages/core/src/process/executors/node/runtime/guest/modules/net.ts -- netPortOf threw the bare
+  netError, the way it does for a dgram bind and a server listen, so a connect's refusal carried no
+  frame of node's own and, because netConnect reaches Socket.prototype.connect through '.apply', the
+  one frame it did carry was the native one node never names. The socket had already made the target
+  its connect needs before the port was read, and nothing closed it when the port was refused.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/net.ts
+    netSiteOf -- the frames node's own source would have thrown from, put in front of the frames of
+      the program, with the native '.apply' frame taken out and the whole stack held to the caller's
+      stackTraceLimit, because node's own frames are inside that count and not behind it.
+    netConnectSites -- 'at lookupAndConnect (node:net:1389:5)' and 'at Socket.connect
+      (node:net:1344:5)', plus 'at Object.connect (node:net:249:17)' only while the module's own
+      connect export is the caller, which is the shape host node prints for net.connect(...) and not
+      for new Socket().connect(...).
+    netConnect -- a connect refused before it began destroys the socket it made, so the process ends
+      as host node's does. A dgram bind, a server listen and every other caller of netPortOf ask for
+      no sites and are the errors they were.
+
+Witness
+  dispatch 1793619999280-6379-6b5aef1f6f89e47b, session verify-stackcode42b, on a fresh git-archive
+  export of origin/main built under /tmp/owc-stackcode42b, host node v24.15.0 on the other side, one
+  fresh container boot per case, stdout + stderr + exit code compared at two memory points.
+  Fourteen cases: eleven agree with host node v24.15.0 and three differ. net-badport-stack agrees
+  after the fix and disagreed before it, and the ten that agreed before -- a stackTraceLimit of
+  three, a plain throw, a CommonJS frame, a caught Buffer.from, an uncaught one, Buffer.alloc's two
+  refusals, an ENOENT caught and uncaught and an error a program coded itself -- still agree. The
+  three that differ are the ones that differed before, by the margin they did: errnet's report
+  banner (its own row), a subclassed Error's extra frame (its own row) and a message getter that
+  throws (its own row).

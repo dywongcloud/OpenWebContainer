@@ -173,15 +173,54 @@ function netFamilyName(address) {
 /* 'positive' is a dgram connect's own reading of a port: host Node 24.15 refuses 0 there --
    'Port should be > 0 and < 65536. Received type number (0)' -- where a bind takes 0 as the
    ephemeral port, and the message carries '> 0' rather than '>= 0'. */
-function netPortOf(value, listen, positive) {
+/* The frames host node gives an error a connect raised: the three of node's own -- 'at
+   lookupAndConnect (node:net:1389:5)', 'at Socket.connect (node:net:1344:5)' and, when the module's
+   own connect export is the caller, 'at Object.connect (node:net:249:17)' -- in front of the frames
+   of the program. A connect reached through '.apply' carries a native frame for it that node never
+   names, so that one goes out first. */
+function netSiteOf(err, sites) {
+  var stack = typeof err.stack === 'string' ? err.stack : '';
+  var cut = stack.indexOf('\n');
+  var head = cut < 0 ? stack : stack.slice(0, cut);
+  var rest = cut < 0 ? '' : stack.slice(cut + 1);
+  var tail = rest === '' ? [] : rest.split('\n');
+  while (tail.length > 0 && /^ {4}at (?:call|apply) \(native\)$/.test(tail[0])) tail.shift();
+  var frames = [];
+  for (var i = 0; i < sites.length; i++) {
+    frames.push('    at ' + sites[i][0] + ' (' + sites[i][1] + ':' + sites[i][2] + ':' + sites[i][3] + ')');
+  }
+  /* Node's own frames are inside the count the caller's stackTraceLimit allows, not added behind it:
+     host node's stack of this error stops at ten frames, the three of them its own, where a stack
+     that had eight frames of the program's would carry eleven here. */
+  var limit = typeof Error.stackTraceLimit === 'number' ? Error.stackTraceLimit : 10;
+  var all = frames.concat(tail);
+  if (all.length > limit) all = all.slice(0, limit);
+  try { err.stack = [head].concat(all).join('\n'); } catch (e) { }
+  return err;
+}
+
+/* True while the module's own connect export is the call a socket's connect was reached through,
+   which is the whole of the difference host node makes between the two shapes: 'net.connect(...)'
+   names the export in a third frame and 'new Socket().connect(...)' does not. */
+var NET_FROM_CONNECT_EXPORT = false;
+
+function netConnectSites() {
+  var sites = [['lookupAndConnect', 'node:net', 1389, 5], ['Socket.connect', 'node:net', 1344, 5]];
+  if (NET_FROM_CONNECT_EXPORT) sites.push(['Object.connect', 'node:net', 249, 17]);
+  return sites;
+}
+
+function netPortOf(value, listen, positive, sites) {
   var port = typeof value === 'string' && value !== '' ? Number(value) : value;
   if (typeof port !== 'number' || !Number.isInteger(port) || port < (positive ? 1 : 0) || port > 65535) {
     /* A server's own refusal names the option it was given, where every other caller -- a connect,
        a dgram bind -- names the port itself: 'options.port should be >= 0 and < 65536. Received
        type string ('')' against 'Port should be >= 0 and < 65536. Received type number (70000).' */
-    throw netError(RangeError, 'ERR_SOCKET_BAD_PORT',
+    var badPort = netError(RangeError, 'ERR_SOCKET_BAD_PORT',
       (listen ? 'options.port' : 'Port') + ' should be ' + (positive ? '> 0' : '>= 0')
       + ' and < 65536. Received ' + netDescribe(value) + '.');
+    if (sites) throw netSiteOf(badPort, sites);
+    throw badPort;
   }
   return port;
 }
@@ -949,7 +988,7 @@ BF['net'] = function () {
       this._owcAsync = asyncOpenResource('TCPWRAP', this);
       /* net.client.socket: the TCP socket a dial is about to be made on, once per connect. */
       dcPublish('net.client.socket', { socket: this });
-      var port = netPortOf(args.port);
+      var port = netPortOf(args.port, false, false, netConnectSites());
       var self = this;
       /* A name with two addresses is tried on both, as Node's happy-eyeballs does: only the caller's
          own lookup changes that, since it is the caller who says which addresses a name has. */
@@ -2623,7 +2662,17 @@ BF['net'] = function () {
   function netConnect() {
     var first = arguments[0];
     var socket = new Socket(first !== null && typeof first === 'object' ? first : undefined);
-    return socket.connect.apply(socket, arguments);
+    NET_FROM_CONNECT_EXPORT = true;
+    try {
+      return socket.connect.apply(socket, arguments);
+    } catch (thrown) {
+      /* A socket whose connect was refused before it began still holds the target it made for it, and
+         a process that holds one never ends: host node refuses the port before any of that exists. */
+      try { socket.destroy(); } catch (ignored) { /* nothing left to close */ }
+      throw thrown;
+    } finally {
+      NET_FROM_CONNECT_EXPORT = false;
+    }
   }
 
   return {
