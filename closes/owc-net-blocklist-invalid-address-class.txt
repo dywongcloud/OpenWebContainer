@@ -1,0 +1,46 @@
+owc-net-blocklist-invalid-address-class resolved witness-eca13a4bedd3a4f8 2026-11-02T05:12:00Z
+
+Symptom
+  For addSubnet('::1', 128), addSubnet('nope', 8), addAddress('nope'),
+  addRange('nope', 'nope2') and addSubnet('1.2.3.4', 24, 'ipv6'), host node
+  v24.15.0 raises [name=Error, code=ERR_INVALID_ADDRESS, message='Invalid
+  socket address'] and the container raised [name=TypeError, ...] -- the code
+  and the message already agreed and only the class differed, so
+  `err instanceof TypeError` was false on the host and true here. The two
+  neighbouring shapes agreed throughout: a bad family is a TypeError with
+  ERR_INVALID_ARG_VALUE and an out-of-range prefix a RangeError with
+  ERR_OUT_OF_RANGE on both.
+  Fixed as 48cfe0b2cdf592223aac7abb132648f17d0b312c, parent origin/main
+  89804194c0fb072f8a4e1471e41e0a6f8c3cc223.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/net.ts: the
+  four ERR_INVALID_ADDRESS sites -- BlockList.addAddress, BlockList.addRange,
+  BlockList.addSubnet and SocketAddress's own constructor -- now build the
+  error with the Error constructor instead of TypeError. The class is the only
+  thing that changes; the code and the message were already the host's. The
+  SocketAddress site is the same symptom in the same file and host node answers
+  Error there too, so it moved with the three the row names.
+
+Witness
+  witness-eca13a4bedd3a4f8, session lane-netos41, output
+  /tmp/owc-netos41/run/witness-net.report (sha256 eca13a4bedd3a4f8a2de25572e
+  9f0ef5b9dca2f22dc3f74ed6b1598a0a0ae2ac).
+
+  Measured from a git archive export of origin/main tip 89804194, installed and
+  built under /tmp/owc-netos41/export, never the shared working tree, which is
+  441 commits behind. Re-measured after the push against tip
+  0dc08daacfab3d9d263e317f184518d52ead0b43 with the published net.ts byte-identical
+  to the copy measured (sha256 c061ee2cf5125ab4acf76782e31f6d682e460343fb62c0b
+  8a1744c4b90225f9c). One fresh container boot per run, host node v24.15.0 on
+  the other side, stdout + stderr + exit code compared together at two memory
+  points (no ballast, and 512 MB of live ballast): 49 cases covering addAddress,
+  addSubnet, addRange, check, rules, toJSON, eleven isIP/isIPv4/isIPv6 samples,
+  BlockList.prototype and every bad argument.
+  ACCEPT both memory points: host stdout e2fcc9c28e0adaddc03ca28623d58401c3cbb36
+  ce87661510a051352f5255ddd == guest stdout, stderr empty and exit 0 on both.
+  Before the fix 6 of the 49 cases differ, every one of them only in this class.
+  The 12-step net sweep -- unix-path listen and connect, second bind EADDRINUSE,
+  an over-long path EINVAL, a connect to an unbound path ENOENT, dgram
+  bind/send/message, connect, autobind and disconnect after close, RST destroy
+  and a plain TCP echo -- is byte-identical before and after.
