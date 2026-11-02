@@ -1,4 +1,4 @@
-owc-crypto-publicexponent-not-bigint stale 1793611022077-0-76a8928c26fc6e20 2026-11-02T18:17:00Z
+owc-crypto-publicexponent-not-bigint stale 1793611394403-5018-975896cc1deceae8 2026-11-02T09:23:29Z
 
 Symptom
   publicKey.asymmetricKeyDetails.publicExponent comes back as a decimal string
@@ -27,7 +27,7 @@ Refutation
   sweeps before and after are the same sweep.
 
 Witness
-  dispatch 1793611022077-0-76a8928c26fc6e20, session verify-pubexp42, at
+  dispatch 1793611394403-5018-975896cc1deceae8, session verify-pubexp42, at
   origin/main fb1b8b5 (published commit's parent): one fresh container boot for
   probe-all.js (5 key types x 12 entry points plus X509 field, legacy object and
   verify dumps for rsa, ec and ed25519 certificates) and one for probe4.js
