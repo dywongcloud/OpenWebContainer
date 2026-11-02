@@ -1,0 +1,50 @@
+owc-trace-events-createtracing-no-validation resolved witness-67e7298096294092 2026-11-02T05:00:00Z
+
+Symptom
+  `trace_events.createTracing()` with no argument returned a tracing object in the
+  container -- `Object.keys` of it `["categories","enabled"]`, its `categories` the
+  empty string -- where host node v24.15.0 raises `TypeError: The "options"
+  argument must be of type object. Received undefined`, and
+  `createTracing({ categories: [] })` returned one too where the host raises
+  `TypeError: At least one category is required`. Everything else on the module
+  agreed: the export keys, the category list, `enable()`, `disable()` and
+  `enabled`. Readme.md recorded `node:trace_events` only as a module that once
+  did not resolve.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/pure-b.ts:
+  `createTracing` now validates what it is handed in node's own order -- an
+  options object, then an array, then an array of strings, then one that is not
+  empty -- and refuses it with the host's own `TypeError`, message and `code`:
+  `ERR_INVALID_ARG_TYPE` for the options object and for a `categories` that is
+  not an array or holds something that is not a string, and
+  `ERR_TRACE_EVENTS_CATEGORY_REQUIRED` for an array of no categories. The
+  message's `. Received ...` clause is node's own spelling of the value. The two
+  exports of the module, the joined category string, `enable()`, `disable()` and
+  a second `disable()` are unchanged.
+
+Witness
+  witness-67e7298096294092, session verify-owc-trace-events-createtracing-no-validation,
+  output /private/tmp/owc-trace41/witness-row1.out (sha256 67e7298096294092de025df0fdf
+  bcc46eef911a76132d6ddbe1c38cf42d72528).
+
+  Measured from a git archive export of origin/main tip 13900f733df6897cbc13b2d81a3f7f
+  84da70722e, installed and built under /private/tmp/owc-trace41/verify/export, never
+  the shared working tree, which is 441 commits behind and would revert over a
+  thousand published lines. Container dist sha256 3b67e46de08b86e5697d79c1366112a2
+  09102a7e7c5e2b44389574a91195de1e, host node v24.15.0 on the other side, one fresh
+  container boot per case, stdout + stderr + exit code compared, two memory points
+  (3.5 GB free and, with 4.5 GB of live ballast, 0.45 GB free; machine load 15).
+  Twelve cases -- `createTracing()` with no argument, `createTracing({})`,
+  `createTracing({ categories: [] })`, a non-array `categories`, `categories: [1]`,
+  `categories: ['node.async_hooks', true]`, one category, two, an unknown name,
+  `enable`, `disable` with a second `disable`, the module's export keys and
+  `getEnabledCategories` -- each run twice: five agreed with the host before the fix
+  and all twelve agree after it. A seven-case sweep of the other modules of the same
+  file -- `node:test`, `node:vm`, `node:repl`, `node:domain`, `node:inspector`,
+  `node:module`, and `node:sea` with `node:wasi` -- answers identically before the
+  fix and after it. One residual is not this row's: the *uncaught* form of either
+  throw now agrees on stdout and on exit code 1 and not on stderr, because this
+  runtime's uncaught reporter writes neither the `TypeError [ERR_INVALID_ARG_TYPE]:`
+  bracket nor the closing `code:` trailer that a host report carries, which it
+  withholds from a plain `TypeError` a program builds and throws itself too.
