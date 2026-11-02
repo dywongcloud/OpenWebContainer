@@ -3337,20 +3337,50 @@ globalThis.crypto = nodeCrypto.webcrypto;
       writable: true, configurable: true
     });
   }
-  AbortSignal.prototype.addEventListener = function addEventListener(type, fn) {
-    if (type === 'abort') STATE.get(this).listeners.push(fn);
-  };
-  AbortSignal.prototype.removeEventListener = function removeEventListener(type, fn) {
-    var st = STATE.get(this);
-    st.listeners = st.listeners.filter(function (l) { return l !== fn; });
-  };
+  /* Node declares addEventListener, removeEventListener and dispatchEvent on EventTarget and not on
+     AbortSignal: a signal is an EventTarget, so it inherits the three, "signal instanceof
+     EventTarget" is answered yes, and the own names of AbortSignal.prototype carry no listener
+     method of its own. web-events.ts installs the runtime's EventTarget later in the bootstrap than
+     this file runs, so the two prototypes are joined when the first signal is made, not here. */
+  var EVENT_TARGET_PROTO = null;
+  function joinEventTarget() {
+    if (EVENT_TARGET_PROTO === null && typeof globalThis.EventTarget === 'function') {
+      EVENT_TARGET_PROTO = globalThis.EventTarget.prototype;
+      Object.setPrototypeOf(AbortSignal.prototype, EVENT_TARGET_PROTO);
+    }
+    return EVENT_TARGET_PROTO;
+  }
   AbortSignal.prototype.throwIfAborted = function throwIfAborted() {
     var st = STATE.get(this);
     if (st.aborted) throw st.reason;
   };
+  /* onabort, the event handler attribute Node declares on AbortSignal.prototype: an enumerable,
+     configurable accessor that reads null until something is assigned to it. An assignment replaces
+     the handler already there instead of adding a second one, and null -- or anything that is not a
+     function -- clears it, because underneath the attribute is one listener for 'abort'. */
+  Object.defineProperty(AbortSignal.prototype, 'onabort', {
+    get: function () { return STATE.get(this).onabort; },
+    set: function (handler) {
+      var st = STATE.get(this);
+      if (st.onabort !== null) this.removeEventListener('abort', st.onabort);
+      st.onabort = typeof handler === 'function' ? handler : null;
+      if (st.onabort !== null) this.addEventListener('abort', st.onabort);
+    },
+    configurable: true,
+    enumerable: true
+  });
   function createSignal() {
-    var signal = Object.create(AbortSignal.prototype);
-    STATE.set(signal, { aborted: false, reason: undefined, listeners: [] });
+    joinEventTarget();
+    /* Listener bookkeeping lives in the EventTarget constructor, so a signal is made by it and then
+       made an AbortSignal; only if the runtime has no EventTarget at all does it fall back to a bare
+       object of the right prototype. */
+    var signal = typeof globalThis.EventTarget === 'function'
+      ? new globalThis.EventTarget()
+      : Object.create(AbortSignal.prototype);
+    if (Object.getPrototypeOf(signal) !== AbortSignal.prototype) {
+      Object.setPrototypeOf(signal, AbortSignal.prototype);
+    }
+    STATE.set(signal, { aborted: false, reason: undefined, onabort: null });
     return signal;
   }
   function abortSignal(signal, reason) {
@@ -3362,12 +3392,10 @@ globalThis.crypto = nodeCrypto.webcrypto;
       reason = new DOMException('This operation was aborted', 'AbortError');
     }
     st.reason = reason;
-    var listeners = st.listeners;
-    st.listeners = [];
-    /* The event an abort hands its listeners names the signal as its target, which is how the
-       reason reaches them: events.addAbortListener's listener reads ev.target.reason, and a host
-       answers 'Error: boom' there where a listener handed no event at all saw nothing. */
-    listeners.forEach(function (fn) { fn({ type: 'abort', target: signal }); });
+    /* The abort reaches its listeners as an event dispatched on the signal, which is what an
+       EventTarget hands a listener: ev.target is the signal, so the reason reads back off
+       ev.target.reason, and a listener -- or an onabort handler -- runs with the signal as 'this'. */
+    signal.dispatchEvent(new globalThis.Event('abort'));
   }
   AbortSignal.abort = function abort(reason) {
     var signal = createSignal();
@@ -3420,13 +3448,58 @@ globalThis.crypto = nodeCrypto.webcrypto;
     }, ms);
     return signal;
   };
+  /* How Node names the value it refused: null and undefined plainly, a primitive by its type, and
+     anything else as an instance of its constructor. */
+  function describeReceived(value) {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'string') return "type string ('" + value + "')";
+    if (typeof value !== 'object') return 'type ' + typeof value + ' (' + String(value) + ')';
+    var name = value.constructor === undefined || value.constructor === null ? '' : value.constructor.name;
+    return 'an instance of ' + (typeof name === 'string' && name !== '' ? name : 'Object');
+  }
+  /* A sequence<AbortSignal>: the argument has to be an object carrying an iterator -- a string or a
+     number is a primitive and cannot be converted to one -- and every element it yields has to be an
+     AbortSignal, so a bad element is named by the position it came from. */
+  function toSignalSequence(signals) {
+    if (signals === null || typeof signals !== 'object' || typeof signals[Symbol.iterator] !== 'function') {
+      throw new TypeError('signals can not be converted to sequence.');
+    }
+    var list = [];
+    var index = 0;
+    var iterator = signals[Symbol.iterator]();
+    var step = iterator.next();
+    while (!step.done) {
+      if (!(step.value instanceof AbortSignal)) {
+        throw new TypeError('The "signals[' + index + ']" argument must be an instance of AbortSignal.'
+          + ' Received ' + describeReceived(step.value));
+      }
+      list.push(step.value);
+      index++;
+      step = iterator.next();
+    }
+    return list;
+  }
   AbortSignal.any = function any(signals) {
+    var sources = toSignalSequence(signals);
     var signal = createSignal();
-    Array.prototype.forEach.call(signals, function (source) {
-      source.addEventListener('abort', function () { abortSignal(signal, source.reason); });
-    });
+    for (var i = 0; i < sources.length; i++) {
+      if (followSource(sources[i], signal)) break;
+    }
     return signal;
   };
+  /* An input that was already aborted when it was handed over counts: the composite is born aborted,
+     carrying the reason of the first input in that state, and nothing is left listening to the ones
+     after it. A later input is followed with a listener instead, so an abort after the call still
+     reaches the composite. */
+  function followSource(source, signal) {
+    if (source.aborted) {
+      abortSignal(signal, source.reason);
+      return true;
+    }
+    source.addEventListener('abort', function () { abortSignal(signal, source.reason); });
+    return false;
+  }
   function AbortController() {
     CONTROLLER_SIGNAL.set(this, createSignal());
   }
