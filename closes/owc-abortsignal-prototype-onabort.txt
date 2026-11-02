@@ -1,0 +1,34 @@
+owc-abortsignal-prototype-onabort resolved lane-abort40-file-entry-sweep-74x2 2026-11-02T02:30:29.732Z
+
+Symptom
+  `Object.getOwnPropertyNames(AbortSignal.prototype)` was
+  `aborted,addEventListener,constructor,reason,removeEventListener,throwIfAborted` in the container
+  and `aborted,constructor,onabort,reason,throwIfAborted` on host node v24.15.0: `onabort` was
+  missing, so assigning `signal.onabort = fn` never ran anything, and the two listener methods were
+  the prototype's own where a host inherits them from `EventTarget.prototype` -- which is also why
+  `signal instanceof EventTarget` was false and an abort listener's `this` was not the signal.
+
+Reproduction (at origin/main 2a62093, /tmp/lane-abort40/export)
+  Same 74-case run as the rows beside it. Before: proto-own-ael and proto-own-rel own descriptors
+  vs undefined; proto-own-onabort "none" vs get/set configurable enumerable; onabort-default
+  undefined vs null; onabort-fires 0 vs 1; onabort-reason "none" vs "Error: why"; onabort-replace
+  0,0 vs 0,1; instanceof-et false vs true; listener-this false vs true.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/globals.ts: AbortSignal.prototype is joined
+  to EventTarget.prototype (lazily, on the first signal, since web-events.ts installs the runtime's
+  EventTarget later in the bootstrap), a signal is made by that constructor and then made an
+  AbortSignal, and an abort dispatches a real 'abort' event on it -- so a listener runs with the
+  signal as `this` and reads the reason off `ev.target`. `onabort` is the accessor on the prototype:
+  null until assigned, replaced rather than added by the next assignment, cleared by null. The two
+  own listener methods are gone.
+
+Witness
+  After the fix `Object.getOwnPropertyNames(AbortSignal.prototype)` is host-identical, `onabort`
+  fires with the signal as `this` and an event whose target is the signal, `instanceof EventTarget`
+  is true, and the EventTarget surface measured beside it (dispatchEvent's return, cancelable and
+  non-cancelable preventDefault, CustomEvent detail, once, once+signal, removeEventListener,
+  listener this/currentTarget) is untouched. A cross-module pass over timers,
+  events.addAbortListener, stream addAbortSignal, fetch, http, AbortSignal.timeout and util.inspect
+  agrees with a host on both sides of the change, except fs's signal option, which ignored the
+  signal before and after. Published 796ab81c233f98753afe124639fb0f8451b50433.

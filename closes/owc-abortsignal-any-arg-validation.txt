@@ -1,0 +1,28 @@
+owc-abortsignal-any-arg-validation resolved lane-abort40-file-entry-sweep-74x2 2026-11-02T02:30:29.732Z
+
+Symptom
+  `AbortSignal.any([{}])` threw `TypeError: not a function` in the container where host node
+  v24.15.0 throws `TypeError: The "signals[0]" argument must be an instance of AbortSignal. Received
+  an instance of Object`, and `AbortSignal.any({})` returned a signal without throwing where a host
+  throws `TypeError: signals can not be converted to sequence.` Neither conversion node does before
+  it builds the signal was done at all.
+
+Reproduction (at origin/main 2a62093, /tmp/lane-abort40/export)
+  Same 74-case run as the row beside it. Before: any-elem-object "not a function"; any-elem-null
+  "cannot read property 'addEventListener' of null"; any-elem-second silent about signals[1];
+  any-noniterable and any-number NO THROW; any-noarg and any-null "cannot convert to object";
+  any-string "not a function". A host names signals[i] and what it received for every element, and
+  refuses a number, a string, null, undefined and an object without an iterator alike.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/globals.ts: `toSignalSequence()` refuses an
+  argument that is not an object carrying Symbol.iterator with "signals can not be converted to
+  sequence." and then names each element, so a bad one throws
+  `The "signals[i]" argument must be an instance of AbortSignal. Received ...` -- null and undefined
+  plainly, a primitive by its type, anything else as an instance of its constructor.
+  Readme.md now names AbortSignal.any.
+
+Witness
+  After the fix every one of those cases throws byte-identically to host node v24.15.0, and
+  `AbortSignal.any` over a Set and over a generator (iterables a host accepts) still works.
+  Published 796ab81c233f98753afe124639fb0f8451b50433.

@@ -1,0 +1,28 @@
+owc-abortsignal-any-already-aborted resolved lane-abort40-file-entry-sweep-74x2 2026-11-02T02:30:29.732Z
+
+Symptom
+  `AbortSignal.any([AbortSignal.abort()]).aborted` was `false` in the container and `true` on host
+  node v24.15.0, and `.reason` was `undefined` where a host hands the composite the reason of the
+  input that was already aborted. `any()` only ever followed inputs that aborted *after* the call,
+  so a signal aborted before it was handed over was treated as one still live.
+
+Reproduction (at origin/main 2a62093, /tmp/lane-abort40/export)
+  74 cases, one fresh container boot each, every case written to /app/<case>.js and run as a file
+  entry (an eval entry has no file to read, which is what made earlier attempts fail with ENOENT
+  '/app/[eval]'), the same source under host node v24.15.0 on the other side, stdout + stderr +
+  exit code compared at two memory points, a pass at the tip and a second holding 512 MB of ballast.
+  Before: any-abort-aborted false vs true; any-abort-reason undefined vs "Error: why";
+  any-abort-reason-dom undefined vs "AbortError: This operation was aborted"; any-controller-pre and
+  any-controller-pre-reason, any-two-second-pre ("true,Error: second"), any-nested and any-set the
+  same way. 34 of 74 cases differed.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/globals.ts: `any()` converts its argument
+  to a sequence of AbortSignal and then follows each input; an input that is already aborted aborts
+  the composite with that input's reason and stops the walk, so nothing is left listening to the
+  inputs after it. A later input is followed with a listener as before.
+
+Witness
+  After the fix the same 74 cases differ in 0 places, at both memory points, with no case drifting
+  between them; the post-construction abort path, the listener path, `AbortSignal.any([])` and the
+  whole `AbortSignal.timeout` ladder are unchanged. Published 796ab81c233f98753afe124639fb0f8451b50433.
