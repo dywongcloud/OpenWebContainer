@@ -2374,7 +2374,10 @@ BF['net'] = function () {
     return bytes.join('.');
   }
 
-  /* net.BlockList: address, range and subnet rules, each of one family; rules lists the newest first, as Node does */
+  /* net.BlockList: address, range and subnet rules, each of one family; rules lists the newest first,
+     as Node does. An address this family will not parse is ERR_INVALID_ADDRESS, which host Node 24.15
+     raises as a plain Error and not as a TypeError -- the neighbouring shapes are the ones that carry
+     a class: a bad family is a TypeError and a prefix outside the family's width a RangeError. */
   class BlockList {
     constructor() {
       netHide(this, '_rules', []);
@@ -2383,7 +2386,7 @@ BF['net'] = function () {
     addAddress(address, type) {
       var text = netBlockAddress(address, 'address');
       var parsed = netAddressOf(text, netBlockFamily(type));
-      if (parsed === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
+      if (parsed === null) throw netError(Error, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
       this._rules.push({ kind: 'Address', family: parsed.family, units: parsed.units, bits: parsed.bits, text: netTextOf(parsed) });
     }
 
@@ -2393,7 +2396,7 @@ BF['net'] = function () {
       var kind = netBlockFamily(type);
       var first = netAddressOf(firstText, kind);
       var last = netAddressOf(lastText, kind);
-      if (first === null || last === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
+      if (first === null || last === null) throw netError(Error, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
       if (netCompareUnits(first.units, last.units) > 0) {
         /* Node names the start it was handed as a SocketAddress, the way inspect prints one. */
         throw netError(TypeError, 'ERR_INVALID_ARG_VALUE',
@@ -2406,7 +2409,7 @@ BF['net'] = function () {
     addSubnet(network, prefix, type) {
       var text = netBlockAddress(network, 'network');
       var parsed = netAddressOf(text, netBlockFamily(type));
-      if (parsed === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
+      if (parsed === null) throw netError(Error, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
       netBlockPrefix(prefix, parsed.total);
       this._rules.push({ kind: 'Subnet', family: parsed.family, units: parsed.units, bits: parsed.bits, prefix: prefix, text: netTextOf(parsed) + '/' + prefix });
     }
@@ -2539,7 +2542,7 @@ BF['net'] = function () {
           'The "options.address" property must be of type string. Received ' + netDescribe(address));
       }
       var parsed = netAddressOf(address, family);
-      if (parsed === null) throw netError(TypeError, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
+      if (parsed === null) throw netError(Error, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
       /* The address a SocketAddress keeps is the one the kernel renders, not the one it was handed:
          lower case, its longest run of zero groups compressed, a v4-mapped one written in dotted
          IPv4 -- '2001:DB8::1' is kept as '2001:db8::1' and '::FFFF:7B7B:7B7B' as
