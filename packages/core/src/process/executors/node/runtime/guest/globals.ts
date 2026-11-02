@@ -1524,6 +1524,26 @@ function isBootstrapFrame(text) {
   return typeof text === 'string' && text.indexOf(BOOTSTRAP_MARK) >= 0;
 }
 
+/*
+ * Whether the error this stack was taken from was built by this container's own code and not by a
+ * program's: the first frame behind the wrapper's own is a frame of the bootstrap's. A program's
+ * error names a file of the program's there instead, and that is the one thing that tells the two
+ * apart later, which is what the code in brackets behind the name hangs on -- node wrote that code
+ * into the line as it built the error, so an error of its own carries 'TypeError [ERR_INVALID_ARG_TYPE]'
+ * while the name it answers is still the plain 'TypeError', and an error a program built and then
+ * gave a code of its own is reported by host node 24.15 as 'TypeError: boom' with 'code:' behind it.
+ */
+function raisedByContainer(stack, ownFrame) {
+  var lines = typeof stack === 'string' && stack !== '' ? stack.split('\n') : [];
+  var at = 0;
+  while (at < lines.length && (lines[at] === CONSTRUCT_FRAME || lines[at] === ownFrame)) at++;
+  if (at >= lines.length) return false;
+  if (isBootstrapFrame(lines[at])) return true;
+  /* A native call -- 'apply', a 'forEach' -- is one this container makes as readily as a program
+     does, so it is the frame behind it that says which of the two it was. */
+  return lines[at].indexOf('(native)') >= 0 && at + 1 < lines.length && isBootstrapFrame(lines[at + 1]);
+}
+
 /* The frame of a function with no name: host node writes the bare location and no name at all where
    this engine writes <anonymous> in front of it. One whose location is not a file -- an eval, a body
    new Function built -- is left as it stands, since a host names those after the eval that made them
@@ -1717,6 +1737,12 @@ function installStackHeader(name) {
       ownFrame = built.length > 1 ? built[1] : '';
     }
     installErrorStack(err, framesOfEngineStack(raw, ownFrame));
+    /* Asked here and kept on the error, because the frames the stack is rewritten into are the
+       frames a host names and hold nothing of the bootstrap's: once they are the only ones an
+       error has, nothing else can say whether it was this container that built it. */
+    Object.defineProperty(err, '__owcRaised', {
+      value: raisedByContainer(raw, ownFrame), writable: true, enumerable: false, configurable: true
+    });
     return err;
   }
   Shim.prototype = Native.prototype;
@@ -4822,7 +4848,7 @@ api.exitReport = function () {
   return '';
 };
 api.formatUncaught = function (err) {
-  if (err instanceof Error) return formatErrorStack(err);
+  if (err instanceof Error) return uncaughtReportOf(err);
   return inspectValue(err);
 };
 api.isExitSignal = function (value) {

@@ -1,0 +1,125 @@
+owc-error-code-line-missing resolved 1793604131165-6913-fe570513f8655ca9 2026-11-02T07:29:11.652Z
+Row: owc-error-code-line-missing
+Witness: 1793604131165-6913-fe570513f8655ca9
+Status: resolved
+
+Symptom
+  An uncaught error carrying a `code` printed without the `[CODE]` decoration on the line the report
+  opens with and without the `code:` trailer behind the frames, where host node 24.15 prints both.
+  Measured: `Buffer.from(1)` -- host writes "TypeError [ERR_INVALID_ARG_TYPE]: The first argument
+  must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object.
+  Received type number (1)" and then "  code: 'ERR_INVALID_ARG_TYPE'" in braces behind the last
+  frame; the container wrote "TypeError: The first argument must be of type string or an instance of
+  Buffer, ArrayBuffer, or Array" and nothing behind the frames at all. Proved with a plain TypeError
+  a program builds itself, so the reporter and not the error was at fault: `e.code = 'ERR_MY_OWN'`
+  on a `new Error('boom')` is `Error: boom` followed by "{\n  code: 'ERR_MY_OWN'\n}" on the host and
+  was `Error: boom` alone here.
+
+Cause
+  Two things the uncaught reporter never did, and one thing it could not know.
+  (1) `api.formatUncaught` (globals.ts) answered `formatErrorStack(err)` -- the report alone. The
+      properties behind it are what node's own handler adds, and it adds them by inspecting the
+      error: the report is the prefix and the own properties the report is not made of go behind it
+      in braces. Nothing here ever wrote that second half, so no error of any kind carried its
+      `code`, its `errno`, its `syscall` or its `path` into the report.
+  (2) `formatErrorStack` (util-assert.ts) built the opening line out of the name and the message
+      alone. Host node writes the code into that line as it builds the error -- an error of its own
+      carries 'TypeError [ERR_INVALID_ARG_TYPE]' in its stack while the name it answers is still the
+      plain 'TypeError' -- and this container's own errors are built the way a program builds them,
+      with the code assigned afterwards, so the line came out with the name alone.
+  (3) Which is also what makes (2) a thing the reporter has to be told: a program's own error with
+      a code of its own is reported by host node 24.15 as 'TypeError: boom', with no brackets, so
+      the decoration cannot be written for every error that carries a code. Whether the container
+      or the program built the error is not something the report can ask of the error afterwards --
+      the frames of the bootstrap's are gone from the stack by then -- so it is asked where the
+      frames still name their author, at the moment the error is built, and kept on it.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/util-assert.ts
+    uncaughtReportOf -- what node writes for an uncaught error: the whole of what 'util.inspect'
+    writes for the value, the report and the properties behind it, and not the report alone.
+    formatErrorStack -- the opening line carries '[<code>]' behind the name when the error is one
+    this container raised with one of node's own codes, the 'ERR_...' ones; the 'ENOENT' and 'EBADF'
+    of a file that would not open belong to another class of error of node's and still print with no
+    brackets, as they do there. The header the stack itself opens with is dropped in front of it the
+    way it already was for a subclass, so the line is written once and not twice.
+  packages/core/src/process/executors/node/runtime/guest/globals.ts
+    raisedByContainer -- whether the first frame behind the wrapper's own is a frame of the
+    bootstrap's (or a native call with the bootstrap behind it), which is what says the container
+    built the error and not the program. Asked in installStackHeader's Shim, where the frames still
+    name their author, and kept on the error as '__owcRaised' -- non-enumerable, so nothing that
+    inspects the error sees it -- because the rewritten stack holds nothing of the bootstrap's.
+    api.formatUncaught -- uncaughtReportOf for an Error, inspectValue for anything else, as before.
+  packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts
+    Buffer.from's refusal of an argument of no type it takes is given the code the host's own
+    carries, 'ERR_INVALID_ARG_TYPE', through the bufErr the rest of the file already uses -- the one
+    site of the row's measured example that answered with a bare TypeError and no code at all.
+
+Witness
+  dispatch 1793604131165-6913-fe570513f8655ca9, session verify-owc-error-code-line-missing, on a
+  fresh export of origin/main 022742a7a04faceaf7dcb69ff48f9c9b79b02452 (git archive, pnpm build in
+  packages/core), host node v24.15.0 on the other side, one fresh container boot per case per run,
+  stdout + stderr + exit code compared, at two memory points (load 29.57 with 2977 MiB free, load
+  33.92 with 719 MiB free), the same 8 cases at both points and every one of them stable across them:
+
+    errcode-buffer-from         TypeError [ERR_INVALID_ARG_TYPE] -- now written (was not)
+    errcode-buffer-alloc-range  RangeError [ERR_OUT_OF_RANGE]     -- now written, line matches the
+                                host's byte for byte (was 'RangeError:' with no brackets)
+    errcode-net-badport         RangeError [ERR_SOCKET_BAD_PORT]  -- now written, line matches the
+                                host's byte for byte (was 'RangeError:' with no brackets)
+    errcode-assert-fail         AssertionError [ERR_ASSERTION]    -- now written, line matches the
+                                host's byte for byte (was 'Error [AssertionError]' with no code)
+
+    errcode-own-typeerror       TypeError: boom, no brackets, with "  code: 'ERR_INVALID_ARG_TYPE'"
+                                behind the frames -- byte for byte the host's report (was 'TypeError:
+                                boom' with nothing behind the frames)
+    errcode-own-err             Error: boom, no brackets, with "  code: 'ERR_MY_OWN'" -- byte for
+                                byte the host's report (was 'Error: boom' with nothing behind it)
+    errcode-fs-enoent           Error: ENOENT: ..., no brackets, with errno, code, syscall and path
+                                behind the frames -- byte for byte the host's trailer (was no trailer)
+
+  The trailer is now written on all eight; it matches the host's exactly on five of them. Of the
+  other three, errcode-fs-badfd is a different error (this container opens '123' and answers ENOENT
+  where the host fstats it and answers EBADF), errcode-net-badport's differs only in the frame the
+  braces hang on (one frame more here), and errcode-assert-fail's only in the order of the
+  properties and a 'diff' this AssertionError does not carry. The decoration is written on every
+  error of this container's that carries one of node's codes and on no error a program built itself,
+  which is the distinction the row's own proof case turns on.
+
+  Re-run at the tip the fix was published onto, dispatch 1793605496220-7082-dc13bcfcc9fd8270, same
+  session, on origin/main 4eb925e66f80917761d631acd9937a763d450025 (a lane had since given the
+  builtins' errors their internal frame): the same verdicts, load 40.23 with 1349 MiB free and
+  load 38.16 with 613 MiB free. There `Buffer.from(1)` -- the row's measured example -- reads
+
+    TypeError [ERR_INVALID_ARG_TYPE]: The first argument must be of type string or an instance of
+    Buffer, ArrayBuffer, or Array
+        at Buffer.from (node:buffer:362:9)
+        at Object.<anonymous> (/app/main.js:1:8)
+        ...
+        at node:internal/main/run_main_module:33:47 {
+      code: 'ERR_INVALID_ARG_TYPE'
+    }
+
+  against the host's
+
+    TypeError [ERR_INVALID_ARG_TYPE]: The first argument must be of type string or an instance of
+    Buffer, ArrayBuffer, or Array or an Array-like Object. Received type number (1)
+        at Buffer.from (node:buffer:362:9)
+        at Object.<anonymous> (/app/main.js:1:8)
+        ...
+        at node:internal/main/run_main_module:33:47 {
+      code: 'ERR_INVALID_ARG_TYPE'
+    }
+
+  -- the decoration, the frame and the trailer all match; what is left is the sentence this
+  container's own Buffer.from validation writes, which is a divergence of its own and not this row's.
+
+  Regression, dispatch 1793604375528-6948-d2dd54841ab60d4c, same export, same session, same two
+  memory points: the script-failure sweep (fail-cjs, fail-esm, fail-syntax, fail-require-missing,
+  fail-throw-string, fail-engine, fail-deep, fail-exit-handler) and the stack sweep (stack-cjs,
+  stack-esm, stack-column, stack-capture, stack-limit, stack-vm, stack-subclass, stack-getter) were
+  run against a build of the same tree without the fix and again with it: 4 SAME / 4 DIFF and
+  5 SAME / 3 DIFF both times, the same cases both times, and no case that agreed with the host
+  before disagrees after. stack-esm still agrees, so the ESM file-URL frames hold; stack-column and
+  stack-capture still agree, so the columns hold; fail-engine and fail-syntax still differ by the
+  same pre-existing margin and no further, so the engine-error block holds.

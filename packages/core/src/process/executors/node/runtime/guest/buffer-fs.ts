@@ -67,8 +67,10 @@ BF.buffer = function () {
       return wrapBytes(arr);
     }
     if (value && value.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
+    /* The code host node's own error carries: an argument of no type Buffer.from takes is
+       ERR_INVALID_ARG_TYPE there, which is what puts it in the line the report opens with. */
     throw internalSiteOf(
-      new TypeError('The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array'),
+      bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array'),
       [['Buffer.from', 'node:buffer', 362, 9]]);
   };
 

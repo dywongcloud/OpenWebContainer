@@ -44,8 +44,21 @@ function formatErrorStack(err) {
   var ctorText = constructorNameOf(err);
   var rawStack = '';
   try { rawStack = err.stack === undefined || err.stack === null ? '' : String(err.stack); } catch (noStack) { rawStack = ''; }
+  /* The line node opens the report of an error of its own with: the name, the code in brackets
+     behind it and the message behind that. Node writes it into the error as it builds it -- an
+     error of its own carries 'TypeError [ERR_INVALID_ARG_TYPE]' in the stack while the name the
+     error answers is still the plain 'TypeError' -- so it is an error this container raised with
+     one of node's codes that is reported that way, and not one a program built and gave a code of
+     its own: host node 24.15 prints 'TypeError: boom' for that one, and the code behind it as a
+     property and never in the line. The codes node writes are the ones it names 'ERR_...'; the
+     'ENOENT' and 'EBADF' of a file that would not open belong to another class of error of its,
+     and an error carrying one of those is reported as 'Error: ENOENT: ...' with no brackets. */
+  var codedName = '';
+  if (typeof err.code === 'string' && err.code.indexOf('ERR_') === 0 && err.__owcRaised === true) {
+    codedName = nameText + ' [' + err.code + ']';
+  }
   var subbed = false;
-  if (ctorText && ctorText !== 'Object' && stackOpensWith(rawStack, nameText)) {
+  if (codedName === '' && ctorText && ctorText !== 'Object' && stackOpensWith(rawStack, nameText)) {
     var prefix = constructorPrefixOf(ctorText, utilTag(err));
     if (nameText !== prefix) {
       if (prefix.indexOf(nameText) >= 0) {
@@ -60,6 +73,7 @@ function formatErrorStack(err) {
       }
     }
   }
+  if (codedName !== '') header = codedName;
   if (err.message) header += header === '' ? String(err.message) : ': ' + err.message;
   var stack = rawStack;
   /* A stack the engine built ends with an empty line of its own, and the frames of the ESM loader
@@ -76,7 +90,7 @@ function formatErrorStack(err) {
      the constructor's and then goes on with the frames -- 'Error: s' is not a line it prints twice.
      The stack of an error out of a 'vm' context carries that header too now, so the same dropping
      is what keeps 'Z [Error]: s' from being followed by it there. */
-  if (subbed) {
+  if (subbed || codedName !== '') {
     var ownHeader = nameText + (err.message ? ': ' + String(err.message) : '');
     if (body === ownHeader || body.indexOf(ownHeader + '\n') === 0) body = body.slice(ownHeader.length + 1);
   }
@@ -1662,6 +1676,19 @@ function errorInspectOf(err, fmt, depth, indent, opts) {
   }
   if (opts && opts.sorted) entries.sort(typeof opts.sorted === 'function' ? opts.sorted : undefined);
   return joinInspectEntries(head + ' ', entries, indent, opts, 0);
+}
+
+/*
+ * What node writes for an uncaught error, which is the whole of what its 'util.inspect' writes for
+ * the value and not only the report: the header and the frames, and behind the last of them the
+ * properties the report is not made of, in braces -- 'code', and the 'errno', 'syscall' and 'path'
+ * of a file that would not open. That is why 'Buffer.from(1)' ends with "{\n  code: 'ERR_INVALID_ARG_TYPE'\n}"
+ * on host node 24.15 and why a plain TypeError a program built and gave a code of its own ends with
+ * the same: the code belongs to the report node's inspect writes and not to the line it opens with.
+ * An error with nothing of its own behind the report is reported as it always was.
+ */
+function uncaughtReportOf(err) {
+  return inspectValue(err);
 }
 
 /* The bytes a buffer prints: every one of them up to 'maxArrayLength' -- a hundred, node's default
