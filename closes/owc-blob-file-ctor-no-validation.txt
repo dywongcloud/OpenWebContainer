@@ -55,8 +55,8 @@ Witness
   40162e0490f608590b42e6e5ae759c99120f, host node v24.15.0 on the other side,
   one fresh container boot per run, stdout + stderr + exit code compared
   together, every case run twice and re-run at further memory points (machine
-  load 13-36, 0.09-3.6 GB free plus speculative). Before the fix the 148-label
-  sweep differs on 38 labels and the five uncaught cases leave exit 0 with no
+  load 13-36, 0.09-3.6 GB free plus speculative). Before the fix the 149-line
+  sweep differs on 53 of its lines and the five uncaught cases leave exit 0 with no
   stderr where the host leaves exit 1; after it all 148 labels are byte
   identical, the five uncaught cases leave exit 1 with the host's own error line
   -- 'TypeError [ERR_INVALID_ARG_TYPE]: The "sources" argument must be a
