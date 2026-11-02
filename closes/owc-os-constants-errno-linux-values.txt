@@ -1,0 +1,50 @@
+owc-os-constants-errno-linux-values resolved witness-280638d7d7539529 2026-11-02T05:12:00Z
+
+Symptom
+  The whole errno table was dumped as JSON on both sides: 79 keys, the same key
+  set, but the values were Linux's and not the host's. Host node v24.15.0 on
+  this macOS box reads EAGAIN 35, EWOULDBLOCK 35, ECONNRESET 54, EADDRINUSE 48,
+  ECONNREFUSED 61, ETIMEDOUT 60, ELOOP 62, ENOTEMPTY 66, EOPNOTSUPP 102,
+  ENOTSUP 45, EPROTO 100; the container read EAGAIN 11, EWOULDBLOCK 11,
+  ECONNRESET 104, EADDRINUSE 98, ECONNREFUSED 111, ETIMEDOUT 110, ELOOP 40,
+  ENOTEMPTY 39, EOPNOTSUPP 95, ENOTSUP 95, EPROTO 71 -- Linux's numbers, so
+  ENOTSUP and EOPNOTSUPP collapsed onto one value where the host keeps them
+  apart. 47 of the 79 names were wrong. os.constants.priority (6 entries),
+  os.constants.signals (31 entries) and the constant group key set were
+  byte-identical throughout.
+  Fixed as 0dc08daacfab3d9d263e317f184518d52ead0b43, parent
+  48cfe0b2cdf592223aac7abb132648f17d0b312c, parent origin/main
+  89804194c0fb072f8a4e1471e41e0a6f8c3cc223.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/misc.ts: BF.os's errno
+  table now carries this platform's numbers instead of Linux's. Same key set,
+  79 names, same alphabetical order, so JSON.stringify(os.constants.errno) is
+  byte-identical to the host's. The numbers the errors this runtime raises carry
+  are this platform's too -- the ERRNOS table buffer-fs keeps already reads
+  ENOTSUP -45, ENOTEMPTY -66, ELOOP -62, ENOSYS -78 -- so os.constants.errno and
+  an error's own errno now name the same thing. priority and signals are
+  untouched.
+
+Witness
+  witness-280638d7d7539529, session lane-netos41, output
+  /tmp/owc-netos41/run/witness-os.report (sha256 280638d7d75395292aa6a58395c3
+  da88ca4426f33a73ee897c4c97ea5b19cf71).
+
+  Measured from a git archive export of origin/main tip 89804194, installed and
+  built under /tmp/owc-netos41/export, never the shared working tree, which is
+  441 commits behind. Re-measured after the push against tip
+  0dc08daacfab3d9d263e317f184518d52ead0b43 with the published misc.ts byte-identical
+  to the copy measured (sha256 f5b2864ba677bd4116a60295fc1793a93332a3e13fc6d51
+  4f67507b25aa22eba). One fresh container boot per run, host node v24.15.0 on
+  the other side, stdout + stderr + exit code compared together at two memory
+  points (no ballast, and 512 MB of live ballast): JSON.stringify of errno,
+  priority and signals and the key count of each.
+  ACCEPT both memory points: host stdout 8ff8f22ac22ec99c085a6a86b92200dce60f8d
+  11c84a1379b47ae1a807feffc1 == guest stdout, stderr empty and exit 0 on both.
+  Before the fix 47 of 79 values differ; after, 0. The 25-field os sweep -- key
+  set, per-key types, platform, type, arch, release, machine, version,
+  endianness, hostname, homedir, tmpdir, totalmem, loadavg, cpus shape and
+  count, availableParallelism, networkInterfaces, userInfo, getPriority,
+  setPriority, dlopen, UV_UDP_REUSEADDR -- differs before and after in the errno
+  table alone.
