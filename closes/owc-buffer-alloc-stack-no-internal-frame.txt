@@ -1,0 +1,44 @@
+owc-buffer-alloc-stack-no-internal-frame resolved 1793616621985-5882-db641b06eec5c795 2026-11-02T09:38:48.000Z
+Row: owc-buffer-alloc-stack-no-internal-frame
+Witness: 1793616621985-5882-db641b06eec5c795
+Status: resolved
+
+Symptom
+  A caught RangeError from Buffer.alloc(-1) opens its stack and goes straight to the frame of the
+  program that called it:
+
+    host   RangeError [ERR_OUT_OF_RANGE]: ... Received -1
+             at Buffer.alloc (node:buffer:439:3)
+             at Object.<anonymous> (/app/main.js:2:10)
+    guest  RangeError [ERR_OUT_OF_RANGE]: ... Received -1
+             at Object.<anonymous> (/app/main.js:2:10)
+
+  Host node v24.15.0 puts its own frame first, because the size is refused inside Buffer.alloc and
+  not at the call. The same is true of a size that is not a number: Buffer.alloc('8') is
+  `at Buffer.alloc (node:buffer:439:3)` on the host there too.
+
+Cause
+  packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts -- internalSiteOf stands
+  beside the two factories because both raise, and it was asked by the Blob and File constructors,
+  Buffer.from, fs.readFileSync and the accessors of both classes. checkSize, the one call that
+  refuses a size, asked for none: it threw the bare bufErr a program sees in its own frame, so the
+  stack carried no frame of node's own and the report had no internal site to open on.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts
+    checkSize -- both refusals, a size that is not a number and one out of range, carry the site
+    node refuses them at: `at Buffer.alloc (node:buffer:439:3)`, which is the line host node names
+    for both. The code, the message, the frames behind it and the columns are the ones they were;
+    Buffer.allocUnsafe is Buffer.alloc here and keeps the same frame.
+
+Witness
+  dispatch 1793616621985-5882-db641b06eec5c795, session verify-stackcode42b, on a fresh git-archive
+  export of origin/main (19574a8) built under /tmp/owc-stackcode42b, host node v24.15.0 on the
+  other side, one fresh container boot per case, stdout + stderr + exit code compared at two memory
+  points. Ten cases: nine agree with host node v24.15.0 and one differs. alloc-stack and alloc-type
+  agree after the fix and disagreed before it. The eight that agreed before -- a caught
+  Buffer.from(1), an uncaught one, an ENOENT caught and uncaught, an error a program coded itself, a
+  plain throw and a CommonJS frame -- still agree. The one that differs, reg-assert, differs by the
+  margin it did before the fix and is not this row's: the assertion's message body names
+  `assert.ok(false)` here and `ok(false)` on the host, which is the call-source wording and belongs
+  to neither frame nor site.

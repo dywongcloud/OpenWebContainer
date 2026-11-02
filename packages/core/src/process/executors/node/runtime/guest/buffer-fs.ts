@@ -89,11 +89,18 @@ BF.buffer = function () {
    * with a buffer instead of refused. A fractional size is allowed, as there: 1.5 is one byte.
    */
   function checkSize(size) {
+    /* The frame host node puts in front of these: Buffer.alloc is where its own source refuses the
+       size, at node:buffer:439:3 -- the same line for the type that is not a number and for the value
+       out of range, because both are the one call node's Buffer.alloc makes before it allocates. */
     if (typeof size !== 'number') {
-      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "size" argument must be of type number. Received ' + describeArg(size));
+      throw internalSiteOf(
+        bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "size" argument must be of type number. Received ' + describeArg(size)),
+        [['Buffer.alloc', 'node:buffer', 439, 3]]);
     }
     if (!(size >= 0 && size <= MAX_BUFFER_LENGTH)) {
-      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "size" is out of range. It must be >= 0 && <= ' + MAX_BUFFER_LENGTH + '. Received ' + receivedOf(size));
+      throw internalSiteOf(
+        bufErr(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "size" is out of range. It must be >= 0 && <= ' + MAX_BUFFER_LENGTH + '. Received ' + receivedOf(size)),
+        [['Buffer.alloc', 'node:buffer', 439, 3]]);
     }
     return size;
   }
