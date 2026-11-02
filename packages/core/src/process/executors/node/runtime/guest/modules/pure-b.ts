@@ -3734,13 +3734,19 @@ export const SRC = String.raw`
        with the tick a pass gets. */
     function lineSkipped(item, pad, at) { line(pad + '﹣ ' + item.name + ' (' + durationOf(at) + ')' + markSuffix('skip', item.skip)); }
     function lineTodo(item, pad, at) { line(pad + '⚠ ' + item.name + ' (' + durationOf(at) + ')' + markSuffix('todo', item.todo)); }
+    /* A todo whose body held is reported with the tick a pass gets, behind the same "# TODO": what
+       makes it a todo is the count it lands in, not the mark it is given. */
+    function lineTodoOk(item, pad, at) { line(pad + '✔ ' + item.name + ' (' + durationOf(at) + ')' + markSuffix('todo', item.todo)); }
 
-    function runTest(item, ancestors, depth, tailAfter) {
+    function runTest(item, ancestors, depth) {
       var pad = new Array(depth + 1).join('  ');
-      if (item.skip !== false || item.todo !== false) {
-        var at0 = Date.now();
-        if (item.todo !== false) { todos += 1; lineTodo(item, pad, at0); }
-        else { skipped += 1; lineSkipped(item, pad, at0); }
+      /* A skipped test is one node never calls: neither its body nor any hook around it runs, and
+         the mark it is given is the whole of it. A todo is the opposite -- node does call it, and
+         it is only the report that differs, which is why its body runs and the hooks around it run
+         with it. */
+      if (item.skip !== false) {
+        skipped += 1;
+        lineSkipped(item, pad, Date.now());
         return Promise.resolve();
       }
       var around = hooksAround(item, ancestors);
@@ -3766,13 +3772,13 @@ export const SRC = String.raw`
       var trail = function () {
         return callEach(around.after, context).then(function () {
           return callEach(item.hooks.filter(function (h) { return h[0] === 'after'; }).map(function (h) { return h[1]; }), context);
-        }).then(function () { return callEach(tailAfter === undefined ? [] : tailAfter, context); });
+        });
       };
       return body.then(function () {
         return trail().then(function () {
           var mark = CTX.get(context).mark;
           if (mark === 'skip') { skipped += 1; lineSkipped(item, pad, at); return undefined; }
-          if (mark === 'todo') { todos += 1; lineTodo(item, pad, at); return undefined; }
+          if (item.todo !== false || mark === 'todo') { todos += 1; lineTodoOk(item, pad, at); return undefined; }
           if (expectFail) {
             failed += 1;
             failures.push({ name: item.name, error: 'test was expected to fail but passed', mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
@@ -3784,6 +3790,7 @@ export const SRC = String.raw`
         });
       }, function (err) {
         return trail().then(function () {
+          var mark = CTX.get(context).mark;
           if (typeof err === 'string' && limit !== undefined && String(err).indexOf('timed out') >= 0) {
             cancelled += 1;
             failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
@@ -3793,6 +3800,15 @@ export const SRC = String.raw`
           if (expectFail) {
             passed += 1;
             lineOk(item, pad, at);
+            return undefined;
+          }
+          /* A todo that did not hold is still a todo: node lists it among the failures, marks it
+             with the warning sign and counts it among the todos -- and it is not a failure, so a
+             run of one does not end on 1. */
+          if (item.todo !== false || mark === 'todo') {
+            todos += 1;
+            failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + markSuffix('todo', item.todo) });
+            lineTodo(item, pad, at);
             return undefined;
           }
           failed += 1;
@@ -3832,15 +3848,17 @@ export const SRC = String.raw`
       var chain = callEach(root.before, { name: undefined });
       var items = root.items.filter(function (item) { return item.only === true; });
       var chosen = items.length > 0 ? items : root.items;
-      chosen.forEach(function (item, index) {
-        /* The module's own after runs once, behind everything it collected -- and ahead of the
-           mark of the last test, which is where node puts it. */
-        var tailAfter = index === chosen.length - 1 && item.kind === 'test' ? root.after : [];
+      chosen.forEach(function (item) {
         chain = chain.then(function () {
-          return item.kind === 'suite' ? runSuite(item, [], 0) : runTest(item, [], 0, tailAfter);
+          return item.kind === 'suite' ? runSuite(item, [], 0) : runTest(item, [], 0);
         });
       });
-      return chain.then(report);
+      /* The module's own after runs once, behind everything it collected -- behind the mark of the
+         last of them, whatever kind that last one is, which is where node puts it: a suite that was
+         registered last, and a test that was skipped, are both followed by it there. */
+      return chain.then(function () {
+        return callEach(root.after, { name: undefined });
+      }).then(report);
     }
 
     function report() {
