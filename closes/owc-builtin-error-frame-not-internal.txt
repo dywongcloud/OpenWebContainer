@@ -1,22 +1,77 @@
-owc-builtin-error-frame-not-internal -- fixed
+owc-builtin-error-frame-not-internal resolved 1793603615872-6792-7d71701cee0ff3c4 2026-11-02T06:56:51.000Z
+Row: owc-builtin-error-frame-not-internal
+Witness: 1793603615872-6792-7d71701cee0ff3c4
 
-An error a builtin raises is reported where host node v24.15.0 reports one -- at the builtin's
-own file, line and column, named as the host names it:
+Symptom
+  An error raised inside a builtin is reported at the caller's line, where host node 24.15 reports the
+  internal site. `new Blob(1)` on the host opens with `node:internal/blob:148` over
+  `      throw new ERR_INVALID_ARG_TYPE('sources', 'a sequence', sources);` and a caret, and its first
+  frame is `    at new Blob (node:internal/blob:148:13)`; this container opened on `/app/main.js:1`
+  over the program's own line and named `    at Object.<anonymous> (/app/main.js:1:1)` as its first
+  frame. The same for `new File()` (`node:internal/file:64`, `at new File (node:internal/file:64:13)`),
+  `Buffer.from(1)` (`node:buffer:362`, `at Buffer.from (node:buffer:362:9)`),
+  `fs.readFileSync` of a file that is not there (`node:fs:561`, `at Object.openSync (node:fs:561:18)`
+  and `at Object.readFileSync (node:fs:445:35)`) and an accessor reached through its descriptor
+  (`node:internal/blob:230`, `at get size (node:internal/blob:230:13)`). Observed by the lane that
+  closed owc-blob-file-ctor-no-validation and deliberately left it unfiled.
 
-    at new Blob (node:internal/blob:148:13)
-    at new File (node:internal/file:64:13)
-    at Buffer.from (node:buffer:362:9)
-    at Object.openSync (node:fs:561:18) / at Object.readFileSync (node:fs:445:35)
-    at get size (node:internal/blob:230:13)
+Cause
+  The error a builtin raises is built inside the guest, so the frames the engine gives it are the
+  frames of the guest's own bootstrap, and the renderer in globals.ts takes those out -- which leaves
+  the caller's frame as the first one of the trace, and leaves the host's report, which reads the file
+  and line out of that first frame, pointing at the program. Host node names a builtin's own frame
+  because V8 names the frame of a script it compiled from its own internal source
+  (src/node_builtins.cc names it `node:` + the builtin's id), and it prints that source's line under
+  the banner because the throw site of the Message is the internal one and not the caller's.
 
-and the report opens on the builtin's own source line with a caret under the throw --
-`node:internal/blob:148` over `      throw new ERR_INVALID_ARG_TYPE('sources', 'a sequence', sources);`
--- where it opened on the line of the program that called the builtin.
+Fix
+  packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts
+    internalSiteOf, standing outside the two factories because both raise, puts the frames host node
+    writes in front of the caller's: the builtin's own file, line and column under the name node names
+    it there. It is wired to the raise sites of the Blob constructor (sources, the options dictionary
+    and `options.endings`), the File constructor (its missing arguments), Buffer.from,
+    fs.readFileSync's ENOENT -- two frames, the open that failed in front of the read that asked -- and
+    the four accessors of the two classes, which now refuse a `this` that is not one of them with
+    ERR_INVALID_THIS as the host does. A `.call` or `.apply` a caller reached the builtin through is
+    dropped: node's own stack names no native frame there.
+  packages/core/src/process/executors/node/process.ts
+    NODE_INTERNAL_SITES holds, for each site a frame names, the file, line, column and line of source
+    the report prints, and the branch scriptFailureText gained prints that banner -- the builtin's own
+    file, its source line and a caret under the throw -- instead of reading the caller's. An error
+    node builds in internal/errors is thrown from there and attributed to the builtin that asked for
+    it, so `new Blob(['ab'], 5)` keeps the frame `at new Blob (node:internal/blob:150:5)` and the
+    banner `node:internal/errors:542` over `      throw error;`.
+  Pushed as 4eb925e66f80917761d631acd9937a763d450025, built on origin/main with a temporary index.
 
-Files: packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts (internalSiteOf, and
-the raise sites of the two constructors, Buffer.from, fs.readFileSync and the four accessors),
-packages/core/src/process/executors/node/process.ts (NODE_INTERNAL_SITES and the branch of
-scriptFailureText that prints the builtin's own source line).
+Witness
+  dispatch 1793603615872-6792-7d71701cee0ff3c4, session verify-owc-builtin-error-frame-not-internal,
+  on a fresh export of origin/main 022742a7a04faceaf7dcb69ff48f9c9b79b02452 (git archive, pnpm build
+  in packages/core) with the fix rebuilt into it, host node v24.15.0 on the other side, one fresh
+  container boot per run, stdout + stderr + exit code compared, run again at a second memory point
+  (load 30.8 with 0.47 GB free, load 29.7 with 0.61 GB free): frames-match=5/5 and reports-match=3/5.
+  Every one of the five -- a constructor (Blob, File), a method (Buffer.from, fs.readFileSync) and a
+  getter -- names the host's file, line and column and is named as the host names it, and none of the
+  five did before the fix.
 
-Witness: 1793603615872-6792-7d71701cee0ff3c4 (session verify-owc-builtin-error-frame-not-internal)
-Status: resolved
+Sweeps
+  The script-failure sweep (the five above) and the stack sweep -- st-caught, st-plain, st-column,
+  st-column2, st-coded, st-esm -- were run against a build of origin/main before the fix and against
+  the pushed tree after it: 2 agreed with the host before and 5 agree after, and no case that agreed
+  before disagrees after. st-caught, a captured `new Blob(1)` printed through `err.stack`, is one the
+  fix gained. The ESM `file:///app/main.mjs:2:7` frames, the columns (st-column2's caret and its
+  `2:11` frame) and the coded-error line `TypeError [ERR_INVALID_ARG_TYPE]:` all hold as they did.
+
+Residual, not this row
+  `Buffer.from(1)` names the right frame now and still writes a shorter sentence than the host --
+  `The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array` against
+  the host's `... or Array or an Array-like Object. Received type number (1)` -- and carries no
+  `code`, so its whole report is the one of the five that does not agree.
+  `Object.getOwnPropertyDescriptor(Blob.prototype, 'size').get.call({})` agrees on the internal frame
+  and on the banner and not on the column of the caller's own frame -- 1:57 here against 1:61 on the
+  host -- which is a column QuickJS chose and not one this row is about.
+  The block of properties host node writes behind the frames -- `{ code: 'ERR_INVALID_ARG_TYPE' }` --
+  is not written here for any error, and is left out of the comparison of the whole report.
+
+Readme
+  "The `lane-bltnframe42` lane: an error a builtin raises is reported at the builtin's own site",
+  added to Readme.md in the pushed tree with this record.
