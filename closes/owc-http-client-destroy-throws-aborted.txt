@@ -1,0 +1,66 @@
+owc-http-client-destroy-throws-aborted resolved 1793607013220-7378-db093ad7dab2c5f3 2026-11-02T07:30:13.220Z
+
+Symptom
+  `req.destroy()` on a client request whose answer has not finished threw an uncaught `Error: aborted` in
+  the container, with a stack naming the program's own `req.destroy()` line, and ended the process with
+  status 1: no `DONE`, no server-side `aborted`. Host node v24.15.0 destroys quietly and exits 0.
+
+Reproduction (at origin/main 022742a7a04faceaf7dcb69ff48f9c9b79b02452)
+  Container built from a `git archive` export of origin/main under /tmp/lane-http42/export (pnpm install,
+  pnpm build in packages/core), host Node v24.15.0 on the other side, one fresh OpenWebContainer boot per
+  run, stdout + stderr + exit code compared. Cases: destroy before the response, during the body, and after
+  the response ended, each with and without an error argument, with listeners for `aborted`, `error` and
+  `close` on both the request and the response, and on the server's request, response and socket.
+  Memory point 1: load=[40.08 34.60 34.80] freeGB=0.83. Memory point 2: load=[34.18 33.19 34.31]
+  freeGB=0.04. Before the fix, the row's own case read
+    guest "client res aborted / destroy returned / client req close / Error: aborted at row.js:17" exit 1
+    host  "destroy returned / client res aborted / client req close / server req aborted /
+           server res close finished=false / server finished write / DONE" exit 0
+
+Cause
+  Three gaps against Node's own code, all in the http guest module.
+  1. `IncomingMessage.prototype.destroy` passed its error to `Readable.prototype.destroy` unconditionally.
+     Node's incoming message calls `onError`, which reports an error only when something listens for it, so
+     a response nobody awaits is destroyed silently instead of fatally.
+  2. `ClientRequest._destroy` aborted the response and failed the request inside `destroy()`, before it
+     returned, and reported the failure through the stream callback. Node hands the socket the error and
+     returns, so the caller's own line is read first and the response's `aborted` follows it.
+  3. The server neither ended its half when the peer ended its own (`socketOnEnd`, with httpAllowHalfOpen
+     off) nor aborted the request its socket outlived (`abortIncoming`), so a client that destroyed
+     mid-response left the server's request open and its response writable.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/http.ts only, 50 insertions and 5
+  deletions against origin/main:
+  - `IncomingMessage.prototype.destroy` raises `aborted` only for a message that stopped short of its end
+    (`readableEnded && complete`), and passes its error through `incomingError`, Node's own listenerCount
+    guard, so an unawaited response is silent.
+  - `IncomingMessage.prototype._dump` stops a destroyed request's response from reaching `data` listeners,
+    as Node's `res._dump()` does.
+  - `ClientRequest._destroy` destroys the socket, dumps the response, then reports the request's error, the
+    response's `aborted` and the request's `close` on the tick after `destroy()` returned; an error handed
+    to a request whose answer already read to its end, or whose socket is already gone, is not reported.
+  - The server ends its half on the peer's `end` while an answer is still being written, and aborts the
+    request still being answered when the socket closes, with Node's ConnResetException `aborted`.
+
+Witness
+  Dispatch 1793607013220-7378-db093ad7dab2c5f3, session verify-owc-http-client-destroy-throws-aborted:
+  the same export at the fixed tip, host Node v24.15.0, one fresh container boot per run, stdout + stderr +
+  exit code compared, every case run once per memory point.
+    row-case           SAME  (destroy returned / client res aborted / client req close / server req aborted /
+                              server res close finished=false / server finished write / DONE, exit 0)
+    during-body        SAME  during-body-err   SAME
+    after-end          SAME  after-end-err     SAME
+    before-response    DIFF  before-response-err DIFF  (see below)
+  Regression sweep, 47 cases (http e2e, fetch sweeps, net sweep) run against the same export built before
+  and after the change, each case compared against host: no case that agreed with the host before the fix
+  disagrees after it; two that disagreed now agree (`http-server-destroy-midbody-nolisten`, which was the
+  same uncaught `Error: aborted`, and `http-destroy-twice`). `requestTimeout`, `CONNECT` (both the tunnel
+  and the dropped case), trailers, keep-alive and `maxHeadersCount` all still agree, as do every fetch and
+  net case. Only two guest outputs changed, and both changed towards the host.
+
+Still open
+  `before-response`: destroy() called in the same tick as `http.get()` still lets the container's request
+  reach the server, where host's request never gets a socket before the destroy. That divergence predates
+  this row and is unaffected by it -- the two sides disagree identically before and after -- so it is left
+  for a row of its own rather than changed here.

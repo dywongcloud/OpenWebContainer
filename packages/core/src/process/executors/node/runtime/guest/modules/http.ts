@@ -49,6 +49,14 @@ function connResetError() {
   return httpError(Error, 'ECONNRESET', 'aborted');
 }
 
+/* The tick a destroyed stream reports on: everything a request's destroy() has to say is queued
+   here, so the line the caller writes after destroy() is read before any of it. */
+function httpDefer(fn) {
+  var proc = typeof process === 'object' && process ? process : requireBuiltin('process');
+  if (proc && typeof proc.nextTick === 'function') proc.nextTick(fn);
+  else queueMicrotask(fn);
+}
+
 function hasOwn(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
@@ -392,10 +400,30 @@ BF['http'] = function () {
     if (typeof callback === 'function') this.once('timeout', callback);
     return this;
   };
+  /* Node's incoming message reports its error only where something listens for it: a response its
+     own request destroyed is silent while nobody awaits it, rather than fatal to the process. */
+  function incomingError(message, error) {
+    return message.listenerCount('error') === 0 ? null : error;
+  }
+  /* A request that is destroyed stops reading what is left of its response, as Node does: the
+     response is dumped, so the bytes it had buffered reach no 'data' listener from here on. */
+  IncomingMessage.prototype._dump = function _dump() {
+    if (this._dumped) return;
+    this._dumped = true;
+    this.removeAllListeners('data');
+    this.resume();
+  };
   /* Destroying a message that has ended must not close its socket: the auto-destroy after 'end' would end a keep-alive connection */
   IncomingMessage.prototype.destroy = function destroy(error) {
+    var read = this.readableEnded && this.complete;
     if (this.socket && !this.socket.destroyed && !this.complete) this.socket.destroy();
-    return Readable.prototype.destroy.call(this, error);
+    /* Only a message that stopped short of its end is aborted, as Node has it: one already read to
+       its end is destroyed with neither 'aborted' nor an error. */
+    if (!read && !this.aborted) {
+      this.aborted = true;
+      this.emit('aborted');
+    }
+    return Readable.prototype.destroy.call(this, read ? null : incomingError(this, error));
   };
 
   function OutgoingMessage(options) {
@@ -914,8 +942,8 @@ BF['http'] = function () {
     _abortResponse() {
       var res = this._res;
       if (!res || res.aborted) return;
-      res.aborted = true;
-      res.emit('aborted');
+      /* 'aborted' and the error belong to the message itself, which raises them only for a response
+         that stopped short of its end -- the way Node's incoming message does on either side. */
       res.destroy(connResetError());
     }
     _onSocketClose() {
@@ -935,11 +963,19 @@ BF['http'] = function () {
       // A request destroyed before its response reports the hang-up, as Node does (abort() stays silent)
       var hangUp = !this._res && !this._done && !this._failed && !this.aborted;
       var failure = error || (hangUp ? httpError(Error, 'ECONNRESET', 'socket hang up') : null);
+      /* An error handed to a request whose socket is already gone, or whose answer already read to
+         its end, is never reported: a live socket is what carries it back to the request. */
+      if (failure && (this._done || (this._socket && this._socket.destroyed))) failure = null;
       this._failed = true;
       this._closeEmitted = true;
-      this._abortResponse();
+      if (this._res) this._res._dump();
       this._destroySocket();
-      callback(failure);
+      /* Node's destroy() hands the socket its error and returns: what follows is read after the
+         caller's own line -- the request's error, then its response's 'aborted', then 'close'. */
+      var req = this;
+      if (failure) httpDefer(function () { req.emit('error', failure); });
+      httpDefer(function () { req._abortResponse(); });
+      callback(null);
     }
     /* Writes the request line and headers once. length is the body size when known; null means chunked for body methods. */
     _sendHead(length) {
@@ -1554,6 +1590,10 @@ BF['http'] = function () {
         return;
       }
       if (!state.responding && state.pending.length === 0) closeSocket(socket);
+      /* A peer that ends its half while an answer is still being written is answered by ending ours,
+         as Node does while httpAllowHalfOpen is off: its socket closes here, and the request it
+         never finished is aborted with it. */
+      else socket.end();
     }
 
     function rejectRequest(err) {
@@ -1578,7 +1618,12 @@ BF['http'] = function () {
       state.dead = true;
       cancelIdle();
       server._connStates.delete(state);
+      /* A request the socket outlived is aborted the way Node aborts one: 'aborted' first, then the
+         ECONNRESET that names the abort, so a request that was still being answered is not left
+         open. Node drops a request from the list it aborts once its response has finished, which is
+         what responding marks here. */
       if (state.res && !state.res.writableFinished) state.res.destroy();
+      if (state.req && state.responding && !state.req.destroyed) state.req.destroy(connResetError());
     }
 
     function onTimeout() {

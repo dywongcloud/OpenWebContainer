@@ -382,6 +382,10 @@ comparing stdout, stderr and the exit code, then repeated at a second memory poi
 - **A response destroyed mid-body** — a server that writes part of a response and then destroys the socket now
   ends the client's response the way host node ends it, `aborted` first and then an `error` carrying `ECONNRESET`
   with the message `aborted`, so the client's reader and the process finish in about 70 ms instead of hanging.
+- **A request destroyed mid-response** — `req.destroy()` on a client request whose answer has not finished no
+  longer throws an uncaught `Error: aborted`: the response hears `aborted` and then `close`, the server's own
+  request hears `aborted` and its response closes with `writableEnded false`, and the process ends with status 0
+  as it does on host node 24.15.
 - **A net server's `connection` against the client's `connect`** — while the client is being read, the listener's
   `connection` now lands before the client's own `connect` callback, which is the order host node shows once a
   `data` listener has resumed the client socket; a client nobody reads keeps the order it had.
