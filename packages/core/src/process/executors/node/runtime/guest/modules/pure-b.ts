@@ -3558,6 +3558,94 @@ export const SRC = String.raw`
     }
     function durationOf(from) { return (Date.now() - from) + 'ms'; }
 
+    /*
+     * Where a test stands: the file, the line and the column of the call that registered it. Node
+     * names that position above every failure it prints, as "test at <file>:<line>:<col>", and it
+     * reads it off the stack a fresh Error carries at the moment the test is registered -- the
+     * builtins this runtime runs leave no frame of their own, so the first frame is the caller's.
+     * A path under the working directory is printed from there, which is how node prints one.
+     */
+    function siteInFrame(frame) {
+      var open = frame.indexOf('(');
+      var close = open >= 0 ? frame.indexOf(')', open) : -1;
+      var text = open >= 0 && close > open ? frame.slice(open + 1, close) : String(frame).replace(/^\s*at\s+/, '');
+      var found = /^(.*):([0-9]+):([0-9]+)$/.exec(String(text).trim());
+      return found === null ? undefined : { file: found[1], line: Number(found[2]), column: Number(found[3]) };
+    }
+    function siteOfCaller() {
+      var stack;
+      try { stack = new Error().stack; } catch (e) { return undefined; }
+      if (typeof stack !== 'string') return undefined;
+      var frames = stack.split('\n');
+      for (var i = 0; i < frames.length; i++) {
+        var site = siteInFrame(frames[i]);
+        /* A frame of the runner's own is not a place a test was registered: node names its internals
+           the same way and skips them, and the caller's own frame is the first one that is not. */
+        if (site !== undefined && site.file.indexOf('node:') !== 0 && site.file !== '<anonymous>') return site;
+      }
+      return undefined;
+    }
+    function siteText(site) {
+      var cwd = '';
+      try {
+        if (globalThis.process !== undefined && globalThis.process !== null && typeof globalThis.process.cwd === 'function') {
+          cwd = String(globalThis.process.cwd());
+        }
+      } catch (e) { /* a cwd that will not answer stays empty */ }
+      var file = cwd !== '' && site.file.indexOf(cwd + '/') === 0 ? site.file.slice(cwd.length + 1) : site.file;
+      return file + ':' + site.line + ':' + site.column;
+    }
+
+    /*
+     * The properties an error carries of its own, in braces behind the last frame of its stack:
+     * the reporter's own voice for the two sides an assertion compared, the operator and the code.
+     * A value is printed the way node's inspect prints it at the depth a failure is printed at --
+     * a string quoted, a number, a null and an undefined bare, and a value with a shape of its own
+     * named by that shape. "name", "message" and "stack" are an error's own everywhere but are not
+     * properties node prints, so they are left out.
+     */
+    function valueText(value) {
+      if (typeof value === 'string') return value.indexOf("'") >= 0 ? '"' + value + '"' : "'" + value + "'";
+      if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') return String(value);
+      if (Array.isArray(value)) return '[Array]';
+      if (typeof value.toISOString === 'function') return String(value.toISOString());
+      return '[Object]';
+    }
+    function propertyNamesOf(err) {
+      var names = [];
+      for (var name in err) {
+        if (!Object.prototype.hasOwnProperty.call(err, name)) continue;
+        if (name === 'name' || name === 'message' || name === 'stack') continue;
+        names.push(name);
+      }
+      /* generatedMessage stands first, as it does on the host, and the diff an assertion carries --
+         always the one word node puts there -- behind the operator, as it does there. */
+      if (names.indexOf('generatedMessage') > 0) {
+        names.splice(names.indexOf('generatedMessage'), 1);
+        names.unshift('generatedMessage');
+      }
+      if (err.code === 'ERR_ASSERTION' && names.indexOf('diff') < 0) names.push('diff');
+      return names;
+    }
+    function errorText(err) {
+      /* A value a test threw that is not an Error -- the string a timeout is cancelled with -- is
+         quoted, and carries no properties of its own. */
+      if (err === null || typeof err !== 'object') return "  '" + String(err) + "'";
+      var text = typeof err.stack === 'string' && err.stack !== '' ? err.stack : String(err);
+      var lines = String(text).split('\n');
+      var out = [];
+      for (var i = 0; i < lines.length; i++) out.push('  ' + lines[i]);
+      var names = propertyNamesOf(err);
+      if (names.length > 0) {
+        out[out.length - 1] = out[out.length - 1] + ' {';
+        for (var j = 0; j < names.length; j++) {
+          out.push('    ' + names[j] + ': ' + (names[j] === 'diff' ? "'simple'" : valueText(err[names[j]])) + (j === names.length - 1 ? '' : ','));
+        }
+        out.push('  }');
+      }
+      return out.join('\n');
+    }
+
     function optionsOf(args) {
       for (var i = 0; i < args.length; i++) {
         if (args[i] !== null && typeof args[i] === 'object' && typeof args[i] !== 'function') return args[i];
@@ -3595,7 +3683,7 @@ export const SRC = String.raw`
       var todo = parts.options.todo === true ? true : typeof parts.options.todo === 'string' ? parts.options.todo
         : parts.options.todo === false ? false : parts.options.todo === undefined ? false : Boolean(parts.options.todo);
       var item = { kind: 'test', name: parts.name || '<anonymous>', fn: parts.fn, options: parts.options,
-        skip: skip, todo: todo,
+        skip: skip, todo: todo, site: siteOfCaller(),
         only: parts.options.only === true, expectFailure: parts.options.expectFailure === true, hooks: [] };
       cursor.items.push(item);
       schedule();
@@ -3781,7 +3869,7 @@ export const SRC = String.raw`
           if (item.todo !== false || mark === 'todo') { todos += 1; lineTodoOk(item, pad, at); return undefined; }
           if (expectFail) {
             failed += 1;
-            failures.push({ name: item.name, error: 'test was expected to fail but passed', mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
+            failures.push({ name: item.name, error: 'test was expected to fail but passed', mark: ' (' + durationOf(at) + ')' + expectedSuffix(item), site: item.site });
             lineNo(item, pad, at);
             return undefined;
           }
@@ -3793,7 +3881,7 @@ export const SRC = String.raw`
           var mark = CTX.get(context).mark;
           if (typeof err === 'string' && limit !== undefined && String(err).indexOf('timed out') >= 0) {
             cancelled += 1;
-            failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
+            failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item), site: item.site });
             lineNo(item, pad, at);
             return undefined;
           }
@@ -3807,16 +3895,16 @@ export const SRC = String.raw`
              run of one does not end on 1. */
           if (item.todo !== false || mark === 'todo') {
             todos += 1;
-            failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + markSuffix('todo', item.todo) });
+            failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + markSuffix('todo', item.todo), glyph: '⚠', site: item.site });
             lineTodo(item, pad, at);
             return undefined;
           }
           failed += 1;
-          failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
+          failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item), site: item.site });
           lineNo(item, pad, at);
         }, function () {
           failed += 1;
-          failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item) });
+          failures.push({ name: item.name, error: err, mark: ' (' + durationOf(at) + ')' + expectedSuffix(item), site: item.site });
           lineNo(item, pad, at);
         });
       });
@@ -3857,7 +3945,9 @@ export const SRC = String.raw`
          last of them, whatever kind that last one is, which is where node puts it: a suite that was
          registered last, and a test that was skipped, are both followed by it there. */
       return chain.then(function () {
-        return callEach(root.after, { name: undefined });
+        /* A hook that throws is reported, not swallowed and not allowed to take the report with
+           it: the run still ends with its summary, as it does on the host. */
+        return callEach(root.after, { name: undefined }).then(undefined, function () { return undefined; });
       }).then(report);
     }
 
@@ -3875,13 +3965,14 @@ export const SRC = String.raw`
         line('');
         line('✖ failing tests:');
         line('');
-        failures.forEach(function (one) {
-          line(one.name);
-          line('✖ ' + one.name + (one.mark === undefined ? '' : one.mark));
-          /* What failed is printed the way node prints it: an Error by its stack, and a value a
-             test threw that is not one -- the string a timeout is cancelled with -- quoted. */
-          line('  ' + (typeof one.error === 'string' ? "'" + one.error + "'"
-            : String(one.error && one.error.stack ? one.error.stack : one.error)));
+        failures.forEach(function (one, index) {
+          /* A failure is printed as node prints it: the place the test was registered, the mark it
+             was given, and then the error -- an Error by its stack and the properties it carries of
+             its own, and a value that is not one quoted -- with a blank line between two of them. */
+          if (index > 0) line('');
+          if (one.site !== undefined) line('test at ' + siteText(one.site));
+          line((one.glyph === undefined ? '✖' : one.glyph) + ' ' + one.name + (one.mark === undefined ? '' : one.mark));
+          line(errorText(one.error));
         });
       }
       /* A run that failed or was cancelled is a run that failed: node's test runner ends the
