@@ -964,6 +964,32 @@ function nodeFrame(text: string, sourceOf: (at: string) => string | undefined): 
 }
 
 /**
+ * The places in node's own internals a builtin raises an error at, keyed by the site the frame the
+ * guest wrote names. Each holds the file, line and column the caret goes under and the line of
+ * source printed above it, which is not always the place the frame names: an error node builds in
+ * `internal/errors` is thrown from there and attributed to the builtin that asked for it, so the
+ * report opens with `internal/errors` while the frame names the builtin's own file.
+ */
+const NODE_INTERNAL_SITES: Record<string, { file: string; line: number; column: number; text: string }> = {
+    'node:internal/blob:148:13': { file: 'node:internal/blob', line: 148, column: 13, text: `      throw new ERR_INVALID_ARG_TYPE('sources', 'a sequence', sources);` },
+    'node:internal/blob:150:5': { file: 'node:internal/errors', line: 542, column: 13, text: `      throw error;` },
+    'node:internal/blob:158:13': { file: 'node:internal/blob', line: 158, column: 13, text: `      throw new ERR_INVALID_ARG_VALUE('options.endings', endings);` },
+    'node:internal/blob:220:13': { file: 'node:internal/blob', line: 220, column: 13, text: `      throw new ERR_INVALID_THIS('Blob');` },
+    'node:internal/blob:230:13': { file: 'node:internal/blob', line: 230, column: 13, text: `      throw new ERR_INVALID_THIS('Blob');` },
+    'node:internal/file:64:13': { file: 'node:internal/file', line: 64, column: 13, text: `      throw new ERR_MISSING_ARGS('fileBits', 'fileName');` },
+    'node:internal/file:87:13': { file: 'node:internal/file', line: 87, column: 13, text: `      throw new ERR_INVALID_THIS('File');` },
+    'node:internal/file:94:13': { file: 'node:internal/file', line: 94, column: 13, text: `      throw new ERR_INVALID_THIS('File');` },
+    'node:buffer:362:9': { file: 'node:buffer', line: 362, column: 9, text: `  throw new ERR_INVALID_ARG_TYPE(` },
+    'node:fs:561:18': { file: 'node:fs', line: 561, column: 18, text: `  return binding.open(` },
+};
+
+/** The site a frame names, when the frame is one of an internal of node's; undefined for every other. */
+function internalSiteOf(text: string): string | undefined {
+    const at = /^\s*at (?:(?:.*?) )?\(node:([^\s()]*):(\d+):(\d+)\)\s*$/.exec(text);
+    return at === null ? undefined : `node:${at[1]}:${at[2]}:${at[3]}`;
+}
+
+/**
  * What node writes when a script file -- not a `-e`/`-p` source -- dies on a fatal error: the file
  * and the line, the offending line of the source, a caret under it, then the error, the frames of
  * the source's own and the version trailer behind them. That block in front and that trailer behind
@@ -986,6 +1012,20 @@ function scriptFailureText(message: string, sourceOf: (at: string) => string | u
        the guest's own formatter produced: there is no line it was raised at, and no host node shape
        to put it in, so it is left as it was too. */
     if (/^Error: Script execution timed out after /.test(lines[0] ?? '')) return undefined;
+    /* An error a builtin raised is reported where node reports one: at the file, line and column of
+       the builtin's own source, with the line of it printed and a caret under the throw, and the
+       frames behind it -- the caller's among them -- left as they are. The source is node's own and
+       not the program's, so it is read out of the table above and not through `sourceOf`. */
+    const raised = internalSiteOf(lines[1] ?? '');
+    const internal = raised === undefined ? undefined : NODE_INTERNAL_SITES[raised];
+    if (internal !== undefined) {
+        const source = internal.text.replace(/\t/g, ' ');
+        const marked = caretColumn(source, internal.column);
+        const caret = marked > source.length ? ' '.repeat(source.length) : ' '.repeat(marked - 1) + '^';
+        const block = `${internal.file}:${internal.line}\n${source}\n${caret}\n`;
+        const frames = lines.slice(1).map((text) => nodeFrame(text, sourceOf));
+        return `${block}\n${lines[0]}\n${frames.join('\n')}${REPORT_TRAILER}`;
+    }
     for (let at = 1; at < lines.length; at++) {
         const site = scriptSiteOf(lines[at] ?? '');
         if (site === undefined) continue;

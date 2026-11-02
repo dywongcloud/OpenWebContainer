@@ -1,0 +1,22 @@
+owc-builtin-error-frame-not-internal -- fixed
+
+An error a builtin raises is reported where host node v24.15.0 reports one -- at the builtin's
+own file, line and column, named as the host names it:
+
+    at new Blob (node:internal/blob:148:13)
+    at new File (node:internal/file:64:13)
+    at Buffer.from (node:buffer:362:9)
+    at Object.openSync (node:fs:561:18) / at Object.readFileSync (node:fs:445:35)
+    at get size (node:internal/blob:230:13)
+
+and the report opens on the builtin's own source line with a caret under the throw --
+`node:internal/blob:148` over `      throw new ERR_INVALID_ARG_TYPE('sources', 'a sequence', sources);`
+-- where it opened on the line of the program that called the builtin.
+
+Files: packages/core/src/process/executors/node/runtime/guest/buffer-fs.ts (internalSiteOf, and
+the raise sites of the two constructors, Buffer.from, fs.readFileSync and the four accessors),
+packages/core/src/process/executors/node/process.ts (NODE_INTERNAL_SITES and the branch of
+scriptFailureText that prints the builtin's own source line).
+
+Witness: 1793603615872-6792-7d71701cee0ff3c4 (session verify-owc-builtin-error-frame-not-internal)
+Status: resolved

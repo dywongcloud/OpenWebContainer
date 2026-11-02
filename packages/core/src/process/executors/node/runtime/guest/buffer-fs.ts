@@ -4,6 +4,32 @@
  * implementation. Plain JavaScript inside a String.raw snippet.
  */
 export const BUFFER_FS_SRC = String.raw`
+/*
+ * The frames host node gives an error a builtin raised: the builtin's own, at the file, line and
+ * column of node's internal source and under the name node names it there -- 'at new Blob
+ * (node:internal/blob:148:13)' -- in front of the frames of the caller. Those were the only frames
+ * one of these carried until now, so a report named the line of the program that called the builtin
+ * where node names the place inside the builtin that raised. Shared by the two factories below,
+ * which is why it stands outside both.
+ */
+function internalSiteOf(err, sites) {
+  var stack = typeof err.stack === 'string' ? err.stack : '';
+  var cut = stack.indexOf('\n');
+  var head = cut < 0 ? stack : stack.slice(0, cut);
+  var rest = cut < 0 ? '' : stack.slice(cut + 1);
+  var tail = rest === '' ? [] : rest.split('\n');
+  /* The frame of a '.call' or '.apply' a caller reached the builtin through is one node's own stack
+     does not carry -- a native frame is never named there -- so it goes out of the frames behind
+     the internal ones, which is what leaves the caller's frame next to them. */
+  while (tail.length > 0 && /^ {4}at (?:call|apply) \(native\)$/.test(tail[0])) tail.shift();
+  var frames = [];
+  for (var i = 0; i < sites.length; i++) {
+    frames.push('    at ' + sites[i][0] + ' (' + sites[i][1] + ':' + sites[i][2] + ':' + sites[i][3] + ')');
+  }
+  try { err.stack = [head].concat(frames, tail).join('\n'); } catch (e) { }
+  return err;
+}
+
 BF.buffer = function () {
   function Buffer(arg, encodingOrOffset, length) {
     /*
@@ -41,7 +67,9 @@ BF.buffer = function () {
       return wrapBytes(arr);
     }
     if (value && value.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
-    throw new TypeError('The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array');
+    throw internalSiteOf(
+      new TypeError('The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array'),
+      [['Buffer.from', 'node:buffer', 362, 9]]);
   };
 
   /*
@@ -731,7 +759,9 @@ BF.buffer = function () {
     if (sources === undefined) return [];
     var iterable = typeof sources === 'object' && sources !== null && typeof sources[Symbol.iterator] === 'function';
     if (!iterable) {
-      throw blobErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "sources" argument must be a sequence. Received ' + describeArg(sources));
+      throw internalSiteOf(
+        blobErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "sources" argument must be a sequence. Received ' + describeArg(sources)),
+        [['new Blob', 'node:internal/blob', 148, 13]]);
     }
     return Array.from(sources);
   }
@@ -742,10 +772,14 @@ BF.buffer = function () {
   function blobOptionsOf(options) {
     if (options === undefined || options === null) return undefined;
     if (typeof options !== 'object' && typeof options !== 'function') {
-      throw blobErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "options" argument must be a dictionary. Received ' + describeArg(options));
+      throw internalSiteOf(
+        blobErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "options" argument must be a dictionary. Received ' + describeArg(options)),
+        [['new Blob', 'node:internal/blob', 150, 5]]);
     }
     if (options.endings !== undefined && options.endings !== 'transparent' && options.endings !== 'native') {
-      throw blobErr(TypeError, 'ERR_INVALID_ARG_VALUE', "The property 'options.endings' is invalid. Received '" + String(options.endings) + "'");
+      throw internalSiteOf(
+        blobErr(TypeError, 'ERR_INVALID_ARG_VALUE', "The property 'options.endings' is invalid. Received '" + String(options.endings) + "'"),
+        [['new Blob', 'node:internal/blob', 158, 13]]);
     }
     return options;
   }
@@ -779,10 +813,21 @@ BF.buffer = function () {
       this[kBlobParts] = parts.filter(function (part) { return part.length > 0; });
       this[kBlobType] = given !== undefined && given.type !== undefined ? blobType(given.type) : '';
     }
+    /* 'this' of every accessor: node refuses a value that is not one of these with ERR_INVALID_THIS,
+       raised at the site of the accessor in its own internal source, and not at the line of the
+       caller that reached into the accessor behind a descriptor. */
     get size() {
+      if (!(this instanceof Blob)) {
+        throw internalSiteOf(blobErr(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type Blob'),
+          [['get size', 'node:internal/blob', 230, 13]]);
+      }
       return this[kBlobBytes].length;
     }
     get type() {
+      if (!(this instanceof Blob)) {
+        throw internalSiteOf(blobErr(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type Blob'),
+          [['get type', 'node:internal/blob', 220, 13]]);
+      }
       return this[kBlobType];
     }
     /* Node yields one chunk per non-empty source part; the reader is the web ReadableStream the
@@ -956,7 +1001,9 @@ BF.buffer = function () {
       /* The two arguments node insists on, counted before the bits are read: a File made with one is
          refused even when the one it was given is a shape a Blob would have taken. */
       if (arguments.length < 2) {
-        throw blobErr(TypeError, 'ERR_MISSING_ARGS', 'The "fileBits" and "fileName" arguments must be specified');
+        throw internalSiteOf(
+          blobErr(TypeError, 'ERR_MISSING_ARGS', 'The "fileBits" and "fileName" arguments must be specified'),
+          [['new File', 'node:internal/file', 64, 13]]);
       }
       super(sources, options);
       if (typeof fileName === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
@@ -968,9 +1015,17 @@ BF.buffer = function () {
       this[kFileModified] = given === undefined ? Date.now() : (given !== given ? 0 : given);
     }
     get name() {
+      if (!(this instanceof File)) {
+        throw internalSiteOf(blobErr(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type File'),
+          [['get name', 'node:internal/file', 87, 13]]);
+      }
       return this[kFileName];
     }
     get lastModified() {
+      if (!(this instanceof File)) {
+        throw internalSiteOf(blobErr(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type File'),
+          [['get lastModified', 'node:internal/file', 94, 13]]);
+      }
       return this[kFileModified];
     }
   }
@@ -1792,7 +1847,10 @@ BF.fs = function () {
     /* The file a read opens is the one the link names, not the link: its type and its access bits
        are the target's, and so are the bytes that come back. */
     var st = statFollowingLinks(file, 'open', pathName(p));
-    if (!st) throw fsError('ENOENT', 'open', pathName(p));
+    /* The two frames node's own readFileSync carries: the open that failed is the one the error is
+       raised at, and the read the caller asked for is behind it. */
+    if (!st) throw internalSiteOf(fsError('ENOENT', 'open', pathName(p)),
+      [['Object.openSync', 'node:fs', 561, 18], ['Object.readFileSync', 'node:fs', 445, 35]]);
     /* A read of a directory is EISDIR on host node 24.15, and the error it raises carries the
        syscall alone: no path, and none in its sentence either, where every other rejection this
        file composes names the file it was asked about. */
