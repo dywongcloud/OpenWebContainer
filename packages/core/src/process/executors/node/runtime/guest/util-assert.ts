@@ -2048,6 +2048,90 @@ function parseArgsImpl(config) {
   return result;
 }
 
+/*
+ * Every entry of util.getSystemErrorMap(): libuv errno -> [name, message]. The 85 rows are the
+ * ones host node v24.15 answers, messages included, so getSystemErrorName over the shared
+ * __owcErrname table and getSystemErrorMap over this one cannot disagree about a name.
+ */
+var SYSTEM_ERROR_ENTRIES = [
+  [-7, ["E2BIG", "argument list too long"]], [-13, ["EACCES", "permission denied"]],
+  [-48, ["EADDRINUSE", "address already in use"]],
+  [-49, ["EADDRNOTAVAIL", "address not available"]],
+  [-47, ["EAFNOSUPPORT", "address family not supported"]],
+  [-35, ["EAGAIN", "resource temporarily unavailable"]],
+  [-3000, ["EAI_ADDRFAMILY", "address family not supported"]],
+  [-3001, ["EAI_AGAIN", "temporary failure"]], [-3002, ["EAI_BADFLAGS", "bad ai_flags value"]],
+  [-3013, ["EAI_BADHINTS", "invalid value for hints"]],
+  [-3003, ["EAI_CANCELED", "request canceled"]], [-3004, ["EAI_FAIL", "permanent failure"]],
+  [-3005, ["EAI_FAMILY", "ai_family not supported"]], [-3006, ["EAI_MEMORY", "out of memory"]],
+  [-3007, ["EAI_NODATA", "no address"]], [-3008, ["EAI_NONAME", "unknown node or service"]],
+  [-3009, ["EAI_OVERFLOW", "argument buffer overflow"]],
+  [-3014, ["EAI_PROTOCOL", "resolved protocol is unknown"]],
+  [-3010, ["EAI_SERVICE", "service not available for socket type"]],
+  [-3011, ["EAI_SOCKTYPE", "socket type not supported"]],
+  [-37, ["EALREADY", "connection already in progress"]],
+  [-9, ["EBADF", "bad file descriptor"]], [-16, ["EBUSY", "resource busy or locked"]],
+  [-89, ["ECANCELED", "operation canceled"]],
+  [-4080, ["ECHARSET", "invalid Unicode character"]],
+  [-53, ["ECONNABORTED", "software caused connection abort"]],
+  [-61, ["ECONNREFUSED", "connection refused"]],
+  [-54, ["ECONNRESET", "connection reset by peer"]],
+  [-39, ["EDESTADDRREQ", "destination address required"]],
+  [-17, ["EEXIST", "file already exists"]],
+  [-14, ["EFAULT", "bad address in system call argument"]], [-27, ["EFBIG", "file too large"]],
+  [-65, ["EHOSTUNREACH", "host is unreachable"]], [-4, ["EINTR", "interrupted system call"]],
+  [-22, ["EINVAL", "invalid argument"]], [-5, ["EIO", "i/o error"]],
+  [-56, ["EISCONN", "socket is already connected"]],
+  [-21, ["EISDIR", "illegal operation on a directory"]],
+  [-62, ["ELOOP", "too many symbolic links encountered"]],
+  [-24, ["EMFILE", "too many open files"]], [-40, ["EMSGSIZE", "message too long"]],
+  [-63, ["ENAMETOOLONG", "name too long"]], [-50, ["ENETDOWN", "network is down"]],
+  [-51, ["ENETUNREACH", "network is unreachable"]], [-23, ["ENFILE", "file table overflow"]],
+  [-55, ["ENOBUFS", "no buffer space available"]], [-19, ["ENODEV", "no such device"]],
+  [-2, ["ENOENT", "no such file or directory"]], [-12, ["ENOMEM", "not enough memory"]],
+  [-4056, ["ENONET", "machine is not on the network"]],
+  [-42, ["ENOPROTOOPT", "protocol not available"]],
+  [-28, ["ENOSPC", "no space left on device"]], [-78, ["ENOSYS", "function not implemented"]],
+  [-57, ["ENOTCONN", "socket is not connected"]], [-20, ["ENOTDIR", "not a directory"]],
+  [-66, ["ENOTEMPTY", "directory not empty"]],
+  [-38, ["ENOTSOCK", "socket operation on non-socket"]],
+  [-45, ["ENOTSUP", "operation not supported on socket"]],
+  [-84, ["EOVERFLOW", "value too large for defined data type"]],
+  [-1, ["EPERM", "operation not permitted"]], [-32, ["EPIPE", "broken pipe"]],
+  [-100, ["EPROTO", "protocol error"]], [-43, ["EPROTONOSUPPORT", "protocol not supported"]],
+  [-41, ["EPROTOTYPE", "protocol wrong type for socket"]],
+  [-34, ["ERANGE", "result too large"]], [-30, ["EROFS", "read-only file system"]],
+  [-58, ["ESHUTDOWN", "cannot send after transport endpoint shutdown"]],
+  [-29, ["ESPIPE", "invalid seek"]], [-3, ["ESRCH", "no such process"]],
+  [-60, ["ETIMEDOUT", "connection timed out"]], [-26, ["ETXTBSY", "text file is busy"]],
+  [-18, ["EXDEV", "cross-device link not permitted"]], [-4094, ["UNKNOWN", "unknown error"]],
+  [-4095, ["EOF", "end of file"]], [-6, ["ENXIO", "no such device or address"]],
+  [-31, ["EMLINK", "too many links"]], [-64, ["EHOSTDOWN", "host is down"]],
+  [-4030, ["EREMOTEIO", "remote I/O error"]],
+  [-25, ["ENOTTY", "inappropriate ioctl for device"]],
+  [-79, ["EFTYPE", "inappropriate file type or format"]],
+  [-92, ["EILSEQ", "illegal byte sequence"]],
+  [-44, ["ESOCKTNOSUPPORT", "socket type not supported"]],
+  [-96, ["ENODATA", "no data available"]],
+  [-4023, ["EUNATCH", "protocol driver not attached"]], [-8, ["ENOEXEC", "exec format error"]],
+];
+/*
+ * The format names util.styleText accepts, in the order node lists them in its
+ * ERR_INVALID_ARG_VALUE -- which is not sorted: the eight SGR attributes, the sixteen colours,
+ * the bright variants, and then the aliases ('grey' for 'gray', 'faint' for 'dim', and so on).
+ */
+var STYLE_TEXT_FORMATS = [
+  'reset', 'bold', 'dim', 'italic', 'underline', 'blink', 'inverse', 'hidden', 'strikethrough',
+  'doubleunderline', 'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
+  'bgBlack', 'bgRed', 'bgGreen', 'bgYellow', 'bgBlue', 'bgMagenta', 'bgCyan', 'bgWhite',
+  'framed', 'overlined', 'gray', 'redBright', 'greenBright', 'yellowBright', 'blueBright',
+  'magentaBright', 'cyanBright', 'whiteBright', 'bgGray', 'bgRedBright', 'bgGreenBright',
+  'bgYellowBright', 'bgBlueBright', 'bgMagentaBright', 'bgCyanBright', 'bgWhiteBright', 'grey',
+  'blackBright', 'bgGrey', 'bgBlackBright', 'faint', 'crossedout', 'strikeThrough',
+  'crossedOut', 'conceal', 'swapColors', 'swapcolors', 'doubleUnderline',
+];
+var STYLE_TEXT_FORMAT_LIST = STYLE_TEXT_FORMATS.map(function (name) { return "'" + name + "'"; }).join(", ");
+
 BF.util = function () {
   var EE = null;
   var util = {
@@ -2143,6 +2227,33 @@ BF.util = function () {
       return String(s).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
     },
     /*
+     * util.styleText(format, text, options). Node validates the format first and always -- a
+     * format it does not know is an ERR_INVALID_ARG_VALUE naming every one it accepts, whether or
+     * not the stream it would write to has any colour -- and only then looks at the text. Here,
+     * no stream this container writes to has colour depth, so the styling is the empty one node
+     * applies on a non-TTY: the text comes back exactly as it went in. The arity a program reads
+     * is 3, as node's is, and the name is 'styleText' and not the name it was built under here.
+     */
+    styleText: function (format, text, options) {
+      var list = Array.isArray(format) ? format : [format];
+      for (var fi = 0; fi < list.length; fi++) {
+        if (STYLE_TEXT_FORMATS.indexOf(list[fi]) === -1) {
+          throw utilArgValueReceived('format', 'must be one of: ' + STYLE_TEXT_FORMAT_LIST, list[fi]);
+        }
+      }
+      if (typeof text !== 'string') throw utilArgTypeError('text', 'of type string', text);
+      if (options !== undefined && (options === null || typeof options !== 'object')) {
+        throw utilArgTypeError('options', 'of type object', options);
+      }
+      if (options !== undefined && options !== null && options.stream !== undefined && options.stream !== null) {
+        var st = options.stream;
+        if (typeof st !== 'object' || (typeof st.pipe !== 'function' && typeof st.write !== 'function' && typeof st.read !== 'function')) {
+          throw utilArgTypeError('stream', 'an instance of ReadableStream, WritableStream, or Stream', st);
+        }
+      }
+      return text;
+    },
+    /*
      * The name of an errno, e.g. -2 -> 'ENOENT'. The table is libuv's, shared with
      * process.binding('uv').errname through __owcErrname, which globals.ts sets. Node rejects
      * anything that is not a negative integer with ERR_OUT_OF_RANGE, and so does this: execa takes
@@ -2166,6 +2277,20 @@ BF.util = function () {
       var name = typeof errname === 'function' ? errname(err) : '';
       return name === undefined || name === null || name === '' ? 'Unknown system error ' + err : name;
     },
+    /*
+     * util.getSystemErrorMap(): the errno table as a Map, errno -> [name, message], the way node
+     * hands it out. A fresh Map per call, as node's is: a caller that puts a row in it or takes
+     * one out does not change what the next caller sees. 85 entries, and an errno the table does
+     * not hold -- a positive one above all -- is simply absent from it, so get(1) is undefined.
+     */
+    getSystemErrorMap: function () {
+      var map = new Map();
+      for (var ei = 0; ei < SYSTEM_ERROR_ENTRIES.length; ei++) {
+        var row = SYSTEM_ERROR_ENTRIES[ei];
+        map.set(row[0], [row[1][0], row[1][1]]);
+      }
+      return map;
+    },
     types: utilTypes(),
     parseArgs: parseArgsImpl,
     TextEncoder: TextEncoderImpl,
@@ -2175,6 +2300,13 @@ BF.util = function () {
      'util.promisify.custom' -- which is the only way a program can put the hook on a value: a
      guest that wrote '{ [util.inspect.custom]: fn }' built an object keyed "undefined" while the
      symbol was missing, and no custom inspect was ever called. */
+  /* The arity and the name a program reads off styleText: node writes it with three parameters
+     -- format, text and the options object -- and names it 'styleText', which is not the name
+     the property this object was built under gives it. */
+  Object.defineProperty(util.styleText, 'length', { value: 3, configurable: true });
+  Object.defineProperty(util.styleText, 'name', { value: 'styleText', configurable: true });
+  Object.defineProperty(util.getSystemErrorMap, 'length', { value: 0, configurable: true });
+  Object.defineProperty(util.getSystemErrorMap, 'name', { value: 'getSystemErrorMap', configurable: true });
   if (INSPECT_CUSTOM !== undefined) util.inspect.custom = INSPECT_CUSTOM;
   if (PROMISIFY_CUSTOM !== undefined) util.promisify.custom = PROMISIFY_CUSTOM;
   return util;
