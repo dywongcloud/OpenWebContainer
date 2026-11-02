@@ -3450,25 +3450,81 @@ export const SRC = String.raw`
    * file here and no category for one to be enabled on, so enable and disable report success
    * without writing anything -- as node's own do for a category no producer owns -- and
    * getEnabledCategories answers undefined, which is what it answers while no tracing is on.
+   * What node's Tracing keeps in a private field this one keeps beside the object rather than on
+   * it, so an instance carries no own property at all: 'categories' and 'enabled' are accessors
+   * of the prototype as node's are, and Object.keys of one is [] as node's is.
+   * rows owc-trace-events-createtracing-no-validation, owc-trace-events-tracing-own-props.
    */
   BF['trace_events'] = function () {
-    function Tracing(categories) {
-      this.categories = categories;
-      this.enabled = false;
+    var states = new WeakMap();
+    function stateOf(tracing) {
+      var state = states.get(tracing);
+      return state === undefined ? { categories: '', enabled: false } : state;
     }
-    Tracing.prototype.enable = function () {
-      this.enabled = true;
-      return undefined;
-    };
-    Tracing.prototype.disable = function () {
-      this.enabled = false;
-      return undefined;
-    };
+    /* node's determineSpecificType: the '. Received ...' clause that ends every one of these. */
+    function receivedOf(value) {
+      if (value === null) return 'null';
+      if (value === undefined) return 'undefined';
+      var type = typeof value;
+      if (type === 'string') return "type string ('" + value + "')";
+      if (type === 'number') return 'type number (' + String(value) + ')';
+      if (type === 'boolean') return 'type boolean (' + String(value) + ')';
+      if (type === 'bigint') return 'type bigint (' + String(value) + 'n)';
+      if (type === 'symbol') return 'type symbol (' + String(value) + ')';
+      if (type === 'function') return 'function ' + (typeof value.name === 'string' ? value.name : '');
+      var ctor = value.constructor;
+      return ctor && typeof ctor.name === 'string' && ctor.name !== ''
+        ? 'an instance of ' + ctor.name : 'type object';
+    }
+    function argTypeError(name, expected, value) {
+      return nodeError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "' + name + '" argument must be ' + expected + '. Received ' + receivedOf(value));
+    }
+    function propTypeError(name, expected, value) {
+      return nodeError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "' + name + '" property must be ' + expected + '. Received ' + receivedOf(value));
+    }
+    function Tracing(categories) {
+      states.set(this, { categories: categories, enabled: false });
+    }
+    /* node's Tracing is a class, so its three methods and its two accessors are not enumerable
+       and the two accessors have no setter -- which is why a caller's own 'tracing.enabled = true'
+       changes nothing on node either. */
+    Object.defineProperty(Tracing.prototype, 'enable', {
+      value: function () { stateOf(this).enabled = true; return undefined; },
+      writable: true, enumerable: false, configurable: true
+    });
+    Object.defineProperty(Tracing.prototype, 'disable', {
+      value: function () { stateOf(this).enabled = false; return undefined; },
+      writable: true, enumerable: false, configurable: true
+    });
+    Object.defineProperty(Tracing.prototype, 'enabled', {
+      get: function () { return stateOf(this).enabled; },
+      enumerable: false, configurable: true
+    });
+    Object.defineProperty(Tracing.prototype, 'categories', {
+      get: function () { return stateOf(this).categories; },
+      enumerable: false, configurable: true
+    });
     return {
       createTracing: function (options) {
-        var categories = options !== null && typeof options === 'object' && Array.isArray(options.categories)
-          ? options.categories.join(',') : '';
-        return new Tracing(categories);
+        /* node's own order: an object, then an array of strings, then one that is not empty. */
+        if (options === null || typeof options !== 'object') {
+          throw argTypeError('options', 'of type object', options);
+        }
+        var categories = options.categories;
+        if (!Array.isArray(categories)) {
+          throw propTypeError('options.categories', 'an instance of Array', categories);
+        }
+        for (var catAt = 0; catAt < categories.length; catAt++) {
+          if (typeof categories[catAt] !== 'string') {
+            throw propTypeError('options.categories[' + catAt + ']', 'of type string', categories[catAt]);
+          }
+        }
+        if (categories.length === 0) {
+          throw nodeError(TypeError, 'ERR_TRACE_EVENTS_CATEGORY_REQUIRED', 'At least one category is required');
+        }
+        return new Tracing(categories.join(','));
       },
       getEnabledCategories: function () { return undefined; }
     };
