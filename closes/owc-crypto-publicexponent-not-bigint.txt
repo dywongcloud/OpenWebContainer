@@ -1,0 +1,41 @@
+owc-crypto-publicexponent-not-bigint stale 1793611022077-0-76a8928c26fc6e20 2026-11-02T18:17:00Z
+
+Symptom
+  publicKey.asymmetricKeyDetails.publicExponent comes back as a decimal string
+  where host node v24.15 hands back a BigInt. It is inside a nested object, so a
+  sweep comparing only publicKey.type and asymmetricKeyType never sees it.
+
+Refutation
+  No caller path reaches a decimal publicExponent at the origin/main tip. Every
+  KeyObject, however it is built -- generateKeyPairSync and generateKeyPair for
+  rsa (default, publicExponent 3, publicExponent 65537), rsa-pss, dsa, ec and
+  ed25519; createPublicKey and createPrivateKey from PEM, DER, JWK and from a
+  private KeyObject; and X509Certificate.publicKey for rsa, rsa-pss, dsa, ec and
+  ed25519 certificates -- answers asymmetricKeyDetails through keyInfo in
+  packages/core/src/process/executors/node/runtime/guest/misc.ts, which turns the
+  capability's decimal text into the guest's own BigInt. Measured: 28 of 28 lines
+  a fresh container boot prints naming publicExponent name it a bigint, 30 of 30
+  on host node v24.15.0, and 0 of either names it a string. The two host-only
+  lines are the PKCS#1 PEM imports this container refuses outright, a case of its
+  own that was already diverging. The one decimal publicExponent in the tree is
+  the host-side X509 parse payload
+  (packages/core/src/process/executors/node/runtime/capabilities/x509.ts,
+  parsePublicKey, "Node's asymmetricKeyDetails.publicExponent is a bigint; this is
+  its decimal text"): no caller reads it, because X509Certificate.publicKey
+  re-imports the SPKI into a KeyObject and the guest reads only .spki.
+  Nothing was changed: no code edit can move a value no caller observes, and the
+  sweeps before and after are the same sweep.
+
+Witness
+  dispatch 1793611022077-0-76a8928c26fc6e20, session verify-pubexp42, at
+  origin/main fb1b8b5 (published commit's parent): one fresh container boot for
+  probe-all.js (5 key types x 12 entry points plus X509 field, legacy object and
+  verify dumps for rsa, ec and ed25519 certificates) and one for probe4.js
+  (explicit publicExponent 3 and 65537, async generateKeyPair, crypto.Certificate,
+  Object.keys(crypto), and rsa, rsa-pss, dsa, ec and ed25519 certificates),
+  against host node v24.15.0 on the other side, stdout + stderr + exit code
+  compared, at two memory points (load 15.55 with 622 MB free and load 90.23 with
+  289 MB free). Measured from an origin/main export under /tmp/owc-pubexp42,
+  never the shared working tree. The Certificate object and the X.509 field,
+  legacy-object and verify lines it shares with the Certificate work are in the
+  same sweep and are unchanged by this row.
