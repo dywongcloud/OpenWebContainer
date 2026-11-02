@@ -1,0 +1,41 @@
+owc-trace-events-tracing-own-props resolved witness-70a6ece51d9c21d0 2026-11-02T05:00:00Z
+
+Symptom
+  A `trace_events` tracing object owned `categories` and `enabled` as writable data
+  properties, so `Object.keys(createTracing({ categories: ['node.async_hooks'] }))`
+  was `["categories","enabled"]` in the container and `[]` on host node v24.15.0,
+  where both are accessors of the prototype: the object spread, serialised and
+  enumerated differently from a host's -- `{"categories":"node.async_hooks","enabled":false}`
+  against `{}`, and a spread that copied both against one that copied neither.
+  `enable` and `disable` were enumerable on the prototype here and are not on node.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/pure-b.ts: what
+  node's `Tracing` keeps in a private field this one now keeps beside the object
+  rather than on it, in a `WeakMap` the factory closes over, so an instance carries
+  no own property at all. `categories` and `enabled` are getter-only accessors of
+  the prototype, as node's are, and `enable` and `disable` are non-enumerable
+  methods there, as node's are; the prototype's own names are the host's five in
+  the host's order -- `constructor`, `enable`, `disable`, `enabled`, `categories`.
+  The two getters answer what they answered before, and `enable()` and `disable()`
+  still answer `undefined` and move the flag.
+
+Witness
+  witness-70a6ece51d9c21d0, session verify-owc-trace-events-tracing-own-props, output
+  /private/tmp/owc-trace41/witness-row2.out (sha256 70a6ece51d9c21d0040a3de6c795f14f
+  2875a0122277066fce476d67f1ab4d65).
+
+  Measured from a git archive export of origin/main tip 13900f733df6897cbc13b2d81a3f7f
+  84da70722e, installed and built under /private/tmp/owc-trace41/verify/export, never
+  the shared working tree, which is 441 commits behind and would revert over a
+  thousand published lines. Container dist sha256 3b67e46de08b86e5697d79c1366112a2
+  09102a7e7c5e2b44389574a91195de1e, host node v24.15.0 on the other side, one fresh
+  container boot per case, stdout + stderr + exit code compared, two memory points
+  (3.5 GB free and, with 4.5 GB of live ballast, 0.45 GB free; machine load 15).
+  Six cases -- `Object.keys`, `Object.getOwnPropertyNames`, the enumerable keys and
+  own names of the prototype, the own and prototype descriptors of `categories` and
+  `enabled` and of `enable` and `disable`, a spread, `JSON.stringify`, the two
+  getters, `enable` and `disable`, and the module's export keys -- each run twice:
+  before the fix the object's own keys were `["categories","enabled"]` against the
+  host's `[]` and after it every line is byte-identical. A seven-case sweep of the
+  other modules of the same file answers identically before the fix and after it.
