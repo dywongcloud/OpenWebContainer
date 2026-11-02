@@ -1,0 +1,46 @@
+owc-stack-subclass-extra-frame resolved 1793620626008-6487-a45a4f37639cb050 2026-11-02T10:23:46.000Z
+Row: owc-stack-subclass-extra-frame
+Witness: 1793620626008-6487-a45a4f37639cb050
+Status: resolved
+
+Symptom
+  A program that subclasses Error and throws the subclass:
+
+    host   Error: boom
+             at Object.<anonymous> (/app/main.js:3:9)
+    guest  Error: boom
+             at MyError (/app/main.js:1:30)
+             at Object.<anonymous> (/app/main.js:3:9)
+
+  Host node v24.15.0 goes from the header straight to the frame that threw; the container carried an
+  extra frame naming the subclass's own constructor between them.
+
+Cause
+  packages/core/src/process/executors/node/runtime/guest/globals.ts -- Shim, the wrapper that stands
+  for the engine's Error and every class beside it, built the stack out of the engine's own trace and
+  cut only the two frames the wrapper itself contributes: the Reflect.construct call and the wrapper.
+  V8 cuts more than that. It captures the trace with the constructor the error was asked through as
+  the cut -- new.target, which is MyError and not Error -- so that frame and every one above it are
+  gone before the frames are counted. Nothing here asked which constructor the error was asked
+  through.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/globals.ts
+    Shim -- new.target, where it is neither undefined nor the wrapper itself, is the subclass the
+      error was asked through, and it is handed to framesOfEngineStack.
+    framesOfEngineStack -- the frames of that constructor and every one above it go out of the trace
+      before the count, the way V8's cut takes them. frameCtorNameOf reads the name a frame calls the
+      function it stands in, 'MyError' out of 'at MyError (...)' and out of 'at new MyError (...)'.
+      An error asked through Error itself, and every error this container raises of its own, asks for
+      no cut and is the stack it was.
+
+Witness
+  dispatch 1793620626008-6487-a45a4f37639cb050, session verify-stackcode42b, on a fresh git-archive
+  export of origin/main built under /tmp/owc-stackcode42b, host node v24.15.0 on the other side, one
+  fresh container boot per case, stdout + stderr + exit code compared at two memory points.
+  Fourteen cases: twelve agree with host node v24.15.0 and two differ. subclass-stack agrees after
+  the fix and disagreed before it, and the eleven that agreed before -- a plain throw, a CommonJS
+  frame, a stackTraceLimit of three, a caught Buffer.from, an uncaught one, Buffer.alloc's two
+  refusals, a caught net.connect, an ENOENT caught and uncaught and an error a program coded
+  itself -- still agree. The two that differ are the ones that differed before, by the margin they
+  did: a message getter that throws and an uncaught coded error's report banner, each its own row.

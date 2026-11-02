@@ -1695,7 +1695,14 @@ function stackHeaderOf(err) {
  * about -- and less the empty line the engine ends every stack with. The count is the limit the
  * host keeps on Error.stackTraceLimit.
  */
-function framesOfEngineStack(stack, ownFrame) {
+/* The name a frame calls the function it stands in: 'MyError' out of '    at MyError (/app/main.js:1:30)'
+   and out of '    at new MyError (/app/main.js:1:30)', which is one frame host node names both ways. */
+function frameCtorNameOf(line) {
+  var m = /^ {4}at (?:new )?([^ ]*) \(/.exec(String(line));
+  return m === null ? '' : m[1];
+}
+
+function framesOfEngineStack(stack, ownFrame, subclassName) {
   var lines = typeof stack === 'string' && stack !== '' ? stack.split('\n') : [];
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   var at = 0;
@@ -1704,6 +1711,17 @@ function framesOfEngineStack(stack, ownFrame) {
      node's own loader behind a guest's included, so it is put on the frames once node's are among
      them and not on the frames the engine handed over before that. */
   var frames = programFramesOf(lines.slice(at));
+  /* A subclass carries the frame of its own constructor and host node's does not: V8 captures the
+     trace with the constructor the error was asked through as the cut, so that frame and every one
+     above it are gone before the frames are counted -- 'throw new MyError('boom')' opens on the
+     frame that threw and not on 'at MyError'. */
+  if (subclassName) {
+    var cut = -1;
+    for (var c = 0; c < frames.length; c++) {
+      if (frameCtorNameOf(frames[c]) === subclassName) { cut = c; break; }
+    }
+    if (cut >= 0) frames = frames.slice(cut + 1);
+  }
   var limit = Error.stackTraceLimit;
   if (typeof limit === 'number' && limit >= 0 && frames.length > limit) frames = frames.slice(0, limit);
   return frames.join('\n');
@@ -1744,6 +1762,10 @@ function installStackHeader(name) {
   if (typeof Reflect === 'undefined' || typeof Reflect.construct !== 'function') return;
   var ownFrame = null;
   function Shim() {
+    /* Asked through a subclass -- 'new MyError('boom')' where MyError extends Error -- new.target is
+       that subclass and not this wrapper, which is how host node knows which constructor's frame to
+       cut and how this one does. */
+    var subclass = new.target !== undefined && new.target !== Shim ? new.target : null;
     var err = Reflect.construct(Native, arguments, new.target === undefined ? Shim : new.target);
     var raw = err.stack;
     /* The first error built names the frame the wrapper itself contributes; every later one is
@@ -1752,7 +1774,7 @@ function installStackHeader(name) {
       var built = typeof raw === 'string' && raw !== '' ? raw.split('\n') : [];
       ownFrame = built.length > 1 ? built[1] : '';
     }
-    installErrorStack(err, framesOfEngineStack(raw, ownFrame));
+    installErrorStack(err, framesOfEngineStack(raw, ownFrame, subclass ? String(subclass.name || '') : ''));
     /* Asked here and kept on the error, because the frames the stack is rewritten into are the
        frames a host names and hold nothing of the bootstrap's: once they are the only ones an
        error has, nothing else can say whether it was this container that built it. */
