@@ -1,0 +1,68 @@
+owc-worker-async-throw-kills-parent resolved 1793606599887-7269-a3e2ca9ae7e2a56d
+Row: owc-worker-async-throw-kills-parent
+Witness: 1793606599887-7269-a3e2ca9ae7e2a56d
+Status: resolved
+
+Symptom
+  A worker's asynchronous throw ended the parent instead of reaching the parent's
+  'uncaughtException' listener. A parent that started a Worker, received its 'ready' message, then
+  removed its 'error' and 'message' listeners and told the worker to throw: host node v24.15 gave
+  the error to the parent's own handler ('parent uncaughtException Error: async-throw-in-worker'),
+  the worker exited with code 1, and the parent went on to print 'after=[exit]' and 'DONE' and
+  exit 0. In the container the error was written raw on stderr with the worker's own frame
+  ('/app/w.js:4', 'Error: async-throw-in-worker', 'at /app/w.js:4:30', 'at apply (native)',
+  'Node.js v24.15.0'), no 'uncaughtException' line and no 'after='/'DONE' were printed, and the
+  parent died with status 1. A Worker that never had an 'error' listener at all behaved the same
+  way, and so did a parent with no 'uncaughtException' listener of its own, which is the one case
+  where the host also ends with status 1. 'worker.uncaughtException' is undefined on both sides,
+  and host node v24.15 has no such member either, so that part of the surface is an agreed
+  absence and not a divergence.
+
+Cause
+  The thread's uncaught error crossed to the parent as an IPC frame of kind 'e'
+  (cpWireWorkerErrors sends it, child.sendToParent carries it), and the parent handed it straight
+  to the Worker: cpIpc ended in 'child.emit('error', cpErrorFrom(frame.v))'. With no 'error'
+  listener left on the Worker, that emit throws, and the throw left the host's delivery of the
+  frame rather than a callback of the guest's own -- guestStep caught it as this.fatalError, so
+  the parent reported it and ended with status 1 without any listener ever being asked. Host node
+  24.15 reaches the same emit and the same throw, but there the throw leaves the message callback
+  that carried the error, which is the route a throw out of a timer or a tick takes: an
+  'uncaughtException' listener is given it and the process runs on, or, with no listener at all,
+  the report is written and the process ends with status 1.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/child.ts
+    cpIpc, the 'e' frame -- the error is counted against the Worker's own listeners first: a
+    Worker that still listens is handed the 'error' event exactly as before, and one that does
+    not is given the route host node 24.15 gives the throw, uncaughtFromCallback -- the parent's
+    'uncaughtException' listener is asked, the domain before it as everywhere else, and the
+    report is written only when there is no listener and no domain, which is what ends the
+    process with status 1. The delivery itself no longer throws, so the worker's 'exit' still
+    arrives and the parent runs to its own end.
+
+Witness
+  dispatch 1793606599887-7269-a3e2ca9ae7e2a56d, session verify-owc-worker-async-throw-kills-parent,
+  on a fresh export of origin/main (git archive, pnpm install and pnpm build in packages/core),
+  host node v24.15.0 on the other side, one fresh container boot per case, stdout + stderr + exit
+  code compared, at three memory points (load 33.13 with 0.89 GB free, load 24.19 with 3.83 GB
+  free, and load 24.07 with 0.10 GB free):
+    wa-err-removed      AGREE  (exit 0, 'parent uncaughtException Error: async-throw-in-worker',
+                                'worker exit 1', 'after=[exit]', 'DONE')
+    wa-no-listener      AGREE  (a Worker that never had an 'error' listener)
+    wa-uncaught-member  AGREE  ('worker.uncaughtException=undefined' on both sides)
+    wa-with-listener    AGREE  (the control: a Worker still listening, unchanged by the fix)
+    wt-esm              AGREE  (an ES module entry worker)
+  Before the fix the first three read exit 1 with the worker's report on stderr and no
+  'uncaughtException', 'after=' or 'DONE' line; the control and the ESM entry read as they do now.
+    wa-no-handler       DIFF on stderr only: with no 'uncaughtException' listener either side,
+                        both print the same stdout and exit 1, and each writes a fatal report --
+                        the container's with the worker's own frame, the host's with its
+                        'node:internal/event_target' rethrow frame. That rendering of a report is
+                        unchanged by this fix and is not what the row asks.
+  The worker sweep (SharedArrayBuffer shared and Atomics.add/load across the two threads,
+  getEnvironmentData/setEnvironmentData including the '9'/'9' key split, BroadcastChannel in both
+  directions, 'execArgv' accepted and refused with ERR_WORKER_INVALID_EXEC_ARGV, 'resourceLimits'
+  at start and after exit, 'env: SHARE_ENV' read and written from both sides, an ES module entry)
+  is byte-identical before and after the fix; the two labels where it still differs from the host
+  -- three 'worker_threads' module names the container does not export, and the thread id a
+  refused 'execArgv' consumes -- differ identically on both builds.

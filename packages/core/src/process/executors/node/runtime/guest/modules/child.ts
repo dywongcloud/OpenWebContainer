@@ -1146,7 +1146,18 @@ function cpIpc(child, frame) {
     child.emit('message', message, undefined);
     cpClusterEmit(child, 'message', [message]);
   } else if (frame.t === 'e') {
-    child.emit('error', cpErrorFrom(frame.v));
+    /* An uncaught error in a worker is an 'error' event on the Worker, and with no listener left
+       on it host node 24.15 does not swallow it: emitting at a listener-less Worker throws, the
+       throw leaves the message callback that carried the error, and that is the route a throw
+       out of any other callback takes -- the parent's own 'uncaughtException' listener is given
+       the error and the parent runs on, or, with none at all, the report is written and the
+       process ends with status 1. Emitting it straight at a Worker that had stopped listening
+       threw out of the delivery instead, which is a fault the host's own route does not have: it
+       ended the parent with status 1, printed the worker's frame on stderr and asked no listener
+       at all. A Worker that is still listening is left exactly as it was. */
+    var failed = cpErrorFrom(frame.v);
+    if (child.listenerCount('error') > 0) child.emit('error', failed);
+    else uncaughtFromCallback(failed);
   }
 }
 
