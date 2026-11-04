@@ -1,0 +1,38 @@
+owc-uncaught-errcode-report-banner-line resolved 1793829719810-3012-5998ca782caab7f8 2026-11-04T22:04:37.000Z
+
+Row: owc-uncaught-errcode-report-banner-line
+Witness: 1793829719810-3012-5998ca782caab7f8
+Status: resolved
+
+Resolution
+  The uncaught report of an error this container raised with one of node's codes now opens
+  on node's own internal throw site. Buffer.alloc(-1), net.connect({port:'x'}) and
+  util.parseArgs({args:'nope'}) name node:internal/errors:542, assert.ok(false) names
+  node:internal/assert/utils:77 and process.kill(pid,'NOPE') names
+  node:internal/process/per_thread:272, each with host node 24.15's source line and caret.
+  Two of the five now agree byte for byte; the other three keep their pre-existing margins
+  (the AssertionError message and two absent internal frames), with the banner identical
+  on all five. Host's internal blocks for Blob, File, Buffer.from and fs.readFileSync are
+  untouched, as are the coded line, the [CODE] decoration, builtin frames, ESM file:// frames
+  and columns.
+
+Cause
+  packages/core/src/process/executors/node/runtime/guest/util-assert.ts left the whole
+  uncaught report to the host renderer, which draws its block from the first frame. Node
+  throws coded errors from internal/errors.js (and assert, validators, process/per_thread)
+  and hideStackFrames removes those frames, so no frame names the line host opens on.
+  uncaughtReportOf now writes that block into an already-whole report for a coded error of
+  its own, and leaves rejection reasons and the host's own builtin sites alone.
+
+Witness
+  dispatch 1793829719810-3012-5998ca782caab7f8, session verify-owc-uncaught-errcode-report-banner-line:
+  a fresh git archive of the pushed origin/main tip 53057d01849175dd9beb65341821a76e55fc98b0,
+  installed and built there, one fresh container boot per case against host node v24.15.0,
+  stdout + stderr + exit code compared at two memory points (load 20.37/0.07 GiB free and
+  15.85/0.43 GiB free): 25 of 43 cases agree, 8 newly fixed, no case newly broken. All five
+  coded banners equal host's at both points; errcode-buffer-alloc-range and
+  errcode-net-badport agree byte for byte; errcode-fs-enoent and errcode-buffer-from still
+  agree.
+
+Commit
+  53057d01849175dd9beb65341821a76e55fc98b0
