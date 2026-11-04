@@ -1,0 +1,18 @@
+owc-crypto-ec-sec1-private-key-import-refused resolved 1793815433869-2363-134671d6341dae61 2026-11-04T18:06:33.012Z
+
+Row: owc-crypto-ec-sec1-private-key-import-refused
+Witness: 1793815433869-2363-134671d6341dae61
+Status: resolved
+
+Resolution
+  An EC PRIVATE KEY named sec1 imports in PEM and DER as asymmetricKeyType ec with namedCurve prime256v1. options.type is validated against host node names and then put aside; options.format now chooses the PEM or DER decoder as the host does.
+
+Witness
+  dispatch 1793815433869-2363-134671d6341dae61, session verify-crypto46-sec1: one fresh container boot
+  of the origin/main export at 74d9fd2c against host node v24.15.0, stdout +
+  stderr + exit code compared at two memory points (369093/3613 pages free
+  before, 277352/12535 after): 1884 agreeing labels, 0 regressions, 387
+  agreeing X.509 fields.
+
+Commit
+  0ade284a4f8351dd214c19c4cbab39003cfbe09c
