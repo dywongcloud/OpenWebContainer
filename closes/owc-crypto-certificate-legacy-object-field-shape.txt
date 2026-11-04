@@ -1,0 +1,18 @@
+owc-crypto-certificate-legacy-object-field-shape resolved 1793815436446-2364-4c6f5989afed0be3 2026-11-04T18:06:34.765Z
+
+Row: owc-crypto-certificate-legacy-object-field-shape
+Witness: 1793815436446-2364-4c6f5989afed0be3
+Status: resolved
+
+Resolution
+  Object.keys(new X509Certificate(pem)) is empty as on host node v24.15.0; toLegacyObject answers the nineteen keys with pubkey and raw as Buffers. The 374 agreeing X.509 fields are intact, 387 agreeing now.
+
+Witness
+  dispatch 1793815436446-2364-4c6f5989afed0be3, session verify-crypto46-legacy: one fresh container boot
+  of the origin/main export at 74d9fd2c against host node v24.15.0, stdout +
+  stderr + exit code compared at two memory points (369093/3613 pages free
+  before, 277352/12535 after): 1884 agreeing labels, 0 regressions, 387
+  agreeing X.509 fields.
+
+Commit
+  0ade284a4f8351dd214c19c4cbab39003cfbe09c
