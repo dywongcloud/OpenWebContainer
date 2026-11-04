@@ -1,0 +1,18 @@
+owc-crypto-rsa-pss-spki-import-loses-pss-params resolved 1793815431305-2361-6188e26ae24e3af8 2026-11-04T18:06:29.623Z
+
+Row: owc-crypto-rsa-pss-spki-import-loses-pss-params
+Witness: 1793815431305-2361-6188e26ae24e3af8
+Status: resolved
+
+Resolution
+  Generated, SPKI PEM/DER, PKCS#8 PEM/DER and derived rsa-pss keys answer all five asymmetricKeyDetails fields; the SPKI re-export is 346 bytes and a sign-and-verify round trip agrees. A pkcs1 export of an rsa-pss key now answers ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS rather than writing a body with no PSS parameters.
+
+Witness
+  dispatch 1793815431305-2361-6188e26ae24e3af8, session verify-crypto46-pss: one fresh container boot
+  of the origin/main export at 74d9fd2c against host node v24.15.0, stdout +
+  stderr + exit code compared at two memory points (369093/3613 pages free
+  before, 277352/12535 after): 1884 agreeing labels, 0 regressions, 387
+  agreeing X.509 fields.
+
+Commit
+  0ade284a4f8351dd214c19c4cbab39003cfbe09c
