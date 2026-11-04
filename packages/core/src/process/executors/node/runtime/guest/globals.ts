@@ -4784,10 +4784,23 @@ function circularStructureText(value, replacer) {
   function activeResourceNames() {
     var names = [];
     var i;
+    /* net.ts keeps the list of the servers, sockets and datagram sockets the virtual
+       hub has open, and of the connects in flight. Node names the requests of the
+       moment first, then the handles it still holds, oldest first. The hook is
+       installed when the net family loads, so a run that never required net names
+       no socket at all, as on a host that made none. */
+    var netNames = typeof globalThis.__owcNetResourceNames === 'function'
+      ? globalThis.__owcNetResourceNames() : null;
+    if (netNames !== null) {
+      for (i = 0; i < netNames.requests.length; i++) names.push(netNames.requests[i]);
+    }
     for (i = 0; i < ioInFlight; i++) names.push('FSReqCallback');
     /* A pipe node names is one it is reading: a stdio pipe with nothing to read and nothing to
        write is not active, which is why a run with its output piped names no PipeWrap at all. */
     if (stdinHeld) names.push('PipeWrap');
+    if (netNames !== null) {
+      for (i = 0; i < netNames.handles.length; i++) names.push(netNames.handles[i]);
+    }
     var ids = [];
     for (var id in timers) ids.push(Number(id));
     if (firingTimer !== 0 && timers[firingTimer] === undefined && ids.indexOf(firingTimer) < 0) ids.push(firingTimer);

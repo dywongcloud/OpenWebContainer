@@ -1,0 +1,64 @@
+owc-process-active-resources-socket-unnamed resolved 1793822561625-2759-1f5ce902cb764bc9 2026-11-04T20:02:41Z
+
+Row: owc-process-active-resources-socket-unnamed
+Witness: 1793822561625-2759-1f5ce902cb764bc9
+Status: resolved
+
+Symptom
+  `process.getActiveResourcesInfo()` named no socket here: host node v24.15.0 answers
+  ["TCPServerWrap"] for a listening server, ["TCPServerWrap","TCPSocketWrap"] once a socket dials,
+  ["ConnectWrap","TCPServerWrap","TCPSocketWrap"] while the connect is in flight, ["UDPWrap"] for a
+  datagram socket and PipeWrap for a unix-path handle, and none of the three once the server is closed
+  and the socket destroyed. The virtual hub kept no list of the handles it made, so globals.ts had
+  nothing to read their kinds off: it answered [] throughout, and still did after the earlier fix that
+  named the file request, the pipe and the timers. Host also names GetAddrInfoReqWrap for a DNS lookup
+  of a name (in flight and in its callback), none for an IP literal, and SimpleShutdownWrap at a socket
+  shutdown; those three requests live in dns.ts and the shutdown path, not in this row's grant.
+
+Fix
+  packages/core/src/process/executors/node/runtime/guest/modules/net.ts
+    A list of the open, referenced handles next to netRefresh, which already knows whether an owner
+    holds a ref. A listening TCP server registers TCPServerWrap (a path listener a PipeWrap); a dialling
+    socket registers TCPSocketWrap (a path one a PipeWrap) and a ConnectWrap request; an accepted socket
+    its own TCPSocketWrap; a datagram socket a UDPWrap from the moment it is made. A listener is named
+    from the turn after listen(), a handle leaves the walk on the turn after its close callback, and
+    ref()/unref() add and drop it. The requests are reported ahead of the handles, oldest first, as
+    node's own walk reports them.
+  packages/core/src/process/executors/node/runtime/guest/globals.ts
+    activeResourceNames() reads the net list through a global hook installed when the net family loads,
+    so a run that required no net names no socket; timers, immediates and file requests keep their own
+    names and the FSReqCallback/PipeWrap/timer ordering.
+
+Measurement
+  At the origin/main tip (74d9fd2c7261b2a0c0df70ef8b92dbe33889940e exported with git archive into
+  /tmp, pnpm install --offline and pnpm build there), one fresh OpenWebContainer boot per case against
+  host node v24.15.0 on the other side, stdout + stderr + exit code, at two memory points with load
+  average and free memory recorded for every measurement: point 1 load 12.77 13.95 15.27, 0.86 GB
+  free, no ballast; point 2 load 17.84 15.52 15.74, 1.05 GB free, 1.5 GB ballast held. 67 cases per
+  point covering a listening server, an accepted connection, an outbound connection in progress, one
+  established, a DNS request, a DNS IP-literal lookup, unix-path listens, dgram, the RST cases, the
+  http client destroy cases, and the process cases: before the fix 23 cases agreed with the host
+  exactly and 109 labelled lines agreed; after the fix 36 cases agreed and 177 labelled lines agreed,
+  with zero label regressions and zero case regressions at both points. The row's own acceptance case
+  agrees with the host on stdout, stderr and exit code after the fix and disagreed before it:
+    listen|["TCPServerWrap"] ; socket-connecting|["TCPServerWrap","TCPSocketWrap"] ;
+    connect-in-flight|["ConnectWrap","TCPServerWrap","TCPSocketWrap"] ; teardown|["Timeout"]
+  Host with output redirected to a file (no stdio PipeWrap); the container captures stdout through
+  process events. With stdout piped host also names PipeWrap, as on the earlier row. The timers,
+  immediates and FSReqCallback cases, the dgram fix (connect returns undefined), the listen-path fix,
+  the RST fix (a destroy with unread bytes is ECONNRESET), and the http-client-destroy fix
+  (req.destroy() is quiet, exit 0) all still agree; no case that agreed before disagrees after.
+  13 cases moved from DIFF to SAME: probe/listen, probe/dgram, edge/dgram-unref, timing/a, timing/b,
+  timing/c, mix/mix3, mix/mix5, sweep/n-listen, sweep/n-unref-server, sweep/n-unref-socket,
+  sweep/n-dgram-created, sweep/n-dgram-unref.
+  Witness: dispatch 1793822561625-2759-1f5ce902cb764bc9, session
+  verify-owc-process-active-resources-socket-unnamed, in .gm/exec-spool/.dispatch-ledger.json. Its
+  report is /tmp/owc-resnames46/witness/verify-report.json, with the full before/after comparison in
+  /tmp/owc-resnames46/witness/m1/witness.json and m2/witness.json.
+
+Readme
+  One line in the lane-resnames46 section names the row and the handles it fixes.
+
+References
+  https://nodejs.org/api/process.html#processgetactiveresourcesinfo (nodejs/node doc/api/process.md)
+  https://github.com/nodejs/node/blob/main/src/node_process_methods.cc (the native walk)

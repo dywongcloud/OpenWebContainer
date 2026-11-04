@@ -469,8 +469,83 @@ function netAggregate(failures) {
   return err;
 }
 
+/*
+ * What getActiveResourcesInfo names for the handles this family makes. Node 24.15 walks
+ * the requests in flight first, then the handles it still holds a reference to, oldest
+ * first; the virtual hub keeps no list of the servers, sockets and datagram sockets it
+ * made, so this one does. An entry is made when a handle is opened and stands until the
+ * turn after it closes, which is when node's own uv_close takes it out of the walk.
+ * netRefresh already knows whether an owner holds a ref, so it keeps the entry in step
+ * with ref() and unref(). globals.ts reads the names through the hook installed below;
+ * the two snippets are separate, so a global name is the bridge between them.
+ */
+var NET_ACTIVE_RESOURCES = [];
+function netResourceEntry(owner, kind, name) {
+  for (var i = 0; i < NET_ACTIVE_RESOURCES.length; i++) {
+    var e = NET_ACTIVE_RESOURCES[i];
+    if (e.owner === owner && e.kind === kind && e.name === name) return e;
+  }
+  return undefined;
+}
+function netResourceEnsure(owner, name, kind, fromNextTurn) {
+  var e = netResourceEntry(owner, kind, name);
+  if (e === undefined) {
+    e = { owner: owner, name: name, kind: kind, live: true, named: false,
+      refed: owner._refed !== false, closing: false };
+    NET_ACTIVE_RESOURCES.push(e);
+  }
+  e.live = true;
+  e.closing = false;
+  e.refed = owner._refed !== false;
+  e.named = !fromNextTurn;
+  if (fromNextTurn) {
+    /* A bind is not a synchronous answer on the host: its listener handle appears on
+       the turn after listen() was called, not on the turn that called it. */
+    process.nextTick(function () { if (e.live && !e.closing) e.named = true; });
+  }
+  return e;
+}
+function netResourceRetire(owner, name) {
+  for (var i = 0; i < NET_ACTIVE_RESOURCES.length; i++) {
+    var e = NET_ACTIVE_RESOURCES[i];
+    if (e.owner !== owner || !e.live || e.closing) continue;
+    if (name !== undefined && e.name !== name) continue;
+    e.closing = true;
+    (function (entry) {
+      /* A handle is still named from its own close callback, and leaves the walk on
+         the turn after that callback, as node's closed uv handle does. */
+      netDefer(function () {
+        netDefer(function () {
+          if (entry.closing && entry.live) {
+            entry.live = false;
+            var at = NET_ACTIVE_RESOURCES.indexOf(entry);
+            if (at >= 0) NET_ACTIVE_RESOURCES.splice(at, 1);
+          }
+        });
+      });
+    })(e);
+  }
+}
+function netResourceRef(owner, on) {
+  for (var i = 0; i < NET_ACTIVE_RESOURCES.length; i++) {
+    var e = NET_ACTIVE_RESOURCES[i];
+    if (e.owner === owner && e.kind !== 'request') e.refed = on;
+  }
+}
+function netResourceNames() {
+  var requests = [], handles = [];
+  for (var i = 0; i < NET_ACTIVE_RESOURCES.length; i++) {
+    var e = NET_ACTIVE_RESOURCES[i];
+    if (!e.live || !e.named || !e.refed) continue;
+    if (e.kind === 'request') requests.push(e.name);
+    else handles.push(e.name);
+  }
+  return { requests: requests, handles: handles };
+}
+globalThis.__owcNetResourceNames = netResourceNames;
 /** Keeps the event loop alive while a server, socket or datagram socket is open and referenced. */
 function netRefresh(owner) {
+  netResourceRef(owner, !!owner._refed);
   var want = !!owner._refed && owner._holdable();
   if (want === owner._holding) return;
   owner._holding = want;
@@ -975,6 +1050,8 @@ BF['net'] = function () {
       this._connectStarted = true;
       this._ensureTarget();
       netRefresh(this);
+      netResourceEnsure(this, args.path !== undefined ? 'PipeWrap' : 'TCPSocketWrap', 'handle', false);
+      netResourceEnsure(this, 'ConnectWrap', 'request', true);
       /* A pipe path names a unix domain socket the virtual hub carries by path. */
       if (args.path !== undefined) {
         var dialled = String(args.path);
@@ -1164,11 +1241,13 @@ BF['net'] = function () {
           if (announced._dead) return;
           announced.emit('connect');
           announced.emit('ready');
+          netResourceRetire(announced, 'ConnectWrap');
         }, 0);
         return;
       }
       this.emit('connect');
       this.emit('ready');
+      netResourceRetire(this, 'ConnectWrap');
     }
 
     _onChunk(chunk) {
@@ -1521,6 +1600,7 @@ BF['net'] = function () {
       this.localFamily = undefined;
       this._remoteName = undefined;
       netRefresh(this);
+      netResourceRetire(this);
     }
 
     _armIdle() {
@@ -2019,6 +2099,7 @@ BF['net'] = function () {
       }
       this._handleId = res.id;
       this._listening = true;
+      netResourceEnsure(this, usePath ? 'PipeWrap' : 'TCPServerWrap', 'handle', true);
       /* A unix listener's address() is the path itself, a plain string, as Node reports it. */
       this._address = usePath ? res.address : { address: netListenShown(shown), family: netFamilyName(shown), port: res.port };
       netRefresh(this);
@@ -2046,6 +2127,7 @@ BF['net'] = function () {
         }
         this._listening = false;
         this._handleId = undefined;
+        netResourceRetire(this);
         /* A closed TCP listener answers address() with null, but a unix listener keeps answering
            with the path it was bound at, as host Node 24.15 does after a close. */
         if (typeof this._address !== 'string') this._address = null;
@@ -2136,6 +2218,7 @@ BF['net'] = function () {
       var made = new Socket({ allowHalfOpen: this._serverOpts.allowHalfOpen });
       /* A connection a server accepted is a TCPWRAP of its own, made when the accept happens. */
       made._owcAsync = asyncOpenResource('TCPWRAP', made);
+      netResourceEnsure(made, typeof this._address === 'string' ? 'PipeWrap' : 'TCPSocketWrap', 'handle', false);
       return made;
     }
 
@@ -2762,6 +2845,7 @@ BF['dgram'] = function () {
           value: this[hidden[h]], writable: true, enumerable: false, configurable: true
         });
       }
+      netResourceEnsure(this, 'UDPWrap', 'handle', false);
     }
 
     _holdable() {
@@ -2952,6 +3036,7 @@ BF['dgram'] = function () {
       }
       this._hubId = undefined;
       netRefresh(this);
+      netResourceRetire(this);
       if (this._targetId !== undefined) {
         deleteTarget(this._targetId);
         this._targetId = undefined;
