@@ -4068,6 +4068,16 @@ function importKeyMaterial(args: any): { id: number } {
     const text = new TextDecoder().decode(bytes);
     const pem = text.includes('-----BEGIN');
     /*
+     * `options.format` chooses the decoder family before the material is read: PEM asked of DER
+     * bytes finds no start line, DER asked of PEM text reads the base64 as an ASN.1 tag, and a bare
+     * Buffer names no format so Node's default 'pem' is what it is read with. Keeping the two apart
+     * is what lets `options.type` stay out of the decoder choice below.
+     */
+    const format = args?.format === undefined || args?.format === null ? 'pem' : String(args?.format);
+    if (format !== 'pem' && format !== 'der') throw decodeFail();
+    if (format === 'der' && pem) throw keyFail('ERR_OSSL_ASN1_WRONG_TAG', 'error:068000A8:asn1 encoding routines::wrong tag');
+    if (format === 'pem' && !pem) throw decodeFail();
+    /*
      * Node picks no decoder from the encoding a caller names: `options.type` is checked and then
      * put aside, and the material goes to the decoders, which read what it is -- the label of a
      * PEM, the shape of a DER -- so an EC PRIVATE KEY named 'pkcs8' imports as the EC key it is
@@ -4076,6 +4086,14 @@ function importKeyMaterial(args: any): { id: number } {
      */
     const named = args?.type === undefined || args?.type === null ? undefined : String(args?.type).toLowerCase();
     const kind = pem ? pemKindOf(text) : (derKindOf(bytes) ?? named ?? (want === 'private' ? 'pkcs8' : 'spki'));
+    /*
+     * A DER named 'pkcs8' goes to OpenSSL's PKCS#8 decoder and no other: a body whose shape is not
+     * PKCS#8 ends on its ASN.1 tag before a generic decoder is tried. PEM has a label to read, so
+     * the same name there changes nothing about which key comes back.
+     */
+    if (!pem && named === 'pkcs8' && kind !== 'pkcs8') {
+        throw keyFail('ERR_OSSL_ASN1_WRONG_TAG', 'error:068000A8:asn1 encoding routines::wrong tag');
+    }
     const sealed = pem && /-----BEGIN ENCRYPTED PRIVATE KEY-----/.test(text);
     /*
      * A caller that asked for a private key and handed over a public one gets no key at all: Node's
@@ -5122,8 +5140,13 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         }
         let der: Uint8Array;
         let label: string;
-        /* PKCS#1 is the RSA pair of formats: an RSAPublicKey, and an RSAPrivateKey of its own. */
-        const rsaPkcs1 = kind === 'pkcs1' && (key.kind === 'rsa' || key.kind === 'rsa-pss');
+        /* PKCS#1 is the RSA pair of formats: an RSAPublicKey, and an RSAPrivateKey of its own.
+         * An rsa-pss key carries PSS parameters a PKCS#1 body cannot hold, so Node refuses the
+         * encoding instead of writing a key whose parameters have been dropped. */
+        if (kind === 'pkcs1' && key.kind === 'rsa-pss') {
+            throw keyFail('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'The selected key encoding pkcs1 can only be used for RSA keys.');
+        }
+        const rsaPkcs1 = kind === 'pkcs1' && key.kind === 'rsa';
         if (key.type === 'public') {
             if (rsaPkcs1) {
                 der = rsaPublicDer(key.ints as IntKey);

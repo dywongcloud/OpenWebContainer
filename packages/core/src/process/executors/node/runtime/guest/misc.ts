@@ -2649,7 +2649,7 @@ BF.crypto = function () {
       var allowed = state.type === 'private' ? ['pkcs8', 'pkcs1', 'sec1'] : ['spki', 'pkcs1'];
       if (allowed.indexOf(opts.type) < 0) throw invalidArgValue('options.type', opts.type);
       var kind = opts.type === 'pkcs1' || opts.type === 'sec1' ? keyInfo(this).asymmetricKeyType : undefined;
-      if (opts.type === 'pkcs1' && kind !== 'rsa' && kind !== 'rsa-pss') {
+      if (opts.type === 'pkcs1' && kind !== 'rsa') {
         var unusable = new Error('The selected key encoding pkcs1 can only be used for RSA keys.');
         unusable.code = 'ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS';
         throw unusable;
@@ -2743,11 +2743,13 @@ BF.crypto = function () {
       /* A {key, format, type, passphrase} wrapper: Node's own callers pass the material inside it. */
       var given = key;
       var type = undefined;
+      var format = undefined;
       var passphrase = undefined;
       var wrapped = false;
       if (typeof key === 'object' && key !== null && Object.prototype.hasOwnProperty.call(key, 'key')) {
         given = key.key;
         type = key.type;
+        format = key.format;
         passphrase = key.passphrase;
         wrapped = true;
       } else if (typeof key === 'object' && key !== null && key.format === 'jwk' && key.key !== undefined) {
@@ -2787,7 +2789,19 @@ BF.crypto = function () {
           ? 'string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey'
           : undefined).toString('base64');
       }
-      var opened = cryptoCap('crypto.key.import', { want: want, jwk: jwk, bytes: bytes, type: type, passphrase: passphrase === undefined ? undefined : String(passphrase) });
+      /* Node checks the names before any decoder runs: a private import takes pkcs1/pkcs8/sec1,
+         a public one spki/pkcs1/pkcs8/sec1, and a format is one of pem/der/jwk. The name is then
+         put aside -- PEM labels and DER shapes are what decide which key comes back. */
+      if (jwk === undefined) {
+        if (format !== undefined && format !== 'pem' && format !== 'der' && format !== 'jwk') throw invalidArgValue('options.format', format);
+        if (type !== undefined && type !== null) {
+          var typeNames = want === 'private' ? ['pkcs1', 'pkcs8', 'sec1'] : ['spki', 'pkcs1', 'pkcs8', 'sec1'];
+          if (typeNames.indexOf(type) < 0) throw invalidArgValue('options.type', type);
+        }
+      } else if (format !== undefined && format !== null && format !== 'jwk') {
+        throw invalidArgValue('options.format', format);
+      }
+      var opened = cryptoCap('crypto.key.import', { want: want, jwk: jwk, bytes: bytes, type: type, format: format === undefined ? 'pem' : format, passphrase: passphrase === undefined ? undefined : String(passphrase) });
       return new KeyObject(want, undefined, opened.id);
     };
   }
@@ -4340,7 +4354,9 @@ BF.crypto = function () {
       if (failed.reason !== undefined && failed.reason !== null) err.reason = failed.reason;
       throw err;
     }
-    this._f = answer;
+    /* Node's X509Certificate has no own enumerable fields: the parsed record is internal, so
+       Object.keys(cert) is empty and every public field lives on the prototype. */
+    Object.defineProperty(this, '_f', { value: answer, enumerable: false, writable: true, configurable: true });
   }
   function x509Get(name) {
     return function () { return this._f[name]; };
