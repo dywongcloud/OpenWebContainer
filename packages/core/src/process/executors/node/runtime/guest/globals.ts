@@ -449,7 +449,10 @@ function stackTextOf(error) {
 /* The one line node puts above the frames: the error's name, its 'code' in brackets when it has
    one, and its message. */
 function headerOf(error) {
-  var text = api.formatUncaught(error);
+  /* A note about an error an exit handler threw carries the error's own header, not the whole
+     uncaught report: formatUncaught writes the block and the version trailer for a fatal error,
+     and neither belongs in the one line this note keeps. */
+  var text = inspectValue(error);
   var cut = text.indexOf('\n');
   return cut < 0 ? text : text.slice(0, cut);
 }
@@ -1661,14 +1664,59 @@ function guestFramesOf(lines) {
   return out;
 }
 
+/* V8 leaves the frames of its own stack preparation on the error a name or message getter
+   throws while it builds err.stack: Error.prototype.toString, defaultPrepareStackTrace,
+   ErrorPrepareStackTrace and prepareStackTraceCallback. This engine has none of them, and
+   names an anonymous accessor's frame only 'get' where host node writes '<Ctor>.get'.
+   Error.stackTraceLimit bounds the whole trace, so the loader tail is cut as it is there. */
+var GETTER_THROW_FRAMES = [
+  '    at Error.toString (<anonymous>)',
+  '    at defaultPrepareStackTrace (node:internal/errors:105:19)',
+  '    at Error.ErrorPrepareStackTrace (node:internal/errors:164:10)',
+  '    at prepareStackTraceCallback (node:internal/errors:145:29)'
+];
+function getterThrowStackOf(thrown, ctorName) {
+  var raw = '';
+  try { raw = String(thrown.stack === undefined || thrown.stack === null ? '' : thrown.stack); } catch (ignored) { }
+  var lines = raw === '' ? [] : raw.split('\n');
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  if (lines.length === 0) return undefined;
+  var head = lines[0];
+  var frames = lines.slice(1);
+  if (frames.length === 0) return undefined;
+  if (frames.length > 0) {
+    var named = /^(\s*at )get( \(.*)$/.exec(frames[0]);
+    if (named !== null) frames[0] = named[1] + ctorName + '.get' + named[2];
+  }
+  frames = [frames[0]].concat(GETTER_THROW_FRAMES, frames.slice(1));
+  try {
+    var limit = Error.stackTraceLimit;
+    if (typeof limit === 'number' && limit >= 0 && frames.length > limit) frames = frames.slice(0, limit);
+  } catch (ignored) { }
+  return head + '\n' + frames.join('\n');
+}
+
 function stackHeaderOf(err) {
   var name = 'Error';
   var message = '';
   try {
     name = String(err.name || 'Error');
     message = String(err.message === undefined || err.message === null ? '' : err.message);
-  } catch (ignored) {
-    /* A message that throws when it is read: the host read it once, before it threw. */
+  } catch (thrown) {
+    /* A message that throws when it is read is not swallowed: host node 24.15 lets the
+       throw leave err.stack, and the error it threw is what the run reports, with the
+       frames of node's stack preparation in front of the caller's. Swallowing it here
+       used to answer 'Error' with the frames of the error's construction and leave the
+       run alive with status 0. */
+    if (thrown !== null && (typeof thrown === 'object' || typeof thrown === 'function')) {
+      var ctorName = 'Error';
+      try { ctorName = String((err.constructor && err.constructor.name) || 'Error'); } catch (ignored) { }
+      var rewritten = getterThrowStackOf(thrown, ctorName);
+      if (rewritten !== undefined) {
+        try { thrown.stack = rewritten; } catch (ignored) { }
+      }
+    }
+    throw thrown;
   }
   /* The code in brackets behind the name, which is how host node 24.15 opens the stack of an error
      of its own: 'TypeError [ERR_INVALID_ARG_TYPE]: ...' where the name the error answers is still

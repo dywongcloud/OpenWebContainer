@@ -27,6 +27,17 @@ function formatErrorStack(err) {
      a stack -- carries that report with it, and it goes out as it stands: no name and colon go
      in front of a report that already holds the line Node opens with. */
   if (err && typeof err.__owcWhole === 'string') return err.__owcWhole;
+  /* Host node 24.15's util.inspect gives up on an error whose name or message getter throws:
+     the value it writes is '[object Error]', not a report. The uncaught handler has its own
+     answer for that error -- see uncaughtReportOf -- so only inspection reaches here, and the
+     reads below are guarded once before the report is built. */
+  var safeName, safeMessage;
+  try {
+    safeName = err.name;
+    safeMessage = err.message;
+  } catch (getterThrew) {
+    return '[object Error]';
+  }
   /* 'class Z extends Error {}' prints 'Z [Error]: s' on host node 24.15: the constructor's name in
      front and the name in brackets behind it. What decides it is node's 'improveStack', and it asks
      three things and not one: that the name ends in 'Error', that the stack opens with that very
@@ -39,7 +50,7 @@ function formatErrorStack(err) {
      of every instance where host node 24.15 reaches it on the prototype, so the test that used to
      stand here -- own-ness -- is what opened its report with 'AbortError: d' and not with
      'DOMException [AbortError]: d'. */
-  var nameText = err.name === undefined || err.name === null ? 'Error' : String(err.name);
+  var nameText = safeName === undefined || safeName === null ? 'Error' : String(safeName);
   var header = nameText;
   var ctorText = constructorNameOf(err);
   var rawStack = '';
@@ -74,7 +85,7 @@ function formatErrorStack(err) {
     }
   }
   if (codedName !== '') header = codedName;
-  if (err.message) header += header === '' ? String(err.message) : ': ' + err.message;
+  if (safeMessage) header += header === '' ? String(safeMessage) : ': ' + safeMessage;
   var stack = rawStack;
   /* A stack the engine built ends with an empty line of its own, and the frames of the ESM loader
      go behind the last frame of the run's entry -- which is the empty line while it is still there,
@@ -83,6 +94,15 @@ function formatErrorStack(err) {
   var raw = stack === '' ? [] : stack.split('\n');
   while (raw.length > 0 && raw[raw.length - 1] === '') raw.pop();
   var lines = guestFramesOf(raw);
+  /* Host node 24.15 names an anonymous accessor frame '<constructor>.get' -- 'at Error.get
+     (/app/main.js:2:64)' -- where this engine writes only 'at get (...)'. A getter that throws
+     is reported as the value it threw, so that frame opens the report of the thrown error. */
+  if (lines.length > 1) {
+    var getterAt = /^(\s*at )get( \(.*)$/.exec(lines[1]);
+    if (getterAt !== null) {
+      lines[1] = getterAt[1] + (constructorNameOf(err) || 'Error') + '.get' + getterAt[2];
+    }
+  }
   var body = lines.join('\n');
   /* The header the error's own stack carries is the one node prints for a plain error and the one
      it drops when it prints 'Z [Error]: s' instead: the stack of a subclass opens with 'Error: s',
@@ -91,7 +111,7 @@ function formatErrorStack(err) {
      The stack of an error out of a 'vm' context carries that header too now, so the same dropping
      is what keeps 'Z [Error]: s' from being followed by it there. */
   if (subbed || codedName !== '') {
-    var ownHeader = nameText + (err.message ? ': ' + String(err.message) : '');
+    var ownHeader = nameText + (safeMessage ? ': ' + String(safeMessage) : '');
     if (body === ownHeader || body.indexOf(ownHeader + '\n') === 0) body = body.slice(ownHeader.length + 1);
   }
   if (body === '') return header;
@@ -113,7 +133,7 @@ function formatErrorStack(err) {
      the engine wrote, or one of an error a program gave a code of its own -- is reported as it
      always was. */
   if (typeof err.code === 'string' && err.code !== '') {
-    var coded = nameText + ' [' + err.code + ']' + (err.message ? ': ' + String(err.message) : '');
+    var coded = nameText + ' [' + err.code + ']' + (safeMessage ? ': ' + String(safeMessage) : '');
     if (body.indexOf(coded) >= 0) return body;
   }
   return body.indexOf(header) >= 0 ? body : header + '\n' + body;
@@ -1687,8 +1707,91 @@ function errorInspectOf(err, fmt, depth, indent, opts) {
  * the same: the code belongs to the report node's inspect writes and not to the line it opens with.
  * An error with nothing of its own behind the report is reported as it always was.
  */
+var TICK = String.fromCharCode(96);
+var DOLLAR = String.fromCharCode(36);
+
+/* The line of node's own source an uncaught coded error's block opens on. Node throws such an
+   error from internal/errors.js, assert, validators or process/per_thread; hideStackFrames takes
+   those frames out of the stack that follows, so no frame names the line the report opens with.
+   The host's renderer only knows the internal frames of the Blob and File constructors, Buffer.from
+   and fs.readFileSync; an error this container raised with one of node's codes carries its block
+   here, as a report already whole whose version trailer tells the host to leave it alone. */
+var CODED_THROW_BLOCKS = {
+  ERR_OUT_OF_RANGE: 'node:internal/errors:542\n      throw error;\n      ^\n',
+  ERR_SOCKET_BAD_PORT: 'node:internal/errors:542\n      throw error;\n      ^\n',
+  ERR_UNKNOWN_SIGNAL: 'node:internal/process/per_thread:272\n        throw new ERR_UNKNOWN_SIGNAL(sig);\n        ^\n',
+  ERR_ASSERTION: 'node:internal/assert/utils:77\n    throw err;\n    ^\n',
+  ERR_INVALID_ARG_TYPE: 'node:internal/errors:542\n      throw error;\n      ^\n'
+};
+var ASSERT_EQUAL_BLOCK = 'node:assert:152\n  throw new AssertionError(obj);\n  ^\n';
+var VALIDATORS_BLOCK = 'node:internal/validators:500\n' +
+  '    throw new ERR_INVALID_ARG_TYPE(name, ' + TICK + '(\'' + DOLLAR +
+  '{ArrayPrototypeJoin(union, \'|\')}\'' + ')' + TICK + ', value);\n    ^\n';
+
+/* Frames the host's own table already opens on node's internal line: their block is the host's to
+   draw, and a block written here would be a second one. A rejection's reason has no loader frames
+   behind it -- node opens that report on the builtin's own frame and not on internal/errors -- so
+   only a report whose frames are a file run's is one this block belongs to. */
+function hostDrawsInternalBlock(report) {
+  var first = report.split('\n')[1] || '';
+  if (first.indexOf('(node:internal/blob:') >= 0 ||
+      first.indexOf('(node:internal/file:') >= 0 ||
+      first.indexOf('(node:buffer:362:9)') >= 0 ||
+      first.indexOf('(node:fs:561:18)') >= 0) return true;
+  return report.indexOf('    at Module._compile (') < 0 &&
+    report.indexOf('    at ModuleJob.run (') < 0;
+}
+
+function reportVersionOf() {
+  var version = 'v24.15.0';
+  try {
+    var proc = globalThis.process;
+    if (proc && typeof proc.version === 'string' && proc.version !== '') version = proc.version;
+  } catch (ignored) { }
+  return version;
+}
+
+/* Which of node's own throw sites an error this container raised with one of its codes came from:
+   an error a program built and gave a code of its own is reported on the program's line, so the
+   __owcRaised mark is what separates the two, exactly as it does on the coded line above. */
+function codedThrowBlockOf(err, messageText) {
+  var code = '';
+  var raised = false;
+  try {
+    code = err.code;
+    raised = err.__owcRaised === true;
+  } catch (ignored) { return undefined; }
+  if (typeof code !== 'string' || code.indexOf('ERR_') !== 0 || raised !== true) return undefined;
+  var block = CODED_THROW_BLOCKS[code];
+  if (block === undefined) return undefined;
+  var message = '';
+  try { message = String(messageText === undefined || messageText === null ? '' : messageText); } catch (ignored) { }
+  if (code === 'ERR_ASSERTION') {
+    /* assert.ok(false) is thrown from assert/utils, where the message is generated; an assertion
+       with a message of its own -- assert.equal(1, 2) writes '1 == 2' -- is thrown from node:assert
+       itself. Both carry generatedMessage: true in the guest, so the message is what tells them
+       apart: node 24.15 opens the two blocks on different lines of its own source. */
+    return message.indexOf('The expression evaluated to a falsy value') === 0 ? block : ASSERT_EQUAL_BLOCK;
+  }
+  if (code === 'ERR_INVALID_ARG_TYPE' && message.indexOf('must be (') >= 0) return VALIDATORS_BLOCK;
+  return block;
+}
+
 function uncaughtReportOf(err) {
-  return inspectValue(err);
+  var nameText, messageText;
+  try {
+    nameText = err.name;
+    messageText = err.message;
+  } catch (getterThrew) {
+    /* Host node 24.15 has nothing it can read of an error whose name or message getter throws:
+       it writes only the --trace-uncaught hint and its version trailer, and no report at all. */
+    return '\n(Use ' + TICK + 'node --trace-uncaught ...' + TICK +
+      ' to show where the exception was thrown)\n\nNode.js ' + reportVersionOf();
+  }
+  var report = inspectValue(err);
+  var block = codedThrowBlockOf(err, messageText);
+  if (block === undefined || hostDrawsInternalBlock(report)) return report;
+  return block + '\n' + report + '\n\nNode.js ' + reportVersionOf();
 }
 
 /* The bytes a buffer prints: every one of them up to 'maxArrayLength' -- a hundred, node's default
