@@ -1,0 +1,32 @@
+owc-stack-getter-message-throws resolved 1793829693375-3009-1e6fbfd09e607ea3 2026-11-04T22:04:37.000Z
+
+Row: owc-stack-getter-message-throws
+Witness: 1793829693375-3009-1e6fbfd09e607ea3
+Status: resolved
+
+Resolution
+  An error whose message or name getter throws is no longer swallowed. Reading err.stack
+  propagates the error the getter threw, with node's four stack-preparation frames ahead of
+  the caller's; util.inspect of that error answers '[object Error]'; and an uncaught error
+  with no readable name or message gets the --trace-uncaught hint and the version trailer
+  alone. The five getter cases and util-inspect agree with host node v24.15.0 on stdout,
+  stderr and exit code.
+
+Cause
+  packages/core/src/process/executors/node/runtime/guest/globals.ts caught the getter's
+  throw in stackHeaderOf and went on with a bare 'Error' header, so the run stayed alive
+  with status 0. util-assert.ts read err.name and err.message without a guard. Host node
+  24.15 lets the throw leave err.stack (V8 has called Error.prototype.toString through
+  prepareStackTrace), reports the thrown error, and exits 1.
+
+Witness
+  dispatch 1793829693375-3009-1e6fbfd09e607ea3, session verify-owc-stack-getter-message-throws:
+  a fresh git archive of the pushed origin/main tip 53057d01849175dd9beb65341821a76e55fc98b0,
+  installed and built there, one fresh container boot per case against host node v24.15.0,
+  stdout + stderr + exit code compared at two memory points (load 15.44/0.11 GiB free and
+  21.94/0.28 GiB free): 25 of 43 cases agree, 8 newly fixed, no case newly broken. The
+  five getter cases, getter-plain and util-inspect agree at both points; getter-uncaught
+  prints only the --trace-uncaught hint and exits 1.
+
+Commit
+  53057d01849175dd9beb65341821a76e55fc98b0
