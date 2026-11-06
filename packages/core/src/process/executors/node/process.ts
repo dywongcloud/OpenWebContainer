@@ -6189,7 +6189,24 @@ function opensScope(tokens: JsToken[], i: number): boolean {
        stands in a statement's place. */
     if (prev.v === ')' || prev.v === '{' || prev.v === '}' || prev.v === ';') return true;
     /* A block behind a `case` or a `default`, and not the object a `:` of any other kind opens. */
-    if (prev.v === ':') return isId(tokens[i - 2], 'case') || isId(tokens[i - 2], 'default');
+    /* A `case`/`default` clause label is an expression (`case 'x':`, `case 1:`,
+       `case N.X:`): the keyword is not necessarily two tokens back. Walk back to it,
+       balanced over the label's brackets, stopping at a statement boundary, a ternary
+       or another colon. The brace behind a clause label opens a block; the brace behind
+       any other colon opens an object literal and binds no names. */
+    if (prev.v === ':') {
+        let depth = 0;
+        for (let k = i - 2; k >= 0 && k > i - 80; k--) {
+            const t = tokens[k];
+            if (t.t === 'punc') {
+                if (t.v === ')' || t.v === ']') { depth++; continue; }
+                if (t.v === '(' || t.v === '[') { if (depth === 0) return false; depth--; continue; }
+                if (t.v === '{' || t.v === '}') return false;
+                if (depth === 0 && (t.v === ';' || t.v === '?' || t.v === ',' || t.v === '=>' || t.v === ':' || t.v === '=')) return false;
+            } else if (depth === 0 && t.t === 'id' && (t.v === 'case' || t.v === 'default')) return true;
+        }
+        return false;
+    }
     if (prev.v !== '=>') return false;
     /* Behind an arrow the brace is either the body of the function or an object it returns, and
        what stands inside it tells the two apart: a property name has a `:` behind it -- or a `,`

@@ -1956,6 +1956,7 @@ run carries only its own dependency closure.
     `switch` cases, and a synthetic ESM module built to that shape -- 29 braced `switch` cases each
     declaring `const token`, plus `class D { async; v = 1; }` -- compiles and runs here byte-identically
     to host Node 24.15, so the braced-case shape is not what stops it: the missing `Tokenizer` export is.
+    `owc-esm-braced-switch-duplicate-binding`: the braced `case <expr>:` labels were the cause, not a missing `Tokenizer`; walking the label expression restored js-yaml 5.5.0 ESM, uuid 14.0.3 bin and zod 4.6.7 ESM to host Node 24.15.
   - `events.addAbortListener` is undefined here, in `require('events')` and in
     `import { addAbortListener } from 'node:events'` alike, where Node 24.15 exports a function and
     `Object.keys(require('events'))` carries the name. `execa` and `got` are the two corpus entries
