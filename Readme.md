@@ -5,6 +5,7 @@ A browser-based virtual container runtime that enables server-like JavaScript ex
 [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
+## URLSearchParams: has and delete filter by the optional value argument -- the guest ignored it, so has('a','9') answered true and delete('a','2') dropped every a pair where host node v24.15.0 kept a=1 (row `owc-urlsearchparams-value-arg-ignored`; 14 of 14 labels agree on stdout, stderr and exit code at two memory points)
 ## structuredClone: a transferred ArrayBuffer keeps the bytes of every view over it -- the guest detached the buffer before cloning, so a Uint8Array came back empty and two views over one buffer threw TypeError, where host node v24.15.0 returned 1,2,3 and both views (row `owc-structuredclone-transfer-loses-views`; 14 of 14 labels agree on stdout, stderr and exit code at two memory points)
 ## The `lane-parseargs29` lane: the three `util.parseArgs` sentences, re-verified at the tip
 
