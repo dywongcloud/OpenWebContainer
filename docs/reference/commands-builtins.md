@@ -7,7 +7,7 @@ code compared separately at two memory points. "Matches host" means byte-identic
 - `.` — the POSIX spelling of `source`, handled by the same function; real files, args, variables, the four error paths and `--`/invalid-option handling match host.
 - `test` — `=`, `-eq`/`-gt`, `-f`, `-d`, `-z`, `-n`, `!`, `-a` and the empty-argument case all match host (status 0/1).
 - `trap` — `trap "echo t" EXIT`, `trap -l` (the full numbered signal list), bare `trap`, `trap -p EXIT` and a failing body's status match host.
-- `times` — prints the host's two-line `0m0.000s 0m0.000s` shape; the host's own CPU values vary between identical runs, so results agree structurally (timing-normalized) rather than byte-for-byte.
+- `times` — prints the host's two-line shape with a nonzero, rising user time from the container's wall clock (no OS CPU accounting exists here); the host's own CPU values vary between identical runs, so results agree timing-normalized rather than byte-for-byte.
 - `umask` — `0022`, `umask 077` -> `0077`, `umask -S` and the `999` out-of-range complaint match host.
 - `until` — `break`, a body that writes three lines, a true condition and the loop's final status match host.
 - `suspend` — `sh: line 0: suspend: cannot suspend: no job control` and status 1 match host.

@@ -320,6 +320,8 @@ export interface ShellState {
      * this status into `ExitSignal` once that result has been delivered.
      */
     fatalBuiltinStatus?: number;
+    /** Wall-clock ms when this state was made: `times` reports the elapsed time as its user time. */
+    clockStart?: number;
     /**
      * The descriptors `exec` opened and left open: `3` is the file `exec 3>f` named, and a later
      * `echo hi >&3` writes to it, the way it does in a shell. One `exec 3>&1` opened is the shell's
@@ -8513,8 +8515,16 @@ function envBuiltin(ctx: CommandContext): CommandResult {
 }
 
 function timesBuiltin(ctx: CommandContext): CommandResult {
-    void ctx;
-    return ok('0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n');
+    const state = stateOf(ctx);
+    /* A host's `times` is the shell's own user/system CPU time and that of the children it waited
+       for. This runtime has no OS CPU accounting of its own, so the wall time since the state was
+       made stands in for user time: it is never all-zero on a shell that ran a command, and it
+       rises after `sleep` or a long loop the way a host's first line does. System and children
+       stay zero because no virtual child burns CPU that the host could have metered. */
+    const elapsed = Math.max(1, Date.now() - (state.clockStart ?? Date.now())) / 1000;
+    const minutes = Math.floor(elapsed / 60);
+    const seconds = (elapsed - minutes * 60).toFixed(3);
+    return ok(`${minutes}m${seconds}s 0m0.000s\n0m0.000s 0m0.000s\n`);
 }
 
 function ulimitBuiltin(ctx: CommandContext): CommandResult {
@@ -9963,7 +9973,8 @@ export function createShellState(env: Record<string, string>, cwd: string, fs?: 
         io: { stdout: '', stderr: '' },
         held: '',
         line: 1,
-        source: '<stdin>'
+        source: '<stdin>',
+        clockStart: Date.now()
     };
     if (fs !== undefined) state.fs = fs;
     setVar(state, 'OPTIND', '1');
