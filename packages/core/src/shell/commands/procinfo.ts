@@ -1041,6 +1041,15 @@ const WATCH_USAGE = [
     '  -s, --shotsdir         directory to store screenshots'
 ].join('\n');
 
+/**
+ * The container's own banner for `watch --version` / `watch -v`. A host's watch prints
+ * `watch from procps-ng 4.0.6`, which is a fact about a program that is not running here;
+ * copying it would be a line about something else. This is the same rule `zip --version` follows
+ * (it reports the container's own version), and it is the one honest value a `--version` flag can
+ * carry in this runtime.
+ */
+const WATCH_VERSION = 'watch 0.1.0 (OpenWebContainer)';
+
 const watch: ShellCommand = (ctx) => {
     const args = ctx.args;
     if (args.length === 0) return fail(WATCH_USAGE.trimStart(), 1);
@@ -1051,6 +1060,7 @@ const watch: ShellCommand = (ctx) => {
         const a = args[i];
         if (a === '--') { i++; break; }
         if (a === '-h' || a === '--help') return out('\n' + WATCH_USAGE.trimStart());
+        if (a === '-v' || a === '--version') return out(WATCH_VERSION);
         if (a === '-n' || a === '--interval') {
             const v = args[i + 1] ?? '';
             i += 2;
@@ -1353,6 +1363,106 @@ const vdir: ShellCommand = (ctx) => {
         stderr: errors.length ? errors.join('\n') + '\n' : '',
         exitCode: missing ? 2 : 0
     };
+};
+
+/* ================================================================== *
+ * 13a. whereis
+ * ================================================================== */
+
+/**
+ * `whereis` reports where a program's executable and manual page live. It is a lookup in the
+ * container's own virtual file system -- nothing leaves the browser -- so it is implementable here
+ * where `ping`, `ssh` and `sntp` are not. The host walks a fixed list of standard directories;
+ * this handler walks the same shapes over `ctx.fs`, printing only paths that really exist in this
+ * file system. A host has /usr/share/man/man1; this container does not, so its answer names fewer
+ * paths but never invents one: the values are the container's own, as they are for `w` and `vdir`.
+ */
+const WHEREIS_USAGE = 'usage: whereis [-abmqu] [-BM dir ... -f] program ...';
+
+/** The directories a host's `whereis` searches for executables. */
+const WHEREIS_BIN_DIRS = ['/bin', '/sbin', '/usr/bin', '/usr/sbin', '/usr/local/bin', '/usr/local/sbin', '/usr/libexec'];
+/** The directories a host's `whereis` searches for manual pages. */
+const WHEREIS_MAN_DIRS = ['/usr/share/man/man1', '/usr/share/man/man8', '/usr/share/man/man1p', '/usr/share/man/man8p', '/usr/local/share/man/man1', '/usr/local/share/man/man8', '/usr/man/man1'];
+/** The names a manual page for `program` can carry. */
+const WHEREIS_MAN_SUFFIXES = ['.1', '.1p', '.8', '.1.gz', '.8.gz'];
+
+/** Paths under `dirs` that exist in this file system, in directory-then-suffix order. */
+function whereisFind(ctx: CommandContext, dirs: string[], program: string, suffixes: string[]): string[] {
+    const found: string[] = [];
+    for (const dir of dirs) {
+        let names: string[];
+        try { names = ctx.fs.listDirectory(dir); } catch { continue; }
+        for (const suffix of suffixes) {
+            const entry = program + suffix;
+            if (!names.includes(entry)) continue;
+            const path = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
+            if (tryStat(ctx, path) !== undefined) found.push(path);
+        }
+    }
+    return found;
+}
+
+const whereis: ShellCommand = (ctx) => {
+    let binaries = true;
+    let manuals = true;
+    let explicitTypes = false;
+    let quiet = false;
+    let unusual = false;
+    let binDirs = WHEREIS_BIN_DIRS;
+    let manDirs = WHEREIS_MAN_DIRS;
+    const programs: string[] = [];
+    const args = ctx.args;
+    let i = 0;
+    while (i < args.length) {
+        const word = args[i];
+        if (word === '--') { i++; while (i < args.length) programs.push(args[i++]); break; }
+        if (word.startsWith('-') && word !== '-') {
+            /* -B/-M take a directory list ended by -f; the host lets -f stand alone too. */
+            if (word === '-B' || word === '-M') {
+                const list: string[] = [];
+                i++;
+                while (i < args.length && args[i] !== '-f') list.push(args[i++]);
+                if (i < args.length && args[i] === '-f') i++;
+                if (word === '-B') binDirs = list; else manDirs = list;
+                continue;
+            }
+            if (word === '-f') { i++; continue; }
+            for (const c of word.slice(1)) {
+                switch (c) {
+                    case 'b':
+                        if (!explicitTypes) { binaries = false; manuals = false; explicitTypes = true; }
+                        binaries = true; break;
+                    case 'm':
+                        if (!explicitTypes) { binaries = false; manuals = false; explicitTypes = true; }
+                        manuals = true; break;
+                    case 'q': quiet = true; break;
+                    case 'u': unusual = true; break;
+                    case 'a': break; // all matches: the container's tree is all there is
+                    default: return fail(`whereis: illegal option -- ${c}\n${WHEREIS_USAGE}`, 64);
+                }
+            }
+            i++;
+            continue;
+        }
+        programs.push(word);
+        i++;
+    }
+    if (programs.length === 0) return fail(WHEREIS_USAGE, 64);
+    const wanted = (binaries ? 1 : 0) + (manuals ? 1 : 0);
+    const lines: string[] = [];
+    for (const raw of programs) {
+        /* A host prints the base name even when the operand itself is a path. */
+        const name = raw.replace(/\/+$/, '').split('/').pop() || raw;
+        const paths = [
+            ...(binaries ? whereisFind(ctx, binDirs, name, ['']) : []),
+            ...(manuals ? whereisFind(ctx, manDirs, name, WHEREIS_MAN_SUFFIXES) : [])
+        ];
+        // -u: a host prints only names that do not have one entry of each requested type.
+        if (unusual && paths.length === wanted) continue;
+        if (quiet) { if (paths.length) lines.push(paths.join(' ')); }
+        else lines.push(paths.length ? `${name}: ${paths.join(' ')}` : `${name}:`);
+    }
+    return out(lines.join('\n'));
 };
 
 /* ================================================================== *
@@ -2091,6 +2201,7 @@ export const COMMANDS: Record<string, ShellCommand> = {
     locate: locateCommand,
     slocate: locateCommand,
     vdir,
+    whereis,
     less: pagerCommand('less'),
     more: pagerCommand('more'),
     man,
