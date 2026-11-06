@@ -6,5 +6,6 @@ a named `[ERR_*] not supported on this runtime` line with exit 1 is a documented
 boundary, not a fake host answer.
 
 - [Builtins, control flow and job control](commands-builtins.md)
+- [Builtins residual](commands-builtins-residual.md)
 - [Text utilities](commands-textutils.md)
 - [System, network and process utilities](commands-system.md)
