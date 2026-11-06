@@ -99,6 +99,8 @@ interface Meta {
     owners: Map<string, Owner>;
     /** Symlink target, for paths `ln -s` created. */
     links: Map<string, string>;
+    /** Paths `mknod <name> p` made into FIFOs: the file system records only file and dir. */
+    fifos: Set<string>;
     /** The last access time `touch -a` set, which the file system carries no room for. */
     atimes: Map<string, number>;
     /** The synthetic inode number of a path. */
@@ -131,6 +133,7 @@ function metaOf(fs: Fs): Meta {
             modes: new Map(),
             owners: new Map(),
             links: new Map(),
+            fifos: new Set(),
             atimes: new Map(),
             inodes: new Map(),
             nlink: new Map(),
@@ -186,6 +189,15 @@ export function setCreationMode(fs: object, path: string, isDir: boolean): void 
 /** The mode a name carries after a utility that named one outright, as `mkdir -m 700 d` does. */
 export function setMode(fs: object, path: string, mode: number): void {
     metaOf(fs as Fs).modes.set(clean(path), mode & 0o7777);
+}
+
+/** Records the FIFO node `mknod` made; the file system has no S_IFIFO of its own. */
+function setFifo(fs: Fs, path: string): void {
+    metaOf(fs).fifos.add(clean(path));
+}
+
+function isFifo(fs: Fs, path: string): boolean {
+    return metaOf(fs).fifos.has(clean(path));
 }
 
 /**
@@ -2007,9 +2019,11 @@ function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcom
             let value: boolean;
             switch (word) {
                 case '-b':
-                case '-p':
                 case '-S':
                     value = false;
+                    break;
+                case '-p':
+                    value = isFifo(ctx.fs, resolveAt(ctx, args[index + 1] ?? ''));
                     break;
                 case '-c': {
                     /* A character device is told apart by the `S_IFCHR` its mode carries, not by
@@ -2035,7 +2049,8 @@ function evalTest(ctx: CommandContext, args: string[], from: number): TestOutcom
                     const device = raw !== undefined && (Number(raw.mode ?? 0) & 0o170000) === 0o020000;
                     /* A character device is not a regular file: `test -f /dev/null` is false on a
                        host, for the same reason `test -c /dev/null` there is true. */
-                    value = file.exists && file.type === 'file' && !file.symlink && !device;
+                    value = file.exists && file.type === 'file' && !file.symlink && !device &&
+                        !isFifo(ctx.fs, resolveAt(ctx, args[index + 1] ?? ''));
                     break;
                 }
                 case '-g': {
@@ -3312,8 +3327,8 @@ const split: ShellCommand = (ctx) => {
 /* --------------------------------------------------------------------- stat */
 
 /** The permission string of a mode, as `ls -l` and `%A` print it. */
-function permissionString(mode: number, type: 'file' | 'dir' | 'link'): string {
-    const letters = type === 'dir' ? 'd' : type === 'link' ? 'l' : '-';
+function permissionString(mode: number, type: 'file' | 'dir' | 'link' | 'fifo'): string {
+    const letters = type === 'dir' ? 'd' : type === 'link' ? 'l' : type === 'fifo' ? 'p' : '-';
     const triplets = [(mode >> 6) & 7, (mode >> 3) & 7, mode & 7];
     let out = letters;
     for (const triplet of triplets) {
@@ -3327,12 +3342,12 @@ function permissionString(mode: number, type: 'file' | 'dir' | 'link'): string {
     return out;
 }
 
-const TYPE_NAMES: Record<string, string> = { file: 'regular file', dir: 'directory', link: 'symbolic link' };
+const TYPE_NAMES: Record<string, string> = { file: 'regular file', dir: 'directory', link: 'symbolic link', fifo: 'named pipe' };
 
 interface StatInfo {
     name: string;
     shown: string;
-    type: 'file' | 'dir' | 'link';
+    type: 'file' | 'dir' | 'link' | 'fifo';
     size: number;
     mode: number;
     uid: number;
@@ -3392,10 +3407,11 @@ function statInfo(ctx: CommandContext, argument: string, dereference = false): S
     const stat = statOf(ctx.fs, subject);
     if (stat === undefined) return undefined;
     const link = isSymlink(ctx.fs, path);
-    const type: 'file' | 'dir' | 'link' = link && !dereference ? 'link' : stat.type;
+    const fifo = isFifo(ctx.fs, subject);
+    const type: 'file' | 'dir' | 'link' | 'fifo' = link && !dereference ? 'link' : fifo ? 'fifo' : stat.type;
     const mode = modeOf(ctx.fs, subject, stat.type === 'dir');
     const owner = ownerOf(ctx.fs, path, ctx.cwd);
-    const typeBits = type === 'dir' ? 0o40000 : type === 'link' ? 0o120000 : 0o100000;
+    const typeBits = type === 'dir' ? 0o40000 : type === 'link' ? 0o120000 : type === 'fifo' ? 0o10000 : 0o100000;
     return {
         name: argument,
         shown: argument,
@@ -3522,7 +3538,7 @@ function formatBsd(info: StatInfo, format: string, timeFormat: string): string {
             case 'b': out += String(info.blocks); break;
             case 'f': out += '0'; break;
             case 't': out += String(info.mtimeMs); break;
-            case 'T': out += info.type === 'dir' ? 'd' : info.type === 'link' ? 'l' : 'f'; break;
+            case 'T': out += info.type === 'dir' ? 'd' : info.type === 'link' ? 'l' : info.type === 'fifo' ? 'p' : 'f'; break;
             case 'Y': out += statTime(info.mtimeMs, timeFormat, false); break;
             default: out += '%' + code; break;
         }
@@ -4460,7 +4476,7 @@ function lsRow(
     }
     return {
         name,
-        perms: permissionString(mode, isDirectory ? 'dir' : isLink ? 'link' : 'file'),
+        perms: permissionString(mode, isDirectory ? 'dir' : isLink ? 'link' : isFifo(fs, path) ? 'fifo' : 'file'),
         links: String(links),
         user: ownerName(fs, path, env, cwd),
         group: nameOfId(owner.gid, GROUP_NAMES),
@@ -5804,6 +5820,170 @@ const zip: ShellCommand = (ctx) => {
     return result(stdout, stderr, exitCode);
 };
 
+/* ------------------------------------------------------------- mktemp / mknod */
+
+const MKTEMP_USAGE =
+    'usage: mktemp [-d] [-p tmpdir] [-q] [-t prefix] [-u] template ...\n' +
+    '       mktemp [-d] [-p tmpdir] [-q] [-u] -t prefix \n';
+
+const MKNOD_USAGE =
+    'usage: mknod [-rR] [-F format] [-m mode] [-g group]\n' +
+    '                   [ name [b | c] major minor\n' +
+    '                   | name [b | c] major unit subunit\n' +
+    '                   | name [b | c] number\n' +
+    '                   | name p ]\n';
+
+/** The alphabet BSD mktemp draws the X's of a template from. */
+const MKTEMP_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+let mktempSerial = 0;
+
+function mktempSuffix(width: number): string {
+    let text = '';
+    for (let i = 0; i < width; i++) {
+        mktempSerial = (mktempSerial + 1) >>> 0;
+        const mixed = (Math.floor(Math.random() * 0x100000000) ^ Math.imul(mktempSerial, 2654435761)) >>> 0;
+        text += MKTEMP_ALPHABET[mixed % MKTEMP_ALPHABET.length];
+    }
+    return text;
+}
+
+/** Replaces only the trailing run of X's, which is what a host's mkstemp does. */
+function mktempTemplate(template: string): string {
+    let end = template.length;
+    while (end > 0 && template[end - 1] === 'X') end--;
+    return template.slice(0, end) + mktempSuffix(template.length - end);
+}
+
+/** The directory a host's mktemp uses when no -p was given. */
+function mktempDir(ctx: CommandContext): string {
+    const dir = ctx.env.TMPDIR || '/tmp';
+    return dir.replace(/\/+$/, '') || '/';
+}
+
+const mktemp: ShellCommand = (ctx) => {
+    let directory = false;
+    let unsafe = false;
+    let quiet = false;
+    let tmpdir = mktempDir(ctx);
+    let explicitDir = false;
+    let prefix: string | undefined;
+    const templates: string[] = [];
+    const args = ctx.args;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--') {
+            for (let j = i + 1; j < args.length; j++) templates.push(args[j]);
+            break;
+        }
+        if (arg.startsWith('--')) return fail(`mktemp: unrecognized option \`${arg}'\n` + MKTEMP_USAGE);
+        if (isOption(arg)) {
+            // BSD lets the short flags cluster: -dq, -du, -tprefix, -pdir.
+            for (let j = 1; j < arg.length; j++) {
+                const ch = arg[j];
+                if (ch === 'd') directory = true;
+                else if (ch === 'u') unsafe = true;
+                else if (ch === 'q') quiet = true;
+                else if (ch === 't' || ch === 'p') {
+                    let value = arg.slice(j + 1);
+                    if (value === '') value = args[++i] ?? '';
+                    if (value === '') return fail(`mktemp: option requires an argument -- ${ch}\n` + MKTEMP_USAGE);
+                    if (ch === 't') prefix = value;
+                    else { tmpdir = value.replace(/\/+$/, '') || '/'; explicitDir = true; }
+                    break;
+                } else return fail(`mktemp: illegal option -- ${ch}\n` + MKTEMP_USAGE);
+            }
+            continue;
+        }
+        templates.push(arg);
+    }
+    if (prefix !== undefined) templates.unshift(`${tmpdir}/${prefix}.XXXXXXXXXX`);
+    if (templates.length === 0) templates.push(`${tmpdir}/tmp.XXXXXXXXXX`);
+    const names: string[] = [];
+    for (const template of templates) {
+        const shape = explicitDir && !template.startsWith('/') ? `${tmpdir}/${template}` : template;
+        let name = shape;
+        let resolved = '';
+        for (let attempt = 0; attempt < 100; attempt++) {
+            name = mktempTemplate(shape);
+            resolved = resolveAt(ctx, name);
+            if (ctx.fs.statPath(resolved) === undefined) break;
+        }
+        if (!unsafe) {
+            if (ctx.fs.statPath(parentOf(resolved))?.type !== 'dir') {
+                return fail(quiet ? '' : `mktemp: mkstemp failed on ${name}: No such file or directory`);
+            }
+            try {
+                if (directory) ctx.fs.createDirectory(resolved);
+                else ctx.fs.writeFile(resolved, '');
+            } catch (error) {
+                const why = error instanceof Error ? error.message : String(error);
+                return fail(quiet ? '' : `mktemp: mkstemp failed on ${name}: ${why}`);
+            }
+            setMode(ctx.fs, resolved, directory ? 0o700 : 0o600);
+        }
+        names.push(name);
+    }
+    return ok(names.join('\n') + '\n');
+};
+
+const mknod: ShellCommand = (ctx) => {
+    let mode = 0o644;
+    const operands: string[] = [];
+    const args = ctx.args;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--') {
+            for (let j = i + 1; j < args.length; j++) operands.push(args[j]);
+            break;
+        }
+        if (arg.startsWith('--')) return fail('mknod: illegal option -- -\n' + MKNOD_USAGE);
+        if (isOption(arg)) {
+            let j = 1;
+            while (j < arg.length) {
+                const ch = arg[j];
+                if (ch === 'r' || ch === 'R') { j++; continue; }
+                if (ch === 'm' || ch === 'F' || ch === 'g') {
+                    let value = arg.slice(j + 1);
+                    if (value === '') value = args[++i] ?? '';
+                    if (value === '') return fail(`mknod: option requires an argument -- ${ch}\n` + MKNOD_USAGE);
+                    if (ch === 'm') {
+                        const parsed = Number.parseInt(value, 8);
+                        if (!Number.isFinite(parsed)) return fail(`mknod: invalid mode: ${value}\n` + MKNOD_USAGE);
+                        mode = parsed & 0o7777;
+                    }
+                    break;
+                }
+                return fail(`mknod: illegal option -- ${ch}\n` + MKNOD_USAGE);
+            }
+            continue;
+        }
+        operands.push(arg);
+    }
+    if (operands.length === 0) return fail(MKNOD_USAGE);
+    const [name, kind, ...rest] = operands;
+    const resolved = resolveAt(ctx, name);
+    if (kind === 'p' && rest.length === 0) {
+        if (ctx.fs.statPath(resolved) !== undefined) {
+            return fail(`mknod: ${name}: File exists`);
+        }
+        if (ctx.fs.statPath(parentOf(resolved))?.type !== 'dir') {
+            return fail(`mknod: ${name}: No such file or directory`);
+        }
+        try { ctx.fs.writeFile(resolved, ''); } catch {
+            return fail(`mknod: ${name}: No such file or directory`);
+        }
+        setFifo(ctx.fs, resolved);
+        setMode(ctx.fs, resolved, mode);
+        return ok();
+    }
+    /* The container has no kernel device table, so a character or block node cannot exist here;
+       on the measured (non-root) host the same request is refused with EPERM. */
+    if ((kind === 'c' || kind === 'b') && rest.length >= 2) {
+        return fail(`mknod: ${name}: Operation not permitted`);
+    }
+    return fail(MKNOD_USAGE);
+};
+
 /** The usage lines this module publishes, by command name. `man` prints them as synopses. */
 export const USAGE: Record<string, string> = {
     find: FIND_USAGE,
@@ -5820,7 +6000,9 @@ export const USAGE: Record<string, string> = {
     nl: NL_USAGE,
     unexpand: UNEXPAND_USAGE,
     dd: DD_USAGE,
-    zip: ZIP_USAGE
+    zip: ZIP_USAGE,
+    mktemp: MKTEMP_USAGE,
+    mknod: MKNOD_USAGE
 };
 
 export const COMMANDS: Record<string, ShellCommand> = {
@@ -5856,5 +6038,7 @@ export const COMMANDS: Record<string, ShellCommand> = {
     nl,
     unexpand,
     dd,
-    zip
+    zip,
+    mktemp,
+    mknod
 };
