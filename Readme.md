@@ -95,6 +95,7 @@ The architecture consists of three main layers:
 - **Previews**
   - Playground preview URLs (`/__owc/preview/<port>/...`) are answered by a service worker that forwards each request to the container's HTTP server on that port
   - A browser cannot open raw TCP or UDP sockets to the outside; the virtual network stays inside the container
+  - The playground document response on :5173 carries no Cross-Origin-Opener-Policy and no Cross-Origin-Embedder-Policy: headful Chrome 157 measured self.crossOriginIsolated=false, typeof SharedArrayBuffer=undefined and isSecureContext=true while the Web IDE still booted, so this engine does not provision the cross-origin isolation a WebContainer-compatible host must set.
   - Preview responses with a 204, 205 or 304 status now reach the browser with that status and no body, instead of a 502 (`owc-preview-null-body-status-502`).
   - Preview request and response bodies now carry every byte: invalid UTF-8 such as `[0,1,2,127,128,255]` is byte-exact in both directions, and UTF-8 text is unchanged (`owc-preview-binary-bodies-corrupted`).
   - Preview requests now carry the page's cookies to the guest, and a guest `Set-Cookie` now sets a cookie on the page (`owc-preview-cookies-not-carried`).
