@@ -659,14 +659,16 @@ export class Shell implements IShell {
                the process reads `stopped` to stop. `sh -c` ends anyway; only the loop that reads
                lines from a terminal needs it, and `exit` inside `( )` or a job never sets it --
                those put the flag back with the rest of the state they restore. */
+            /* `set -e` ended the line: the shell stops with the status of the command that failed,
+               the way /bin/sh does -- typed into it, not only handed to it with `-c`. Read before
+               the exit flag below sets `stopped`, so an abort the engine signalled still counts
+               as an errexit stop for the interactive reader of this flag. */
+            this.errexitStopped = state.options.errexit && run.exitCode !== 0 && !this.stopped;
             if (state.exitCalled === true) {
                 state.exitCalled = false;
                 this.stopped = true;
                 this.stoppedCode = run.exitCode;
             }
-            /* `set -e` ended the line: the shell stops with the status of the command that failed,
-               the way /bin/sh does -- typed into it, not only handed to it with `-c`. */
-            this.errexitStopped = state.options.errexit && run.exitCode !== 0 && !this.stopped;
             let result: ShellCommandResult = {
                 stdout: run.stdout + flushed.stdout,
                 stderr: run.stderr + flushed.stderr,

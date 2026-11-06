@@ -170,6 +170,8 @@ export interface FunctionDef {
     body: Command;
     /** The file the function was defined in. */
     source: string;
+    /** The name that file was sourced under, for diagnostics raised inside the body. */
+    sourceLabel?: string;
     line: number;
     /** The source text between the braces, for `type`. */
     text?: string;
@@ -393,6 +395,14 @@ export interface ShellState {
     line: number;
     /** Name of the script being run, for `caller`. */
     source: string;
+    /**
+     * The name a sourced file was written under, and whose line `state.line` counts, while the
+     * engine is running that file. Bash 3.2 heads a diagnostic raised inside it with that name
+     * and its 1-based line (`/tmp/s.sh: line 2: q: command not found`), not with `$0: line N:`.
+     * A function body carries its own label, so a call into or out of a sourced file keeps the
+     * name of the file the body was defined in.
+     */
+    sourceLabel?: string;
 }
 
 /* ================================================================== *
@@ -4968,7 +4978,17 @@ function runParsed(state: ShellState, script: string): number {
            in, which is why it is told it is the top of the script: see `runCommandList`. */
         return runCommandList(state, nodes, null, true);
     } catch (error) {
-        if (error instanceof ExitSignal) return error.code;
+        if (error instanceof ExitSignal) {
+            /* A signal the engine let reach the top of a script ended the shell itself: `set -e`
+               on a failing command, `exec` of a program that is not there, and `exit` all stop
+               /bin/sh a line was handed to with `-c`. The host runs such a line step by step,
+               one fragment at a time, and only `exitCalled` makes it refuse the fragments behind
+               the failure. A signal a subshell, a substitution or a trap caught never gets here,
+               so those keep their own status without ending the shell. An interactive shell
+               keeps its old `errexitStopped` behaviour instead. */
+            if (!state.options.interactive) state.exitCalled = true;
+            return error.code;
+        }
         if (error instanceof ReturnSignal) return error.code;
         if (error instanceof ShellSyntaxError) {
             const at = error.at ?? script.length;
@@ -4977,7 +4997,10 @@ function runParsed(state: ShellState, script: string): number {
             } catch (signal) {
                 /* The lines in front of the bad one ended the shell, so the bad one was never read:
                    the `exit`'s status is the script's, and no syntax error is reported at all. */
-                if (signal instanceof ExitSignal) return signal.code;
+                if (signal instanceof ExitSignal) {
+                    if (!state.options.interactive) state.exitCalled = true;
+                    return signal.code;
+                }
             }
             /* A host names the line it read, and says it read the one `-c` was handed: `/bin/sh: -c:
                line 1: syntax error near unexpected token `;''. Where the input ended it names the
@@ -6007,6 +6030,7 @@ function runCommand(state: ShellState, command: Command, input: string | null): 
                 name: command.name,
                 body: command.body,
                 source: state.source,
+                sourceLabel: state.sourceLabel,
                 line: command.line,
                 text: command.text
             });
@@ -6896,6 +6920,8 @@ function callFunction(state: ShellState, fn: FunctionDef, args: string[]): numbe
     const savedOptind = state.optind;
     const savedOptchar = state.optchar;
     const savedOptarg = state.optarg;
+    const savedSourceLabel = state.sourceLabel;
+    state.sourceLabel = fn.sourceLabel;
     state.positional = args;
     state.optind = 1;
     state.optchar = 1;
@@ -6931,6 +6957,7 @@ function callFunction(state: ShellState, fn: FunctionDef, args: string[]): numbe
         state.optind = savedOptind;
         state.optchar = savedOptchar;
         state.optarg = savedOptarg;
+        state.sourceLabel = savedSourceLabel;
     }
     return status;
 }
@@ -8810,8 +8837,12 @@ function sourceBuiltin(ctx: CommandContext, name = 'source'): CommandResult {
     }
     const savedPositional = state.positional;
     const savedSource = state.source;
+    const savedSourceLabel = state.sourceLabel;
     state.positional = args.slice(1);
     state.source = path;
+    /* The name as it was typed, not the absolute path the file system resolved it to: a host's
+       `. ./s.sh` reports `./s.sh: line N:`, while `caller` keeps the resolved `state.source`. */
+    state.sourceLabel = file;
     let status = 0;
     try {
         const nodes = new Parser(text, state).parse();
@@ -8823,6 +8854,7 @@ function sourceBuiltin(ctx: CommandContext, name = 'source'): CommandResult {
     } finally {
         state.positional = savedPositional;
         state.source = savedSource;
+        state.sourceLabel = savedSourceLabel;
     }
     return { stdout: '', stderr: '', exitCode: status };
 }
@@ -9124,11 +9156,23 @@ function popdBuiltin(ctx: CommandContext): CommandResult {
 }
 
 /**
+ * The front of a diagnostic raised while a file is being sourced: bash 3.2 names that file as it
+ * was written (`/tmp/s.sh` or `./s.sh`) and the 1-based line inside it, with no `sh:` in front.
+ * Both a builtin's own complaint and a lookup's `command not found` carry this heading there.
+ */
+function sourceHeading(state: ShellState): string | undefined {
+    if (state.sourceLabel === undefined || state.sourceLabel === '') return undefined;
+    return `${state.sourceLabel}: line ${Math.max(1, state.line)}: `;
+}
+
+/**
  * The front of a builtin's own diagnostic, as bash 3.2 prints it: `$0: line N: ` for a shell
  * running the string `sh -c` was given -- numbered from 0, which is why its first line is
  * `line 0` -- and `$0: ` with no line at all for an interactive one.
  */
 export function diagnosticPrefix(state: ShellState): string {
+    const heading = sourceHeading(state);
+    if (heading !== undefined) return heading;
     const name = state.shellName === '' ? 'sh' : state.shellName;
     if (state.options.interactive) return `${name}: `;
     return `${name}: line ${state.line > 1 ? state.line - 1 : 0}: `;
@@ -9142,6 +9186,8 @@ export function diagnosticPrefix(state: ShellState): string {
  * `line 0` even there. Measured against this machine's /bin/sh (bash 3.2.57).
  */
 export function plainPrefix(state: ShellState): string {
+    const heading = sourceHeading(state);
+    if (heading !== undefined) return heading;
     const name = state.shellName === '' ? 'sh' : state.shellName;
     if (state.options.interactive) return `${name}: `;
     const line = state.line > 1 ? state.line - 1 : 0;
