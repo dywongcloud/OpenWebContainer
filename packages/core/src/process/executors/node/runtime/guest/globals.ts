@@ -2237,8 +2237,25 @@ function urlGlobalOf(nodeUrl) {
     for (var i = 0; i < text.length; i++) {
       var ch = text.charAt(i);
       var code = text.charCodeAt(i);
+      /* A code point past the BMP is a surrogate pair: encodeURIComponent needs both halves
+         together, or it throws on the lone half and leaves the character unencoded. */
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+        var low = text.charCodeAt(i + 1);
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          out += encodeURIComponent(ch + text.charAt(i + 1));
+          i++;
+          continue;
+        }
+      }
       if (code <= 0x20 || code > 0x7e || extra.indexOf(code) >= 0) {
-        try { out += encodeURIComponent(ch); } catch (loneSurrogate) { out += ch; }
+        /* encodeURIComponent leaves an apostrophe alone even when the set asks for it; every
+           ASCII byte named by a set is written as its own %XX escape. */
+        if (code <= 0x7e) {
+          var hex = code.toString(16).toUpperCase();
+          out += '%' + (hex.length === 1 ? '0' : '') + hex;
+        } else {
+          try { out += encodeURIComponent(ch); } catch (loneSurrogate) { out += ch; }
+        }
       } else out += ch;
     }
     return out;
@@ -2313,12 +2330,31 @@ function urlGlobalOf(nodeUrl) {
   /* A reference resolved against a base: the pieces of the base it keeps, the same way the url
      module resolves one, rewritten here against the parser's own state. */
   function referenceAgainst(base, rel) {
+    var specialBase = specialScheme(base.protocol);
+    /* file: is special but its extra leading slashes are path slashes, not an authority's
+       ignored slashes, so only the other special schemes skip them. */
+    var skipSlashes = specialBase && base.protocol !== 'file:';
+    /* A special URL reads a backslash as a slash, and skips every leading slash beyond the two
+       that open an authority before that authority is read. Only the part before a query or a
+       fragment is rewritten: a backslash inside either is an ordinary character. */
+    if (specialBase) {
+      var stop = rel.length;
+      var qAt = rel.indexOf('?'), hAt = rel.indexOf('#');
+      if (qAt >= 0) stop = Math.min(stop, qAt);
+      if (hAt >= 0) stop = Math.min(stop, hAt);
+      rel = rel.slice(0, stop).replace(/\\/g, '/') + rel.slice(stop);
+    }
+    var credentials = base.username === '' && base.password === '' ? '' :
+      base.username + (base.password === '' ? '' : ':' + base.password) + '@';
     var prefix = base.protocol +
-      (base.hasHost || base.protocol === 'file:' ? '//' + base.hostname + (base.port ? ':' + base.port : '') : '');
+      (base.hasHost || base.protocol === 'file:' ? '//' + credentials + base.hostname + (base.port ? ':' + base.port : '') : '');
     var search = base.query === null ? '' : '?' + base.query;
-    var fragment = base.hash === null ? '' : '#' + base.hash;
-    if (rel.slice(0, 2) === '//') return base.protocol + rel;
-    if (rel === '') return prefix + base.pathname + search + fragment;
+    if (rel.slice(0, 2) === '//') {
+      return base.protocol + (skipSlashes ? '//' + rel.replace(/^\/+/, '') : rel);
+    }
+    /* an empty reference replaces the base's fragment with none at all; a fragment-only
+       reference writes its own fragment below */
+    if (rel === '') return prefix + base.pathname + search;
     if (rel.charAt(0) === '/') return prefix + rel;
     if (rel.charAt(0) === '?') return prefix + base.pathname + rel;
     if (rel.charAt(0) === '#') return prefix + base.pathname + search + rel;
@@ -2648,6 +2684,10 @@ function urlGlobalOf(nodeUrl) {
     var scheme = SCHEME_RE.exec(text);
     if (scheme === null) {
       if (base === null || base === undefined) throw invalidUrl(raw);
+      /* WHATWG: a base whose path is opaque cannot resolve a relative reference; only a
+         fragment-only reference may be resolved against it. */
+      if (!base.hasHost && base.protocol !== 'file:' && !specialScheme(base.protocol) &&
+          base.pathname.charAt(0) !== '/' && text.charAt(0) !== '#') throw invalidUrl(raw);
       text = referenceAgainst(base, text);
       scheme = SCHEME_RE.exec(text);
       if (scheme === null) throw invalidUrl(raw);
@@ -2991,7 +3031,7 @@ function urlGlobalOf(nodeUrl) {
     get: function () {
       var state = STATE.get(this);
       if (state.sp !== undefined) return state.sp;
-      var sp = new URLSearchParams(state.query === null ? '' : state.query);
+      var sp = new URLSearchParams('?' + (state.query === null ? '' : state.query));
       var proto = URLSearchParams.prototype;
       ['append', 'set', 'delete', 'sort'].forEach(function (name) {
         Object.defineProperty(sp, name, {
