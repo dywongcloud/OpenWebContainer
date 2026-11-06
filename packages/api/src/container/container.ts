@@ -21,6 +21,7 @@ export class ContainerManager {
             debug: false,
             maxProcesses: 10,
             memoryLimit: 512 * 1024 * 1024, // 512MB
+            coep: 'none',
             ...options
         };
 
@@ -44,7 +45,8 @@ export class ContainerManager {
             // Initialize worker with options
             await this.worker.initialize({
                 debug: this.options.debug,
-                memoryLimit: this.options.memoryLimit
+                memoryLimit: this.options.memoryLimit,
+                coep: this.options.coep
             });
 
             // Set up worker message handlers

@@ -2,6 +2,7 @@ export interface ContainerOptions {
     debug?: boolean;
     maxProcesses?: number;
     memoryLimit?: number;
+    coep?: 'require-corp' | 'credentialless' | 'none';
     onServerListen?: (port: number) => void;
     onServerClose?: (port: number) => void;
 }

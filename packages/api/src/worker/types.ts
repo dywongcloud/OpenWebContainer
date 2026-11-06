@@ -32,6 +32,7 @@ export type ProcessErrorPayload = {
 export interface WorkerInitOptions {
     debug?: boolean;
     memoryLimit?: number;
+    coep?: 'require-corp' | 'credentialless' | 'none';
 }
 
 export interface HttpRequestPayload {

@@ -16,6 +16,10 @@ interface PendingRequest {
 }
 import workerCode from '@open-web-container/core/worker-code';
 
+export const COEP_VALUES = ['require-corp', 'credentialless', 'none'] as const;
+export type CoepValue = typeof COEP_VALUES[number];
+let firstBootCoep: CoepValue | undefined;
+
 export class WorkerBridge {
     private worker: Worker|undefined;
     private messageHandlers: Set<MessageHandler> = new Set();
@@ -33,11 +37,22 @@ export class WorkerBridge {
         if (this.initialized) {
             throw new Error('Worker already initialized');
         }
+        const coep: CoepValue = options.coep ?? 'none';
+        if (!(COEP_VALUES as readonly string[]).includes(coep)) {
+            throw new Error(`Invalid coep: ${String(coep)}; expected require-corp | credentialless | none`);
+        }
+        if (firstBootCoep !== undefined && firstBootCoep !== coep) {
+            throw new Error(`coep is fixed at first boot (${firstBootCoep}) and cannot change on a later boot (${coep})`);
+        }
+        firstBootCoep = coep;
+        if (coep !== 'none' && typeof self !== 'undefined' && !self.crossOriginIsolated) {
+            throw new Error(`coep '${coep}' requires a cross-origin isolated document: set Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: ${coep} on the host response`);
+        }
         await this.boot();
 
         await this.sendMessage({
             type: 'initialize',
-            payload: options
+            payload: { ...options, coep }
         });
 
         this.initialized = true;
