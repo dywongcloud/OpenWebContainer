@@ -4290,6 +4290,82 @@ BF.fs = function () {
       ? copyFileGeneric.call(fs, from, to, flags, cb)
       : copyFileGeneric.call(fs, from, to, cb);
   };
+  /*
+   * fs.read(fd, options, cb): the options-object overload. The generated sweep above hands the
+   * options object itself to readSync as the buffer, so an options read wrote into a plain object,
+   * reported an undefined byte count and -- once offset or length were named -- threw "not a
+   * function" from Uint8Array.prototype.set. Node 24.15 instead takes buffer/offset/length/
+   * position out of the object, allocates a 16 KiB buffer when none is named, and hands that
+   * buffer back as the callback's third argument. Its validation runs before the request starts,
+   * so a bad options object throws from the call instead of reaching the callback.
+   */
+  function readOptionsError(value) {
+    return fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+      'The "options" argument must be of type object. Received ' + describeFsArg(value));
+  }
+  function readBufferError(value) {
+    return fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+      'The "buffer" argument must be an instance of Buffer, TypedArray, or DataView. Received ' + describeFsArg(value));
+  }
+  function readLengthOf(value, room) {
+    if (value < 0) throw fsArgErr(RangeError, 'ERR_OUT_OF_RANGE',
+      'The value of "length" is out of range. It must be >= 0. Received ' + value);
+    if (value > room) throw fsArgErr(RangeError, 'ERR_OUT_OF_RANGE',
+      'The value of "length" is out of range. It must be <= ' + room + '. Received ' + value);
+    var n = Math.trunc(Number(value));
+    return n !== n ? 0 : n;
+  }
+  function readPositionOf(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'bigint') return Number(value);
+    if (typeof value !== 'number') throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+      'The "position" argument must be of type bigint or integer. Received ' + describeFsArg(value));
+    if (value !== Math.floor(value)) throw fsArgErr(RangeError, 'ERR_OUT_OF_RANGE',
+      'The value of "position" is out of range. It must be an integer. Received ' + value);
+    return value;
+  }
+  fs.read = function (fd) {
+    var args = Array.prototype.slice.call(arguments);
+    var cb = args.pop();
+    if (typeof cb !== 'function') {
+      throw fsArgErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "cb" argument must be of type function. Received ' + describeFsArg(cb));
+    }
+    var second = args[1];
+    var optionsForm = args.length < 2 || (args.length === 2
+      && !ArrayBuffer.isView(second) && !Array.isArray(second));
+    var buffer, off, len, at, syncArgs;
+    if (optionsForm) {
+      var o = second === null || second === undefined ? {} : second;
+      if (typeof o !== 'object') throw readOptionsError(o);
+      buffer = o.buffer === undefined ? Buf.alloc(16384) : o.buffer;
+      if (!ArrayBuffer.isView(buffer)) throw readBufferError(buffer);
+      off = o.offset === undefined ? 0 : checkRange(o.offset, 'offset');
+      var room = buffer.byteLength - off;
+      len = o.length === undefined ? room : readLengthOf(o.length, room);
+      at = readPositionOf(o.position);
+      /* A view over the same bytes also makes a DataView, which has no .length, readable. */
+      syncArgs = [fd, new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength), off, len, at];
+    } else {
+      syncArgs = args;
+      buffer = callbackBufferOf('read', args);
+    }
+    var signal = signalOptionOf(args);
+    var error = null, result = 0;
+    if (signal && signal.aborted) {
+      settleRequest(function () { cb(null, 0, buffer); }, false);
+      return;
+    }
+    try {
+      result = fs.readSync.apply(fs, syncArgs);
+    } catch (err) {
+      error = err;
+    }
+    settleRequest(function () {
+      if (error) cb(error, 0, buffer);
+      else cb(null, result, buffer);
+    }, false);
+  };
   promises.open = function (p, flags, mode) {
     return new Promise(function (resolve, reject) {
       try {
