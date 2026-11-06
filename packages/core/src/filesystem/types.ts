@@ -47,6 +47,10 @@ export interface IFileSystem {
      * whole.
      */
     appendBytes?(path: string, data: Uint8Array, mode?: number): void;
+    /** Records a symlink the guest created, so module resolution can follow it. */
+    setSymlink?(target: string, linkPath: string): void;
+    /** The path a symlinked prefix resolves to, or the path itself when no link covers it. */
+    realPath?(path: string): string;
     removePath(path: string, recursive?: boolean): void;
     renamePath(from: string, to: string): void;
     /**

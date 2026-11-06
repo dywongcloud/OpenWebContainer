@@ -4497,6 +4497,16 @@ export class NodeProcess extends Process {
                     message,
                 }));
             }
+            /* An "imports" target naming a node: builtin is invalid: Node reports
+               ERR_INVALID_PACKAGE_TARGET and names the package config that holds it. */
+            if (detail.kind === 'invalid-package-target') {
+                const message = `Invalid "imports" target "${detail.target}" defined for '${detail.specifier}' in the package config ${joinPaths(detail.packageDir, 'package.json')}${baseName ? ` imported from ${baseName}` : ''}`;
+                return ERROR_MODULE_PREFIX + encodeURIComponent(JSON.stringify({
+                    code: 'ERR_INVALID_PACKAGE_TARGET',
+                    ctor: 'Error',
+                    message,
+                }));
+            }
             /* An "exports" target that names a directory: Node refuses the import outright rather
                than reading an index out of it, and names the directory the map pointed at. */
             if (detail.kind === 'dir-target') {
@@ -4755,9 +4765,17 @@ export class NodeProcess extends Process {
                such key, which is the one thing that separates the two. */
             source += `export { __owc_m as "module.exports" };\n`;
         }
+        let stringExportIndex = 0;
         for (const key of keys) {
-            if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) && !RESERVED_WORDS.has(key) && key !== 'default' && !key.startsWith('__owc')) {
+            if (key === 'default' || key.startsWith('__owc') || RESERVED_WORDS.has(key)) continue;
+            if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)) {
                 source += `export const ${key} = __owc_m[${JSON.stringify(key)}];\n`;
+            } else {
+                /* Node's cjs-module-lexer detects bracket-string names such as exports['a-b'],
+                   and the ESM namespace carries them under that exact string. A generated
+                   identifier bound to the value is exported under a string export name. */
+                const alias = `__owc_n${stringExportIndex++}`;
+                source += `const ${alias} = __owc_m[${JSON.stringify(key)}];\nexport { ${alias} as ${JSON.stringify(key)} };\n`;
             }
         }
         return source;

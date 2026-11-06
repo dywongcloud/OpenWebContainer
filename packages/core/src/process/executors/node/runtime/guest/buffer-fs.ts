@@ -2108,6 +2108,7 @@ BF.fs = function () {
     if (symlinkCode) throw symlinkError(symlinkCode, fromName, toName);
     SYMLINKS[to] = from;
     LINKTARGETS[to] = raw;
+    if (host.setSymlink) host.setSymlink(from, to);
   };
 
   /*
@@ -4175,6 +4176,21 @@ BF.fs = function () {
     return true;
   }
 
+  /* Node's async fs calls accept options.signal: one already aborted, or one that aborts before
+     the request settles, rejects with its AbortError instead of doing the work. */
+  function signalOptionOf(args) {
+    for (var i = args.length - 1; i >= 0; i--) {
+      var a = args[i];
+      if (a && typeof a === 'object' && a.signal && typeof a.signal.aborted === 'boolean') return a.signal;
+    }
+    return null;
+  }
+  function abortedError() {
+    var e = new Error('The operation was aborted');
+    e.name = 'AbortError';
+    e.code = 'ABORT_ERR';
+    return e;
+  }
   var names = Object.keys(fs);
   var promises = {};
   fs.promises = promises;
@@ -4186,15 +4202,19 @@ BF.fs = function () {
       var args = Array.prototype.slice.call(arguments);
       var cb = args.pop();
       if (typeof cb !== 'function') throw new TypeError('The "cb" argument must be of type function');
+      var signal = signalOptionOf(args);
       var result;
-      var error = null;
-      try {
-        result = impl.apply(fs, args);
-      } catch (err) {
-        error = err;
+      var error = signal && signal.aborted ? abortedError() : null;
+      if (!error) {
+        try {
+          result = impl.apply(fs, args);
+        } catch (err) {
+          error = err;
+        }
       }
       settleRequest(function () {
-        if (error) cb(error);
+        if (signal && signal.aborted) cb(abortedError());
+        else if (error) cb(error);
         else cb(null, result);
       }, contentCost(syncName, error));
     };
@@ -4202,12 +4222,15 @@ BF.fs = function () {
       promises[base] = function () {
         var args = Array.prototype.slice.call(arguments);
         return new Promise(function (resolve, reject) {
+          var signal = signalOptionOf(args);
           var result;
-          var error = null;
-          try {
-            result = impl.apply(fs, args);
-          } catch (err) {
-            error = err;
+          var error = signal && signal.aborted ? abortedError() : null;
+          if (!error) {
+            try {
+              result = impl.apply(fs, args);
+            } catch (err) {
+              error = err;
+            }
           }
           /*
            * Only the calls host node 24.15 spends a second turn on are settled late here. The others
@@ -4217,12 +4240,14 @@ BF.fs = function () {
            * the reaction behind the immediate instead ('iSI').
            */
           if (!contentCost(syncName, error)) {
-            if (error) reject(error);
+            if (signal && signal.aborted) reject(abortedError());
+            else if (error) reject(error);
             else resolve(result);
             return;
           }
           settleRequest(function () {
-            if (error) reject(error);
+            if (signal && signal.aborted) reject(abortedError());
+            else if (error) reject(error);
             else resolve(result);
           }, true);
         });

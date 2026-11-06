@@ -249,6 +249,11 @@ function notFoundError(id, fromDir, parent) {
     e2.code = 'ERR_PACKAGE_IMPORT_NOT_DEFINED';
     return e2;
   }
+  if (info.kind === 'invalid-package-target') {
+    var e5 = new Error('Invalid "imports" target "' + info.target + '" defined for \'' + info.specifier + '\' in the package config ' + info.packageDir + '/package.json');
+    e5.code = 'ERR_INVALID_PACKAGE_TARGET';
+    return e5;
+  }
   /* An "exports" target that names a directory: Node reads no index out of it, so the require is
      a missing module -- and names the directory the map pointed at, not the specifier. */
   if (info.kind === 'dir-target') return moduleNotFound(info.dir, parent);
@@ -1811,6 +1816,11 @@ function importMetaOf(filename, isMain, urlSuffix) {
         var e2 = new TypeError("Package import specifier \"" + info.specifier + "\" is not defined in package " + info.packageDir + '/package.json imported from ' + filename);
         e2.code = 'ERR_PACKAGE_IMPORT_NOT_DEFINED';
         throw e2;
+      }
+      if (info.kind === 'invalid-package-target') {
+        var e6 = new Error('Invalid "imports" target "' + info.target + '" defined for \'' + info.specifier + '\' in the package config ' + info.packageDir + '/package.json imported from ' + filename);
+        e6.code = 'ERR_INVALID_PACKAGE_TARGET';
+        throw e6;
       }
       if (info.kind === 'bad-file-url') {
         var e3 = info.ctor === 'URIError' ? new URIError(info.message) : new TypeError(info.message);

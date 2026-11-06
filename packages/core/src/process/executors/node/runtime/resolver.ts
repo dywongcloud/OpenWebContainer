@@ -14,6 +14,7 @@ export type ResolveMode = 'require' | 'import';
 export type ResolveFailure =
     | { kind: 'not-exported'; packageDir: string; subpath: string; self?: boolean }
     | { kind: 'import-not-defined'; packageDir: string; specifier: string }
+    | { kind: 'invalid-package-target'; packageDir: string; specifier: string; target: string }
     | { kind: 'dir-target'; dir: string }
     | { kind: 'bad-file-url'; ctor: 'TypeError' | 'URIError'; code: string; message: string }
     | { kind: 'unknown-extension'; file: string; ext: string }
@@ -273,7 +274,18 @@ export class NodeResolver {
         const scope = this.nearestPackageScope(fromDir);
         if (scope === undefined) return undefined;
         const target = resolveImportsTarget(scope.pkg.imports, specifier, mode);
-        if (target === undefined) {
+        if (target !== undefined && target.kind === 'bare') {
+            /* An "imports" target that is not a ./ path is a package specifier, which Node
+               resolves from the package scope; a node: builtin is not a valid target at all. */
+            const bare = target.value;
+            if (bare.startsWith('node:') || IMPORTS_BUILTIN_NAMES.has(bare)) {
+                this.lastFailure = { kind: 'invalid-package-target', packageDir: scope.dir, specifier, target: bare };
+                return undefined;
+            }
+            return this.resolve(bare, scope.dir, mode);
+        }
+        const relative = target === undefined ? undefined : target.value;
+        if (relative === undefined) {
             /* import() always reports ERR_PACKAGE_IMPORT_NOT_DEFINED; require() reports it only for
                a package.json that has an "imports" map at all, and a plain missing module for one
                that has none. */
@@ -282,8 +294,9 @@ export class NodeResolver {
             }
             return undefined;
         }
-        const resolved = normalizeAbsolute(joinPaths(scope.dir, target));
-        return this.fileSystem.statPath(resolved)?.type === 'file' ? resolved : this.resolveAsPath(resolved, mode);
+        const resolved = normalizeAbsolute(joinPaths(scope.dir, relative));
+        const real = this.fileSystem.realPath ? this.fileSystem.realPath(resolved) : resolved;
+        return this.fileSystem.statPath(real)?.type === 'file' ? real : this.resolveAsPath(real, mode);
     }
 
     /**
@@ -407,8 +420,9 @@ export class NodeResolver {
         while (true) {
             if (!dir.endsWith('/node_modules')) {
                 const packageDir = joinPaths(dir, 'node_modules', name);
-                if (this.fileSystem.statPath(packageDir)?.type === 'dir') {
-                    return this.resolvePackageDirectory(packageDir, subpath, mode);
+                const real = this.fileSystem.realPath ? this.fileSystem.realPath(packageDir) : packageDir;
+                if (this.fileSystem.statPath(real)?.type === 'dir') {
+                    return this.resolvePackageDirectory(real, subpath, mode);
                 }
             }
             if (dir === '/') {
@@ -632,40 +646,80 @@ export function resolveExportsTarget(exportsField: unknown, subpath: string, mod
     if (Object.prototype.hasOwnProperty.call(map, subpath)) {
         return pickCondition(map[subpath], conditions);
     }
-    for (const key of Object.keys(map)) {
-        const star = key.indexOf('*');
-        if (star < 0) continue;
-        const prefix = key.slice(0, star);
-        const suffix = key.slice(star + 1);
-        if (subpath.length >= key.length - 1 && subpath.startsWith(prefix) && subpath.endsWith(suffix)) {
-            const matched = subpath.slice(prefix.length, subpath.length - suffix.length);
-            const target = pickCondition(map[key], conditions);
-            if (target !== undefined) return target.split('*').join(matched);
+    /* Node picks the most specific pattern key: the longest prefix before the star, then the
+       longest whole key, and only then the order the map was written in. A key whose target is
+       null blocks the subpath: no less specific key is tried after that one wins. */
+    const best = bestPatternKey(map, subpath);
+    if (best === undefined) return undefined;
+    const target = pickCondition(map[best.key], conditions);
+    if (target === undefined) return undefined;
+    return target.split('*').join(best.matched);
+}
+
+/** The builtin specifiers a package "imports" map may not name as a target. */
+const IMPORTS_BUILTIN_NAMES = new Set(['fs','path','os','util','events','stream','buffer','url','crypto','assert','http','https','net','dns','child_process','timers','module','process','querystring','string_decoder','zlib','readline','v8','vm','worker_threads','perf_hooks','async_hooks','diagnostics_channel','inspector','tls','dgram','cluster','punycode','domain','repl','constants','sys','console','_http_agent','_http_client','_http_common','_http_incoming','_http_outgoing','_http_server','_stream_duplex','_stream_passthrough','_stream_readable','_stream_transform','_stream_wrap','_stream_writable','_tls_common','_tls_wrap']);
+
+export type ImportsTarget = { kind: 'path' | 'bare'; value: string } | undefined;
+
+/** Resolves a `#name` specifier against package.json "imports" (exact keys and `*` patterns).
+ *  A `./` target is a path under the package; a bare target is a package specifier, as Node reads it. */
+export function resolveImportsTarget(importsField: unknown, specifier: string, mode: ResolveMode): ImportsTarget {
+    if (!isPlainObject(importsField)) return undefined;
+    const conditions = mode === 'require' ? ['require', 'node', 'default'] : ['import', 'node', 'default'];
+    const map = importsField;
+    const shape = (target: string | undefined): ImportsTarget =>
+        target === undefined ? undefined : { kind: target.startsWith('./') ? 'path' : 'bare', value: target };
+    if (Object.prototype.hasOwnProperty.call(map, specifier)) {
+        return shape(pickImportsCondition(map[specifier], conditions));
+    }
+    const best = bestPatternKey(map, specifier);
+    if (best === undefined) return undefined;
+    const target = pickImportsCondition(map[best.key], conditions);
+    if (target === undefined) return undefined;
+    const value = target.split('*').join(best.matched);
+    return shape(value);
+}
+
+/** An "imports" condition object: unlike "exports", a bare package specifier is a valid target. */
+function pickImportsCondition(target: unknown, conditions: string[]): string | undefined {
+    if (typeof target === 'string') return target;
+    if (Array.isArray(target)) {
+        for (const entry of target) {
+            const found = pickImportsCondition(entry, conditions);
+            if (found !== undefined) return found;
+        }
+        return undefined;
+    }
+    if (isPlainObject(target)) {
+        for (const key of Object.keys(target)) {
+            if (!conditions.includes(key)) continue;
+            const found = pickImportsCondition(target[key], conditions);
+            if (found !== undefined) return found;
         }
     }
     return undefined;
 }
 
-/** Resolves a `#name` specifier against package.json "imports" (exact keys and `*` patterns). */
-export function resolveImportsTarget(importsField: unknown, specifier: string, mode: ResolveMode): string | undefined {
-    if (!isPlainObject(importsField)) return undefined;
-    const conditions = mode === 'require' ? ['require', 'node', 'default'] : ['import', 'node', 'default'];
-    const map = importsField;
-    if (Object.prototype.hasOwnProperty.call(map, specifier)) {
-        return pickCondition(map[specifier], conditions);
-    }
-    for (const key of Object.keys(map)) {
-        const star = key.indexOf('*');
+/** The most specific `*` key for a subpath: longest prefix, then longest key, then map order. */
+function bestPatternKey(map: Record<string, unknown>, key: string): { key: string; matched: string } | undefined {
+    let bestKey: string | undefined;
+    let bestPrefix = -1;
+    let bestLength = -1;
+    let bestMatched = '';
+    for (const candidate of Object.keys(map)) {
+        const star = candidate.indexOf('*');
         if (star < 0) continue;
-        const prefix = key.slice(0, star);
-        const suffix = key.slice(star + 1);
-        if (specifier.length >= key.length - 1 && specifier.startsWith(prefix) && specifier.endsWith(suffix)) {
-            const matched = specifier.slice(prefix.length, specifier.length - suffix.length);
-            const target = pickCondition(map[key], conditions);
-            if (target !== undefined) return target.split('*').join(matched);
+        const prefix = candidate.slice(0, star);
+        const suffix = candidate.slice(star + 1);
+        if (key.length < candidate.length - 1 || !key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+        if (prefix.length > bestPrefix || (prefix.length === bestPrefix && candidate.length > bestLength)) {
+            bestKey = candidate;
+            bestPrefix = prefix.length;
+            bestLength = candidate.length;
+            bestMatched = key.slice(prefix.length, key.length - suffix.length);
         }
     }
-    return undefined;
+    return bestKey === undefined ? undefined : { key: bestKey, matched: bestMatched };
 }
 
 function pickCondition(target: unknown, conditions: string[]): string | undefined {

@@ -3227,6 +3227,11 @@ function structuredCloneOf(value, moved, seen) {
         return value;
     }
     if (moved !== null && moved.has(value)) return moved.get(value);
+    /* A MessagePort is transferable, not cloneable: one named in no transferList is refused with
+       the host's own words instead of coming back as a plain object of its own properties. */
+    if (typeof globalThis.MessagePort === 'function' && value instanceof globalThis.MessagePort) {
+        throw dataCloneError('Object that needs transfer was found in message but not listed in transferList');
+    }
     if (seen.has(value)) return seen.get(value);
     var tag = Object.prototype.toString.call(value).slice(8, -1);
     var isDomException = typeof globalThis.DOMException === 'function' && value instanceof globalThis.DOMException;
@@ -3353,6 +3358,10 @@ globalThis.structuredClone = function (value, options) {
                there is nothing of a supported type left to transfer. */
             if (each === null || (typeof each !== 'object' && typeof each !== 'function')) {
                 throw new TypeError('Value is not an object');
+            }
+            if (typeof globalThis.MessagePort === 'function' && each instanceof globalThis.MessagePort) {
+                moved.set(each, each);
+                continue;
             }
             if (Object.prototype.toString.call(each) !== '[object ArrayBuffer]') {
                 throw dataCloneError('Found invalid value in transferList.');

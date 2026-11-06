@@ -3856,12 +3856,24 @@ function owcBuildStreamCore() {
     var reader = readableStream.getReader();
     var opts = {};
     if (options) for (var key in options) opts[key] = options[key];
-    opts.read = function () {
-      var self = this;
+    /* Node's adapter reads ahead to fill the readable's highWaterMark, so chunks a web stream
+       already holds are all pushed before the consumer's first pull. Reading exactly one chunk
+       per _read call left a non-objectMode readable yielding one chunk per web chunk. */
+    var pumping = false;
+    var readAhead = opts.objectMode !== true;
+    var pump = function (self) {
       reader.read().then(function (step) {
-        if (step.done) self.push(null);
-        else self.push(nodeChunkOf(step.value));
-      }, function (err) { self.destroy(err); });
+        if (step.done) { self.push(null); pumping = false; return; }
+        self.push(nodeChunkOf(step.value));
+        var st = self._readableState;
+        if (readAhead && !st.destroyed && !st.errored && st.length < st.highWaterMark) pump(self);
+        else pumping = false;
+      }, function (err) { pumping = false; self.destroy(err); });
+    };
+    opts.read = function () {
+      if (pumping) return;
+      pumping = true;
+      pump(this);
     };
     if (typeof opts.destroy !== 'function') {
       opts.destroy = function (err, cb) {
@@ -3927,12 +3939,24 @@ function owcBuildStreamCore() {
     var writer = writable.getWriter();
     var opts = {};
     if (options) for (var key in options) opts[key] = options[key];
-    opts.read = function () {
-      var self = this;
+    /* Node's adapter reads ahead to fill the readable's highWaterMark, so chunks a web stream
+       already holds are all pushed before the consumer's first pull. Reading exactly one chunk
+       per _read call left a non-objectMode readable yielding one chunk per web chunk. */
+    var pumping = false;
+    var readAhead = opts.objectMode !== true;
+    var pump = function (self) {
       reader.read().then(function (step) {
-        if (step.done) self.push(null);
-        else self.push(nodeChunkOf(step.value));
-      }, function (err) { self.destroy(err); });
+        if (step.done) { self.push(null); pumping = false; return; }
+        self.push(nodeChunkOf(step.value));
+        var st = self._readableState;
+        if (readAhead && !st.destroyed && !st.errored && st.length < st.highWaterMark) pump(self);
+        else pumping = false;
+      }, function (err) { pumping = false; self.destroy(err); });
+    };
+    opts.read = function () {
+      if (pumping) return;
+      pumping = true;
+      pump(this);
     };
     opts.write = function (chunk, encoding, cb) {
       writer.write(chunk).then(function () { cb(); }, function (err) { cb(err); });

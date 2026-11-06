@@ -218,6 +218,11 @@ export function installHostBridge(context: QuickJSContext, deps: HostBridgeDeps)
         merged.set(bytes, existing.length);
         deps.fileSystem.writeBytes(file, merged, optionalMode(mode));
     })));
+    /* A symlink the guest made is a name in the file system, so resolution has to be told where
+       it points: the guest's own table lives in another realm and the resolver reads this one. */
+    define('setSymlink', (target, linkPath) => context.newString(guardFs(() => {
+        deps.fileSystem.setSymlink?.(text(target), text(linkPath));
+    })));
     define('mkdir', (path, mode) => context.newString(guardFs(() => {
         deps.fileSystem.createDirectory(text(path), optionalMode(mode));
     })));

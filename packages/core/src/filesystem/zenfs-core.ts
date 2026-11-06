@@ -415,6 +415,30 @@ export class ZenFSCore implements IFileSystem {
 
     /* `mode` is carried through: a guest's `fs.statSync` reports it, and the executable bit is
        what a search for a binary reads. */
+    /** Symlinks the guest created at runtime: the virtual file system keeps the link name as a
+        file, so only this table knows the directory a resolution has to be redirected to. */
+    private symlinkTargets = new Map<string, string>();
+
+    setSymlink(target: string, linkPath: string): void {
+        this.symlinkTargets.set(this.normalizePath(linkPath), this.normalizePath(target));
+    }
+
+    realPath(path: string): string {
+        let current = this.normalizePath(path);
+        for (let depth = 0; depth < 16; depth++) {
+            let replaced = false;
+            for (const [link, target] of this.symlinkTargets) {
+                if (current === link || current.startsWith(link + '/')) {
+                    current = this.normalizePath(target + current.slice(link.length));
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) break;
+        }
+        return current;
+    }
+
     statPath(path: string): PathStat | undefined {
         requirePathWithinLimits(path);
         if (!this.fs.existsSync(path)) return undefined;
