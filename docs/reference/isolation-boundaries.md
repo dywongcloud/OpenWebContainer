@@ -1,0 +1,6 @@
+# Isolation boundaries
+
+  - The playground document response on :5173 carries no Cross-Origin-Opener-Policy and no Cross-Origin-Embedder-Policy: headful Chrome 157 measured self.crossOriginIsolated=false, typeof SharedArrayBuffer=undefined and isSecureContext=true while the Web IDE still booted, so this engine does not provision the cross-origin isolation a WebContainer-compatible host must set.
+  - There is no WebContainer.boot-style coep option here: ContainerOptions carries only debug/maxProcesses/memoryLimit/onServerListen/onServerClose and WorkerInitOptions only debug/memoryLimit, so the require-corp | credentialless | none union and a coep value fixed at first boot cannot be honoured on a later reboot.
+  - Direct-TCP database drivers (MongoDB, Mongoose, PostgreSQL, MySQL) cannot connect from a browser-hosted container; use an HTTP/API-accessible provider such as Neon serverless Postgres instead, because only the container virtual TCP and page-level fetch exist.
+  - Guest fetch is not browser or host undici parity: Node fetch is built on undici, an HTTP/1.1 client written from scratch for Node, while this container serves its own undici module over its own http/https client, so a program cannot assume host or browser fetch, connection and stream behaviour.
