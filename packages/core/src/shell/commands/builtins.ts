@@ -314,6 +314,13 @@ export interface ShellState {
      */
     trapDepth?: number;
     /**
+     * A non-interactive shell ends on a POSIX special builtin's unrecoverable error: `.`/`source`
+     * with no file, or a file it cannot read. The builtin still returns its diagnostic through the
+     * ordinary CommandResult so a redirection on the command carries it; `runCommandList` turns
+     * this status into `ExitSignal` once that result has been delivered.
+     */
+    fatalBuiltinStatus?: number;
+    /**
      * The descriptors `exec` opened and left open: `3` is the file `exec 3>f` named, and a later
      * `echo hi >&3` writes to it, the way it does in a shell. One `exec 3>&1` opened is the shell's
      * own standard output rather than a file, and one `exec 3<f` opened is a descriptor `cat <&3`
@@ -3256,6 +3263,10 @@ class Parser {
         let elseBody: Node[] | undefined;
         for (;;) {
             const cond = this.parseList(['then']);
+            /* `if then` and `if` newline `then` have no condition at all: a host stops on the
+               `then` it read where a command should have stood, rather than reading to EOF and
+               reporting an `if` that was never closed. */
+            if (cond.length === 0) throw new ShellSyntaxError("syntax error near unexpected token `then'");
             this.skipSpace(true);
             if (!this.keywordAt(this.pos, 'then')) throw this.expectedKeyword();
             this.pos += 4;
@@ -4948,6 +4959,7 @@ function runLinesBefore(state: ShellState, script: string, errorLine: number): v
 
 /** Parses and runs a whole script, and reports one that failed the way a shell reports it. */
 function runParsed(state: ShellState, script: string): number {
+    state.fatalBuiltinStatus = undefined;
     try {
         const nodes = new Parser(script, state).parse();
         /* The list a script was handed is the one a stray `break` or `continue` is nothing at all
@@ -5173,6 +5185,18 @@ function runCommandList(state: ShellState, nodes: Node[], input: string | null, 
         try {
             status = runNode(state, node, input);
             state.lastStatus = status;
+            /* A special builtin's unrecoverable error ends a non-interactive shell. Its diagnostic
+               has already been delivered through `finish` (so a redirection on the command still
+               applies), and this is the first loop every node list shares: bash 3.2 ends the script
+               for `.`/`source` even behind `||`, inside a function or on a later line. */
+            if (state.fatalBuiltinStatus !== undefined) {
+                const fatal = state.fatalBuiltinStatus;
+                state.fatalBuiltinStatus = undefined;
+                /* `exit` leaves this flag so the host that runs a `-c` line step by step refuses
+                   every command behind the failure; without it the next fragment would run. */
+                state.exitCalled = true;
+                throw new ExitSignal(fatal);
+            }
             if (status !== 0 && state.protectedDepth === 0) {
                 /* A command of a trap's own action is not one of the line, so a failure inside an
                    ERR trap does not run the trap again -- see `trapDepth`. Nor is a command of a
@@ -8701,28 +8725,82 @@ function evalBuiltin(ctx: CommandContext): CommandResult {
 }
 
 /**
- * The two lines a host writes when `source` is given no file: the name it was called by -- `.` and
- * `source` each name themselves -- and then its usage: `/bin/sh: .: filename argument required`
- * followed by `.: usage: . filename [arguments]`.
+ * The report bash 3.2 writes for a syntax error inside a sourced file: the file it was reading,
+ * the 1-based line in that file, the parser's own words and -- after `syntax error near` -- the
+ * line it gave up on in backquotes. A sourced file's error does not end the shell: the `.` that
+ * read it leaves status 1 (`source bad; echo $?` prints `1`), where the same text handed to
+ * `sh -c` ends 2 and is headed `sh: -c: line N:`.
+ */
+function sourceSyntaxDiagnostic(file: string, text: string, error: ShellSyntaxError): CommandResult {
+    const line = (error.reportedLine ?? lineIndexOf(text, error.at ?? text.length)) + 1;
+    const heading = `${file}: line ${line}: `;
+    let stderr = '';
+    for (const report of error.reports) stderr += `${heading}${report}\n`;
+    stderr += `${heading}${error.message}\n`;
+    if (error.message.startsWith('syntax error near')) {
+        const spans = lineSpans(text);
+        const span = spans[Math.min(line - 1, spans.length - 1)];
+        const from = error.echoFrom ?? span?.start ?? 0;
+        if (span !== undefined) stderr += `${heading}\`${text.slice(from, span.end).replace(/\n$/, '')}'\n`;
+    }
+    return { stdout: '', stderr, exitCode: 1 };
+}
+
+/**
+ * `.` and `source`. Three error paths measured against this machine's /bin/sh (bash 3.2.57): with
+ * no file it writes a two-line usage complaint headed by `sh: line 0:` and ends a non-interactive
+ * shell on 2; a file that is not there is `sh: <name>: No such file or directory` and ends it on 1;
+ * a directory is `sh: line 0: <name>: <path>: is a directory`, status 1, and the shell carries on.
+ * The last two name the path exactly as it was typed, not the absolute path the file system
+ * resolved it to. A missing file is fatal in a non-interactive POSIX shell even behind `||` or
+ * inside a function, while `runScript` still runs an EXIT trap when the signal reaches the top.
  */
 function sourceBuiltin(ctx: CommandContext, name = 'source'): CommandResult {
     const state = stateOf(ctx);
-    if (ctx.args.length === 0) {
-        return failLine(`${state.shellName}: ${name}: filename argument required\n${name}: usage: ${name} filename [arguments]`, 2);
+    /* bash 3.2 reads one leading `--` as the end of the options and nothing else; a file named
+       `-` is an ordinary file, but `-x` and `--help` are options it does not have. The complaint
+       names the option letter (`--help` is reported as `--`), is headed by the line like any other
+       builtin diagnostic, and ends the shell on 2 the way a no-file call does. */
+    let args = ctx.args;
+    let first = args[0];
+    if (first === '--') {
+        args = args.slice(1);
+        first = args[0];
+    } else if (first !== undefined && first.length > 1 && first.startsWith('-')) {
+        const result = failLine(`${diagnosticPrefix(state)}${name}: ${first.slice(0, 2)}: invalid option\n${name}: usage: ${name} filename [arguments]`, 2);
+        if (!state.options.interactive) state.fatalBuiltinStatus = result.exitCode;
+        return result;
     }
-    const file = ctx.args[0];
+    if (first === undefined) {
+        const result = failLine(`${diagnosticPrefix(state)}${name}: filename argument required\n${name}: usage: ${name} filename [arguments]`, 2);
+        if (!state.options.interactive) state.fatalBuiltinStatus = result.exitCode;
+        return result;
+    }
+    const file = first;
     // resolve here and hand `inputText` an absolute path, so its own resolution cannot move it
     const path = resolvePath(state, file);
-    const fileCtx: CommandContext = { args: [path], cwd: state.cwd, env: state.env, input: null, fs: (state.fs ?? NO_FS) as never };
+    const fs = state.fs ?? NO_FS;
+    /* The virtual file system throws for a path that is not there at all, so a probe for a
+       directory cannot sit outside the read's own error handling. */
+    let isDir = false;
+    try { isDir = fs.isDirectory(path); } catch { isDir = false; }
+    if (isDir) return failDiag(state, `${name}: ${file}: is a directory`, 1);
+    const fileCtx: CommandContext = { args: [path], cwd: state.cwd, env: state.env, input: null, fs: fs as never };
     let text: string | undefined;
     try {
         text = inputText(fileCtx)[0].text;
     } catch (error) {
-        return failLine(`${path}: ${errorMessage(error).replace(/^[^:]*: /, '')}`, 1);
+        const detail = errorMessage(error);
+        if (!/No such file or directory|ENOENT/.test(detail)) {
+            return failLine(`${file}: ${detail.replace(/^[^:]*: /, '')}`, 1);
+        }
+        const result = failLine(`${plainPrefix(state)}${file}: No such file or directory`, 1);
+        if (!state.options.interactive) state.fatalBuiltinStatus = result.exitCode;
+        return result;
     }
     const savedPositional = state.positional;
     const savedSource = state.source;
-    state.positional = ctx.args.slice(1);
+    state.positional = args.slice(1);
     state.source = path;
     let status = 0;
     try {
@@ -8730,7 +8808,7 @@ function sourceBuiltin(ctx: CommandContext, name = 'source'): CommandResult {
         status = runCommandList(state, nodes, null);
     } catch (error) {
         if (error instanceof ReturnSignal) return { stdout: '', stderr: '', exitCode: error.code };
-        if (error instanceof ShellSyntaxError) return failLine(error.message, 2);
+        if (error instanceof ShellSyntaxError) return sourceSyntaxDiagnostic(file, text, error);
         throw error;
     } finally {
         state.positional = savedPositional;
