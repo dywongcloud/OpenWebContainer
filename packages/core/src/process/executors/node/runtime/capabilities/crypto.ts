@@ -1,7 +1,7 @@
 import { blake2b, blake2s } from '@noble/hashes/blake2';
 import { md5 } from '@noble/hashes/legacy';
 import { ripemd160 } from '@noble/hashes/ripemd160';
-import { argon2d, argon2i, argon2id } from '@noble/hashes/argon2';
+import { argon2d, argon2i, argon2id, type ArgonOpts } from '@noble/hashes/argon2';
 import { pbkdf2 } from '@noble/hashes/pbkdf2';
 import { scrypt } from '@noble/hashes/scrypt';
 import { sha1 } from '@noble/hashes/sha1';
@@ -4717,9 +4717,9 @@ function generatorOf(value: unknown, asNumber: unknown): bigint {
  * whatever shape it comes in, so a Buffer holding DER bytes is not a SPKAC and answers nothing.
  * ------------------------------------------------------------------------------------------ */
 
-interface DerNode { tag: number; header: number; end: number; content: Uint8Array; }
+interface DerFrame { tag: number; header: number; end: number; content: Uint8Array; }
 
-function derNodeAt(bytes: Uint8Array, at: number): DerNode | null {
+function derNodeAt(bytes: Uint8Array, at: number): DerFrame | null {
     if (at + 2 > bytes.length) return null;
     const tag = bytes[at];
     const first = bytes[at + 1];
@@ -4739,8 +4739,8 @@ function derNodeAt(bytes: Uint8Array, at: number): DerNode | null {
     return { tag, header: at, end, content: bytes.subarray(start, end) };
 }
 
-function derChildren(content: Uint8Array): DerNode[] | null {
-    const out: DerNode[] = [];
+function derChildren(content: Uint8Array): DerFrame[] | null {
+    const out: DerFrame[] = [];
     let at = 0;
     while (at < content.length) {
         const node = derNodeAt(content, at);
@@ -4917,7 +4917,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         const priv = state.curve.curve.utils.randomPrivateKey();
         state.priv = priv;
         state.pub = state.curve.curve.getPublicKey(priv, false);
-        return { public: bytesToBase64(state.pub), private: bytesToBase64(state.priv) };
+        return { public: bytesToBase64(state.pub!), private: bytesToBase64(state.priv!) };
     },
     /** Args {id}: the curve and whichever halves exist. */
     'crypto.ecdh.info': (args) => {
@@ -4942,7 +4942,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
         const priv = base64ToBytes(String(args?.private));
         state.priv = priv;
         state.pub = state.curve.curve.getPublicKey(priv, false);
-        return { public: bytesToBase64(state.pub) };
+        return { public: bytesToBase64(state.pub!) };
     },
     /** Args {id, public}: the other party's point, kept for computeSecret. */
     'crypto.ecdh.setPublic': (args) => {
@@ -4956,7 +4956,7 @@ export const CRYPTO_CAPABILITIES: Record<string, CapabilityHandler> = {
     'crypto.argon2': (args) => {
         const variant = String(args?.variant);
         const fn = variant === 'argon2d' ? argon2d : variant === 'argon2i' ? argon2i : argon2id;
-        const opts: Record<string, unknown> = {
+        const opts: ArgonOpts = {
             t: Number(args?.passes),
             m: Number(args?.memory),
             p: Number(args?.parallelism),
