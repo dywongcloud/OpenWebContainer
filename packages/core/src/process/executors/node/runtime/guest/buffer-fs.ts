@@ -4191,6 +4191,20 @@ BF.fs = function () {
     e.code = 'ABORT_ERR';
     return e;
   }
+  /* Node hands a read/write callback the buffer (or the buffers array, or the string) the
+     call was given as a third argument; tar's ReadStream takes its chunk from that argument.
+     On failure the same four calls pass (err, 0, buffer). Every other async call's callback
+     is (err[, result]) with no third value. An options-object second argument carries the
+     buffer at .buffer (fs.read(fd, { buffer, ... }, cb)). */
+  var BUFFERED_CALLBACK = { read: 1, write: 1, readv: 1, writev: 1 };
+  function callbackBufferOf(base, args) {
+    var first = args[1];
+    if ((base === 'read' || base === 'write') && first && typeof first === 'object'
+        && !ArrayBuffer.isView(first) && !Array.isArray(first) && first.buffer !== undefined) {
+      return first.buffer;
+    }
+    return first;
+  }
   var names = Object.keys(fs);
   var promises = {};
   fs.promises = promises;
@@ -4213,8 +4227,13 @@ BF.fs = function () {
         }
       }
       settleRequest(function () {
+        var buffer = BUFFERED_CALLBACK[base] ? callbackBufferOf(base, args) : undefined;
         if (signal && signal.aborted) cb(abortedError());
-        else if (error) cb(error);
+        else if (error) {
+          if (BUFFERED_CALLBACK[base]) cb(error, 0, buffer);
+          else cb(error);
+        }
+        else if (BUFFERED_CALLBACK[base]) cb(null, result, buffer);
         else cb(null, result);
       }, contentCost(syncName, error));
     };
@@ -4379,7 +4398,7 @@ BF.fs = function () {
       var bytes = ArrayBuffer.isView(buffer) ? Buf.from(buffer.buffer, buffer.byteOffset, buffer.byteLength) : Buf.from(String(buffer));
       var from = Number(offset) > 0 ? Number(offset) : 0;
       var written = rec.write(bytes.slice(from).toString('utf8'));
-      if (done) queueMicrotask(function () { done(null, written); });
+      if (done) queueMicrotask(function () { done(null, written, buffer); });
       return;
     }
     var args = Array.prototype.slice.call(arguments, 1);
@@ -4391,7 +4410,7 @@ BF.fs = function () {
     } catch (err) {
       error = err;
     }
-    if (done) queueMicrotask(function () { done(error, count); });
+    if (done) queueMicrotask(function () { done(error, count, buffer); });
     else if (error) throw error;
   };
   /*
