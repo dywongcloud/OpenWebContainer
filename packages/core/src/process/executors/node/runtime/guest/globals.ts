@@ -2261,6 +2261,75 @@ function urlGlobalOf(nodeUrl) {
     return out;
   }
 
+  /* WHATWG: an opaque path is not a normal path. Only the C0 control percent-encode set ever
+     touches it, so a space, a quote, angle brackets, braces and a pipe stay exactly as written,
+     where the path percent-encode set would have escaped them. */
+  function percentEncodeC0In(text) {
+    var out = '';
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      var code = text.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+        var low = text.charCodeAt(i + 1);
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          out += encodeURIComponent(ch + text.charAt(i + 1));
+          i++;
+          continue;
+        }
+      }
+      if (code <= 0x1f || code > 0x7e) {
+        if (code <= 0x7e) {
+          var hex = code.toString(16).toUpperCase();
+          out += '%' + (hex.length === 1 ? '0' : '') + hex;
+        } else {
+          try { out += encodeURIComponent(ch); } catch (loneSurrogate) { out += ch; }
+        }
+      } else out += ch;
+    }
+    return out;
+  }
+
+  /* A Windows drive letter at the front of a file: reference, with or without one leading slash:
+     'C|/x', '/C:/x' and 'c:' name a drive of their own, not a segment of the base's path. */
+  function windowsDrive(rel) {
+    var lead = rel.charAt(0) === '/' ? 1 : 0;
+    var letter = rel.charAt(lead);
+    var isLetter = (letter >= 'A' && letter <= 'Z') || (letter >= 'a' && letter <= 'z');
+    var sep = rel.charAt(lead + 1);
+    if (!isLetter || (sep !== ':' && sep !== '|')) return null;
+    var next = rel.charAt(lead + 2);
+    if (next !== '' && next !== '/' && next !== String.fromCharCode(92) &&
+        next !== '?' && next !== '#') return null;
+    return { letter: letter, tail: rel.slice(lead + 2) };
+  }
+
+  function isDriveSegment(text) {
+    if (text.length !== 2) return false;
+    var letter = text.charAt(0);
+    var isLetter = (letter >= 'A' && letter <= 'Z') || (letter >= 'a' && letter <= 'z');
+    return isLetter && (text.charAt(1) === ':' || text.charAt(1) === '|');
+  }
+
+  /* A file: path's first drive segment is also the one a Windows volume keeps, so a pipe written
+     after that letter is the drive separator a colon is. */
+  function normalizeFileDrivePipe(path) {
+    for (var i = 2; i < path.length; i++) {
+      if (path.charAt(i) !== '|') continue;
+      var before = path.charAt(i - 2);
+      if (before !== '/' && before !== String.fromCharCode(92)) continue;
+      var letter = path.charAt(i - 1);
+      var after = path.charAt(i + 1);
+      /* A pipe is the drive separator only where a drive letter may end: before a slash, a
+         question mark, a hash or the end of the path. 'w|m' and 'C|a' keep their pipe. */
+      var driveEnd = after === '' || after === '/' || after === String.fromCharCode(92) ||
+        after === '?' || after === '#';
+      if (driveEnd && ((letter >= 'A' && letter <= 'Z') || (letter >= 'a' && letter <= 'z'))) {
+        return path.slice(0, i) + ':' + path.slice(i + 1);
+      }
+    }
+    return path;
+  }
+
   function invalidUrl(input) {
     var err = new TypeError('Invalid URL');
     err.code = 'ERR_INVALID_URL';
@@ -2285,26 +2354,37 @@ function urlGlobalOf(nodeUrl) {
     return percentEncodeIn(text, PATH_EXTRA);
   }
 
-  /* RFC 3986 5.2.4: '.' and '..' segments are resolved out, and a percent-encoded dot segment
-     counts as one, the way the url module's own parser reads it. */
-  function removeDotSegments(pathname) {
+  /* WHATWG path state: the leading slash opens a list of segments and every empty segment is a
+     segment of its own, so six slashes stay six slashes. A dot or double-dot segment shortens the
+     list and leaves an empty segment behind when it ends the path. A file: URL whose first segment
+     is a Windows drive letter never shortens past that drive. */
+  function dotSegmentKind(segment) {
+    var decoded = segment;
+    try { decoded = decodeURIComponent(segment); } catch (err) { /* an invalid escape is itself */ }
+    var lower = decoded.toLowerCase();
+    if (lower === '.' || lower === '%2e') return 1;
+    if (lower === '..' || lower === '.%2e' || lower === '%2e.' || lower === '%2e%2e') return 2;
+    return 0;
+  }
+
+  function removeDotSegments(pathname, protectDrive) {
     if (pathname.charAt(0) !== '/') return pathname;
     var segments = pathname.split('/');
     var out = [''];
-    var trailing = false;
     for (var i = 1; i < segments.length; i++) {
       var segment = segments[i];
-      var decoded = segment;
-      try { decoded = decodeURIComponent(segment); } catch (err) { /* an invalid escape is itself */ }
-      if (decoded === '.') { trailing = true; continue; }
-      if (decoded === '..') { if (out.length > 1) out.pop(); trailing = true; continue; }
-      if (segment === '' && i === segments.length - 1) { trailing = true; continue; }
-      trailing = false;
+      var kind = dotSegmentKind(segment);
+      var last = i === segments.length - 1;
+      if (kind === 1) { if (last) out.push(''); continue; }
+      if (kind === 2) {
+        var driveHeld = protectDrive && out.length === 2 && isDriveSegment(out[1]);
+        if (out.length > 1 && !driveHeld) out.pop();
+        if (last) out.push('');
+        continue;
+      }
       out.push(segment);
     }
-    var resolved = out.join('/');
-    if (trailing && resolved.charAt(resolved.length - 1) !== '/') resolved += '/';
-    return resolved === '' ? '/' : resolved;
+    return out.join('/') || '/';
   }
 
   function portOf(text, raw) {
@@ -2349,20 +2429,39 @@ function urlGlobalOf(nodeUrl) {
     var prefix = base.protocol +
       (base.hasHost || base.protocol === 'file:' ? '//' + credentials + base.hostname + (base.port ? ':' + base.port : '') : '');
     var search = base.query === null ? '' : '?' + base.query;
+    /* A non-special base with no host whose path starts with two slashes must be written with a
+       slash and a dot in front, or the string built here would be read back as an authority. */
+    function protectOpaque(text) {
+      if (specialBase || base.hasHost) return text;
+      var rest = text.slice(base.protocol.length);
+      if (rest.slice(0, 2) === '//') return base.protocol + '/.' + rest;
+      return text;
+    }
     if (rel.slice(0, 2) === '//') {
       return base.protocol + (skipSlashes ? '//' + rel.replace(/^\/+/, '') : rel);
     }
     /* an empty reference replaces the base's fragment with none at all; a fragment-only
        reference writes its own fragment below */
-    if (rel === '') return prefix + base.pathname + search;
-    if (rel.charAt(0) === '/') return prefix + rel;
-    if (rel.charAt(0) === '?') return prefix + base.pathname + rel;
-    if (rel.charAt(0) === '#') return prefix + base.pathname + search + rel;
+    if (rel === '') return protectOpaque(prefix + base.pathname + search);
+    /* WHATWG file: a reference that names a Windows drive letter replaces the base's path with
+       that drive, and a bare absolute path against a drive-letter base stays on that same drive. */
+    if (base.protocol === 'file:') {
+      var wd = windowsDrive(rel);
+      if (wd !== null) return prefix + '/' + wd.letter + ':' + wd.tail;
+      if (rel.charAt(0) === '/' && rel.charAt(1) !== '/') {
+        var driveAt = base.pathname.indexOf('/', 1);
+        var first = base.pathname.slice(1, driveAt < 0 ? base.pathname.length : driveAt);
+        if (isDriveSegment(first)) return prefix + '/' + first + rel;
+      }
+    }
+    if (rel.charAt(0) === '/') return protectOpaque(prefix + rel);
+    if (rel.charAt(0) === '?') return protectOpaque(prefix + base.pathname + rel);
+    if (rel.charAt(0) === '#') return protectOpaque(prefix + base.pathname + search + rel);
     /* a base path that ends in '/' names a directory, so the reference goes inside it; only
        otherwise is the last segment the file it replaces */
     var cut = base.pathname.lastIndexOf('/');
     var dir = cut >= 0 ? base.pathname.slice(0, cut + 1) : (base.hasHost ? '/' : '');
-    return prefix + dir + rel;
+    return protectOpaque(prefix + dir + rel);
   }
 
   /* ---- hosts ----
@@ -2790,6 +2889,10 @@ function urlGlobalOf(nodeUrl) {
         /* a special scheme that names no host is no URL at all -- except file:, which has none */
         if (special && state.hostname === '' && protocol !== 'file:') throw invalidUrl(raw);
         if (state.port !== '' && DEFAULT_PORTS[protocol] === state.port) state.port = '';
+        /* WHATWG: a URL that is not special cannot carry credentials, a port or even an empty
+           port on an empty host; 'foo:///a' is fine, 'foo://@/', 'foo://:/' and 'foo://:12/' are not. */
+        if (!special && state.hostname === '' &&
+            (authority.indexOf('@') >= 0 || authority.indexOf(':') >= 0)) throw invalidUrl(raw);
       }
     }
     var hashAt = rest.indexOf('#');
@@ -2807,7 +2910,17 @@ function urlGlobalOf(nodeUrl) {
     /* a file: URL has a path that starts at the root whether or not it named an authority, which is
        why 'file:a' is 'file:///a' and not 'file://a' with 'a' as its host */
     else if ((hasHost || protocol === 'file:') && path.charAt(0) !== '/') path = '/' + path;
-    state.pathname = encodePath(removeDotSegments(path));
+    if (protocol === 'file:') path = normalizeFileDrivePipe(path);
+    /* A scheme that is not special and wrote no authority has an opaque path: only the C0 control
+       set encodes it, where a normal path uses the path percent-encode set. */
+    var opaquePath = !special && !hasHost;
+    /* A space that ends an opaque path just before a query or a fragment is written as %20; the
+       ones in front of it stay the literal spaces the C0 control set leaves alone. */
+    if (opaquePath && (hashAt >= 0 || queryAt >= 0) && path.charAt(path.length - 1) === ' ') {
+      path = path.slice(0, -1) + '%20';
+    }
+    var shortened = removeDotSegments(path, protocol === 'file:');
+    state.pathname = opaquePath ? percentEncodeC0In(shortened) : encodePath(shortened);
     return state;
   }
 
@@ -2964,7 +3077,10 @@ function urlGlobalOf(nodeUrl) {
   }, function (value) {
     var state = STATE.get(this);
     var text = String(value);
-    state.pathname = encodePath(removeDotSegments(state.hasHost && text.charAt(0) !== '/' ? '/' + text : text));
+    var written = state.hasHost && text.charAt(0) !== '/' ? '/' + text : text;
+    var shortened = removeDotSegments(written, state.protocol === 'file:');
+    var opaque = !specialScheme(state.protocol) && !state.hasHost;
+    state.pathname = opaque ? percentEncodeC0In(shortened) : encodePath(shortened);
   });
   field('search', function () {
     var state = STATE.get(this);
@@ -2998,11 +3114,11 @@ function urlGlobalOf(nodeUrl) {
   field('origin', function () {
     var state = STATE.get(this);
     if (state.protocol === 'blob:') {
-      /* One level only, and only into a scheme that carries a host of its own: the origin of
-         'blob:blob:http://h/x' is 'null', not the 'http://h' a second step would reach. */
+      /* One level only, and only into an http(s) URL: another scheme's origin is opaque, and so is
+         the origin of 'blob:blob:http://h/x' that a second step would reach. */
       try {
         var inner = new URL(state.pathname);
-        if (DEFAULT_PORTS.hasOwnProperty(inner.protocol)) return inner.origin;
+        if (inner.protocol === 'http:' || inner.protocol === 'https:') return inner.origin;
       } catch (notAUrl) { /* an unparseable path is the opaque origin */ }
       return 'null';
     }
@@ -3018,7 +3134,13 @@ function urlGlobalOf(nodeUrl) {
         : '';
       authority = '//' + userinfo + state.hostname + (state.port ? ':' + state.port : '');
     }
-    return state.protocol + authority + state.pathname + queryPartOf(state) +
+    /* WHATWG: a path that begins with two slashes and has no host is written with a slash and a
+       dot in front, so it cannot be read back as an authority. */
+    var writtenPath = state.pathname;
+    if (!state.hasHost && state.protocol !== 'file:' && writtenPath.slice(0, 2) === '//') {
+      writtenPath = '/.' + writtenPath;
+    }
+    return state.protocol + authority + writtenPath + queryPartOf(state) +
       (state.hash === null ? '' : '#' + state.hash);
   }, function (value) {
     var state = STATE.get(this);
