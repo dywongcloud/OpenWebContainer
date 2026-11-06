@@ -13,5 +13,6 @@ Every page here describes the code on `origin/main`, not the diverged local work
 | [troubleshooting.md](troubleshooting.md) | Problems actually encountered in this repository's history. |
 | [reference/compatibility-notes.md](reference/compatibility-notes.md) | The entire former chronological `Readme.md`, byte-for-byte below a one-line header note. |
 | [reference/isolation-boundaries.md](reference/isolation-boundaries.md) | The four measured host-isolation boundaries: COOP/COEP, `coep`, direct-TCP databases, guest undici parity. |
+| [reference/commands.md](reference/commands.md) | Shell command reference and four per-family pages: [builtins](reference/commands-builtins.md), [builtins residual](reference/commands-builtins-residual.md), [text utilities](reference/commands-textutils.md), [system utilities](reference/commands-system.md). |
 
 The root [Readme.md](../Readme.md) is the short, user-facing entry point. This page indexes the detail behind it.

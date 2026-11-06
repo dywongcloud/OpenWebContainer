@@ -4,7 +4,7 @@ First off, thank you for considering contributing to OpenWebContainer! It's peop
 For the full user and developer documentation, see the [documentation index](docs/README.md).
 
 ## Table of Contents
-- [Code of Conduct](#code-of-conduct)
+- [Conduct](#conduct)
 - [Project Structure](#project-structure)
 - [Development Setup](#development-setup)
 - [Development Workflow](#development-workflow)
@@ -13,9 +13,9 @@ For the full user and developer documentation, see the [documentation index](doc
 - [Testing Guidelines](#testing-guidelines)
 - [Documentation](#documentation)
 
-## Code of Conduct
+## Conduct
 
-This project and everyone participating in it is governed by our Code of Conduct. By participating, you are expected to uphold this code. Please report unacceptable behavior to [project maintainers].
+This repository has no CODE_OF_CONDUCT file, and GitHub issues are disabled. Be respectful in contributions and keep discussion in pull requests.
 
 ## Project Structure
 
@@ -63,14 +63,14 @@ open-web-container/
 ## Development Setup
 
 1. **Prerequisites**
-   - Node.js (v16 or higher)
+   - Node.js v24.15.0 (the host version used by the differential compatibility harness; no `engines` field, `.nvmrc` or `.node-version` pins a floor)
    - pnpm (v8 or higher)
    - Git
 
 2. **Initial Setup**
    ```bash
    # Clone the repository
-   git clone https://github.com/thecodacus/OpenWebContainer.git
+   git clone https://github.com/dywongcloud/OpenWebContainer.git
    cd OpenWebContainer
 
    # Install dependencies
@@ -88,11 +88,11 @@ open-web-container/
    # Build all packages
    pnpm build
 
-   # Run tests
-   pnpm test
+   # Run the package test suites
+   pnpm -r test
 
-   # Lint code
-   pnpm lint
+   # Lint the packages
+   pnpm -r lint
    ```
 
 ## Development Workflow
@@ -134,7 +134,7 @@ open-web-container/
 2. Update documentation if needed
 3. Add tests for new features
 4. Ensure the PR description clearly describes the problem and solution
-5. Reference any relevant issues
+5. Note any related documentation in the PR description
 
 ## Commit Guidelines
 
@@ -166,9 +166,9 @@ docs(readme): update installation instructions
    });
    ```
 
-2. **Run tests before submitting PR**
+2. **Run the package tests before submitting PR**
    ```bash
-   pnpm test
+   pnpm --filter @open-web-container/core test
    ```
 
 3. **Ensure good test coverage**
@@ -209,9 +209,9 @@ docs(readme): update installation instructions
 
 1. **Core Package**
    ```typescript
-   // Enable debug logs
-   import { setDebugMode } from '@open-web-container/core';
-   setDebugMode(true);
+   // Enable debug logs with the real ContainerOptions.debug flag
+   import { OpenWebContainer } from '@open-web-container/core';
+   const core = new OpenWebContainer({ debug: true });
    ```
 
 2. **Playground**
@@ -222,8 +222,7 @@ docs(readme): update installation instructions
 ## Questions?
 
 If you have questions, please:
-1. Check existing issues
-2. Create a new issue with the 'question' label
-3. Join our community discussions
+1. Check the [documentation index](docs/README.md)
+2. Read the [API reference](docs/api.md) and [compatibility notes](docs/reference/compatibility-notes.md); issues are disabled on this repository.
 
 Thank you for contributing! 🎉
