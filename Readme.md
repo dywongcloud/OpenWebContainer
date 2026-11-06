@@ -5,6 +5,7 @@ A browser-based virtual container runtime that enables server-like JavaScript ex
 [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
+## structuredClone: a transferred ArrayBuffer keeps the bytes of every view over it -- the guest detached the buffer before cloning, so a Uint8Array came back empty and two views over one buffer threw TypeError, where host node v24.15.0 returned 1,2,3 and both views (row `owc-structuredclone-transfer-loses-views`; 14 of 14 labels agree on stdout, stderr and exit code at two memory points)
 ## The `lane-parseargs29` lane: the three `util.parseArgs` sentences, re-verified at the tip
 
 - **re-verified `owc-parseargs-argtype-received-tail`** (witness 1793504937013-1277-4fcd2c2befd3d92d): on one fresh container boot per case against host node v24.15.0 at load 7.4-8.4, with 23.1 GB and again with 12.7 GB of memory free, the seven `ERR_INVALID_ARG_TYPE` paths (`args`, `options`, `strict`, `allowPositionals`, `tokens`, `options.a.short` and `options.a.multiple`) end on node's own `. Received type <t> (<v>)` clause byte for byte, and the two controls (`bad-option-name` and `bad-single-char-option`) keep agreeing: 9 of 9 labels agree with the host on stdout, stderr and exit code at both memory points.

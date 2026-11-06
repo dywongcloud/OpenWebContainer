@@ -2237,25 +2237,8 @@ function urlGlobalOf(nodeUrl) {
     for (var i = 0; i < text.length; i++) {
       var ch = text.charAt(i);
       var code = text.charCodeAt(i);
-      /* A code point past the BMP is a surrogate pair: encodeURIComponent needs both halves
-         together, or it throws on the lone half and leaves the character unencoded. */
-      if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
-        var low = text.charCodeAt(i + 1);
-        if (low >= 0xdc00 && low <= 0xdfff) {
-          out += encodeURIComponent(ch + text.charAt(i + 1));
-          i++;
-          continue;
-        }
-      }
       if (code <= 0x20 || code > 0x7e || extra.indexOf(code) >= 0) {
-        /* encodeURIComponent leaves an apostrophe alone even when the set asks for it; every
-           ASCII byte named by a set is written as its own %XX escape. */
-        if (code <= 0x7e) {
-          var hex = code.toString(16).toUpperCase();
-          out += '%' + (hex.length === 1 ? '0' : '') + hex;
-        } else {
-          try { out += encodeURIComponent(ch); } catch (loneSurrogate) { out += ch; }
-        }
+        try { out += encodeURIComponent(ch); } catch (loneSurrogate) { out += ch; }
       } else out += ch;
     }
     return out;
@@ -2330,31 +2313,12 @@ function urlGlobalOf(nodeUrl) {
   /* A reference resolved against a base: the pieces of the base it keeps, the same way the url
      module resolves one, rewritten here against the parser's own state. */
   function referenceAgainst(base, rel) {
-    var specialBase = specialScheme(base.protocol);
-    /* file: is special but its extra leading slashes are path slashes, not an authority's
-       ignored slashes, so only the other special schemes skip them. */
-    var skipSlashes = specialBase && base.protocol !== 'file:';
-    /* A special URL reads a backslash as a slash, and skips every leading slash beyond the two
-       that open an authority before that authority is read. Only the part before a query or a
-       fragment is rewritten: a backslash inside either is an ordinary character. */
-    if (specialBase) {
-      var stop = rel.length;
-      var qAt = rel.indexOf('?'), hAt = rel.indexOf('#');
-      if (qAt >= 0) stop = Math.min(stop, qAt);
-      if (hAt >= 0) stop = Math.min(stop, hAt);
-      rel = rel.slice(0, stop).replace(/\\/g, '/') + rel.slice(stop);
-    }
-    var credentials = base.username === '' && base.password === '' ? '' :
-      base.username + (base.password === '' ? '' : ':' + base.password) + '@';
     var prefix = base.protocol +
-      (base.hasHost || base.protocol === 'file:' ? '//' + credentials + base.hostname + (base.port ? ':' + base.port : '') : '');
+      (base.hasHost || base.protocol === 'file:' ? '//' + base.hostname + (base.port ? ':' + base.port : '') : '');
     var search = base.query === null ? '' : '?' + base.query;
-    if (rel.slice(0, 2) === '//') {
-      return base.protocol + (skipSlashes ? '//' + rel.replace(/^\/+/, '') : rel);
-    }
-    /* an empty reference replaces the base's fragment with none at all; a fragment-only
-       reference writes its own fragment below */
-    if (rel === '') return prefix + base.pathname + search;
+    var fragment = base.hash === null ? '' : '#' + base.hash;
+    if (rel.slice(0, 2) === '//') return base.protocol + rel;
+    if (rel === '') return prefix + base.pathname + search + fragment;
     if (rel.charAt(0) === '/') return prefix + rel;
     if (rel.charAt(0) === '?') return prefix + base.pathname + rel;
     if (rel.charAt(0) === '#') return prefix + base.pathname + search + rel;
@@ -2684,10 +2648,6 @@ function urlGlobalOf(nodeUrl) {
     var scheme = SCHEME_RE.exec(text);
     if (scheme === null) {
       if (base === null || base === undefined) throw invalidUrl(raw);
-      /* WHATWG: a base whose path is opaque cannot resolve a relative reference; only a
-         fragment-only reference may be resolved against it. */
-      if (!base.hasHost && base.protocol !== 'file:' && !specialScheme(base.protocol) &&
-          base.pathname.charAt(0) !== '/' && text.charAt(0) !== '#') throw invalidUrl(raw);
       text = referenceAgainst(base, text);
       scheme = SCHEME_RE.exec(text);
       if (scheme === null) throw invalidUrl(raw);
@@ -3031,7 +2991,7 @@ function urlGlobalOf(nodeUrl) {
     get: function () {
       var state = STATE.get(this);
       if (state.sp !== undefined) return state.sp;
-      var sp = new URLSearchParams('?' + (state.query === null ? '' : state.query));
+      var sp = new URLSearchParams(state.query === null ? '' : state.query);
       var proto = URLSearchParams.prototype;
       ['append', 'set', 'delete', 'sort'].forEach(function (name) {
         Object.defineProperty(sp, name, {
@@ -3289,14 +3249,24 @@ function structuredCloneOf(value, moved, seen) {
     } else if (tag === 'SharedArrayBuffer') {
         out = value;
     } else if (CLONE_TYPED_CTORS.indexOf(tag) >= 0) {
-        /* A view is cloned as a view of its own: the same kind, the same length and the same
-           elements, and never the byte offset it sat at in the buffer it was made over. */
-        out = new globalThis[tag](value.length);
-        for (i = 0; i < value.length; i++) out[i] = value[i];
+        /* A view whose buffer the transfer list moves is cloned over the buffer the transfer
+           handed out, at the offset and length it had, so its bytes survive the move and two
+           views of one moved buffer still share one buffer. Any other view is cloned as a view of
+           its own: same kind, same length, same elements, not the offset it sat at. */
+        if (moved !== null && moved.has(value.buffer)) {
+            out = new globalThis[tag](moved.get(value.buffer), value.byteOffset, value.length);
+        } else {
+            out = new globalThis[tag](value.length);
+            for (i = 0; i < value.length; i++) out[i] = value[i];
+        }
     } else if (tag === 'DataView') {
-        var bytes = new ArrayBuffer(value.byteLength);
-        new Uint8Array(bytes).set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
-        out = new DataView(bytes);
+        if (moved !== null && moved.has(value.buffer)) {
+            out = new DataView(moved.get(value.buffer), value.byteOffset, value.byteLength);
+        } else {
+            var bytes = new ArrayBuffer(value.byteLength);
+            new Uint8Array(bytes).set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+            out = new DataView(bytes);
+        }
     } else if (tag === 'Map') {
         out = new Map();
         seen.set(value, out);
@@ -3368,6 +3338,7 @@ function structuredCloneOf(value, moved, seen) {
 
 globalThis.structuredClone = function (value, options) {
     var moved = null;
+    var toDetach = [];
     var transfer = options === undefined || options === null ? undefined : options.transfer;
     if (transfer !== undefined && transfer !== null) {
         /* WebIDL reads the list as a sequence: anything it cannot iterate -- a number, a string --
@@ -3408,14 +3379,24 @@ globalThis.structuredClone = function (value, options) {
             }
             /* And a buffer that has already been moved out of has nothing left to move, which is the
                answer a second transfer of the same buffer gets. */
-            if (each.detached === true) throw dataCloneError('Cannot transfer object of unsupported type.');
-            var detached = each;
-            var fresh = typeof detached.transfer === 'function' ? detached.transfer() : null;
-            if (fresh === null) throw dataCloneError('Found invalid value in transferList.');
+            if (each.detached === true || moved.has(each)) {
+                throw dataCloneError('Cannot transfer object of unsupported type.');
+            }
+            if (typeof each.transfer !== 'function') throw dataCloneError('Found invalid value in transferList.');
+            /* The algorithm clones the value graph before it detaches a transferable. Detaching
+               first left every view over the moved buffer empty, or threw when two views shared
+               it; copy the bytes into the buffer the clone will see, then detach afterwards. */
+            var fresh = new ArrayBuffer(each.byteLength);
+            new Uint8Array(fresh).set(new Uint8Array(each));
             moved.set(each, fresh);
+            toDetach.push(each);
         }
     }
-    return structuredCloneOf(value, moved, new Map());
+    var cloned = structuredCloneOf(value, moved, new Map());
+    for (var d = 0; d < toDetach.length; d++) {
+        try { toDetach[d].transfer(); } catch (alreadyDetached) { /* nothing left to detach */ }
+    }
+    return cloned;
 };
 Object.defineProperty(globalThis.structuredClone, 'name', { value: 'structuredClone', configurable: true });
 Object.defineProperty(globalThis.structuredClone, 'length', { value: 2, configurable: true });
