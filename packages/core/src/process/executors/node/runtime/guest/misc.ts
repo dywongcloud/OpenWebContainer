@@ -582,11 +582,20 @@ BF.url = function () {
   URLSearchParams.prototype.getAll = function (k) {
     return this._list.filter(function (pair) { return pair[0] === String(k); }).map(function (pair) { return pair[1]; });
   };
+  /* WHATWG url: has and delete take an optional second value. With it, only pairs whose value
+     matches are counted or removed; without it, every pair of that name is. The value is read as
+     a string, and both methods keep their WebIDL arity of one because the argument is optional. */
   URLSearchParams.prototype.has = function (k) {
-    return this._list.some(function (pair) { return pair[0] === String(k); });
+    var value = arguments.length >= 2 ? String(arguments[1]) : undefined;
+    return this._list.some(function (pair) {
+      return pair[0] === String(k) && (value === undefined || pair[1] === value);
+    });
   };
   URLSearchParams.prototype.delete = function (k) {
-    this._list = this._list.filter(function (pair) { return pair[0] !== String(k); });
+    var value = arguments.length >= 2 ? String(arguments[1]) : undefined;
+    this._list = this._list.filter(function (pair) {
+      return !(pair[0] === String(k) && (value === undefined || pair[1] === value));
+    });
   };
   URLSearchParams.prototype.forEach = function (cb, thisArg) {
     for (var i = 0; i < this._list.length; i++) cb.call(thisArg, this._list[i][1], this._list[i][0], this);
