@@ -293,6 +293,19 @@ globalThis.Function = function Function() {
   for (var k = 0; k < argc - 1; k++) params.push(String(arguments[k]));
   var body = argc === 0 ? '' : String(arguments[argc - 1]);
   var src = '(function anonymous(' + params.join(',') + '\n) {\n' + body + '\n})';
+  var derived = new.target;
+  /* A class X extends Function calls Function with new.target = X, and the real constructor
+     gives the new function X.prototype as its [[Prototype]]. A function the host compiles for us
+     starts on Function.prototype instead; argparse's Action builds one whose body reads
+     'arguments.callee.call', which must resolve on X.prototype and not on Function.prototype.
+     Put it back on the subclass prototype before the function is used. */
+  function finish(fn) {
+    if (derived !== undefined && derived !== Function && derived.prototype &&
+        typeof derived.prototype === 'object') {
+      Object.setPrototypeOf(fn, derived.prototype);
+    }
+    return fn;
+  }
   if (CURRENT_FILE === '') {
     /* No module is running -- an ES module body, a -e script's top level, a REPL line -- so the
        engine compiles the body itself and resolves an import in it from the working directory, as
@@ -301,12 +314,12 @@ globalThis.Function = function Function() {
        the compile with 'stack underflow', and a package that builds one in an ES module (or inside
        a -e line) is as entitled to the hoist as a CommonJS module is. */
     try {
-      return REAL_FUNCTION.apply(REAL_FUNCTION, arguments);
+      return finish(REAL_FUNCTION.apply(REAL_FUNCTION, arguments));
     } catch (engineErr) {
       var retry = null;
       try { retry = rxRewrite(body); } catch (rewriteErr) { retry = null; }
       if (retry === null) throw engineErr;
-      return REAL_FUNCTION.apply(REAL_FUNCTION, params.concat([retry]));
+      return finish(REAL_FUNCTION.apply(REAL_FUNCTION, params.concat([retry])));
     }
   }
   var compiled = host.compileFunction(src, CURRENT_FILE);
@@ -318,11 +331,11 @@ globalThis.Function = function Function() {
     try { fixed = rxRewrite(src); } catch (rewriteErr) { fixed = null; }
     if (fixed !== null) {
       var retried = host.compileFunction(fixed, CURRENT_FILE);
-      if (typeof retried !== 'string') return retried;
+      if (typeof retried !== 'string') return finish(retried);
     }
     throw new SyntaxError(compiled);
   }
-  return compiled;
+  return finish(compiled);
 };
 globalThis.Function.prototype = REAL_FUNCTION.prototype;
 
