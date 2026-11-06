@@ -30,6 +30,8 @@ A browser-based virtual container runtime that enables server-like JavaScript ex
 ## streams: `Readable.fromWeb` reads ahead to highWaterMark so buffered web chunks coalesce in non-object mode (row `owc-readable-fromweb-read-ahead`)
 ## structuredClone: a `MessagePort` with no transferList is a `DataCloneError`, not `{}` (row `owc-structuredclone-messageport-datacloneerror`)
 ## fs: `readFile` and `promises.readFile` reject an aborted `options.signal` with `ABORT_ERR` (row `owc-fs-readfile-aborted-signal`)
+## npm: a `.bin` shim in a `"type":"module"` project now runs its CommonJS bin -- the extensionless shim is loaded as an ES module, so it builds a `require` from `module.createRequire(process.argv[1])` when the native one is absent (row `owc-npm-bin-shim-esm-project`).
+## node -e: `process.exit(0)` leaves 0 with no report -- the stack column lookup keeps the engine column when a frame file such as `/app/[eval]` is unreadable, so an Error built inside `-e` no longer throws ENOENT (row `owc-node-eval-process-exit-zero`).
 ## 🗺️ Architecture Overview
 
 ![OpenWebContainer Architecture](./images/architecture.png)

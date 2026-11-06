@@ -586,9 +586,15 @@ export class NpmInstaller {
         for (const [binName, relativeFile] of Object.entries(bins)) {
             const file = normalizeAbsolute(joinPaths(packageDir, relativeFile));
             if (this.fileSystem.statPath(file)?.type !== 'file') continue;
+            /* A shim lives in <pkg>/../.bin, whose nearest package.json is the project's. In a
+               `"type":"module"` project node loads the extensionless shim as an ES module, where
+               `require` is undefined. Host npm links the real bin file instead, so the nearest
+               package.json is the dependency's own and a CommonJS bin keeps working. A shim has to
+               run in both module modes: use the native require when it exists, otherwise build one
+               from the module builtin. `process.argv[1]` is this shim's absolute path. */
             const statement = this.resolver.isESM(file)
                 ? `import(${JSON.stringify(file)});`
-                : `require(${JSON.stringify(file)});`;
+                : `const __owc_require = typeof require === 'function' ? require : process.getBuiltinModule('module').createRequire(process.argv[1]);\n__owc_require(${JSON.stringify(file)});`;
             this.fileSystem.writeFile(joinPaths(binDir, binName), `#!/usr/bin/env node\n${statement}\n`);
         }
     }

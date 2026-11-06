@@ -2787,7 +2787,16 @@ export class NodeProcess extends Process {
                and this report never sees: the one V8 would have named, read out of the source of
                the line the frame names. A file this process cannot read keeps the column it has. */
             columnOf: (path, line, column) => {
-                const source = this.fileSystem.readFile(path);
+                /* A frame of a `node -e` program names `/app/[eval]`, which is not a file the
+                   virtual filesystem holds: `readFile` reports that by throwing, and building an
+                   Error must not die in its own stack formatter. Keep the column the engine gave,
+                   as the note above says for any file this process cannot read. */
+                let source: string | undefined;
+                try {
+                    source = this.fileSystem.readFile(path);
+                } catch {
+                    return column;
+                }
                 if (source === undefined) return column;
                 return nodeColumn((source.split('\n')[line - 1] ?? '').replace(/\t/g, ' '), column);
             },
