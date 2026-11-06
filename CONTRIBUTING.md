@@ -1,6 +1,7 @@
 # Contributing to OpenWebContainer
 
 First off, thank you for considering contributing to OpenWebContainer! It's people like you that make OpenWebContainer such a great tool.
+For the full user and developer documentation, see the [documentation index](docs/README.md).
 
 ## Table of Contents
 - [Code of Conduct](#code-of-conduct)
