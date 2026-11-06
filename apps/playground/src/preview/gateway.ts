@@ -7,8 +7,8 @@
  * returns the response over the MessagePort that the service worker supplied.
  *
  * HTTP ingress only. A browser cannot provide raw TCP or UDP sockets, so the
- * container's virtual TCP/UDP stays inside the container. Bodies are carried as UTF-8
- * text, which matches the container's HTTP bridge; binary bodies are not preserved.
+ * container's virtual TCP/UDP stays inside the container. Bodies are carried as latin1
+ * byte strings -- one character per byte -- so the HTTP bridge keeps every byte.
  */
 
 const PREVIEW_PREFIX = '/__owc/preview';
@@ -74,7 +74,7 @@ export interface PreviewRequest {
 	/** Path plus query as the guest server sees it, for example "/hello?x=1". */
 	path: string;
 	headers: Record<string, string>;
-	/** Request body as UTF-8 text, or undefined when the request has none. */
+	/** Request body as a latin1 byte string (one character per byte), or undefined. */
 	body: string | undefined;
 }
 
@@ -186,14 +186,32 @@ async function onWorkerMessage(event: MessageEvent): Promise<void> {
 	}
 
 	try {
+		/* A service worker cannot read the Cookie request header; the page's own jar is
+		   the only place it survives, so put it back before the guest server sees it. */
+		const requestHeaders: Record<string, string> = { ...message.headers };
+		if (!Object.keys(requestHeaders).some((name) => name.toLowerCase() === 'cookie') && document.cookie) {
+			requestHeaders.cookie = document.cookie;
+		}
 		const response = await handler(message.port, {
 			method: message.method,
 			path: message.path,
-			headers: message.headers,
-			body: message.body === null ? undefined : decodeBase64ToText(message.body),
+			headers: requestHeaders,
+			body: message.body === null ? undefined : decodeBase64ToBinary(message.body),
 		});
+		/* Chrome drops Set-Cookie from a Response built by a service worker. The core
+		   bridge carries it as x-owc-set-cookie; apply it here, where document.cookie
+		   is available, and keep the internal header out of the preview response. */
+		const setCookie = response.headers.get('x-owc-set-cookie');
+		if (setCookie) {
+			try {
+				for (const value of JSON.parse(setCookie) as string[]) document.cookie = value;
+			} catch {
+				/* a value the bridge could not encode is left alone */
+			}
+		}
 		const headers: Record<string, string> = {};
 		response.headers.forEach((value, name) => {
+			if (name.toLowerCase() === 'x-owc-set-cookie') return;
 			headers[name] = value;
 		});
 		const bytes = new Uint8Array(await response.arrayBuffer());
@@ -208,13 +226,17 @@ async function onWorkerMessage(event: MessageEvent): Promise<void> {
 	}
 }
 
-function decodeBase64ToText(text: string): string {
+function decodeBase64ToBinary(text: string): string {
 	const binary = atob(text);
 	const bytes = new Uint8Array(binary.length);
 	for (let i = 0; i < binary.length; i++) {
 		bytes[i] = binary.charCodeAt(i);
 	}
-	return new TextDecoder().decode(bytes);
+	let out = '';
+	for (let i = 0; i < bytes.length; i += 0x8000) {
+		out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+	}
+	return out;
 }
 
 function encodeBytesToBase64(bytes: Uint8Array): string {

@@ -288,7 +288,10 @@ self.onmessage = async function (e: MessageEvent<WorkerMessage>) {
                             status: response.status,
                             statusText: response.statusText,
                             headers: Object.fromEntries((response.headers as any).entries()),
-                            body: await response.text()
+                            /* Keep the body as bytes: decoding to UTF-8 text here would
+                               corrupt every byte >= 0x80, and a null-body status (204/205/304)
+                               must cross as null or the page cannot rebuild the Response. */
+                            body: response.body ? new Uint8Array(await response.arrayBuffer()) : null
                         },
                         port
                     }

@@ -177,7 +177,7 @@ function requestTarget(request: HostHttpRequest): string {
     return direct.startsWith('/') ? direct : `/${direct}`;
 }
 
-/** The raw HTTP/1.1 bytes of a preview request: head (latin1) followed by the UTF-8 body. */
+/** The raw HTTP/1.1 bytes of a preview request: a latin1 head followed by the raw body. */
 function encodeRequest(request: HostHttpRequest, port: number): Uint8Array {
     const method = (request.method || 'GET').toUpperCase();
     const lines = [`${method} ${requestTarget(request)} HTTP/1.1`];
@@ -190,9 +190,11 @@ function encodeRequest(request: HostHttpRequest, port: number): Uint8Array {
     }
     if (!hasHost) lines.push(`Host: localhost:${port}`);
     lines.push('Connection: close');
+    /* The preview page carries request bytes as a latin1 string (one char per byte),
+       so decoding them as UTF-8 here would replace every byte >= 0x80 with U+FFFD. */
     const body = request.body === undefined || request.body === null
         ? new Uint8Array(0)
-        : new TextEncoder().encode(String(request.body));
+        : latin1Bytes(String(request.body));
     if (body.length > 0 || method === 'POST' || method === 'PUT' || method === 'PATCH') {
         lines.push(`Content-Length: ${body.length}`);
     }
@@ -260,14 +262,22 @@ class ResponseReader {
         const head = this.head;
         if (!head) throw protocolError('ECONNRESET', 'socket hang up');
         const headers = new Headers();
+        const setCookie: string[] = [];
         for (const [name, value] of head.headers) {
             if (this.mode === 'chunked' && name.toLowerCase() === 'transfer-encoding') continue;
+            /* A Response built for a service worker cannot expose Set-Cookie. Carry it
+               on an internal header so the preview page can apply it to its own jar. */
+            if (name.toLowerCase() === 'set-cookie') {
+                setCookie.push(value);
+                continue;
+            }
             try {
                 headers.append(name, value);
             } catch {
                 // a header the Response refuses is dropped
             }
         }
+        if (setCookie.length > 0) headers.set('x-owc-set-cookie', JSON.stringify(setCookie));
         const body = this.method === 'HEAD' || NO_BODY_STATUSES.has(head.status) ? null : concatBytes(this.parts);
         const statusText = head.statusText.replace(/[^\t\x20-\x7e\x80-\xff]/g, '');
         return new Response(body as unknown as BodyInit | null, { status: head.status, statusText, headers });
