@@ -1,1 +1,3 @@
-owc-docs-commands-index-missing-residual-link resolved 1794008632084-5481-b5e875392bfa8090 2026-11-06T23:46:10.693Z
+Row: owc-docs-commands-index-missing-residual-link
+Witness: 1794008632084-5481-b5e875392bfa8090
+Status: resolved
