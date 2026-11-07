@@ -1006,12 +1006,12 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     else repo.remove(repo.g('OWC_DETACH_LABEL'));
     repo.checkoutTree(oid);
     const headLine = 'HEAD is now at ' + abbrev(oid) + ' ' + repo.subjectOf(oid) + '\n';
-    /* Host git 2.53.0: checking out a named tag detaches HEAD and prints a
-       "Note: switching to" line plus the detached-HEAD advice block on stderr,
-       before "HEAD is now at ...". A raw commit oid, --detach, or an already
-       detached HEAD prints only the HEAD line; advice.detachedHead=false
-       (config or -c) suppresses the advice. */
-    if (repo.refs.tags().includes(name) && !flags.has('--detach') && wasAttached) {
+    /* Host git 2.53.0: any checkout that detaches HEAD from an attached branch
+       prints a "Note: switching to" line plus the detached-HEAD advice block on
+       stderr before "HEAD is now at ...", whether the argument is a named tag,
+       a short ref, a full commit oid or HEAD~1. Only --detach, an already
+       detached HEAD, or advice.detachedHead=false (config or -c) suppress it. */
+    if (!flags.has('--detach') && wasAttached) {
         const advice = repo.configOverrides().get('advice.detachedhead') ?? repo.config.get('advice.detachedhead');
         if (advice === undefined || !/^(false|no|off|0)$/i.test(advice)) {
             return ok('', "Note: switching to '" + name + "'.\n\n" +
