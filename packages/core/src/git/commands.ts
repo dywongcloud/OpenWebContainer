@@ -999,6 +999,7 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     const resolved = repo.object(oid);
     if (resolved !== undefined && resolved.type === 'tag') oid = parseTag(resolved.content).object;
     const wasAttached = repo.refs.head().ref !== undefined;
+    const prevOid = repo.refs.headOid();
     repo.refs.setDetached(oid);
     /* git describe uses the checked-out tag name for the detached label; a raw oid or HEAD uses
        the abbreviated oid. */
@@ -1025,6 +1026,15 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
                 "  git switch -\n\n" +
                 "Turn off this advice by setting config variable advice.detachedHead to false\n\n" + headLine);
         }
+    }
+    /* Host git 2.53.0: moving from an already-detached HEAD to a DIFFERENT
+       commit prints the previous position on stderr before the HEAD line.
+       The detached-HEAD advice block stays ABSENT on this path; a same-oid
+       no-op, a branch switch and the --detach-from-attached suppression all
+       print only the HEAD line. */
+    if (!wasAttached && prevOid !== undefined && prevOid !== oid) {
+        return ok('', 'Previous HEAD position was ' + abbrev(prevOid) + ' ' +
+            repo.subjectOf(prevOid) + '\n' + headLine);
     }
     return ok('', headLine);
 }
