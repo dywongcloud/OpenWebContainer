@@ -208,7 +208,7 @@ function commitHeader(repo: GitRepo, changes: Change[], message: string, oid: st
     const prefix = root ? '[' + branch + ' (root-commit) ' + abbrev(oid) + ']' : '[' + branch + ' ' + abbrev(oid) + ']';
     let out = prefix + ' ' + message.trim().split('\n')[0] + '\n';
     if (amend) out += ' Date: ' + mediumDate(author.ts, author.tz) + '\n';
-    out += commitLines(repo, changes);
+    if (changes.length > 0) out += commitLines(repo, changes);
     return out;
 }
 
@@ -668,6 +668,7 @@ function cmdCommit(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const amend = flags.has('--amend');
+    const allowEmpty = flags.has('--allow-empty');
     const all = flags.has('-a') || flags.has('--all');
     if (all) {
         let entries = repo.indexEntries();
@@ -678,7 +679,7 @@ function cmdCommit(ctx: CommandContext, flags: Set<string>, values: Map<string,s
         repo.writeIndexEntries(entries);
     }
     const view = statusOf(repo);
-    if (view.staged.length === 0 && !amend) return ok(longStatus(view, true), '', 1);
+    if (view.staged.length === 0 && !amend && !allowEmpty) return ok(longStatus(view, true), '', 1);
     let message = values.get('-m') ?? values.get('--message');
     if (message === undefined && values.has('-F')) message = repo.readText(repo.w(values.get('-F') as string)) ?? '';
     if (message === undefined) message = amend ? repo.subjectOf(repo.refs.headOid() ?? '') : '';
