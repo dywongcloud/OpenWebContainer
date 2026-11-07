@@ -390,11 +390,16 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
     if (!key.includes('.')) return fail('error: key does not contain a section: ' + key, 2);
     if (key.includes(' ')) return fail('error: invalid key: ' + key, 1);
     if (wantsUnset) {
-        const code = repo.config.unset(scope, key);
-        if (code === 5) return fail('', 5);
+        const code = repo.config.unset(scope, key, flags.has('--unset-all'));
+        if (code === 5) return ok('', '', 5);
+        if (code === 6) return fail('warning: ' + key + ' has multiple values', 5);
         return ok('');
     }
-    if (wantsGetAll) return ok(repo.config.getAll(key).map((v) => v + '\n').join(''));
+    if (wantsGetAll) {
+        const values = repo.config.getAll(key);
+        if (values.length === 0) return ok('', '', 1);
+        return ok(values.map((v) => v + '\n').join(''));
+    }
     if (rest.length === 1 || flags.has('--get')) {
         const value = repo.config.get(key);
         if (value === undefined) return fail('', 1);

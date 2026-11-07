@@ -121,7 +121,9 @@ export class GitConfig {
         this.fs.writeFile(path, formatConfig(lines));
     }
 
-    unset(scope: ConfigScope, key: string): number {
+    /* Host git 2.53.0: --unset refuses a multi-valued key without writing (warning, exit 5);
+       --unset-all removes every value. A missing key is a silent exit 5. */
+    unset(scope: ConfigScope, key: string, all = false): number {
         const parts = splitKey(key);
         const path = this.paths[scope];
         const lines = this.readScope(scope);
@@ -133,7 +135,7 @@ export class GitConfig {
             return true;
         });
         if (removed === 0) return 5;
-        if (removed > 1) return 5;
+        if (removed > 1 && !all) return 6;
         this.fs.writeFile(path, formatConfig(kept));
         return 0;
     }
