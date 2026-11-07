@@ -9,15 +9,22 @@ seeding a PATH file for it would be resolved before the module command and recur
 
 ## How a boundary is reported
 
-Every subcommand that is not implemented locally returns the project's ONE canonical named
-outcome (packages/core/src/shell/commands/unsupported.ts:1839-1843, reached through
+Every invocation that gitBoundaryOutcome classifies as a boundary returns the project's ONE
+canonical named outcome (packages/core/src/shell/commands/unsupported.ts:1839-1843, reached through
 gitBoundaryOutcome in packages/core/src/git/boundaries.ts):
 
     git-<family>: [<CODE>] not supported on this runtime: <reason>
 
 on stderr with a trailing newline, empty stdout and exit code 1. Nothing returns a bare 127.
-The 18 git-<family> keys live in the UNSUPPORTED record (unsupported.ts:1789); each carries one
-code and one reason. The dispatcher may call unsupportedResult('git-<family>') directly.
+The 18 git-<family> keys live in the UNSUPPORTED record (unsupported.ts:1837-1856); each carries
+one code and one reason. The dispatcher may call unsupportedResult('git-<family>') directly.
+
+Current surface (origin/main after 55b024e): all 18 declared keys are reachable from a
+boundaryFamily case (an 18<->18 bijection); git-gitlink is emitted for `git submodule add` and
+git-credentials for credential-store/cache/osxkeychain/libsecret invocations. An unrecognised
+`git <name>` is not classified as a boundary: it still answers the generic not-a-git-command
+line with exit 1, never a bare 127. bisect, fsck, fetch, push, pull, ls-remote and the remote
+.git/config subcommands are implemented over the VFS; only URL-based transports are boundaries.
 
 MEASURED DEVIATION (deliberate, kept on purpose, never normalized away): host git exits 128 on a
 fatal transport error, and git ls-remote exits 2 when no refs match. The container deliberately
@@ -36,9 +43,11 @@ OWC boot; stdout was empty and exit was 1 for all of them.
 - git pull (named remote) -> git-pull / ERR_GIT_NO_UPLOAD_PACK | '' / 1 | same ENETUNREACH; pull is fetch plus merge.
 - git ls-remote (url) -> git-ls-remote / ERR_GIT_NO_UPLOAD_PACK | '' / 1 | same ENETUNREACH; no info/refs endpoint.
 - git push (named remote) -> git-push / ERR_GIT_NO_RECEIVE_PACK | '' / 1 | same ENETUNREACH; no git-receive-pack.
-- git remote add (name, url) -> git-remote / ERR_GIT_NO_REMOTE_HELPER | '' / 1 | no transport or remote helper.
+- git remote show / prune / update (url) -> git-remote / ERR_GIT_NO_REMOTE_HELPER | '' / 1 | a remote-ref query needs a transport. `git remote add/remove/rename/set-url/get-url/-v` are LOCAL .git/config operations; URL-based fetch/push/pull/ls-remote are boundaries while local VFS paths fall through to the local implementation.
 - git submodule update -> git-submodule / ERR_GIT_NO_SUBMODULE_TRANSPORT | '' / 1 | fetch of another repo is egress.
 - git credential fill -> git-credential / ERR_GIT_NO_CREDENTIAL_HELPER | '' / 1 | no keychain or helper in the container.
+- git submodule add (gitlink 160000) -> git-gitlink / ERR_NO_GITLINK | '' / 1 | no nested checkout on the VFS.
+- git credential-store / credential-cache / credential-osxkeychain / credential-libsecret -> git-credentials / ERR_NO_CREDENTIALS | '' / 1 | host keychain must not be mirrored.
 - git clone (plain http remote) -> git-smart-http / ERR_GIT_NO_SMART_HTTP | '' / 1 | smart-HTTP info/refs and upload-pack unreachable.
 - git clone (ssh or scp url) -> git-ssh-transport / ERR_GIT_NO_SSH_TRANSPORT | '' / 1 | no ssh binary, no SSH transport.
 - git clone (git:// url) -> git-git-transport / ERR_GIT_NO_GIT_TRANSPORT | '' / 1 | no git daemon transport.
@@ -110,4 +119,4 @@ STAGE 1 (origin/main commit 74a2053887d84d0f51f69e2616d91c3495143b94, 'Add self-
 - git rebase -> commands.ts:262 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
 - git remote -> commands.ts:263 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3). (local config only; a real remote is a named boundary)
 
-STAGE 2 and STAGE 3 are still in progress. No per-command stdout / stderr / exit-code measurement at two memory points has been published for these implemented cases, so this section does NOT claim the commands are complete or host-faithful; it will be filled from the published STAGE 2/3 command list and measurements when they land. The exit-1 deviation for named boundaries recorded above is unchanged.
+STAGE 2/3 measurements and the closes through c21651b0 have landed; five regression rows were repaired and witnessed at two memory points in 55b024e (detached checkout, annotated tags, bisect/fsck, local remotes and the seven downstream divergences). The current runCommand switch has 42 cases (36 STAGE 1 cases plus bisect, fsck, fetch, push, pull and ls-remote) and UNSUPPORTED declares 18 git-* keys, all reachable from boundaryFamily. The exit-1 deviation for named boundaries recorded above is unchanged, and an unrecognised `git <name>` still returns the generic not-a-git-command line rather than a canonical boundary.
