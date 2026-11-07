@@ -6,7 +6,7 @@
  * Antialiasing is 4 vertical sub-scanlines per pixel row with exact horizontal span integration, so
  * horizontal and vertical edges are exact and diagonal edges get four levels of grey. Cairo's
  * rasteriser is a 256-level analytic one, so the shim's edges differ from the add-on's by up to a
- * quarter of a pixel of coverage; that is recorded in MANIFEST.md rather than hidden.
+ * quarter of a pixel of coverage; that is recorded in docs/reference/compatibility-notes.md:1053-1058 rather than hidden.
  */
 
 import type { SubPath } from './path';

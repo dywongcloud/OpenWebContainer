@@ -36,6 +36,8 @@ boundary, and a host 127 mirrored by the container 127 is host-faithful.
 - `tty` — implemented; `tty`, `tty -s`, `tty --version` agree byte-for-byte with host on stdout, stderr and status (1/1/2).
 - `openssl` — implemented subset (`dgst`, `rand`, `version`, `help`): `openssl badcommand` matches host status/message; `version` and `help` print the container's own subset identity/content, documented in `unsupported.ts` and the Readme.
 
-`command -v whereis` still exits 1 because the PATH-to-utility table lives in `builtins.ts`, outside
-this shard's grant; the `whereis` command itself runs through the module command tables in
-`shell.ts` and `capabilities/child.ts`, which need no edit. Named and not edited here.
+`command -v whereis` now answers `/usr/bin/whereis` with exit 0. `HOST_UTILITY_PATHS` in
+`builtins.ts` has 90 measured host-utility paths including `whereis: '/usr/bin/whereis'`, and the
+shell's PATH is `/bin:/usr/bin`; `command -V whereis` and `type whereis` likewise report that path
+with exit 0. Rows `owc-sh-command-v-whereis-not-found` and
+`owc-sh-command-v-host-utility-paths-incomplete` are resolved (see `closes/`).

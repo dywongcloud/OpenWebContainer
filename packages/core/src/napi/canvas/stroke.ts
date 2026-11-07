@@ -4,7 +4,7 @@
  * path to device space first and strokes it there with the geometric mean of the two axis scales, which
  * is what most 2D renderers without a full stroker do. Under a uniform scale, a rotation or a skew-free
  * translate the two agree exactly; under a non-uniform scale the shim's stroke is uniform where cairo's
- * is not, and MANIFEST.md says so.
+ * is not; docs/reference/compatibility-notes.md:1053-1058 says so.
  *
  * Joins, caps and dashes follow the HTML canvas spec: a miter join falls back to a bevel past
  * miterLimit, an odd dash array is duplicated, and a dash of total length zero is no dash at all.

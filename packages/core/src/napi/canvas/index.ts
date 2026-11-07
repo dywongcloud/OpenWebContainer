@@ -6,8 +6,8 @@
  * version strings -- which is everything index.js, lib/canvas.js, lib/context2d.js and lib/image.js
  * reach for. There is no Cairo here: the 2D context is a scanline rasteriser written for this file's
  * neighbours, PNG and JPEG are encoded and decoded in JavaScript, and text comes from the built-in
- * monoline font in glyphs.ts. MANIFEST.md lists what is faithful, what is approximated and what is
- * refused with a named error.
+ * monoline font in glyphs.ts. The published measured record of what is faithful, what is
+ * approximated and what is refused is docs/reference/compatibility-notes.md:1053-1058.
  *
  * `host` is the guest's facilities, the way src/napi/leveldown takes them: `Buffer` (the guest's buffer
  * constructor, so toBuffer() hands back something with toString('base64')) and `fs` (so an Image src

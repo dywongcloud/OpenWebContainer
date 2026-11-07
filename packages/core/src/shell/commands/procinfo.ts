@@ -19,7 +19,7 @@
  *     missing desktop/display. `man` has pages after all -- one per command this container
  *     implements, assembled from the usage line that command already prints -- and answers the
  *     host's own "No manual entry for <name>" for anything else. Each decision is recorded next to
- *     the command and in MANIFEST.md.
+ *     the command and in docs/reference/commands.md and the docs/reference/commands-*.md pages.
  *
  * Output shapes (column headers, field widths, sort order, exit codes, usage text) were measured
  * against the host utilities on macOS; the values printed are the container's own.

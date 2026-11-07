@@ -9,7 +9,7 @@
  * converts each device pixel centre back through the inverse of the current transformation matrix.
  *
  * Operations the shim refuses throw an Error whose message begins 'OWC_CANVAS_UNSUPPORTED' and are
- * named in MANIFEST.md; none of them silently draws nothing.
+ * named in docs/reference/compatibility-notes.md:1053-1058; none of them silently draws nothing.
  */
 
 import type { RGBA } from './color';

@@ -6,7 +6,7 @@
  * package that owns the add-on file, not by what the add-on does.
  *
  * The differences are the ones the C++ and the JS wrapper carry, all measured against the real
- * rocksdb on Node 24.15 and recorded in MANIFEST.md:
+ * rocksdb on Node 24.15 and recorded in docs/reference/compatibility-notes.md:1053-1058:
  *  - The package's own name and prebuild basenames (prebuilds/<platform>-<arch>/node.napi*.node).
  *  - getProperty: leveldb's properties are named leveldb.* and rocksdb answers '' for every one of
  *    them, because RocksDB's own property names (rocksdb.*) differ; the shim returns '' for both.

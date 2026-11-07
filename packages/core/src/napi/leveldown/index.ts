@@ -12,7 +12,7 @@
  * Napi::AsyncWorker does -- except iterator_next and iterator_seek on an ended iterator, which the
  * add-on completes in the calling tick, and db_get_property, which is synchronous.
  *
- * Divergences from the add-on, all deliberate and recorded in MANIFEST.md:
+ * Divergences from the add-on, all deliberate and recorded in docs/reference/compatibility-notes.md:1053-1058:
  *  - The add-on dereferences a NULL db_ after close (measured: put, get, del and batch take the
  *    process down with SIGSEGV). The shim instead calls back with Error('Database is not open').
  *  - approximateSize has no sstable/memtable split to report; it sums the entries of the range that a
