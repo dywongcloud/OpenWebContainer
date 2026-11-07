@@ -146,6 +146,7 @@ export function longStatus(view: StatusView, commit = false): string {
         return out + 'nothing added to commit but untracked files present (use "git add" to track)\n';
     }
     if (view.unstaged.length > 0) return out + 'no changes added to commit (use "git add" and/or "git commit -a")\n';
+    if (view.noCommits) return out + '\nnothing to commit (create/copy files and use "git add" to track)\n';
     return out + 'nothing to commit, working tree clean\n';
 }
 
