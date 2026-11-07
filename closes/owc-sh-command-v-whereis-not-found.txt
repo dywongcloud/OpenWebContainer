@@ -1,1 +1,3 @@
-owc-sh-command-v-whereis-not-found resolved 1794009634048-5680-a17d582d75b806cb 2026-11-07T00:06:21.163Z
+Row: owc-sh-command-v-whereis-not-found
+Witness: 1794009634048-5680-a17d582d75b806cb
+Status: resolved
