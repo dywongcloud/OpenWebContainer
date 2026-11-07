@@ -6,7 +6,7 @@ import {
 } from './repo';
 import { readIndex, writeIndex, type IndexEntry, ZERO_OID, type ConfigScope, formatConfig, type ConfigLine } from './store';
 import { parseTree, serializeTree, parseCommit, serializeCommit, serializeTag, parseTag, oidOf, type CommitInfo } from './objects';
-import { renderDiff, renderStat, countsFor, tarOf, splitLines } from './diff';
+import { renderDiff, renderStat, countsFor, tarOf, zipOf, splitLines } from './diff';
 
 export function ok(stdout = '', stderr = '', exitCode = 0): CommandResult { return { stdout, stderr, exitCode }; }
 export function fail(stderr: string, exitCode = 1): CommandResult {
@@ -1198,11 +1198,16 @@ function cmdBlame(ctx: CommandContext, flags: Set<string>, values: Map<string,st
 function cmdArchive(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const rev = rest[0] ?? 'HEAD';
+    let format = values.get('--format');
+    let revAt = 0;
+    if (format === undefined && flags.has('--format')) { format = rest[0]; revAt = 1; }
+    format = format ?? 'tar';
+    const rev = rest[revAt] ?? 'HEAD';
     const oid = repo.resolve(rev);
     const commit = oid === undefined ? undefined : repo.readCommit(oid);
     if (commit === undefined) return fail('fatal: Not a valid object name: ' + rev, 128);
-    const bytes = tarOf(repo, repo.flatTree(commit.tree));
+    const tree = repo.flatTree(commit.tree);
+    const bytes = format === 'zip' ? zipOf(repo, tree, values.get('--prefix') ?? '') : tarOf(repo, tree);
     const output = values.get('-o') ?? values.get('--output');
     if (output !== undefined) { repo.writeBytes(output.startsWith('/') ? output : repo.w(output), bytes); return ok(''); }
     return ok(binaryString(bytes));

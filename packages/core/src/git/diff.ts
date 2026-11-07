@@ -1,4 +1,5 @@
 import { utf8, text, concat, abbrev } from './bytes';
+import { zipSync } from 'fflate';
 import type { Change } from './repo';
 import type { GitRepo } from './repo';
 
@@ -238,4 +239,22 @@ export function tarOf(repo: GitRepo, tree: Map<string, { oid: string; mode: numb
     }
     blocks.push(new Uint8Array(1024));
     return concat(blocks);
+}
+
+/** A REAL ZIP container: --format=zip must not write USTAR bytes. Directory entries are
+    explicit zero-byte members with a trailing slash, as host git 2.53.0 emits. */
+export function zipOf(repo: GitRepo, tree: Map<string, { oid: string; mode: number }>, prefix = ''): Uint8Array {
+    const entries = new Map<string, Uint8Array>();
+    for (const path of [...tree.keys()].sort()) {
+        const state = tree.get(path) as { oid: string; mode: number };
+        const blob = repo.readBlob(state.oid);
+        if (blob === undefined) continue;
+        const name = prefix + path;
+        const parts = name.split('/');
+        for (let i = 1; i < parts.length; i++) entries.set(parts.slice(0, i).join('/') + '/', new Uint8Array(0));
+        entries.set(name, blob);
+    }
+    const data: Record<string, Uint8Array> = {};
+    for (const name of [...entries.keys()].sort()) data[name] = entries.get(name) as Uint8Array;
+    return zipSync(data, { level: 0 });
 }
