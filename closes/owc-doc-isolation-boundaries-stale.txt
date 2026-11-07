@@ -1,1 +1,3 @@
-owc-doc-isolation-boundaries-stale resolved 1794023198745-7695-850c867073e07dcd 2026-11-07T04:05:47.940Z
+Row: owc-doc-isolation-boundaries-stale
+Witness: 1794023198745-7695-850c867073e07dcd
+Status: resolved
