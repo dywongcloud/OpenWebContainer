@@ -509,6 +509,16 @@ function cmdUpdateIndex(ctx: CommandContext, flags: Set<string>, values: Map<str
     let repo: GitRepo;
     try { repo = GitRepo.discover(ctx); } catch (error) { return fatalResult(error); }
     let entries = repo.indexEntries();
+    const chmod = values.get('--chmod');
+    if (chmod === '+x' || chmod === '-x') {
+        const wanted = chmod === '+x' ? 0o100755 : 0o100644;
+        for (const raw of rest) {
+            entries = entries.filter((entry) => entry.path !== raw);
+            entries.push({ ...repo.entryFor(raw), mode: wanted });
+        }
+        repo.writeIndexEntries(entries);
+        return ok('');
+    }
     const remove = flags.has('--remove');
     const add = flags.has('--add') || !remove;
     for (const raw of rest) {

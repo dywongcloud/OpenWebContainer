@@ -40,6 +40,13 @@ export interface IFileSystem {
     readBytes(path: string): Uint8Array | undefined;
     writeBytes(path: string, data: Uint8Array, mode?: number): void;
     /**
+     * Applies a mode to a name that already exists, the way chmod(2) does. A shell chmod
+     * that only wrote the command module's side table left the exec bit invisible to every
+     * reader of the file system's own stat (git's statPath among them). An implementation
+     * with no modes of its own leaves this out and the side table alone stands.
+     */
+    chmodPath?(path: string, mode: number): void;
+    /**
      * Adds bytes to the end of a file, which is what `fs.appendFileSync` asks for. `writeBytes`
      * rewrites the whole file, so an append built on it costs the file's whole size every call and
      * a log that grows by appends never finishes; a file system that appends writes only the bytes

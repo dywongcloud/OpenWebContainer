@@ -478,7 +478,16 @@ export class ZenFSCore implements IFileSystem {
         this.fs.writeFileSync(path, data, mode === undefined ? undefined : { mode: mode & 0o7777 });
         /* writeFileSync creates 0o644 whatever its mode option says, and a global bin shim's
            executable bit is what makes it runnable by name: chmod it when a mode was asked for. */
-        if (mode !== undefined && (this.fs.statSync(path).mode & 0o111) === 0) this.fs.chmodSync(path, mode & 0o7777);
+        /* A mode was asked for: apply it even when the file already has an executable bit.
+           writeFileSync does not move the mode of a name that is already there, so a
+           checkout of a 100644 entry over a 100755 worktree file used to keep 0755. */
+        if (mode !== undefined) this.fs.chmodSync(path, mode & 0o7777);
+    }
+
+    /** The real mode bits a shell chmod set, observable by statPath and by git. */
+    chmodPath(path: string, mode: number): void {
+        requirePathWithinLimits(path);
+        this.fs.chmodSync(path, mode & 0o7777);
     }
 
     /* An append is a write at the end of what is already there. `writeBytes` hands the file system

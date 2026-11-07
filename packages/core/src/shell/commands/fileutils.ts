@@ -189,6 +189,13 @@ export function setCreationMode(fs: object, path: string, isDir: boolean): void 
 /** The mode a name carries after a utility that named one outright, as `mkdir -m 700 d` does. */
 export function setMode(fs: object, path: string, mode: number): void {
     metaOf(fs as Fs).modes.set(clean(path), mode & 0o7777);
+    /* The mode has to reach the file system itself: git and every guest fs.statSync read
+       statPath().mode, not this module's side table. A file system with no chmod leaves
+       the side table as the only record, as before. */
+    const target = fs as Fs;
+    if (typeof target.chmodPath === 'function') {
+        try { target.chmodPath(clean(path), mode & 0o7777); } catch { /* absent path or link */ }
+    }
 }
 
 /** Records the FIFO node `mknod` made; the file system has no S_IFIFO of its own. */

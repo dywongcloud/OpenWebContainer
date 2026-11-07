@@ -170,7 +170,7 @@ export class GitRepo {
     readText(path: string): string | undefined { try { return this.fs.readFile(path); } catch { return undefined; } }
     writeText(path: string, value: string): void { this.mkdirp(path.slice(0, path.lastIndexOf('/'))); this.fs.writeFile(path, value); }
     readBytes(path: string): Uint8Array | undefined { try { return this.fs.readBytes(path); } catch { return undefined; } }
-    writeBytes(path: string, value: Uint8Array): void { this.mkdirp(path.slice(0, path.lastIndexOf('/'))); this.fs.writeBytes(path, value); }
+    writeBytes(path: string, value: Uint8Array, mode?: number): void { this.mkdirp(path.slice(0, path.lastIndexOf('/'))); this.fs.writeBytes(path, value, mode); }
     mkdirp(path: string): void { if (path !== '' && !this.exists(path)) this.fs.createDirectory(path); }
     names(path: string): string[] { try { return this.fs.readdirNames(path) ?? []; } catch { return []; } }
     remove(path: string): void { if (this.exists(path)) { try { this.fs.removePath(path, true); } catch { /* absent */ } } }
@@ -414,7 +414,9 @@ export class GitRepo {
         for (const [path, state] of tree) {
             const blob = this.readBlob(state.oid);
             if (blob === undefined) continue;
-            this.writeBytes(this.w(path), blob);
+            /* A tree entry carries its mode: writing the blob without it materialised a
+               100755 entry as 0644 and made status report a spurious mode change. */
+            this.writeBytes(this.w(path), blob, state.mode);
         }
         const entries: IndexEntry[] = [];
         for (const [path, state] of tree) {
