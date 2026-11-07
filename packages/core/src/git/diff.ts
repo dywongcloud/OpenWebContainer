@@ -80,12 +80,12 @@ export function unifiedFor(path: string, oldOid: string | undefined, newOid: str
     out.push('diff --git a/' + path + ' b/' + path);
     if (oldOid === undefined) {
         out.push('new file mode ' + modeText);
-        out.push('index 0000000..' + abbrev(newOid ?? '0000000') + ' ' + modeText);
+        out.push('index 0000000..' + abbrev(newOid ?? '0000000'));
         out.push('--- /dev/null');
         out.push('+++ b/' + path);
     } else if (newOid === undefined) {
         out.push('deleted file mode ' + modeText);
-        out.push('index ' + abbrev(oldOid) + '..0000000 ' + modeText);
+        out.push('index ' + abbrev(oldOid) + '..0000000');
         out.push('--- a/' + path);
         out.push('+++ /dev/null');
     } else {

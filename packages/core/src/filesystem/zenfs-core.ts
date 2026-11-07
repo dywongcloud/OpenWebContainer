@@ -209,9 +209,9 @@ function deviceAt(path: string): DeviceSpec | undefined {
  * shell would run to reach the same command, executable for the same reason the node file is: every
  * lookup ends in `isexe`, which reads the mode bits.
  *
- * Two things keep a name off this list. A command this container cannot run gets no file: there is
- * no `git` here, and a file that named one would answer `command -v git` with a path and then fail
- * the moment a line ran it. And a command the shell reaches through its runner rather than through
+ * Two things keep a name off this list. A command this container cannot run gets no file: git
+ * itself is a MODULE_COMMAND, not a file, and a PATH stub here would be re-dispatched through its
+ * shebang instead of reaching the module. And a command the shell reaches through its runner rather than through
  * its own built-ins -- `grep` and `sed` are two -- is left without one on purpose: a file on `PATH`
  * outranks the runner, so giving them one makes `command -v grep` answer and `grep` itself stop
  * working ("it is the file /usr/bin/grep, which only a child can run"). Being able to run them is

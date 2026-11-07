@@ -7440,6 +7440,7 @@ const HOST_UTILITY_PATHS: Record<string, string> = {
     tr: '/usr/bin/tr', uncompress: '/usr/bin/uncompress', unexpand: '/usr/bin/unexpand',
     uniq: '/usr/bin/uniq', wc: '/usr/bin/wc', which: '/usr/bin/which', xargs: '/usr/bin/xargs',
     whereis: '/usr/bin/whereis',
+    git: '/usr/bin/git',
     xxd: '/usr/bin/xxd', yes: '/usr/bin/yes', zcat: '/usr/bin/zcat', zip: '/usr/bin/zip',
     clear: '/usr/bin/clear',
     groups: '/usr/bin/groups',

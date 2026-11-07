@@ -6,6 +6,7 @@ import { COMMANDS as TEXT_UTILS } from '../../../../../shell/commands/textutils'
 import { COMMANDS as FILE_UTILS } from '../../../../../shell/commands/fileutils';
 import { COMMANDS as ARCHIVES } from '../../../../../shell/commands/archives';
 import { COMMANDS as PROC_INFO } from '../../../../../shell/commands/procinfo';
+import { GIT_COMMANDS } from '../../../../../git/cli';
 import {
     COMMANDS as UNSUPPORTED_UTILS,
     UNSUPPORTED_COMMANDS,
@@ -673,6 +674,7 @@ const SHELL_MODULE_COMMANDS: Record<string, ShellCommand> = {
     ...FILE_UTILS,
     ...ARCHIVES,
     ...PROC_INFO,
+    ...GIT_COMMANDS,
     ...SHELL_BUILTIN_UTILS,
     ...UNSUPPORTED_UTILS,
     ...UNSUPPORTED_COMMANDS

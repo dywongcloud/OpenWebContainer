@@ -217,8 +217,10 @@ export class GitRefs {
     constructor(private fs: IFileSystem, private gitDir: string) {}
 
     headRaw(): string {
-        const value = this.fs.readFile(this.gitDir + '/HEAD');
-        return value === undefined ? 'ref: refs/heads/main\n' : value;
+        try {
+            const value = this.fs.readFile(this.gitDir + '/HEAD');
+            return value === undefined ? 'ref: refs/heads/main\n' : value;
+        } catch { return ''; }
     }
     head(): { ref?: string; oid?: string } {
         const raw = this.headRaw().trim();
@@ -232,13 +234,15 @@ export class GitRefs {
         return '(detached)';
     }
     private loose(name: string): string | undefined {
-        const value = this.fs.readFile(this.gitDir + '/' + name);
+        let value: string | undefined;
+        try { value = this.fs.readFile(this.gitDir + '/' + name); } catch { return undefined; }
         if (value === undefined) return undefined;
         const oid = value.trim();
         return /^[0-9a-f]{40}$/.test(oid) ? oid : undefined;
     }
     private packed(name: string): string | undefined {
-        const value = this.fs.readFile(this.gitDir + '/packed-refs');
+        let value: string | undefined;
+        try { value = this.fs.readFile(this.gitDir + '/packed-refs'); } catch { return undefined; }
         if (value === undefined) return undefined;
         for (const line of value.split('\n')) {
             const match = /^([0-9a-f]{40}) (.+)$/.exec(line);
@@ -289,7 +293,8 @@ export class GitRefs {
     }
     reflog(name: string): ReflogEntry[] {
         const path = this.gitDir + '/logs/' + (name === 'HEAD' ? 'HEAD' : name);
-        const value = this.fs.readFile(path);
+        let value: string | undefined;
+        try { value = this.fs.readFile(path); } catch { return []; }
         if (value === undefined) return [];
         const out: ReflogEntry[] = [];
         for (const line of value.split('\n')) {

@@ -326,7 +326,7 @@ export class GitRepo {
         const stat = this.statOf(this.w(path));
         const mode = stat.mode & 0o100 ? 0o100755 : 0o100644;
         return {
-            path, oid: bytes === undefined ? ZERO_OID : this.hashBlob(bytes), mode,
+            path, oid: bytes === undefined ? ZERO_OID : this.objects.write('blob', bytes), mode,
             size: stat.size, mtimeSec: Math.floor(stat.mtimeMs / 1000), mtimeNs: 0, stage: 0
         };
     }

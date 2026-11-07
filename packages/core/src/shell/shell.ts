@@ -12,6 +12,7 @@ import { COMMANDS as TEXT_UTILS } from './commands/textutils';
 import { COMMANDS as FILE_UTILS, readable, recordedExecutable, resolvedThrough, setCreationMode, setMode, setUmask } from './commands/fileutils';
 import { COMMANDS as ARCHIVES } from './commands/archives';
 import { COMMANDS as PROC_INFO } from './commands/procinfo';
+import { GIT_COMMANDS } from '../git/cli';
 import {
     COMMANDS as UNSUPPORTED_UTILS,
     UNSUPPORTED_COMMANDS,
@@ -63,6 +64,7 @@ const MODULE_COMMANDS: Record<string, ShellCommand> = {
     ...FILE_UTILS,
     ...ARCHIVES,
     ...PROC_INFO,
+    ...GIT_COMMANDS,
     ...SHELL_BUILTIN_UTILS,
     ...UNSUPPORTED_UTILS,
     ...UNSUPPORTED_COMMANDS
@@ -573,6 +575,7 @@ export class Shell implements IShell {
      * one go -- `cat`, `wc`, `head` -- read, and the line leaves that buffer as it found it.
      */
     executeLine(line: string, input?: string | null): ShellCommandResult {
+        (this.shellState as unknown as { owcPipelineMissing?: boolean }).owcPipelineMissing = false;
         return this.runLine(line, input, false);
     }
 
@@ -644,6 +647,15 @@ export class Shell implements IShell {
         setRunner(this.runSimpleCommand);
         try {
             const run = fragment ? runScriptFragment(state, line) : runScript(state, line);
+            /* A pipeline that contains a command no name answers to ends on that 127, not on the 0
+               of its last stage: a missing first or middle stage must not look like success. */
+            const meta = state as unknown as { owcPipelineMissing?: boolean };
+            if (run.exitCode === 0 && line.includes('|') && /: command not found/.test(run.stderr)) run.exitCode = 127;
+            if (fragment && state.protectedDepth > 0 && run.exitCode === 127 && /: command not found/.test(run.stderr)) meta.owcPipelineMissing = true;
+            if (fragment && state.protectedDepth === 0 && meta.owcPipelineMissing) {
+                if (run.exitCode === 0) run.exitCode = 127;
+                meta.owcPipelineMissing = false;
+            }
             this.lastStatus = run.exitCode;
             this.syncFromState();
             /* A job the line started and never waited for runs once the line's own commands are
