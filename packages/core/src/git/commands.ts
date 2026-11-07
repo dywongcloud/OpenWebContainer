@@ -806,6 +806,8 @@ function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, st
             tag.message.replace(/\n$/, '') + '\n\n';
         oid = tag.object;
     }
+    const blob = repo.readBlob(oid);
+    if (blob !== undefined) return ok(binaryString(blob));
     const info = repo.readCommit(oid);
     if (info === undefined) return fail('fatal: bad object ' + rev, 128);
     const parentTree = info.parents.length > 0 ? (repo.readCommit(info.parents[0])?.tree ?? '') : '';
