@@ -320,7 +320,10 @@ function cmdInit(ctx: CommandContext, flags: Set<string>, values: Map<string, st
     const line = reinit
         ? 'Reinitialized existing Git repository in ' + location + '\n'
         : 'Initialized empty Git repository in ' + location + '\n';
-    return ok(line, reinit ? '' : created.hint);
+    /* Host git 2.53.0 warns and ignores -b/--initial-branch on a re-init. */
+    const reinitWarning = reinit && branch !== undefined
+        ? 'warning: re-init: ignored --initial-branch=' + branch + '\n' : '';
+    return ok(line, reinit ? reinitWarning : created.hint);
 }
 
 /* ---- config ---- */

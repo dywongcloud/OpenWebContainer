@@ -98,6 +98,10 @@ export class GitRepo {
     static init(ctx: CommandContext, target: string, branch?: string, bare = false): { repo: GitRepo; hint: string } {
         const dir = normalizePath(target.startsWith('/') ? target : (ctx.cwd || '/app') + '/' + target);
         const gitDir = bare ? dir : dir + '/.git';
+        /* Host git 2.53.0 reinitializes without rewriting HEAD, config, description or
+           info/exclude: those files keep their [user]/[remote]/[multi] sections and a
+           detached or renamed HEAD byte-for-byte. */
+        const existing = ctx.fs.fileExists(gitDir + '/HEAD');
         if (!ctx.fs.fileExists(dir)) ctx.fs.createDirectory(dir);
         for (const sub of ['objects', 'objects/info', 'objects/pack', 'refs', 'refs/heads', 'refs/tags', 'info', 'hooks', 'branches', 'logs']) {
             const path = gitDir + '/' + sub;
@@ -117,6 +121,7 @@ export class GitRepo {
         /* The 13 host hint lines appear ONLY when neither the branch nor the default branch
            nor advice.defaultBranchName=false suppresses them. */
         const hint = branch === undefined && configured === undefined && !adviceOff ? INIT_HINT : '';
+        if (!existing) {
         ctx.fs.writeFile(gitDir + '/HEAD', 'ref: refs/heads/' + chosen + '\n');
         ctx.fs.writeFile(gitDir + '/config', [
             '[core]',
@@ -133,6 +138,7 @@ export class GitRepo {
         ].join('\n'));
         ctx.fs.writeFile(gitDir + '/description', "Unnamed repository; edit this file 'description' to name the repository.\n");
         ctx.fs.writeFile(gitDir + '/info/exclude', '# git ls-files --others --exclude-from=.git/info/exclude\n*.[oa]\n*~\n');
+        }
         return { repo, hint };
     }
 
