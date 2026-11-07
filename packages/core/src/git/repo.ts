@@ -221,13 +221,24 @@ export class GitRepo {
             const oid = this.refs.read(name);
             if (oid !== undefined) return oid;
         }
-        const caret = /^(.+)([\^~])([0-9]*)$/.exec(rev);
-        if (caret !== null) {
-            let oid = this.resolve(caret[1]);
-            const count = caret[3] === '' ? 1 : Number(caret[3]);
-            for (let i = 0; i < count && oid !== undefined; i++) {
-                const commit = this.readCommit(oid);
-                oid = commit?.parents[0];
+        /* ^N selects the N-th parent of a merge (^0 is the commit itself); ~N walks
+           the first-parent chain N hops. Chained suffixes are applied left to right. */
+        const suffix = /^(.+?)((?:[\^~]\d*)+)$/.exec(rev);
+        if (suffix !== null) {
+            let oid = this.resolve(suffix[1]);
+            for (const op of suffix[2].match(/[\^~]\d*/g) ?? []) {
+                if (oid === undefined) return undefined;
+                const count = op.length > 1 ? Number(op.slice(1)) : 1;
+                if (op[0] === '^') {
+                    if (count === 0) continue;
+                    const commit = this.readCommit(oid);
+                    oid = commit?.parents[count - 1];
+                } else {
+                    for (let i = 0; i < count && oid !== undefined; i++) {
+                        const commit = this.readCommit(oid);
+                        oid = commit?.parents[0];
+                    }
+                }
             }
             return oid;
         }
