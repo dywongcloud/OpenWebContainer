@@ -2,7 +2,7 @@
 
 ## Global npm modules are not on `require()` resolution
 
-`npm install -g` puts packages in the VFS prefix `<PREFIX>/lib/node_modules` and their bin links in `<PREFIX>/bin` on `PATH`. Host npm behaves the same way: a global package is **not** resolvable with `require()` from an unrelated cwd (`MODULE_NOT_FOUND`) unless `NODE_PATH` names the prefix. `npm bin -g` is an unknown command (removed in host npm 9+). See [npm global installs](reference/npm-global.md). The archived compatibility-notes.md "Global installs are refused" lines 118 and 1091 are **SUPERSEDED** and left verbatim.
+`npm install -g` puts packages in the VFS prefix `<PREFIX>/lib/node_modules` and their bin links in `<PREFIX>/bin` on `PATH`. Host npm behaves the same way: a global package is **not** resolvable with `require()` from an unrelated cwd (`MODULE_NOT_FOUND`) unless `NODE_PATH` names the prefix. `npm bin -g` is an unknown command (removed in host npm 9+). See [npm global installs](reference/npm-global.md). The archived compatibility-notes.md "Global installs are refused" line 118 is **SUPERSEDED** and left verbatim.
 
 
 These are the boundaries an application author needs before choosing OpenWebContainer. Each one has a measured basis in the [verbatim notes archive](reference/compatibility-notes.md) or in the source on `origin/main`. They are not speculations.
@@ -34,7 +34,7 @@ A guest loop blocks the host thread; no second thread can preempt it. The only t
 - `new OpenWebContainer({ guestBudgetMs: ms })` sets a default **30000 ms** uninterrupted-execution budget; `0` disarms it. `while (true) {}` is stopped at ~30155 ms with `Error: Script execution timed out after 30000ms` and exit 1. The budget bounds one *uninterrupted stretch*: every host call, await or timer wait restarts it (old Readme lines 1103-1140).
 - `child.kill()` on a busy child has no moment at which to run: it still answers `false`, and `worker.terminate()` on a busy worker is not prompt (old Readme lines 1772, 2089). A `spawn`'s `timeout` works because the deadline is put on the interrupt handler instead of a host timer.
 - QuickJS 0.32 has no WebAssembly of its own; guest WASM is supplied by the host realm (`runtime/wasm-host.ts`). Bare QuickJS 0.32 reproduces the chained `Iterator.prototype` helper `TypeError`, and `Intl` is a guest shim with eight of host Node's twelve names: `Intl.Locale`, `DisplayNames`, `Segmenter` and `DurationFormat` are `undefined` (old Readme lines 1035-1037).
-- Some native add-ons are JavaScript reimplementations (`bcrypt`, `better-sqlite3`, `canvas`, `sharp`, `leveldown`, `rocksdb`, `node-pty`, `sodium-native`); `esbuild`'s Go binary cannot execute, so `npm install esbuild` fails `ENOEXEC` in postinstall. `sql.js` does not run.
+- Some native add-ons are JavaScript reimplementations (`bcrypt`, `better-sqlite3`, `canvas`, `sharp`, `leveldown`, `rocksdb`, `node-pty`, `sodium-native`); `esbuild`'s Go binary cannot execute, so `npm install esbuild` fails `ENOEXEC` in postinstall. `sql.js` 1.15.1 does run: written as bytes (`container.ts:206 writeBytes`, resolved row `owc-sqljs-wasm-load`), its 684897-byte `sql-wasm.wasm` loads and a create/insert/select returns `ROWS=[[1,"alpha"],[2,"beta"],[3,"gamma"]]` and `COUNT=[[3]]`, stdout+stderr+exit identical to host Node v24.15.0 at two memory points, twice.
 
 ## Sparse files and the guest-to-host channel
 

@@ -67,8 +67,8 @@ prefix from its own config, `/usr/local` by default.
 
 ## Superseded archive statements
 
-The verbatim archive `docs/reference/compatibility-notes.md` lines 118 and 1091 say
-**"Global installs are refused"**. Those lines describe the tree they were measured on and are
+The verbatim archive `docs/reference/compatibility-notes.md` line 118 says
+**"Global installs are refused"**. That line describes the tree it was measured on and is
 **SUPERSEDED** by this feature: the archive is byte-for-byte verbatim and is deliberately left
 unedited. Global installs now land in the VFS prefix, global bins are on PATH, and global modules
 are NOT on `require()` resolution. `npm bin -g` remains an exact unknown-command match because

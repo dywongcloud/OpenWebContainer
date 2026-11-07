@@ -2,7 +2,7 @@
 
 ## Global npm installs
 
-`npm install -g` installs into the VFS prefix, links bins into `<PREFIX>/bin` on `PATH`, and writes nothing into the cwd. Global modules are **NOT** on `require()` resolution from an unrelated cwd. `npm ls -g`, `npm uninstall -g`, `npm root -g`, `npm prefix -g` and `npm config get globalconfig` are supported; see [npm global installs](docs/reference/npm-global.md). The archived compatibility-notes.md "Global installs are refused" statements (lines 118, 1091) are **SUPERSEDED**; that archive is left verbatim.
+`npm install -g` installs into the VFS prefix, links bins into `<PREFIX>/bin` on `PATH`, and writes nothing into the cwd. Global modules are **NOT** on `require()` resolution from an unrelated cwd. `npm ls -g`, `npm uninstall -g`, `npm root -g`, `npm prefix -g` and `npm config get globalconfig` are supported; see [npm global installs](docs/reference/npm-global.md). The archived compatibility-notes.md "Global installs are refused" statements (line 118) are **SUPERSEDED**; that archive is left verbatim.
 
 
 [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

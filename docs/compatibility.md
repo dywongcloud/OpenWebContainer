@@ -2,7 +2,7 @@
 
 ## npm global installs
 
-Global `npm install -g` (and `--location=global`) installs into the VFS prefix `<PREFIX>/lib/node_modules` and links bins into `<PREFIX>/bin`, which is on `PATH`; nothing is written into the cwd. `npm ls -g` roots at `<PREFIX>/lib`, and `npm uninstall -g`, `npm root -g`, `npm prefix -g` and `npm config get globalconfig` are implemented. Global modules are **NOT** on `require()` resolution from an unrelated cwd. See [npm global installs](reference/npm-global.md) for every measured case. The archived compatibility-notes.md lines 118 and 1091 saying "Global installs are refused" are **SUPERSEDED**; that archive is verbatim and intentionally unedited.
+Global `npm install -g` (and `--location=global`) installs into the VFS prefix `<PREFIX>/lib/node_modules` and links bins into `<PREFIX>/bin`, which is on `PATH`; nothing is written into the cwd. `npm ls -g` roots at `<PREFIX>/lib`, and `npm uninstall -g`, `npm root -g`, `npm prefix -g` and `npm config get globalconfig` are implemented. Global modules are **NOT** on `require()` resolution from an unrelated cwd. See [npm global installs](reference/npm-global.md) for every measured case. The archived compatibility-notes.md line 118 saying "Global installs are refused" is **SUPERSEDED**; that archive is verbatim and intentionally unedited.
 
 
 Compatibility in this project is a **measurement**, not a claim of identity with Node.
