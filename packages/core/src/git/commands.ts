@@ -1036,6 +1036,14 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
         return ok('', 'Previous HEAD position was ' + abbrev(prevOid) + ' ' +
             repo.subjectOf(prevOid) + '\n' + headLine);
     }
+    /* Host git 2.53.0: `checkout HEAD` on an already-detached HEAD is a
+       symbolic no-op that prints nothing, while an explicit oid or a tag
+       resolving to that same commit still prints the HEAD line; `--detach`
+       forces the HEAD line even for the symbolic name. */
+    if (name === 'HEAD' && !flags.has('--detach') && !wasAttached &&
+        prevOid !== undefined && prevOid === oid) {
+        return ok('', '');
+    }
     return ok('', headLine);
 }
 
