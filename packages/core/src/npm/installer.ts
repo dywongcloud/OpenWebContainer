@@ -1,5 +1,6 @@
 import semver from 'semver';
 import { IFileSystem } from '../filesystem';
+import type { GlobalPaths } from './config';
 import { NodeResolver, dirnameOf, joinPaths, normalizeAbsolute } from '../process/executors/node/runtime/resolver';
 import { NpmRegistry, PackageVersion, Packument, selectVersion } from './registry';
 import { lockKey, LockTreeNode, writeLockfile } from './lockfile';
@@ -111,6 +112,8 @@ export class NpmInstaller {
     private resolver: NodeResolver;
     /** package.json already read from a directory, including the reads that found none. */
     private manifestCache = new Map<string, Record<string, any> | undefined>();
+    /** Set by installGlobal when --ignore-scripts suppresses every install lifecycle event. */
+    private ignoreScripts = false;
 
     constructor(
         private fileSystem: IFileSystem,
@@ -443,6 +446,7 @@ export class NpmInstaller {
 
     /** npm runs install scripts once the tree is placed, with dependencies before the packages that need them. */
     private async runInstallScripts(packageDirs: string[]): Promise<void> {
+        if (this.ignoreScripts) return;
         for (const dir of [...new Set(packageDirs)].reverse()) {
             const manifest = this.readManifest(dir) ?? {};
             const name = String(manifest.name ?? '');
@@ -649,6 +653,80 @@ export class NpmInstaller {
     private writeManifest(root: string, manifest: Record<string, unknown>): void {
         this.fileSystem.writeFile(joinPaths(root, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
         this.forgetManifests(root);
+    }
+
+    /**
+     * `npm install -g`: place the requested packages under <prefix>/lib/node_modules without ever
+     * writing the project's package.json or package-lock.json. `root` is <prefix>/lib, so the
+     * installer's own placement rule already puts each package at <prefix>/lib/node_modules/<name>.
+     */
+    async installGlobal(paths: GlobalPaths, specs: InstallSpec[], options: { ignoreScripts: boolean }): Promise<InstallReport> {
+        const root = normalizeAbsolute(paths.lib);
+        for (const dir of [paths.lib, paths.modules, paths.bin]) {
+            if (this.fileSystem.statPath(dir)?.type !== 'dir') this.fileSystem.createDirectory(dir);
+        }
+        this.ignoreScripts = options.ignoreScripts;
+        const edges: Edge[] = specs.map((spec) => this.specEdge(root, spec, false));
+        const { added } = await this.installTree(root, edges);
+        /* Host npm symlinks a local-folder global install; this tree copies it. Record the source
+           so `npm ls -g` can draw the same `-> <path>` arrow. */
+        for (const spec of specs) {
+            if (spec.localPath === undefined) continue;
+            const source = normalizeAbsolute(spec.localPath);
+            const manifest = this.readManifest(root + '/node_modules/' + (this.readManifest(source)?.name ?? ''));
+            if (manifest === undefined) continue;
+            const name = String(manifest.name ?? '');
+            if (name !== '') this.fileSystem.writeFile(joinPaths(paths.modules, name, '.owc-global-link'), source + '\n');
+        }
+        return { added };
+    }
+
+    /**
+     * Link every `bin` entry of every package in <prefix>/lib/node_modules into <prefix>/bin as a
+     * runnable 0755 shim. A host uses symlinks; this file system has no file symlink or chmod, so a
+     * shebang shim that loads the real bin file is the equivalent. A colliding bin name keeps the
+     * first link and fails the install with EEXIST.
+     */
+    linkGlobalBinaries(projectLibDir: string): void {
+        const lib = normalizeAbsolute(projectLibDir);
+        const modules = joinPaths(lib, 'node_modules');
+        const prefix = dirnameOf(lib);
+        const binDir = joinPaths(prefix, 'bin');
+        if (this.fileSystem.statPath(binDir)?.type !== 'dir') this.fileSystem.createDirectory(binDir);
+        const packages: string[] = [];
+        for (const name of this.fileSystem.readdirNames(modules) ?? []) {
+            if (name === '.bin' || name.startsWith('.')) continue;
+            if (name.startsWith('@')) {
+                for (const scoped of this.fileSystem.readdirNames(joinPaths(modules, name)) ?? []) packages.push(`${name}/${scoped}`);
+            } else {
+                packages.push(name);
+            }
+        }
+        for (const name of packages) {
+            const dir = joinPaths(modules, name);
+            const manifest = this.readManifest(dir);
+            if (!manifest?.bin) continue;
+            const bins: Record<string, string> = typeof manifest.bin === 'string'
+                ? { [String(manifest.name ?? '').split('/').pop() || 'bin']: manifest.bin }
+                : manifest.bin;
+            for (const [binName, relativeFile] of Object.entries(bins)) {
+                const file = normalizeAbsolute(joinPaths(dir, relativeFile));
+                if (this.fileSystem.statPath(file)?.type !== 'file') continue;
+                const link = joinPaths(binDir, binName);
+                const existing = this.fileSystem.statPath(link)?.type === 'file' ? this.fileSystem.readFile(link) : undefined;
+                if (existing !== undefined) {
+                    if (existing.includes(file)) continue; // our own link: nothing to do
+                    throw Object.assign(new Error(
+                        `npm error code EEXIST\nnpm error path ${link}\nnpm error EEXIST: file already exists, symlink '${link}'\nnpm error File exists: ${link}\nnpm error Remove the existing file and try again, or run npm install with --force`
+                    ), { exitCode: 1 });
+                }
+                const statement = this.resolver.isESM(file)
+                    ? `import(${JSON.stringify(file)});`
+                    : `const __owc_require = typeof require === 'function' ? require : process.getBuiltinModule('module').createRequire(process.argv[1]);\n__owc_require(${JSON.stringify(file)});`;
+                this.fileSystem.writeBytes(link,
+                    new TextEncoder().encode(`#!/usr/bin/env node\n${statement}\n`), 0o755);
+            }
+        }
     }
 
     private ensureManifest(root: string): void {

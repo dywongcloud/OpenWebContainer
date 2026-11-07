@@ -748,6 +748,10 @@ export class Shell implements IShell {
 
         const found = this.lookupOnPath(state, command);
         if (found !== undefined) {
+            /* A file on PATH can be the shim of a globally installed package: run it through its
+               shebang instead of refusing it. A bare name has no slash, so pass the resolved path. */
+            const shim = this.runShebangScript(found, args);
+            if (shim !== undefined) return shim;
             return this.cannotRun(command, `it is the file ${found}, which only a child can run`);
         }
         const script = this.runShebangScript(command, args);
@@ -1340,6 +1344,8 @@ export class Shell implements IShell {
             for (const path of paths) {
                 const executablePath = this.fileSystem.resolvePath(command, path);
                 if (this.fileSystem.fileExists(executablePath)) {
+                    const shim = this.runShebangScript(executablePath, args);
+                    if (shim !== undefined) return shim;
                     return { stdout: '', stderr: `No executor found for: ${executablePath}`, exitCode: 1 };
                 }
             }

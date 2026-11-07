@@ -3,13 +3,13 @@ import { InstallSpec, NpmInstaller, localSpecTarget, parseInstallSpec, ScriptRun
 import { DEFAULT_REGISTRY, NpmRegistry } from '../../../npm/registry';
 import { runPkgCommand } from '../../../npm/pkg';
 import { didYouMean } from '../../../npm/didyoumean';
-import { runConfigCommand } from '../../../npm/config';
+import { globalPaths, isGlobalArg, runConfigCommand } from '../../../npm/config';
 import { runPack, runPublish } from '../../../npm/pack';
 import { runOutdated } from '../../../npm/outdated';
 import { runAudit } from '../../../npm/audit';
 import { runCacheVerify } from '../../../npm/cache';
 import { findWorkspaceRoot, parseWorkspaceOptions, resolveWorkspaces } from '../../../npm/workspaces';
-import { scriptEnvironment } from '../../../npm/script-env';
+import { globalInstallEnvironment, scriptEnvironment } from '../../../npm/script-env';
 import {
     LIFECYCLE_COMMANDS,
     NPM_VERSION,
@@ -27,7 +27,8 @@ import {
     scriptList,
     scriptPath
 } from '../../../npm/scripts';
-import { dependencyTree, parseListArgs } from '../../../npm/tree';
+import { dependencyTree, globalDependencyTree, parseListArgs } from '../../../npm/tree';
+import type { GlobalListOptions } from '../../../npm/tree';
 import { Process, ProcessType } from '../../base';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../node/runtime/resolver';
 import { ROOT_POST_INSTALL_SCRIPT_EVENTS, ROOT_PRE_INSTALL_SCRIPT_EVENTS } from '../../../npm/lifecycle';
@@ -101,6 +102,15 @@ export class NpmProcess extends Process {
             case 'i':
             case 'add':
                 return this.install(rest, registry, log);
+            case 'uninstall':
+            case 'un':
+            case 'remove':
+            case 'rm':
+            case 'unlink':
+                return this.uninstall(rest);
+            case 'root':
+            case 'prefix':
+                return this.rootPrefix(command, rest);
             case 'init':
                 return this.init();
             case 'ls':
@@ -232,12 +242,17 @@ export class NpmProcess extends Process {
 
     private async install(args: string[], registry: NpmRegistry, log: (line: string) => void): Promise<number> {
         let save: 'dependencies' | 'devDependencies' | 'none' = 'dependencies';
+        let global = false;
+        let ignoreScripts = false;
         const specs: InstallSpec[] = [];
         for (const arg of args) {
             if (arg === '-D' || arg === '--save-dev') save = 'devDependencies';
             else if (arg === '-P' || arg === '--save-prod' || arg === '-S' || arg === '--save') save = 'dependencies';
             else if (arg === '--no-save') save = 'none';
-            else if (arg === '-g' || arg === '--global') throw new Error('Global installs are not supported by this runtime');
+            else if (arg === '-g' || arg === '--global' || arg === '--location=global') global = true;
+            else if (arg === '--ignore-scripts') ignoreScripts = true;
+            else if (arg === '--global-style') this.emitError('npm warn config global-style This option has been deprecated in favor of `--install-strategy=shallow`\n');
+            else if (arg === '--force') this.emitError('npm warn using --force Recommended protections disabled.\n');
             else if (arg.startsWith('-')) continue;
             else {
                 /* A spec that names a directory -- `./localpkg`, `file:./localpkg`, an absolute
@@ -246,6 +261,8 @@ export class NpmProcess extends Process {
                 specs.push(local === undefined ? parseInstallSpec(arg) : { name: '', localPath: local });
             }
         }
+
+        if (global) return this.installGlobal(specs, registry, log, ignoreScripts);
 
         const projectDir = this.cwd ?? '/';
         const packageDir = findPackageRoot(this.fileSystem, projectDir) ?? normalizeAbsolute(projectDir);
@@ -401,6 +418,7 @@ export class NpmProcess extends Process {
 
     /** `npm ls`: the installed tree of the package here, as `npm ls` draws it. */
     private listDependencies(args: string[]): number {
+        if (isGlobalArg(args)) return this.listGlobalDependencies(args);
         const packageDir = findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/');
         this.emitOutput(dependencyTree(this.fileSystem, packageDir, parseListArgs(args)));
         return 0;
@@ -473,6 +491,13 @@ export class NpmProcess extends Process {
     ): Promise<number> {
         let shim = explicitPackage ? undefined : findLocalBinShim(this.fileSystem, cwd, binName);
 
+        /* A global bin is resolved from npm's configured prefix, not refetched from the registry. */
+        if (shim === undefined && !explicitPackage) {
+            const paths = globalPaths(this.fileSystem, cwd, Object.fromEntries(this.env));
+            const globalBin = joinPaths(paths.bin, binName);
+            if (this.fileSystem.statPath(globalBin)?.type === 'file') shim = globalBin;
+        }
+
         if (shim === undefined && !explicitPackage) {
             /* The package in the directory itself declares bins, and `npm exec` runs one of them
                before it looks anywhere else: it is this project's command, not a package's. npm
@@ -527,6 +552,112 @@ export class NpmProcess extends Process {
         const binName = parseInstallSpec(command ?? requested).name.split('/').pop()!;
         return this.runBin(binName, requested, args, this.cwd ?? '/', registry, log, packageArg !== undefined);
     }
+    /**
+     * `npm install -g <pkg>`: install into <prefix>/lib/node_modules, link bins into <prefix>/bin,
+     * and write nothing at all into the current working directory. The prefix comes from npm's own
+     * config (default /usr/local); --location=global is the same mode. The save-related flags are
+     * ignored for the install outcome, --ignore-scripts suppresses the three lifecycle events, and
+     * --global-style/--force only add npm's warnings.
+     */
+    private async installGlobal(
+        specs: InstallSpec[], registry: NpmRegistry, log: (line: string) => void, ignoreScripts: boolean
+    ): Promise<number> {
+        const cwd = this.cwd ?? '/';
+        const env = Object.fromEntries(this.env);
+        const paths = globalPaths(this.fileSystem, cwd, env);
+        const started = performance.now();
+        const installer = new NpmInstaller(this.fileSystem, registry, log,
+            (args, scriptCwd, scriptEnv) => this.runLifecycleScript(args, scriptCwd, {
+                ...globalInstallEnvironment(paths.prefix), ...scriptEnv
+            }));
+        try {
+            let wanted = specs;
+            if (wanted.length === 0) {
+                const manifest = readManifest(this.fileSystem, normalizeAbsolute(cwd));
+                if (manifest === undefined) {
+                    this.emitError(`npm error code ENOENT\nnpm error syscall open\nnpm error path ${joinPaths(normalizeAbsolute(cwd), 'package.json')}\nnpm error errno -2\nnpm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '${joinPaths(normalizeAbsolute(cwd), 'package.json')}'\nnpm error enoent This is related to npm not being able to find a file.\nnpm error enoent\n`);
+                    return 254;
+                }
+                wanted = [{ name: '', localPath: normalizeAbsolute(cwd) }];
+            }
+            const report = await installer.installGlobal(paths, wanted, { ignoreScripts });
+            installer.linkGlobalBinaries(paths.lib);
+            const duration = elapsedDuration(performance.now() - started);
+            if (report.added.length === 0) this.emitOutput(`\nup to date in ${duration}\n`);
+            else this.emitOutput(`\nadded ${report.added.length} package${report.added.length === 1 ? '' : 's'} in ${duration}\n`);
+            return 0;
+        } catch (error: any) {
+            const message = typeof error?.message === 'string' ? error.message : String(error);
+            if (/not found in the registry|E404/.test(message)) {
+                const name = specs[0]?.name || '';
+                this.emitError(`npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/${name} - Not found\nnpm error 404\nnpm error 404  The requested resource '${name}@*' could not be found or you do not have permission to access it.\nnpm error 404\nnpm error 404 Note that you can also install from a\nnpm error 404 tarball, folder, http url, or git url.\n`);
+                return 1;
+            }
+            this.emitError(message.endsWith('\n') ? message : message + '\n');
+            return typeof error?.exitCode === 'number' ? error.exitCode : 1;
+        }
+    }
+
+    /** `npm ls -g` / `npm list -g`: the tree rooted at <prefix>/lib, not at the cwd's package. */
+    private listGlobalDependencies(args: string[]): number {
+        const paths = globalPaths(this.fileSystem, this.cwd ?? '/', Object.fromEntries(this.env));
+        const options = parseGlobalListArgs(args);
+        if (this.fileSystem.statPath(paths.lib)?.type !== 'dir') {
+            this.emitError(`npm error code ENOENT\nnpm error syscall lstat\nnpm error path ${paths.prefix}\nnpm error errno -2\nnpm error enoent ENOENT: no such file or directory, lstat '${paths.prefix}'\nnpm error enoent This is related to npm not being able to find a file.\nnpm error enoent\n`);
+            return 254;
+        }
+        if (options.invalidDepth) {
+            this.emitError('npm warn invalid config depth="invalid" set in command line options\nnpm warn invalid config Must be one of: null, numeric value\n');
+        }
+        this.emitOutput(globalDependencyTree(this.fileSystem, paths.lib, options));
+        return 0;
+    }
+
+    /** `npm uninstall -g <pkg>` and its aliases: remove the global module and its bin links. */
+    private uninstall(args: string[]): number {
+        const global = isGlobalArg(args);
+        const names = args.filter((arg) => !arg.startsWith('-'));
+        if (names.length === 0) {
+            this.emitError('npm error code EUSAGE\nnpm error\nnpm error Remove a package\nnpm error\nnpm error Usage:\nnpm error npm uninstall [<@scope>/]<pkg>...\nnpm error\nnpm error Options:\nnpm error [-S|--save|--no-save|--save-prod|--save-dev|--save-optional|--save-peer|--save-bundle]\nnpm error [-g|--global]\nnpm error [-w|--workspace <workspace-name> [-w|--workspace <workspace-name> ...]]\nnpm error [--workspaces] [--include-workspace-root] [--install-links]\nnpm error\nnpm error   -S|--save\nnpm error     Save installed packages to a `package.json` file as dependencies.\nnpm error\nnpm error   -g|--global\nnpm error     Operates in "global" mode, so that packages are installed into the\nnpm error\nnpm error   -w|--workspace\nnpm error     Enable running a command in the context of the configured workspaces of the\nnpm error\nnpm error   --workspaces\nnpm error     Set to true to run the command in the context of **all** configured\nnpm error\nnpm error   --include-workspace-root\nnpm error     Include workspace root when workspaces are enabled for a command.\nnpm error\nnpm error   --install-links\nnpm error     When set file: protocol dependencies will be packed and installed as\nnpm error\nnpm error\nnpm error aliases: unlink, remove, rm, r, un\nnpm error\nnpm error Run "npm help uninstall" for more info\n');
+            return 1;
+        }
+        const paths = globalPaths(this.fileSystem, this.cwd ?? '/', Object.fromEntries(this.env));
+        const modules = global ? paths.modules : joinPaths(findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/'), 'node_modules');
+        const binDir = global ? paths.bin : undefined;
+        const started = performance.now();
+        let removed = 0;
+        for (const name of names) {
+            const dir = joinPaths(modules, name);
+            if (this.fileSystem.statPath(dir)?.type !== 'dir') continue;
+            if (binDir !== undefined) {
+                for (const link of this.fileSystem.readdirNames(binDir) ?? []) {
+                    const file = joinPaths(binDir, link);
+                    let text: string | undefined;
+                    try { text = this.fileSystem.readFile(file); } catch { text = undefined; }
+                    if (text !== undefined && text.includes(dir + '/')) this.fileSystem.removePath(file);
+                }
+            }
+            this.fileSystem.removePath(dir, true);
+            removed += 1;
+        }
+        const duration = elapsedDuration(performance.now() - started);
+        if (removed === 0) this.emitOutput(`\nup to date in ${duration}\n`);
+        else this.emitOutput(`\nremoved ${removed} package${removed === 1 ? '' : 's'} in ${duration}\n`);
+        return 0;
+    }
+
+    /** `npm root [-g]`: the effective node_modules directory; `npm prefix [-g]`: the prefix. */
+    private rootPrefix(command: string, args: string[]): number {
+        const global = isGlobalArg(args);
+        const paths = globalPaths(this.fileSystem, this.cwd ?? '/', Object.fromEntries(this.env));
+        if (command === 'root') {
+            this.emitOutput((global ? paths.modules : joinPaths(findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/'), 'node_modules')) + '\n');
+        } else {
+            this.emitOutput((global ? paths.prefix : (findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/'))) + '\n');
+        }
+        return 0;
+    }
+
 }
 
 /** npm's `EJSONPARSE` block for a package.json it cannot read: the parse error, the text and its two notes. */
@@ -674,4 +805,21 @@ function hashString(text: string): string {
         hash = Math.imul(hash, 0x01000193) >>> 0;
     }
     return hash.toString(16).padStart(8, '0');
+}
+
+/** `npm ls -g [--depth=n] [--all] [--json] [--parseable]`: the global tree's options. */
+function parseGlobalListArgs(args: string[]): GlobalListOptions {
+    const local = parseListArgs(args);
+    let json = false, parseable = false, all = false, invalidDepth = false;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--json' || arg === '-j') json = true;
+        else if (arg === '--parseable' || arg === '-p') parseable = true;
+        else if (arg === '--all' || arg === '-a') all = true;
+        else if (arg === '--depth' || arg.startsWith('--depth=')) {
+            const raw = arg === '--depth' ? args[i + 1] : arg.slice('--depth='.length);
+            if (raw === undefined || (raw !== 'Infinity' && !(Number.isFinite(Number(raw)) && Number(raw) >= 0))) invalidDepth = true;
+        }
+    }
+    return { ...local, json, parseable, all, invalidDepth, depth: all ? Infinity : local.depth };
 }

@@ -71,6 +71,9 @@ export interface ScriptEnvironment {
     env: Record<string, string>;
     /** Whether the run is over the workspaces of a root, which npm's user agent reports. */
     workspaces?: boolean;
+    /** True for the lifecycle scripts of a globally installed package: npm exports npm_config_global
+        and points local_prefix at the prefix rather than at the package directory. */
+    global?: boolean;
 }
 
 /**
@@ -104,12 +107,13 @@ export function scriptEnvironment(
        empty string, so a boolean that is off is a variable that is there and empty. */
     const values: Record<string, unknown> = {
         audit: config.audit,
+        ...(input.global === true ? { global: true } : {}),
         cache: config.cache,
         fund: config.fund,
         global_prefix: prefix,
         globalconfig: joinPaths(prefix, 'etc/npmrc'),
         init_module: joinPaths(home, '.npm-init.js'),
-        local_prefix: packageDir,
+        local_prefix: input.global === true ? prefix : packageDir,
         node_gyp: NODE_GYP,
         noproxy: config.noproxy ?? '',
         npm_version: NPM_VERSION,
@@ -134,4 +138,19 @@ export function scriptEnvironment(
     env.NODE = NODE_BINARY;
     env.npm_node_execpath = NODE_BINARY;
     return env;
+}
+
+/**
+ * The `npm_config_*` variables of one lifecycle script of a globally installed package. npm runs
+ * those scripts with cwd=<prefix>/lib/node_modules/<name> and exports the prefix-derived config
+ * keys; the package's own npm_package_* names are added by the caller.
+ */
+export function globalInstallEnvironment(prefix: string): Record<string, string> {
+    return {
+        npm_config_global: 'true',
+        npm_config_prefix: prefix,
+        npm_config_global_prefix: prefix,
+        npm_config_local_prefix: prefix,
+        npm_config_globalconfig: joinPaths(prefix, 'etc/npmrc')
+    };
 }

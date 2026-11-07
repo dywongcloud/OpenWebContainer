@@ -17,6 +17,53 @@ export interface ConfigResult {
     exitCode: number;
 }
 
+/**
+ * The layout npm's global mode uses under the configured prefix. A host keeps globally installed
+ * packages at <prefix>/lib/node_modules and links their bins into <prefix>/bin; `npm ls -g` is
+ * rooted at <prefix>/lib, and npm's own global config file is <prefix>/etc/npmrc.
+ */
+export interface GlobalPaths {
+    prefix: string;
+    /** The directory `npm ls -g` draws its tree from. */
+    lib: string;
+    /** The global package tree. */
+    modules: string;
+    /** The directory global bin links are written into. */
+    bin: string;
+    /** npm_config_globalconfig. */
+    globalconfig: string;
+}
+
+/** The configured prefix: npm's own default is /usr/local, overridable by .npmrc or npm_config_prefix. */
+export function resolveGlobalPrefix(fileSystem: IFileSystem, cwd: string, env: Record<string, string>): string {
+    const config = resolveConfig(fileSystem, cwd, env);
+    return config.prefix || DEFAULTS.prefix;
+}
+
+/** Every directory a global command needs, derived from the configured prefix. */
+export function globalPaths(fileSystem: IFileSystem, cwd: string, env: Record<string, string>): GlobalPaths {
+    const prefix = resolveGlobalPrefix(fileSystem, cwd, env);
+    return {
+        prefix,
+        lib: joinPaths(prefix, 'lib'),
+        modules: joinPaths(prefix, 'lib/node_modules'),
+        bin: joinPaths(prefix, 'bin'),
+        globalconfig: joinPaths(prefix, 'etc/npmrc')
+    };
+}
+
+/** `-g`, `--global` and `--location=global` all put npm in global mode. */
+export function isGlobalArg(args: string[]): boolean {
+    return args.some((arg) => arg === '-g' || arg === '--global' || arg === '--location=global');
+}
+
+/** `npm config get <key>`: globalconfig and global_prefix are derived from the prefix, not static. */
+function configValue(config: Record<string, string>, key: string): string {
+    if (key === 'globalconfig') return joinPaths(config.prefix || DEFAULTS.prefix, 'etc/npmrc');
+    if (key === 'global_prefix' || key === 'global-prefix') return config.prefix || DEFAULTS.prefix;
+    return config[key] ?? 'undefined';
+}
+
 /** npm's own defaults for the keys this runtime answers. */
 const DEFAULTS: Record<string, string> = {
     registry: 'https://registry.npmjs.org/',
@@ -105,8 +152,8 @@ function requestedKeys(args: string[]): string[] {
 export function runConfigGet(config: Record<string, string>, args: string[]): ConfigResult {
     const keys = requestedKeys(args);
     if (keys.length === 0) return { stdout: configListing(config), stderr: '', exitCode: 0 };
-    if (keys.length === 1) return { stdout: `${config[keys[0]] ?? 'undefined'}\n`, stderr: '', exitCode: 0 };
-    const lines = keys.map((key) => `${key}=${config[key] ?? 'undefined'}`);
+    if (keys.length === 1) return { stdout: `${configValue(config, keys[0])}\n`, stderr: '', exitCode: 0 };
+    const lines = keys.map((key) => `${key}=${configValue(config, key)}`);
     return { stdout: lines.join('\n') + '\n', stderr: '', exitCode: 0 };
 }
 

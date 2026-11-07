@@ -980,6 +980,20 @@ export class ShellProcess extends Process {
         if (words.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
         const [head, ...args] = words;
         const command = spawnedAs(head);
+        /* A globally installed package's bin is a file on PATH with a shebang: run it through
+           its interpreter here as well, so compound lines can use it, not only a line of its own. */
+        const pathShim = this.resolvePathShim(command);
+        if (pathShim !== undefined) {
+            const env = Object.fromEntries(this.env);
+            if (input !== null) env.OWC_STDIN = 'pipe';
+            const shimArgs = pathShim.interpreter === undefined ? args : [pathShim.path, ...args];
+            const run = await this.spawnChild(
+                pathShim.interpreter ?? pathShim.path, shimArgs, env,
+                this.shell.getWorkingDirectory(), { stdin: input ?? undefined, silent: true }
+            );
+            this.shell.noteChildStatus(run.exitCode);
+            return run;
+        }
         if (this.shell.isSpawnedCommand(command)) {
             const env = Object.fromEntries(this.env);
             /* The child reads its stdin only when it is told it has one, the way a pipe tells it */
@@ -1053,6 +1067,21 @@ export class ShellProcess extends Process {
      * Runs a command that only a child process can run, or returns undefined when the command is not
      * one of those and the line belongs to the script engine.
      */
+    /** A bare name that resolves on PATH to a shim with a shebang or a .js backing. */
+    private resolvePathShim(command: string): { path: string; interpreter?: string } | undefined {
+        if (command.includes('/')) return undefined;
+        const PATH = this.env.get('PATH');
+        if (!PATH) return undefined;
+        for (const dir of PATH.split(':')) {
+            const path = joinOnPath(this.fileSystem, dir, command);
+            if (!this.fileSystem.fileExists(path)) continue;
+            const interpreter = shebangInterpreter(this.fileSystem, path);
+            if (interpreter === undefined && !path.endsWith('.js')) continue;
+            return { path, interpreter };
+        }
+        return undefined;
+    }
+
     private async spawnOneCommand(command: string, cmdArgs: string[]): Promise<ShellCommandResult | undefined> {
         try {
             if (this.shell.isSpawnedCommand(command)) {
@@ -1096,6 +1125,9 @@ export class ShellProcess extends Process {
                        executor of its own -- so a script that calls an installed bin by name works. */
                     const interpreter = shebangInterpreter(this.fileSystem, executablePath);
                     const spawnArgs = interpreter === undefined ? cmdArgs : [executablePath, ...cmdArgs];
+                    /* The child's output is forwarded to this shell as it runs; emitting the
+                       collected result as well would print a global bin's output twice. */
+                    this.liveChildOutput = true;
                     return await this.spawnChild(
                         interpreter ?? executablePath,
                         spawnArgs,

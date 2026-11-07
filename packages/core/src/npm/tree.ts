@@ -310,3 +310,87 @@ function drawChildren(children: TreeNode[], prefix: string, lines: string[], lev
         if (continues) drawChildren(child.children, prefix + (last ? '  ' : '│ '), lines, levels - 1);
     });
 }
+
+/** Options of `npm ls -g`: the global root has no manifest, so its children are read from node_modules. */
+export interface GlobalListOptions extends ListOptions {
+    json?: boolean;
+    parseable?: boolean;
+    all?: boolean;
+    invalidDepth?: boolean;
+}
+
+/**
+ * `npm ls -g`: the tree npm draws under <prefix>/lib. A host roots the tree at the lib directory
+ * itself (not lib/node_modules) and lists every package installed in that prefix at the top level;
+ * local-folder installs carry a `-> <path>` arrow. There is no package.json at the root, so the
+ * children come from the directory rather than from a manifest's dependency fields.
+ */
+export function globalDependencyTree(fileSystem: IFileSystem, libDir: string, options: GlobalListOptions): string {
+    const lib = normalizeAbsolute(libDir);
+    const modules = joinPaths(lib, 'node_modules');
+    const entries: { name: string; version: string; dir: string; link?: string }[] = [];
+    const collect = (name: string): void => {
+        const dir = joinPaths(modules, name);
+        const manifest = readManifest(fileSystem, dir);
+        if (manifest === undefined) return;
+        let link: string | undefined;
+        try {
+            const marker = fileSystem.readFile(joinPaths(dir, '.owc-global-link'));
+            if (marker !== undefined && marker.trim() !== '') link = marker.trim();
+        } catch { /* no link marker: a registry install */ }
+        entries.push({ name, version: String(manifest.version ?? ''), dir, link });
+    };
+    for (const name of fileSystem.readdirNames(modules) ?? []) {
+        if (name === '.bin' || name.startsWith('.')) continue;
+        if (name.startsWith('@')) {
+            for (const scoped of fileSystem.readdirNames(joinPaths(modules, name)) ?? []) collect(`${name}/${scoped}`);
+        } else {
+            collect(name);
+        }
+    }
+    entries.sort((left, right) => comparePackageIds(
+        `${left.name}@${left.version}`, `${right.name}@${right.version}`));
+
+    if (options.parseable) {
+        return [lib, ...entries.map((entry) => entry.dir)].join('\n') + '\n';
+    }
+    if (options.json) {
+        const dependencies: Record<string, unknown> = {};
+        for (const entry of entries) dependencies[entry.name] = { version: entry.version, overridden: false };
+        const root: Record<string, unknown> = { name: 'lib' };
+        if (entries.length > 0) root.dependencies = dependencies;
+        return JSON.stringify(root, null, 2) + '\n';
+    }
+
+    const lines: string[] = [lib];
+    if (entries.length === 0) {
+        lines.push('`-- (empty)');
+    } else {
+        const seen = new Set<string>();
+        const draw = (list: typeof entries, nesting: string, depth: number): void => {
+            list.forEach((entry, index) => {
+                const last = index === list.length - 1;
+                lines.push(nesting + (last ? '`-- ' : '+-- ') +
+                    `${entry.name}@${entry.version}` + (entry.link === undefined ? '' : ` -> ${entry.link}`));
+                if (!options.all || depth <= 0 || seen.has(entry.dir)) return;
+                seen.add(entry.dir);
+                const manifest = readManifest(fileSystem, entry.dir);
+                if (manifest === undefined) return;
+                const children: typeof entries = [];
+                for (const name of Object.keys((manifest.dependencies ?? {}) as Record<string, unknown>)) {
+                    const dir = findInstalledCopy(fileSystem, entry.dir, name);
+                    if (dir === undefined || dir === entry.dir) continue;
+                    const installed = readManifest(fileSystem, dir);
+                    if (installed === undefined) continue;
+                    const short = dir.slice(dir.lastIndexOf('/node_modules/') + '/node_modules/'.length);
+                    if (short === '' || short === entry.name) continue;
+                    children.push({ name: short, version: String(installed.version ?? ''), dir });
+                }
+                children.sort((a, b) => comparePackageIds(`${a.name}@${a.version}`, `${b.name}@${b.version}`));
+                if (children.length > 0) draw(children, nesting + (last ? '   ' : '|  '), depth - 1);
+            });
+        };
+        draw(entries, '', options.all ? 32 : 0);
+    }
+    return lines.join('\n') + '\n\n';
+}

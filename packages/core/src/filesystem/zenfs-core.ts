@@ -71,7 +71,9 @@ function createScratchDirectories(): void {
  * `fs.writeFileSync('/etc/...', ...)` failed with ENOENT, and `PATH` lists `/bin` and `/usr/bin`
  * while neither existed.
  */
-const SYSTEM_DIRS: ReadonlyArray<string> = ['/bin', '/dev', '/etc', '/home', '/opt', '/usr/bin', '/usr/lib', '/app'];
+const SYSTEM_DIRS: ReadonlyArray<string> = ['/bin', '/dev', '/etc', '/home', '/opt', '/usr/bin', '/usr/lib', '/app',
+    /* npm's global prefix: modules at /usr/local/lib/node_modules, bin links at /usr/local/bin. */
+    '/usr/local/lib', '/usr/local/lib/node_modules', '/usr/local/etc'];
 
 function createSystemDirectories(): void {
     for (const dir of SYSTEM_DIRS) {
@@ -474,6 +476,9 @@ export class ZenFSCore implements IFileSystem {
     writeBytes(path: string, data: Uint8Array, mode?: number): void {
         requirePathWithinLimits(path);
         this.fs.writeFileSync(path, data, mode === undefined ? undefined : { mode: mode & 0o7777 });
+        /* writeFileSync creates 0o644 whatever its mode option says, and a global bin shim's
+           executable bit is what makes it runnable by name: chmod it when a mode was asked for. */
+        if (mode !== undefined && (this.fs.statSync(path).mode & 0o111) === 0) this.fs.chmodSync(path, mode & 0o7777);
     }
 
     /* An append is a write at the end of what is already there. `writeBytes` hands the file system
