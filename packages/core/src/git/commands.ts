@@ -131,6 +131,32 @@ export function porcelainV2(view: StatusView, branch = false): string {
     return out;
 }
 
+/** Host 'git status --short --ignored' folds ignored paths under a directory to "!! dir/". */
+export function ignoredRows(paths: string[]): string {
+    const folded = new Set<string>();
+    for (const path of paths) {
+        const slash = path.indexOf('/');
+        folded.add(slash < 0 ? path : path.slice(0, slash) + '/');
+    }
+    return [...folded].sort().map((path) => '!! ' + path + '\n').join('');
+}
+
+/* Root .gitignore globs ('*.log') are not covered by GitRepo.ignored at this tip; keep the
+   parity commands.ts-side so the repo.ts owner can extend ignored() independently. */
+function isIgnored(repo: GitRepo, path: string): boolean {
+    if (repo.ignored(path)) return true;
+    const rules = repo.readText(repo.w('.gitignore'));
+    if (rules === undefined) return false;
+    const name = path.slice(path.lastIndexOf('/') + 1);
+    for (const raw of rules.split('\n')) {
+        const line = raw.trim();
+        if (line === '' || line.startsWith('#') || line.startsWith('!')) continue;
+        if (line.startsWith('*') && name.endsWith(line.slice(1))) return true;
+        if (line.endsWith('*') && name.startsWith(line.slice(0, -1))) return true;
+    }
+    return false;
+}
+
 export function longStatus(view: StatusView, commit = false): string {
     let out = view.detached ? 'HEAD detached at ' + (view.detachedLabel ?? abbrev(view.headOid ?? ZERO_OID)) + '\n' : 'On branch ' + view.branch + '\n';
     if (view.noCommits) out += '\n' + (commit ? 'Initial commit' : 'No commits yet') + '\n';
@@ -640,7 +666,13 @@ function cmdStatus(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     const view = statusOf(repo);
     const withBranch = flags.has('-b') || flags.has('--branch');
     if (values.get('--porcelain') === 'v2') return ok(porcelainV2(view, withBranch));
-    if (short) return ok(shortStatus(view, withBranch));
+    if (short) {
+        if (!flags.has('--ignored')) return ok(shortStatus(view, withBranch));
+        const index = repo.indexTree();
+        const ignored = repo.worktreeFiles().filter((path) => !index.has(path) && isIgnored(repo, path));
+        const left = { ...view, untracked: view.untracked.filter((path) => !ignored.includes(path)) };
+        return ok(shortStatus(left, withBranch) + ignoredRows(ignored));
+    }
     return ok(longStatus(view));
 }
 
