@@ -1,1 +1,3 @@
-owc-npm-pack-notice-glyph resolved 1794023224211-7716-b5dc43d1eea3b3c2 2026-11-07T04:08:39.291Z
+Row: owc-npm-pack-notice-glyph
+Witness: 1794023224211-7716-b5dc43d1eea3b3c2
+Status: resolved
