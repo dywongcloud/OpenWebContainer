@@ -1150,7 +1150,25 @@ function cmdStash(ctx: CommandContext, flags: Set<string>, values: Map<string,st
 function cmdReflog(ctx: CommandContext, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    return ok(repo.refs.reflog('HEAD').slice().reverse().map((entry, index) => abbrev(entry.next) + ' HEAD@{' + index + '}: ' + entry.message + '\n').join(''));
+    /* git reflog show <ref>[@{n}]: honour the ref, its label and the @{n} start
+       (host git 2.53.0). A bare reflog show / HEAD keeps the HEAD reflog. */
+    const words = rest.filter((entry) => !entry.startsWith('-'));
+    const spec = words[0] === 'show' ? words[1] : words[0];
+    const at = spec !== undefined ? /^(.*)@\{(\d+)\}$/.exec(spec) : null;
+    const base = at !== null ? at[1] : (spec ?? '');
+    const from = at !== null ? Number(at[2]) : 0;
+    const ambiguous = () => fail("fatal: ambiguous argument '" + spec + "': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'", 128);
+    let label = base, logName: string | undefined;
+    if (base === '' || base === '@' || base === 'HEAD') { label = 'HEAD'; logName = 'HEAD'; }
+    else if (base.startsWith('refs/')) { label = base; logName = base; }
+    else logName = ['refs/heads/' + base, 'refs/tags/' + base, 'refs/remotes/' + base, base]
+        .find((name) => repo.refs.reflog(name).length > 0);
+    if (logName === undefined) return ambiguous();
+    const entries = repo.refs.reflog(logName).slice().reverse();
+    if (at !== null && from >= entries.length) return fail("fatal: log for '" + label + "' only has " + entries.length + " entries", 128);
+    let out = '';
+    for (let i = from; i < entries.length; i++) out += abbrev(entries[i].next) + ' ' + label + '@{' + i + '}: ' + entries[i].message + '\n';
+    return ok(out);
 }
 
 function cmdGrep(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
