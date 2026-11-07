@@ -1,5 +1,10 @@
 # Known limitations
 
+## Global npm modules are not on `require()` resolution
+
+`npm install -g` puts packages in the VFS prefix `<PREFIX>/lib/node_modules` and their bin links in `<PREFIX>/bin` on `PATH`. Host npm behaves the same way: a global package is **not** resolvable with `require()` from an unrelated cwd (`MODULE_NOT_FOUND`) unless `NODE_PATH` names the prefix. `npm bin -g` is an unknown command (removed in host npm 9+). See [npm global installs](reference/npm-global.md). The archived compatibility-notes.md "Global installs are refused" lines 118 and 1091 are **SUPERSEDED** and left verbatim.
+
+
 These are the boundaries an application author needs before choosing OpenWebContainer. Each one has a measured basis in the [verbatim notes archive](reference/compatibility-notes.md) or in the source on `origin/main`. They are not speculations.
 
 ## No outbound raw TCP or UDP

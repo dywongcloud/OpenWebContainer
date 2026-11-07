@@ -47,9 +47,10 @@ import {
 import { nodeSyncRunner, syncRunActive } from '../../pump';
 import type { SyncChildResult } from '../../pump';
 import type { MaybeAsync } from './dispatch';
-import { InstallSpec, NpmInstaller, parseInstallSpec } from '../../../../../npm/installer';
+import { InstallSpec, NpmInstaller, localSpecTarget, parseInstallSpec } from '../../../../../npm/installer';
 import type { SaveTarget } from '../../../../../npm/installer';
 import { NpmRegistry } from '../../../../../npm/registry';
+import { globalPaths } from '../../../../../npm/config';
 
 /*
  * Host half of child_process, worker_threads and cluster. The guest half is ../guest/modules/child.ts.
@@ -3117,8 +3118,8 @@ function projectFile(dir: string, name: string): string {
  */
 function npmRemove(shell: SyncShell, args: string[]): ShellStep {
     const rest = args.slice(1);
-    if (rest.includes('-g') || rest.includes('--global')) {
-        return { stdout: '', stderr: diagnostic('npm error code EUNSUPPORTED\nnpm error Global installs are not supported by this runtime'), exitCode: 1 };
+    if (rest.includes('-g') || rest.includes('--global') || rest.includes('--location=global')) {
+        return npmRemoveGlobal(shell, rest);
     }
     const names = rest.filter((arg) => !arg.startsWith('-'));
     const packageDir = findPackageRoot(shell.ctx.fileSystem, shell.cwd) ?? shell.cwd;
@@ -3160,6 +3161,80 @@ function npmRemove(shell: SyncShell, args: string[]): ShellStep {
     return { stdout: `removed ${removed} package${removed === 1 ? '' : 's'} in ${seconds}s\n`, stderr: '', exitCode: 0 };
 }
 
+/**
+ * `npm uninstall -g <name...>` inside a synchronous guest call. Uninstall reads and writes only
+ * the virtual file system, so it answers in-process with its own stdout/stderr/status; no nested
+ * child has to be spawned while the guest is unwound.
+ */
+function npmRemoveGlobal(shell: SyncShell, args: string[]): ShellStep {
+    const fs = shell.ctx.fileSystem;
+    const paths = globalPaths(fs, shell.cwd, { ...shell.env });
+    const names = args.filter((arg) => !arg.startsWith('-'));
+    if (names.length === 0) {
+        return { stdout: '', stderr: diagnostic('npm error code EUSAGE\nnpm error Usage: npm uninstall <pkg>\n'), exitCode: 1 };
+    }
+    const started = performance.now();
+    let removed = 0;
+    for (const name of names) {
+        const dir = `${paths.modules}/${name}`;
+        if (fs.statPath(dir)?.type !== 'dir') continue;
+        for (const link of fs.readdirNames(paths.bin) ?? []) {
+            const file = `${paths.bin}/${link}`;
+            let text: string | undefined;
+            try { text = fs.readFile(file); } catch { text = undefined; }
+            if (text !== undefined && text.includes(dir + '/')) fs.removePath(file);
+        }
+        fs.removePath(dir, true);
+        removed += 1;
+    }
+    const seconds = ((performance.now() - started) / 1000).toFixed(1);
+    if (removed === 0) return { stdout: `up to date in ${seconds}s\n`, stderr: '', exitCode: 0 };
+    return { stdout: `removed ${removed} package${removed === 1 ? '' : 's'} in ${seconds}s\n`, stderr: '', exitCode: 0 };
+}
+
+/**
+ * `npm install -g` inside a synchronous guest call. The registry work suspends the guest exactly
+ * as the local install does; on resume the tree is in <prefix>/lib/node_modules and the bin links
+ * in <prefix>/bin, and the step reports the same summary npm prints.
+ */
+async function npmInstallGlobalStep(shell: SyncShell, args: string[]): Promise<ShellStep> {
+    const fs = shell.ctx.fileSystem;
+    const paths = globalPaths(fs, shell.cwd, { ...shell.env });
+    let stdout = '';
+    const log = (line: string) => { stdout += line + '\n'; };
+    const specs: InstallSpec[] = [];
+    let ignoreScripts = false;
+    for (const arg of args) {
+        if (arg === '--ignore-scripts') { ignoreScripts = true; continue; }
+        if (arg.startsWith('-')) continue;
+        const local = localSpecTarget(arg, shell.cwd);
+        specs.push(local === undefined ? parseInstallSpec(arg) : { name: '', localPath: local });
+    }
+    const installer = new NpmInstaller(fs, new NpmRegistry(), log);
+    const started = performance.now();
+    try {
+        let wanted = specs;
+        if (wanted.length === 0) {
+            const manifest = readManifest(fs, shell.cwd);
+            if (manifest === undefined) {
+                return { stdout: '', stderr: diagnostic('npm error code ENOENT\nnpm error enoent Could not read package.json'), exitCode: 254 };
+            }
+            wanted = [{ name: '', localPath: shell.cwd }];
+        }
+        const report = await installer.installGlobal(paths, wanted, { ignoreScripts });
+        installer.linkGlobalBinaries(paths.lib);
+        const seconds = ((performance.now() - started) / 1000).toFixed(1);
+        stdout += report.added.length === 0
+            ? `up to date in ${seconds}s\n`
+            : `\nadded ${report.added.length} package${report.added.length === 1 ? '' : 's'} in ${seconds}s\n`;
+        return { stdout, stderr: '', exitCode: 0 };
+    } catch (error: any) {
+        const failure = error as { exitCode?: unknown; message?: unknown };
+        const stderr = typeof failure?.message === 'string' ? failure.message : String(error);
+        return { stdout, stderr: diagnostic(stderr), exitCode: typeof failure?.exitCode === 'number' ? failure.exitCode : 1 };
+    }
+}
+
 /** The npm subcommands that install, and so the ones that have to reach the registry. */
 const INSTALL_SUBCOMMANDS = new Set(['install', 'i', 'add']);
 
@@ -3186,8 +3261,8 @@ function npmInstallStep(shell: SyncShell, args: string[]): Promise<ShellStep> | 
     const [sub, ...rest] = args;
     if (sub === undefined || !INSTALL_SUBCOMMANDS.has(sub)) return undefined;
     if (syncRunActive()) return undefined;
-    if (rest.includes('-g') || rest.includes('--global')) {
-        return Promise.resolve({ stdout: '', stderr: diagnostic('npm error code EUNSUPPORTED\nnpm error Global installs are not supported by this runtime'), exitCode: 1 });
+    if (rest.includes('-g') || rest.includes('--global') || rest.includes('--location=global')) {
+        return npmInstallGlobalStep(shell, rest);
     }
     const { specs, save } = installRequest(rest);
     return (async () => {
