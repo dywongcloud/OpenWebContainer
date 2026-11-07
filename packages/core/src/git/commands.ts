@@ -111,7 +111,7 @@ function branchHeader(view: StatusView): string {
     return '## ' + view.branch;
 }
 
-export function porcelainV2(view: StatusView, branch = false): string {
+export function porcelainV2(view: StatusView, branch = false, opts: { ignored?: string[]; showIgnored?: boolean; matching?: boolean } = {}): string {
     let out = '';
     if (branch) {
         out += '# branch.oid ' + (view.headOid ?? '(initial)') + '\n';
@@ -121,7 +121,33 @@ export function porcelainV2(view: StatusView, branch = false): string {
     const oid = (state?: { oid: string }) => state ? state.oid : ZERO_OID;
     const tracked = view.rows.filter((row) => row.x !== '?').sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
     const untracked = view.rows.filter((row) => row.x === '?').map((row) => row.path).sort();
+    // Host reports a staged rename as one '2 R.' record, not a '1 D.' + '1 A.' pair.
+    // 'git mv' keeps the blob oid, so a deleted path whose HEAD blob matches an added
+    // path's index blob is a 100%-similar rename (score R100).
+    const consumed = new Set<string>();
+    const renames = new Map<string, string>();
+    const deletions = tracked.filter((r) => r.x === 'D');
+    const additions = tracked.filter((r) => r.x === 'A');
+    for (const del of deletions) {
+        const head = view.v2?.get(del.path)?.h;
+        if (!head) continue;
+        const add = additions.find((r) => !consumed.has(r.path) && view.v2?.get(r.path)?.i?.oid === head.oid);
+        if (!add) continue;
+        renames.set(add.path, del.path);
+        consumed.add(del.path); consumed.add(add.path);
+    }
     for (const row of tracked) {
+        const orig = renames.get(row.path);
+        if (orig !== undefined) {
+            const head = view.v2?.get(orig)?.h;
+            const index = view.v2?.get(row.path)?.i;
+            const work = view.v2?.get(row.path)?.w;
+            const xy = 'R' + (row.y === ' ' ? '.' : row.y);
+            out += '2 ' + xy + ' N... ' + mode(head) + ' ' + mode(index) + ' ' + mode(work) +
+                ' ' + oid(head) + ' ' + oid(index) + ' R100 ' + row.path + '\t' + orig + '\n';
+            continue;
+        }
+        if (consumed.has(row.path)) continue;
         const state = view.v2?.get(row.path);
         const xy = (row.x === ' ' ? '.' : row.x) + (row.y === ' ' ? '.' : row.y);
         out += '1 ' + xy + ' N... ' + mode(state?.h) + ' ' + mode(state?.i) + ' ' + mode(state?.w) +
