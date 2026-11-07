@@ -998,13 +998,35 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     if (oid === undefined) return fail("error: pathspec '" + name + "' did not match any file(s) known to git", 1);
     const resolved = repo.object(oid);
     if (resolved !== undefined && resolved.type === 'tag') oid = parseTag(resolved.content).object;
+    const wasAttached = repo.refs.head().ref !== undefined;
     repo.refs.setDetached(oid);
     /* git describe uses the checked-out tag name for the detached label; a raw oid or HEAD uses
        the abbreviated oid. */
     if (repo.refs.tags().includes(name)) repo.writeText(repo.g('OWC_DETACH_LABEL'), name);
     else repo.remove(repo.g('OWC_DETACH_LABEL'));
     repo.checkoutTree(oid);
-    return ok('', 'HEAD is now at ' + abbrev(oid) + ' ' + repo.subjectOf(oid) + '\n');
+    const headLine = 'HEAD is now at ' + abbrev(oid) + ' ' + repo.subjectOf(oid) + '\n';
+    /* Host git 2.53.0: checking out a named tag detaches HEAD and prints a
+       "Note: switching to" line plus the detached-HEAD advice block on stderr,
+       before "HEAD is now at ...". A raw commit oid, --detach, or an already
+       detached HEAD prints only the HEAD line; advice.detachedHead=false
+       (config or -c) suppresses the advice. */
+    if (repo.refs.tags().includes(name) && !flags.has('--detach') && wasAttached) {
+        const advice = repo.configOverrides().get('advice.detachedhead') ?? repo.config.get('advice.detachedhead');
+        if (advice === undefined || !/^(false|no|off|0)$/i.test(advice)) {
+            return ok('', "Note: switching to '" + name + "'.\n\n" +
+                "You are in 'detached HEAD' state. You can look around, make experimental\n" +
+                "changes and commit them, and you can discard any commits you make in this\n" +
+                "state without impacting any branches by switching back to a branch.\n\n" +
+                "If you want to create a new branch to retain commits you create, you may\n" +
+                "do so (now or later) by using -c with the switch command. Example:\n\n" +
+                "  git switch -c <new-branch-name>\n\n" +
+                "Or undo this operation with:\n\n" +
+                "  git switch -\n\n" +
+                "Turn off this advice by setting config variable advice.detachedHead to false\n\n" + headLine);
+        }
+    }
+    return ok('', headLine);
 }
 
 function cmdSwitch(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
