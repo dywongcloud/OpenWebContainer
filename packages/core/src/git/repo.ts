@@ -216,6 +216,13 @@ export class GitRepo {
         /* REV:PATH: host git resolves a path inside the revision's tree to its object oid. */
         const colon = rev.indexOf(':');
         if (colon > 0) return this.pathState(rev.slice(0, colon), rev.slice(colon + 1))?.oid;
+        /* <ref>@{n}: the n-th reflog entry, newest first (host git 2.53.0). */
+        const atBrace = /^(.+)@\{(\d+)\}$/.exec(rev);
+        if (atBrace !== null) {
+            const name = atBrace[1] === '@' ? 'HEAD' : atBrace[1];
+            const entries = this.refs.reflog(name);
+            return entries[entries.length - 1 - Number(atBrace[2])]?.next;
+        }
         const aliases: Record<string, string> = { HEAD: 'HEAD', '@': 'HEAD' };
         const key = aliases[rev] ?? rev;
         if (key === 'HEAD') return this.refs.headOid();
