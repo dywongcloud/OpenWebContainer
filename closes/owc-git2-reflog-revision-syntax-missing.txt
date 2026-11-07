@@ -1,1 +1,3 @@
-owc-git2-reflog-revision-syntax-missing resolved 1794051244855-11634-b3db5dd8d9f82251 2026-11-07T11:44:54.876Z
+Row: owc-git2-reflog-revision-syntax-missing
+Witness: 1794051244855-11634-b3db5dd8d9f82251
+Status: resolved
