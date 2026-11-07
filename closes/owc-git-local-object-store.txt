@@ -1,1 +1,3 @@
-owc-git-local-object-store resolved 1794035797459-9508-e0d24d871a2709db 2026-11-07T07:19:49.721Z
+Row: owc-git-local-object-store
+Witness: 1794035797459-9508-e0d24d871a2709db
+Status: resolved

@@ -1,1 +1,3 @@
-owc-git-pipeline-exit-status resolved 1794035831028-9517-4ea1501aead6e15b 2026-11-07T07:20:21.671Z
+Row: owc-git-pipeline-exit-status
+Witness: 1794035831028-9517-4ea1501aead6e15b
+Status: resolved
