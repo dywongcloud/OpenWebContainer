@@ -37,7 +37,7 @@ boundary, and a host 127 mirrored by the container 127 is host-faithful.
 - `openssl` — implemented subset (`dgst`, `rand`, `version`, `help`): `openssl badcommand` matches host status/message; `version` and `help` print the container's own subset identity/content, documented in `unsupported.ts` and the Readme.
 
 `command -v whereis` now answers `/usr/bin/whereis` with exit 0. `HOST_UTILITY_PATHS` in
-`builtins.ts` has 90 measured host-utility paths including `whereis: '/usr/bin/whereis'`, and the
+`builtins.ts` has 90 measured host-utility paths plus one `git` module-command entry (91 entries total), including `whereis: '/usr/bin/whereis'`, and the
 shell's PATH is `/bin:/usr/bin`; `command -V whereis` and `type whereis` likewise report that path
 with exit 0. Rows `owc-sh-command-v-whereis-not-found` and
 `owc-sh-command-v-host-utility-paths-incomplete` are resolved (see `closes/`).
