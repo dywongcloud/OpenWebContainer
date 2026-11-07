@@ -87,8 +87,9 @@ function label(change: Change): string {
     return change.status === 'A' ? 'new file:   ' : change.status === 'D' ? 'deleted:   ' : 'modified:   ';
 }
 
-export function shortStatus(view: StatusView): string {
+export function shortStatus(view: StatusView, branch = false): string {
     const lines: string[] = [];
+    if (branch) lines.push(branchHeader(view) + '\n');
     for (const row of view.rows) if (row.x !== '?') lines.push(row.x + row.y + ' ' + row.path + '\n');
     /* Host porcelain v1 collapses untracked files under a directory to "?? dir/". */
     const untracked = new Set<string>();
@@ -98,6 +99,12 @@ export function shortStatus(view: StatusView): string {
     }
     for (const path of [...untracked].sort()) lines.push('?? ' + path + '\n');
     return lines.join('');
+}
+
+function branchHeader(view: StatusView): string {
+    if (view.detached) return '## HEAD (no branch)';
+    if (view.noCommits) return '## No commits yet on ' + view.branch;
+    return '## ' + view.branch;
 }
 
 export function longStatus(view: StatusView, commit = false): string {
@@ -244,7 +251,7 @@ function parseFlags(args: string[], repeatParents = false): { flags: Set<string>
                 const value = args[++i];
                 const list = multi.get('-p') ?? []; list.push(value); multi.set('-p', list);
                 values.set('-p', value);
-            } else if ((arg === '-m' || arg === '-b' || arg === '-o' || arg === '-t' || arg === '-n' || arg === '-S' || arg === '-F' || arg === '-c' || arg === '-C' || arg === '-u') && i + 1 < args.length) {
+            } else if ((arg === '-m' || arg === '-b' || arg === '-o' || arg === '-t' || arg === '-n' || arg === '-S' || arg === '-F' || arg === '-c' || arg === '-C' || arg === '-u') && i + 1 < args.length && !args[i + 1].startsWith('-')) {
                 values.set(arg, args[++i]);
             } else {
                 for (const ch of arg.slice(1)) flags.add('-' + ch);
@@ -590,7 +597,9 @@ function cmdStatus(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const view = statusOf(repo);
-    return ok(short ? shortStatus(view) : longStatus(view));
+    const withBranch = flags.has('-b') || flags.has('--branch');
+    if (short) return ok(shortStatus(view, withBranch));
+    return ok(longStatus(view));
 }
 
 function cmdAdd(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
