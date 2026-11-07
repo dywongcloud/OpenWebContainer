@@ -47,6 +47,8 @@ export interface StatusView {
     unmerged: string[];
     /** Per-path object ids/modes captured for porcelain v2 records. */
     v2?: Map<string, { h?: FileState; i?: FileState; w?: FileState }>;
+    /** Stage 1/2/3 index states plus the worktree state for each unmerged path. */
+    unmergedStages?: Map<string, { s1?: FileState; s2?: FileState; s3?: FileState; w?: FileState }>;
 }
 
 export function statusOf(repo: GitRepo): StatusView {
@@ -82,9 +84,20 @@ export function statusOf(repo: GitRepo): StatusView {
     }
     for (const path of untracked) rows.push({ x: '?', y: '?', path, staged: false, unstaged: false });
     const label = repo.readText(repo.g('OWC_DETACH_LABEL'))?.trim();
-    const unmerged = [...new Set(repo.indexEntries().filter((entry) => entry.stage > 0).map((entry) => entry.path))].sort();
+    const unmergedStages = new Map<string, { s1?: FileState; s2?: FileState; s3?: FileState; w?: FileState }>();
+    for (const entry of repo.indexEntries()) {
+        if (entry.stage === 0) continue;
+        const group = unmergedStages.get(entry.path) ?? {};
+        const state: FileState = { oid: entry.oid, mode: entry.mode };
+        if (entry.stage === 1) group.s1 = state;
+        else if (entry.stage === 2) group.s2 = state;
+        else if (entry.stage === 3) group.s3 = state;
+        unmergedStages.set(entry.path, group);
+    }
+    for (const [path, group] of unmergedStages) group.w = worktree.get(path);
+    const unmerged = [...unmergedStages.keys()].sort();
     return { rows, untracked, staged, unstaged, branch: repo.refs.branch(), detached: repo.refs.head().ref === undefined,
-        noCommits, headOid, detachedLabel: label !== undefined && label !== '' ? label : undefined, unmerged, v2 };
+        noCommits, headOid, detachedLabel: label !== undefined && label !== '' ? label : undefined, unmerged, v2, unmergedStages };
 }
 
 function label(change: Change): string {
@@ -121,6 +134,7 @@ export function porcelainV2(view: StatusView, branch = false, opts: { ignored?: 
     const oid = (state?: { oid: string }) => state ? state.oid : ZERO_OID;
     const tracked = view.rows.filter((row) => row.x !== '?').sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
     const untracked = view.rows.filter((row) => row.x === '?').map((row) => row.path).sort();
+    const unmerged = new Set(view.unmerged);
     // Host reports a staged rename as one '2 R.' record, not a '1 D.' + '1 A.' pair.
     // 'git mv' keeps the blob oid, so a deleted path whose HEAD blob matches an added
     // path's index blob is a 100%-similar rename (score R100).
@@ -137,6 +151,21 @@ export function porcelainV2(view: StatusView, branch = false, opts: { ignored?: 
         consumed.add(del.path); consumed.add(add.path);
     }
     for (const row of tracked) {
+        if (unmerged.has(row.path)) {
+            const st = view.unmergedStages?.get(row.path);
+            const s1 = st?.s1, s2 = st?.s2, s3 = st?.s3, w = st?.w;
+            const h1 = !!s1, h2 = !!s2, h3 = !!s3;
+            let xy = 'DD';
+            if (h1 && h2 && h3) xy = 'UU';
+            else if (!h1 && h2 && h3) xy = 'AA';
+            else if (h1 && h2 && !h3) xy = 'UD';
+            else if (h1 && !h2 && h3) xy = 'DU';
+            else if (!h1 && h2 && !h3) xy = 'AU';
+            else if (!h1 && !h2 && h3) xy = 'UA';
+            out += 'u ' + xy + ' N... ' + mode(s1) + ' ' + mode(s2) + ' ' + mode(s3) + ' ' + mode(w) +
+                ' ' + oid(s1) + ' ' + oid(s2) + ' ' + oid(s3) + ' ' + row.path + '\n';
+            continue;
+        }
         const orig = renames.get(row.path);
         if (orig !== undefined) {
             const head = view.v2?.get(orig)?.h;
