@@ -782,6 +782,15 @@ function cmdLog(ctx: CommandContext, flags: Set<string>, values: Map<string,stri
     const max = parseInt(values.get('-n') ?? values.get('--max-count') ?? '100', 10) || 100;
     const entries = repo.logEntries(start, max);
     if (flags.has('--oneline')) return ok(entries.map((entry) => abbrev(entry.oid) + ' ' + entry.info.message.trim().split('\n')[0] + '\n').join(''));
+    if (flags.has('-p') || flags.has('--patch')) {
+        return ok(entries.map((entry, index) => {
+            const parent = entry.info.parents[0];
+            const parentTree = parent === undefined ? '' : (repo.readCommit(parent)?.tree ?? '');
+            const changes = parentTree === '' ? repo.changesBetween(new Map(), repo.flatTree(entry.info.tree))
+                : repo.changesBetween(repo.flatTree(parentTree), repo.flatTree(entry.info.tree));
+            return (index === 0 ? '' : '\n') + mediumLog(repo, entry.oid, entry.info) + '\n' + renderDiff(repo, changes);
+        }).join(''));
+    }
     return ok(entries.map((entry, index) => (index === 0 ? '' : '\n') + mediumLog(repo, entry.oid, entry.info)).join(''));
 }
 
