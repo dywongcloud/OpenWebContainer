@@ -1,3 +1,4 @@
 Row: owc-git3-checkout-detached-head-advice
 Witness: 1794083215774-14226-fcf52c44edaa403
 Status: resolved
+owc-git3-checkout-detached-head-advice resolved 1794083215774-14226-fcf52c44edaa403 2026-11-07T20:50:35.621Z
