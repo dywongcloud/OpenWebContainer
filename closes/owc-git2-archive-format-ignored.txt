@@ -1,1 +1,3 @@
-owc-git2-archive-format-ignored resolved 1794061353045-12646-a0e078875c6995a5 2026-11-07T14:30:36.023Z
+Row: owc-git2-archive-format-ignored
+Witness: 1794061353045-12646-a0e078875c6995a5
+Status: resolved
