@@ -7439,6 +7439,7 @@ const HOST_UTILITY_PATHS: Record<string, string> = {
     true: '/usr/bin/true', false: '/usr/bin/false',
     tr: '/usr/bin/tr', uncompress: '/usr/bin/uncompress', unexpand: '/usr/bin/unexpand',
     uniq: '/usr/bin/uniq', wc: '/usr/bin/wc', which: '/usr/bin/which', xargs: '/usr/bin/xargs',
+    whereis: '/usr/bin/whereis',
     xxd: '/usr/bin/xxd', yes: '/usr/bin/yes', zcat: '/usr/bin/zcat', zip: '/usr/bin/zip',
     /* `[` is a file on a host's PATH under that name, next to the builtin of the same one: `type -a
        [` is `[ is a shell builtin` and then `[ is /bin/[`. */
