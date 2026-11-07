@@ -55,7 +55,7 @@ export function statusOf(repo: GitRepo): StatusView {
     const worktree = new Map<string, FileState>();
     for (const [path, state] of index) {
         const bytes = repo.readBytes(repo.w(path));
-        if (bytes !== undefined) worktree.set(path, { oid: repo.hashBlob(bytes), mode: state.mode });
+        if (bytes !== undefined) worktree.set(path, { oid: repo.hashBlob(bytes), mode: repo.worktreeMode(path) });
     }
     const staged = repo.changesBetween(head, index);
     const unstaged = repo.changesBetween(index, worktree);
@@ -67,11 +67,12 @@ export function statusOf(repo: GitRepo): StatusView {
         let x = ' ';
         if (inHead === undefined && inIndex !== undefined) x = 'A';
         else if (inHead !== undefined && inIndex === undefined) x = 'D';
-        else if (inHead !== undefined && inIndex !== undefined && inHead.oid !== inIndex.oid) x = 'M';
+        else if (inHead !== undefined && inIndex !== undefined &&
+            (inHead.oid !== inIndex.oid || inHead.mode !== inIndex.mode)) x = 'M';
         let y = ' ';
         if (inIndex !== undefined) {
             if (inWork === undefined) y = 'D';
-            else if (inWork.oid !== inIndex.oid) y = 'M';
+            else if (inWork.oid !== inIndex.oid || inWork.mode !== inIndex.mode) y = 'M';
         }
         if (x !== ' ' || y !== ' ') rows.push({ x, y, path, staged: x !== ' ', unstaged: y !== ' ' });
     }
@@ -224,9 +225,10 @@ function mediumLog(repo: GitRepo, oid: string, info: CommitInfo): string {
  * command dispatch
  * ------------------------------------------------------------------ */
 
-function parseFlags(args: string[]): { flags: Set<string>; values: Map<string, string>; rest: string[] } {
+function parseFlags(args: string[], repeatParents = false): { flags: Set<string>; values: Map<string, string>; multi: Map<string, string[]>; rest: string[] } {
     const flags = new Set<string>();
     const values = new Map<string, string>();
+    const multi = new Map<string, string[]>();
     const rest: string[] = [];
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
@@ -237,18 +239,22 @@ function parseFlags(args: string[]): { flags: Set<string>; values: Map<string, s
             if (['-m', '--message'].includes(arg)) { values.set(arg, args[++i] ?? ''); }
             else flags.add(arg);
         } else if (arg.startsWith('-') && arg.length > 1) {
-            if ((arg === '-m' || arg === '-b' || arg === '-o' || arg === '-t' || arg === '-n' || arg === '-S' || arg === '-F' || arg === '-c' || arg === '-C' || arg === '-u') && i + 1 < args.length) {
+            if (repeatParents && arg === '-p' && i + 1 < args.length) {
+                const value = args[++i];
+                const list = multi.get('-p') ?? []; list.push(value); multi.set('-p', list);
+                values.set('-p', value);
+            } else if ((arg === '-m' || arg === '-b' || arg === '-o' || arg === '-t' || arg === '-n' || arg === '-S' || arg === '-F' || arg === '-c' || arg === '-C' || arg === '-u') && i + 1 < args.length) {
                 values.set(arg, args[++i]);
             } else {
                 for (const ch of arg.slice(1)) flags.add('-' + ch);
             }
         } else rest.push(arg);
     }
-    return { flags, values, rest };
+    return { flags, values, multi, rest };
 }
 
 export function runCommand(ctx: CommandContext, sub: string, args: string[]): CommandResult {
-    const { flags, values, rest } = parseFlags(args);
+    const { flags, values, multi, rest } = parseFlags(args, sub === 'commit-tree');
     const short = flags.has('-s') || flags.has('--short') || flags.has('--porcelain') || values.has('--porcelain');
 
     switch (sub) {
@@ -261,7 +267,7 @@ export function runCommand(ctx: CommandContext, sub: string, args: string[]): Co
         case 'rev-parse': return cmdRevParse(ctx, flags, values, rest);
         case 'ls-files': return cmdLsFiles(ctx, flags, values, rest);
         case 'write-tree': return cmdWriteTree(ctx);
-        case 'commit-tree': return cmdCommitTree(ctx, flags, values, rest);
+        case 'commit-tree': return cmdCommitTree(ctx, flags, values, rest, multi);
         case 'update-index': return cmdUpdateIndex(ctx, flags, values, rest);
         case 'read-tree': return cmdReadTree(ctx, flags, values, rest);
         case 'status': return cmdStatus(ctx, flags, values, rest, short);
@@ -305,9 +311,16 @@ export const GIT_HELP = "usage: git [-v | --version] [-h | --help] [-C <path>] [
 function cmdInit(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
     const branch = values.get('-b') ?? values.get('--initial-branch') ?? undefined;
     const target = rest[0] ?? (ctx.cwd || '/app');
-    const created = GitRepo.init(ctx, target, branch);
+    const bare = flags.has('--bare');
     const absolute = normalizePath(target.startsWith('/') ? target : (ctx.cwd || '/app') + '/' + target);
-    return ok('Initialized empty Git repository in ' + absolute + '/.git/\n', created.hint);
+    const gitDir = bare ? absolute : absolute + '/.git';
+    const reinit = ctx.fs.fileExists(gitDir + '/HEAD');
+    const created = GitRepo.init(ctx, target, branch, bare);
+    const location = bare ? absolute + '/' : absolute + '/.git/';
+    const line = reinit
+        ? 'Reinitialized existing Git repository in ' + location + '\n'
+        : 'Initialized empty Git repository in ' + location + '\n';
+    return ok(line, reinit ? '' : created.hint);
 }
 
 /* ---- config ---- */
@@ -402,11 +415,19 @@ function cmdCatFile(ctx: CommandContext, raw: string[]): CommandResult {
     try { repo = GitRepo.discover(ctx); } catch (error) { return fatalResult(error); }
     const mode = raw.includes('-t') ? 't' : raw.includes('-s') ? 's' : raw.includes('-e') ? 'e' : 'p';
     const rev = raw.filter((entry) => !entry.startsWith('-'))[0] ?? '';
+    if (rev === '') return fail('fatal: Not a valid object name \n', 128);
     const oid = repo.resolve(rev);
     if (oid === undefined) return fail('fatal: Not a valid object name ' + rev, 128);
     const obj = repo.object(oid);
-    if (obj === undefined) return fail('fatal: Not a valid object name ' + rev, 128);
-    if (mode === 'e') return obj === undefined ? fail('', 1) : ok('');
+    if (obj === undefined) {
+        /* Host git 2.53.0: '-e' on a missing but well-formed object name is SILENT exit 1.
+           '-t'/'-s' report "could not get object info"; '-p' reports the object name. */
+        /* ok() does not append a newline: host '-e' on a missing oid is SILENT on both streams. */
+        if (mode === 'e') return ok('', '', 1);
+        if (mode === 't' || mode === 's') return fail('fatal: git cat-file: could not get object info\n', 128);
+        return fail('fatal: Not a valid object name ' + rev, 128);
+    }
+    if (mode === 'e') return ok('');
     if (mode === 't') return ok(obj.type + '\n');
     if (mode === 's') return ok(String(obj.content.length) + '\n');
     if (obj.type === 'tree') {
@@ -467,11 +488,14 @@ function cmdWriteTree(ctx: CommandContext): CommandResult {
     return ok(repo.buildTree(repo.indexTree()) + '\n');
 }
 
-function cmdCommitTree(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
+function cmdCommitTree(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[],
+    multi: Map<string, string[]>): CommandResult {
     let repo: GitRepo;
     try { repo = GitRepo.discover(ctx); } catch (error) { return fatalResult(error); }
     const tree = rest[0] ?? '';
-    const parents = [...flags].filter((f) => f === '-p').map(() => values.get('-p') ?? '').filter((p) => p !== '');
+    /* '-p' is repeatable and takes an oid value: resolve every parent to a full oid before
+       serializing, so a merge commit really carries its parents (host git 2.53.0). */
+    const parents = (multi.get('-p') ?? []).map((p) => repo.resolve(p) ?? p);
     const message = values.get('-m') ?? values.get('-F') ?? ctx.input ?? '';
     const info: CommitInfo = { tree, parents, author: repo.identity(), committer: repo.identity(),
         message: message.endsWith('\n') ? message : message + '\n', extra: [] };
@@ -535,7 +559,7 @@ function worktreeState(repo: GitRepo, writeBlobs: boolean): Map<string, FileStat
         const bytes = repo.readBytes(repo.w(entry.path));
         if (bytes !== undefined) {
             const oid = writeBlobs ? repo.objects.write('blob', bytes) : repo.hashBlob(bytes);
-            out.set(entry.path, { oid, mode: entry.mode });
+            out.set(entry.path, { oid, mode: repo.worktreeMode(entry.path) });
         }
     }
     return out;
@@ -654,7 +678,8 @@ function cmdCommit(ctx: CommandContext, flags: Set<string>, values: Map<string,s
 function cmdLog(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const start = repo.refs.headOid();
+    const rev = rest.find((entry) => !entry.startsWith('-'));
+    const start = rev === undefined ? repo.refs.headOid() : repo.resolve(rev);
     if (start === undefined) return fail("fatal: your current branch '" + repo.refs.branch() + "' does not have any commits yet", 128);
     const max = parseInt(values.get('-n') ?? values.get('--max-count') ?? '100', 10) || 100;
     const entries = repo.logEntries(start, max);

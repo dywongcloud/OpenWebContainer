@@ -71,12 +71,13 @@ function range(start: number, count: number): string {
 }
 
 export function unifiedFor(path: string, oldOid: string | undefined, newOid: string | undefined,
-    before: string, after: string, mode: number): string {
+    before: string, after: string, mode: number, oldMode: number = mode): string {
     const oldLines = splitLines(before), newLines = splitLines(after);
     const ops = diffOps(oldLines, newLines);
     const hunks = hunksFor(ops);
     const out: string[] = [];
     const modeText = mode === 0o100755 ? '100755' : '100644';
+    const oldModeText = oldMode === 0o100755 ? '100755' : '100644';
     out.push('diff --git a/' + path + ' b/' + path);
     if (isBinaryText(before) || isBinaryText(after)) {
         /* Host never emits a hunk for a binary blob; it prints one "Binary files ... differ"
@@ -106,9 +107,14 @@ export function unifiedFor(path: string, oldOid: string | undefined, newOid: str
         out.push('--- a/' + path);
         out.push('+++ /dev/null');
     } else {
-        const oldMode = modeText;
-        if (oldOid === newOid) return '';
-        out.push('index ' + abbrev(oldOid) + '..' + abbrev(newOid) + ' ' + oldMode);
+        const modeChanged = oldModeText !== modeText;
+        if (modeChanged) {
+            out.push('old mode ' + oldModeText);
+            out.push('new mode ' + modeText);
+        }
+        /* A pure mode change has NO index line and NO hunks (host git 2.53.0). */
+        if (oldOid === newOid) return out.join('\n') + '\n';
+        out.push('index ' + abbrev(oldOid) + '..' + abbrev(newOid) + (modeChanged ? '' : ' ' + modeText));
         out.push('--- a/' + path);
         out.push('+++ b/' + path);
     }
@@ -141,7 +147,8 @@ export function renderDiff(repo: GitRepo, changes: Change[]): string {
     for (const change of changes) {
         const before = repo.lineCounts(change.oldOid).text;
         const after = repo.lineCounts(change.newOid).text;
-        const text = unifiedFor(change.path, change.oldOid, change.newOid, before, after, change.mode);
+        const text = unifiedFor(change.path, change.oldOid, change.newOid, before, after, change.mode,
+            change.oldMode ?? change.mode);
         if (text !== '') out.push(text);
     }
     return out.join('');
@@ -166,14 +173,20 @@ export function renderStat(repo: GitRepo, changes: Change[], width = 80, modeLin
         const minus = Math.min(graphWidth - plus, Math.round(entry.removed / scale));
         const graph = '+'.repeat(plus) + '-'.repeat(minus);
         const count = entry.added + entry.removed;
-        lines.push(' ' + entry.path.padEnd(nameWidth) + ' | ' + count + ' ' + graph);
+        lines.push(' ' + entry.path.padEnd(nameWidth) + ' | ' + count + (graph === '' ? '' : ' ' + graph));
     }
     const files = changes.length;
     const anyBinary = counts.some((entry) => entry.binary);
     const parts: string[] = [];
     parts.push(' ' + files + ' file' + (files === 1 ? '' : 's') + ' changed');
-    if (added > 0 || anyBinary) parts.push(added + ' insertion' + (added === 1 ? '' : 's') + '(+)');
-    if (removed > 0 || anyBinary) parts.push(removed + ' deletion' + (removed === 1 ? '' : 's') + '(-)');
+    if (total === 0 && !anyBinary) {
+        /* Host prints both zero counts for a mode-only change. */
+        parts.push('0 insertions(+)');
+        parts.push('0 deletions(-)');
+    } else {
+        if (added > 0 || anyBinary) parts.push(added + ' insertion' + (added === 1 ? '' : 's') + '(+)');
+        if (removed > 0 || anyBinary) parts.push(removed + ' deletion' + (removed === 1 ? '' : 's') + '(-)');
+    }
     /* Host prints the change-count summary BEFORE the create/delete mode lines. */
     lines.push(parts.join(', '));
     if (modeLines) for (const entry of counts) {
