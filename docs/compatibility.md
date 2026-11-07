@@ -38,6 +38,7 @@ Known softer edges are recorded rather than hidden: `node:util` exposes 22 of th
 - A "host-identical" result means stdout, stderr and exit code agreed for that case on that tree. It is not a guarantee for other cases or a later commit.
 - "Fixed at HEAD" in the archive means the fix was measured at the commit named there.
 - Six host-Node deviations from WPT and 20 documented IDNA cases remain open; see [Known limitations](known-limitations.md).
+- Reported swarm measurements follow the convention stated at `docs/compatibility.md:19`: they are supplied with the documentation brief as reported measurements, not figures derivable from a checked-in CI suite or from a file on `origin/main`; a measured result that was never published is therefore not a broken documentation promise.
 
 ## Next
 
