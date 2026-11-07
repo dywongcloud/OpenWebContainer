@@ -38,13 +38,15 @@ export function gitMain(ctx: CommandContext): CommandResult {
     const rest = args.slice(i);
     if (sub === undefined) return fail(GIT_HELP, 1);
     if (sub === 'help') return ok(GIT_HELP);
-    const boundary = gitBoundaryOutcome(sub, rest);
+    const boundary = gitBoundaryOutcome(sub, rest, overrides);
     if (boundary !== undefined) return boundary;
     const next: CommandContext = { ...ctx, cwd, env: overrides, args: rest };
     try {
         return runCommand(next, sub, rest);
     } catch (error) {
         if (error instanceof GitError) return fail(error.message, error.code);
+        const gitCode = (error as unknown as { gitCode?: number }).gitCode;
+        if (gitCode !== undefined) return fail(error instanceof Error ? error.message : String(error), gitCode);
         return fail('fatal: ' + (error instanceof Error ? error.message : String(error)), 128);
     }
 }

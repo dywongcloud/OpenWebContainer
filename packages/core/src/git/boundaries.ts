@@ -35,10 +35,13 @@ function remoteScheme(arg: string): string | undefined {
  * Picks the git-<family> UNSUPPORTED key for a boundary invocation, or undefined when the CLI
  * implements it. Keys carry no spaces so isUnsupported and UNSUPPORTED_COMMANDS derive from them.
  */
-function boundaryFamily(subcommand: string, args: string[]): string | undefined {
+function boundaryFamily(subcommand: string, args: string[], env: Record<string, string> = {}): string | undefined {
     const positionals = args.filter((a) => !a.startsWith('-'));
     const has = (...flags: string[]) =>
         args.some((a) => flags.includes(a) || flags.some((f) => f.endsWith('=') && a.startsWith(f)));
+    /* Environment overrides that would repoint the repository outside the VFS cannot be honoured. */
+    if (env.GIT_DIR || env.GIT_WORK_TREE || env.GIT_CEILING_DIRECTORIES || env.GIT_INDEX_FILE ||
+        env.GIT_OBJECT_DIRECTORY || env.GIT_ALTERNATE_OBJECT_DIRECTORIES || env.GIT_COMMON_DIR) return 'git-worktree';
     switch (subcommand) {
         /* Network egress: hub.ts:5-8 and :279 are loopback-only (ENETUNREACH). */
         case 'clone': {
@@ -87,6 +90,23 @@ function boundaryFamily(subcommand: string, args: string[]): string | undefined 
         case 'credential-libsecret':
             return 'git-credentials';
 
+        /* Object-format / ref-format backends, partial clones and binary stdout need subsystems
+           the VFS does not have: route them to canonical named boundaries instead of a fake
+           success. All keys used here are declared in unsupported.ts (18<->18 bijection). */
+        case 'init': {
+            const of = args.find((a) => a.startsWith('--object-format'));
+            const rf = args.find((a) => a.startsWith('--ref-format'));
+            if (of !== undefined && !/=sha1$/.test(of)) return 'git-packfiles';
+            if (rf !== undefined && !/=files$/.test(rf)) return 'git-packfiles';
+            return undefined;
+        }
+        case 'archive': {
+            if (args.includes('-o') || args.some((a) => a.startsWith('--output') || a.startsWith('-o'))) return undefined;
+            return 'git-packfiles';
+        }
+        case 'backfill':
+            return args.some((a) => a.startsWith('--filter') || a.startsWith('--promisor')) ? 'git-packfiles' : undefined;
+
         /* GPG signing: commit -S / tag -s / verify-*. */
         case 'commit':
             return has('-S', '--gpg-sign', '--gpg-sign=') ? 'git-gpg' : undefined;
@@ -126,7 +146,7 @@ function boundaryFamily(subcommand: string, args: string[]): string | undefined 
  * (unsupported.ts:38-40, :1842) -- a measured deviation from host git's fatal 128 and
  * git ls-remote's 2 -- deliberately kept, not normalized to the host.
  */
-export function gitBoundaryOutcome(subcommand: string, args: string[]): CommandResult | undefined {
-    const family = boundaryFamily(subcommand, args);
+export function gitBoundaryOutcome(subcommand: string, args: string[], env: Record<string, string> = {}): CommandResult | undefined {
+    const family = boundaryFamily(subcommand, args, env);
     return family === undefined ? undefined : unsupportedResult(family);
 }

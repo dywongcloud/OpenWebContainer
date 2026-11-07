@@ -78,6 +78,23 @@ export function unifiedFor(path: string, oldOid: string | undefined, newOid: str
     const out: string[] = [];
     const modeText = mode === 0o100755 ? '100755' : '100644';
     out.push('diff --git a/' + path + ' b/' + path);
+    if (isBinaryText(before) || isBinaryText(after)) {
+        /* Host never emits a hunk for a binary blob; it prints one "Binary files ... differ"
+           line after the index/mode headers. */
+        if (oldOid === undefined) {
+            out.push('new file mode ' + modeText);
+            out.push('index 0000000..' + abbrev(newOid ?? '0000000'));
+            out.push('Binary files /dev/null and b/' + path + ' differ');
+        } else if (newOid === undefined) {
+            out.push('deleted file mode ' + modeText);
+            out.push('index ' + abbrev(oldOid) + '..0000000');
+            out.push('Binary files a/' + path + ' and /dev/null differ');
+        } else {
+            out.push('index ' + abbrev(oldOid) + '..' + abbrev(newOid) + ' ' + modeText);
+            out.push('Binary files a/' + path + ' and b/' + path + ' differ');
+        }
+        return out.join('\n') + '\n';
+    }
     if (oldOid === undefined) {
         out.push('new file mode ' + modeText);
         out.push('index 0000000..' + abbrev(newOid ?? '0000000'));
@@ -102,16 +119,21 @@ export function unifiedFor(path: string, oldOid: string | undefined, newOid: str
     return out.join('\n') + '\n';
 }
 
-export interface DiffCounts { path: string; added: number; removed: number; mode: number; created: boolean; deleted: boolean; }
+export interface DiffCounts { path: string; added: number; removed: number; mode: number; created: boolean; deleted: boolean;
+    binary: boolean; oldSize: number; newSize: number; }
+
+export function isBinaryText(value: string): boolean { return value.includes('\u0000'); }
 
 export function countsFor(repo: GitRepo, change: Change): DiffCounts {
     const before = repo.lineCounts(change.oldOid);
     const after = repo.lineCounts(change.newOid);
+    const binary = isBinaryText(before.text) || isBinaryText(after.text);
     const ops = diffOps(splitLines(before.text), splitLines(after.text));
     let added = 0, removed = 0;
-    for (const op of ops) { if (op.kind === '+') added++; else if (op.kind === '-') removed++; }
+    if (!binary) for (const op of ops) { if (op.kind === '+') added++; else if (op.kind === '-') removed++; }
     return { path: change.path, added, removed, mode: change.mode,
-        created: change.status === 'A', deleted: change.status === 'D' };
+        created: change.status === 'A', deleted: change.status === 'D', binary,
+        oldSize: repo.blobSize(change.oldOid), newSize: repo.blobSize(change.newOid) };
 }
 
 export function renderDiff(repo: GitRepo, changes: Change[]): string {
@@ -125,7 +147,7 @@ export function renderDiff(repo: GitRepo, changes: Change[]): string {
     return out.join('');
 }
 
-export function renderStat(repo: GitRepo, changes: Change[], width = 80): string {
+export function renderStat(repo: GitRepo, changes: Change[], width = 80, modeLines = true): string {
     if (changes.length === 0) return '';
     const counts = changes.map((change) => countsFor(repo, change));
     let added = 0, removed = 0;
@@ -136,6 +158,10 @@ export function renderStat(repo: GitRepo, changes: Change[], width = 80): string
     const scale = total === 0 ? 0 : Math.max(1, Math.ceil(total / graphWidth));
     const lines: string[] = [];
     for (const entry of counts) {
+        if (entry.binary) {
+            lines.push(' ' + entry.path.padEnd(nameWidth) + ' | Bin ' + entry.oldSize + ' -> ' + entry.newSize + ' bytes');
+            continue;
+        }
         const plus = Math.min(graphWidth, Math.round(entry.added / scale));
         const minus = Math.min(graphWidth - plus, Math.round(entry.removed / scale));
         const graph = '+'.repeat(plus) + '-'.repeat(minus);
@@ -143,13 +169,14 @@ export function renderStat(repo: GitRepo, changes: Change[], width = 80): string
         lines.push(' ' + entry.path.padEnd(nameWidth) + ' | ' + count + ' ' + graph);
     }
     const files = changes.length;
+    const anyBinary = counts.some((entry) => entry.binary);
     const parts: string[] = [];
     parts.push(' ' + files + ' file' + (files === 1 ? '' : 's') + ' changed');
-    if (added > 0) parts.push(added + ' insertion' + (added === 1 ? '' : 's') + '(+)');
-    if (removed > 0) parts.push(removed + ' deletion' + (removed === 1 ? '' : 's') + '(-)');
+    if (added > 0 || anyBinary) parts.push(added + ' insertion' + (added === 1 ? '' : 's') + '(+)');
+    if (removed > 0 || anyBinary) parts.push(removed + ' deletion' + (removed === 1 ? '' : 's') + '(-)');
     /* Host prints the change-count summary BEFORE the create/delete mode lines. */
     lines.push(parts.join(', '));
-    for (const entry of counts) {
+    if (modeLines) for (const entry of counts) {
         if (entry.created) lines.push(' create mode ' + (entry.mode === 0o100755 ? '100755' : '100644') + ' ' + entry.path);
         if (entry.deleted) lines.push(' delete mode ' + (entry.mode === 0o100755 ? '100755' : '100644') + ' ' + entry.path);
     }

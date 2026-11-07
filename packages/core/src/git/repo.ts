@@ -252,18 +252,31 @@ export class GitRepo {
     }
 
     ignored(rel: string): boolean {
-        const patterns = (this.readText(this.w('.gitignore')) ?? '').split('\n');
-        for (const raw of patterns) {
-            const line = raw.trim();
-            if (line === '' || line.startsWith('#')) continue;
-            const negated = line.startsWith('!');
-            const pattern = negated ? line.slice(1) : line;
-            const match = pattern.endsWith('/')
-                ? (rel === pattern.slice(0, -1) || rel.startsWith(pattern))
-                : (rel === pattern || rel.endsWith('/' + pattern) || rel.split('/').includes(pattern));
-            if (match) return !negated;
+        /* Root .gitignore, .git/info/exclude and every nested .gitignore, in precedence order:
+           a pattern in a deeper directory applies to the remainder of the path below it. */
+        const parts = rel.split('/');
+        const sources: string[] = [this.g('info/exclude')];
+        for (let i = 0; i < parts.length; i++) {
+            const dir = parts.slice(0, i).join('/');
+            sources.push(this.w(dir === '' ? '.gitignore' : dir + '/.gitignore'));
         }
-        return false;
+        let ignored = false;
+        for (let s = 0; s < sources.length; s++) {
+            const content = this.readText(sources[s]);
+            if (content === undefined) continue;
+            const sub = s === 0 ? rel : parts.slice(s - 1).join('/');
+            for (const raw of content.split('\n')) {
+                const line = raw.trim();
+                if (line === '' || line.startsWith('#')) continue;
+                const negated = line.startsWith('!');
+                const pattern = negated ? line.slice(1) : line;
+                const match = pattern.endsWith('/')
+                    ? (sub === pattern.slice(0, -1) || sub.startsWith(pattern))
+                    : (sub === pattern || sub.endsWith('/' + pattern) || sub.split('/').includes(pattern));
+                if (match) ignored = !negated;
+            }
+        }
+        return ignored;
     }
 
     worktreeOid(rel: string): string | undefined {
@@ -284,6 +297,13 @@ export class GitRepo {
             }
         }
         return out;
+    }
+
+    /** Raw byte size of a blob: the "Bin N -> M bytes" stat must not decode UTF-8 first. */
+    blobSize(oid: string | undefined): number {
+        if (oid === undefined) return 0;
+        const obj = this.object(oid);
+        return obj === undefined || obj.type !== 'blob' ? 0 : obj.content.length;
     }
 
     lineCounts(oid: string | undefined): { lines: number; text: string } {

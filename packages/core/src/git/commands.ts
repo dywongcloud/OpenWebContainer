@@ -1,4 +1,5 @@
 import type { CommandContext, CommandResult } from '../shell/commands/types';
+import { unsupportedResult } from '../shell/commands/unsupported';
 import { utf8, text, concat, abbrev, binaryString, fromBinaryString, isHexOid, zinflate, sha1Hex } from './bytes';
 import {
     GitRepo, GitError, fatal, normalizePath, type Change, type FileState, type StatusRow
@@ -42,6 +43,8 @@ export interface StatusView {
     headOid?: string;
     /** Host labels a detached HEAD with the tag/ref it was checked out from, else the abbrev oid. */
     detachedLabel?: string;
+    /** Paths with index stage 1/2/3 entries written by a conflicting merge. */
+    unmerged: string[];
 }
 
 export function statusOf(repo: GitRepo): StatusView {
@@ -74,8 +77,9 @@ export function statusOf(repo: GitRepo): StatusView {
     }
     for (const path of untracked) rows.push({ x: '?', y: '?', path, staged: false, unstaged: false });
     const label = repo.readText(repo.g('OWC_DETACH_LABEL'))?.trim();
+    const unmerged = [...new Set(repo.indexEntries().filter((entry) => entry.stage > 0).map((entry) => entry.path))].sort();
     return { rows, untracked, staged, unstaged, branch: repo.refs.branch(), detached: repo.refs.head().ref === undefined,
-        noCommits, headOid, detachedLabel: label !== undefined && label !== '' ? label : undefined };
+        noCommits, headOid, detachedLabel: label !== undefined && label !== '' ? label : undefined, unmerged };
 }
 
 function label(change: Change): string {
@@ -83,12 +87,31 @@ function label(change: Change): string {
 }
 
 export function shortStatus(view: StatusView): string {
-    return view.rows.map((row) => (row.x === '?' ? '?? ' : row.x + row.y + ' ') + row.path + '\n').join('');
+    const lines: string[] = [];
+    for (const row of view.rows) if (row.x !== '?') lines.push(row.x + row.y + ' ' + row.path + '\n');
+    /* Host porcelain v1 collapses untracked files under a directory to "?? dir/". */
+    const untracked = new Set<string>();
+    for (const path of view.untracked) {
+        const slash = path.indexOf('/');
+        untracked.add(slash < 0 ? path : path.slice(0, slash) + '/');
+    }
+    for (const path of [...untracked].sort()) lines.push('?? ' + path + '\n');
+    return lines.join('');
 }
 
 export function longStatus(view: StatusView): string {
     let out = view.detached ? 'HEAD detached at ' + (view.detachedLabel ?? abbrev(view.headOid ?? ZERO_OID)) + '\n' : 'On branch ' + view.branch + '\n';
     if (view.noCommits) out += '\nNo commits yet\n';
+    if (view.unmerged.length > 0) {
+        out += 'You have unmerged paths.\n';
+        out += '  (fix conflicts and run "git commit")\n';
+        out += '  (use "git merge --abort" to abort the merge)\n\n';
+        out += 'Unmerged paths:\n';
+        out += '  (use "git add <file>..." to mark resolution)\n';
+        for (const path of view.unmerged) out += '\tboth modified:   ' + path + '\n';
+        out += '\nno changes added to commit (use "git add" and/or "git commit -a")\n';
+        return out;
+    }
     const sections: string[] = [];
     if (view.staged.length > 0) {
         let section = 'Changes to be committed:\n';
@@ -133,9 +156,10 @@ function commitLines(repo: GitRepo, changes: Change[]): string {
     const counts = changes.map((change) => countsFor(repo, change));
     let added = 0, removed = 0;
     for (const entry of counts) { added += entry.added; removed += entry.removed; }
+    const anyBinary = counts.some((entry) => entry.binary);
     let summary = ' ' + changes.length + ' file' + (changes.length === 1 ? '' : 's') + ' changed';
-    if (added > 0) summary += ', ' + added + ' insertion' + (added === 1 ? '' : 's') + '(+)';
-    if (removed > 0) summary += ', ' + removed + ' deletion' + (removed === 1 ? '' : 's') + '(-)';
+    if (added > 0 || anyBinary) summary += ', ' + added + ' insertion' + (added === 1 ? '' : 's') + '(+)';
+    if (removed > 0 || anyBinary) summary += ', ' + removed + ' deletion' + (removed === 1 ? '' : 's') + '(-)';
     let out = summary + '\n';
     for (const change of changes) {
         if (change.status === 'A') out += ' create mode ' + (change.mode === 0o100755 ? '100755' : '100644') + ' ' + change.path + '\n';
@@ -270,6 +294,7 @@ export function runCommand(ctx: CommandContext, sub: string, args: string[]): Co
         case 'push': return cmdPush(ctx, args);
         case 'pull': return cmdPull(ctx, args);
         case 'ls-remote': return cmdLsRemote(ctx, args);
+        case 'backfill': return cmdBackfill(ctx, flags, values, rest);
         default: return fail("git: '" + sub + "' is not a git command. See 'git --help'.", 1);
     }
 }
@@ -428,7 +453,7 @@ function cmdLsFiles(ctx: CommandContext, flags: Set<string>, values: Map<string,
     let repo: GitRepo;
     try { repo = GitRepo.discover(ctx); } catch (error) { return fatalResult(error); }
     const entries = repo.indexEntries();
-    if (flags.has('--stage')) {
+    if (flags.has('--stage') || flags.has('-s')) {
         return ok(entries.map((entry) => entry.mode.toString(8).padStart(6, '0') + ' ' + entry.oid + ' ' + entry.stage + '\t' + entry.path + '\n').join(''));
     }
     const filter = rest.filter((entry) => !entry.startsWith('-'));
@@ -578,12 +603,25 @@ function cmdMv(ctx: CommandContext, rest: string[]): CommandResult {
 function cmdClean(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const view = statusOf(repo);
     const dry = flags.has('-n') || flags.has('--dry-run');
+    const force = flags.has('-f') || flags.has('--force');
+    const interactive = flags.has('-i');
+    /* Host requires -f (or -n/-i) as a safety gate; never delete a file the host would keep. */
+    if (!dry && !force && !interactive) return fail('fatal: clean.requireForce is true and -f not given: refusing to clean\n', 128);
+    const dirs = flags.has('-d');
+    const all = flags.has('-x');
+    const candidates = all ? repo.worktreeFiles() : statusOf(repo).untracked;
+    const targets: string[] = [];
+    const seenDirs = new Set<string>();
+    for (const path of candidates) {
+        const slash = path.indexOf('/');
+        if (slash < 0) targets.push(path);
+        else if (dirs) { const dir = path.slice(0, slash); if (!seenDirs.has(dir)) { seenDirs.add(dir); targets.push(dir + '/'); } }
+    }
     let out = '';
-    for (const path of view.untracked) {
-        if (dry) out += 'Would remove ' + path + '\n';
-        else { repo.remove(repo.w(path)); out += 'Removing ' + path + '\n'; }
+    for (const target of targets) {
+        if (dry) out += 'Would remove ' + target + '\n';
+        else { repo.remove(repo.w(target.replace(/\/$/, ''))); out += 'Removing ' + target + '\n'; }
     }
     return ok(out);
 }
@@ -670,7 +708,9 @@ function cmdDiff(ctx: CommandContext, flags: Set<string>, values: Map<string,str
     const changes = repo.changesBetween(base, next);
     if (flags.has('--name-only')) return ok(changes.map((c) => c.path + '\n').join(''));
     if (flags.has('--stat')) {
-        const stat = renderStat(repo, changes);
+        /* Host 'git diff --stat' never prints create/delete mode lines (git merge's fast-forward
+           summary does), so suppress them for this call only. */
+        const stat = renderStat(repo, changes, 80, false);
         return ok(stat, '', flags.has('--exit-code') && changes.length > 0 ? 1 : 0);
     }
     const diff = renderDiff(repo, changes);
@@ -818,7 +858,23 @@ function cmdMerge(ctx: CommandContext, flags: Set<string>, values: Map<string,st
         if (o === undefined && t === undefined) { merged.delete(path); continue; }
         conflicts.push(path);
     }
-    if (conflicts.length > 0) return fail('Auto-merging ' + conflicts.join(', ') + '\nCONFLICT (content): Merge conflict in ' + conflicts[0] + '\nAutomatic merge failed; fix conflicts and then commit the result.', 1);
+    if (conflicts.length > 0) {
+        repo.writeText(repo.g('MERGE_HEAD'), other + '\n');
+        let entries = repo.indexEntries().filter((entry) => !conflicts.includes(entry.path));
+        for (const path of conflicts) {
+            const b = baseTree.get(path), o = ours.get(path), t = theirs.get(path);
+            for (const [stage, state] of [[1, b], [2, o], [3, t]] as [number, FileState | undefined][]) {
+                if (state !== undefined) entries.push({ path, oid: state.oid, mode: state.mode,
+                    size: 0, mtimeSec: 0, mtimeNs: 0, stage });
+            }
+            const oursText = o === undefined ? '' : text(repo.readBlob(o.oid) ?? new Uint8Array());
+            const theirsText = t === undefined ? '' : text(repo.readBlob(t.oid) ?? new Uint8Array());
+            repo.writeBytes(repo.w(path), utf8('<<<<<<< HEAD\n' + oursText + '=======\n' + theirsText + '>>>>>>> ' + name + '\n'));
+        }
+        repo.writeIndexEntries(entries);
+        return ok('Auto-merging ' + conflicts.join(', ') + '\nCONFLICT (content): Merge conflict in ' + conflicts[0] +
+            '\nAutomatic merge failed; fix conflicts and then commit the result.\n', '', 1);
+    }
     const treeOid = repo.buildTree(merged);
     makeCommit(repo, 'Merge branch ' + "'" + name + "'", { parents: [head, other], tree: treeOid });
     repo.checkoutTree(treeOid, false);
@@ -872,6 +928,25 @@ function cmdTag(ctx: CommandContext, flags: Set<string>, values: Map<string,stri
     return ok('');
 }
 
+function stashDrop(repo: GitRepo): void {
+    repo.refs.removeRef('refs/stash');
+    repo.remove(repo.g('logs/refs/stash'));
+}
+function stashChanges(repo: GitRepo, oid: string): { parent: string | undefined; changes: Change[] } | undefined {
+    const stash = repo.readCommit(oid);
+    if (stash === undefined) return undefined;
+    const parent = stash.parents[0];
+    const parentCommit = parent === undefined ? undefined : repo.readCommit(parent);
+    const changes = parentCommit !== undefined ? repo.changesBetween(repo.flatTree(parentCommit.tree), repo.flatTree(stash.tree))
+        : repo.changesBetween(new Map(), repo.flatTree(stash.tree));
+    return { parent, changes };
+}
+function applyStashToWorktree(repo: GitRepo, changes: Change[]): void {
+    for (const change of changes) {
+        if (change.newOid !== undefined) { const blob = repo.readBlob(change.newOid); if (blob !== undefined) repo.writeBytes(repo.w(change.path), blob); }
+        else repo.remove(repo.w(change.path));
+    }
+}
 function cmdStash(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
@@ -879,24 +954,41 @@ function cmdStash(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     if (action === 'list') {
         return ok(repo.refs.reflog('refs/stash').map((entry, index) => 'stash@{' + index + '}: ' + entry.message + '\n').join(''));
     }
-    if (action === 'pop' || action === 'apply') {
-        const oid = repo.refs.read('refs/stash');
-        if (oid === undefined) return fail('No stash entries found.', 1);
-        const stash = repo.readCommit(oid);
-        if (stash === undefined) return fail('No stash entries found.', 1);
-        const parent = stash.parents[0];
-        const parentCommit = repo.readCommit(parent);
-        const changes = parentCommit !== undefined ? repo.changesBetween(repo.flatTree(parentCommit.tree), repo.flatTree(stash.tree))
-            : repo.changesBetween(new Map(), repo.flatTree(stash.tree));
-        for (const change of changes) {
-            if (change.newOid !== undefined) { const blob = repo.readBlob(change.newOid); if (blob !== undefined) repo.writeBytes(repo.w(change.path), blob); }
-            else repo.remove(repo.w(change.path));
+    const stashOid = repo.refs.read('refs/stash');
+    if (action === 'clear') { stashDrop(repo); return ok(''); }
+    if (action === 'drop') {
+        if (stashOid === undefined) return fail('No stash entries found.', 1);
+        stashDrop(repo);
+        return ok('Dropped refs/stash@{0} (' + stashOid + ')\n');
+    }
+    if (action === 'show') {
+        if (stashOid === undefined) return fail('No stash entries found.', 1);
+        const info = stashChanges(repo, stashOid);
+        if (info === undefined) return fail('No stash entries found.', 1);
+        if (flags.has('-p') || flags.has('--patch')) return ok(renderDiff(repo, info.changes));
+        return ok(renderStat(repo, info.changes));
+    }
+    if (action === 'pop' || action === 'apply' || action === 'branch') {
+        if (stashOid === undefined) return fail('No stash entries found.', 1);
+        const info = stashChanges(repo, stashOid);
+        if (info === undefined) return fail('No stash entries found.', 1);
+        let branchStderr = '';
+        if (action === 'branch') {
+            const name = rest[1] ?? '';
+            if (name === '') return fail('fatal: No branch name specified', 128);
+            if (info.parent !== undefined) {
+                repo.refs.writeRef('refs/heads/' + name, info.parent);
+                repo.refs.setHead('refs/heads/' + name);
+                const parentCommit = repo.readCommit(info.parent);
+                if (parentCommit !== undefined) repo.checkoutTree(parentCommit.tree);
+            }
+            branchStderr = "Switched to a new branch '" + name + "'\n";
         }
-        /* git stash pop restores the WORKTREE only: the index stays at HEAD, so the changes are
-           unstaged. Staging them here produced "Changes to be committed" instead of host's
-           "Changes not staged for commit" section. */
-        if (action === 'pop') repo.refs.removeRef('refs/stash');
-        return ok(longStatus(statusOf(repo)) + 'Dropped refs/stash@{0} (' + oid + ')\n');
+        /* git stash pop/branch restores the WORKTREE only: the index stays at HEAD, so the
+           changes are unstaged (host prints "Changes not staged for commit"). */
+        applyStashToWorktree(repo, info.changes);
+        if (action === 'pop' || action === 'branch') stashDrop(repo);
+        return ok(longStatus(statusOf(repo)) + 'Dropped refs/stash@{0} (' + stashOid + ')\n', branchStderr);
     }
     const view = statusOf(repo);
     if (view.unstaged.length === 0 && view.staged.length === 0) return ok('No local changes to save\n');
@@ -949,19 +1041,27 @@ function cmdBlame(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     const history = head === undefined ? [] : repo.logEntries(head, 100);
     let out = '';
     splitLines(text(bytes)).forEach((line, index) => {
+        /* Follow the file back through renames: the oldest commit whose tree contains a blob with
+           this line is the origin, and host prints the ORIGINAL path after the abbrev oid. */
         let owner = history[0];
-        for (const entry of history) {
+        let originPath = path;
+        let boundary = false;
+        for (let k = history.length - 1; k >= 0; k--) {
+            const entry = history[k];
             const commit = repo.readCommit(entry.oid);
-            const state = commit !== undefined ? repo.flatTree(commit.tree).get(path) : undefined;
-            if (state !== undefined) {
+            if (commit === undefined) continue;
+            let found = false;
+            for (const [candidate, state] of repo.flatTree(commit.tree)) {
                 const blob = repo.readBlob(state.oid);
-                if (blob !== undefined && splitLines(text(blob)).includes(line)) { owner = entry; break; }
+                if (blob !== undefined && splitLines(text(blob)).includes(line)) { originPath = candidate; found = true; break; }
             }
+            if (found) { owner = entry; boundary = entry.info.parents.length === 0; break; }
         }
         const oid = owner?.oid ?? ZERO_OID;
         const author = owner?.info.author ?? repo.identity();
-        const boundary = owner !== undefined && owner.info.parents.length === 0 ? '^' : '';
-        out += boundary + abbrev(oid, 7) + ' (' + author.name + ' ' + isoDate(author.ts, author.tz) + ' ' + (index + 1) + ') ' + line + '\n';
+        const renamed = originPath !== path ? ' ' + originPath : '';
+        out += (boundary ? '^' : '') + abbrev(oid, 7) + renamed + ' (' + author.name + ' ' +
+            isoDate(author.ts, author.tz) + ' ' + (index + 1) + ') ' + line + '\n';
     });
     return ok(out);
 }
@@ -1382,4 +1482,15 @@ function cmdLsRemote(ctx: CommandContext, raw: string[]): CommandResult {
     for (const b of src.refs.branches()) { const o = src.refs.read('refs/heads/' + b); if (o !== undefined) out += o + '\trefs/heads/' + b + '\n'; }
     for (const t of src.refs.tags()) { const o = src.refs.read('refs/tags/' + t); if (o !== undefined) out += o + '\trefs/tags/' + t + '\n'; }
     return ok(out);
+}
+
+/* git backfill on a repo with no promisor remote has nothing to fetch and succeeds silently;
+   a promisor remote needs a packfile transport the VFS does not have. */
+function cmdBackfill(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
+    const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
+    const repo = asRepo(found) as GitRepo;
+    const partial = repo.config.get('extensions.partialclone');
+    const promisor = repo.config.readScope('local').some((line) => line.section === 'remote' && line.key === 'promisor');
+    if (partial !== undefined || promisor) return unsupportedResult('git-packfiles');
+    return ok('');
 }

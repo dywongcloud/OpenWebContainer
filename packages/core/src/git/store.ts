@@ -155,10 +155,18 @@ export interface IndexEntry {
 
 export function readIndex(fs: IFileSystem, gitDir: string): IndexEntry[] {
     const raw = fs.readBytes(gitDir + '/index');
-    if (raw === undefined || raw.length < 32) return [];
-    if (text(raw.subarray(0, 4)) !== 'DIRC') return [];
+    if (raw === undefined) return [];
+    /* A malformed or non-v2 index must NOT be silently read as an empty index: that rewrote the
+       index as v2 and reported staged deletions. Host aborts with a fatal 128. */
+    const indexError = (message: string): never => {
+        const e = new Error(message) as Error & { gitCode?: number };
+        e.gitCode = 128;
+        throw e;
+    };
+    if (raw.length < 32) indexError('fatal: .git/index: index file smaller than expected');
+    if (text(raw.subarray(0, 4)) !== 'DIRC') indexError('fatal: .git/index: index file smaller than expected');
     const version = readU32be(raw, 4);
-    if (version !== 2) return [];
+    if (version !== 2) indexError('fatal: .git/index: unknown index version ' + version);
     const count = readU32be(raw, 8);
     const entries: IndexEntry[] = [];
     let at = 12;
