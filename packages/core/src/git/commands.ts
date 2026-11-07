@@ -132,8 +132,9 @@ export function porcelainV2(view: StatusView, branch = false, opts: { ignored?: 
     }
     const mode = (state?: { mode: number }) => state ? state.mode.toString(8).padStart(6, '0') : '000000';
     const oid = (state?: { oid: string }) => state ? state.oid : ZERO_OID;
-    const tracked = view.rows.filter((row) => row.x !== '?').sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
-    const untracked = view.rows.filter((row) => row.x === '?').map((row) => row.path).sort();
+    const ignoredSet = new Set(opts.ignored ?? []);
+    const tracked = view.rows.filter((row) => row.x !== '?' && !ignoredSet.has(row.path)).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    const untracked = view.rows.filter((row) => row.x === '?' && !ignoredSet.has(row.path)).map((row) => row.path).sort();
     const unmerged = new Set(view.unmerged);
     // Host reports a staged rename as one '2 R.' record, not a '1 D.' + '1 A.' pair.
     // 'git mv' keeps the blob oid, so a deleted path whose HEAD blob matches an added
@@ -183,17 +184,19 @@ export function porcelainV2(view: StatusView, branch = false, opts: { ignored?: 
             ' ' + oid(state?.h) + ' ' + oid(state?.i) + ' ' + row.path + '\n';
     }
     for (const path of untracked) out += '? ' + path + '\n';
+    if (opts.showIgnored) out += ignoredRows(opts.ignored ?? [], '!', opts.matching === true);
     return out;
 }
 
 /** Host 'git status --short --ignored' folds ignored paths under a directory to "!! dir/". */
-export function ignoredRows(paths: string[]): string {
+export function ignoredRows(paths: string[], mark = '!!', matching = false): string {
     const folded = new Set<string>();
     for (const path of paths) {
+        if (matching) { folded.add(path); continue; }
         const slash = path.indexOf('/');
         folded.add(slash < 0 ? path : path.slice(0, slash) + '/');
     }
-    return [...folded].sort().map((path) => '!! ' + path + '\n').join('');
+    return [...folded].sort().map((path) => mark + ' ' + path + '\n').join('');
 }
 
 /* Root .gitignore globs ('*.log') are not covered by GitRepo.ignored at this tip; keep the
@@ -728,13 +731,21 @@ function cmdStatus(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     const repo = asRepo(found) as GitRepo;
     const view = statusOf(repo);
     const withBranch = flags.has('-b') || flags.has('--branch');
-    if (values.get('--porcelain') === 'v2') return ok(porcelainV2(view, withBranch));
+    // --ignored arrives as a bare flag or as --ignored=<mode>; parseFlags puts the
+    // "=" form into values (not flags), so honour both spellings here.
+    const ignoredMode = values.get('--ignored');
+    const showIgnored = (flags.has('--ignored') || ignoredMode !== undefined) && ignoredMode !== 'no';
+    const matching = ignoredMode === 'matching';
+    const index = repo.indexTree();
+    const ignored = repo.worktreeFiles().filter((path) => !index.has(path) && isIgnored(repo, path));
+    const opts = { ignored, showIgnored, matching };
+    if (values.get('--porcelain') === 'v2') return ok(porcelainV2(view, withBranch, opts));
     if (short) {
-        if (!flags.has('--ignored')) return ok(shortStatus(view, withBranch));
-        const index = repo.indexTree();
-        const ignored = repo.worktreeFiles().filter((path) => !index.has(path) && isIgnored(repo, path));
-        const left = { ...view, untracked: view.untracked.filter((path) => !ignored.includes(path)) };
-        return ok(shortStatus(left, withBranch) + ignoredRows(ignored));
+        const ignoredSet = new Set(ignored);
+        const left = { ...view, untracked: view.untracked.filter((path) => !ignoredSet.has(path)) };
+        const base = shortStatus(left, withBranch);
+        if (!showIgnored) return ok(base);
+        return ok(base + ignoredRows(ignored, '!!', matching));
     }
     return ok(longStatus(view));
 }
