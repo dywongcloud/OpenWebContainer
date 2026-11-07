@@ -230,7 +230,7 @@ export function runCommand(ctx: CommandContext, sub: string, args: string[]): Co
         case 'help': return ok(GIT_HELP);
         case 'clone': return cmdClone(ctx, flags, values, rest);
         case 'hash-object': return cmdHashObject(ctx, flags, values, rest);
-        case 'cat-file': return cmdCatFile(ctx, flags, values, rest);
+        case 'cat-file': return cmdCatFile(ctx, args);
         case 'rev-parse': return cmdRevParse(ctx, flags, values, rest);
         case 'ls-files': return cmdLsFiles(ctx, flags, values, rest);
         case 'write-tree': return cmdWriteTree(ctx);
@@ -304,11 +304,12 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
         }
         return ok(repo.config.list());
     }
-    if (key === undefined || key === '') return fail('error: no name specified', 2);
-    if (!key.includes('.')) return fail('error: invalid key: ' + key, 1);
+    if (key === undefined || key === '') return fail('usage: git config [<options>]', 129);
+    if (!key.includes('.')) return fail('error: key does not contain a section: ' + key, 2);
+    if (key.includes(' ')) return fail('error: invalid key: ' + key, 1);
     if (wantsUnset) {
         const code = repo.config.unset(scope, key);
-        if (code === 5) return fail('fatal: ' + key + ' has multiple values', 5);
+        if (code === 5) return fail('', 5);
         return ok('');
     }
     if (wantsGetAll) return ok(repo.config.getAll(key).map((v) => v + '\n').join(''));
@@ -362,16 +363,16 @@ function cmdHashObject(ctx: CommandContext, flags: Set<string>, values: Map<stri
     }
     return ok(out);
 }
-function cmdCatFile(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
+function cmdCatFile(ctx: CommandContext, raw: string[]): CommandResult {
     let repo: GitRepo;
     try { repo = GitRepo.discover(ctx); } catch (error) { return fatalResult(error); }
-    const mode = flags.has('-p') ? 'p' : flags.has('-t') ? 't' : flags.has('-s') ? 's' : flags.has('-e') ? 'e' : 'p';
-    const rev = rest[0] ?? '';
+    const mode = raw.includes('-t') ? 't' : raw.includes('-s') ? 's' : raw.includes('-e') ? 'e' : 'p';
+    const rev = raw.filter((entry) => !entry.startsWith('-'))[0] ?? '';
     const oid = repo.resolve(rev);
     if (oid === undefined) return fail('fatal: Not a valid object name ' + rev, 128);
     const obj = repo.object(oid);
     if (obj === undefined) return fail('fatal: Not a valid object name ' + rev, 128);
-    if (mode === 'e') return ok('');
+    if (mode === 'e') return obj === undefined ? fail('', 1) : ok('');
     if (mode === 't') return ok(obj.type + '\n');
     if (mode === 's') return ok(String(obj.content.length) + '\n');
     if (obj.type === 'tree') {
@@ -708,7 +709,7 @@ function switchBranch(repo: GitRepo, name: string, create: boolean): CommandResu
 function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const create = flags.has('-b') || flags.has('-B') || flags.has('--branch');
+    const create = flags.has('-b') || flags.has('-B') || flags.has('--branch') || values.has('-b') || values.has('-B') || values.has('--branch');
     const name = create ? (values.get('-b') ?? values.get('-B') ?? values.get('--branch')) : rest[0];
     if (create && name !== undefined) return switchBranch(repo, name, true);
     if (flags.has('--')) {
@@ -730,7 +731,7 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
 function cmdSwitch(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const create = flags.has('-c') || flags.has('-C') || flags.has('--create');
+    const create = flags.has('-c') || flags.has('-C') || flags.has('--create') || values.has('-c') || values.has('-C') || values.has('--create');
     const name = create ? (values.get('-c') ?? values.get('-C') ?? values.get('--create')) : rest[0];
     if (name === undefined) return fail('fatal: missing branch or commit argument', 128);
     return switchBranch(repo, name, create);

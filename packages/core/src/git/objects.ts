@@ -121,7 +121,7 @@ export function serializeCommit(info: CommitInfo): Uint8Array {
     for (const extra of info.extra) lines.push(extra);
     lines.push('');
     const message = info.message.endsWith('\n') ? info.message : info.message + '\n';
-    return utf8(lines.join('\n') + message);
+    return utf8(lines.join('\n') + '\n' + message);
 }
 
 export interface TagInfo { object: string; type: string; tag: string; tagger: Identity; message: string; }

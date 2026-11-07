@@ -279,7 +279,8 @@ export class GitRefs {
     branches(): string[] {
         const out: string[] = [];
         this.walk(this.gitDir + '/refs/heads', '', out);
-        const packed = this.fs.readFile(this.gitDir + '/packed-refs');
+        let packed: string | undefined;
+        try { packed = this.fs.readFile(this.gitDir + '/packed-refs'); } catch { packed = undefined; }
         if (packed !== undefined) for (const line of packed.split('\n')) {
             const match = /^[0-9a-f]{40} refs\/heads\/(.+)$/.exec(line);
             if (match !== null && !out.includes(match[1])) out.push(match[1]);
@@ -312,7 +313,8 @@ export class GitRefs {
         const dir = path.slice(0, path.lastIndexOf('/'));
         if (!this.fs.fileExists(dir)) this.fs.createDirectory(dir);
         const line = old + ' ' + next + ' ' + who + ' ' + ts + ' ' + tz + '\t' + message + '\n';
-        const previous = this.fs.readFile(path) ?? '';
+        let previous = '';
+        try { previous = this.fs.readFile(path) ?? ''; } catch { previous = ''; }
         this.fs.writeFile(path, previous + line);
     }
 }
