@@ -41,6 +41,7 @@ OpenWebContainer runs a Node-like environment entirely inside a browser page. Th
 - `apps/playground/public/owc-sw.js` intercepts `/__owc/preview/<port>/<path>` (`PREVIEW_PATH_PREFIX = '/__owc/preview/'`) and posts each request to a window client.
 - `apps/playground/src/preview/gateway.ts` (`PREVIEW_PREFIX = '/__owc/preview'`) starts `startPreviewGateway(handle)` and hands each service-worker request to the app's handler, which forwards it through the worker bridge to the guest HTTP server on that port; the response goes back over the `MessagePort` the service worker supplied. `IframeBridge` (`packages/api/src/iframe/bridge.ts`) is used by `ContainerManager.createPreview` for iframe previews.
 - This is the only external ingress: **HTTP only**, no raw sockets. The diagram in `images/architecture.png` shows the page, bridge, worker and runtime layers.
+- Two-tab live witness: 4 concurrent and 6 sequential `/__owc/preview/<port>/` requests per run, twice at each of two memory points (load 27.72 / 30.97, free 227 MB / 494 MB), all 40 answered 200 with their own tab/port body and request id — no cross-talk, no lost responses, no hang within a bounded deadline — and a reload between phases still answered; normalized fields are `latency` (→ `<t>`) and `port` (→ `<port>`).
 
 ## Where to go next
 
