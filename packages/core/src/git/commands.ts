@@ -45,6 +45,8 @@ export interface StatusView {
     detachedLabel?: string;
     /** Paths with index stage 1/2/3 entries written by a conflicting merge. */
     unmerged: string[];
+    /** Per-path object ids/modes captured for porcelain v2 records. */
+    v2?: Map<string, { h?: FileState; i?: FileState; w?: FileState }>;
 }
 
 export function statusOf(repo: GitRepo): StatusView {
@@ -61,6 +63,8 @@ export function statusOf(repo: GitRepo): StatusView {
     const unstaged = repo.changesBetween(index, worktree);
     const untracked = repo.worktreeFiles().filter((path) => !index.has(path) && !repo.ignored(path));
     const paths = new Set<string>([...index.keys(), ...head.keys()]);
+    const v2 = new Map<string, { h?: FileState; i?: FileState; w?: FileState }>();
+    for (const path of paths) v2.set(path, { h: head.get(path), i: index.get(path), w: worktree.get(path) });
     const rows: StatusRow[] = [];
     for (const path of [...paths].sort()) {
         const inHead = head.get(path), inIndex = index.get(path), inWork = worktree.get(path);
@@ -80,7 +84,7 @@ export function statusOf(repo: GitRepo): StatusView {
     const label = repo.readText(repo.g('OWC_DETACH_LABEL'))?.trim();
     const unmerged = [...new Set(repo.indexEntries().filter((entry) => entry.stage > 0).map((entry) => entry.path))].sort();
     return { rows, untracked, staged, unstaged, branch: repo.refs.branch(), detached: repo.refs.head().ref === undefined,
-        noCommits, headOid, detachedLabel: label !== undefined && label !== '' ? label : undefined, unmerged };
+        noCommits, headOid, detachedLabel: label !== undefined && label !== '' ? label : undefined, unmerged, v2 };
 }
 
 function label(change: Change): string {
@@ -105,6 +109,26 @@ function branchHeader(view: StatusView): string {
     if (view.detached) return '## HEAD (no branch)';
     if (view.noCommits) return '## No commits yet on ' + view.branch;
     return '## ' + view.branch;
+}
+
+export function porcelainV2(view: StatusView, branch = false): string {
+    let out = '';
+    if (branch) {
+        out += '# branch.oid ' + (view.headOid ?? '(initial)') + '\n';
+        out += '# branch.head ' + (view.detached ? '(detached)' : view.branch) + '\n';
+    }
+    const mode = (state?: { mode: number }) => state ? state.mode.toString(8).padStart(6, '0') : '000000';
+    const oid = (state?: { oid: string }) => state ? state.oid : ZERO_OID;
+    const tracked = view.rows.filter((row) => row.x !== '?').sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    const untracked = view.rows.filter((row) => row.x === '?').map((row) => row.path).sort();
+    for (const row of tracked) {
+        const state = view.v2?.get(row.path);
+        const xy = (row.x === ' ' ? '.' : row.x) + (row.y === ' ' ? '.' : row.y);
+        out += '1 ' + xy + ' N... ' + mode(state?.h) + ' ' + mode(state?.i) + ' ' + mode(state?.w) +
+            ' ' + oid(state?.h) + ' ' + oid(state?.i) + ' ' + row.path + '\n';
+    }
+    for (const path of untracked) out += '? ' + path + '\n';
+    return out;
 }
 
 export function longStatus(view: StatusView, commit = false): string {
@@ -598,6 +622,7 @@ function cmdStatus(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     const repo = asRepo(found) as GitRepo;
     const view = statusOf(repo);
     const withBranch = flags.has('-b') || flags.has('--branch');
+    if (values.get('--porcelain') === 'v2') return ok(porcelainV2(view, withBranch));
     if (short) return ok(shortStatus(view, withBranch));
     return ok(longStatus(view));
 }
