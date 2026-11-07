@@ -1,1 +1,3 @@
-owc-git2-log-patch-ignored resolved 1794061415686-12653-ae3fa7875b24fed 2026-11-07T14:34:51.196Z
+Row: owc-git2-log-patch-ignored
+Witness: 1794061415686-12653-ae3fa7875b24fed
+Status: resolved
