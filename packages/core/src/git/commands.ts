@@ -100,9 +100,9 @@ export function shortStatus(view: StatusView): string {
     return lines.join('');
 }
 
-export function longStatus(view: StatusView): string {
+export function longStatus(view: StatusView, commit = false): string {
     let out = view.detached ? 'HEAD detached at ' + (view.detachedLabel ?? abbrev(view.headOid ?? ZERO_OID)) + '\n' : 'On branch ' + view.branch + '\n';
-    if (view.noCommits) out += '\nNo commits yet\n';
+    if (view.noCommits) out += '\n' + (commit ? 'Initial commit' : 'No commits yet') + '\n';
     if (view.unmerged.length > 0) {
         out += 'You have unmerged paths.\n';
         out += '  (fix conflicts and run "git commit")\n';
@@ -677,7 +677,7 @@ function cmdCommit(ctx: CommandContext, flags: Set<string>, values: Map<string,s
         repo.writeIndexEntries(entries);
     }
     const view = statusOf(repo);
-    if (view.staged.length === 0 && !amend) return fail(longStatus(view), 1);
+    if (view.staged.length === 0 && !amend) return ok(longStatus(view, true), '', 1);
     let message = values.get('-m') ?? values.get('--message');
     if (message === undefined && values.has('-F')) message = repo.readText(repo.w(values.get('-F') as string)) ?? '';
     if (message === undefined) message = amend ? repo.subjectOf(repo.refs.headOid() ?? '') : '';
