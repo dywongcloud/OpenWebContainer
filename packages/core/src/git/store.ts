@@ -105,20 +105,30 @@ export class GitConfig {
         return this.all().map((line) => configKey(line) + '=' + line.value + '\n').join('');
     }
 
-    set(scope: ConfigScope, key: string, value: string): void {
+    /* Host git 2.53.0: a single-value set refuses a multi-valued key; --replace-all
+       rewrites every value of that key into one value. */
+    set(scope: ConfigScope, key: string, value: string, replaceAll = false): number {
         const parts = splitKey(key);
         const path = this.paths[scope];
         const lines = this.readScope(scope);
-        let changed = false;
+        let count = 0;
         for (const line of lines) {
             if (line.section === parts.section && line.key === parts.name &&
-                (parts.subsection === undefined || line.subsection === parts.subsection)) {
-                if (!changed) { line.value = value; changed = true; }
-            }
+                (parts.subsection === undefined || line.subsection === parts.subsection)) count++;
         }
-        if (!changed) lines.push({ section: parts.section, subsection: parts.subsection, key: parts.name, value });
+        if (count > 1 && !replaceAll) return 5;
+        let written = false;
+        const kept = lines.filter((line) => {
+            const match = line.section === parts.section && line.key === parts.name &&
+                (parts.subsection === undefined || line.subsection === parts.subsection);
+            if (!match) return true;
+            if (written) return false;
+            line.value = value; written = true; return true;
+        });
+        if (count === 0) kept.push({ section: parts.section, subsection: parts.subsection, key: parts.name, value });
         this.fs.createDirectory(path.slice(0, path.lastIndexOf('/')));
-        this.fs.writeFile(path, formatConfig(lines));
+        this.fs.writeFile(path, formatConfig(kept));
+        return 0;
     }
 
     /* Host git 2.53.0: --unset refuses a multi-valued key without writing (warning, exit 5);

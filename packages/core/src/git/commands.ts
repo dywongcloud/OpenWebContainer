@@ -379,6 +379,15 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
     const wantsUnset = flags.has('--unset') || flags.has('--unset-all');
     const wantsGetAll = flags.has('--get-all');
     const key = rest[0];
+    if (flags.has('--get-regexp')) {
+        const pattern = key ?? '';
+        let re: RegExp;
+        try { re = new RegExp(pattern); }
+        catch { return fail('error: invalid key pattern: ' + pattern, 6); }
+        const hits = repo.config.list().split('\n').filter((line) => line !== '' && re.test(line.slice(0, line.indexOf('='))));
+        if (hits.length === 0) return ok('', '', 1);
+        return ok(hits.map((line) => { const eq = line.indexOf('='); return line.slice(0, eq) + ' ' + line.slice(eq + 1) + '\n'; }).join(''));
+    }
     if (wantsList) {
         const scoped = flags.has('--global') || flags.has('--system') || flags.has('--local') || flags.has('--worktree') || file !== undefined;
         if (scoped) {
@@ -414,7 +423,10 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
         ctx.fs.writeFile(path, formatLines(lines));
         return ok('');
     }
-    repo.config.set(scope, key, rest.slice(1).join(' '));
+    const code = repo.config.set(scope, key, rest.slice(1).join(' '), flags.has('--replace-all'));
+    if (code === 5) return fail('warning: ' + key + ' has multiple values\n' +
+        'error: cannot overwrite multiple values with a single value\n' +
+        '       Use a regexp, --add or --replace-all to change ' + key + '.', 5);
     return ok('');
 }
 
