@@ -1,1 +1,3 @@
-owc-git2-show-blob-oid-fails resolved 1794061383031-12650-a4dfefa4504ed2cc 2026-11-07T14:32:38.102Z
+Row: owc-git2-show-blob-oid-fails
+Witness: 1794061383031-12650-a4dfefa4504ed2cc
+Status: resolved
