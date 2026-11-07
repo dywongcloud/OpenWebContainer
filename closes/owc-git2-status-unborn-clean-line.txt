@@ -1,1 +1,3 @@
-owc-git2-status-unborn-clean-line resolved 1794057843988-12367-e33fe6984987e80b 2026-11-07T13:26:22.724Z
+Row: owc-git2-status-unborn-clean-line
+Witness: 1794057843988-12367-e33fe6984987e80b
+Status: resolved
