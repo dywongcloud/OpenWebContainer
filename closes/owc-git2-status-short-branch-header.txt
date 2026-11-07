@@ -1,1 +1,3 @@
-owc-git2-status-short-branch-header resolved 1794057911408-12374-7bc7fb2a82f6c96b 2026-11-07T13:34:00.075Z
+Row: owc-git2-status-short-branch-header
+Witness: 1794057911408-12374-7bc7fb2a82f6c96b
+Status: resolved
