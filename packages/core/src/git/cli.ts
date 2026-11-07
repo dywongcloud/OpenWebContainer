@@ -35,6 +35,9 @@ export function gitMain(ctx: CommandContext): CommandResult {
             arg === '--no-advice' || arg === '--bare' || arg === '--literal-pathspecs') continue;
         sub = arg; i++; break;
     }
+    /* Host git -c <name>=<value> overrides configure this ONE invocation. Carry them in the
+       command context so init/advice/config reads can honour them instead of dropping them. */
+    if (configOverrides.length > 0) overrides.GIT_OWC_CONFIG_OVERRIDES = configOverrides.join('\n');
     const rest = args.slice(i);
     if (sub === undefined) return fail(GIT_HELP, 1);
     if (sub === 'help') return ok(GIT_HELP);

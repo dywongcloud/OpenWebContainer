@@ -24,20 +24,33 @@ export function normalizePath(path: string): string {
 }
 
 export interface FileState { oid: string; mode: number; }
-export interface StatusRow { x: string; y: string; path: string; staged: boolean; unstaged: boolean; orig?: string; }
-export interface Change { path: string; status: 'A' | 'M' | 'D'; oldOid?: string; newOid?: string; mode: number; }
+/** Host git 2.53.0 hook sample names written by both a normal and a bare init. */
+export const HOOK_SAMPLES = [
+    'applypatch-msg.sample', 'commit-msg.sample', 'fsmonitor-watchman.sample', 'post-update.sample',
+    'pre-applypatch.sample', 'pre-commit.sample', 'pre-merge-commit.sample', 'pre-push.sample',
+    'pre-rebase.sample', 'pre-receive.sample', 'prepare-commit-msg.sample', 'push-to-checkout.sample',
+    'sendemail-validate.sample', 'update.sample'
+];
 
+export interface StatusRow { x: string; y: string; path: string; staged: boolean; unstaged: boolean; orig?: string; }
+export interface Change { path: string; status: 'A' | 'M' | 'D'; oldOid?: string; newOid?: string; oldMode?: number; mode: number; }
+
+/* Verbatim host git 2.53.0 init advice: 13 STDERR lines, 586 bytes. Suppressed by
+   init.defaultBranch (global or -c), -b/--initial-branch, or advice.defaultBranchName=false. */
 export const INIT_HINT = [
     "hint: Using 'master' as the name for the initial branch. This default branch name",
-    'hint: is subject to change. To configure the initial branch name to use in all',
-    'hint: of your new repositories, which will suppress this warning, call:',
-    'hint: ',
-    'hint: \tgit config --global init.defaultBranch <name>',
-    'hint: ',
+    "hint: will change to \"main\" in Git 3.0. To configure the initial branch name",
+    "hint: to use in all of your new repositories, which will suppress this warning,",
+    "hint: call:",
+    "hint:",
+    "hint: \tgit config --global init.defaultBranch <name>",
+    "hint:",
     "hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and",
     "hint: 'development'. The just-created branch can be renamed via this command:",
-    'hint: ',
-    'hint: \tgit branch -m <name>'
+    "hint:",
+    "hint: \tgit branch -m <name>",
+    "hint:",
+    "hint: Disable this message with \"git config set advice.defaultBranchName false\""
 ].join('\n') + '\n';
 
 export class GitRepo {
@@ -72,6 +85,9 @@ export class GitRepo {
         for (let i = 0; i < 64; i++) {
             const candidate = dir + '/.git';
             if (ctx.fs.fileExists(candidate)) return new GitRepo(ctx, dir, candidate);
+            /* A bare repository keeps HEAD/config/objects at its root, with no worktree. */
+            if (ctx.fs.fileExists(dir + '/HEAD') && ctx.fs.fileExists(dir + '/config') &&
+                ctx.fs.isDirectory(dir + '/objects')) return new GitRepo(ctx, dir, dir);
             if (dir === '/') break;
             const cut = dir.lastIndexOf('/');
             dir = cut <= 0 ? '/' : dir.slice(0, cut);
@@ -79,32 +95,66 @@ export class GitRepo {
         throw fatal('not a git repository (or any of the parent directories): .git');
     }
 
-    static init(ctx: CommandContext, target: string, branch?: string): { repo: GitRepo; hint: string } {
+    static init(ctx: CommandContext, target: string, branch?: string, bare = false): { repo: GitRepo; hint: string } {
         const dir = normalizePath(target.startsWith('/') ? target : (ctx.cwd || '/app') + '/' + target);
-        const gitDir = dir + '/.git';
+        const gitDir = bare ? dir : dir + '/.git';
         if (!ctx.fs.fileExists(dir)) ctx.fs.createDirectory(dir);
         for (const sub of ['objects', 'objects/info', 'objects/pack', 'refs', 'refs/heads', 'refs/tags', 'info', 'hooks', 'branches', 'logs']) {
             const path = gitDir + '/' + sub;
             if (!ctx.fs.fileExists(path)) ctx.fs.createDirectory(path);
         }
+        /* Host git 2.53.0 writes the same hook sample names for a bare and a normal init. */
+        for (const name of HOOK_SAMPLES) {
+            const path = gitDir + '/hooks/' + name;
+            if (!ctx.fs.fileExists(path)) ctx.fs.writeFile(path, '');
+        }
         const repo = new GitRepo(ctx, dir, gitDir);
-        const configured = repo.config.get('init.defaultbranch');
+        const overrides = repo.configOverrides();
+        const configured = overrides.get('init.defaultbranch') ?? repo.config.get('init.defaultbranch');
+        const advice = overrides.get('advice.defaultbranchname') ?? repo.config.get('advice.defaultbranchname');
+        const adviceOff = advice !== undefined && /^(false|no|off|0)$/i.test(advice);
         const chosen = branch ?? configured ?? 'master';
-        const hint = branch === undefined && configured === undefined ? INIT_HINT : '';
+        /* The 13 host hint lines appear ONLY when neither the branch nor the default branch
+           nor advice.defaultBranchName=false suppresses them. */
+        const hint = branch === undefined && configured === undefined && !adviceOff ? INIT_HINT : '';
         ctx.fs.writeFile(gitDir + '/HEAD', 'ref: refs/heads/' + chosen + '\n');
         ctx.fs.writeFile(gitDir + '/config', [
             '[core]',
             '\trepositoryformatversion = 0',
             '\tfilemode = true',
-            '\tbare = false',
-            '\tlogallrefupdates = true',
-            '\tignorecase = true',
-            '\tprecomposeunicode = true',
+            bare ? '\tbare = true' : '\tbare = false',
+            ...(bare ? [] : ['\tlogallrefupdates = true']),
+            /* Container-own: the ZenFS VFS is case-sensitive and does not precompose Unicode.
+               Host macOS writes true/true for its own filesystem; fabricating those here made
+               core.ignorecase a lie with no reader. */
+            '\tignorecase = false',
+            '\tprecomposeunicode = false',
             ''
         ].join('\n'));
-        ctx.fs.writeFile(gitDir + '/description', 'Unnamed repository; edit this file to name the repository.\n');
+        ctx.fs.writeFile(gitDir + '/description', "Unnamed repository; edit this file 'description' to name the repository.\n");
         ctx.fs.writeFile(gitDir + '/info/exclude', '# git ls-files --others --exclude-from=.git/info/exclude\n*.[oa]\n*~\n');
         return { repo, hint };
+    }
+
+    /** '-c <name>=<value>' overrides carried by the CLI for this one invocation. */
+    configOverrides(): Map<string, string> {
+        const out = new Map<string, string>();
+        for (const line of (this.env.GIT_OWC_CONFIG_OVERRIDES ?? '').split('\n')) {
+            const eq = line.indexOf('=');
+            if (eq > 0) out.set(line.slice(0, eq).toLowerCase(), line.slice(eq + 1));
+        }
+        return out;
+    }
+
+    /** Honour core.ignorecase: fold case-distinct worktree paths when the user sets it true. */
+    caseInsensitive(): boolean {
+        const value = this.configOverrides().get('core.ignorecase') ?? this.config.get('core.ignorecase');
+        return value !== undefined && !/^(false|no|off|0|)$/i.test(value);
+    }
+
+    /** The exec bit of a worktree file, never the stale index mode. */
+    worktreeMode(rel: string): number {
+        return this.statOf(this.w(rel)).mode & 0o100 ? 0o100755 : 0o100644;
     }
 
     g(rel: string): string { return this.gitDir + '/' + rel; }
@@ -150,6 +200,12 @@ export class GitRepo {
                 }
             }
             if (candidates.length === 1) return candidates[0];
+        }
+        /* HEAD^{tree}: resolve the commit and return its tree oid (host git 2.53.0). */
+        const treeSuffix = /\^\{tree\}$/.exec(rev);
+        if (treeSuffix !== null) {
+            const base = this.resolve(rev.slice(0, treeSuffix.index));
+            return base === undefined ? undefined : this.readCommit(base)?.tree;
         }
         const aliases: Record<string, string> = { HEAD: 'HEAD', '@': 'HEAD' };
         const key = aliases[rev] ?? rev;
@@ -238,13 +294,20 @@ export class GitRepo {
     /* Every status read re-hashes the worktree file: the stat cache is never trusted. */
     worktreeFiles(): string[] {
         const out: string[] = [];
+        const fold = this.caseInsensitive();
+        const seen = new Set<string>();
+        const add = (rel: string): void => {
+            const key = fold ? rel.toLowerCase() : rel;
+            if (seen.has(key)) return;
+            seen.add(key); out.push(rel);
+        };
         const walk = (dir: string, prefix: string): void => {
             for (const name of this.names(dir)) {
                 if (name === '.git') continue;
                 const path = dir + '/' + name;
                 const rel = prefix + name;
                 if (this.isDir(path)) walk(path, rel + '/');
-                else out.push(rel);
+                else add(rel);
             }
         };
         walk(this.root, '');
@@ -293,7 +356,7 @@ export class GitRepo {
             if (before === undefined && after !== undefined) out.push({ path, status: 'A', newOid: after.oid, mode: after.mode });
             else if (before !== undefined && after === undefined) out.push({ path, status: 'D', oldOid: before.oid, mode: before.mode });
             else if (before !== undefined && after !== undefined && (before.oid !== after.oid || before.mode !== after.mode)) {
-                out.push({ path, status: 'M', oldOid: before.oid, newOid: after.oid, mode: after.mode });
+                out.push({ path, status: 'M', oldOid: before.oid, newOid: after.oid, oldMode: before.mode, mode: after.mode });
             }
         }
         return out;
