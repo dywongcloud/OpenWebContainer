@@ -1,10 +1,10 @@
 import type { CommandContext, CommandResult } from '../shell/commands/types';
-import { utf8, text, concat, abbrev, binaryString, fromBinaryString, isHexOid } from './bytes';
+import { utf8, text, concat, abbrev, binaryString, fromBinaryString, isHexOid, zinflate, sha1Hex } from './bytes';
 import {
     GitRepo, GitError, fatal, normalizePath, type Change, type FileState, type StatusRow
 } from './repo';
-import { readIndex, writeIndex, type IndexEntry, ZERO_OID, type ConfigScope } from './store';
-import { parseTree, serializeTree, parseCommit, serializeCommit, oidOf, type CommitInfo } from './objects';
+import { readIndex, writeIndex, type IndexEntry, ZERO_OID, type ConfigScope, formatConfig, type ConfigLine } from './store';
+import { parseTree, serializeTree, parseCommit, serializeCommit, serializeTag, parseTag, oidOf, type CommitInfo } from './objects';
 import { renderDiff, renderStat, countsFor, tarOf, splitLines } from './diff';
 
 export function ok(stdout = '', stderr = '', exitCode = 0): CommandResult { return { stdout, stderr, exitCode }; }
@@ -40,6 +40,8 @@ export interface StatusView {
     detached: boolean;
     noCommits: boolean;
     headOid?: string;
+    /** Host labels a detached HEAD with the tag/ref it was checked out from, else the abbrev oid. */
+    detachedLabel?: string;
 }
 
 export function statusOf(repo: GitRepo): StatusView {
@@ -71,8 +73,9 @@ export function statusOf(repo: GitRepo): StatusView {
         if (x !== ' ' || y !== ' ') rows.push({ x, y, path, staged: x !== ' ', unstaged: y !== ' ' });
     }
     for (const path of untracked) rows.push({ x: '?', y: '?', path, staged: false, unstaged: false });
+    const label = repo.readText(repo.g('OWC_DETACH_LABEL'))?.trim();
     return { rows, untracked, staged, unstaged, branch: repo.refs.branch(), detached: repo.refs.head().ref === undefined,
-        noCommits, headOid };
+        noCommits, headOid, detachedLabel: label !== undefined && label !== '' ? label : undefined };
 }
 
 function label(change: Change): string {
@@ -84,7 +87,7 @@ export function shortStatus(view: StatusView): string {
 }
 
 export function longStatus(view: StatusView): string {
-    let out = view.detached ? 'HEAD detached at ' + abbrev(view.headOid ?? ZERO_OID) + '\n' : 'On branch ' + view.branch + '\n';
+    let out = view.detached ? 'HEAD detached at ' + (view.detachedLabel ?? abbrev(view.headOid ?? ZERO_OID)) + '\n' : 'On branch ' + view.branch + '\n';
     if (view.noCommits) out += '\nNo commits yet\n';
     const sections: string[] = [];
     if (view.staged.length > 0) {
@@ -261,6 +264,12 @@ export function runCommand(ctx: CommandContext, sub: string, args: string[]): Co
         case 'cherry-pick': return cmdCherryPick(ctx, flags, values, rest);
         case 'rebase': return cmdRebase(ctx, flags, values, rest);
         case 'remote': return cmdRemote(ctx, flags, values, rest);
+        case 'bisect': return cmdBisect(ctx, args);
+        case 'fsck': return cmdFsck(ctx, args);
+        case 'fetch': return cmdFetch(ctx, args);
+        case 'push': return cmdPush(ctx, args);
+        case 'pull': return cmdPull(ctx, args);
+        case 'ls-remote': return cmdLsRemote(ctx, args);
         default: return fail("git: '" + sub + "' is not a git command. See 'git --help'.", 1);
     }
 }
@@ -615,18 +624,27 @@ function cmdLog(ctx: CommandContext, flags: Set<string>, values: Map<string,stri
     return ok(entries.map((entry, index) => (index === 0 ? '' : '\n') + mediumLog(repo, entry.oid, entry.info)).join(''));
 }
 
-function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
+function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const rev = rest[0] ?? 'HEAD';
-    const oid = repo.resolve(rev);
+    let oid = repo.resolve(rev);
     if (oid === undefined) return fail('fatal: bad revision ' + rev, 128);
+    let tagHeader = '';
+    const tagged = repo.object(oid);
+    if (tagged !== undefined && tagged.type === 'tag') {
+        const tag = parseTag(tagged.content);
+        tagHeader = 'tag ' + tag.tag + '\nTagger: ' + tag.tagger.name + ' <' + tag.tagger.email + '>\n' +
+            'Date:   ' + mediumDate(tag.tagger.ts, tag.tagger.tz) + '\n\n' +
+            tag.message.replace(/\n$/, '') + '\n\n';
+        oid = tag.object;
+    }
     const info = repo.readCommit(oid);
     if (info === undefined) return fail('fatal: bad object ' + rev, 128);
     const parentTree = info.parents.length > 0 ? (repo.readCommit(info.parents[0])?.tree ?? '') : '';
     const changes = parentTree === '' ? repo.changesBetween(new Map(), repo.flatTree(info.tree))
         : repo.changesBetween(repo.flatTree(parentTree), repo.flatTree(info.tree));
-    return ok(mediumLog(repo, oid, info) + '\n' + renderDiff(repo, changes));
+    return ok(tagHeader + mediumLog(repo, oid, info) + '\n' + renderDiff(repo, changes));
 }
 
 function cmdDiff(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
@@ -700,6 +718,7 @@ function switchBranch(repo: GitRepo, name: string, create: boolean): CommandResu
     const target = repo.refs.read('refs/heads/' + name);
     if (target === undefined) return fail('fatal: invalid reference: ' + name, 128);
     const from = repo.refs.branch();
+    repo.remove(repo.g('OWC_DETACH_LABEL'));
     repo.refs.setHead('refs/heads/' + name);
     repo.checkoutTree(target);
     repo.refs.appendReflog('HEAD', target, target, repo.who(), 'checkout: moving from ' + from + ' to ' + name, repo.identity().ts, repo.identity().tz);
@@ -721,9 +740,15 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     }
     if (name === undefined) return fail('fatal: you are on a branch yet to be born', 128);
     if (repo.refs.branches().includes(name)) return switchBranch(repo, name, false);
-    const oid = repo.resolve(name);
+    let oid = repo.resolve(name);
     if (oid === undefined) return fail("error: pathspec '" + name + "' did not match any file(s) known to git", 1);
+    const resolved = repo.object(oid);
+    if (resolved !== undefined && resolved.type === 'tag') oid = parseTag(resolved.content).object;
     repo.refs.setDetached(oid);
+    /* git describe uses the checked-out tag name for the detached label; a raw oid or HEAD uses
+       the abbreviated oid. */
+    if (repo.refs.tags().includes(name)) repo.writeText(repo.g('OWC_DETACH_LABEL'), name);
+    else repo.remove(repo.g('OWC_DETACH_LABEL'));
     repo.checkoutTree(oid);
     return ok('', 'HEAD is now at ' + abbrev(oid) + ' ' + repo.subjectOf(oid) + '\n');
 }
@@ -867,14 +892,11 @@ function cmdStash(ctx: CommandContext, flags: Set<string>, values: Map<string,st
             if (change.newOid !== undefined) { const blob = repo.readBlob(change.newOid); if (blob !== undefined) repo.writeBytes(repo.w(change.path), blob); }
             else repo.remove(repo.w(change.path));
         }
-        let entries = repo.indexEntries();
-        for (const change of changes) {
-            entries = entries.filter((entry) => entry.path !== change.path);
-            if (change.newOid !== undefined && repo.exists(repo.w(change.path))) entries.push(repo.entryFor(change.path));
-        }
-        repo.writeIndexEntries(entries);
+        /* git stash pop restores the WORKTREE only: the index stays at HEAD, so the changes are
+           unstaged. Staging them here produced "Changes to be committed" instead of host's
+           "Changes not staged for commit" section. */
         if (action === 'pop') repo.refs.removeRef('refs/stash');
-        return ok(longStatus(statusOf(repo)) + 'Dropped refs/stash@{0} (' + abbrev(oid) + ')\n');
+        return ok(longStatus(statusOf(repo)) + 'Dropped refs/stash@{0} (' + oid + ')\n');
     }
     const view = statusOf(repo);
     if (view.unstaged.length === 0 && view.staged.length === 0) return ok('No local changes to save\n');
@@ -983,37 +1005,95 @@ function cmdCherryPick(ctx: CommandContext, flags: Set<string>, values: Map<stri
         '\n Date: ' + mediumDate(info.author.ts, info.author.tz) + '\n' + commitLines(repo, made.changes));
 }
 
-function cmdRebase(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
+function cmdRebase(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const onto = repo.resolve(rest[0] ?? 'HEAD');
     const head = repo.refs.headOid();
     if (onto === undefined || head === undefined) return fail('fatal: invalid upstream', 128);
-    if (onto === head || repo.commonAncestor(onto, head) === onto) return ok('Current branch ' + repo.refs.branch() + ' is up to date.\n');
-    return ok('Successfully rebased and updated refs/heads/' + repo.refs.branch() + '.\n');
+    const branch = repo.refs.branch();
+    if (onto === head || repo.commonAncestor(onto, head) === onto) return ok('Current branch ' + branch + ' is up to date.\n');
+    /* Replay every commit from the merge-base exclusive up to HEAD onto the upstream tree. */
+    const base = repo.commonAncestor(head, onto);
+    const chain: { oid: string; info: CommitInfo }[] = [];
+    let cur: string | undefined = head;
+    while (cur !== undefined && cur !== base) {
+        const info: CommitInfo | undefined = repo.readCommit(cur);
+        if (info === undefined) break;
+        chain.push({ oid: cur, info });
+        cur = info.parents[0];
+    }
+    chain.reverse();
+    const ontoCommit = repo.readCommit(onto);
+    if (ontoCommit === undefined) return fail('fatal: invalid upstream', 128);
+    let treeMap = new Map<string, FileState>(repo.flatTree(ontoCommit.tree));
+    let parent = onto;
+    const progress: string[] = [];
+    for (let i = 0; i < chain.length; i++) {
+        progress.push('Rebasing (' + (i + 1) + '/' + chain.length + ')\r');
+        const info = chain[i].info;
+        const parentTree = info.parents.length > 0 ? (repo.readCommit(info.parents[0])?.tree ?? '') : '';
+        const before = parentTree === '' ? new Map<string, FileState>() : repo.flatTree(parentTree);
+        for (const change of repo.changesBetween(before, repo.flatTree(info.tree))) {
+            if (change.newOid === undefined) treeMap.delete(change.path);
+            else treeMap.set(change.path, { oid: change.newOid, mode: change.mode });
+        }
+        const treeOid = repo.buildTree(treeMap);
+        const made: CommitInfo = { tree: treeOid, parents: [parent], author: info.author,
+            committer: repo.identity(), message: info.message, extra: [] };
+        parent = repo.objects.write('commit', serializeCommit(made));
+    }
+    repo.refs.writeRef('refs/heads/' + branch, parent);
+    repo.refs.appendReflog('HEAD', head, parent, repo.who(), 'rebase: onto ' + (rest[0] ?? 'HEAD'), repo.identity().ts, repo.identity().tz);
+    repo.checkoutTree(parent);
+    return ok('', progress.join('') + 'Successfully rebased and updated refs/heads/' + branch + '.\n');
 }
 
-function cmdRemote(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
+function cmdRemote(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const names = rest.filter((r) => !r.startsWith('-'));
-    if (flags.has('-v') || flags.has('--verbose') || names.length === 0) {
-        const remotes = new Set<string>();
-        for (const line of repo.config.readScope('local')) if (line.section === 'remote' && line.subsection !== undefined) remotes.add(line.subsection);
-        if (flags.has('-v')) {
-            let out = '';
-            for (const name of [...remotes].sort()) {
-                const url = repo.config.get('remote.' + name + '.url') ?? '';
-                out += name + '\t' + url + ' (fetch)\n' + name + '\t' + url + ' (push)\n';
-            }
-            return ok(out);
+    const lines = (): ConfigLine[] => repo.config.readScope('local');
+    const save = (ls: ConfigLine[]): void => { ctx.fs.writeFile(repo.gitDir + '/config', formatConfig(ls)); };
+    const remotesOf = (ls: ConfigLine[]): string[] => [...new Set(ls
+        .filter((l) => l.section === 'remote' && l.subsection !== undefined)
+        .map((l) => l.subsection as string))].sort();
+    const urlOf = (name: string): string | undefined => repo.config.get('remote.' + name + '.url');
+    const verbose = flags.has('-v') || flags.has('--verbose');
+    if (verbose || names.length === 0) {
+        if (!verbose) return ok(remotesOf(lines()).map((n) => n + '\n').join(''));
+        let out = '';
+        for (const n of remotesOf(lines())) {
+            const url = urlOf(n) ?? '';
+            out += n + '\t' + url + ' (fetch)\n' + n + '\t' + url + ' (push)\n';
         }
-        return ok([...remotes].sort().map((name) => name + '\n').join(''));
+        return ok(out);
     }
-    if (names[0] === 'add' && names.length >= 3) {
-        repo.config.set('local', 'remote.' + names[1] + '.url', names[2]);
-        repo.config.set('local', 'remote.' + names[1] + '.fetch', '+refs/heads/*:refs/remotes/' + names[1] + '/*');
-        return ok('');
+    const sub = names[0];
+    if (sub === 'add' && names.length >= 3) {
+        const ls = lines();
+        ls.push({ section: 'remote', subsection: names[1], key: 'url', value: names[2] });
+        ls.push({ section: 'remote', subsection: names[1], key: 'fetch', value: '+refs/heads/*:refs/remotes/' + names[1] + '/*' });
+        save(ls); return ok('');
+    }
+    if (sub === 'get-url' && names.length >= 2) {
+        const url = urlOf(names[1]);
+        if (url === undefined) return fail("fatal: No such remote '" + names[1] + "'", 128);
+        return ok(url + '\n');
+    }
+    if (sub === 'set-url' && names.length >= 3) {
+        const ls = lines(); let hit = false;
+        for (const l of ls) if (l.section === 'remote' && l.subsection === names[1] && l.key === 'url') { l.value = names[2]; hit = true; }
+        if (!hit) return fail("fatal: No such remote '" + names[1] + "'", 128);
+        save(ls); return ok('');
+    }
+    if ((sub === 'remove' || sub === 'rm') && names.length >= 2) {
+        save(lines().filter((l) => !(l.section === 'remote' && l.subsection === names[1]))); return ok('');
+    }
+    if (sub === 'rename' && names.length >= 3) {
+        const ls = lines();
+        for (const l of ls) if (l.section === 'remote' && l.subsection === names[1]) l.subsection = names[2];
+        save(ls); return ok('');
     }
     return ok('');
 }
@@ -1043,4 +1123,263 @@ function cmdClone(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     const commit = oid === undefined ? undefined : repo.readCommit(oid);
     if (commit !== undefined) repo.checkoutTree(commit.tree, false);
     return ok('', "Cloning into '" + target + "'...\ndone.\n");
+}
+
+/* ------------------------------------------------------------------ *
+ * bisect: .git/BISECT_* state over the VFS
+ * ------------------------------------------------------------------ */
+const BISECT_USAGE = [
+    'usage: git bisect start [--term-(bad|new)=<term-new> --term-(good|old)=<term-old>]',
+    '                        [--no-checkout] [--first-parent] [<bad> [<good>...]] [--] [<pathspec>...]',
+    '   or: git bisect (bad|new|<term-new>) [<rev>]',
+    '   or: git bisect (good|old|<term-old>) [<rev>...]',
+    '   or: git bisect terms [--term-(good|old) | --term-(bad|new)]',
+    '   or: git bisect skip [(<rev>|<range>)...]',
+    '   or: git bisect next',
+    '   or: git bisect reset [<commit>]',
+    '   or: git bisect (visualize|view)',
+    '   or: git bisect replay <logfile>',
+    '   or: git bisect log',
+    '   or: git bisect run <cmd> [<arg>...]',
+    '   or: git bisect help',
+    '', ''
+].join('\n');
+
+function bisectState(repo: GitRepo) {
+    return {
+        log: repo.readText(repo.g('BISECT_LOG')) ?? '',
+        bad: repo.readText(repo.g('BISECT_BAD'))?.trim(),
+        good: repo.readText(repo.g('BISECT_GOOD'))?.trim(),
+        status: repo.readText(repo.g('BISECT_STATUS'))?.trim() ?? 'waiting for both good and bad commits'
+    };
+}
+function bisectClear(repo: GitRepo): void {
+    for (const n of ['BISECT_START', 'BISECT_LOG', 'BISECT_BAD', 'BISECT_GOOD', 'BISECT_STATUS', 'BISECT_EXPECTED_REV', 'BISECT_HEAD_MOVED'])
+        repo.remove(repo.g(n));
+}
+function bisectChain(repo: GitRepo, from: string, to: string): string[] {
+    const out: string[] = [];
+    let cur: string | undefined = from;
+    const seen = new Set<string>();
+    while (cur !== undefined && cur !== to && !seen.has(cur)) {
+        seen.add(cur);
+        const info = repo.readCommit(cur);
+        if (info === undefined) break;
+        out.push(cur);
+        cur = info.parents[0];
+    }
+    return out;
+}
+function cmdBisect(ctx: CommandContext, raw: string[]): CommandResult {
+    const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
+    const repo = asRepo(found) as GitRepo;
+    const rest = raw.filter((a) => !a.startsWith('-'));
+    const action = rest[0];
+    if (action === undefined) return fail('fatal: need a command\n\n' + BISECT_USAGE, 129);
+    if (action === 'start') {
+        bisectClear(repo);
+        repo.writeText(repo.g('BISECT_START'), repo.refs.headOid() ?? '');
+        repo.writeText(repo.g('BISECT_LOG'), 'git bisect start\n');
+        repo.writeText(repo.g('BISECT_STATUS'), 'waiting for both good and bad commits');
+        return ok('status: waiting for both good and bad commits\n');
+    }
+    if (action === 'reset') {
+        /* Host prints "Already on '<branch>'" when bisect never moved HEAD; only a checked-out
+           midpoint produces the "Previous HEAD position was ..." pair. */
+        const moved = repo.exists(repo.g('BISECT_HEAD_MOVED'));
+        const head = repo.refs.headOid();
+        bisectClear(repo);
+        if (!moved) return ok('', "Already on '" + repo.refs.branch() + "'\n");
+        return ok('', 'Previous HEAD position was ' + abbrev(head ?? ZERO_OID) + ' ' +
+            repo.subjectOf(head ?? '') + "\nSwitched to branch '" + repo.refs.branch() + "'\n");
+    }
+    if (action === 'log') return ok(bisectState(repo).log);
+    if (action === 'bad' || action === 'good') {
+        const state = bisectState(repo);
+        const rev = rest[1] ?? 'HEAD';
+        const oid = repo.resolve(rev);
+        if (oid === undefined) return fail('fatal: bad revision ' + rev, 128);
+        const subject = repo.subjectOf(oid);
+        let log = state.log + '# status: ' + state.status + '\n# ' + action + ': [' + oid + '] ' + subject + '\n' +
+            'git bisect ' + action + ' ' + oid + '\n';
+        let status = state.status;
+        if (action === 'bad') {
+            repo.writeText(repo.g('BISECT_BAD'), oid);
+            status = repo.exists(repo.g('BISECT_GOOD')) ? 'waiting for bad commit, good commit known' : 'waiting for good commit(s), bad commit known';
+        } else {
+            if (state.bad === oid) { repo.writeText(repo.g('BISECT_LOG'), log); return ok(oid + ' was both good and bad\n', '', 1); }
+            repo.writeText(repo.g('BISECT_GOOD'), oid);
+            const bad = state.bad ?? repo.refs.headOid();
+            if (bad !== undefined && oid !== bad) {
+                const chain = bisectChain(repo, bad, oid);
+                if (chain.length > 1) {
+                    const mid = chain[Math.floor((chain.length - 1) / 2)];
+                    const midInfo = repo.readCommit(mid);
+                    repo.refs.setDetached(mid);
+                    repo.checkoutTree(mid);
+                    repo.writeText(repo.g('BISECT_HEAD_MOVED'), mid);
+                    status = 'Bisecting: ' + (chain.length - 2) + ' revisions left to test after this (roughly ' +
+                        Math.round(Math.log2(Math.max(1, chain.length - 1))) + ' steps)';
+                    repo.writeText(repo.g('BISECT_LOG'), log);
+                    repo.writeText(repo.g('BISECT_STATUS'), status);
+                    return ok('Bisecting: ' + (chain.length - 2) + ' revisions left to test after this (roughly ' +
+                        Math.round(Math.log2(Math.max(1, chain.length - 1))) + ' steps)\n[' + mid + '] ' +
+                        (midInfo === undefined ? '' : midInfo.message.trim().split('\n')[0]) + '\n');
+                }
+            }
+            status = 'waiting for both good and bad commits';
+        }
+        repo.writeText(repo.g('BISECT_LOG'), log);
+        repo.writeText(repo.g('BISECT_STATUS'), status);
+        return ok('status: ' + status + '\n');
+    }
+    return fail("fatal: unknown command: '" + action + "'\n\n" + BISECT_USAGE, 129);
+}
+
+/* ------------------------------------------------------------------ *
+ * fsck: loose-object sha1 walk + connectivity from refs and reflogs
+ * ------------------------------------------------------------------ */
+function cmdFsck(ctx: CommandContext, raw: string[]): CommandResult {
+    const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
+    const repo = asRepo(found) as GitRepo;
+    const all: { oid: string; type: string }[] = [];
+    const errors: string[] = [];
+    for (const dir of repo.names(repo.g('objects'))) {
+        if (!/^[0-9a-f]{2}$/.test(dir)) continue;
+        for (const name of repo.names(repo.g('objects/' + dir))) {
+            const oid = dir + name;
+            if (!/^[0-9a-f]{40}$/.test(oid)) continue;
+            const rel = '.git/objects/' + dir + '/' + name;
+            const packed = repo.readBytes(repo.g('objects/' + dir + '/' + name));
+            if (packed === undefined) { errors.push('error: ' + oid + ': object corrupt or missing: ' + rel + '\n'); continue; }
+            let full: Uint8Array;
+            try { full = zinflate(packed); } catch {
+                errors.push('error: inflate: data stream error (incorrect header check)\n' +
+                    'error: unable to unpack header of ' + rel + '\n' +
+                    'error: ' + oid + ': object corrupt or missing: ' + rel + '\n');
+                continue;
+            }
+            if (sha1Hex(full) !== oid) errors.push('error: ' + oid + ': object corrupt or missing: ' + rel + '\n');
+            const nul = full.indexOf(0);
+            const type = nul < 0 ? '' : text(full.subarray(0, nul)).split(' ')[0];
+            all.push({ oid, type });
+        }
+    }
+    const reachable = new Set<string>();
+    const queue: string[] = [];
+    const head = repo.refs.headOid();
+    if (head !== undefined) queue.push(head);
+    for (const b of repo.refs.branches()) { const o = repo.refs.read('refs/heads/' + b); if (o !== undefined) queue.push(o); }
+    for (const t of repo.refs.tags()) { const o = repo.refs.read('refs/tags/' + t); if (o !== undefined) queue.push(o); }
+    for (const e of repo.refs.reflog('HEAD')) queue.push(e.old, e.next);
+    for (const e of repo.refs.reflog('refs/stash')) queue.push(e.old, e.next);
+    while (queue.length > 0) {
+        const oid = queue.shift() as string;
+        if (!/^[0-9a-f]{40}$/.test(oid) || reachable.has(oid)) continue;
+        reachable.add(oid);
+        const obj = repo.object(oid);
+        if (obj === undefined) continue;
+        if (obj.type === 'commit') { const info = parseCommit(obj.content); queue.push(info.tree, ...info.parents); }
+        else if (obj.type === 'tree') { for (const e of parseTree(obj.content)) queue.push(e.oid); }
+        else if (obj.type === 'tag') { queue.push(parseTag(obj.content).object); }
+    }
+    let out = '';
+    for (const obj of all) if (!reachable.has(obj.oid)) out += 'dangling ' + obj.type + ' ' + obj.oid + '\n';
+    return ok(out, errors.join(''), errors.length > 0 ? 1 : 0);
+}
+
+/* ------------------------------------------------------------------ *
+ * local-path transport: fetch / push / pull / ls-remote over the VFS
+ * ------------------------------------------------------------------ */
+function localRepo(ctx: CommandContext, source: string): GitRepo | undefined {
+    if (/^https?:\/\//.test(source) || /^ssh:\/\//.test(source) || /^git:\/\//.test(source) ||
+        /^file:\/\//.test(source) || /^[^/:@\s]+@[^/:\s]+:/.test(source)) return undefined;
+    const base = ctx.cwd || '/app';
+    const abs = normalizePath(source.startsWith('/') ? source : base + '/' + source);
+    for (const gd of [abs + '/.git', abs]) {
+        if (ctx.fs.fileExists(gd + '/objects')) return new GitRepo({ ...ctx, cwd: abs }, abs, gd);
+    }
+    return undefined;
+}
+function remoteTarget(repo: GitRepo, target: string): string {
+    return repo.config.get('remote.' + target + '.url') ?? target;
+}
+function copyObjects(from: GitRepo, to: GitRepo): void {
+    for (const dir of from.names(from.g('objects'))) {
+        if (!/^[0-9a-f]{2}$/.test(dir)) continue;
+        for (const name of from.names(from.g('objects/' + dir))) {
+            const bytes = from.readBytes(from.g('objects/' + dir + '/' + name));
+            if (bytes === undefined) continue;
+            const dst = to.g('objects/' + dir + '/' + name);
+            if (!to.exists(dst)) { to.mkdirp(dst.slice(0, dst.lastIndexOf('/'))); to.writeBytes(dst, bytes); }
+        }
+    }
+}
+function displayUrl(url: string): string { return url.replace(/\.git$/, ''); }
+function cmdPush(ctx: CommandContext, raw: string[]): CommandResult {
+    const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
+    const repo = asRepo(found) as GitRepo;
+    const rest = raw.filter((a) => !a.startsWith('-'));
+    const target = rest[0] ?? 'origin';
+    const url = remoteTarget(repo, target);
+    const src = localRepo(ctx, url);
+    if (src === undefined) return fail("fatal: '" + target + "' does not appear to be a git repository", 128);
+    const head = repo.refs.headOid();
+    if (head === undefined) return fail('fatal: no commits yet', 128);
+    const branch = rest[1] ?? repo.refs.branch();
+    copyObjects(repo, src);
+    src.refs.writeRef('refs/heads/' + branch, head);
+    if (!src.exists(src.g('HEAD'))) src.refs.setHead('refs/heads/' + branch);
+    return ok('', 'To ' + url + '\n * [new branch]      ' + branch + ' -> ' + branch + '\n');
+}
+function cmdFetch(ctx: CommandContext, raw: string[]): CommandResult {
+    const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
+    const repo = asRepo(found) as GitRepo;
+    const rest = raw.filter((a) => !a.startsWith('-'));
+    const target = rest[0] ?? 'origin';
+    const url = remoteTarget(repo, target);
+    const src = localRepo(ctx, url);
+    if (src === undefined) return fail("fatal: '" + target + "' does not appear to be a git repository", 128);
+    copyObjects(src, repo);
+    const oid = src.refs.headOid() ?? '';
+    repo.writeText(repo.g('FETCH_HEAD'), oid + '\n');
+    return ok('', 'From ' + displayUrl(url) + '\n * branch            HEAD       -> FETCH_HEAD\n');
+}
+function cmdPull(ctx: CommandContext, raw: string[]): CommandResult {
+    const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
+    const repo = asRepo(found) as GitRepo;
+    const rest = raw.filter((a) => !a.startsWith('-'));
+    const target = rest[0] ?? 'origin';
+    const url = remoteTarget(repo, target);
+    const src = localRepo(ctx, url);
+    if (src === undefined) return fail("fatal: '" + target + "' does not appear to be a git repository", 128);
+    const branch = rest[1] ?? repo.refs.branch();
+    copyObjects(src, repo);
+    const oid = src.refs.headOid();
+    const head = repo.refs.headOid();
+    if (oid !== undefined && oid !== head) {
+        const commit = repo.readCommit(oid);
+        if (commit !== undefined) {
+            if (repo.refs.head().ref !== undefined) repo.refs.writeRef(repo.refs.head().ref as string, oid);
+            else repo.refs.setDetached(oid);
+            repo.checkoutTree(oid);
+        }
+    }
+    repo.writeText(repo.g('FETCH_HEAD'), (oid ?? '') + '\n');
+    return ok('Already up to date.\n', 'From ' + displayUrl(url) + '\n * branch            ' + branch + '       -> FETCH_HEAD\n');
+}
+function cmdLsRemote(ctx: CommandContext, raw: string[]): CommandResult {
+    const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
+    const repo = asRepo(found) as GitRepo;
+    const rest = raw.filter((a) => !a.startsWith('-'));
+    const target = rest[0] ?? 'origin';
+    const url = remoteTarget(repo, target);
+    const src = localRepo(ctx, url);
+    if (src === undefined) return fail("fatal: '" + target + "' does not appear to be a git repository", 128);
+    let out = '';
+    const head = src.refs.headOid();
+    if (head !== undefined) out += head + '\tHEAD\n';
+    for (const b of src.refs.branches()) { const o = src.refs.read('refs/heads/' + b); if (o !== undefined) out += o + '\trefs/heads/' + b + '\n'; }
+    for (const t of src.refs.tags()) { const o = src.refs.read('refs/tags/' + t); if (o !== undefined) out += o + '\trefs/tags/' + t + '\n'; }
+    return ok(out);
 }

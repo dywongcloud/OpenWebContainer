@@ -53,22 +53,39 @@ function boundaryFamily(subcommand: string, args: string[]): string | undefined 
             if (/^http:\/\//.test(source)) return 'git-smart-http';
             return 'git-clone'; // https and every other remote scheme
         }
+        /* A LOCAL VFS path needs no transport: fetch/push/pull/ls-remote fall through to the
+           local implementation in commands.ts. Only a URL (http/https/ssh/git/other scheme) is a
+           remote transport boundary. The named outcome is never derived from a name alone. */
         case 'fetch':
         case 'upload-pack':
-            return 'git-fetch';
         case 'pull':
-            return 'git-pull';
         case 'push':
         case 'receive-pack':
-            return 'git-push';
-        case 'ls-remote':
-            return 'git-ls-remote';
-        case 'remote':
+        case 'ls-remote': {
+            const url = positionals.find((a) => { const s = remoteScheme(a); return s !== undefined && s !== 'file'; });
+            if (url === undefined) return undefined; // implemented over the VFS for local paths
+            const family: Record<string, string> = { fetch: 'git-fetch', 'upload-pack': 'git-fetch',
+                pull: 'git-pull', push: 'git-push', 'receive-pack': 'git-push', 'ls-remote': 'git-ls-remote' };
+            return family[subcommand];
+        }
+        case 'remote': {
+            /* add/remove/rename/set-url/get-url/-v and the bare listing are LOCAL .git/config
+               operations. show/prune/update query or mutate remote refs over a transport. */
+            const verb = positionals[0];
+            const local = verb === undefined || ['add', 'remove', 'rm', 'rename', 'set-url',
+                'get-url', 'set-head', 'set-branches', 'get-url-all'].includes(verb);
+            if (local) return undefined;
             return 'git-remote';
+        }
         case 'submodule':
-            return 'git-submodule';
+            return positionals[0] === 'add' ? 'git-gitlink' : 'git-submodule';
         case 'credential':
             return 'git-credential';
+        case 'credential-store':
+        case 'credential-cache':
+        case 'credential-osxkeychain':
+        case 'credential-libsecret':
+            return 'git-credentials';
 
         /* GPG signing: commit -S / tag -s / verify-*. */
         case 'commit':

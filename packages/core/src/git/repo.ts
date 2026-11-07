@@ -296,7 +296,17 @@ export class GitRepo {
     }
 
     checkoutTree(oid: string, prune = true): void {
-        const tree = this.flatTree(oid);
+        /* Callers pass either a tree oid (reset --hard, merge, stash, clone, read-tree) or a
+           COMMIT oid (checkout --detach, switchBranch). flatTree only walks tree objects, so a
+           commit oid produced an empty tree: it deleted every tracked worktree file and wrote an
+           empty index, which made a following 'git status' report staged deletions. */
+        let treeOid = oid;
+        const obj = this.object(oid);
+        if (obj !== undefined && obj.type === 'commit') {
+            const commit = this.readCommit(oid);
+            if (commit !== undefined) treeOid = commit.tree;
+        }
+        const tree = this.flatTree(treeOid);
         const tracked = this.indexTree();
         if (prune) for (const path of tracked.keys()) {
             if (!tree.has(path)) this.remove(this.w(path));

@@ -142,5 +142,8 @@ export function parseTag(content: Uint8Array): TagInfo {
 export function serializeTag(info: TagInfo): Uint8Array {
     const lines = ['object ' + info.object, 'type ' + info.type, 'tag ' + info.tag, 'tagger ' + identityLine(info.tagger), ''];
     const message = info.message.endsWith('\n') ? info.message : info.message + '\n';
-    return utf8(lines.join('\n') + message);
+    /* A tag object has a BLANK line between the header and the message, exactly like a commit
+       (serializeCommit: lines.join('\n') + '\n' + message). Without it, git show / cat-file -p
+       of an annotated tag has no header/message separator. */
+    return utf8(lines.join('\n') + '\n' + message);
 }

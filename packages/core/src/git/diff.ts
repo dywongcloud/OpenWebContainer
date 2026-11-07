@@ -147,11 +147,12 @@ export function renderStat(repo: GitRepo, changes: Change[], width = 80): string
     parts.push(' ' + files + ' file' + (files === 1 ? '' : 's') + ' changed');
     if (added > 0) parts.push(added + ' insertion' + (added === 1 ? '' : 's') + '(+)');
     if (removed > 0) parts.push(removed + ' deletion' + (removed === 1 ? '' : 's') + '(-)');
+    /* Host prints the change-count summary BEFORE the create/delete mode lines. */
+    lines.push(parts.join(', '));
     for (const entry of counts) {
         if (entry.created) lines.push(' create mode ' + (entry.mode === 0o100755 ? '100755' : '100644') + ' ' + entry.path);
         if (entry.deleted) lines.push(' delete mode ' + (entry.mode === 0o100755 ? '100755' : '100644') + ' ' + entry.path);
     }
-    lines.push(parts.join(', '));
     return lines.join('\n') + '\n';
 }
 
