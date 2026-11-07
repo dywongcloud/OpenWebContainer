@@ -1,0 +1,115 @@
+/**
+ * The git subcommands that are named boundaries, not implementations.
+ *
+ * The local git CLI in this directory implements the commands that work entirely over the VFS:
+ * init, add, commit, log, status, branch, checkout, merge, tag, stash, config, diff, ... and a
+ * clone of a LOCAL PATH, which copies HEAD/objects/refs within the VFS and needs no transport.
+ * Everything that would need a remote transport, a signing binary, a spawned hook, a
+ * packfile/mmap subsystem, a linked worktree, a submodule gitlink, a credential helper or a host
+ * identity is a boundary.
+ *
+ * gitBoundaryOutcome maps such an invocation to the ONE canonical named outcome the shell already
+ * uses for every utility it cannot have: unsupportedResult('git-<family>') in
+ * shell/commands/unsupported.ts:1839-1843, whose shape is
+ *
+ *     git-<family>: [<CODE>] not supported on this runtime: <reason>
+ *
+ * on stderr with a trailing newline, empty stdout, and exit code 1. This module invents no second
+ * output shape. It returns undefined for every subcommand the CLI implements, so the dispatcher
+ * falls through to the real command; a boundary never returns a bare 127.
+ */
+import { unsupportedResult } from '../shell/commands/unsupported';
+import type { CommandResult } from '../shell/commands/types';
+
+/** A remote transport URL, as opposed to a local path a clone can copy within the VFS. */
+function remoteScheme(arg: string): string | undefined {
+    if (/^https?:\/\//.test(arg)) return 'http';
+    if (/^git:\/\//.test(arg)) return 'git';
+    if (/^ssh:\/\//.test(arg) || /^[^/:@\s]+@[^/:\s]+:/.test(arg)) return 'ssh';
+    if (/^file:\/\//.test(arg)) return 'file';
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(arg)) return 'other';
+    return undefined;
+}
+
+/**
+ * Picks the git-<family> UNSUPPORTED key for a boundary invocation, or undefined when the CLI
+ * implements it. Keys carry no spaces so isUnsupported and UNSUPPORTED_COMMANDS derive from them.
+ */
+function boundaryFamily(subcommand: string, args: string[]): string | undefined {
+    const positionals = args.filter((a) => !a.startsWith('-'));
+    const has = (...flags: string[]) =>
+        args.some((a) => flags.includes(a) || flags.some((f) => f.endsWith('=') && a.startsWith(f)));
+    switch (subcommand) {
+        /* Network egress: hub.ts:5-8 and :279 are loopback-only (ENETUNREACH). */
+        case 'clone': {
+            const source = positionals.find((a) => {
+                const s = remoteScheme(a);
+                return s !== undefined && s !== 'file';
+            });
+            if (source === undefined) return undefined; // a LOCAL-PATH clone is implemented
+            const scheme = remoteScheme(source);
+            if (scheme === 'ssh') return 'git-ssh-transport';
+            if (scheme === 'git') return 'git-git-transport';
+            if (/^http:\/\//.test(source)) return 'git-smart-http';
+            return 'git-clone'; // https and every other remote scheme
+        }
+        case 'fetch':
+        case 'upload-pack':
+            return 'git-fetch';
+        case 'pull':
+            return 'git-pull';
+        case 'push':
+        case 'receive-pack':
+            return 'git-push';
+        case 'ls-remote':
+            return 'git-ls-remote';
+        case 'remote':
+            return 'git-remote';
+        case 'submodule':
+            return 'git-submodule';
+        case 'credential':
+            return 'git-credential';
+
+        /* GPG signing: commit -S / tag -s / verify-*. */
+        case 'commit':
+            return has('-S', '--gpg-sign', '--gpg-sign=') ? 'git-gpg' : undefined;
+        case 'tag':
+            return has('-s', '--sign', '-u', '--local-user') ? 'git-gpg' : undefined;
+        case 'verify-commit':
+        case 'verify-tag':
+            return 'git-gpg';
+
+        /* Hooks, packfiles, worktrees, gitlinks, host identity. */
+        case 'hook':
+        case 'hooks':
+            return 'git-hooks';
+        case 'gc':
+        case 'repack':
+        case 'prune':
+        case 'index-pack':
+        case 'pack-objects':
+        case 'pack-refs':
+        case 'multi-pack-index':
+            return 'git-packfiles';
+        case 'worktree':
+            return 'git-worktree';
+        case 'lfs':
+        case 'git-lfs':
+            return 'git-host-identity';
+        default:
+            break;
+    }
+    if (subcommand.startsWith('credential-')) return 'git-credential';
+    return undefined; // implemented by the local git CLI
+}
+
+/**
+ * The canonical named "[CODE] not supported on this runtime" outcome for a boundary git
+ * subcommand, or undefined when the local git CLI implements it. Exit code is 1 by that contract
+ * (unsupported.ts:38-40, :1842) -- a measured deviation from host git's fatal 128 and
+ * git ls-remote's 2 -- deliberately kept, not normalized to the host.
+ */
+export function gitBoundaryOutcome(subcommand: string, args: string[]): CommandResult | undefined {
+    const family = boundaryFamily(subcommand, args);
+    return family === undefined ? undefined : unsupportedResult(family);
+}

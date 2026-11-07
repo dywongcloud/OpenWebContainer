@@ -1827,7 +1827,33 @@ export const UNSUPPORTED: Record<string, Unsupported> = {
     import: { code: 'ERR_NO_X_DISPLAY', reason: 'the container has no X display to capture' },
     xclip: { code: 'ERR_NO_X_SELECTION', reason: 'the container has no X selection to read or write' },
     open: { code: 'ERR_NO_DESKTOP', reason: 'the container cannot open a file on the host desktop' },
-    write: { code: 'ERR_NO_OTHER_USERS', reason: 'the container has no other users and no terminals to write to' }
+    write: { code: 'ERR_NO_OTHER_USERS', reason: 'the container has no other users and no terminals to write to' },
+    /* git: named BOUNDARIES. Local git (init/add/commit/log/status/branch/checkout/... over the
+       VFS) is a real implementation in src/git; a clone of a LOCAL PATH is one too. These keys are
+       the invocations that need a transport, a signing binary, a spawned hook, a packfile/mmap
+       subsystem, a linked worktree, a submodule gitlink, a credential helper or a host identity.
+       Each is a git-<family> key (no spaces) so isUnsupported and UNSUPPORTED_COMMANDS derive
+       from it; src/git/boundaries.ts maps an invocation to one of them. */
+    'git-clone': { code: 'ERR_GIT_NO_UPLOAD_PACK', reason: 'an https clone needs the remote git-upload-pack over smart HTTP, and the container network is loopback-only (ENETUNREACH)' },
+    'git-fetch': { code: 'ERR_GIT_NO_UPLOAD_PACK', reason: 'fetch needs a remote git-upload-pack, and the container network is loopback-only (ENETUNREACH)' },
+    'git-pull': { code: 'ERR_GIT_NO_UPLOAD_PACK', reason: 'pull is fetch plus merge, and the fetch needs a remote git-upload-pack the loopback-only network cannot reach' },
+    'git-ls-remote': { code: 'ERR_GIT_NO_UPLOAD_PACK', reason: 'ls-remote reads a remote info/refs over git-upload-pack, and the container network is loopback-only' },
+    'git-push': { code: 'ERR_GIT_NO_RECEIVE_PACK', reason: 'push needs a remote git-receive-pack, and the container network is loopback-only (ENETUNREACH)' },
+    'git-remote': { code: 'ERR_GIT_NO_REMOTE_HELPER', reason: 'a remote helper transports refs to another host, and no transport or remote helper exists in the container' },
+    'git-submodule': { code: 'ERR_GIT_NO_SUBMODULE_TRANSPORT', reason: 'submodule update fetches another repository, and the container network is loopback-only' },
+    'git-credential': { code: 'ERR_GIT_NO_CREDENTIAL_HELPER', reason: 'there is no credential helper or keychain in the container to store or supply credentials' },
+    'git-smart-http': { code: 'ERR_GIT_NO_SMART_HTTP', reason: 'a plain-http clone needs the smart-HTTP info/refs and upload-pack endpoints, and the container network is loopback-only' },
+    'git-ssh-transport': { code: 'ERR_GIT_NO_SSH_TRANSPORT', reason: 'an ssh/scp clone needs an SSH transport and an ssh binary, neither of which the container has' },
+    'git-git-transport': { code: 'ERR_GIT_NO_GIT_TRANSPORT', reason: 'a git:// clone needs the git daemon transport, which the loopback-only container network cannot reach' },
+
+    /* git: host-fidelity families. */
+    'git-gpg': { code: 'ERR_NO_GPG', reason: 'the container ships no gpg binary, so it cannot sign or verify a commit (-S) or tag (-s)' },
+    'git-hooks': { code: 'ERR_NO_HOOKS', reason: 'the container cannot spawn a hook: the shell starts only node, npm and npx as children (shell.ts:83)' },
+    'git-packfiles': { code: 'ERR_NO_PACKFILES', reason: 'there is no mmap/packfile subsystem: files are loose ArrayBuffers in one InMemoryStore (zenfs-core.ts:8-12), so gc/repack/prune/index-pack cannot be host-faithful' },
+    'git-worktree': { code: 'ERR_NO_WORKTREE', reason: 'a linked worktree needs real directories and symlinks, and symlinkSync is EPERM on the VFS (zenfs-core.ts:166-167)' },
+    'git-gitlink': { code: 'ERR_NO_GITLINK', reason: 'a submodule gitlink (mode 160000) cannot be host-faithful on a VFS with no real symlinks and no nested checkout' },
+    'git-credentials': { code: 'ERR_NO_CREDENTIALS', reason: 'the container has no credential store, and the host keychain (osxkeychain) must not be mirrored' },
+    'git-host-identity': { code: 'ERR_NO_HOST_IDENTITY', reason: 'host identity artifacts (user.name/user.email, git-lfs filters, osxkeychain, /opt/homebrew git, nvm PATH) must not be mirrored into the container (default-env.ts:26-33)' }
 };
 
 /** True when `name` is a utility the container cannot have. */
