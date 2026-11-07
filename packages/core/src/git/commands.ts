@@ -538,12 +538,20 @@ function cmdRevParse(ctx: CommandContext, flags: Set<string>, values: Map<string
     if (targets.length === 0) return ok((repo.refs.headOid() ?? '') + '\n');
     const verify = flags.has('--verify');
     let out = '';
+    let bad: string | undefined;
     for (const target of targets) {
         const oid = repo.resolve(target);
         if (oid === undefined) {
             if (verify) return fail('fatal: Needed a single revision', 128);
+            /* Host git 2.53.0 still echoes the literal on stdout, but dies 128 on the
+               first ambiguous argument on stderr and stops before later targets. */
             out += target + '\n';
+            bad = target;
+            break;
         } else out += oid + '\n';
+    }
+    if (bad !== undefined) {
+        return ok(out, "fatal: ambiguous argument '" + bad + "': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'\n", 128);
     }
     return ok(out);
 }
