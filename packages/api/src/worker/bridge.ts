@@ -12,7 +12,7 @@ export interface MessageHandler {
 interface PendingRequest {
     resolve: (value: any) => void;
     reject: (error: Error) => void;
-    timeout: number;
+    timeout: ReturnType<typeof setTimeout>;
 }
 import workerCode from '@open-web-container/core/worker-code';
 
