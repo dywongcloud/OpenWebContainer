@@ -27,7 +27,7 @@ import {
     scriptList,
     scriptPath
 } from '../../../npm/scripts';
-import { dependencyTree, globalDependencyTree, parseListArgs } from '../../../npm/tree';
+import { dependencyTree, globalDependencyTree, parseListArgs, orphanNames, globalRootNames, recordGlobalRoots, forgetGlobalRoots } from '../../../npm/tree';
 import type { GlobalListOptions } from '../../../npm/tree';
 import { Process, ProcessType } from '../../base';
 import { dirnameOf, joinPaths, normalizeAbsolute } from '../node/runtime/resolver';
@@ -90,9 +90,22 @@ export class NpmProcess extends Process {
                 ? await this.runNpx(registry, log)
                 : await this.runNpm(registry, log);
         } catch (error: any) {
-            this.emitError(`${error.message}\n`);
+            this.emitNpmError(error.message);
             this._exitCode = typeof error.exitCode === 'number' ? error.exitCode : 1;
         }
+    }
+
+    /** npm's trailing debug-log line. The container has no host log file, so the path is its own
+        cache's; the volatile log name is normalized like the host's. */
+    private debugLogFooter(): string {
+        const stamp = new Date().toISOString().replace(/:/g, '_');
+        return `npm error A complete log of this run can be found in: /home/.npm/_logs/${stamp}-debug-0.log\n`;
+    }
+
+    /** Emits an npm error block with exactly one trailing debug-log line. */
+    private emitNpmError(text: string): void {
+        const body = text.endsWith('\n') ? text : text + '\n';
+        this.emitError(body.includes('A complete log of this run') ? body : body + this.debugLogFooter());
     }
 
     private async runNpm(registry: NpmRegistry, log: (line: string) => void): Promise<number> {
@@ -158,10 +171,14 @@ export class NpmProcess extends Process {
     }
 
     /** `npm config get|set|list`: npm's own settings, not a package's. */
+    /** `npm config get|set|list`: npm's own settings, not a package's. */
     private runConfig(args: string[]): number {
         const result = runConfigCommand(this.fileSystem, this.cwd ?? '/', Object.fromEntries(this.env), args);
         if (result.stdout !== '') this.emitOutput(result.stdout);
-        if (result.stderr !== '') this.emitError(result.stderr);
+        if (result.stderr !== '') {
+            if (result.exitCode !== 0) this.emitNpmError(result.stderr);
+            else this.emitError(result.stderr);
+        }
         return result.exitCode;
     }
 
@@ -266,7 +283,7 @@ export class NpmProcess extends Process {
 
         const projectDir = this.cwd ?? '/';
         const packageDir = findPackageRoot(this.fileSystem, projectDir) ?? normalizeAbsolute(projectDir);
-        const installer = new NpmInstaller(this.fileSystem, registry, log, (args, cwd, env) => this.runLifecycleScript(args, cwd, env));
+        const installer = new NpmInstaller(this.fileSystem, registry, log, (args, cwd, env) => this.runLifecycleScript(args, cwd, env), (line: string) => this.emitError(line));
         const started = performance.now();
         /* npm runs the root's own scripts on `npm install` with no arguments and not on
            `npm install <pkg>`, which changes a dependency rather than the root: preinstall before
@@ -518,7 +535,7 @@ export class NpmProcess extends Process {
             const packageDir = localDir ?? joinPaths(npxCacheDir(requested), 'node_modules', spec.name);
             if (localDir === undefined && this.fileSystem.statPath(packageDir)?.type !== 'dir') {
                 log(`Need to install the following packages:\n${requested}`);
-                const installer = new NpmInstaller(this.fileSystem, registry, log, (args, cwd, env) => this.runLifecycleScript(args, cwd, env));
+                const installer = new NpmInstaller(this.fileSystem, registry, log, (args, cwd, env) => this.runLifecycleScript(args, cwd, env), (line: string) => this.emitError(line));
                 await installer.addPackages(npxCacheDir(requested), [spec], 'none');
             }
             const file = binFromPackage(this.fileSystem, packageDir, binName);
@@ -569,13 +586,13 @@ export class NpmProcess extends Process {
         const installer = new NpmInstaller(this.fileSystem, registry, log,
             (args, scriptCwd, scriptEnv) => this.runLifecycleScript(args, scriptCwd, {
                 ...globalInstallEnvironment(paths.prefix), ...scriptEnv
-            }));
+            }), (line: string) => this.emitError(line));
         try {
             let wanted = specs;
             if (wanted.length === 0) {
                 const manifest = readManifest(this.fileSystem, normalizeAbsolute(cwd));
                 if (manifest === undefined) {
-                    this.emitError(`npm error code ENOENT\nnpm error syscall open\nnpm error path ${joinPaths(normalizeAbsolute(cwd), 'package.json')}\nnpm error errno -2\nnpm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '${joinPaths(normalizeAbsolute(cwd), 'package.json')}'\nnpm error enoent This is related to npm not being able to find a file.\nnpm error enoent\n`);
+                    this.emitNpmError(`npm error code ENOENT\nnpm error syscall open\nnpm error path ${joinPaths(normalizeAbsolute(cwd), 'package.json')}\nnpm error errno -2\nnpm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '${joinPaths(normalizeAbsolute(cwd), 'package.json')}'\nnpm error enoent This is related to npm not being able to find a file.\nnpm error enoent\n`);
                     return 254;
                 }
                 wanted = [{ name: '', localPath: normalizeAbsolute(cwd) }];
@@ -590,10 +607,10 @@ export class NpmProcess extends Process {
             const message = typeof error?.message === 'string' ? error.message : String(error);
             if (/not found in the registry|E404/.test(message)) {
                 const name = specs[0]?.name || '';
-                this.emitError(`npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/${name} - Not found\nnpm error 404\nnpm error 404  The requested resource '${name}@*' could not be found or you do not have permission to access it.\nnpm error 404\nnpm error 404 Note that you can also install from a\nnpm error 404 tarball, folder, http url, or git url.\n`);
+                this.emitNpmError(`npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/${name} - Not found\nnpm error 404\nnpm error 404  The requested resource '${name}@*' could not be found or you do not have permission to access it.\nnpm error 404\nnpm error 404 Note that you can also install from a\nnpm error 404 tarball, folder, http url, or git url.\n`);
                 return 1;
             }
-            this.emitError(message.endsWith('\n') ? message : message + '\n');
+            this.emitNpmError(message);
             return typeof error?.exitCode === 'number' ? error.exitCode : 1;
         }
     }
@@ -622,25 +639,37 @@ export class NpmProcess extends Process {
             return 1;
         }
         const paths = globalPaths(this.fileSystem, this.cwd ?? '/', Object.fromEntries(this.env));
-        const modules = global ? paths.modules : joinPaths(findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/'), 'node_modules');
-        const binDir = global ? paths.bin : undefined;
+        const packageDir = findPackageRoot(this.fileSystem, this.cwd ?? '/') ?? normalizeAbsolute(this.cwd ?? '/');
+        const modules = global ? paths.modules : joinPaths(packageDir, 'node_modules');
+        const binDir = global ? paths.bin : joinPaths(modules, '.bin');
         const started = performance.now();
-        let removed = 0;
-        for (const name of names) {
+        const roots = global
+            ? globalRootNames(this.fileSystem, paths.lib)
+            : declaredDependencies(this.fileSystem, packageDir);
+        const keep = roots.filter((name) => !names.includes(name));
+        const gone = names.filter((name) => this.fileSystem.statPath(joinPaths(modules, name))?.type === 'dir');
+        /* npm prunes the packages that no remaining root reaches, and keeps a transitive
+           dependency another root still shares. */
+        const orphans = gone.length > 0
+            ? orphanNames(this.fileSystem, modules, global ? paths.modules : packageDir, keep)
+                .filter((name) => !names.includes(name))
+            : [];
+        const toRemove = [...gone, ...orphans];
+        for (const name of toRemove) {
             const dir = joinPaths(modules, name);
             if (this.fileSystem.statPath(dir)?.type !== 'dir') continue;
-            if (binDir !== undefined) {
-                for (const link of this.fileSystem.readdirNames(binDir) ?? []) {
-                    const file = joinPaths(binDir, link);
-                    let text: string | undefined;
-                    try { text = this.fileSystem.readFile(file); } catch { text = undefined; }
-                    if (text !== undefined && text.includes(dir + '/')) this.fileSystem.removePath(file);
-                }
+            for (const link of this.fileSystem.readdirNames(binDir) ?? []) {
+                const file = joinPaths(binDir, link);
+                let text: string | undefined;
+                try { text = this.fileSystem.readFile(file); } catch { text = undefined; }
+                if (text !== undefined && text.includes(dir + '/')) this.fileSystem.removePath(file);
             }
             this.fileSystem.removePath(dir, true);
-            removed += 1;
         }
+        if (global && gone.length > 0) forgetGlobalRoots(this.fileSystem, paths.lib, gone);
+        if (!global && gone.length > 0) removeDeclaredDependencies(this.fileSystem, packageDir, names);
         const duration = elapsedDuration(performance.now() - started);
+        const removed = toRemove.length;
         if (removed === 0) this.emitOutput(`\nup to date in ${duration}\n`);
         else this.emitOutput(`\nremoved ${removed} package${removed === 1 ? '' : 's'} in ${duration}\n`);
         return 0;
@@ -658,6 +687,32 @@ export class NpmProcess extends Process {
         return 0;
     }
 
+}
+
+/** The dependency names a project's package.json declares: the roots of its local tree. */
+function declaredDependencies(fileSystem: IFileSystem, packageDir: string): string[] {
+    const manifest = readManifest(fileSystem, packageDir);
+    if (manifest === undefined) return [];
+    const out = new Set<string>();
+    for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
+        for (const name of Object.keys((manifest[field] ?? {}) as Record<string, unknown>)) out.add(name);
+    }
+    return [...out];
+}
+
+/** `npm uninstall` also takes the names out of package.json, which is what leaves their
+    transitive dependencies orphaned on the next install. */
+function removeDeclaredDependencies(fileSystem: IFileSystem, packageDir: string, names: string[]): void {
+    const manifest = readManifest(fileSystem, packageDir);
+    if (manifest === undefined) return;
+    for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
+        const entries = manifest[field];
+        if (entries === undefined || typeof entries !== 'object') continue;
+        const record = entries as Record<string, unknown>;
+        for (const name of names) delete record[name];
+        if (Object.keys(record).length === 0) delete manifest[field];
+    }
+    fileSystem.writeFile(joinPaths(packageDir, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
 }
 
 /** npm's `EJSONPARSE` block for a package.json it cannot read: the parse error, the text and its two notes. */

@@ -321,14 +321,27 @@ export interface GlobalListOptions extends ListOptions {
 
 /**
  * `npm ls -g`: the tree npm draws under <prefix>/lib. A host roots the tree at the lib directory
- * itself (not lib/node_modules) and lists every package installed in that prefix at the top level;
- * local-folder installs carry a `-> <path>` arrow. There is no package.json at the root, so the
- * children come from the directory rather than from a manifest's dependency fields.
+ * itself and lists only the packages the user explicitly installed at the top level; their
+ * dependencies are nested beneath them. The global install writes every package into
+ * <prefix>/lib/node_modules, so the tree records which names were requested and resolves each
+ * package's declared dependencies out of that directory.
  */
-export function globalDependencyTree(fileSystem: IFileSystem, libDir: string, options: GlobalListOptions): string {
-    const lib = normalizeAbsolute(libDir);
-    const modules = joinPaths(lib, 'node_modules');
-    const entries: { name: string; version: string; dir: string; link?: string }[] = [];
+export interface GlobalEntry {
+    name: string;
+    version: string;
+    dir: string;
+    /** `UNMET ... DEPENDENCY` line for a dependency that could not be placed anywhere. */
+    label?: string;
+    link?: string;
+}
+
+/** The file a global install writes with the names it was explicitly asked to install. */
+const GLOBAL_ROOTS_FILE = '.owc-global-roots';
+
+/** Every package the global prefix holds, scopes included, in npm's alphabetical order. */
+function globalEntries(fileSystem: IFileSystem, libDir: string): GlobalEntry[] {
+    const modules = joinPaths(normalizeAbsolute(libDir), 'node_modules');
+    const out: GlobalEntry[] = [];
     const collect = (name: string): void => {
         const dir = joinPaths(modules, name);
         const manifest = readManifest(fileSystem, dir);
@@ -338,7 +351,7 @@ export function globalDependencyTree(fileSystem: IFileSystem, libDir: string, op
             const marker = fileSystem.readFile(joinPaths(dir, '.owc-global-link'));
             if (marker !== undefined && marker.trim() !== '') link = marker.trim();
         } catch { /* no link marker: a registry install */ }
-        entries.push({ name, version: String(manifest.version ?? ''), dir, link });
+        out.push({ name, version: String(manifest.version ?? ''), dir, link });
     };
     for (const name of fileSystem.readdirNames(modules) ?? []) {
         if (name === '.bin' || name.startsWith('.')) continue;
@@ -348,54 +361,189 @@ export function globalDependencyTree(fileSystem: IFileSystem, libDir: string, op
             collect(name);
         }
     }
-    entries.sort((left, right) => comparePackageIds(
+    out.sort((left, right) => comparePackageIds(
         `${left.name}@${left.version}`, `${right.name}@${right.version}`));
+    return out;
+}
+
+/**
+ * The names npm was explicitly asked to install. A tree written before the roots were recorded
+ * still has a defensible answer: a package no other package declares as a dependency is a root,
+ * because npm hoists a transitive dependency into the very directory a root would occupy.
+ */
+export function globalRootNames(fileSystem: IFileSystem, libDir: string): string[] {
+    const modules = joinPaths(normalizeAbsolute(libDir), 'node_modules');
+    const all = globalEntries(fileSystem, libDir);
+    try {
+        const recorded = fileSystem.readFile(joinPaths(modules, GLOBAL_ROOTS_FILE));
+        if (recorded !== undefined && recorded.trim() !== '') {
+            const present = new Set(all.map((entry) => entry.name));
+            return recorded.split('\n').map((line) => line.trim()).filter((name) => present.has(name));
+        }
+    } catch { /* the VFS holds no roots record for this prefix */ }
+    const depended = new Set<string>();
+    for (const entry of all) {
+        const manifest = readManifest(fileSystem, entry.dir) ?? {};
+        for (const name of Object.keys((manifest.dependencies ?? {}) as Record<string, unknown>)) depended.add(name);
+        for (const name of Object.keys((manifest.optionalDependencies ?? {}) as Record<string, unknown>)) depended.add(name);
+        for (const name of Object.keys((manifest.peerDependencies ?? {}) as Record<string, unknown>)) depended.add(name);
+    }
+    const inferred = all.filter((entry) => !depended.has(entry.name)).map((entry) => entry.name);
+    return inferred.length > 0 ? inferred : all.map((entry) => entry.name);
+}
+
+/** Records the names a global install was asked for, keeping the roots of earlier installs. */
+export function recordGlobalRoots(fileSystem: IFileSystem, libDir: string, names: string[]): void {
+    const modules = joinPaths(normalizeAbsolute(libDir), 'node_modules');
+    const existing = new Set(globalRootNames(fileSystem, libDir));
+    for (const name of names) existing.add(name);
+    fileSystem.writeFile(joinPaths(modules, GLOBAL_ROOTS_FILE), [...existing].sort().join('\n') + '\n');
+}
+
+/** Removes the names a global uninstall took out of the roots record. */
+export function forgetGlobalRoots(fileSystem: IFileSystem, libDir: string, names: string[]): void {
+    const modules = joinPaths(normalizeAbsolute(libDir), 'node_modules');
+    const kept = globalRootNames(fileSystem, libDir).filter((name) => !names.includes(name));
+    fileSystem.writeFile(joinPaths(modules, GLOBAL_ROOTS_FILE), kept.sort().join('\n') + '\n');
+}
+
+/** The directories of every package reachable from `starts` by its declared dependency edges. */
+function reachableDirs(fileSystem: IFileSystem, starts: { dir: string; names: string[] }[]): Set<string> {
+    const seen = new Set<string>();
+    const queue = [...starts];
+    while (queue.length > 0) {
+        const { dir, names } = queue.shift()!;
+        for (const name of names) {
+            const found = findInstalledCopy(fileSystem, dir, name);
+            if (found === undefined) continue;
+            const key = normalizeAbsolute(found);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const manifest = readManifest(fileSystem, found) ?? {};
+            const deps = [
+                ...Object.keys((manifest.dependencies ?? {}) as Record<string, unknown>),
+                ...Object.keys((manifest.optionalDependencies ?? {}) as Record<string, unknown>)
+            ];
+            queue.push({ dir: found, names: deps });
+        }
+    }
+    return seen;
+}
+
+/** Names in a node_modules no remaining root reaches: what `npm uninstall` prunes. */
+export function orphanNames(
+    fileSystem: IFileSystem,
+    modulesDir: string,
+    requesterDir: string,
+    roots: string[]
+): string[] {
+    const all: { name: string; dir: string }[] = [];
+    const add = (name: string): void => {
+        const dir = joinPaths(modulesDir, name);
+        if (readManifest(fileSystem, dir) === undefined) return;
+        all.push({ name, dir });
+    };
+    for (const name of fileSystem.readdirNames(modulesDir) ?? []) {
+        if (name === '.bin' || name.startsWith('.')) continue;
+        if (name.startsWith('@')) {
+            for (const scoped of fileSystem.readdirNames(joinPaths(modulesDir, name)) ?? []) add(`${name}/${scoped}`);
+        } else {
+            add(name);
+        }
+    }
+    const reachable = reachableDirs(fileSystem, roots.map((name) => ({ dir: requesterDir, names: [name] })));
+    return all
+        .filter((entry) => !roots.includes(entry.name) && !reachable.has(normalizeAbsolute(entry.dir)))
+        .map((entry) => entry.name);
+}
+
+export function globalDependencyTree(fileSystem: IFileSystem, libDir: string, options: GlobalListOptions): string {
+    const lib = normalizeAbsolute(libDir);
+    const modules = joinPaths(lib, 'node_modules');
+    const all = globalEntries(fileSystem, lib);
+    const rootNames = new Set(globalRootNames(fileSystem, lib));
+    const roots = all.filter((entry) => rootNames.has(entry.name));
+    const rootDirs = new Set(roots.map((entry) => normalizeAbsolute(entry.dir)));
+    const levels = options.depth === Infinity ? Infinity : options.depth + 1;
+
+    /** The dependencies of one package, resolved from the global node_modules it sits in. */
+    const childrenOf = (entry: GlobalEntry, ancestors: Set<string>): GlobalEntry[] => {
+        if (entry.dir === '') return [];
+        const manifest = readManifest(fileSystem, entry.dir) ?? {};
+        const required = (manifest.dependencies ?? {}) as Record<string, string>;
+        const optional = (manifest.optionalDependencies ?? {}) as Record<string, string>;
+        const names: { name: string; range: string; optional: boolean }[] = [];
+        for (const [name, range] of Object.entries(required)) {
+            if (!(name in optional)) names.push({ name, range: String(range), optional: false });
+        }
+        for (const [name, range] of Object.entries(optional)) names.push({ name, range: String(range), optional: true });
+        const out: GlobalEntry[] = [];
+        for (const { name, range, optional: isOptional } of names) {
+            const dir = findInstalledCopy(fileSystem, entry.dir, name);
+            if (dir === undefined) {
+                out.push({
+                    name, version: range, dir: '',
+                    label: `UNMET ${isOptional ? 'OPTIONAL ' : ''}DEPENDENCY ${name}@${range}`
+                });
+                continue;
+            }
+            const key = normalizeAbsolute(dir);
+            if (rootDirs.has(key) || ancestors.has(key)) continue;
+            const installed = readManifest(fileSystem, dir);
+            if (installed === undefined) continue;
+            const short = dir.slice(dir.lastIndexOf('/node_modules/') + '/node_modules/'.length);
+            if (short === '' || short === entry.name) continue;
+            out.push({ name: short, version: String(installed.version ?? ''), dir });
+        }
+        out.sort((left, right) => comparePackageIds(
+            `${left.name}@${left.version}`, `${right.name}@${right.version}`));
+        return out;
+    };
 
     if (options.parseable) {
-        return [lib, ...entries.map((entry) => entry.dir)].join('\n') + '\n';
+        return [lib, ...roots.map((entry) => entry.dir)].join('\n') + '\n';
     }
     if (options.json) {
+        const node = (entry: GlobalEntry, ancestors: Set<string>): Record<string, unknown> => {
+            const value: Record<string, unknown> = { version: entry.version };
+            if (entry.link !== undefined) value.resolved = 'file:' + relativeFrom(dirnameOf(entry.dir), entry.link);
+            value.overridden = false;
+            if (options.depth === Infinity) {
+                const next = new Set(ancestors);
+                next.add(normalizeAbsolute(entry.dir));
+                const children = childrenOf(entry, next).filter((child) => child.dir !== '');
+                if (children.length > 0) {
+                    const dependencies: Record<string, unknown> = {};
+                    for (const child of children) dependencies[child.name] = node(child, next);
+                    value.dependencies = dependencies;
+                }
+            }
+            return value;
+        };
         const dependencies: Record<string, unknown> = {};
-        for (const entry of entries) {
-            const node: Record<string, unknown> = { version: entry.version };
-            if (entry.link !== undefined) node.resolved = 'file:' + relativeFrom(dirnameOf(entry.dir), entry.link);
-            node.overridden = false;
-            dependencies[entry.name] = node;
-        }
-        const root: Record<string, unknown> = { name: 'lib' };
-        if (entries.length > 0) root.dependencies = dependencies;
-        return JSON.stringify(root, null, 2) + '\n';
+        for (const entry of roots) dependencies[entry.name] = node(entry, new Set());
+        const result: Record<string, unknown> = { name: 'lib' };
+        if (roots.length > 0) result.dependencies = dependencies;
+        return JSON.stringify(result, null, 2) + '\n';
     }
 
     const lines: string[] = [lib];
-    if (entries.length === 0) {
+    if (roots.length === 0) {
         lines.push('`-- (empty)');
     } else {
-        const seen = new Set<string>();
-        const draw = (list: typeof entries, nesting: string, depth: number): void => {
+        const draw = (list: GlobalEntry[], nesting: string, depth: number, ancestors: Set<string>): void => {
             list.forEach((entry, index) => {
                 const last = index === list.length - 1;
+                const next = new Set(ancestors);
+                next.add(normalizeAbsolute(entry.dir));
+                const children = depth > 1 ? childrenOf(entry, next) : [];
+                const label = entry.label ?? `${entry.name}@${entry.version}`;
                 lines.push(nesting + (last ? '`-- ' : '+-- ') +
-                    `${entry.name}@${entry.version}` + (entry.link === undefined ? '' : ` -> ${entry.link}`));
-                if (!options.all || depth <= 0 || seen.has(entry.dir)) return;
-                seen.add(entry.dir);
-                const manifest = readManifest(fileSystem, entry.dir);
-                if (manifest === undefined) return;
-                const children: typeof entries = [];
-                for (const name of Object.keys((manifest.dependencies ?? {}) as Record<string, unknown>)) {
-                    const dir = findInstalledCopy(fileSystem, entry.dir, name);
-                    if (dir === undefined || dir === entry.dir) continue;
-                    const installed = readManifest(fileSystem, dir);
-                    if (installed === undefined) continue;
-                    const short = dir.slice(dir.lastIndexOf('/node_modules/') + '/node_modules/'.length);
-                    if (short === '' || short === entry.name) continue;
-                    children.push({ name: short, version: String(installed.version ?? ''), dir });
-                }
-                children.sort((a, b) => comparePackageIds(`${a.name}@${a.version}`, `${b.name}@${b.version}`));
-                if (children.length > 0) draw(children, nesting + (last ? '   ' : '|  '), depth - 1);
+                    label + (entry.link === undefined ? '' : ` -> ${entry.link}`));
+                if (children.length > 0) draw(children, nesting + (last ? '  ' : '|  '), depth - 1, next);
             });
         };
-        draw(entries, '', options.all ? 32 : 0);
+        draw(roots, '', levels, new Set());
     }
     return lines.join('\n') + '\n\n';
 }

@@ -11,6 +11,8 @@ export interface PackageVersion {
     os?: string | string[];
     cpu?: string | string[];
     libc?: string | string[];
+    /** npm's `deprecated` notice for this version, emitted as `npm warn deprecated` on install. */
+    deprecated?: string;
     bin?: string | Record<string, string>;
     dist: {
         tarball: string;

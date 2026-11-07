@@ -170,6 +170,9 @@ function configListing(config: Record<string, string>): string {
     return lines.join('\n') + '\n';
 }
 
+/** npm's own config keys: `npm config set` refuses a name npm has no option for. */
+const KNOWN_CONFIG_KEYS = new Set(`_auth access all allow-git allow-same-version also audit audit-level auth-type before bin-links browser bypass-2fa ca cache cache-max cache-min cafile call cert cidr color commit-hooks cpu depth description dev diff diff-dst-prefix diff-ignore-all-space diff-name-only diff-no-prefix diff-src-prefix diff-text diff-unified dry-run editor engine-strict expect-result-count expect-results expires fetch-retries fetch-retry-factor fetch-retry-maxtimeout fetch-retry-mintimeout fetch-timeout force foreground-scripts format-package-lock fund git git-tag-version global global-style globalconfig heading https-proxy if-present ignore-scripts include include-attestations include-staged include-workspace-root init-author-email init-author-name init-author-url init-license init-module init-private init-type init-version init.author.email init.author.name init.author.url init.license init.module init.version install-links install-strategy json key legacy-bundling legacy-peer-deps libc link local-address location lockfile-version loglevel logs-dir logs-max long maxsockets message min-release-age name node-gyp node-options noproxy offline omit omit-lockfile-registry-resolved only optional orgs orgs-permission os otp pack-destination package package-lock package-lock-only packages packages-all packages-and-scopes-permission parseable password prefer-dedupe prefer-offline prefer-online prefix preid production progress provenance provenance-file proxy read-only rebuild-bundle registry replace-registry-host save save-bundle save-dev save-exact save-optional save-peer save-prefix save-prod sbom-format sbom-type scope scopes script-shell searchexclude searchlimit searchopts searchstaleness shell shrinkwrap sign-git-commit sign-git-tag strict-peer-deps strict-ssl tag tag-version-prefix timing token-description umask unicode update-notifier usage user-agent userconfig version versions viewer which workspace workspaces workspaces-update yes`.split(' '));
+
 /** `npm config set <key>=<value>`: the project `.npmrc`, which is where npm writes it. */
 export function runConfigSet(
     fileSystem: IFileSystem,
@@ -180,14 +183,26 @@ export function runConfigSet(
     if (assignments.length === 0) {
         return { stdout: '', stderr: 'npm error code EUSAGE\nnpm error Usage: npm config set <key>=<value>\n', exitCode: 1 };
     }
+    /* npm accepts both `key=value` and `key value`, and refuses a key it has no option for. */
+    const pairs: { key: string; value: string }[] = [];
+    for (let i = 0; i < assignments.length; i++) {
+        const assignment = assignments[i];
+        const equals = assignment.indexOf('=');
+        if (equals > 0) {
+            pairs.push({ key: assignment.slice(0, equals).trim(), value: assignment.slice(equals + 1).trim() });
+        } else if (i + 1 < assignments.length) {
+            pairs.push({ key: assignment, value: assignments[++i] });
+        }
+    }
+    for (const { key } of pairs) {
+        if (!KNOWN_CONFIG_KEYS.has(key) && DEFAULTS[key] === undefined) {
+            return { stdout: '', stderr: `npm error \`${key}\` is not a valid npm option\n`, exitCode: 1 };
+        }
+    }
     const dir = findPackageRoot(fileSystem, cwd) ?? cwd;
     const file = joinPaths(dir, '.npmrc');
     const existing = fileSystem.statPath(file)?.type === 'file' ? parseNpmrc(fileSystem.readFile(file) ?? '') : {};
-    for (const assignment of assignments) {
-        const equals = assignment.indexOf('=');
-        if (equals <= 0) continue;
-        existing[assignment.slice(0, equals).trim()] = assignment.slice(equals + 1).trim();
-    }
+    for (const { key, value } of pairs) existing[key] = value;
     const text = Object.entries(existing).map(([key, value]) => `${key}=${value}`).join('\n') + '\n';
     fileSystem.writeFile(file, text);
     return { stdout: '', stderr: '', exitCode: 0 };

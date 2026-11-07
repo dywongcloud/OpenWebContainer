@@ -3,6 +3,7 @@ import { IFileSystem } from '../filesystem';
 import type { GlobalPaths } from './config';
 import { NodeResolver, dirnameOf, joinPaths, normalizeAbsolute } from '../process/executors/node/runtime/resolver';
 import { NpmRegistry, PackageVersion, Packument, selectVersion } from './registry';
+import { recordGlobalRoots } from './tree';
 import { lockKey, LockTreeNode, writeLockfile } from './lockfile';
 import { PlatformFields, platformDescription, platformMismatch } from './platform';
 import { INSTALL_SCRIPT_EVENTS, nodeArguments } from './lifecycle';
@@ -113,13 +114,16 @@ export class NpmInstaller {
     /** package.json already read from a directory, including the reads that found none. */
     private manifestCache = new Map<string, Record<string, any> | undefined>();
     /** Set by installGlobal when --ignore-scripts suppresses every install lifecycle event. */
+    /** Set by installGlobal when --ignore-scripts suppresses every install lifecycle event. */
     private ignoreScripts = false;
-
+    /** Deprecated versions whose tarballs this install has fetched, with their byte lengths. */
+    private deprecations: { label: string; message: string; bytes: number }[] = [];
     constructor(
         private fileSystem: IFileSystem,
         private registry: NpmRegistry,
         private log: (line: string) => void = () => { },
-        private runScript?: ScriptRunner
+        private runScript?: ScriptRunner,
+        private warn: (line: string) => void = () => { }
     ) {
         this.resolver = new NodeResolver(fileSystem);
     }
@@ -353,10 +357,9 @@ export class NpmInstaller {
                         const { wanted, current } = platformDescription(unsupported);
                         throw new Error(`npm error code EBADPLATFORM\nnpm error notsup Unsupported platform for ${label}: wanted ${wanted} (current: ${current})`);
                     }
-                    if (!skipped.has(label)) {
-                        skipped.add(label);
-                        this.log(`skipped optional ${label}: unsupported platform`);
-                    }
+                    /* A skipped optional dependency is neither announced nor counted: host npm
+                       installs the rest of the tree and says nothing about the one it left out. */
+                    skipped.add(label);
                     continue;
                 }
 
@@ -399,6 +402,14 @@ export class NpmInstaller {
             }
         }
         await this.runInstallScripts(installedDirs);
+        /* npm writes a deprecation warning when a tarball has been unpacked, so the smallest
+           package finishes first and its warning is printed first. Sort by the bytes fetched,
+           which is the order host npm's concurrent reify reaches the deprecated packages. */
+        this.deprecations.sort((left, right) => left.bytes - right.bytes);
+        for (const item of this.deprecations) {
+            this.warn(`npm warn deprecated ${item.label}: ${item.message}\n`);
+        }
+        this.deprecations = [];
         return { added, resolved, nodes: [...nodes.values()] };
     }
 
@@ -507,6 +518,13 @@ export class NpmInstaller {
      */
     private async placePackage(target: string, version: PackageVersion): Promise<void> {
         const tarball = await this.registry.fetchTarball(version);
+        if (typeof version.deprecated === 'string' && version.deprecated !== '') {
+            this.deprecations.push({
+                label: `${version.name}@${version.version}`,
+                message: version.deprecated,
+                bytes: tarball.length
+            });
+        }
         if (this.fileSystem.statPath(target)) this.fileSystem.removePath(target, true);
         const made = new Set<string>(['/']);
         for (const ancestor of ancestorsOf(target)) made.add(ancestor);
@@ -688,6 +706,13 @@ export class NpmInstaller {
             const name = String(manifest.name ?? '');
             if (name !== '') this.fileSystem.writeFile(joinPaths(paths.modules, name, '.owc-global-link'), source + '\n');
         }
+        /* Only the packages npm was explicitly asked to install are roots of `npm ls -g`; the
+           transitive dependencies hoisted into the same directory are drawn beneath them. */
+        const requested = specs.map((spec) => spec.localPath === undefined
+            ? spec.name
+            : String(this.readManifest(normalizeAbsolute(spec.localPath))?.name ?? ''))
+            .filter((name) => name !== '');
+        recordGlobalRoots(this.fileSystem, paths.lib, requested);
         return { added };
     }
 

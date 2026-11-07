@@ -252,7 +252,7 @@ function tarballNotice(
     const unpacked = entries.reduce((total, entry) => total + entry.bytes.length, 0);
     const lines = [
         '',
-        `📦  ${String(manifest.name ?? '')}@${String(manifest.version ?? '')}`,
+        `package: ${String(manifest.name ?? '')}@${String(manifest.version ?? '')}`,
         'Tarball Contents'
     ];
     for (const entry of entries) lines.push(`${formatBytes(entry.bytes.length, false)} ${entry.path}`);
