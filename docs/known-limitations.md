@@ -7,6 +7,10 @@
 
 These are the boundaries an application author needs before choosing OpenWebContainer. Each one has a measured basis in the [verbatim notes archive](reference/compatibility-notes.md) or in the source on `origin/main`. They are not speculations.
 
+## Git is local; remote transports are named boundaries
+
+git is a shell module command implemented over the VFS, not a host binary: init, add, commit, log, status, branch, checkout, diff and a local-path clone all work against the self-contained object store in packages/core/src/git/. Remote transports against a real remote are named boundaries, as are GPG signing, hooks, packfiles, worktrees and gitlinks; each reports the project [CODE] not supported on this runtime outcome with exit 1 instead of a bare command-not-found. See the [git command reference](reference/commands-git.md). The verbatim archive's git-absent lines are no longer current: archive :505/:508/:511 are SUPERSEDED, and that archive is left byte-for-byte unchanged.
+
 ## No outbound raw TCP or UDP
 
 The virtual network (`packages/core/src/network/virtual/hub.ts`) is a loopback between processes of **one** container, with a virtual name table and path-carried Unix sockets. `net`, `dgram`, `dns`, `http`, `https` and `http2` work inside it; non-local connects fail or are dropped. A browser cannot open a raw socket to the outside. Previews are **HTTP ingress only** through the service worker at `/__owc/preview/<port>/...`.

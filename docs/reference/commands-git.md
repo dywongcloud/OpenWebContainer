@@ -70,7 +70,44 @@ both points.
 
 ## Implemented cases
 
-<!-- PHASE B: one measured line per implemented subcommand, filled from drain-git-impl1's
-     published command list once its first git source commit is on origin/main. Each line records
-     stdout / stderr / exit code at two memory points. Left empty until that source exists. -->
-_Pending Phase B: the published local git CLI command list._
+STAGE 1 (origin/main commit 74a2053887d84d0f51f69e2616d91c3495143b94, 'Add self-contained git object store over the VFS') published eight source files under packages/core/src/git/: boundaries.ts (the named-boundary wrapper), bytes.ts (pako deflate/inflate with RFC1950 zlib framing), objects.ts (loose object serialization), store.ts (VFS object store), repo.ts (index v2, refs, config), diff.ts, commands.ts (the runCommand switch) and cli.ts. cli.ts calls gitBoundaryOutcome FIRST and exports GIT_COMMANDS = { git: gitMain }; it also handles --version, --help, -C and -c. Local git works over the VFS; remote transports are named boundaries (see Boundary cases above). Each line below names one published STAGE 1 source case at commands.ts:228-263. These lines name source, NOT a claim that each command is complete or host-faithful.
+
+- git --version / --help / -C / -c -> cli.ts global options (source; no /usr/bin/git VFS file).
+- git init -> commands.ts:228 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git config -> commands.ts:229 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git help -> commands.ts:230 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git clone -> commands.ts:231 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3). (LOCAL-PATH only; a remote clone is a named boundary)
+- git hash-object -> commands.ts:232 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git cat-file -> commands.ts:233 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git rev-parse -> commands.ts:234 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git ls-files -> commands.ts:235 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git write-tree -> commands.ts:236 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git commit-tree -> commands.ts:237 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git update-index -> commands.ts:238 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git read-tree -> commands.ts:239 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git status -> commands.ts:240 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git add -> commands.ts:241 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git rm -> commands.ts:242 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git mv -> commands.ts:243 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git clean -> commands.ts:244 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git commit -> commands.ts:245 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3). (-S is a named boundary)
+- git log -> commands.ts:246 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git show -> commands.ts:247 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git diff -> commands.ts:248 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git branch -> commands.ts:249 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git checkout -> commands.ts:250 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git switch -> commands.ts:251 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git restore -> commands.ts:252 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git merge -> commands.ts:253 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git reset -> commands.ts:254 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git tag -> commands.ts:255 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3). (-s is a named boundary)
+- git stash -> commands.ts:256 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git reflog -> commands.ts:257 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git grep -> commands.ts:258 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git blame -> commands.ts:259 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git archive -> commands.ts:260 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git cherry-pick -> commands.ts:261 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git rebase -> commands.ts:262 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
+- git remote -> commands.ts:263 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3). (local config only; a real remote is a named boundary)
+
+STAGE 2 and STAGE 3 are still in progress. No per-command stdout / stderr / exit-code measurement at two memory points has been published for these implemented cases, so this section does NOT claim the commands are complete or host-faithful; it will be filled from the published STAGE 2/3 command list and measurements when they land. The exit-1 deviation for named boundaries recorded above is unchanged.

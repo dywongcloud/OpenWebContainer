@@ -30,6 +30,10 @@ The playground page, the API bridge, the Web Worker and the container runtime ([
 
 Every case runs the same script on host Node v24.15.0 and in one fresh container process, and compares **stdout, stderr and exit code**. A fix is recorded only when all three agree, usually at two memory points. The repository has no `.github/workflows`, so those measurements are not CI-verified; see [Compatibility](docs/compatibility.md) and the [verbatim notes archive](docs/reference/compatibility-notes.md).
 
+## Git in the container
+
+git runs as a shell module command over the VFS: local init, add, commit, log, status, branch, checkout, diff and a local-path clone work against the self-contained object store in packages/core/src/git/. Remote transports against a real remote (clone, fetch, pull, push, ls-remote, remote, submodule, credential), GPG signing, hooks, packfiles, worktrees and gitlinks are named boundaries that report the project [CODE] not supported on this runtime outcome with exit 1. See the [git command reference](docs/reference/commands-git.md). The verbatim compatibility archive's git-absent lines are no longer current: archive :505/:508/:511 are SUPERSEDED, and that archive is left byte-for-byte unchanged.
+
 ## Try it
 
 Prerequisites: Git, Node.js, and pnpm. The repository pins `pnpm@8.15.3` in the root `package.json` (`packageManager`) and declares no `engines` minimum; the compatibility measurements were taken on Node v24.15.0. You also need a browser with Web Worker and service worker support.

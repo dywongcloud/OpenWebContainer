@@ -16,6 +16,7 @@ Every page here describes the code on `origin/main`, not the diverged local work
 | [reference/commands.md](reference/commands.md) | Shell command reference and four per-family pages: [builtins](reference/commands-builtins.md), [builtins residual](reference/commands-builtins-residual.md), [text utilities](reference/commands-textutils.md), [system utilities](reference/commands-system.md). |
 | [npm-global.md](reference/npm-global.md) | Measured global `npm install -g` cases against host npm 11.12.1: VFS prefix, bin links on `PATH`, the `require()` boundary and the superseded archive refusal. |
 | [vfs-isolation.md](reference/vfs-isolation.md) | Measured VFS isolation is realm-scoped (one module-level mount), not per-container, so a fresh node process per boot is the clean-isolation path. |
+| [reference/commands-git.md](reference/commands-git.md) | Local git runs as a shell module command over the VFS (object store, index, refs); remote transports against a real remote are named boundaries reporting the project [CODE] not supported on this runtime outcome with exit 1; archive :505/:508/:511 are SUPERSEDED, while the verbatim archive stays unchanged. |
 
 The root [Readme.md](../Readme.md) is the short, user-facing entry point. This page indexes the detail behind it.
 
