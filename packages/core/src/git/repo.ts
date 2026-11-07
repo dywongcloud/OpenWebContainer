@@ -213,6 +213,9 @@ export class GitRepo {
             const base = this.resolve(rev.slice(0, treeSuffix.index));
             return base === undefined ? undefined : this.readCommit(base)?.tree;
         }
+        /* REV:PATH: host git resolves a path inside the revision's tree to its object oid. */
+        const colon = rev.indexOf(':');
+        if (colon > 0) return this.pathState(rev.slice(0, colon), rev.slice(colon + 1))?.oid;
         const aliases: Record<string, string> = { HEAD: 'HEAD', '@': 'HEAD' };
         const key = aliases[rev] ?? rev;
         if (key === 'HEAD') return this.refs.headOid();
@@ -256,6 +259,20 @@ export class GitRepo {
     readBlob(oid: string): Uint8Array | undefined {
         const obj = this.object(oid);
         return obj !== undefined && obj.type === 'blob' ? obj.content : undefined;
+    }
+    /** The tree entry a REV:PATH names, or undefined when the revision or path is absent. */
+    pathState(rev: string, path: string): FileState | undefined {
+        const base = this.resolve(rev);
+        if (base === undefined) return undefined;
+        const commit = this.readCommit(base);
+        const treeOid = commit !== undefined ? commit.tree : (this.object(base)?.type === 'tree' ? base : undefined);
+        if (treeOid === undefined) return undefined;
+        return this.flatTree(treeOid).get(path.replace(/^\/+/, ''));
+    }
+    /** The blob bytes a REV:PATH names: git show HEAD:a.txt prints these (host git 2.53.0). */
+    blobAt(rev: string, path: string): Uint8Array | undefined {
+        const state = this.pathState(rev, path);
+        return state === undefined ? undefined : this.readBlob(state.oid);
     }
 
     flatTree(oid: string, prefix = '', out: Map<string, FileState> = new Map()): Map<string, FileState> {

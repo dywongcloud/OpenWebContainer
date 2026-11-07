@@ -704,6 +704,12 @@ function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, st
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const rev = rest[0] ?? 'HEAD';
+    const colonAt = rev.indexOf(':');
+    if (colonAt > 0) {
+        const blob = repo.blobAt(rev.slice(0, colonAt), rev.slice(colonAt + 1));
+        if (blob === undefined) return fail("fatal: path '" + rev.slice(colonAt + 1) + "' does not exist in '" + rev.slice(0, colonAt) + "'", 128);
+        return ok(text(blob));
+    }
     let oid = repo.resolve(rev);
     if (oid === undefined) return fail('fatal: bad revision ' + rev, 128);
     let tagHeader = '';
