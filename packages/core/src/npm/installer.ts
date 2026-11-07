@@ -666,7 +666,17 @@ export class NpmInstaller {
             if (this.fileSystem.statPath(dir)?.type !== 'dir') this.fileSystem.createDirectory(dir);
         }
         this.ignoreScripts = options.ignoreScripts;
-        const edges: Edge[] = specs.map((spec) => this.specEdge(root, spec, false));
+        /* A package already at the same place in the global tree is not added again: host npm
+           answers a repeated global install with "up to date", not "added N packages". */
+        const pending = specs.filter((spec) => {
+            const name = spec.localPath !== undefined
+                ? String(this.readManifest(normalizeAbsolute(spec.localPath))?.name ?? '')
+                : spec.name;
+            if (name === '') return true;
+            const existing = this.readManifest(joinPaths(paths.modules, name));
+            return existing === undefined;
+        });
+        const edges: Edge[] = pending.map((spec) => this.specEdge(root, spec, false));
         const { added } = await this.installTree(root, edges);
         /* Host npm symlinks a local-folder global install; this tree copies it. Record the source
            so `npm ls -g` can draw the same `-> <path>` arrow. */

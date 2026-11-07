@@ -1070,13 +1070,16 @@ export class ShellProcess extends Process {
     /** A bare name that resolves on PATH to a shim with a shebang or a .js backing. */
     private resolvePathShim(command: string): { path: string; interpreter?: string } | undefined {
         if (command.includes('/')) return undefined;
+        /* A spawned command (node/npm/npx) or a shell builtin is never a global bin shim:
+           leave those to their own executor / the script engine. */
+        if (this.shell.isSpawnedCommand(command)) return undefined;
         const PATH = this.env.get('PATH');
         if (!PATH) return undefined;
         for (const dir of PATH.split(':')) {
             const path = joinOnPath(this.fileSystem, dir, command);
             if (!this.fileSystem.fileExists(path)) continue;
             const interpreter = shebangInterpreter(this.fileSystem, path);
-            if (interpreter === undefined && !path.endsWith('.js')) continue;
+            if (interpreter !== 'node' && !path.endsWith('.js')) continue;
             return { path, interpreter };
         }
         return undefined;

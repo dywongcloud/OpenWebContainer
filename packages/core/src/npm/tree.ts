@@ -356,7 +356,12 @@ export function globalDependencyTree(fileSystem: IFileSystem, libDir: string, op
     }
     if (options.json) {
         const dependencies: Record<string, unknown> = {};
-        for (const entry of entries) dependencies[entry.name] = { version: entry.version, overridden: false };
+        for (const entry of entries) {
+            const node: Record<string, unknown> = { version: entry.version };
+            if (entry.link !== undefined) node.resolved = 'file:' + relativeFrom(dirnameOf(entry.dir), entry.link);
+            node.overridden = false;
+            dependencies[entry.name] = node;
+        }
         const root: Record<string, unknown> = { name: 'lib' };
         if (entries.length > 0) root.dependencies = dependencies;
         return JSON.stringify(root, null, 2) + '\n';
@@ -393,4 +398,14 @@ export function globalDependencyTree(fileSystem: IFileSystem, libDir: string, op
         draw(entries, '', options.all ? 32 : 0);
     }
     return lines.join('\n') + '\n\n';
+}
+
+/** <to> as a relative path from <from>, the way npm records a linked local-folder install. */
+function relativeFrom(from: string, to: string): string {
+    const a = normalizeAbsolute(from).split('/').filter(Boolean);
+    const b = normalizeAbsolute(to).split('/').filter(Boolean);
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    const ups = new Array(a.length - i).fill('..');
+    return [...ups, ...b.slice(i)].join('/');
 }
