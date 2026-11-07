@@ -1,1 +1,3 @@
-owc-git2-commit-allow-empty-not-honored resolved 1794057878134-12372-2f0493eac6b89a98 2026-11-07T13:31:52.300Z
+Row: owc-git2-commit-allow-empty-not-honored
+Witness: 1794057878134-12372-2f0493eac6b89a98
+Status: resolved
