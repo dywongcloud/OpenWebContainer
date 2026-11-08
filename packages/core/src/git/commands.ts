@@ -1110,7 +1110,9 @@ function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, st
         return ok(text(blob));
     }
     let oid = repo.resolve(rev);
-    if (oid === undefined) return fail('fatal: bad revision ' + rev, 128);
+    if (oid === undefined) return fail("fatal: ambiguous argument '" + rev + "': unknown revision or path not in the working tree.\n" +
+        "Use '--' to separate paths from revisions, like this:\n" +
+        "'git <command> [<revision>...] -- [<file>...]'\n", 128);
     let tagHeader = '';
     const tagged = repo.object(oid);
     if (tagged !== undefined && tagged.type === 'tag') {
