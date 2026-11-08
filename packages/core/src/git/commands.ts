@@ -1011,6 +1011,10 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     if (resolved !== undefined && resolved.type === 'tag') oid = parseTag(resolved.content).object;
     const wasAttached = repo.refs.head().ref !== undefined;
     const prevOid = repo.refs.headOid();
+    /* Host git 2.53.0: a checkout that carries local modifications across
+       prints one short-status line per modified path on stdout. */
+    const dirtyNotice = statusOf(repo).rows.filter((row) => row.unstaged)
+        .map((row) => row.y + String.fromCharCode(9) + row.path + String.fromCharCode(10)).join('');
     repo.refs.setDetached(oid);
     /* git describe uses the checked-out tag name for the detached label; a raw oid or HEAD uses
        the abbreviated oid. */
@@ -1026,7 +1030,7 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     if (!flags.has('--detach') && wasAttached) {
         const advice = repo.configOverrides().get('advice.detachedhead') ?? repo.config.get('advice.detachedhead');
         if (advice === undefined || !/^(false|no|off|0)$/i.test(advice)) {
-            return ok('', "Note: switching to '" + name + "'.\n\n" +
+            return ok(dirtyNotice, "Note: switching to '" + name + "'.\n\n" +
                 "You are in 'detached HEAD' state. You can look around, make experimental\n" +
                 "changes and commit them, and you can discard any commits you make in this\n" +
                 "state without impacting any branches by switching back to a branch.\n\n" +
@@ -1044,7 +1048,7 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
        no-op, a branch switch and the --detach-from-attached suppression all
        print only the HEAD line. */
     if (!wasAttached && prevOid !== undefined && prevOid !== oid) {
-        return ok('', 'Previous HEAD position was ' + abbrev(prevOid) + ' ' +
+        return ok(dirtyNotice, 'Previous HEAD position was ' + abbrev(prevOid) + ' ' +
             repo.subjectOf(prevOid) + '\n' + headLine);
     }
     /* Host git 2.53.0: `checkout HEAD` on an already-detached HEAD is a
@@ -1053,9 +1057,9 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
        forces the HEAD line even for the symbolic name. */
     if (name === 'HEAD' && !flags.has('--detach') && !wasAttached &&
         prevOid !== undefined && prevOid === oid) {
-        return ok('', '');
+        return ok(dirtyNotice, '');
     }
-    return ok('', headLine);
+    return ok(dirtyNotice, headLine);
 }
 
 function cmdSwitch(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
