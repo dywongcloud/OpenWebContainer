@@ -1,1 +1,3 @@
-owc-git6-cat-file-batch-all-objects resolved 1794141663288-9380-22e431aefb95424a 2026-11-08T12:50:03.684Z
+Row: owc-git6-cat-file-batch-all-objects
+Witness: 1794141663288-9380-22e431aefb95424a
+Status: resolved
