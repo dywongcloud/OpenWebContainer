@@ -1002,7 +1002,13 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
         const moves = repo.refs.reflog('HEAD')
             .filter((entry) => entry.message.startsWith('checkout: moving from '));
         const from = moves[moves.length - hops];
-        if (from !== undefined && repo.resolve(from.old) !== undefined) name = from.old;
+        /* Host git 2.53.0: - / @{-N} name the previous checkout SOURCE. When
+           that source is a live branch, switching back stays attached; a
+           detached oid keeps the detach path and its 609 B advice block. */
+        const prior = from === undefined ? undefined
+            : /^checkout: moving from (\S+) to /.exec(from.message)?.[1];
+        if (prior !== undefined && repo.refs.branches().includes(prior)) name = prior;
+        else if (from !== undefined && repo.resolve(from.old) !== undefined) name = from.old;
     }
     if (repo.refs.branches().includes(name)) return switchBranch(repo, name, false);
     let oid = repo.resolve(name);
