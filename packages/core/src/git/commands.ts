@@ -6,7 +6,7 @@ import {
 } from './repo';
 import { readIndex, writeIndex, type IndexEntry, ZERO_OID, type ConfigScope, formatConfig, type ConfigLine } from './store';
 import { parseTree, serializeTree, parseCommit, serializeCommit, serializeTag, parseTag, oidOf, type CommitInfo } from './objects';
-import { renderDiff, renderStat, countsFor, tarOf, zipOf, splitLines } from './diff';
+import { renderDiff, renderStat, countsFor, tarOf, zipOf, splitLines, diffOps, unifiedFor } from './diff';
 
 export function ok(stdout = '', stderr = '', exitCode = 0): CommandResult { return { stdout, stderr, exitCode }; }
 export function fail(stderr: string, exitCode = 1): CommandResult {
@@ -342,26 +342,67 @@ function mediumLog(repo: GitRepo, oid: string, info: CommitInfo): string {
  * command dispatch
  * ------------------------------------------------------------------ */
 
-function parseFlags(args: string[], repeatParents = false): { flags: Set<string>; values: Map<string, string>; multi: Map<string, string[]>; rest: string[] } {
+/* Host git 2.53.0 parses value-taking options PER SUBCOMMAND. One global list
+   eats the operand of a switch (grep -n, blame -t) and drops the value of a
+   long option (clone --depth/--branch), and a bare '--' must stay visible to
+   the command so it can separate revisions from pathspecs. */
+const SHORT_VALUE_OPTS: Record<string, Set<string>> = {
+    'init': new Set(['-b']),
+    'hash-object': new Set(['-t']),
+    'commit-tree': new Set(['-m', '-F', '-S']),
+    'commit': new Set(['-m', '-F', '-S']),
+    'merge': new Set(['-m', '-S']),
+    'branch': new Set(['-m']),
+    'tag': new Set(['-m', '-F', '-u']),
+    'stash': new Set(['-m']),
+    'log': new Set(['-n']),
+    'switch': new Set(['-c', '-C']),
+    'checkout': new Set(['-b', '-B']),
+    'archive': new Set(['-o']),
+    'cherry-pick': new Set(['-m']),
+    'clone': new Set(['-b', '-o']),
+    'clean': new Set(), 'status': new Set(), 'diff': new Set(), 'reset': new Set(),
+    'ls-files': new Set(), 'config': new Set(), 'reflog': new Set(), 'grep': new Set(),
+    'blame': new Set(), 'show': new Set(), 'add': new Set(), 'rm': new Set(),
+    'mv': new Set(), 'read-tree': new Set(), 'write-tree': new Set(),
+    'rev-parse': new Set(), 'restore': new Set(), 'remote': new Set(),
+    'rebase': new Set(), 'update-index': new Set(), 'backfill': new Set(), 'help': new Set(),
+};
+const LEGACY_VALUE_SHORTS = new Set(['-m', '-b', '-o', '-t', '-n', '-S', '-F', '-c', '-C', '-u']);
+const LONG_VALUE_OPTS = new Set([
+    '--depth', '--branch', '--origin', '--message', '--author', '--since', '--until',
+    '--max-count', '--source', '--chmod', '--file', '--initial-branch', '--contains',
+    '--set-upstream-to', '--get-regexp', '--expire', '--expire-unreachable', '--output',
+    '--prefix', '--format', '--pretty', '--abbrev', '--date', '--color', '--config',
+    '--reference', '--separate-git-dir', '--template', '--upload-pack', '--line-prefix',
+    '--word-diff-regex', '--ws-error-highlight', '--pathspec-from-file',
+    '--stat-name-width', '--stat-graph-width', '--diff-filter', '--find-renames',
+    '--find-copies', '--break-rewrites', '--max-parents', '--min-parents', '--skip',
+    '--output-directory', '--exec-path', '--git-dir', '--work-tree', '--super-prefix',
+    '--config-env', '--namespace'
+]);
+
+function parseFlags(args: string[], repeatParents = false, sub = ''): { flags: Set<string>; values: Map<string, string>; multi: Map<string, string[]>; rest: string[] } {
     const flags = new Set<string>();
     const values = new Map<string, string>();
     const multi = new Map<string, string[]>();
     const rest: string[] = [];
+    const shortValues = SHORT_VALUE_OPTS[sub] ?? LEGACY_VALUE_SHORTS;
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
-        if (arg === '--') { rest.push(...args.slice(i + 1)); break; }
+        if (arg === '--') { flags.add('--'); rest.push('--'); rest.push(...args.slice(i + 1)); break; }
         if (arg.startsWith('--') && arg.includes('=')) {
-            const eq = arg.indexOf('='); values.set(arg.slice(0, eq), arg.slice(eq + 1));
+            const eq = arg.indexOf('='); values.set(arg.slice(0, eq), arg.slice(eq + 1)); flags.add(arg.slice(0, eq));
         } else if (arg.startsWith('--')) {
-            if (['-m', '--message'].includes(arg)) { values.set(arg, args[++i] ?? ''); }
+            if (LONG_VALUE_OPTS.has(arg) && i + 1 < args.length) { values.set(arg, args[++i]); flags.add(arg); }
             else flags.add(arg);
         } else if (arg.startsWith('-') && arg.length > 1) {
             if (repeatParents && arg === '-p' && i + 1 < args.length) {
                 const value = args[++i];
                 const list = multi.get('-p') ?? []; list.push(value); multi.set('-p', list);
                 values.set('-p', value);
-            } else if ((arg === '-m' || arg === '-b' || arg === '-o' || arg === '-t' || arg === '-n' || arg === '-S' || arg === '-F' || arg === '-c' || arg === '-C' || arg === '-u') && i + 1 < args.length && !args[i + 1].startsWith('-')) {
-                values.set(arg, args[++i]);
+            } else if (shortValues.has(arg) && i + 1 < args.length && !args[i + 1].startsWith('-')) {
+                values.set(arg, args[++i]); flags.add(arg);
             } else {
                 for (const ch of arg.slice(1)) flags.add('-' + ch);
             }
@@ -371,7 +412,7 @@ function parseFlags(args: string[], repeatParents = false): { flags: Set<string>
 }
 
 export function runCommand(ctx: CommandContext, sub: string, args: string[]): CommandResult {
-    const { flags, values, multi, rest } = parseFlags(args, sub === 'commit-tree');
+    const { flags, values, multi, rest } = parseFlags(args, sub === 'commit-tree', sub);
     const short = flags.has('-s') || flags.has('--short') || flags.has('--porcelain') || values.has('--porcelain');
 
     switch (sub) {
@@ -1106,8 +1147,13 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     let name = create ? (values.get('-b') ?? values.get('-B') ?? values.get('--branch')) : rest[0];
     if (create && name !== undefined) return switchBranch(repo, name, true);
     if (flags.has('--')) {
-        for (const path of rest.filter((r) => r !== '--')) {
-            const state = repo.indexTree().get(path);
+        const dd = rest.indexOf('--');
+        const paths = dd >= 0 ? rest.slice(dd + 1) : rest.filter((r) => r !== '--');
+        const fromOid = dd > 0 ? repo.resolve(rest[0]) : undefined;
+        const treeOid = fromOid !== undefined ? repo.readCommit(fromOid)?.tree : undefined;
+        const source = treeOid !== undefined ? repo.flatTree(treeOid) : repo.indexTree();
+        for (const path of paths) {
+            const state = source.get(path);
             if (state !== undefined) { const blob = repo.readBlob(state.oid); if (blob !== undefined) repo.writeBytes(repo.w(path), blob); }
         }
         return ok('');
@@ -1572,7 +1618,7 @@ function cmdBlame(ctx: CommandContext, flags: Set<string>, values: Map<string,st
         const renamed = originPath !== path ? ' ' + originPath : '';
         const shortOid = boundary ? '^' + abbrev(oid, 7) : abbrev(oid, 8);
         out += shortOid + renamed + ' (' + author.name + ' ' +
-            isoDate(author.ts, author.tz) + ' ' + (index + 1) + ') ' + line + '\n';
+            (flags.has('-t') ? author.ts + ' ' + author.tz : isoDate(author.ts, author.tz)) + ' ' + (index + 1) + ') ' + line + '\n';
     });
     return ok(out);
 }
@@ -1743,7 +1789,9 @@ function cmdClone(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     const oid = repo.refs.headOid();
     const commit = oid === undefined ? undefined : repo.readCommit(oid);
     if (commit !== undefined) repo.checkoutTree(commit.tree, false);
-    return ok('', "Cloning into '" + target + "'...\ndone.\n");
+    /* Host git 2.53.0 warns that --depth is ignored on a local-path clone. */
+    const depthNote = values.has('--depth') ? "warning: --depth is ignored in local clones; use file:// instead.\n" : '';
+    return ok('', "Cloning into '" + target + "'...\n" + depthNote + "done.\n");
 }
 
 /* ------------------------------------------------------------------ *
