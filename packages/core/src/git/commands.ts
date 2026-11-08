@@ -1127,6 +1127,47 @@ function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, st
     return ok(tagHeader + header + sep + bodyText);
 }
 
+/* Host git 2.53.0 enables rename detection by default (diff.renames=true):
+   an exact-content delete/add pair is one rename block, not two patches. */
+interface Rename { from: string; to: string; oid: string; }
+function splitRenames(changes: Change[]): { changes: Change[]; renames: Rename[] } {
+    const dels = changes.filter((c) => c.status === 'D' && c.oldOid !== undefined);
+    const adds = changes.filter((c) => c.status === 'A' && c.newOid !== undefined);
+    const renames: Rename[] = [];
+    const used = new Set<Change>();
+    for (const d of dels) {
+        const a = adds.find((x) => !used.has(x) && x.newOid === d.oldOid);
+        if (a !== undefined) { renames.push({ from: d.path, to: a.path, oid: d.oldOid as string }); used.add(d); used.add(a); }
+    }
+    return { changes: changes.filter((c) => !used.has(c)), renames: renames };
+}
+function renameBlock(r: Rename): string {
+    return 'diff --git a/' + r.from + ' b/' + r.to + '\n' +
+        'similarity index 100%\nrename from ' + r.from + '\nrename to ' + r.to + '\n';
+}
+function wordDiffFor(repo: GitRepo, change: Change, porcelain: boolean): string {
+    const before = repo.lineCounts(change.oldOid).text;
+    const after = repo.lineCounts(change.newOid).text;
+    const uni = unifiedFor(change.path, change.oldOid, change.newOid, before, after,
+        change.mode, change.oldMode ?? change.mode);
+    const lines = uni.split('\n');
+    let at = 0;
+    for (let i = 0; i < lines.length; i++) if (lines[i].startsWith('@@')) at = i;
+    let out = lines.slice(0, at + 1).join('\n') + '\n';
+    for (const op of diffOps(splitLines(before), splitLines(after))) {
+        if (porcelain) {
+            if (op.kind === ' ') out += ' ' + op.value + '\n~\n';
+            else if (op.kind === '+') out += '+' + op.value + '\n~\n';
+            else out += '-' + op.value + '\n~\n';
+        } else {
+            if (op.kind === ' ') out += op.value + '\n';
+            else if (op.kind === '+') out += '{+' + op.value + '+}\n';
+            else out += '[-' + op.value + '-]\n';
+        }
+    }
+    return out;
+}
+
 function cmdDiff(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
@@ -1148,14 +1189,34 @@ function cmdDiff(ctx: CommandContext, flags: Set<string>, values: Map<string,str
         next = worktreeState(repo, true);
     }
     const changes = repo.changesBetween(base, next);
-    if (flags.has('--name-only')) return ok(changes.map((c) => c.path + '\n').join(''));
+    const split = splitRenames(changes);
+    const plain = split.changes, renames = split.renames;
+    if (flags.has('--name-only')) return ok([...plain.map((c) => c.path), ...renames.map((r) => r.to)].sort().map((p) => p + '\n').join(''));
+    if (flags.has('--name-status')) {
+        const lines = plain.map((c) => c.status + '\t' + c.path + '\n');
+        for (const r of renames) lines.push('R100\t' + r.from + '\t' + r.to + '\n');
+        return ok(lines.join(''));
+    }
+    if (flags.has('--numstat')) {
+        const lines = plain.map((c) => {
+            const k = countsFor(repo, c);
+            return (k.binary ? '-\t-' : k.added + '\t' + k.removed) + '\t' + c.path + '\n';
+        });
+        for (const r of renames) lines.push('0\t0\t' + r.from + ' => ' + r.to + '\n');
+        return ok(lines.join(''));
+    }
+    const wordDiff = values.get('--word-diff');
+    if (flags.has('--word-diff') || wordDiff !== undefined) {
+        const porcelain = wordDiff === 'porcelain';
+        return ok(plain.map((c) => wordDiffFor(repo, c, porcelain)).join('') + renames.map(renameBlock).join(''));
+    }
     if (flags.has('--stat')) {
         /* Host 'git diff --stat' never prints create/delete mode lines (git merge's fast-forward
            summary does), so suppress them for this call only. */
-        const stat = renderStat(repo, changes, 80, false);
+        const stat = renderStat(repo, plain, 80, false) + renames.map(renameBlock).join('');
         return ok(stat, '', flags.has('--exit-code') && changes.length > 0 ? 1 : 0);
     }
-    const diff = renderDiff(repo, changes);
+    const diff = renderDiff(repo, plain) + renames.map(renameBlock).join('');
     return ok(diff, '', flags.has('--exit-code') && diff !== '' ? 1 : 0);
 }
 
