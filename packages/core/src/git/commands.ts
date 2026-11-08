@@ -1520,13 +1520,28 @@ function cmdGrep(ctx: CommandContext, flags: Set<string>, values: Map<string,str
 function cmdBlame(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const path = rest[0] ?? '';
+    /* Host git 2.53.0: -L <range> consumes the range as its own operand; the path
+       follows it. parseFlags leaves both in rest and records -L as a flag. */
+    let from = 1, to = Number.MAX_SAFE_INTEGER;
+    let path = rest[0] ?? '';
+    if (flags.has('-L')) {
+        const spec = rest[0] ?? '';
+        path = rest[1] ?? '';
+        const m = /^(\d+)(?:,(\d+)|,\+(\d+))?$/.exec(spec);
+        if (m !== null) {
+            from = parseInt(m[1], 10) || 1;
+            if (m[2] !== undefined) to = parseInt(m[2], 10);
+            else if (m[3] !== undefined) to = from + parseInt(m[3], 10) - 1;
+            else to = from;
+        }
+    }
     const bytes = repo.readBytes(repo.w(path));
     if (bytes === undefined) return fail('fatal: no such path ' + path + ' in HEAD', 128);
     const head = repo.refs.headOid();
     const history = head === undefined ? [] : repo.logEntries(head, 100);
     let out = '';
     splitLines(text(bytes)).forEach((line, index) => {
+        if (index + 1 < from || index + 1 > to) return;
         /* Follow the file back through renames: the oldest commit whose tree contains a blob with
            this line is the origin, and host prints the ORIGINAL path after the abbrev oid. */
         let owner = history[0];
@@ -1546,7 +1561,8 @@ function cmdBlame(ctx: CommandContext, flags: Set<string>, values: Map<string,st
         const oid = owner?.oid ?? ZERO_OID;
         const author = owner?.info.author ?? repo.identity();
         const renamed = originPath !== path ? ' ' + originPath : '';
-        out += (boundary ? '^' : '') + abbrev(oid, 7) + renamed + ' (' + author.name + ' ' +
+        const shortOid = boundary ? '^' + abbrev(oid, 7) : abbrev(oid, 8);
+        out += shortOid + renamed + ' (' + author.name + ' ' +
             isoDate(author.ts, author.tz) + ' ' + (index + 1) + ') ' + line + '\n';
     });
     return ok(out);
