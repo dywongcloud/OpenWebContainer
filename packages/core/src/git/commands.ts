@@ -948,10 +948,35 @@ function cmdCommit(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     return ok(commitHeader(repo, made.changes, message, made.oid, root && !amend, amend, oldAuthor ?? repo.identity()));
 }
 
+/* Host git 2.53.0 pretty-format placeholder renderer. */
+function prettyPlaceholders(spec: string, repo: GitRepo, oid: string, info: CommitInfo, deco: string): string {
+    const subject = info.message.trim().split('\n')[0];
+    const raw = info.message.endsWith('\n') ? info.message : info.message + '\n';
+    const body = info.message.replace(/\n$/, '').split('\n').slice(1).join('\n');
+    const map: Record<string, string> = {
+        '%H': oid, '%h': abbrev(oid), '%s': subject, '%B': raw, '%b': body,
+        '%an': info.author.name, '%ae': info.author.email,
+        '%ad': isoDate(info.author.ts, info.author.tz), '%d': deco,
+        '%n': '\n', '%%': '%'
+    };
+    let out = '';
+    for (let i = 0; i < spec.length; i++) {
+        if (spec[i] === '%' && i + 1 < spec.length) {
+            const two = spec.slice(i, i + 2);
+            if (map[two] !== undefined) { out += map[two]; i++; continue; }
+        }
+        out += spec[i];
+    }
+    return out;
+}
+
 function cmdLog(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const rev = rest.find((entry) => !entry.startsWith('-'));
+    const dd = rest.indexOf('--');
+    const revArgs = dd >= 0 ? rest.slice(0, dd) : rest;
+    const pathspecs = dd >= 0 ? rest.slice(dd + 1) : [];
+    const rev = revArgs.find((entry) => !entry.startsWith('-'));
     const start = rev === undefined ? repo.refs.headOid() : repo.resolve(rev);
     if (start === undefined) return fail("fatal: your current branch '" + repo.refs.branch() + "' does not have any commits yet", 128);
     /* Host git 2.53.0: -1/-3 shorthands are max-count, as are -n and --max-count. */
@@ -982,8 +1007,47 @@ function cmdLog(ctx: CommandContext, flags: Set<string>, values: Map<string,stri
         return parentTree === '' ? repo.changesBetween(new Map(), repo.flatTree(entry.info.tree))
             : repo.changesBetween(repo.flatTree(parentTree), repo.flatTree(entry.info.tree));
     };
+    /* Host git 2.53.0: --since/--until/--author filter on author date/name,
+       --follow and pathspecs keep only commits touching the named path,
+       --reverse flips the walk; max-count applies AFTER those filters. */
+    const since = values.get('--since'), until = values.get('--until'), author = values.get('--author');
+    const parseStamp = (v: string): number => {
+        const t = Date.parse(v);
+        if (!Number.isNaN(t)) return t / 1000;
+        const m = /(\d{4})/.exec(v);
+        return m !== null ? Date.parse(m[1] + '-01-01T00:00:00Z') / 1000 : Number.NaN;
+    };
+    const sinceT = since !== undefined ? parseStamp(since) : undefined;
+    const untilT = until !== undefined ? parseStamp(until) : undefined;
+    if (sinceT !== undefined || untilT !== undefined || author !== undefined || pathspecs.length > 0) {
+        entries = entries.filter((entry) => {
+            if (sinceT !== undefined && entry.info.author.ts < sinceT) return false;
+            if (untilT !== undefined && entry.info.author.ts > untilT) return false;
+            if (author !== undefined && !entry.info.author.name.toLowerCase().includes(author.toLowerCase())) return false;
+            if (pathspecs.length > 0 && !changesFor(entry).some((c) => pathspecs.includes(c.path))) return false;
+            return true;
+        });
+    }
+    if (flags.has('--reverse')) entries.reverse();
+    entries = entries.slice(0, max);
+    const decorate = flags.has('--decorate');
+    const headOid = repo.refs.headOid();
+    const headBranch = repo.refs.branch();
+    const decoOf = (o: string): string => decorate && o === headOid ? ' (HEAD -> ' + headBranch + ')' : '';
+    const pretty = values.get('--pretty');
+    const format = values.get('--format');
+    const spec = format ?? pretty;
+    if (spec !== undefined) {
+        if (spec === 'oneline') {
+            return ok(entries.map((entry) => (graph ? '* ' : '') + entry.oid + decoOf(entry.oid) + ' ' + entry.info.message.trim().split('\n')[0] + '\n').join(''));
+        }
+        const body = spec.startsWith('tformat:') || spec.startsWith('format:') ? spec.slice(spec.indexOf(':') + 1) : spec;
+        const tformat = spec.startsWith('tformat:') || format !== undefined;
+        const parts = entries.map((entry) => prettyPlaceholders(body, repo, entry.oid, entry.info, decoOf(entry.oid)));
+        return ok(parts.join('\n') + (tformat ? '\n' : ''));
+    }
     if (flags.has('--oneline')) {
-        return ok(entries.map((entry) => (graph ? '* ' : '') + abbrev(entry.oid) + ' ' + entry.info.message.trim().split('\n')[0] + '\n').join(''));
+        return ok(entries.map((entry) => (graph ? '* ' : '') + abbrev(entry.oid) + decoOf(entry.oid) + ' ' + entry.info.message.trim().split('\n')[0] + '\n').join(''));
     }
     if (graph && !stat && !patch) {
         /* Host draws a linear chain: '* ' first line, '| ' continuation, two spaces at root. */
@@ -997,9 +1061,14 @@ function cmdLog(ctx: CommandContext, flags: Set<string>, values: Map<string,stri
     }
     return ok(entries.map((entry, index) => {
         let block = (index === 0 ? '' : '\n') + mediumLog(repo, entry.oid, entry.info);
+        if (flags.has('--abbrev-commit') || decorate) {
+            block = block.replace('commit ' + entry.oid,
+                'commit ' + (flags.has('--abbrev-commit') ? abbrev(entry.oid) : entry.oid) + decoOf(entry.oid));
+        }
         if (stat && patch) block += '---\n' + renderStat(repo, changesFor(entry), 80, false) + '\n' + renderDiff(repo, changesFor(entry));
         else if (stat) block += '\n' + renderStat(repo, changesFor(entry), 80, false);
         else if (patch) block += '\n' + renderDiff(repo, changesFor(entry));
+        if (flags.has('--name-only')) block += '\n' + changesFor(entry).map((c) => c.path + '\n').join('');
         return block;
     }).join(''));
 }
@@ -1007,7 +1076,10 @@ function cmdLog(ctx: CommandContext, flags: Set<string>, values: Map<string,stri
 function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const rev = rest[0] ?? 'HEAD';
+    const dd = rest.indexOf('--');
+    const revArgs = dd >= 0 ? rest.slice(0, dd) : rest;
+    const pathspecs = dd >= 0 ? rest.slice(dd + 1) : [];
+    const rev = revArgs.find((e) => !e.startsWith('-')) ?? 'HEAD';
     const colonAt = rev.indexOf(':');
     if (colonAt > 0) {
         const blob = repo.blobAt(rev.slice(0, colonAt), rev.slice(colonAt + 1));
@@ -1032,16 +1104,27 @@ function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, st
     const parentTree = info.parents.length > 0 ? (repo.readCommit(info.parents[0])?.tree ?? '') : '';
     const changes = parentTree === '' ? repo.changesBetween(new Map(), repo.flatTree(info.tree))
         : repo.changesBetween(repo.flatTree(parentTree), repo.flatTree(info.tree));
-    /* Host git 2.53.0: --stat renders the diffstat (no patch, no create-mode lines);
-       --oneline replaces the commit header with "<abbrev> <subject>". */
-    if (flags.has('--stat') || flags.has('--oneline')) {
-        const header = flags.has('--oneline')
-            ? abbrev(oid) + ' ' + info.message.trim().split('\n')[0] + '\n'
-            : mediumLog(repo, oid, info) + '\n';
-        const body = flags.has('--stat') ? renderStat(repo, changes, 80, false) : renderDiff(repo, changes);
-        return ok(tagHeader + header + body);
+    const shown = pathspecs.length > 0 ? changes.filter((c) => pathspecs.includes(c.path)) : changes;
+    if (pathspecs.length > 0 && shown.length === 0) return ok('');
+    const subject = info.message.trim().split('\n')[0];
+    const pretty = values.get('--pretty');
+    const format = values.get('--format');
+    const spec = format ?? pretty;
+    let header = mediumLog(repo, oid, info);
+    let sep = '\n';
+    if (flags.has('--oneline')) { header = abbrev(oid) + ' ' + subject + '\n'; sep = ''; }
+    if (spec === 'oneline') { header = oid + ' ' + subject + '\n'; sep = ''; }
+    else if (spec !== undefined) {
+        const body = spec.startsWith('tformat:') || spec.startsWith('format:') ? spec.slice(spec.indexOf(':') + 1) : spec;
+        const deco = flags.has('--decorate') && oid === repo.refs.headOid() ? ' (HEAD -> ' + repo.refs.branch() + ')' : '';
+        header = prettyPlaceholders(body, repo, oid, info, deco) +
+            (spec.startsWith('tformat:') || format !== undefined ? '\n' : '');
+        sep = '';
     }
-    return ok(tagHeader + mediumLog(repo, oid, info) + '\n' + renderDiff(repo, changes));
+    if (flags.has('-s') || flags.has('--no-patch')) return ok(tagHeader + header);
+    if (flags.has('--name-only')) return ok(tagHeader + header + '\n' + shown.map((c) => c.path + '\n').join(''));
+    const bodyText = flags.has('--stat') ? renderStat(repo, shown, 80, false) : renderDiff(repo, shown);
+    return ok(tagHeader + header + sep + bodyText);
 }
 
 function cmdDiff(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
