@@ -1,1 +1,3 @@
-owc-git6-diff-flag-set-ignored resolved 1794138362408-9294-2f1740a55b196e84 2026-11-08T12:03:14.161Z
+Row: owc-git6-diff-flag-set-ignored
+Witness: 1794138362408-9294-2f1740a55b196e84
+Status: resolved
