@@ -1019,7 +1019,7 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
        current commit is a silent no-op: an attached HEAD stays attached and
        nothing is printed. An explicit oid/tag at the same commit keeps its
        HEAD line, and --detach forces the HEAD line. */
-    if (name === 'HEAD' && !flags.has('--detach') &&
+    if ((name === 'HEAD' || name === '@') && !flags.has('--detach') &&
         prevOid !== undefined && prevOid === oid) {
         return ok(dirtyNotice, '');
     }
