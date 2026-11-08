@@ -104,17 +104,18 @@ function label(change: Change): string {
     return change.status === 'A' ? 'new file:   ' : change.status === 'D' ? 'deleted:   ' : 'modified:   ';
 }
 
-export function shortStatus(view: StatusView, branch = false): string {
+export function shortStatus(view: StatusView, branch = false, nul = false): string {
+    const eol = nul ? String.fromCharCode(0) : '\n';
     const lines: string[] = [];
-    if (branch) lines.push(branchHeader(view) + '\n');
-    for (const row of view.rows) if (row.x !== '?') lines.push(row.x + row.y + ' ' + row.path + '\n');
+    if (branch) lines.push(branchHeader(view) + eol);
+    for (const row of view.rows) if (row.x !== '?') lines.push(row.x + row.y + ' ' + row.path + eol);
     /* Host porcelain v1 collapses untracked files under a directory to "?? dir/". */
     const untracked = new Set<string>();
     for (const path of view.untracked) {
         const slash = path.indexOf('/');
         untracked.add(slash < 0 ? path : path.slice(0, slash) + '/');
     }
-    for (const path of [...untracked].sort()) lines.push('?? ' + path + '\n');
+    for (const path of [...untracked].sort()) lines.push('?? ' + path + eol);
     return lines.join('');
 }
 
@@ -189,14 +190,14 @@ export function porcelainV2(view: StatusView, branch = false, opts: { ignored?: 
 }
 
 /** Host 'git status --short --ignored' folds ignored paths under a directory to "!! dir/". */
-export function ignoredRows(paths: string[], mark = '!!', matching = false): string {
+export function ignoredRows(paths: string[], mark = '!!', matching = false, nul = false): string {
     const folded = new Set<string>();
     for (const path of paths) {
         if (matching) { folded.add(path); continue; }
         const slash = path.indexOf('/');
         folded.add(slash < 0 ? path : path.slice(0, slash) + '/');
     }
-    return [...folded].sort().map((path) => mark + ' ' + path + '\n').join('');
+    return [...folded].sort().map((path) => mark + ' ' + path + (nul ? String.fromCharCode(0) : '\n')).join('');
 }
 
 /* Root .gitignore globs ('*.log') are not covered by GitRepo.ignored at this tip; keep the
@@ -741,11 +742,12 @@ function cmdStatus(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     const opts = { ignored, showIgnored, matching };
     if (values.get('--porcelain') === 'v2') return ok(porcelainV2(view, withBranch, opts));
     if (short) {
+        const nul = flags.has('-z');
         const ignoredSet = new Set(ignored);
         const left = { ...view, untracked: view.untracked.filter((path) => !ignoredSet.has(path)) };
-        const base = shortStatus(left, withBranch);
+        const base = shortStatus(left, withBranch, nul);
         if (!showIgnored) return ok(base);
-        return ok(base + ignoredRows(ignored, '!!', matching));
+        return ok(base + ignoredRows(ignored, '!!', matching, nul));
     }
     return ok(longStatus(view));
 }
