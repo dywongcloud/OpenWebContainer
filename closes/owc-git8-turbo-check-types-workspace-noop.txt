@@ -1,1 +1,3 @@
-owc-git8-turbo-check-types-workspace-noop resolved 1794158812965-8960-ec65d3cd6f6a91e5 2026-11-08T17:36:54.386Z
+Row: owc-git8-turbo-check-types-workspace-noop
+Witness: 1794158812965-8960-ec65d3cd6f6a91e5
+Status: resolved
