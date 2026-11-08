@@ -1543,18 +1543,42 @@ function cmdMerge(ctx: CommandContext, flags: Set<string>, values: Map<string,st
         repo.remove(repo.g('MERGE_HEAD'));
         return ok('');
     }
-    const name = rest[0] ?? '';
+    /* Host git 2.53.0: -s/--strategy names a merge strategy, not a
+       commit-ish; parseFlags leaves the bare '-s ours' word in rest. */
+    const rawArgs = ctx.args ?? [];
+    let strategy: string | undefined;
+    for (let i = 0; i < rawArgs.length; i++) {
+        const a = rawArgs[i];
+        if (a === '-s' || a === '--strategy') { strategy = rawArgs[i + 1]; break; }
+        if (a.startsWith('--strategy=')) { strategy = a.slice('--strategy='.length); break; }
+        if (a.startsWith('-s=')) { strategy = a.slice(3); break; }
+    }
+    const commitArgs = strategy !== undefined ? rest.filter((r) => r !== strategy) : rest;
+    const name = commitArgs[0] ?? '';
     const other = repo.resolve(name);
     const head = repo.refs.headOid();
     if (other === undefined || head === undefined) return fail('fatal: ' + name + ' - not something we can merge', 128);
     const headCommit = repo.readCommit(head), otherCommit = repo.readCommit(other);
     if (headCommit === undefined || otherCommit === undefined) return fail('fatal: bad object', 128);
+    if (strategy === 'ours') {
+        makeCommit(repo, 'Merge branch ' + "'" + name + "'", { parents: [head, other], tree: headCommit.tree });
+        return ok("Merge made by the 'ours' strategy.\n");
+    }
     const base = repo.commonAncestor(head, other);
     if (base === head && !flags.has('--no-ff')) {
+        const changes = repo.changesBetween(repo.flatTree(headCommit.tree), repo.flatTree(otherCommit.tree));
+        const stat = renderStat(repo, changes);
+        const prefix = 'Updating ' + abbrev(head) + '..' + abbrev(other) + '\nFast-forward\n';
+        if (flags.has('--squash')) {
+            const entries: IndexEntry[] = [];
+            for (const [path, state] of repo.flatTree(otherCommit.tree)) entries.push({ path, oid: state.oid, mode: state.mode, size: 0, mtimeSec: 0, mtimeNs: 0, stage: 0 });
+            repo.writeIndexEntries(entries);
+            repo.checkoutTree(otherCommit.tree, false);
+            return ok(prefix + 'Squash commit -- not updating HEAD\n' + stat);
+        }
         updateHead(repo, other, 'merge ' + name + ': Fast-forward', head);
         repo.checkoutTree(otherCommit.tree);
-        const changes = repo.changesBetween(repo.flatTree(headCommit.tree), repo.flatTree(otherCommit.tree));
-        return ok('Updating ' + abbrev(head) + '..' + abbrev(other) + '\nFast-forward\n' + renderStat(repo, changes));
+        return ok(prefix + stat);
     }
     const baseTree = base === undefined ? new Map<string, FileState>() : repo.flatTree(repo.readCommit(base)?.tree ?? '');
     const ours = repo.flatTree(headCommit.tree), theirs = repo.flatTree(otherCommit.tree);
@@ -1587,6 +1611,13 @@ function cmdMerge(ctx: CommandContext, flags: Set<string>, values: Map<string,st
             '\nAutomatic merge failed; fix conflicts and then commit the result.\n', '', 1);
     }
     const treeOid = repo.buildTree(merged);
+    if (flags.has('--squash')) {
+        const entries: IndexEntry[] = [];
+        for (const [path, state] of merged) entries.push({ path, oid: state.oid, mode: state.mode, size: 0, mtimeSec: 0, mtimeNs: 0, stage: 0 });
+        repo.writeIndexEntries(entries);
+        repo.checkoutTree(treeOid, false);
+        return ok('Squash commit -- not updating HEAD\n', 'Automatic merge went well; stopped before committing as requested\n');
+    }
     makeCommit(repo, 'Merge branch ' + "'" + name + "'", { parents: [head, other], tree: treeOid });
     repo.checkoutTree(treeOid, false);
     const changes = repo.changesBetween(ours, merged);
