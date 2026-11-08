@@ -2073,6 +2073,10 @@ function cmdClone(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     const sourceGit = normalizePath(source.startsWith('/') ? source + '/.git' : baseDir + '/' + source + '/.git');
     if (!ctx.fs.fileExists(sourceGit)) return fail('fatal: repository ' + source + ' does not exist', 128);
     const dest = normalizePath(target.startsWith('/') ? target : baseDir + '/' + target);
+    /* Host git 2.53.0: an existing NON-EMPTY destination is a fatal 128,
+       while an existing EMPTY destination is allowed. */
+    if (ctx.fs.isDirectory(dest) && (ctx.fs.readdirNames(dest) ?? []).length > 0)
+        return fail("fatal: destination path '" + target + "' already exists and is not an empty directory.", 128);
     const bare = flags.has('--bare');
     const destGit = bare ? dest : dest + '/.git';
     const copyDir = (from: string, to: string): void => {
