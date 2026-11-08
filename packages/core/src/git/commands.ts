@@ -1229,18 +1229,36 @@ function cmdDiff(ctx: CommandContext, flags: Set<string>, values: Map<string,str
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const cached = flags.has('--cached') || flags.has('--staged');
-    const rev = rest.filter((r) => !r.startsWith('-'))[0];
+    /* Host git 2.53.0: git diff A B renders the commit-to-commit diff between
+       the two revisions; a lone revision still diffs its tree against the worktree.
+       Only operands before a bare -- are revisions. */
+    const operands: string[] = [];
+    for (const r of rest) { if (r === '--') break; if (!r.startsWith('-')) operands.push(r); }
+    const rev = operands[0];
+    const rev2 = operands[1];
+    const treeOf = (name: string): Map<string, FileState> | undefined => {
+        const oid = repo.resolve(name);
+        const commit = oid === undefined ? undefined : repo.readCommit(oid);
+        const tree = commit !== undefined ? commit.tree : undefined;
+        if (tree === undefined) return undefined;
+        const out = new Map<string, FileState>();
+        for (const [path, state] of repo.flatTree(tree)) out.set(path, state);
+        return out;
+    };
     const base = new Map<string, FileState>();
     let next = new Map<string, FileState>();
     if (cached) {
         for (const [path, state] of repo.headTree()) base.set(path, state);
         for (const [path, state] of repo.indexTree()) next.set(path, state);
     } else if (rev !== undefined) {
-        const oid = repo.resolve(rev);
-        const commit = oid === undefined ? undefined : repo.readCommit(oid);
-        const tree = commit !== undefined ? commit.tree : undefined;
-        if (tree !== undefined) for (const [path, state] of repo.flatTree(tree)) base.set(path, state);
-        next = worktreeState(repo, true);
+        const first = treeOf(rev);
+        const second = rev2 === undefined ? undefined : treeOf(rev2);
+        if (first !== undefined) for (const [path, state] of first) base.set(path, state);
+        if (second !== undefined) {
+            for (const [path, state] of second) next.set(path, state);
+        } else {
+            next = worktreeState(repo, true);
+        }
     } else {
         for (const [path, state] of repo.indexTree()) base.set(path, state);
         next = worktreeState(repo, true);
