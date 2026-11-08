@@ -630,6 +630,27 @@ function cmdCatFile(ctx: CommandContext, raw: string[]): CommandResult {
        "<oid> <type> <size>" (and the object body for --batch) and exit 0 on EOF. */
     const batchCheck = raw.includes('--batch-check');
     const batch = raw.includes('--batch') || batchCheck;
+    /* Host git 2.53.0: --batch-all-objects enumerates every loose object
+       sorted by oid instead of reading object names from stdin. */
+    if (raw.includes('--batch-all-objects')) {
+        const oids: string[] = [];
+        for (const dir of repo.names(repo.g('objects'))) {
+            if (!/^[0-9a-f]{2}$/.test(dir)) continue;
+            for (const name of repo.names(repo.g('objects/' + dir))) {
+                const oid = dir + name;
+                if (/^[0-9a-f]{40}$/.test(oid)) oids.push(oid);
+            }
+        }
+        oids.sort();
+        let out = '';
+        for (const oid of oids) {
+            const obj = repo.object(oid);
+            if (obj === undefined) continue;
+            out += oid + ' ' + obj.type + ' ' + obj.content.length + '\n';
+            if (!batchCheck) out += text(obj.content) + '\n';
+        }
+        return ok(out);
+    }
     if (batch) {
         const input = ctx.input ?? '';
         let out = '';
