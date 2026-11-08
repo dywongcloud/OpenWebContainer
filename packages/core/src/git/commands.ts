@@ -983,7 +983,7 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const create = flags.has('-b') || flags.has('-B') || flags.has('--branch') || values.has('-b') || values.has('-B') || values.has('--branch');
-    const name = create ? (values.get('-b') ?? values.get('-B') ?? values.get('--branch')) : rest[0];
+    let name = create ? (values.get('-b') ?? values.get('-B') ?? values.get('--branch')) : rest[0];
     if (create && name !== undefined) return switchBranch(repo, name, true);
     if (flags.has('--')) {
         for (const path of rest.filter((r) => r !== '--')) {
@@ -993,6 +993,17 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
         return ok('');
     }
     if (name === undefined) return fail('fatal: you are on a branch yet to be born', 128);
+    /* Host git 2.53.0: the - and @{-N} forms name the previous
+       checkout target recorded in .git/logs/HEAD. Resolve it to that commit's
+       full oid so the Note line and the detach path use the
+       same name the host prints. */
+    if (name === '-' || (name.startsWith('@{-') && name.endsWith('}'))) {
+        const hops = name === '-' ? 1 : Number(name.slice(3, -1));
+        const moves = repo.refs.reflog('HEAD')
+            .filter((entry) => entry.message.startsWith('checkout: moving from '));
+        const from = moves[moves.length - hops];
+        if (from !== undefined && repo.resolve(from.old) !== undefined) name = from.old;
+    }
     if (repo.refs.branches().includes(name)) return switchBranch(repo, name, false);
     let oid = repo.resolve(name);
     if (oid === undefined) return fail("error: pathspec '" + name + "' did not match any file(s) known to git", 1);
