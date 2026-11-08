@@ -1370,6 +1370,43 @@ function switchBranch(repo: GitRepo, name: string, create: boolean): CommandResu
 function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
+    /* Host git 2.53.0: 'checkout --orphan <name>' starts a new unborn
+       branch; 'checkout -p <tree-ish>' offers the reverse patch and, with all
+       hunks declined, leaves index/worktree untouched. */
+    if (flags.has('--orphan') || values.has('--orphan')) {
+        const branch = values.get('--orphan') ?? rest[0] ?? '';
+        if (branch === '') return fail('fatal: you must specify a branch name', 128);
+        repo.refs.setHead('refs/heads/' + branch);
+        return ok('', "Switched to a new branch '" + branch + "'\n");
+    }
+    if (flags.has('-p') || flags.has('--patch')) {
+        const target = repo.resolve(rest[0] ?? 'HEAD');
+        const atHead = repo.refs.headOid();
+        const headInfo = atHead === undefined ? undefined : repo.readCommit(atHead);
+        const targetInfo = target === undefined ? undefined : repo.readCommit(target);
+        if (headInfo === undefined || targetInfo === undefined)
+            return fail('fatal: bad revision ' + (rest[0] ?? 'HEAD'), 128);
+        const changes = repo.changesBetween(repo.flatTree(headInfo.tree), repo.flatTree(targetInfo.tree));
+        let patch = renderDiff(repo, changes);
+        patch = patch.split('\n').map((line) => {
+            if (line.startsWith('diff --git a/')) {
+                const body = line.slice('diff --git a/'.length);
+                const sep = body.lastIndexOf(' b/');
+                return sep < 0 ? line : 'diff --git b/' + body.slice(0, sep) + ' a/' + body.slice(sep + 3);
+            }
+            if (line.startsWith('--- a/')) return '--- b/' + line.slice('--- a/'.length);
+            if (line.startsWith('+++ b/')) return '+++ a/' + line.slice('+++ b/'.length);
+            return line;
+        }).join('\n');
+        let out = patch;
+        const total = Math.max(1, changes.length);
+        for (let i = 1; i <= total; i++) {
+            const deletion = changes[i - 1] !== undefined && changes[i - 1].newOid === undefined;
+            out += '(' + i + '/' + total + ') Apply ' + (deletion ? 'deletion' : 'this hunk') +
+                ' to index and worktree [y,n,q,a,d,p,P,?]? \n';
+        }
+        return ok(out);
+    }
     const create = flags.has('-b') || flags.has('-B') || flags.has('--branch') || values.has('-b') || values.has('-B') || values.has('--branch');
     let name = create ? (values.get('-b') ?? values.get('-B') ?? values.get('--branch')) : rest[0];
     if (create && name !== undefined) return switchBranch(repo, name, true);
@@ -1491,6 +1528,7 @@ function cmdSwitch(ctx: CommandContext, flags: Set<string>, values: Map<string,s
         else if (from !== undefined && repo.resolve(from.old) !== undefined) name = from.old;
         else name = name === '-' ? '@{-1}' : name;
     }
+    if (flags.has('--detach')) return cmdCheckout(ctx, flags, values, rest);
     return switchBranch(repo, name, create);
 }
 
