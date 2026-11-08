@@ -1,1 +1,3 @@
-owc-git3-checkout-at-symbolic-noop resolved 1794098360799-11454-e45883eeb936b35e 2026-11-08T00:57:44.413Z
+Row: owc-git3-checkout-at-symbolic-noop
+Witness: 1794098360799-11454-e45883eeb936b35e
+Status: resolved
