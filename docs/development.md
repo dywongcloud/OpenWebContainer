@@ -67,7 +67,7 @@ The worker entry is what `@open-web-container/api` imports as `@open-web-contain
 | `build` | `tsc -b && vite build` |
 | `lint` | `eslint .` |
 | `preview` | `vite preview` |
-| `check-types` | `tsc --noEmit` |
+| `check-types` | `tsc -b --noEmit` |
 
 `pnpm playground` at the root filters turbo's `dev` task to `@open-web-container/playground`, which is `vite`. `apps/playground/vite.config.ts` sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` for both `server` and `preview`, excludes `quickjs-emscripten` from dep optimisation, and includes `**/*.wasm` as assets.
 

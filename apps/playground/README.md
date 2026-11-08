@@ -13,7 +13,7 @@ pnpm playground   # turbo run dev --filter='@open-web-container/playground'
 pnpm dev          # all packages in parallel
 ```
 
-Or from this directory: `pnpm dev` (which is `vite`), `pnpm build` (`tsc -b && vite build`), `pnpm preview`, `pnpm lint`, `pnpm check-types`.
+Or from this directory: `pnpm dev` (which is `vite`), `pnpm build` (`tsc -b && vite build`), `pnpm preview`, `pnpm lint`, `pnpm check-types` (`tsc -b --noEmit`, which type-checks both the app and node projects).
 
 Open <http://localhost:5173>. `vite.config.ts` sets no `server.port`, so Vite's default 5173 is used. It does declare `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` for both `server` and `preview`; verify the headers your deployment actually serves before relying on `SharedArrayBuffer` (see [Known limitations](../../docs/known-limitations.md)).
 
