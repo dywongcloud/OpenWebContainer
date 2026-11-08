@@ -935,10 +935,32 @@ function cmdBranch(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const names = rest.filter((r) => !r.startsWith('-'));
+    const moveValue = values.get('-m');
+    const wantsMove = moveValue !== undefined || flags.has('-m') || flags.has('--move');
+    if (wantsMove && !flags.has('-d') && !flags.has('-D') && !flags.has('--delete')) {
+        const args = moveValue !== undefined ? [moveValue, ...names] : names;
+        const from = args.length > 1 ? args[0] : repo.refs.branch();
+        const to = args.length > 1 ? args[1] : args[0];
+        if (to !== undefined) {
+            const oid = repo.refs.read('refs/heads/' + from);
+            if (oid !== undefined) repo.refs.writeRef('refs/heads/' + to, oid);
+            repo.refs.removeRef('refs/heads/' + from);
+            if (repo.refs.headRef() === 'refs/heads/' + from) repo.refs.setHead('refs/heads/' + to);
+        }
+        return ok('');
+    }
     if (flags.has('-d') || flags.has('-D') || flags.has('--delete')) {
+        const force = flags.has('-D');
         let out = '';
         for (const name of names) {
             const oid = repo.refs.read('refs/heads/' + name);
+            const head = repo.refs.headOid();
+            if (!force && oid !== undefined && head !== undefined &&
+                repo.commonAncestor(head, oid) !== oid) {
+                return fail("error: the branch '" + name + "' is not fully merged\n" +
+                    "hint: If you are sure you want to delete it, run 'git branch -D " + name + "'\n" +
+                    'hint: Disable this message with "git config set advice.forceDeleteBranch false"', 1);
+            }
             repo.refs.removeRef('refs/heads/' + name);
             out += 'Deleted branch ' + name + ' (was ' + abbrev(oid ?? ZERO_OID) + ').\n';
         }
