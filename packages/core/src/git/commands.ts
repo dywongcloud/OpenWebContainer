@@ -445,7 +445,7 @@ export function runCommand(ctx: CommandContext, sub: string, args: string[]): Co
         case 'reset': return cmdReset(ctx, flags, values, rest);
         case 'tag': return cmdTag(ctx, flags, values, rest);
         case 'stash': return cmdStash(ctx, flags, values, rest);
-        case 'reflog': return cmdReflog(ctx, rest);
+        case 'reflog': return cmdReflog(ctx, flags, values, rest);
         case 'grep': return cmdGrep(ctx, flags, values, rest);
         case 'blame': return cmdBlame(ctx, flags, values, rest);
         case 'archive': return cmdArchive(ctx, flags, values, rest);
@@ -1751,12 +1751,68 @@ function cmdStash(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     return ok('Saved working directory and index state ' + message + '\n');
 }
 
-function cmdReflog(ctx: CommandContext, rest: string[]): CommandResult {
+function rawReflog(repo: GitRepo, path: string): string[] {
+    const raw = repo.readText(path);
+    return raw === undefined ? [] : raw.split('\n').filter((line) => line !== '');
+}
+function writeRawReflog(repo: GitRepo, path: string, lines: string[]): void {
+    repo.writeText(path, lines.length === 0 ? '' : lines.join('\n') + '\n');
+}
+function reflogPaths(repo: GitRepo, only?: string): string[] {
+    if (only !== undefined) {
+        const base = only === 'HEAD' || only === '@' || only === '' ? 'HEAD'
+            : (only.startsWith('refs/') ? only : 'refs/heads/' + only);
+        return [repo.g('logs/' + base)];
+    }
+    const out: string[] = [];
+    const walk = (dir: string): void => {
+        for (const name of repo.names(dir)) {
+            const full = dir + '/' + name;
+            if (repo.isDir(full)) walk(full); else out.push(full);
+        }
+    };
+    walk(repo.g('logs'));
+    return out;
+}
+
+function cmdReflog(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     /* git reflog show <ref>[@{n}]: honour the ref, its label and the @{n} start
        (host git 2.53.0). A bare reflog show / HEAD keeps the HEAD reflog. */
     const words = rest.filter((entry) => !entry.startsWith('-'));
+    if (words[0] === 'expire') {
+        /* Host git 2.53.0 prunes reflog entries older than the cutoff;
+           --expire=now drops every entry, --all walks all logs under logs/. */
+        const now = Math.floor(Date.now() / 1000);
+        const expireSpec = values.get('--expire') ?? 'now';
+        const cutoff = /^\d+$/.test(expireSpec) ? Number(expireSpec) : now;
+        const paths = reflogPaths(repo, flags.has('--all') ? undefined : words[1]);
+        for (const path of paths) {
+            const kept = rawReflog(repo, path).filter((line) => {
+                const head = line.split('\t')[0].trim().split(' ');
+                const ts = Number(head[head.length - 2]);
+                return Number.isFinite(ts) && ts >= cutoff;
+            });
+            writeRawReflog(repo, path, kept);
+        }
+        return ok('');
+    }
+    if (words[0] === 'delete') {
+        /* Host git 2.53.0 deletes exactly the named @{n} entry ( @{0} is the
+           newest, i.e. the last line of the chronological reflog file). */
+        const spec = words[1] ?? '';
+        const at = /^(.*)@\{(\d+)\}$/.exec(spec);
+        if (at !== null) {
+            const base = at[1] === '' || at[1] === '@' || at[1] === 'HEAD' ? 'HEAD'
+                : (at[1].startsWith('refs/') ? at[1] : 'refs/heads/' + at[1]);
+            const path = repo.g('logs/' + base);
+            const lines = rawReflog(repo, path);
+            const idx = lines.length - 1 - Number(at[2]);
+            if (idx >= 0 && idx < lines.length) { lines.splice(idx, 1); writeRawReflog(repo, path, lines); }
+        }
+        return ok('');
+    }
     const spec = words[0] === 'show' ? words[1] : words[0];
     const at = spec !== undefined ? /^(.*)@\{(\d+)\}$/.exec(spec) : null;
     const base = at !== null ? at[1] : (spec ?? '');
