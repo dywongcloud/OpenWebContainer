@@ -890,19 +890,54 @@ function cmdLog(ctx: CommandContext, flags: Set<string>, values: Map<string,stri
     const rev = rest.find((entry) => !entry.startsWith('-'));
     const start = rev === undefined ? repo.refs.headOid() : repo.resolve(rev);
     if (start === undefined) return fail("fatal: your current branch '" + repo.refs.branch() + "' does not have any commits yet", 128);
-    const max = parseInt(values.get('-n') ?? values.get('--max-count') ?? '100', 10) || 100;
-    const entries = repo.logEntries(start, max);
-    if (flags.has('--oneline')) return ok(entries.map((entry) => abbrev(entry.oid) + ' ' + entry.info.message.trim().split('\n')[0] + '\n').join(''));
-    if (flags.has('-p') || flags.has('--patch')) {
-        return ok(entries.map((entry, index) => {
-            const parent = entry.info.parents[0];
-            const parentTree = parent === undefined ? '' : (repo.readCommit(parent)?.tree ?? '');
-            const changes = parentTree === '' ? repo.changesBetween(new Map(), repo.flatTree(entry.info.tree))
-                : repo.changesBetween(repo.flatTree(parentTree), repo.flatTree(entry.info.tree));
-            return (index === 0 ? '' : '\n') + mediumLog(repo, entry.oid, entry.info) + '\n' + renderDiff(repo, changes);
-        }).join(''));
+    /* Host git 2.53.0: -1/-3 shorthands are max-count, as are -n and --max-count. */
+    const shortMax = [...flags].find((flag) => /^-\d+$/.test(flag));
+    const max = parseInt(values.get('-n') ?? values.get('--max-count') ?? (shortMax !== undefined ? shortMax.slice(1) : '100'), 10) || 100;
+    let entries: { oid: string; info: CommitInfo }[];
+    if (flags.has('--all')) {
+        /* --all walks every ref tip; host orders by date, breaking ties by ref traversal. */
+        const tips: string[] = [];
+        for (const name of repo.refs.branches()) { const oid = repo.refs.read('refs/heads/' + name); if (oid !== undefined) tips.push(oid); }
+        for (const name of repo.refs.tags()) { const oid = repo.refs.read('refs/tags/' + name); if (oid !== undefined) tips.push(oid); }
+        const head = repo.refs.headOid(); if (head !== undefined) tips.push(head);
+        const seen = new Set<string>(); entries = [];
+        for (const tip of tips) for (const entry of repo.logEntries(tip, 1000)) {
+            if (seen.has(entry.oid)) continue;
+            seen.add(entry.oid); entries.push(entry);
+        }
+        entries = entries.slice(0, max);
+    } else {
+        entries = repo.logEntries(start, max);
     }
-    return ok(entries.map((entry, index) => (index === 0 ? '' : '\n') + mediumLog(repo, entry.oid, entry.info)).join(''));
+    const graph = flags.has('--graph');
+    const stat = flags.has('--stat');
+    const patch = flags.has('-p') || flags.has('--patch');
+    const changesFor = (entry: { oid: string; info: CommitInfo }) => {
+        const parent = entry.info.parents[0];
+        const parentTree = parent === undefined ? '' : (repo.readCommit(parent)?.tree ?? '');
+        return parentTree === '' ? repo.changesBetween(new Map(), repo.flatTree(entry.info.tree))
+            : repo.changesBetween(repo.flatTree(parentTree), repo.flatTree(entry.info.tree));
+    };
+    if (flags.has('--oneline')) {
+        return ok(entries.map((entry) => (graph ? '* ' : '') + abbrev(entry.oid) + ' ' + entry.info.message.trim().split('\n')[0] + '\n').join(''));
+    }
+    if (graph && !stat && !patch) {
+        /* Host draws a linear chain: '* ' first line, '| ' continuation, two spaces at root. */
+        const blocks = entries.map((entry, index) => {
+            const lines = mediumLog(repo, entry.oid, entry.info).split('\n');
+            const last = index === entries.length - 1;
+            const body = last ? lines.slice(0, -1) : lines;
+            return body.map((line, i) => (i === 0 ? '* ' : (last ? '  ' : '| ')) + line).join('\n');
+        });
+        return ok(blocks.join('\n') + '\n');
+    }
+    return ok(entries.map((entry, index) => {
+        let block = (index === 0 ? '' : '\n') + mediumLog(repo, entry.oid, entry.info);
+        if (stat && patch) block += '---\n' + renderStat(repo, changesFor(entry), 80, false) + '\n' + renderDiff(repo, changesFor(entry));
+        else if (stat) block += '\n' + renderStat(repo, changesFor(entry), 80, false);
+        else if (patch) block += '\n' + renderDiff(repo, changesFor(entry));
+        return block;
+    }).join(''));
 }
 
 function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, string>, rest: string[]): CommandResult {
