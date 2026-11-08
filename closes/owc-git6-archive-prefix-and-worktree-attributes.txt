@@ -1,1 +1,3 @@
-owc-git6-archive-prefix-and-worktree-attributes resolved 1794141752340-9387-8ac2d57ff1e0ee1f 2026-11-08T12:59:43.362Z
+Row: owc-git6-archive-prefix-and-worktree-attributes
+Witness: 1794141752340-9387-8ac2d57ff1e0ee1f
+Status: resolved
