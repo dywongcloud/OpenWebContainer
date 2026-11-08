@@ -15,6 +15,7 @@
 		"clean": "rimraf dist",
 		"dev": "tsc --project tsconfig.json --watch",
 		"typecheck": "tsc --noEmit",
+		"check-types": "tsc --noEmit",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"files": [

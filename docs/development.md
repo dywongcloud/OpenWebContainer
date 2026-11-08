@@ -83,10 +83,10 @@ The worker entry is what `@open-web-container/api` imports as `@open-web-contain
 | --- | --- |
 | `install` | `dependsOn: ["^install"]` |
 | `build` | `dependsOn: ["^build"]`, `outputs: ["dist/**"]` |
-| `check-types` | `dependsOn: ["^check-types"]` |
+| `check-types` | `dependsOn: ["^check-types"]`; **all three packages** now declare this script — `core` and `api` run `tsc --noEmit`, `playground` runs `tsc -b --noEmit` — so `turbo run check-types` type-checks the whole workspace, not just the playground |
 | `dev` | `persistent: true`, `cache: false` |
 
-The `^` prefix means a package's task waits for the same task in its dependencies, so `turbo run build` builds `core` before `api` and `playground`.
+The `^` prefix means a package's task waits for the same task in its dependencies, so `turbo run build` builds `core` before `api` and `playground`. `turbo run check-types` reaches all three packages (core, api, playground) because each now declares a `check-types` script; before this fix only the playground did, so the workspace gate silently type-checked one package.
 
 ## Before you publish
 
