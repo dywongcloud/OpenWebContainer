@@ -527,7 +527,7 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
     const wantsGetAll = flags.has('--get-all');
     const key = rest[0];
     if (flags.has('--get-regexp')) {
-        const pattern = key ?? '';
+        const pattern = values.get('--get-regexp') ?? key ?? '';
         let re: RegExp;
         try { re = new RegExp(pattern); }
         catch { return fail('error: invalid key pattern: ' + pattern, 6); }
@@ -537,20 +537,25 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
             return (showOrigin ? originFor(scopeOfKey(k)) : '') + k + ' ' + line.slice(eq + 1) + '\n'; }).join(''));
     }
     if (wantsList) {
+        /* Host git 2.53.0: --show-scope prefixes each line with its scope name
+           and a TAB; --name-only emits only the key, never =value. */
+        const nameOnly = flags.has('--name-only');
+        const showScope = flags.has('--show-scope');
+        const emit = (line: { section: string; subsection?: string; key: string; value: string }, s: ConfigScope): string =>
+            (showScope ? s + '\t' : (showOrigin ? originFor(s) : '')) +
+            (nameOnly ? keyOfLine(line) + '\n' : configLine(line));
         const scoped = flags.has('--global') || flags.has('--system') || flags.has('--local') || flags.has('--worktree') || file !== undefined;
-        if (scoped) {
-            const pre = showOrigin ? originFor(scope) : '';
-            return ok(repo.config.readScope(scope).map((line) => pre + configLine(line)).join(''));
-        }
+        if (scoped) return ok(repo.config.readScope(scope).map((line) => emit(line, scope)).join(''));
         let out = '';
-        for (const s of scopes) {
-            const pre = showOrigin ? originFor(s) : '';
-            for (const line of repo.config.readScope(s)) out += pre + configLine(line);
-        }
+        for (const s of scopes) for (const line of repo.config.readScope(s)) out += emit(line, s);
         return ok(out);
     }
     if (key === undefined || key === '') return fail('usage: git config [<options>]', 129);
-    if (!key.includes('.')) return fail('error: key does not contain a section: ' + key, 2);
+    if (key === 'set' && rest.length === 1) return fail('error: wrong number of arguments, should be 2', 129);
+    if (!key.includes('.')) {
+        const getLike = rest.length === 1 && !wantsUnset && !wantsGetAll && !flags.has('--add') && !flags.has('--replace-all');
+        return fail('error: key does not contain a section: ' + key, getLike ? 1 : 2);
+    }
     if (key.includes(' ')) return fail('error: invalid key: ' + key, 1);
     if (wantsUnset) {
         const code = repo.config.unset(scope, key, flags.has('--unset-all'));
@@ -565,8 +570,9 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
         return ok(vals.map((v) => pre + v + '\n').join(''));
     }
     if (rest.length === 1 || flags.has('--get')) {
-        const value = repo.config.get(key);
-        if (value === undefined) return fail('', 1);
+        /* Honour the per-invocation -c overrides carried on the command context. */
+        const value = repo.configOverrides().get(key.toLowerCase()) ?? repo.config.get(key);
+        if (value === undefined) return ok('', '', 1);
         return ok((showOrigin ? originFor(scopeOfKey(key)) : '') + value + '\n');
     }
     if (flags.has('--add')) {
