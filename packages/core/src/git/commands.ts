@@ -985,6 +985,15 @@ function cmdShow(ctx: CommandContext, flags: Set<string>, values: Map<string, st
     const parentTree = info.parents.length > 0 ? (repo.readCommit(info.parents[0])?.tree ?? '') : '';
     const changes = parentTree === '' ? repo.changesBetween(new Map(), repo.flatTree(info.tree))
         : repo.changesBetween(repo.flatTree(parentTree), repo.flatTree(info.tree));
+    /* Host git 2.53.0: --stat renders the diffstat (no patch, no create-mode lines);
+       --oneline replaces the commit header with "<abbrev> <subject>". */
+    if (flags.has('--stat') || flags.has('--oneline')) {
+        const header = flags.has('--oneline')
+            ? abbrev(oid) + ' ' + info.message.trim().split('\n')[0] + '\n'
+            : mediumLog(repo, oid, info) + '\n';
+        const body = flags.has('--stat') ? renderStat(repo, changes, 80, false) : renderDiff(repo, changes);
+        return ok(tagHeader + header + body);
+    }
     return ok(tagHeader + mediumLog(repo, oid, info) + '\n' + renderDiff(repo, changes));
 }
 
