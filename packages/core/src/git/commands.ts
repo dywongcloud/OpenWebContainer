@@ -1293,7 +1293,38 @@ function cmdBranch(ctx: CommandContext, flags: Set<string>, values: Map<string,s
         return ok('');
     }
     const current = repo.refs.branch();
-    return ok(repo.refs.branches().map((name) => (name === current ? '* ' : '  ') + name + '\n').join(''));
+    /* Host git 2.53.0: -r lists remote-tracking branches only, --contains <ref>
+       keeps branches whose history includes that commit, -vv (also -v) appends
+       the abbreviated tip oid and its subject. --set-upstream-to is a setup
+       operation handled elsewhere, not part of this listing surface. */
+    const remoteOnly = flags.has('-r') || flags.has('--remotes');
+    const verbose = flags.has('-vv') || flags.has('-v') || flags.has('--verbose');
+    const contains = values.get('--contains');
+    let branches = repo.refs.branches();
+    if (contains !== undefined) {
+        const target = repo.resolve(contains);
+        if (target !== undefined) branches = branches.filter((name) => {
+            const oid = repo.refs.read('refs/heads/' + name);
+            return oid !== undefined && repo.logEntries(oid, 1000).some((e) => e.oid === target);
+        });
+    }
+    const remotes: string[] = [];
+    const walkRemotes = (dir: string, prefix: string): void => {
+        for (const name of repo.names(dir)) {
+            const full = dir + '/' + name;
+            if (repo.isDir(full)) walkRemotes(full, prefix + name + '/');
+            else remotes.push(prefix + name);
+        }
+    };
+    walkRemotes(repo.g('refs/remotes'), '');
+    const lines: string[] = [];
+    if (!remoteOnly) for (const name of branches) {
+        const oid = repo.refs.read('refs/heads/' + name) ?? ZERO_OID;
+        const suffix = verbose ? ' ' + abbrev(oid) + ' ' + repo.subjectOf(oid) : '';
+        lines.push((name === current ? '* ' : '  ') + name + suffix + '\n');
+    }
+    for (const name of remotes.sort()) lines.push('  remotes/' + name + '\n');
+    return ok(lines.join(''));
 }
 
 function switchBranch(repo: GitRepo, name: string, create: boolean): CommandResult {
