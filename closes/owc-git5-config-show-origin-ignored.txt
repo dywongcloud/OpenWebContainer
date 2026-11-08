@@ -1,1 +1,3 @@
-owc-git5-config-show-origin-ignored resolved 1794120316656-10094-786ce08349efd2c7 2026-11-08T06:46:05.187Z
+Row: owc-git5-config-show-origin-ignored
+Witness: 1794120316656-10094-786ce08349efd2c7
+Status: resolved
