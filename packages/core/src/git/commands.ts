@@ -1955,11 +1955,14 @@ function cmdLsRemote(ctx: CommandContext, raw: string[]): CommandResult {
     const url = remoteTarget(repo, target);
     const src = localRepo(ctx, url);
     if (src === undefined) return fail("fatal: '" + target + "' does not appear to be a git repository", 128);
+    const headsOnly = raw.includes('--heads');
+    const tagsOnly = raw.includes('--tags');
+    const filtered = headsOnly || tagsOnly;
     let out = '';
     const head = src.refs.headOid();
-    if (head !== undefined) out += head + '\tHEAD\n';
-    for (const b of src.refs.branches()) { const o = src.refs.read('refs/heads/' + b); if (o !== undefined) out += o + '\trefs/heads/' + b + '\n'; }
-    for (const t of src.refs.tags()) { const o = src.refs.read('refs/tags/' + t); if (o !== undefined) out += o + '\trefs/tags/' + t + '\n'; }
+    if (!filtered && head !== undefined) out += head + '\tHEAD\n';
+    if (!tagsOnly) for (const b of src.refs.branches()) { const o = src.refs.read('refs/heads/' + b); if (o !== undefined) out += o + '\trefs/heads/' + b + '\n'; }
+    if (!headsOnly) for (const t of src.refs.tags()) { const o = src.refs.read('refs/tags/' + t); if (o !== undefined) out += o + '\trefs/tags/' + t + '\n'; }
     return ok(out);
 }
 
