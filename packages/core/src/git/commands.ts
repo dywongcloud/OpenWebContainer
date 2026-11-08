@@ -1749,6 +1749,21 @@ function cmdStash(ctx: CommandContext, flags: Set<string>, values: Map<string,st
         if (action === 'pop' || action === 'branch') stashDrop(repo);
         return ok(longStatus(statusOf(repo)) + 'Dropped refs/stash@{0} (' + stashOid + ')\n', branchStderr);
     }
+    /* Host git 2.53.0: 'stash push -p' offers each hunk interactively.
+       With all hunks declined (or no input) it prints the patch and prompt,
+       exits 1 with 'No changes selected' and saves nothing. */
+    if (flags.has('-p') || flags.has('--patch')) {
+        const pending = statusOf(repo);
+        const changes = pending.unstaged.length > 0 ? pending.unstaged : pending.staged;
+        if (changes.length === 0) return ok('No local changes to save\n');
+        for (const change of changes) {
+            if (change.newOid !== undefined) {
+                const bytes = repo.readBytes(repo.w(change.path));
+                if (bytes !== undefined) repo.objects.write("blob", bytes);
+            }
+        }
+        return ok(renderDiff(repo, changes) + '(1/1) Stash this hunk [y,n,q,a,d,e,p,P,?]? \n', 'No changes selected\n', 1);
+    }
     const view = statusOf(repo);
     const includeUntracked = flags.has('-u') || flags.has('--include-untracked');
     const untracked = includeUntracked ? view.untracked : [];
@@ -1966,6 +1981,7 @@ function cmdCherryPick(ctx: CommandContext, flags: Set<string>, values: Map<stri
         if (change.newOid !== undefined && repo.exists(repo.w(change.path))) entries.push(repo.entryFor(change.path));
     }
     repo.writeIndexEntries(entries);
+    if (flags.has('--no-commit')) return ok('');
     const made = makeCommit(repo, info.message);
     return ok('[' + repo.refs.branch() + ' ' + abbrev(made.oid) + '] ' + info.message.trim().split('\n')[0] +
         '\n Date: ' + mediumDate(info.author.ts, info.author.tz) + '\n' + commitLines(repo, made.changes));
