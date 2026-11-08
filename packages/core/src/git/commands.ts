@@ -1430,12 +1430,23 @@ function cmdStash(ctx: CommandContext, flags: Set<string>, values: Map<string,st
         return ok(longStatus(statusOf(repo)) + 'Dropped refs/stash@{0} (' + stashOid + ')\n', branchStderr);
     }
     const view = statusOf(repo);
-    if (view.unstaged.length === 0 && view.staged.length === 0) return ok('No local changes to save\n');
+    const includeUntracked = flags.has('-u') || flags.has('--include-untracked');
+    const untracked = includeUntracked ? view.untracked : [];
+    if (view.unstaged.length === 0 && view.staged.length === 0 && untracked.length === 0) return ok('No local changes to save\n');
     const head = repo.refs.headOid();
     if (head === undefined) return fail('fatal: You do not have the initial commit yet', 128);
     const state = worktreeState(repo, true);
+    /* Host git 2.53.0: -u saves untracked files in the stash tree and removes them from
+       the worktree; -m/--message replaces the WIP subject with "On <branch>: <msg>". */
+    for (const path of untracked) {
+        const bytes = repo.readBytes(repo.w(path));
+        if (bytes !== undefined) state.set(path, { oid: repo.objects.write('blob', bytes), mode: repo.worktreeMode(path) });
+    }
     const treeOid = repo.buildTree(state);
-    const message = 'WIP on ' + repo.refs.branch() + ': ' + abbrev(head) + ' ' + repo.subjectOf(head);
+    const custom = values.get('-m') ?? values.get('--message');
+    const message = custom !== undefined
+        ? 'On ' + repo.refs.branch() + ': ' + custom
+        : 'WIP on ' + repo.refs.branch() + ': ' + abbrev(head) + ' ' + repo.subjectOf(head);
     const info: CommitInfo = { tree: treeOid, parents: [head], author: repo.identity(), committer: repo.identity(), message: message + '\n', extra: [] };
     const oid = repo.objects.write('commit', serializeCommit(info));
     const previous = repo.refs.read('refs/stash') ?? ZERO_OID;
@@ -1443,6 +1454,7 @@ function cmdStash(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     repo.refs.appendReflog('refs/stash', previous, oid, repo.who(), message, repo.identity().ts, repo.identity().tz);
     const headCommit = repo.readCommit(head);
     if (headCommit !== undefined) repo.checkoutTree(headCommit.tree);
+    for (const path of untracked) repo.remove(repo.w(path));
     return ok('Saved working directory and index state ' + message + '\n');
 }
 
