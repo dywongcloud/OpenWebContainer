@@ -1,1 +1,3 @@
-owc-git5-log-graph-all-stat-and-1-ignored resolved 1794123322885-9930-7ebf1e9b6edc52d3 2026-11-08T07:37:09.826Z
+Row: owc-git5-log-graph-all-stat-and-1-ignored
+Witness: 1794123322885-9930-7ebf1e9b6edc52d3
+Status: resolved
