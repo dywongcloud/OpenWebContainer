@@ -216,7 +216,7 @@ function isIgnored(repo: GitRepo, path: string): boolean {
     return false;
 }
 
-export function longStatus(view: StatusView, commit = false): string {
+export function longStatus(view: StatusView, commit = false, untrackedSuppressed = false): string {
     let out = view.detached ? 'HEAD detached at ' + (view.detachedLabel ?? abbrev(view.headOid ?? ZERO_OID)) + '\n' : 'On branch ' + view.branch + '\n';
     if (view.noCommits) out += '\n' + (commit ? 'Initial commit' : 'No commits yet') + '\n';
     if (view.unmerged.length > 0) {
@@ -263,7 +263,7 @@ export function longStatus(view: StatusView, commit = false): string {
     }
     if (view.unstaged.length > 0) return out + 'no changes added to commit (use "git add" and/or "git commit -a")\n';
     if (view.noCommits) return out + '\nnothing to commit (create/copy files and use "git add" to track)\n';
-    return out + 'nothing to commit, working tree clean\n';
+    return out + (untrackedSuppressed ? 'nothing to commit (use -u to show untracked files)\n' : 'nothing to commit, working tree clean\n');
 }
 
 /* ------------------------------------------------------------------ *
@@ -397,7 +397,11 @@ function parseFlags(args: string[], repeatParents = false, sub = ''): { flags: S
             if (LONG_VALUE_OPTS.has(arg) && i + 1 < args.length) { values.set(arg, args[++i]); flags.add(arg); }
             else flags.add(arg);
         } else if (arg.startsWith('-') && arg.length > 1) {
-            if (repeatParents && arg === '-p' && i + 1 < args.length) {
+            /* Host git 2.53.0: -uno / -unormal / -uall are attached-value short
+               options for status, not three independent switches. */
+            if (sub === 'status' && /^-u(no|normal|all)$/.test(arg)) {
+                values.set('--untracked-files', arg.slice(2)); flags.add('--untracked-files');
+            } else if (repeatParents && arg === '-p' && i + 1 < args.length) {
                 const value = args[++i];
                 const list = multi.get('-p') ?? []; list.push(value); multi.set('-p', list);
                 values.set('-p', value);
@@ -867,12 +871,19 @@ function expandPaths(repo: GitRepo, args: string[], all = false): string[] {
 function cmdStatus(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[], short: boolean): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const view = statusOf(repo);
+    /* Host git 2.53.0: -uno / --untracked-files=no suppresses every untracked
+       row across short, -z, -b, porcelain v1/v2 and the long form. Filtering the
+       StatusView here keeps every renderer unchanged. */
+    const untrackedMode = values.get('--untracked-files');
+    const baseView = statusOf(repo);
+    const view = untrackedMode === 'no'
+        ? { ...baseView, rows: baseView.rows.filter((row) => row.x !== '?'), untracked: [] }
+        : baseView;
     const withBranch = flags.has('-b') || flags.has('--branch');
     // --ignored arrives as a bare flag or as --ignored=<mode>; parseFlags puts the
     // "=" form into values (not flags), so honour both spellings here.
     const ignoredMode = values.get('--ignored');
-    const showIgnored = (flags.has('--ignored') || ignoredMode !== undefined) && ignoredMode !== 'no';
+    const showIgnored = (flags.has('--ignored') || ignoredMode !== undefined) && ignoredMode !== 'no' && untrackedMode !== 'no';
     const matching = ignoredMode === 'matching';
     const index = repo.indexTree();
     const ignored = repo.worktreeFiles().filter((path) => !index.has(path) && isIgnored(repo, path));
@@ -886,7 +897,7 @@ function cmdStatus(ctx: CommandContext, flags: Set<string>, values: Map<string,s
         if (!showIgnored) return ok(base);
         return ok(base + ignoredRows(ignored, '!!', matching, nul));
     }
-    return ok(longStatus(view));
+    return ok(longStatus(view, false, untrackedMode === 'no'));
 }
 
 function cmdAdd(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
