@@ -1615,7 +1615,8 @@ function cmdClone(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     const sourceGit = normalizePath(source.startsWith('/') ? source + '/.git' : baseDir + '/' + source + '/.git');
     if (!ctx.fs.fileExists(sourceGit)) return fail('fatal: repository ' + source + ' does not exist', 128);
     const dest = normalizePath(target.startsWith('/') ? target : baseDir + '/' + target);
-    const destGit = dest + '/.git';
+    const bare = flags.has('--bare');
+    const destGit = bare ? dest : dest + '/.git';
     const copyDir = (from: string, to: string): void => {
         if (!ctx.fs.fileExists(to)) ctx.fs.createDirectory(to);
         for (const name of ctx.fs.readdirNames(from) ?? []) {
@@ -1627,6 +1628,10 @@ function cmdClone(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     copyDir(sourceGit, destGit);
     const clonedCtx: CommandContext = { ...ctx, cwd: dest };
     const repo = new GitRepo(clonedCtx, dest, destGit);
+    if (bare) {
+        repo.config.set('local', 'core.bare', 'true', true);
+        return ok('', "Cloning into bare repository '" + target + "'...\ndone.\n");
+    }
     const oid = repo.refs.headOid();
     const commit = oid === undefined ? undefined : repo.readCommit(oid);
     if (commit !== undefined) repo.checkoutTree(commit.tree, false);
