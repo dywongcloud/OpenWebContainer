@@ -1083,8 +1083,21 @@ function cmdSwitch(ctx: CommandContext, flags: Set<string>, values: Map<string,s
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const create = flags.has('-c') || flags.has('-C') || flags.has('--create') || values.has('-c') || values.has('-C') || values.has('--create');
-    const name = create ? (values.get('-c') ?? values.get('-C') ?? values.get('--create')) : rest[0];
+    let name = create ? (values.get('-c') ?? values.get('-C') ?? values.get('--create')) : rest[0];
     if (name === undefined) return fail('fatal: missing branch or commit argument', 128);
+    /* Host git 2.53.0: 'switch -' / @{-N} return to the previous checkout
+       source in .git/logs/HEAD, exactly like 'checkout -'. */
+    if (name === '-' || (name.startsWith('@{-') && name.endsWith('}'))) {
+        const hops = name === '-' ? 1 : Number(name.slice(3, -1));
+        const moves = repo.refs.reflog('HEAD')
+            .filter((entry) => entry.message.startsWith('checkout: moving from '));
+        const from = moves[moves.length - hops];
+        const prior = from === undefined ? undefined
+            : /^checkout: moving from (\S+) to /.exec(from.message)?.[1];
+        if (prior !== undefined && repo.refs.branches().includes(prior)) name = prior;
+        else if (from !== undefined && repo.resolve(from.old) !== undefined) name = from.old;
+        else name = name === '-' ? '@{-1}' : name;
+    }
     return switchBranch(repo, name, create);
 }
 
