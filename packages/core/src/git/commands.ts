@@ -1628,9 +1628,26 @@ function cmdTag(ctx: CommandContext, flags: Set<string>, values: Map<string,stri
     if (names.length === 0 || flags.has('-l') || flags.has('--list')) {
         const listed = (flags.has('-l') || flags.has('--list')) && names.length > 0
             ? names.map(tagGlob) : [];
-        return ok(repo.refs.tags()
-            .filter((tag) => listed.length === 0 || listed.some((re) => re.test(tag)))
-            .map((name) => name + '\n').join(''));
+        const tags = repo.refs.tags()
+            .filter((tag) => listed.length === 0 || listed.some((re) => re.test(tag)));
+        /* Host git 2.53.0: -n/-n<num> prints the tag name padded to 16 columns
+           followed by up to <num> lines of the annotation message (or the
+           commit subject for a lightweight tag). */
+        const nNum = [...flags].find((f) => /^-\d+$/.test(f));
+        const wantsN = flags.has('-n') || nNum !== undefined;
+        if (!wantsN) return ok(tags.map((name) => name + '\n').join(''));
+        const limit = nNum !== undefined ? parseInt(nNum.slice(1), 10) : 1;
+        return ok(tags.map((name) => {
+            const oid = repo.refs.read('refs/tags/' + name);
+            let message = '';
+            if (oid !== undefined) {
+                const obj = repo.object(oid);
+                if (obj !== undefined && obj.type === 'tag') message = parseTag(obj.content).message;
+                else message = repo.subjectOf(oid);
+            }
+            const lines = message.replace(/\n$/, '').split('\n').slice(0, limit);
+            return name.padEnd(16) + lines.join('\n') + '\n';
+        }).join(''));
     }
     const head = repo.refs.headOid();
     if (head === undefined) return fail('fatal: Failed to resolve HEAD as a valid ref.', 128);
