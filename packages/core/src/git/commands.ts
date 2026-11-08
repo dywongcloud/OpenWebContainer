@@ -1015,6 +1015,14 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
        prints one short-status line per modified path on stdout. */
     const dirtyNotice = statusOf(repo).rows.filter((row) => row.unstaged)
         .map((row) => row.y + String.fromCharCode(9) + row.path + String.fromCharCode(10)).join('');
+    /* Host git 2.53.0: a symbolic checkout of HEAD that resolves to the
+       current commit is a silent no-op: an attached HEAD stays attached and
+       nothing is printed. An explicit oid/tag at the same commit keeps its
+       HEAD line, and --detach forces the HEAD line. */
+    if (name === 'HEAD' && !flags.has('--detach') &&
+        prevOid !== undefined && prevOid === oid) {
+        return ok(dirtyNotice, '');
+    }
     repo.refs.setDetached(oid);
     /* git describe uses the checked-out tag name for the detached label; a raw oid or HEAD uses
        the abbreviated oid. */
