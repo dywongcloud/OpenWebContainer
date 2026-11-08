@@ -14,6 +14,8 @@ All commands below are real `scripts` keys from the four manifests on `origin/ma
 
 `pnpm test` at the root is a **failing placeholder**, not a test runner. There is no `engines` field in any manifest; the root pins `"packageManager": "pnpm@8.15.3"`.
 
+The recursive workspace commands are not gates either: this repository ships no test files and no test runner, so `pnpm -r test` and `pnpm -r lint` find no `test`/`lint` scripts to run (both are no-ops that exit 0). The playground's ESLint 9 flat config throws a `TypeError` on this pinned tree, so no package exposes a working `lint` script. The real gates are `pnpm build` and `pnpm turbo run check-types --force`.
+
 ```bash
 pnpm install
 pnpm dev          # or: pnpm playground

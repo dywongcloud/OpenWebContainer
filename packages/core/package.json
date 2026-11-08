@@ -14,9 +14,6 @@
 		"build": "pnpm build:napi-guest && pnpm build:quic-guest && pnpm build:worker && pnpm build:main",
 		"clean": "rimraf dist",
 		"dev": "tsc --project tsconfig.json --watch",
-		"test": "jest",
-		"test:watch": "jest --watch",
-		"lint": "eslint src --ext .ts",
 		"typecheck": "tsc --noEmit",
 		"prepublishOnly": "npm run clean && npm run build"
 	},

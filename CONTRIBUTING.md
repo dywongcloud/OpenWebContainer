@@ -88,11 +88,11 @@ open-web-container/
    # Build all packages
    pnpm build
 
-   # Run the package test suites
-   pnpm -r test
-
-   # Lint the packages
-   pnpm -r lint
+   # This repository ships no test files, no test runner and no working ESLint
+   # gate (no-test-files policy). `pnpm -r test` / `pnpm -r lint` find no scripts.
+   # Verify a change with the gates that actually work:
+   pnpm build
+   pnpm turbo run check-types --force
    ```
 
 ## Development Workflow
@@ -157,24 +157,19 @@ docs(readme): update installation instructions
 
 ## Testing Guidelines
 
-1. **Write tests for new features**
-   ```typescript
-   describe('VirtualFileSystem', () => {
-     it('should create directories', () => {
-       // Test code
-     });
-   });
-   ```
+This repository ships **no test files and no test runner** (the no-test-files
+policy). There is no `jest` setup in `packages/core`, and the recursive
+commands `pnpm -r test`, `pnpm -r lint` and
+`pnpm --filter @open-web-container/core test` are not test suites: they find
+no `test`/`lint` scripts to run. The playground's ESLint 9 flat config is
+broken on this tree (typescript-eslint 8.14 throws a `TypeError` loading
+`no-unused-expressions`), so no package exposes a working `lint` gate either.
+Verify a change with the commands that do work:
 
-2. **Run the package tests before submitting PR**
-   ```bash
-   pnpm --filter @open-web-container/core test
-   ```
-
-3. **Ensure good test coverage**
-   - Unit tests for utilities
-   - Integration tests for features
-   - End-to-end tests for workflows
+```bash
+pnpm build                          # turbo run build, all packages
+pnpm turbo run check-types --force  # tsc gate for core, api and playground
+```
 
 ## Documentation
 
