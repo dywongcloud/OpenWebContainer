@@ -805,7 +805,13 @@ function cmdClean(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     if (!dry && !force && !interactive) return fail('fatal: clean.requireForce is true and -f not given: refusing to clean\n', 128);
     const dirs = flags.has('-d');
     const all = flags.has('-x');
-    const candidates = all ? repo.worktreeFiles() : statusOf(repo).untracked;
+    /* Host git 2.53.0: clean never lists TRACKED files. Without -x ignored
+       paths are excluded; -x adds them back but never adds index entries. */
+    const index = repo.indexTree();
+    const ignoredPaths = new Set(repo.worktreeFiles()
+        .filter((path) => !index.has(path) && isIgnored(repo, path)));
+    const candidates = repo.worktreeFiles()
+        .filter((path) => !index.has(path) && (all || !ignoredPaths.has(path)));
     const targets: string[] = [];
     const seenDirs = new Set<string>();
     for (const path of candidates) {
