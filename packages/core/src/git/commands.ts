@@ -2346,7 +2346,7 @@ function cmdPull(ctx: CommandContext, raw: string[]): CommandResult {
     const url = remoteTarget(repo, target);
     const src = localRepo(ctx, url);
     if (src === undefined) return fail("fatal: '" + target + "' does not appear to be a git repository", 128);
-    const branch = rest[1] ?? repo.refs.branch();
+    const branch = rest[1] ?? 'HEAD';
     copyObjects(src, repo);
     const oid = src.refs.headOid();
     const head = repo.refs.headOid();
@@ -2372,11 +2372,38 @@ function cmdLsRemote(ctx: CommandContext, raw: string[]): CommandResult {
     const headsOnly = raw.includes('--heads');
     const tagsOnly = raw.includes('--tags');
     const filtered = headsOnly || tagsOnly;
+    const patterns = rest.slice(1);
+    const matches = (ref: string): boolean => {
+        if (patterns.length === 0) return true;
+        const tail = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length)
+            : ref.startsWith('refs/tags/') ? ref.slice('refs/tags/'.length) : ref;
+        return patterns.some((pattern) => {
+            if (ref === pattern || tail === pattern || ref.endsWith('/' + pattern)) return true;
+            if (pattern.indexOf('*') < 0) return false;
+            const parts = pattern.split('*');
+            let at = 0;
+            for (const part of parts) {
+                if (part === '') continue;
+                const found = ref.indexOf(part, at);
+                if (found < 0) return false;
+                at = found + part.length;
+            }
+            return true;
+        });
+    };
     let out = '';
     const head = src.refs.headOid();
-    if (!filtered && head !== undefined) out += head + '\tHEAD\n';
-    if (!tagsOnly) for (const b of src.refs.branches()) { const o = src.refs.read('refs/heads/' + b); if (o !== undefined) out += o + '\trefs/heads/' + b + '\n'; }
-    if (!headsOnly) for (const t of src.refs.tags()) { const o = src.refs.read('refs/tags/' + t); if (o !== undefined) out += o + '\trefs/tags/' + t + '\n'; }
+    if (!filtered && head !== undefined && matches('HEAD')) out += head + '\tHEAD\n';
+    if (headsOnly || !tagsOnly) for (const b of src.refs.branches()) {
+        const ref = 'refs/heads/' + b;
+        const o = src.refs.read(ref);
+        if (o !== undefined && matches(ref)) out += o + '\t' + ref + '\n';
+    }
+    if (tagsOnly || !headsOnly) for (const t of src.refs.tags()) {
+        const ref = 'refs/tags/' + t;
+        const o = src.refs.read(ref);
+        if (o !== undefined && matches(ref)) out += o + '\t' + ref + '\n';
+    }
     return ok(out);
 }
 
