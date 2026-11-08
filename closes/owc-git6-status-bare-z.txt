@@ -1,1 +1,3 @@
-owc-git6-status-bare-z resolved 1794141137562-9401-7e1d828cac621d6 2026-11-08T12:37:38.328Z
+Row: owc-git6-status-bare-z
+Witness: 1794141137562-9401-7e1d828cac621d6
+Status: resolved
