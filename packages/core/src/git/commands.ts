@@ -579,6 +579,23 @@ function cmdHashObject(ctx: CommandContext, flags: Set<string>, values: Map<stri
 function cmdCatFile(ctx: CommandContext, raw: string[]): CommandResult {
     let repo: GitRepo;
     try { repo = GitRepo.discover(ctx); } catch (error) { return fatalResult(error); }
+    /* Host git 2.53.0: --batch/--batch-check read object names from stdin, emit
+       "<oid> <type> <size>" (and the object body for --batch) and exit 0 on EOF. */
+    const batchCheck = raw.includes('--batch-check');
+    const batch = raw.includes('--batch') || batchCheck;
+    if (batch) {
+        const input = ctx.input ?? '';
+        let out = '';
+        for (const name of input.split('\n')) {
+            if (name === '') continue;
+            const oid = repo.resolve(name);
+            const obj = oid !== undefined ? repo.object(oid) : undefined;
+            if (oid === undefined || obj === undefined) { out += name + ' missing\n'; continue; }
+            out += oid + ' ' + obj.type + ' ' + obj.content.length + '\n';
+            if (!batchCheck) out += text(obj.content) + '\n';
+        }
+        return ok(out);
+    }
     const mode = raw.includes('-t') ? 't' : raw.includes('-s') ? 's' : raw.includes('-e') ? 'e' : 'p';
     const rev = raw.filter((entry) => !entry.startsWith('-'))[0] ?? '';
     if (rev === '') return fail('fatal: Not a valid object name \n', 128);
