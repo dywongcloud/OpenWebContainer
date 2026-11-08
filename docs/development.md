@@ -36,8 +36,6 @@ pnpm build
 | `dev` | `tsc --project tsconfig.json --watch` |
 | `check-types` | `tsc --noEmit` |
 | `typecheck` | `tsc --noEmit` |
-| `build` | `pnpm build:napi-guest && pnpm build:quic-guest && pnpm build:worker && pnpm build:main` |
-| `typecheck` | `tsc --noEmit` |
 | `prepublishOnly` | `npm run clean && npm run build` |
 
 ### Build order
@@ -69,7 +67,6 @@ The worker entry is what `@open-web-container/api` imports as `@open-web-contain
 | `build` | `tsc -b && vite build` |
 | `check-types` | `tsc -b --noEmit` |
 | `preview` | `vite preview` |
-| `check-types` | `tsc -b --noEmit` |
 
 `pnpm playground` at the root filters turbo's `dev` task to `@open-web-container/playground`, which is `vite`. `apps/playground/vite.config.ts` sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` for both `server` and `preview`, excludes `quickjs-emscripten` from dep optimisation, and includes `**/*.wasm` as assets.
 
