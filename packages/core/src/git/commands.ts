@@ -1210,12 +1210,39 @@ function cmdReset(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     return ok(out);
 }
 
+/* Host git 2.53.0: 'tag -l' filters tag names with fnmatch-style globs. */
+function tagGlob(pattern: string): RegExp {
+    let out = '^';
+    for (const ch of pattern) {
+        if (ch === '*') out += '.*';
+        else if (ch === '?') out += '.';
+        else if (/[A-Za-z0-9]/.test(ch)) out += ch;
+        else out += String.fromCharCode(92) + ch;
+    }
+    return new RegExp(out + '$');
+}
+
 function cmdTag(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
     const names = rest.filter((r) => !r.startsWith('-'));
-    if (flags.has('-d') || flags.has('--delete')) { for (const name of names) repo.refs.removeRef('refs/tags/' + name); return ok(''); }
-    if (names.length === 0 || flags.has('-l') || flags.has('--list')) return ok(repo.refs.tags().map((name) => name + '\n').join(''));
+    if (flags.has('-d') || flags.has('--delete')) {
+        let deleted = '';
+        for (const name of names) {
+            const oid = repo.refs.read('refs/tags/' + name);
+            if (oid === undefined) return fail("error: tag '" + name + "' not found.", 1);
+            repo.refs.removeRef('refs/tags/' + name);
+            deleted += "Deleted tag '" + name + "' (was " + abbrev(oid) + ")\n";
+        }
+        return ok(deleted);
+    }
+    if (names.length === 0 || flags.has('-l') || flags.has('--list')) {
+        const listed = (flags.has('-l') || flags.has('--list')) && names.length > 0
+            ? names.map(tagGlob) : [];
+        return ok(repo.refs.tags()
+            .filter((tag) => listed.length === 0 || listed.some((re) => re.test(tag)))
+            .map((name) => name + '\n').join(''));
+    }
     const head = repo.refs.headOid();
     if (head === undefined) return fail('fatal: Failed to resolve HEAD as a valid ref.', 128);
     const name = names[0];
