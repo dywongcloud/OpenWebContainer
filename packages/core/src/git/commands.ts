@@ -413,7 +413,7 @@ function parseFlags(args: string[], repeatParents = false, sub = ''): { flags: S
 
 export function runCommand(ctx: CommandContext, sub: string, args: string[]): CommandResult {
     const { flags, values, multi, rest } = parseFlags(args, sub === 'commit-tree', sub);
-    const short = flags.has('-s') || flags.has('--short') || flags.has('--porcelain') || values.has('--porcelain');
+    const short = flags.has('-s') || flags.has('--short') || flags.has('--porcelain') || values.has('--porcelain') || flags.has('-z');
 
     switch (sub) {
         case 'init': return cmdInit(ctx, flags, values, rest);
