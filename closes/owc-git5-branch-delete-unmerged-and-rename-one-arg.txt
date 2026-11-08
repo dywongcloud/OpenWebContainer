@@ -1,1 +1,3 @@
-owc-git5-branch-delete-unmerged-and-rename-one-arg resolved 1794119965220-10047-455b38ebc79a411f 2026-11-08T06:40:17.678Z
+Row: owc-git5-branch-delete-unmerged-and-rename-one-arg
+Witness: 1794119965220-10047-455b38ebc79a411f
+Status: resolved
