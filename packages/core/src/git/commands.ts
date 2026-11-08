@@ -2023,7 +2023,50 @@ function cmdArchive(ctx: CommandContext, flags: Set<string>, values: Map<string,
     const commit = oid === undefined ? undefined : repo.readCommit(oid);
     if (commit === undefined) return fail('fatal: Not a valid object name: ' + rev, 128);
     const tree = repo.flatTree(commit.tree);
-    const bytes = format === 'zip' ? zipOf(repo, tree, values.get('--prefix') ?? '') : tarOf(repo, tree);
+    const prefix = values.get('--prefix') ?? '';
+    let entries: Map<string, { oid: string; mode: number }> = tree;
+    /* Host git 2.53.0: --worktree-attributes reads .gitattributes from the
+       worktree; export-ignore paths are excluded and export-subst paths have
+       their $Format:...$ placeholders expanded. */
+    if (flags.has('--worktree-attributes') || values.has('--worktree-attributes')) {
+        const attrs = repo.readText(repo.w('.gitattributes')) ?? '';
+        const ignored: string[] = [];
+        const subst: string[] = [];
+        for (const line of attrs.split('\n')) {
+            const trimmed = line.trim();
+            if (trimmed === '' || trimmed.startsWith('#')) continue;
+            const parts = trimmed.split(/\s+/);
+            if (parts.includes('export-ignore')) ignored.push(parts[0]);
+            if (parts.includes('export-subst')) subst.push(parts[0]);
+        }
+        const hit = (pattern: string, path: string): boolean => {
+            if (pattern === path || path.endsWith('/' + pattern)) return true;
+            if (pattern.endsWith('/')) return path.startsWith(pattern);
+            if (pattern.startsWith('*')) return path.endsWith(pattern.slice(1));
+            if (pattern.endsWith('*')) return path.startsWith(pattern.slice(0, -1));
+            return false;
+        };
+        entries = new Map<string, { oid: string; mode: number }>();
+        for (const [path, state] of tree) {
+            if (ignored.some((pattern) => hit(pattern, path))) continue;
+            let oid = state.oid;
+            if (subst.some((pattern) => hit(pattern, path))) {
+                const blob = repo.readBlob(oid);
+                if (blob !== undefined) {
+                    const commitOid = repo.resolve(rev) ?? '';
+                    const body = text(blob)
+                        .replace(/\$Format:%H\$/g, commitOid)
+                        .replace(/\$Format:%h\$/g, abbrev(commitOid))
+                        .replace(/\$Format:%s\$/g, commitOid === '' ? '' : repo.subjectOf(commitOid));
+                    oid = repo.objects.write('blob', utf8(body));
+                }
+            }
+            entries.set(path, { oid, mode: state.mode });
+        }
+    }
+    const tarEntries = new Map<string, { oid: string; mode: number }>();
+    for (const [path, state] of entries) tarEntries.set(prefix + path, state);
+    const bytes = format === 'zip' ? zipOf(repo, entries, prefix) : tarOf(repo, tarEntries);
     const output = values.get('-o') ?? values.get('--output');
     if (output !== undefined) { repo.writeBytes(output.startsWith('/') ? output : repo.w(output), bytes); return ok(''); }
     return ok(binaryString(bytes));
