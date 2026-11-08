@@ -715,9 +715,32 @@ function cmdLsFiles(ctx: CommandContext, flags: Set<string>, values: Map<string,
     if (flags.has('--stage') || flags.has('-s')) {
         return ok(entries.map((entry) => entry.mode.toString(8).padStart(6, '0') + ' ' + entry.oid + ' ' + entry.stage + '\t' + entry.path + '\n').join(''));
     }
+    /* Host git 2.53.0: -o/--others lists untracked (not ignored) files,
+       -m/--modified files whose worktree bytes differ from the index,
+       -d/--deleted tracked files missing from the worktree, -v tags each
+       cached path with 'H '. Without any filter the whole index is listed. */
+    const others = flags.has('-o') || flags.has('--others');
+    const modified = flags.has('-m') || flags.has('--modified');
+    const deleted = flags.has('-d') || flags.has('--deleted');
+    const cached = flags.has('-c') || flags.has('--cached');
+    const showTag = flags.has('-v');
+    let chosen: string[];
+    if (others || modified || deleted) {
+        const view = statusOf(repo);
+        const set = new Set<string>();
+        if (others) for (const path of view.untracked) set.add(path);
+        if (modified) for (const row of view.rows) if (row.unstaged && row.y === 'M') set.add(row.path);
+        if (deleted) for (const row of view.rows) if (row.unstaged && row.y === 'D') set.add(row.path);
+        if (cached) for (const entry of entries) set.add(entry.path);
+        chosen = [...set];
+    } else {
+        chosen = entries.map((entry) => entry.path);
+    }
     const filter = rest.filter((entry) => !entry.startsWith('-'));
-    const chosen = filter.length > 0 ? entries.filter((entry) => filter.includes(entry.path)) : entries;
-    return ok(chosen.map((entry) => entry.path + '\n').join(''));
+    if (filter.length > 0) chosen = chosen.filter((path) => filter.includes(path));
+    chosen.sort();
+    const pre = showTag ? 'H ' : '';
+    return ok(chosen.map((path) => pre + path + '\n').join(''));
 }
 
 function cmdWriteTree(ctx: CommandContext): CommandResult {
