@@ -1021,6 +1021,9 @@ function cmdCheckout(ctx: CommandContext, flags: Set<string>, values: Map<string
     if (repo.refs.tags().includes(name)) repo.writeText(repo.g('OWC_DETACH_LABEL'), name);
     else repo.remove(repo.g('OWC_DETACH_LABEL'));
     repo.checkoutTree(oid);
+    /* Host git 2.53.0: -q/--quiet suppresses every checkout status/advice
+       line on stderr; the local-change notice on stdout is unaffected. */
+    if (flags.has('-q') || flags.has('--quiet')) return ok(dirtyNotice, '');
     const headLine = 'HEAD is now at ' + abbrev(oid) + ' ' + repo.subjectOf(oid) + '\n';
     /* Host git 2.53.0: any checkout that detaches HEAD from an attached branch
        prints a "Note: switching to" line plus the detached-HEAD advice block on
