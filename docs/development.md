@@ -1,6 +1,6 @@
 # Development
 
-All commands below are real `scripts` keys from the four manifests on `origin/main`. Nothing here comes from `packageold.json` (an archived file, not a manifest).
+All rows in the tables below are real `scripts` keys from the four manifests on `origin/main`. Nothing here comes from `packageold.json` (an archived file, not a manifest). The owc-git8 fix removed every `test`, `test:watch` and `lint` script, so no test runner or `lint` gate appears below; the root `test` entry is a failing placeholder, and the real gates are `pnpm build` and `pnpm turbo run check-types --force`.
 
 ## Root (`package.json`)
 
@@ -34,9 +34,9 @@ pnpm build
 | `build` | `pnpm build:napi-guest && pnpm build:quic-guest && pnpm build:worker && pnpm build:main` |
 | `clean` | `rimraf dist` |
 | `dev` | `tsc --project tsconfig.json --watch` |
-| `test` | `jest` |
-| `test:watch` | `jest --watch` |
-| `lint` | `eslint src --ext .ts` |
+| `check-types` | `tsc --noEmit` |
+| `typecheck` | `tsc --noEmit` |
+| `build` | `pnpm build:napi-guest && pnpm build:quic-guest && pnpm build:worker && pnpm build:main` |
 | `typecheck` | `tsc --noEmit` |
 | `prepublishOnly` | `npm run clean && npm run build` |
 
@@ -56,8 +56,8 @@ The worker entry is what `@open-web-container/api` imports as `@open-web-contain
 | Script | Command |
 | --- | --- |
 | `build` | `tsc` |
-| `test` | `jest` |
-| `lint` | `eslint src/**/*.ts` |
+| `typecheck` | `tsc --noEmit` |
+| `check-types` | `tsc --noEmit` |
 
 `@open-web-container/api` depends on `@open-web-container/core` via `workspace:*` and has React `^18.0.0` as a peer dependency. It declares no `exports` field.
 
@@ -67,7 +67,7 @@ The worker entry is what `@open-web-container/api` imports as `@open-web-contain
 | --- | --- |
 | `dev` | `vite` |
 | `build` | `tsc -b && vite build` |
-| `lint` | `eslint .` |
+| `check-types` | `tsc -b --noEmit` |
 | `preview` | `vite preview` |
 | `check-types` | `tsc -b --noEmit` |
 
