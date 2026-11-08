@@ -20,6 +20,6 @@ Every page here describes the code on `origin/main`, not the diverged local work
 
 The root [Readme.md](../Readme.md) is the short, user-facing entry point. This page indexes the detail behind it.
 
-Current git surface (origin/main after 55b024e): 42 runCommand cases including bisect, fsck and local-path fetch/push/pull/ls-remote, and 18 declared UNSUPPORTED git-* keys, all reachable from boundaryFamily. Remote .git/config subcommands and local-path transport are local VFS operations; URL transports remain canonical [ERR_*] boundaries. An unrecognised `git <name>` returns a generic not-a-git-command line, never a bare 127.
+Current git surface (origin/main after 55b024e): 43 runCommand cases including bisect, fsck, backfill and local-path fetch/push/pull/ls-remote, and 18 declared UNSUPPORTED git-* keys, all reachable from boundaryFamily. Remote .git/config subcommands and local-path transport are local VFS operations; URL transports remain canonical [ERR_*] boundaries. An unrecognised `git <name>` returns a generic not-a-git-command line, never a bare 127.
 
 Note: the verbatim former chronological `Readme.md` archive keeps its links byte-for-byte, and they are root-relative, so the links on lines 6 (LICENSE), 7 (CONTRIBUTING.md), 41 (./images/architecture.png), 1392 (CONTRIBUTING.md) and 1476 (LICENSE) do not resolve from `docs/reference/`; the real targets are the root [LICENSE](../LICENSE), [CONTRIBUTING.md](../CONTRIBUTING.md) and [images/architecture.png](../images/architecture.png).
