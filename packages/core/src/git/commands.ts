@@ -1573,7 +1573,10 @@ function cmdMerge(ctx: CommandContext, flags: Set<string>, values: Map<string,st
 function cmdReset(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
-    const mode = flags.has('--soft') ? 'soft' : flags.has('--hard') ? 'hard' : 'mixed';
+    /* Host git 2.53.0: --merge/--keep move HEAD and the index but carry the
+       worktree changes across and print NO mixed-reset "Unstaged changes" notice. */
+    const mode = flags.has('--soft') ? 'soft' : flags.has('--hard') ? 'hard'
+        : (flags.has('--merge') || flags.has('--keep')) ? 'carry' : 'mixed';
     const rev = rest[0] ?? 'HEAD';
     const oid = repo.resolve(rev);
     if (oid === undefined) return fail("fatal: ambiguous argument '" + rev + "': unknown revision or path not in the working tree.", 128);
@@ -1590,6 +1593,7 @@ function cmdReset(ctx: CommandContext, flags: Set<string>, values: Map<string,st
         return ok('HEAD is now at ' + abbrev(oid) + ' ' + repo.subjectOf(oid) + '\n');
     }
     repo.writeIndexEntries(entries);
+    if (mode === 'carry') return ok('');
     const view = statusOf(repo);
     let out = '';
     if (view.unstaged.length > 0) {
