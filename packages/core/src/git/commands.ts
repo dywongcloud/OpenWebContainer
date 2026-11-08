@@ -460,6 +460,27 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
         (repo.config as unknown as { paths: Record<ConfigScope, string> }).paths = paths;
     }
     if (file !== undefined) (repo.config as unknown as { paths: Record<ConfigScope, string> }).paths.file = file;
+    /* Host git 2.53.0: --show-origin prefixes every emitted line with the
+       owning config file and a TAB. Global/system/file keep their absolute
+       paths; local/worktree are the worktree-relative .git/config. */
+    const showOrigin = flags.has('--show-origin');
+    const cfgPaths = (repo.config as unknown as { paths: Record<ConfigScope, string> }).paths;
+    const scopes: ConfigScope[] = ['system', 'global', 'local', 'worktree', 'file'];
+    const keyOfLine = (line: { section: string; subsection?: string; key: string }): string =>
+        line.section + (line.subsection === undefined ? '' : '.' + line.subsection) + '.' + line.key;
+    const configLine = (line: { section: string; subsection?: string; key: string; value: string }): string =>
+        keyOfLine(line) + '=' + line.value + '\n';
+    const originFor = (scope: ConfigScope): string =>
+        (scope === 'local' || scope === 'worktree' ? 'file:.git/config' : 'file:' + (cfgPaths[scope] ?? '')) + '\t';
+    const scopeOfKey = (key: string): ConfigScope => {
+        let found: ConfigScope = 'local';
+        for (const scope of scopes) {
+            for (const line of repo.config.readScope(scope)) {
+                if (keyOfLine(line) === key.toLowerCase()) found = scope;
+            }
+        }
+        return found;
+    };
     const wantsList = flags.has('--list') || flags.has('-l');
     const wantsUnset = flags.has('--unset') || flags.has('--unset-all');
     const wantsGetAll = flags.has('--get-all');
@@ -471,14 +492,21 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
         catch { return fail('error: invalid key pattern: ' + pattern, 6); }
         const hits = repo.config.list().split('\n').filter((line) => line !== '' && re.test(line.slice(0, line.indexOf('='))));
         if (hits.length === 0) return ok('', '', 1);
-        return ok(hits.map((line) => { const eq = line.indexOf('='); return line.slice(0, eq) + ' ' + line.slice(eq + 1) + '\n'; }).join(''));
+        return ok(hits.map((line) => { const eq = line.indexOf('='); const k = line.slice(0, eq);
+            return (showOrigin ? originFor(scopeOfKey(k)) : '') + k + ' ' + line.slice(eq + 1) + '\n'; }).join(''));
     }
     if (wantsList) {
         const scoped = flags.has('--global') || flags.has('--system') || flags.has('--local') || flags.has('--worktree') || file !== undefined;
         if (scoped) {
-            return ok(repo.config.readScope(scope).map((line) => line.section + (line.subsection === undefined ? '' : '.' + line.subsection) + '.' + line.key + '=' + line.value + '\n').join(''));
+            const pre = showOrigin ? originFor(scope) : '';
+            return ok(repo.config.readScope(scope).map((line) => pre + configLine(line)).join(''));
         }
-        return ok(repo.config.list());
+        let out = '';
+        for (const s of scopes) {
+            const pre = showOrigin ? originFor(s) : '';
+            for (const line of repo.config.readScope(s)) out += pre + configLine(line);
+        }
+        return ok(out);
     }
     if (key === undefined || key === '') return fail('usage: git config [<options>]', 129);
     if (!key.includes('.')) return fail('error: key does not contain a section: ' + key, 2);
@@ -490,14 +518,15 @@ function cmdConfig(ctx: CommandContext, flags: Set<string>, values: Map<string, 
         return ok('');
     }
     if (wantsGetAll) {
-        const values = repo.config.getAll(key);
-        if (values.length === 0) return ok('', '', 1);
-        return ok(values.map((v) => v + '\n').join(''));
+        const vals = repo.config.getAll(key);
+        if (vals.length === 0) return ok('', '', 1);
+        const pre = showOrigin ? originFor(scopeOfKey(key)) : '';
+        return ok(vals.map((v) => pre + v + '\n').join(''));
     }
     if (rest.length === 1 || flags.has('--get')) {
         const value = repo.config.get(key);
         if (value === undefined) return fail('', 1);
-        return ok(value + '\n');
+        return ok((showOrigin ? originFor(scopeOfKey(key)) : '') + value + '\n');
     }
     if (flags.has('--add')) {
         const path = (repo.config as unknown as { paths: Record<ConfigScope, string> }).paths[scope];
