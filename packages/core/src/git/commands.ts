@@ -1225,6 +1225,25 @@ function cmdRestore(ctx: CommandContext, flags: Set<string>, values: Map<string,
 function cmdMerge(ctx: CommandContext, flags: Set<string>, values: Map<string,string>, rest: string[]): CommandResult {
     const found = discover(ctx); const failure = failed(found); if (failure !== undefined) return failure;
     const repo = asRepo(found) as GitRepo;
+    /* Host git 2.53.0: merge --abort with no MERGE_HEAD is a fatal 128; with one it
+       restores the pre-merge index/worktree silently. */
+    if (flags.has('--abort')) {
+        const mergeHead = repo.readText(repo.g('MERGE_HEAD'));
+        if (mergeHead === undefined || mergeHead.trim() === '') return fail('fatal: There is no merge to abort (MERGE_HEAD missing).', 128);
+        const abortHead = repo.refs.headOid();
+        if (abortHead !== undefined) {
+            const commit = repo.readCommit(abortHead);
+            if (commit !== undefined) {
+                const tree = repo.flatTree(commit.tree);
+                const entries: IndexEntry[] = [];
+                for (const [path, state] of tree) entries.push({ path, oid: state.oid, mode: state.mode, size: 0, mtimeSec: 0, mtimeNs: 0, stage: 0 });
+                repo.writeIndexEntries(entries);
+                repo.checkoutTree(commit.tree);
+            }
+        }
+        repo.remove(repo.g('MERGE_HEAD'));
+        return ok('');
+    }
     const name = rest[0] ?? '';
     const other = repo.resolve(name);
     const head = repo.refs.headOid();
@@ -1232,7 +1251,7 @@ function cmdMerge(ctx: CommandContext, flags: Set<string>, values: Map<string,st
     const headCommit = repo.readCommit(head), otherCommit = repo.readCommit(other);
     if (headCommit === undefined || otherCommit === undefined) return fail('fatal: bad object', 128);
     const base = repo.commonAncestor(head, other);
-    if (base === head) {
+    if (base === head && !flags.has('--no-ff')) {
         updateHead(repo, other, 'merge ' + name + ': Fast-forward', head);
         repo.checkoutTree(otherCommit.tree);
         const changes = repo.changesBetween(repo.flatTree(headCommit.tree), repo.flatTree(otherCommit.tree));
