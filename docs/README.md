@@ -6,6 +6,8 @@ Every page here describes the code on `origin/main`, not the diverged local work
 | --- | --- |
 | [getting-started.md](getting-started.md) | Prerequisites, install, launch the playground, first container, first `node`/`sh` command, preview ports. |
 | [architecture.md](architecture.md) | Web Worker + QuickJS, host bridge, guest bootstrap, ZenFS, process executors, virtual network hub, service-worker preview gateway, React UI. |
+| [architecture.md#diagrams](architecture.md#diagrams) | Nine maintained Mermaid system diagrams: layers, boot sequence, package graph, capability bridge, VFS and npm install, virtual network, multi-tab preview gateway, WASM bridge, git dispatch. |
+| [reference/state-machines.md](reference/state-machines.md) | Ten `stateDiagram-v2` machines with prose alternatives and transition tables: container, process, COEP lock, guest budget, preview routing, npm corpus retry gate, git dispatch, gateway registration, differential verdict, PRD row. |
 | [api.md](api.md) | The real `OpenWebContainer` (core) and `ContainerManager` (api) methods, events and signatures. |
 | [compatibility.md](compatibility.md) | The host Node target, differential method, spec baselines, WPT and swarm conformance numbers, and CI status. |
 | [known-limitations.md](known-limitations.md) | User-facing compatibility boundaries, each with its measured basis. |
@@ -21,5 +23,19 @@ Every page here describes the code on `origin/main`, not the diverged local work
 The root [Readme.md](../Readme.md) is the short, user-facing entry point. This page indexes the detail behind it.
 
 Current git surface (origin/main after 55b024e): 43 runCommand cases including bisect, fsck, backfill and local-path fetch/push/pull/ls-remote, and 18 declared UNSUPPORTED git-* keys, all reachable from boundaryFamily. Remote .git/config subcommands and local-path transport are local VFS operations; URL transports remain canonical [ERR_*] boundaries. An unrecognised `git <name>` returns a generic not-a-git-command line, never a bare 127.
+
+## Diagram conventions
+
+The maintained diagrams are fenced Mermaid blocks in `../Readme.md`, `architecture.md`, `api.md`, `getting-started.md` and `reference/state-machines.md`. GitHub renders them as SVG and selects the Mermaid theme from the reader's light or dark colour mode. No block assigns `classDef`, `style` or a custom palette: there is no categorical colour series, so no state or node is conveyed by colour alone. Shapes, arrow labels and the surrounding prose carry the meaning.
+
+Every block is followed by a **Text alternative** that restates the same information in prose; every state machine also has a state/event/next-state table. Diagrams are ASCII-only text, so they survive a terminal reader, a diff and a forced-colours browser. Each diagram names the pinned source paths and lines it was read from; a citation names a source, not a claim that the named command is complete or host-faithful. The older `images/architecture.png` raster is kept as the original overview, not treated as the maintained source.
+
+| Page | Diagrams | Type |
+| --- | --- | --- |
+| [Readme.md](../Readme.md) | System architecture at a glance, container lifecycle | flowchart, stateDiagram-v2 |
+| [architecture.md](architecture.md) | Nine system diagrams | flowchart, sequenceDiagram |
+| [api.md](api.md) | Boot/spawn/preview sequence, exported surfaces, VirtualProcess events | sequenceDiagram, classDiagram, stateDiagram-v2 |
+| [getting-started.md](getting-started.md) | First-run flow | flowchart |
+| [reference/state-machines.md](reference/state-machines.md) | Ten machines | stateDiagram-v2 |
 
 Note: the verbatim former chronological `Readme.md` archive keeps its links byte-for-byte, and they are root-relative, so the links on lines 6 (LICENSE), 7 (CONTRIBUTING.md), 41 (./images/architecture.png), 1392 (CONTRIBUTING.md) and 1476 (LICENSE) do not resolve from `docs/reference/`; the real targets are the root [LICENSE](../LICENSE), [CONTRIBUTING.md](../CONTRIBUTING.md) and [images/architecture.png](../images/architecture.png).

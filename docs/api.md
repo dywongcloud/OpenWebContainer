@@ -5,6 +5,95 @@ Two packages, two surfaces. Both are real on `origin/main`. Every signature belo
 - `@open-web-container/core` exports `OpenWebContainer` (worker-side, **synchronous** filesystem calls) plus `Process`, `ProcessRegistry`, `ProcessManager`, `ProcessEvent`, `ProcessState`, `ShellProcess` and the type `ProcessExecutor`.
 - `@open-web-container/api` exports `ContainerManager` (page-side, **asynchronous**, talks to the worker), `VirtualProcess`, `BrowserEventEmitter`, `ContainerOptions`, `ProcessOptions` and `WorkerBridge` (`src/index.ts` re-exports `./container`, `./process` and `./worker`). It does **not** re-export `OpenWebContainer`, and `IframeBridge` / `HostRequest` in `src/iframe/bridge.ts` are internal types imported by `ContainerManager`, not public exports.
 
+## Lifecycle diagrams
+
+Three surfaces, one page-side lifecycle. The diagrams are fenced Mermaid; GitHub renders them in light and dark colour modes. No block uses a categorical palette, so no class or state is encoded by colour alone. Every block is followed by a **Text alternative**. All labels are ASCII. See [Architecture diagrams](architecture.md#diagrams) for the runtime path and [State machines](reference/state-machines.md) for the complete lifecycle tables.
+
+```mermaid
+sequenceDiagram
+  participant App as Browser page
+  participant CM as ContainerManager
+  participant WB as WorkerBridge
+  participant W as Blob Web Worker
+  participant VP as VirtualProcess
+  App->>CM: new ContainerManager()
+  CM->>WB: initialize(options)
+  WB->>W: Blob URL, new Worker, initialize
+  W-->>CM: initialized
+  App->>CM: await waitForReady()
+  App->>CM: await writeFile("/app/hello.js", source)
+  App->>CM: await spawn("node", ["/app/hello.js"])
+  CM->>WB: sendMessage spawn with request id
+  WB->>W: postMessage spawn
+  W-->>CM: spawned with pid
+  CM->>VP: new VirtualProcess(pid)
+  VP-->>App: on("output", handler)
+  W-->>CM: processOutput and processExit
+  CM-->>VP: emit output, then emit exit
+  VP-->>App: exit event with exitCode
+  App->>CM: await dispose()
+  CM->>WB: dispose
+  WB->>W: dispose then terminate
+```
+
+**Text alternative.** The page constructs `ContainerManager` and waits for `waitForReady()`. It writes a file, then calls `spawn` with an **array** of arguments. The manager sends a numbered `spawn` request through `WorkerBridge`; the worker replies with the pid and the manager creates a `VirtualProcess`. Output and exit arrive as worker messages and are emitted on that `VirtualProcess`, which exposes `on`, `once`, `off` and `emit` but not `addEventListener`. `dispose()` tears down the worker. Sources: `packages/api/src/container/container.ts:19-60,62-95`, `packages/api/src/worker/bridge.ts:61-92,101-119`, `packages/core/src/worker-entry.ts:28-52`, `docs/api.md` ContainerManager and VirtualProcess sections.
+
+```mermaid
+classDiagram
+  class ContainerManager {
+    +waitForReady() Promise~void~
+    +writeFile(path, content) Promise~void~
+    +readFile(path) Promise~string~
+    +spawn(command, args, options) Promise~VirtualProcess~
+    +createPreview(options)
+    +getStats() Promise~ContainerStats~
+    +dispose() Promise~void~
+    +isReady
+    +isDisposed
+  }
+  class WorkerBridge {
+    +initialize(options) Promise~void~
+    +sendMessage(message, timeout)
+    +onMessage(handler)
+    +dispose() Promise~void~
+  }
+  class VirtualProcess {
+    +pid
+    +command
+    +args
+    +write(input) Promise~void~
+    +kill() Promise~void~
+    +on(event, handler)
+    +once(event, handler)
+  }
+  class BrowserEventEmitter {
+    +on(event, handler)
+    +once(event, handler)
+    +off(event, handler)
+    +emit(event, data)
+  }
+  ContainerManager --> WorkerBridge : owns one
+  ContainerManager --> VirtualProcess : creates
+  VirtualProcess --|> BrowserEventEmitter : extends
+```
+
+**Text alternative.** `ContainerManager` owns one `WorkerBridge` and creates `VirtualProcess` instances. `VirtualProcess` extends `BrowserEventEmitter`, which is why it has `on`, `once`, `off` and `emit` and why its event map has exactly `output`, `exit` and `error`. The **core** `Process` class is a different surface: it adds typed `addEventListener` overloads for `start`, `exit`, `error`, `message` and `spawn_child`, and file calls there are synchronous. The manager has no `deleteDirectory`, `readFileBytes` or `listFilesPaced`; core has all three. Sources: `docs/api.md` method and event tables, `packages/api/src/process/process.ts`, `packages/core/src/process/base/process.ts:292-300`, `packages/api/src/container/types.ts`, `packages/api/src/process/types.ts`.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Spawned: spawn returns a VirtualProcess
+  Spawned --> Streaming: output event, output and isError
+  Streaming --> Streaming: another output event
+  Streaming --> Exited: exit event with exitCode
+  Spawned --> Exited: exit event with no prior output
+  Streaming --> Errored: error event with Error
+  Spawned --> Errored: error event with Error
+  Exited --> [*]
+  Errored --> [*]
+```
+
+**Text alternative.** `VirtualProcess` has only three events. `output` carries `{ output, isError }` and may repeat; `exit` carries `{ exitCode: number | null }`; `error` carries `{ error: Error }`. There is no `start` or `message` event on this class. `isRunning`, `exitCode`, `startTime`, `endTime` and `uptime` are getters over the same process record. Sources: `docs/api.md` ProcessEventMap table, `packages/api/src/process/types.ts`, `packages/api/src/process/process.ts`.
+
 ## `OpenWebContainer` (`packages/core/src/container.ts`)
 
 ```ts
@@ -153,5 +242,6 @@ The old Readme also listed `pnpm core:dev`, `pnpm core:build`, `pnpm format`, `p
 ## Next
 
 - [Getting started](getting-started.md) for a working end-to-end example.
-- [Architecture](architecture.md) for what each layer does.
+- [Architecture](architecture.md) for what each layer does and the nine system diagrams.
+- [State machines](reference/state-machines.md) for container and process lifecycle tables.
 - [Known limitations](known-limitations.md) before designing around `fetch` or raw sockets.

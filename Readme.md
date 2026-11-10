@@ -14,7 +14,84 @@ OpenWebContainer is a browser-hosted, Node-compatible container. It runs your Ja
 
 ![OpenWebContainer architecture](./images/architecture.png)
 
-The playground page, the API bridge, the Web Worker and the container runtime ([architecture](docs/architecture.md)).
+The playground page, the API bridge, the Web Worker and the container runtime ([architecture](docs/architecture.md)). The raster above is the original overview; the Mermaid diagrams below are the maintained, source-linked version. See [Architecture diagrams](docs/architecture.md#diagrams) for the full set and [State machines](docs/reference/state-machines.md) for the lifecycle, budget, routing, retry and dispatch machines.
+
+## System architecture at a glance
+
+```mermaid
+flowchart TB
+  subgraph Page["Browser page - apps/playground"]
+    UI["React UI: Monaco editor, xterm terminal, file explorer, preview pane"]
+    SW["Service worker - public/owc-sw.js"]
+    GW["Preview gateway - src/preview/gateway.ts"]
+    IB["IframeBridge - packages/api/src/iframe/bridge.ts"]
+  end
+  subgraph Api["packages/api - page side, asynchronous"]
+    CM["ContainerManager"]
+    WB["WorkerBridge"]
+    VP["VirtualProcess"]
+  end
+  subgraph Worker["Web Worker - Blob built from core worker-code"]
+    WE["worker-entry.ts - self.onmessage switch"]
+    OWC["OpenWebContainer"]
+  end
+  subgraph Core["packages/core - worker side"]
+    FS["ZenFSCore - InMemoryStore virtual file system"]
+    PM["ProcessManager and ProcessRegistry"]
+    NODE["NodeProcessExecutor - QuickJS guest"]
+    SH["ShellProcessExecutor"]
+    NPM["NpmProcessExecutor and NpmInstaller"]
+    NET["VirtualNetwork - loopback TCP and UDP"]
+    WASM["WasmBridge - host-realm WebAssembly"]
+    GIT["git CLI over the virtual file system"]
+  end
+  REG["npm registry over the page fetch"]
+  SRV["Guest HTTP server on a container port"]
+
+  UI --> CM
+  CM --> WB
+  CM --> VP
+  CM --> IB
+  IB --> SW
+  WB -->|postMessage| WE
+  WE --> OWC
+  OWC --> FS
+  OWC --> PM
+  OWC --> NET
+  PM --> NODE
+  PM --> SH
+  PM --> NPM
+  NODE -->|host bridge| FS
+  NODE -->|host bridge| NET
+  NODE -->|host.wasm| WASM
+  SH --> GIT
+  NPM -->|packument and tarball| REG
+  NET --> SRV
+  SRV -->|handleHttpRequest| GW
+  GW --> SW
+  SW -->|HTTP response| IB
+```
+
+**Text alternative.** The React UI creates one `ContainerManager` for the page. `ContainerManager` owns a `WorkerBridge`, produces `VirtualProcess` objects and uses `IframeBridge` for previews. `WorkerBridge` turns core's `worker-code` export into a Blob Worker and sends it `postMessage` requests; the worker's `self.onmessage` switch in `worker-entry.ts` constructs `OpenWebContainer`. That class owns the ZenFS virtual file system, the process manager and the virtual network. The process manager dispatches to the `node`, `sh` and `npm` executors. The `node` executor reaches the file system and the network through the host bridge, and reaches host-realm `WebAssembly` through `host.wasm`; the shell dispatches `git` as a module command over the same file system; the npm executor fetches packuments and tarballs through the page's `fetch`. A guest HTTP server receives requests through `handleHttpRequest`, and the service worker answers the browser after the preview gateway has forwarded the request. No arrow leaves the browser except the npm registry fetch. Sources: `packages/api/src/container/container.ts:8-33`, `packages/api/src/worker/bridge.ts:130-140`, `packages/core/src/worker-entry.ts:10-35`, `packages/core/src/container.ts:55`, `apps/playground/public/owc-sw.js:83-90`, `apps/playground/src/preview/gateway.ts:113-155`.
+
+### Container lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> Created: new ContainerManager(options)
+  Created --> Initializing: constructor calls initialize
+  Initializing --> Ready: WorkerBridge.initialize resolves
+  Initializing --> Failed: initialize throws, _disposed set true
+  Ready --> Ready: spawn, writeFile, createPreview, getStats
+  Ready --> Disposing: dispose
+  Disposing --> Disposed: worker terminated
+  Failed --> [*]
+  Disposed --> [*]
+```
+
+**Text alternative.** Construction immediately starts `initialize()`. A successful `WorkerBridge.initialize()` sets `_isReady`; a throw sets `_disposed` and rethrows, so `waitForReady()` rejects. While ready, spawn, file, preview and stats calls are repeatable without leaving the state. `dispose()` moves the container to a terminal state after the worker is terminated. Sources: `packages/api/src/container/container.ts:13-15,35-60`, `packages/api/src/worker/bridge.ts:101-119`; full machine and tables in [State machines](docs/reference/state-machines.md#1-container-lifecycle).
+
+The [Architecture page](docs/architecture.md#diagrams) adds the boot sequence, package graph, capability bridge, VFS and npm install, virtual network, multi-tab preview gateway, WASM bridge and git dispatch diagrams. Every diagram there, and every machine in [State machines](docs/reference/state-machines.md), has a plain-text alternative; no block uses colour as the only carrier of meaning.
 
 ### What it is not
 
@@ -85,6 +162,8 @@ Read [Known limitations](docs/known-limitations.md) before you plan an applicati
 | [Known limitations](docs/known-limitations.md) | User-facing boundaries, each with its measured basis |
 | [Development](docs/development.md) | Real scripts, build order and turbo tasks |
 | [Troubleshooting](docs/troubleshooting.md) | Problems actually seen in this repository |
+| [Architecture diagrams](docs/architecture.md#diagrams) | Nine maintained Mermaid system diagrams with pinned source paths. |
+| [State machines](docs/reference/state-machines.md) | Ten state machines with prose alternatives and transition tables. |
 | [Compatibility notes archive](docs/reference/compatibility-notes.md) | The former chronological `Readme.md`, byte-for-byte below a one-line header |
 
 ## Project layout

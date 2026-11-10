@@ -6,6 +6,33 @@
 - **pnpm**. The root `package.json` pins `"packageManager": "pnpm@8.15.3"`.
 - A browser with Web Worker and service worker support. Cross-origin isolation is a host-page requirement; see [Known limitations](known-limitations.md).
 
+## First-run flow diagram
+
+```mermaid
+flowchart TD
+  Clone["git clone and pnpm install"] --> Dev["pnpm dev or pnpm playground"]
+  Dev --> Vite["Vite serves localhost:5173 with COOP and COEP headers"]
+  Vite --> App["React App mounts useContainer"]
+  App --> CM["one ContainerManager for the page lifetime"]
+  CM --> WB["WorkerBridge boots the Blob Worker"]
+  WB --> Ready["await waitForReady()"]
+  Ready --> Write["await writeFile('/app/hello.js', source)"]
+  Write --> Spawn["await spawn('node', ['/app/hello.js'])"]
+  Spawn --> Out["proc.on('output') prints into the xterm terminal"]
+  Spawn --> Exit["proc.once('exit') reports exitCode"]
+  Spawn --> Server["optional guest HTTP server listens on a port"]
+  Server --> Ports["listActiveServers() advertises the port"]
+  Ports --> URL["preview URL /__owc/preview/PORT/path"]
+  URL --> SW["service worker routes to the guest server"]
+  SW --> Iframe["preview pane shows the response"]
+  Out --> Dispose["await dispose()"]
+  Exit --> Dispose
+```
+
+**Text alternative.** After `pnpm install`, either `pnpm dev` (all packages through turbo) or `pnpm playground` (the playground filter) starts Vite on `localhost:5173`; `apps/playground/vite.config.ts` declares `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` for both `server` and `preview`. The React app mounts `useContainer`, which creates one `ContainerManager` for the page's lifetime. That manager boots the Blob Worker and `waitForReady()` resolves. The first file is written with `await writeFile`, the first process is started with `spawn(command, args[])` where the arguments are an **array**, and output and exit events feed the xterm terminal. If the guest starts an HTTP server, `listActiveServers()` advertises its port, the preview URL is `/__owc/preview/<port>/<path>`, and the service worker forwards the request to that guest server. `dispose()` is the final page-side call. Sources: `docs/getting-started.md` install and first-container sections, `apps/playground/vite.config.ts:8-18`, `apps/playground/src/hooks/useContainer.ts`, `docs/api.md`, `apps/playground/public/owc-sw.js:83-90`.
+
+The runtime path behind this flow is drawn in [Architecture diagrams](architecture.md#diagrams); the container and process states are in [State machines](reference/state-machines.md#1-container-lifecycle). Every diagram there has a plain-text alternative.
+
 ## Install
 
 ```bash
@@ -89,7 +116,8 @@ http://localhost:5173/__owc/preview/<port>/<path>
 
 ## Next
 
-- [Architecture](architecture.md) for how the pieces fit.
+- [Architecture](architecture.md) for how the pieces fit and for the nine system diagrams.
+- [State machines](reference/state-machines.md) for the container and process lifecycle tables.
 - [API reference](api.md) before writing code against the packages.
 - [Development](development.md) if you are changing the repository itself.
 - [Troubleshooting](troubleshooting.md) if the terminal hangs or the tree looks stale.
