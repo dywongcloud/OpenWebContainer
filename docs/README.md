@@ -28,7 +28,7 @@ Current git surface (origin/main after 55b024e): 43 runCommand cases including b
 
 The maintained diagrams are fenced Mermaid blocks in `../Readme.md`, `architecture.md`, `api.md`, `getting-started.md` and `reference/state-machines.md`. GitHub renders them as SVG and selects the Mermaid theme from the reader's light or dark colour mode. No block assigns `classDef`, `style` or a custom palette: there is no categorical colour series, so no state or node is conveyed by colour alone. Shapes, arrow labels and the surrounding prose carry the meaning.
 
-Every block is followed by a **Text alternative** that restates the same information in prose; every state machine also has a state/event/next-state table. Diagrams are ASCII-only text, so they survive a terminal reader, a diff and a forced-colours browser. Each diagram names the pinned source paths and lines it was read from; a citation names a source, not a claim that the named command is complete or host-faithful. The older `images/architecture.png` raster is kept as the original overview, not treated as the maintained source.
+Every block is followed by a **Text alternative** that restates the same information in prose; every state machine also has a state/event/next-state table. Diagrams are ASCII-only text, so they survive a terminal reader, a diff and a forced-colours browser. Every product diagram names the pinned repository path and line numbers it was read from; the workflow machines name the repository artifacts and served rules they describe. A citation names a source, not a claim that the named command is complete or host-faithful. The older `images/architecture.png` raster is kept as the original overview, not treated as the maintained source.
 
 | Page | Diagrams | Type |
 | --- | --- | --- |
@@ -37,5 +37,9 @@ Every block is followed by a **Text alternative** that restates the same informa
 | [api.md](api.md) | Boot/spawn/preview sequence, exported surfaces, VirtualProcess events | sequenceDiagram, classDiagram, stateDiagram-v2 |
 | [getting-started.md](getting-started.md) | First-run flow | flowchart |
 | [reference/state-machines.md](reference/state-machines.md) | Ten machines | stateDiagram-v2 |
+
+### Verification witness
+
+All 25 blocks were parsed and rendered to SVG with Mermaid **11.4.1** (`https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js`) in headful Chrome through the `gm.browser` CDP verb. Procedure: read every fenced Mermaid block from the five diagram-bearing files, call `mermaid.parse` and then `mermaid.render` once with `theme: default` and once with `theme: dark`, and require each result to contain an SVG element. Measured result: 50 records, 50 parses PASS, 50 renders PASS, 50 SVG, 0 errors, 0 console events. Witness dispatch `1794293294093-2851-4b21591d29238264`. The harness files live outside the repository; the version, the procedure and the counts are pinned here so the check is reproducible from any checkout.
 
 Note: the verbatim former chronological `Readme.md` archive keeps its links byte-for-byte, and they are root-relative, so the links on lines 6 (LICENSE), 7 (CONTRIBUTING.md), 41 (./images/architecture.png), 1392 (CONTRIBUTING.md) and 1476 (LICENSE) do not resolve from `docs/reference/`; the real targets are the root [LICENSE](../LICENSE), [CONTRIBUTING.md](../CONTRIBUTING.md) and [images/architecture.png](../images/architecture.png).

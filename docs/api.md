@@ -92,7 +92,7 @@ stateDiagram-v2
   Errored --> [*]
 ```
 
-**Text alternative.** `VirtualProcess` has only three events. `output` carries `{ output, isError }` and may repeat; `exit` carries `{ exitCode: number | null }`; `error` carries `{ error: Error }`. There is no `start` or `message` event on this class. `isRunning`, `exitCode`, `startTime`, `endTime` and `uptime` are getters over the same process record. Sources: `docs/api.md` ProcessEventMap table, `packages/api/src/process/types.ts`, `packages/api/src/process/process.ts`.
+**Text alternative.** `VirtualProcess` has only three events. `output` carries `{ output, isError }` and may repeat; `exit` carries `{ exitCode: number | null }`; `error` carries `{ error: Error }`. There is no `start` or `message` event on this class. `isRunning`, `exitCode`, `startTime`, `endTime` and `uptime` are getters over the same process record. Sources: `packages/api/src/process/types.ts:17-21`, `packages/api/src/process/process.ts:12-15,64-67,89-116`, and the ProcessEventMap table on this page.
 
 **Transition table.**
 

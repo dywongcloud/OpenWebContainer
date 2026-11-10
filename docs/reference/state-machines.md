@@ -2,7 +2,7 @@
 
 This page documents the state machines of OpenWebContainer and of this repository's verification workflow. Every machine has a fenced Mermaid `stateDiagram-v2` block, a **Text alternative** in prose, and a transition table that carries the same states and events without the diagram. GitHub renders Mermaid as SVG in both light and dark colour modes; no block assigns a categorical palette, so no state is distinguishable by colour alone. Labels are ASCII only.
 
-Two machines on this page are **not** product runtime behaviour and are labelled as such: [6. npm install bounded retry](#6-npm-install-bounded-retry-corpus-gate) is a corpus verification gate, and [9. differential verdict](#9-differential-compatibility-verdict) and [10. PRD row](#10-prd-row-lifecycle-workflow) are repository workflow machines. `NpmInstaller` itself performs one host fetch per packument or tarball with no internal retry; that fact is recorded in `memory/owc-npm-fetch-transient-retry.md`.
+Three machines on this page are **not** product runtime behaviour and are labelled as such: [6. npm install bounded retry](#6-npm-install-bounded-retry-corpus-gate) is a corpus verification gate, and [9. differential verdict](#9-differential-compatibility-verdict) and [10. PRD row](#10-prd-row-lifecycle-workflow) are repository workflow machines. `NpmInstaller` itself performs one host fetch per packument or tarball with no internal retry; that fact is recorded in `memory/owc-npm-fetch-transient-retry.md`.
 
 | Machine | Where | Source |
 | --- | --- | --- |
@@ -188,7 +188,7 @@ stateDiagram-v2
   [*] --> Attempt1: run the same spec in a fresh npm process
   Attempt1 --> Pass: own exit 0
   Attempt1 --> Fatal: not found, integrity, invalid version, EBADPLATFORM, ENOENT
-  Attempt1 --> Retryable: fetch failed, ECONNRESET, ETIMEDOUT, EAI_AGAIN, socket hang up, 429, 5xx
+  Attempt1 --> Retryable: fetch failed, ECONNRESET, ETIMEDOUT, EAI_AGAIN, socket hang up, 429, 5xx, network
   Retryable --> Backoff1: wait 250 ms
   Backoff1 --> Attempt2
   Attempt2 --> Pass: own exit 0
@@ -203,18 +203,23 @@ stateDiagram-v2
   Attributed --> [*]: attribute to the code change
 ```
 
-**Text alternative.** At most three attempts of the **same spec in the same cwd**, each in a fresh npm process, with backoff 250 ms then 500 ms (the rule names 1000 ms as the third step for a longer policy). A success on any attempt ends the case with no divergence and the case is never re-run for attribution. A fatal string ends the case immediately, without retry. Only three consecutive identical retryable failures justify attributing the failure to a code change. A failure that clears on retry is never a divergence.
+**Text alternative.** At most three attempts of the **same spec in the same cwd**, each in a fresh npm process, with backoff 250 ms then 500 ms (the rule also names 1000 ms, which a three-attempt gate never reaches). A success on any attempt ends the case with no divergence and the case is never re-run for attribution. A fatal string ends the case immediately, without retry. Only three consecutive identical retryable failures justify attributing the failure to a code change. A failure that clears on retry is never a divergence.
 
 | From | Event | To |
 | --- | --- | --- |
-| (start) | run spec in fresh npm process | Attempt1 |
+| (start) | run the same spec in a fresh npm process | Attempt1 |
 | Attempt1 / Attempt2 / Attempt3 | own exit 0 | Pass |
-| Attempt1 / Attempt2 | fatal string | Attributed |
-| Attempt1 / Attempt2 | retryable string | Backoff1 / Backoff2 |
-| Backoff1 | 250 ms | Attempt2 |
-| Backoff2 | 500 ms | Attempt3 |
+| Attempt1 / Attempt2 | fatal string | Fatal |
+| Attempt1 | retryable string | Retryable |
+| Retryable | wait 250 ms | Backoff1 |
+| Backoff1 | no label on the arrow | Attempt2 |
+| Attempt2 | same retryable string | Retryable2 |
+| Retryable2 | wait 500 ms | Backoff2 |
+| Backoff2 | no label on the arrow | Attempt3 |
 | Attempt3 | third identical retryable failure | Attributed |
-| Pass, Attributed | terminal | (end) |
+| Fatal | any fatal string, attribute immediately | Attributed |
+| Pass | no divergence, never re-run | (end) |
+| Attributed | attribute to the code change | (end) |
 
 Retryable strings: `fetch failed`, `ECONNRESET`, `ETIMEDOUT`, `EAI_AGAIN`, `socket hang up`, HTTP 429, HTTP 5xx, `network`. Fatal strings: `not found in the registry`, `Integrity check failed`, `Invalid version or range`, `No matching version found`, `EBADPLATFORM`, `Global installs are not supported`, `ENOENT`. Source: `memory/owc-npm-fetch-transient-retry.md:25-43`, `packages/core/src/npm/registry.ts`, `closes/owc-container-npm-fetch-flake.txt`.
 
@@ -351,7 +356,7 @@ stateDiagram-v2
 | InProgress | witnessed refutation | Stale |
 | Resolved, Stale | close commit with three trailers | (end) |
 
-Source: `/Users/dylanwong/.claude/skills/gm/SKILL.md` (Standing preferences, Witness, Closed rows), `.gm/prd/`, `.gm/prd-log.jsonl`, `closes/`, `docs/development.md`.
+Source: `closes/owc-container-npm-fetch-flake.txt:1-3` for the normalized three-line close record, `docs/README.md:27-39` for the maintained-page index, and `.gm/prd/` plus `.gm/prd-log.jsonl` for the runtime row store. The transition rule itself comes from the served gm skill prose for Standing preferences, Witness and Closed rows; that skill file is outside the repository, so a runtime artifact is named rather than a pinned repository line.
 
 ## Conventions
 
@@ -359,7 +364,7 @@ Source: `/Users/dylanwong/.claude/skills/gm/SKILL.md` (Standing preferences, Wit
 - GitHub selects the Mermaid theme from the reader's colour mode. No `classDef`, `style`, `linkStyle` or custom palette is used, so there is no categorical colour series to validate and no state is conveyed by colour alone.
 - Every block has a prose **Text alternative** and every state machine has a state/event/next-state table, so the information survives without SVG, in a terminal reader or in a forced-colours browser.
 - All labels are ASCII. Arrows are Mermaid's `-->` form; the diff introduces no decorative non-ASCII glyph.
-- Each diagram names the pinned source paths and lines it was read from. A citation is a source, not a promise that the named command is complete or host-faithful.
+- Every product diagram names the pinned repository path and line numbers it was read from; the workflow machines name the repository artifacts and served rules they describe. A citation is a source, not a promise that the named command is complete or host-faithful.
 - The verbatim archive `docs/reference/compatibility-notes.md` is never edited; corrections live in the maintained pages and are marked SUPERSEDED where they refer to it.
 
 ## Next
