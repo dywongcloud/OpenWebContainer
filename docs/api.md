@@ -94,6 +94,20 @@ stateDiagram-v2
 
 **Text alternative.** `VirtualProcess` has only three events. `output` carries `{ output, isError }` and may repeat; `exit` carries `{ exitCode: number | null }`; `error` carries `{ error: Error }`. There is no `start` or `message` event on this class. `isRunning`, `exitCode`, `startTime`, `endTime` and `uptime` are getters over the same process record. Sources: `docs/api.md` ProcessEventMap table, `packages/api/src/process/types.ts`, `packages/api/src/process/process.ts`.
 
+**Transition table.**
+
+| From | Event | To |
+| --- | --- | --- |
+| start | spawn returns a VirtualProcess | Spawned |
+| Spawned | output event | Streaming |
+| Streaming | another output event | Streaming |
+| Spawned | exit with no prior output | Exited |
+| Streaming | exit event | Exited |
+| Spawned | error event | Errored |
+| Streaming | error event | Errored |
+| Exited | terminal | end |
+| Errored | terminal | end |
+
 ## `OpenWebContainer` (`packages/core/src/container.ts`)
 
 ```ts

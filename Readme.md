@@ -91,6 +91,20 @@ stateDiagram-v2
 
 **Text alternative.** Construction immediately starts `initialize()`. A successful `WorkerBridge.initialize()` sets `_isReady`; a throw sets `_disposed` and rethrows, so `waitForReady()` rejects. While ready, spawn, file, preview and stats calls are repeatable without leaving the state. `dispose()` moves the container to a terminal state after the worker is terminated. Sources: `packages/api/src/container/container.ts:13-15,35-60`, `packages/api/src/worker/bridge.ts:101-119`; full machine and tables in [State machines](docs/reference/state-machines.md#1-container-lifecycle).
 
+**Transition table.**
+
+| From | Event | To |
+| --- | --- | --- |
+| start | new ContainerManager with options | Created |
+| Created | constructor calls initialize | Initializing |
+| Initializing | WorkerBridge.initialize resolves | Ready |
+| Initializing | initialize throws, _disposed set true | Failed |
+| Ready | spawn, writeFile, createPreview, getStats | Ready |
+| Ready | dispose | Disposing |
+| Disposing | worker terminated | Disposed |
+| Failed | terminal | end |
+| Disposed | terminal | end |
+
 The [Architecture page](docs/architecture.md#diagrams) adds the boot sequence, package graph, capability bridge, VFS and npm install, virtual network, multi-tab preview gateway, WASM bridge and git dispatch diagrams. Every diagram there, and every machine in [State machines](docs/reference/state-machines.md), has a plain-text alternative; no block uses colour as the only carrier of meaning.
 
 ### What it is not
