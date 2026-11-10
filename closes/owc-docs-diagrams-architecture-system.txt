@@ -1,1 +1,3 @@
-owc-docs-diagrams-architecture-system resolved 1794291377000-2429-650272d1c67a4ff1 2026-11-10T06:23:44.579Z
+Row: owc-docs-diagrams-architecture-system
+Witness: 1794291377000-2429-650272d1c67a4ff1
+Status: resolved
