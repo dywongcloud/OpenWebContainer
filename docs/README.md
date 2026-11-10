@@ -33,10 +33,10 @@ Every block is followed by a **Text alternative** that restates the same informa
 | Page | Diagrams | Type |
 | --- | --- | --- |
 | [Readme.md](../Readme.md) | System architecture at a glance, container lifecycle | flowchart, stateDiagram-v2 |
-| [architecture.md](architecture.md) | Nine system diagrams | flowchart, sequenceDiagram |
+| [architecture.md](architecture.md) | Layered architecture, boot sequence, package graph, capability bridge, VFS and npm install, virtual network, preview gateway, WASM bridge, git dispatch | flowchart, sequenceDiagram |
 | [api.md](api.md) | Boot/spawn/preview sequence, exported surfaces, VirtualProcess events | sequenceDiagram, classDiagram, stateDiagram-v2 |
 | [getting-started.md](getting-started.md) | First-run flow | flowchart |
-| [reference/state-machines.md](reference/state-machines.md) | Ten machines | stateDiagram-v2 |
+| [reference/state-machines.md](reference/state-machines.md) | Container, process, COEP lock, guest budget, preview routing, npm retry gate, git dispatch, gateway registration, differential verdict, PRD row | stateDiagram-v2 |
 
 ### Verification witness
 

@@ -42,4 +42,5 @@ Scratch exports under `/tmp` have twice filled the disk to zero bytes on this ma
 - [Known limitations](known-limitations.md) — a boundary may be the actual explanation (no raw TCP, no CORS parity, no cross-origin isolation).
 - [Getting started](getting-started.md) — verify the playground actually serves the COOP/COEP headers.
 - [Development](development.md) — the real scripts and build order.
+- [Architecture diagrams](architecture.md#diagrams) - nine maintained system diagrams, each with a text alternative.
 - [Compatibility notes archive](reference/compatibility-notes.md) — the verbatim chronological record of every measured case (one header line precedes it).

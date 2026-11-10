@@ -93,4 +93,4 @@ This repository's shared working tree is far behind `origin/main` (a measured 15
 
 ## Contributing
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for the project structure, branch and PR workflow, commit guidelines and documentation conventions. See [API reference](api.md) before changing a public method, and [Compatibility](compatibility.md) for how a change is measured.
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the project structure, branch and PR workflow, commit guidelines and documentation conventions. See [Architecture diagrams](architecture.md#diagrams) and [State machines](reference/state-machines.md) for the maintained diagrams and lifecycle machines. See [API reference](api.md) before changing a public method, and [Compatibility](compatibility.md) for how a change is measured.

@@ -44,4 +44,5 @@ Known softer edges are recorded rather than hidden: `node:util` exposes 22 of th
 
 - [Known limitations](known-limitations.md) for what this means for applications.
 - [Architecture](architecture.md) for why the boundaries exist.
+- [Architecture diagrams](architecture.md#diagrams) and [State machines](reference/state-machines.md) for the maintained system visualizations and lifecycle machines.
 - [Development](development.md) for the scripts available locally.

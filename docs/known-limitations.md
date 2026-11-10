@@ -60,4 +60,4 @@ Six host-Node deviations from the WPT `urltestdata.json` fixture and 20 document
 
 Every chronological measurement, including the documentation lines of every closed PRD row, is preserved byte-for-byte, below a single header line, in [docs/reference/compatibility-notes.md](reference/compatibility-notes.md). If a number here conflicts with the archive, the archive is the primary record of what was measured.
 
-Cross-origin isolation and host-header details are covered in [Isolation boundaries](reference/isolation-boundaries.md).
+Cross-origin isolation and host-header details are covered in [Isolation boundaries](reference/isolation-boundaries.md). The maintained [Architecture diagrams](architecture.md#diagrams), [State machines](reference/state-machines.md) and [Diagram conventions](README.md#diagram-conventions) use the same boundaries.

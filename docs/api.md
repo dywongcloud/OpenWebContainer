@@ -240,7 +240,7 @@ proc.once('exit', ({ exitCode }) => console.log('exit', exitCode));
 
 ## What the old Readme's examples got wrong
 
-The former chronological Readme imported `OpenWebContainer` from `@open-web-container/core` (`Readme.md:1286`), so most of its Usage calls are **real on the core class** and are kept above: `writeFile`/`readFile`/`deleteDirectory` are synchronous there, and `shell.addEventListener('exit', ...)` is valid on the core `Process` (`base/process.ts:292-298`). Two calls in those examples are not usable as written, and the api class is a different surface:
+The former chronological Readme imported `OpenWebContainer` from `@open-web-container/core` (`docs/reference/compatibility-notes.md:1287`), so most of its Usage calls are **real on the core class** and are kept above: `writeFile`/`readFile`/`deleteDirectory` are synchronous there, and `shell.addEventListener('exit', ...)` is valid on the core `Process` (`base/process.ts:292-298`). Two calls in those examples are not usable as written, and the api class is a different surface:
 
 | Old Readme text | Corrected form |
 | --- | --- |

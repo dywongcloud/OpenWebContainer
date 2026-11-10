@@ -324,7 +324,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  Argv["git <subcommand> args"]
+  Argv["git SUBCOMMAND args"]
   Shell["shell - MODULE_COMMANDS, not a spawned PATH file"]
   Main["gitMain - parse -C, -c, --git-dir, --version, --help"]
   Boundary["gitBoundaryOutcome(sub, rest, env) called FIRST"]

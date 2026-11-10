@@ -119,4 +119,6 @@ STAGE 1 (origin/main commit 74a2053887d84d0f51f69e2616d91c3495143b94, 'Add self-
 - git rebase -> commands.ts:262 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3).
 - git remote -> commands.ts:263 (STAGE 1 source-shipped; per-command two-memory-point measurement pending STAGE 2/3). (local config only; a real remote is a named boundary)
 
+The dispatch flow is drawn in [Architecture: git command dispatch](../architecture.md#9-git-command-dispatch) and [State machines: git command dispatch](state-machines.md#7-git-command-dispatch).
+
 STAGE 2/3 measurements and the closes through c21651b0 have landed; five regression rows were repaired and witnessed at two memory points in 55b024e (detached checkout, annotated tags, bisect/fsck, local remotes and the seven downstream divergences). The current runCommand switch has 43 cases (36 STAGE 1 cases plus bisect, fsck, backfill, fetch, push, pull and ls-remote) and UNSUPPORTED declares 18 git-* keys, all reachable from boundaryFamily. The exit-1 deviation for named boundaries recorded above is unchanged, and an unrecognised `git <name>` still returns the generic not-a-git-command line rather than a canonical boundary.

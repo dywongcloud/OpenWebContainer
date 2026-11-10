@@ -82,25 +82,31 @@ stateDiagram-v2
   [*] --> Unset: firstBootCoep undefined
   Unset --> Validating: initialize options
   Validating --> Rejected: value not in COEP_VALUES
-  Validating --> Rejected: non-none coep but crossOriginIsolated false
-  Validating --> Locked: value valid, firstBootCoep set
-  Locked --> Locked: later boot with the same value
-  Locked --> Rejected: later boot with a different value
+  Validating --> Rejected: firstBootCoep set and different
+  Validating --> Locked: value valid, firstBootCoep = coep
+  Locked --> Rejected: non-none coep but crossOriginIsolated false
+  Locked --> Booting: isolation satisfied or coep none
+  Booting --> Ready: boot plus initialize message
+  Ready --> Validating: another bridge initializes
   Rejected --> [*]
+  Ready --> [*]
 ```
 
-**Text alternative.** `COEP_VALUES` is exactly `require-corp`, `credentialless`, `none`, defaulting to `none`. `firstBootCoep` is a module-level variable, so it is shared by every `WorkerBridge` in the page. The first `initialize()` validates the requested value against that array, then rejects a non-`none` value when the document is not cross-origin isolated, then stores the value. Any later boot with a different value throws `coep is fixed at first boot (...) and cannot change on a later boot (...)`. The check happens before `boot()`, so a failed validation never creates a Worker. Cross-origin isolation itself is the host page's job: `apps/playground/vite.config.ts` declares COOP `same-origin` and COEP `require-corp` for both `server` and `preview`.
+**Text alternative.** `COEP_VALUES` is exactly `require-corp`, `credentialless`, `none`, defaulting to `none`. `firstBootCoep` is a module-level variable, so it is shared by every `WorkerBridge` in the page. The first `initialize()` validates the value against that array (`bridge.ts:41-43`), rejects a later mismatch (`:44-46`), assigns `firstBootCoep = coep` (`:47`), and only then checks cross-origin isolation (`:48-50`). An isolation rejection therefore still leaves `firstBootCoep` set, so a later boot with a different value is refused by the mismatch check at `:44-46`. `boot()` runs at `:51`, so a value or mismatch failure never creates a Worker. Cross-origin isolation itself is the host page's job: `apps/playground/vite.config.ts` declares COOP `same-origin` and COEP `require-corp` for both `server` and `preview`.
 
 | From | Event | To |
 | --- | --- | --- |
 | (start) | module load, `firstBootCoep` undefined | Unset |
 | Unset | `initialize(options)` | Validating |
 | Validating | value outside `COEP_VALUES` (:41-43) | Rejected |
-| Validating | coep not `none` and `!self.crossOriginIsolated` (:48-50) | Rejected |
+| Validating | mismatch with `firstBootCoep` (:44-46) | Rejected |
 | Validating | valid value, `firstBootCoep = coep` (:47) | Locked |
-| Locked | later boot, same value | Locked |
-| Locked | later boot, different value (:44-46) | Rejected |
+| Locked | non-`none` coep and `!self.crossOriginIsolated` (:48-50) | Rejected |
+| Locked | isolation satisfied or coep `none` | Booting |
+| Booting | boot plus initialize message (:51-58) | Ready |
+| Ready | another bridge initializes | Validating |
 | Rejected | throw, no Worker created | (end) |
+| Ready | terminal for that bridge | (end) |
 
 Source: `packages/api/src/worker/bridge.ts:19-50`, `apps/playground/vite.config.ts:8-18`, `docs/reference/isolation-boundaries.md`.
 
@@ -114,11 +120,11 @@ stateDiagram-v2
   Counting --> Counting: host call, await or timer restarts the budget
   Counting --> Interrupted: uninterrupted stretch exceeds the budget
   Interrupted --> Done: vm timeout error, process fails
-  Disarmed --> Disarmed: no interrupt handler installed
+  Disarmed --> Disarmed: handler installed, budgetMs 0, no budget check
   Done --> [*]
 ```
 
-**Text alternative.** There is one QuickJS interrupt handler per runtime. It measures an **uninterrupted stretch** of guest execution that made no host call; every host call, await or timer restarts the clock. `installHostBridge` calls `deps.onHostCall()` at the top of every defined host function, which is the reset point. When the stretch exceeds `guestBudgetMs` the guest is stopped with the `vm` timeout error Node reports. `guestBudgetMs = 0` disarms the guard and leaves a runaway loop unstoppable, which hangs the browser tab. There is no second host thread that can preempt a busy worker: this interrupt fires from inside QuickJS.
+**Text alternative.** There is one QuickJS interrupt handler per runtime. It measures an **uninterrupted stretch** of guest execution that made no host call; every host call, await or timer restarts the clock. `installHostBridge` calls `deps.onHostCall()` at the top of every defined host function, which is the reset point. When the stretch exceeds `guestBudgetMs` the guest is stopped with the `vm` timeout error Node reports. `guestBudgetMs = 0` sets the handler's budget to 0 (`armVmBudget`, `capabilities/vm.ts:534-537`), so the budget branch is skipped; the handler installed by `bindVmRuntime` (`vm.ts:483-504`) remains and still handles cancellation and deadlines (`:506-514`). The `container.ts:32-37` comment records that this leaves a runaway loop unstoppable, which hangs the browser tab. There is no second host thread that can preempt a busy worker: this interrupt fires from inside QuickJS.
 
 | From | Event | To |
 | --- | --- | --- |
@@ -128,10 +134,10 @@ stateDiagram-v2
 | Counting | host call, await or timer (`onHostCall`, `host-bridge.ts:103,120`) | Counting |
 | Counting | uninterrupted stretch exceeds budget | Interrupted |
 | Interrupted | `vm` timeout error, process state failed | Done |
-| Disarmed | no interrupt handler | Disarmed |
+| Disarmed | handler installed, `budgetMs` 0 | Disarmed |
 | Done | terminal | (end) |
 
-Source: `packages/core/src/container.ts:28-38`, `packages/core/src/process/executors/node/runtime/host-bridge.ts:99-125`, `docs/architecture.md` processes section, `docs/known-limitations.md`.
+Source: `packages/core/src/container.ts:28-38`, `packages/core/src/process/executors/node/runtime/capabilities/vm.ts:483-540`, `packages/core/src/process/executors/node/runtime/host-bridge.ts:99-125`, `docs/architecture.md` processes section, `docs/known-limitations.md`.
 
 ## 5. Preview request routing
 

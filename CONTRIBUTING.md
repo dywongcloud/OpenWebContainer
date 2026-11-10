@@ -219,5 +219,6 @@ pnpm turbo run check-types --force  # tsc gate for core, api and playground
 If you have questions, please:
 1. Check the [documentation index](docs/README.md)
 2. Read the [API reference](docs/api.md) and [compatibility notes](docs/reference/compatibility-notes.md); issues are disabled on this repository.
+3. See [Architecture diagrams](docs/architecture.md#diagrams) and [State machines](docs/reference/state-machines.md) for the maintained system visualizations.
 
 Thank you for contributing! 🎉

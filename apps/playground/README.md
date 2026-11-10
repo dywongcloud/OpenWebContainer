@@ -37,3 +37,5 @@ http://localhost:5173/__owc/preview/<port>/<path>
 - [Compatibility](../../docs/compatibility.md)
 - [Development](../../docs/development.md)
 - [Troubleshooting](../../docs/troubleshooting.md)
+- [Architecture diagrams](../../docs/architecture.md#diagrams) - nine maintained Mermaid system diagrams
+- [State machines](../../docs/reference/state-machines.md) - ten lifecycle and dispatch machines
