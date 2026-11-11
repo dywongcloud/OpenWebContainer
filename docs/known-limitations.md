@@ -33,7 +33,7 @@ A WebContainer-compatible host must serve `Cross-Origin-Opener-Policy: same-orig
 
 ## Interactive prompts need a terminal or piped input
 
-A guest `process.stdin` reports neither `isTTY` nor `columns` (`packages/core/src/process/executors/node/runtime/guest/globals.ts:1088`), the shape a host stream has when its input is a pipe rather than a person at a terminal. A CLI that asks `isTTY` whether a person is present is told that none is. `npx create-next-app@latest` with no project name prints its project-name prompt and exits 0 on a closed stdin, with no directory created; host npm 11.12.1 on Node v24.15.0 does exactly the same (own exit 0, 89 bytes of ANSI prompt, no directory). Pass a project name and `--yes`, or pipe the name in. See [Troubleshooting](troubleshooting.md#npx-create-next-applatest).
+A guest `process.stdin` reports neither `isTTY` nor `columns` (`packages/core/src/process/executors/node/runtime/guest/globals.ts:1088`), the shape a host stream has when its input is a pipe rather than a person at a terminal. A CLI that asks `isTTY` whether a person is present is told that none is. `npx create-next-app@latest` with no project name prints its project-name prompt and exits 0 on a closed stdin, with no directory created; host npm 11.12.1 on Node v24.15.0 does exactly the same (own exit 0, 89 bytes of ANSI prompt, no directory). Pass a project name and `--yes`. A piped stdin does not reach the prompt in the container: the guest `process.stdin` reports no `isTTY` and has no live reader, so the prompt library sees end of file. Host npm 11.12.1 with a piped stdin does create the app. See [Troubleshooting](troubleshooting.md#npx-create-next-applatest).
 
 ## One host thread, pinned to QuickJS
 
