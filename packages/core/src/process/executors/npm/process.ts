@@ -482,6 +482,7 @@ export class NpmProcess extends Process {
      * follow it are its own. `-p`/`--package` names the package the bin comes out of, as npx has it.
      */
     private async runExec(args: string[], registry: NpmRegistry, log: (line: string) => void): Promise<number> {
+        const assumeYes = args.some(arg => arg === '-y' || arg === '--yes' || arg === '--yes=true');
         const { command, commandArgs, packageArg } = parseExecArgs(args);
         const requested = packageArg ?? command;
         if (requested === undefined) {
@@ -489,7 +490,7 @@ export class NpmProcess extends Process {
             return 1;
         }
         const binName = parseInstallSpec(command ?? requested).name.split('/').pop()!;
-        return this.runBin(binName, requested, commandArgs, this.cwd ?? '/', registry, log, packageArg !== undefined);
+        return this.runBin(binName, requested, commandArgs, this.cwd ?? '/', registry, log, packageArg !== undefined, assumeYes);
     }
 
     /**
@@ -504,7 +505,8 @@ export class NpmProcess extends Process {
         cwd: string,
         registry: NpmRegistry,
         log: (line: string) => void,
-        explicitPackage: boolean
+        explicitPackage: boolean,
+        assumeYes: boolean = false
     ): Promise<number> {
         let shim = explicitPackage ? undefined : findLocalBinShim(this.fileSystem, cwd, binName);
 
@@ -534,9 +536,16 @@ export class NpmProcess extends Process {
             const localDir = explicitPackage ? undefined : findLocalPackageDir(this.fileSystem, cwd, spec.name);
             const packageDir = localDir ?? joinPaths(npxCacheDir(requested), 'node_modules', spec.name);
             if (localDir === undefined && this.fileSystem.statPath(packageDir)?.type !== 'dir') {
-                log(`Need to install the following packages:\n${requested}`);
                 const installer = new NpmInstaller(this.fileSystem, registry, log, (args, cwd, env) => this.runLifecycleScript(args, cwd, env), (line: string) => this.emitError(line));
                 await installer.addPackages(npxCacheDir(requested), [spec], 'none');
+                if (!assumeYes) {
+                    let resolvedVersion = requested;
+                    try {
+                        const manifest = JSON.parse(this.fileSystem.readFile(joinPaths(packageDir, 'package.json')) ?? '{}') as { version?: string };
+                        if (typeof manifest.version === 'string') resolvedVersion = `${spec.name}@${manifest.version}`;
+                    } catch { /* fall back to the requested spec */ }
+                    this.emitError(`npm warn exec The following package was not found and will be installed: ${resolvedVersion}\n`);
+                }
             }
             const file = binFromPackage(this.fileSystem, packageDir, binName);
             if (file === undefined) {
@@ -557,9 +566,11 @@ export class NpmProcess extends Process {
     private async runNpx(registry: NpmRegistry, log: (line: string) => void): Promise<number> {
         const args = [...this.args];
         let packageArg: string | undefined;
+        let assumeYes = false;
         while (args.length > 0 && args[0].startsWith('-')) {
             const flag = args.shift()!;
             if (flag === '-p' || flag === '--package') packageArg = args.shift();
+            else if (flag === '-y' || flag === '--yes' || flag === '--yes=true') assumeYes = true;
         }
         const command = args.shift();
         const requested = packageArg ?? command;
@@ -567,7 +578,7 @@ export class NpmProcess extends Process {
 
         // the command names the bin, so a version on it (npx cowsay@1) is stripped: the bin is `cowsay`
         const binName = parseInstallSpec(command ?? requested).name.split('/').pop()!;
-        return this.runBin(binName, requested, args, this.cwd ?? '/', registry, log, packageArg !== undefined);
+        return this.runBin(binName, requested, args, this.cwd ?? '/', registry, log, packageArg !== undefined, assumeYes);
     }
     /**
      * `npm install -g <pkg>`: install into <prefix>/lib/node_modules, link bins into <prefix>/bin,
