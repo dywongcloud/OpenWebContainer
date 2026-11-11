@@ -146,6 +146,7 @@ To write your first file and run it, see [Getting started](docs/getting-started.
 - `node` — CommonJS and ES modules, `node_modules` resolution, `node -e`, `node --test`.
 - `sh` — an interactive shell with built-in commands, pipes and redirection.
 - `npm` and `npx` — `npm install`, `npm run`, `npm exec`, and installs from a directory in the virtual file system.
+- `npx create-next-app@latest my-app --yes --skip-install` scaffolds a Next.js app in the virtual file system; it prints `Success! Created my-app` and exits 0.
 - WebAssembly modules, including real npm packages that ship WASM.
 - Real packages installed from the npm registry (`lodash`, `prettier`, `xlsx`, `cheerio`, `hash-wasm`, and others) with their dependency trees.
 - Node built-ins: `path`, `events`, `util`, `assert`, `fs`, `crypto`, streams, `http`, `https`, `http2`, `net`, `dgram`, `dns`, `child_process`, `worker_threads` and `cluster`, plus Web Streams and the usual web globals.
@@ -160,6 +161,7 @@ This is the most important section. The container is deliberately *not* a genera
 - **Cross-origin isolation is the host page's job.** A host must serve `Cross-Origin-Opener-Policy: same-origin` together with `Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`). A recorded Chrome measurement at `:5173` found `crossOriginIsolated=false` and `typeof SharedArrayBuffer=undefined`; `apps/playground/vite.config.ts` now declares both headers, but check the actual response headers of your deployment before relying on shared memory.
 - **One host thread, pinned to QuickJS.** There is no second thread to preempt a busy worker. A runaway guest is stopped from inside by a QuickJS interrupt handler after a 30000 ms default budget (`guestBudgetMs`), not by a host timer. Some language behaviour and the small `Intl` placeholder subset come from the pinned engine.
 - **Some Node surfaces are partial.** `fs.glob`/`globSync` are absent; `node:util` exposes 22 of the host's 35 names; several built-in namespaces are narrower than host Node's.
+- **Interactive CLI prompts need a name or piped stdin.** `npx create-next-app@latest` with no arguments prints the project-name prompt and exits 0 on a closed stdin, creating no directory; host npm 11.12.1 on Node v24.15.0 does the same. Pass a project name, add `--yes`, or pipe the name in. A full install without `--skip-install` runs `next typegen`, which needs a native SWC binary the browser-hosted container cannot load; see [Troubleshooting](docs/troubleshooting.md#npx-create-next-applatest).
 - **Measurement is differential, not CI-verified.** Compatibility is established by comparing stdout, stderr and exit code against host Node v24.15.0, and the repository has no `.github/workflows`. Six host-Node deviations from the WPT URL fixture and 20 documented IDNA cases remain.
 
 Read [Known limitations](docs/known-limitations.md) before you plan an application around this runtime. The full measured record is preserved verbatim in the [compatibility notes archive](docs/reference/compatibility-notes.md).
