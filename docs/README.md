@@ -11,8 +11,10 @@ Every page here describes the code on `origin/main`, not the diverged local work
 | [api.md](api.md) | The real `OpenWebContainer` (core) and `ContainerManager` (api) methods, events and signatures. |
 | [compatibility.md](compatibility.md) | The host Node target, differential method, spec baselines, WPT and swarm conformance numbers, and CI status. |
 | [known-limitations.md](known-limitations.md) | User-facing compatibility boundaries, each with its measured basis. |
+| [known-limitations.md#interactive-prompts-need-a-terminal-or-piped-input](known-limitations.md#interactive-prompts-need-a-terminal-or-piped-input) | Interactive CLI prompts need a project name or piped stdin; guest `process.stdin` has no `isTTY`. |
 | [development.md](development.md) | Real scripts from every manifest, core build order, turbo tasks, contributing link. |
 | [troubleshooting.md](troubleshooting.md) | Problems actually encountered in this repository's history. |
+| [troubleshooting.md#npx-create-next-applatest](troubleshooting.md#npx-create-next-applatest) | `npx create-next-app@latest`: working invocations, the closed-stdin prompt boundary, and the mixed-bundle `settleIO` failure with its rebuild. |
 | [reference/compatibility-notes.md](reference/compatibility-notes.md) | The entire former chronological `Readme.md`, byte-for-byte below a one-line header note. |
 | [reference/isolation-boundaries.md](reference/isolation-boundaries.md) | The four measured host-isolation boundaries: COOP/COEP, `coep`, direct-TCP databases, guest undici parity. |
 | [reference/commands.md](reference/commands.md) | Shell command reference and four per-family pages: [builtins](reference/commands-builtins.md), [builtins residual](reference/commands-builtins-residual.md), [text utilities](reference/commands-textutils.md), [system utilities](reference/commands-system.md). |

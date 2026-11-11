@@ -14,6 +14,16 @@ A `while (true) {}` or any long stretch of guest code with no host call blocks t
 
 If the terminal stops answering during a long install, this is the cause; see `listFilesPaced()` in the [API reference](api.md), which slices a whole-tree walk so a foreground child keeps the thread.
 
+## `npx create-next-app@latest`
+
+The command works when it is given a project name and `--yes`. On the live `:5173` playground, `npx create-next-app@latest my-app --yes --skip-install` prints `Success! Created my-app at /my-app` with exit 0 and empty stderr, and `npx create-next-app@latest --help` prints the full option list.
+
+**A bare `npx create-next-app@latest` needs stdin.** With no project name the CLI prints `? What is your project named?` and waits. Host npm 11.12.1 on Node v24.15.0 with a closed stdin exits 0 after printing only that prompt and creates no directory; the container answers the same way. Write a name to stdin (`printf 'my-app\n' | npx create-next-app@latest`) or name it on the command line. Host npm with `pipe-app\n` on stdin exits 0 in 27782 ms after `added 360 packages`, `Types generated successfully`, `Initialized a git repository` and `Success! Created pipe-app`. On a cold cache the container npx shim prints a two-line `Need to install the following packages:` notice even under `--yes`; host npm with a warm cache does not. That difference is stdout-only: exit code and stderr matched in all 8 pairs of a two-memory-point differential run.
+
+**`ReferenceError: 'settleIO' is not defined` means a mixed bundle.** The guest bootstrap is one IIFE joined from ten snippets in `packages/core/src/process/executors/node/runtime/bootstrap.ts`. If `LOADER_SRC` comes from one source revision and `BUFFER_FS_SRC` or `GLOBALS_SRC` from another, `settleIO` is undeclared while `settleRequest` still calls it; the first async `readdir` inside `@nodelib/fs.scandir` `readdirWithFileTypes` then fails with exit 1. `packages/core/dist` is ignored by git, so a stale bundle survives a source update. Rebuild both steps from one revision (`pnpm build:worker` then `pnpm build:main` in `packages/core`) and restart the dev server. Check that `dist/index.js`, `dist/index.cjs`, `dist/worker-code.js`, `dist/worker-code.cjs` and `dist/worker.global.js` each contain exactly one `function settleIO(`. The worker build `onSuccess` hook in `tsup.config.ts` now refuses the build with a named diagnostic when that count is not one, instead of emitting a broken `src/generated/worker-code.ts`.
+
+A full install without `--skip-install` runs `next typegen` as a child after npm installs dependencies; see [A guest that runs away](#a-guest-that-runs-away) for the 30000 ms uninterrupted-execution budget that bounds a child on the single host thread.
+
 ## A shared Chrome window taken by another lane
 
 The browser used for live measurements is one headful window per project root, leased across lanes. A `browser`/`chrome` call takes the lease and **waits for the holder**; it never kills or reuses another agent's window, and the window closes after 15 minutes with no holder or waiter. If a measurement appears stuck, it is usually waiting on that lease. Do not call `browser_reset` on someone else's window — it closes it and gives up their lease. Use a distinct session and wait.

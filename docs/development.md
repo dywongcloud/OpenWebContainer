@@ -49,6 +49,8 @@ pnpm build
 
 The worker entry is what `@open-web-container/api` imports as `@open-web-container/core/worker-code` and boots as a Blob Worker. Skipping the guest-bundle steps leaves a shim edit out of the container. The package exports `.` → `./dist/index.js` and `./worker-code` → `./dist/worker-code.js` (or `.cjs` for require).
 
+`packages/core/dist` is ignored by git. Rebuild both steps together from one source revision and replace all of `dist/` at once: a bundle that joins a `LOADER_SRC` from one revision with a `BUFFER_FS_SRC` from another has no `settleIO` declaration and fails at the first async `readdir` with `ReferenceError: 'settleIO' is not defined`. The worker build `onSuccess` hook in `tsup.config.ts` checks the emitted `dist/worker.global.js` for exactly one `function settleIO(` and stops the build with a named diagnostic when the count differs. See [Troubleshooting](troubleshooting.md#npx-create-next-applatest).
+
 ## `packages/api` (`packages/api/package.json`)
 
 | Script | Command |
