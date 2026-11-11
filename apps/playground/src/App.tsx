@@ -39,13 +39,15 @@ export default function App() {
 	   command that started it -- a reload can then run the line again and have the server back. */
 	const handleCommand = useCallback(
 		async (input: string) => {
-			if (input === "\r") {
+			if (input === "\r" || input === "\n") {
 				const line = commandLineRef.current.trim();
 				if (line) lastCommandRef.current = line;
 				commandLineRef.current = "";
-			} else if (input === "\b") {
+			} else if (input === "\b" || input === "\x7f") {
 				commandLineRef.current = commandLineRef.current.slice(0, -1);
-			} else if (input.length === 1) {
+			} else if (!/[\x00-\x1f\x7f]/.test(input)) {
+				/* xterm's onData groups a fast paste or an IME commit into one chunk; keep the
+				   whole printable run so a remembered server command is not just its last key. */
 				commandLineRef.current += input;
 			}
 			await sendCommand(input);

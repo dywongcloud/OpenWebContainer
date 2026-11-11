@@ -13,6 +13,11 @@ export const NODE_VERSION = 'v24.15.0';
 export const GLOBALS_SRC = String.raw`
 var EventEmitterCls = requireBuiltin('events');
 var envStore = JSON.parse(host.envJSON());
+/* The host marks a foreground job of a terminal with this one variable. It is read before any user
+   code runs, then removed from process.env; a child's own host process re-derives it from the
+   terminal chain, so the marker never leaks into a program's own environment. */
+var owcTerminalAttached = envStore.OWC_TERMINAL === '1';
+globalThis.__owcTerminalAttached = owcTerminalAttached;
 /*
  * Node's own process.env is not a plain object: its prototype is an object of node's that is not
  * Object.prototype, and a package that asks which it is gets the answer the host gives. An empty
@@ -1085,12 +1090,16 @@ function makeStdioStream(fd, writeText) {
     stream._type = 'fs';
     stream.autoClose = false;
     /*
-     * No terminal is attached, and a stream node has with no terminal behind it has *no* isTTY and
-     * *no* columns: a host run with its output piped reports undefined for both, not false and 80.
-     * The difference is observable -- columns || 80 never falls back here, and a library that reads
-     * isTTY to decide whether it is talking to a person is answered with a value that says it is
-     * not rather than with nothing. Both are left off the stream, as a piped host leaves them off.
+     * A run with a terminal behind it reports the three markers a tty stream carries: isTTY,
+     * columns and rows. Prompt libraries read them to decide whether a person is typing and how
+     * wide the question may be. A piped run has *no* isTTY and *no* columns, not false and 80,
+     * which is what a host leaves on a stream a pipe is behind.
      */
+    if (owcTerminalAttached) {
+        stream.isTTY = true;
+        stream.columns = 80;
+        stream.rows = 24;
+    }
     return stream;
 }
 /*
@@ -1266,11 +1275,19 @@ function stdinOf() {
     });
     /* fd 0, the descriptor a process reads its input from, whether anything is fed through it. */
     stdinStream.fd = 0;
+    /* A tty stream reports isTTY, columns and rows, and readline calls setRawMode on it before it
+       decodes arrow keys and y/n presses into keypress events. A pipe has none of them. */
+    if (owcTerminalAttached) {
+      stdinStream.isTTY = true;
+      stdinStream.columns = 80;
+      stdinStream.rows = 24;
+      stdinStream.isRaw = false;
+      stdinStream.setRawMode = function (mode) { this.isRaw = !!mode; return this; };
+    }
     /* The same pipe stdout and stderr are, reported the same way: fd 0 is a pipe on a run a parent
        started with one, and a stream built here is built the first time a program reads it. */
     var closeStdin = asyncOpenResource('PIPEWRAP', stdinStream);
     if (closeStdin !== null) stdinStream.once('close', closeStdin);
-    // as on stdout: a stream with no terminal behind it reports neither isTTY nor columns
     // text in, text out: a pushed chunk reaches a reader as the string it was written as
     stdinStream.setEncoding('utf8');
     /* newListener is emitted before the listener is added, so the count is read on the next turn */
@@ -1324,6 +1341,13 @@ if (procEnv.OWC_STDIN_INPUT !== undefined) {
 }
 if (procEnv.OWC_STDIN === 'pipe') {
   delete procEnv.OWC_STDIN;
+  stdinOpen = true;
+}
+if (owcTerminalAttached) {
+  delete procEnv.OWC_TERMINAL;
+  /* A terminal keeps stdin open until the program stops reading or the terminal sends Ctrl-D:
+     a prompt that saw end of file at boot took its default answer and exited before a key was
+     ever typed. */
   stdinOpen = true;
 }
 /* Node's process is an accessor pair on the global object -- non-enumerable, configurable, and

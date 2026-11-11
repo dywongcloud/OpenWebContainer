@@ -5191,7 +5191,7 @@ function owcBuildStreamCore() {
     keypressStreams.set(stream, { iface: iface === undefined ? null : iface });
     var decoder = createDecoder('utf8');
     var pending = '';
-    stream.on('data', function (chunk) {
+    var onData = function (chunk) {
       var text = decoder.write(chunk);
       for (var i = 0; i < text.length; i++) {
         pending += text.charAt(i);
@@ -5200,7 +5200,17 @@ function owcBuildStreamCore() {
         stream.emit('keypress', press.str, press.key);
         pending = '';
       }
-    });
+    };
+    stream.on('data', onData);
+    /* Node drops this listener when the interface closes. Keeping it leaves a 'data' reader on
+       process.stdin, which on a terminal holds the process open after the last question was
+       answered; removing it also lets a later prompt attach a fresh decoder to the same stdin. */
+    if (iface && typeof iface.once === 'function') {
+      iface.once('close', function () {
+        stream.removeListener('data', onData);
+        keypressStreams.delete(stream);
+      });
+    }
   }
 
   /* Node's readline module exports these seven in its own order, not the order they are defined in:

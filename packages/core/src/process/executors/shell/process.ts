@@ -463,6 +463,11 @@ export class ShellProcess extends Process {
         this.stdinPiped = true;
     }
 
+    /** An interactive shell owns the terminal: `sh -c <line>` reads a line, not a person. */
+    override hasTerminal(): boolean {
+        return this.filteredArgs.length === 0;
+    }
+
     /** A write to this shell's stdin pipe: kept as the text a command of the line reads. */
     override writeInput(input: string): void {
         this.stdinText += input;

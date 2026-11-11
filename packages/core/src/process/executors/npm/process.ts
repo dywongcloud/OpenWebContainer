@@ -82,7 +82,15 @@ export class NpmProcess extends Process {
         this.fileSystem = fileSystem;
     }
 
+    /** `npx` hands the terminal it was given to the bin it runs, which is the process that prompts. */
+    override hasTerminal(): boolean {
+        return this.hasParentTerminal();
+    }
+
     protected async execute(): Promise<void> {
+        /* `npx` runs the package's bin as a child, so it takes the shell's terminal first and
+           the bin then takes it from `npx`: keystrokes travel down to the process that prompts. */
+        this.adoptParentTerminal();
         const registry = new NpmRegistry();
         const log = (line: string) => this.emitOutput(line + '\n');
         try {

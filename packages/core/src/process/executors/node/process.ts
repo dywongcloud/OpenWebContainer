@@ -1666,6 +1666,8 @@ export class NodeProcess extends Process {
      * which is what a host `node` finds when its stdin is not a tty.
      */
     private readonly replReadsTerminal: boolean;
+    /** A terminal this run can be typed at: a REPL, or a foreground job of an interactive shell. */
+    private readonly terminalAttached: boolean;
     /** The input is a pipe a parent writes to and will close: a program arrives on it in pieces. */
     private readonly stdinFromPipe: boolean;
     /** `process.execArgv`: the options the line named, as node reports them. */
@@ -1853,7 +1855,12 @@ export class NodeProcess extends Process {
         /* A pipe on fd 0 is a writer, not a person: what it carries is a program, or data for one,
            and it ends when the writer closes it. A terminal is the only thing a REPL prompts at. */
         this.stdinFromPipe = env.OWC_STDIN === 'pipe';
-        this.replReadsTerminal = this.interactive || (!this.stdinFromPipe && this.parentHasTerminal());
+        /* A terminal follows the chain of children a line starts: an interactive shell owns it,
+           `npx` inherits it from that shell, and the bin `npx` runs prompts at it. With no TTY a
+           prompt library sees end of input (or no isTTY) and takes its default answer at once. */
+        this.terminalAttached = this.repl || (!this.stdinFromPipe && this.parentHasTerminal());
+        this.replReadsTerminal = this.terminalAttached || this.interactive;
+        if (this.terminalAttached) this.env.set('OWC_TERMINAL', '1');
         /*
          * A bare `node` nobody is typing at reads its program from what it is given instead, exactly
          * as a host `node` does when its stdin is not a terminal: `echo 'console.log(7)' | node`
@@ -1863,7 +1870,7 @@ export class NodeProcess extends Process {
         this.stdinScript = executablePath === '[stdin]' || (this.repl && !this.replReadsTerminal && !this.test);
         /* A piped stdin, a REPL and a `node -` all read what is written to them; a `node -` reads
            the whole program before it runs any of it. */
-        this.stdinPiped = env.OWC_STDIN === 'pipe' || this.repl || this.stdinScript;
+        this.stdinPiped = env.OWC_STDIN === 'pipe' || this.repl || this.stdinScript || this.terminalAttached;
         this.execArgv = run.execArgv;
         this.stackTraceLimit = run.stackTraceLimit;
         this.title = run.title;
@@ -2570,25 +2577,23 @@ export class NodeProcess extends Process {
     }
 
     /**
-     * A REPL takes over the terminal of the process that started it: the shell hands it every
-     * keystroke instead of editing a line of its own, the way a foreground job owns a terminal.
+     * A foreground job takes over the terminal of the process that started it: the shell hands it
+     * every keystroke instead of editing a line of its own. Interactive CLIs (`npx
+     * create-next-app`, a `y/n` confirm) need exactly the raw byte stream a REPL does.
      */
     private claimParentTerminal(): void {
-        if (!this.repl || this.parentPid === undefined) return;
+        if (!this.terminalAttached || this.parentPid === undefined) return;
         processOf(this.parentPid)?.adoptInteractiveChild(this);
     }
 
-    /**
-     * Whether the shell that started this process reads its lines from a terminal: one started with
-     * no command of its own -- `sh`, or the playground's `sh --osc` -- is reading what a person
-     * types and has a terminal to hand a REPL, and one started with a command (`sh -c <line>`, the
-     * way a program runs a command) is reading that command. A `node` with no shell behind it and
-     * no pipe on its input has nothing being typed at it either.
-     */
+    /** Whether the process that started this run owns a terminal this one can be typed at. */
     private parentHasTerminal(): boolean {
-        const parent = this.parentPid === undefined ? undefined : processOf(this.parentPid);
-        if (parent === undefined || parent.type !== ProcessType.SHELL) return false;
-        return parent.args.every((arg) => arg === '--osc');
+        return this.hasParentTerminal();
+    }
+
+    /** A run with a terminal hands it to the children it starts, so a nested CLI prompts too. */
+    override hasTerminal(): boolean {
+        return this.terminalAttached;
     }
 
     /**
@@ -2607,6 +2612,11 @@ export class NodeProcess extends Process {
         if (!this.repl) {
             if (!this.stdinPiped) {
                 super.writeInput(input);
+                return;
+            }
+            /* Ctrl-D on a terminal is end of input, not a byte of the answer. */
+            if (this.terminalAttached && input === '\x04') {
+                this.endStdin();
                 return;
             }
             this.stdinQueue.push(input);

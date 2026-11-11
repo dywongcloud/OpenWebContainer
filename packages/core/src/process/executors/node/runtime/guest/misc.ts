@@ -6754,16 +6754,16 @@ BF.tty = function () {
    * lib/unixTerminal.js builds one of these around the fd its add-on returns and reads the child's
    * output from it, and writes to it go through fs.write to the child's input.
    *
-   * The container has no terminal, so this stream is not one: isTTY is false, and isatty below
-   * answers false for every fd. A fd that is not one of the shim's gives an inert stream, so
-   * new tty.ReadStream(0) does not fail.
+   * A run with a terminal behind it reports a tty stream, and isatty answers true for the three
+   * standard descriptors. A run with none keeps the historical false. A fd that is not one of the
+   * shim's gives an inert stream, so new tty.ReadStream(0) does not fail.
    */
   function PtyReadStream(fd) {
     var self = this;
     var rec = recordOf(fd);
     EE.call(this);
     this.fd = fd;
-    this.isTTY = false;
+    this.isTTY = globalThis.__owcTerminalAttached === true;
     this.readable = true;
     this.writable = false;
     this.columns = rec ? rec.cols : 80;
@@ -6826,7 +6826,7 @@ BF.tty = function () {
   function PtyWriteStream(fd) {
     EE.call(this);
     this.fd = fd;
-    this.isTTY = false;
+    this.isTTY = globalThis.__owcTerminalAttached === true;
     this.writable = true;
     this.columns = 80;
     this.rows = 24;
@@ -6836,7 +6836,7 @@ BF.tty = function () {
   PtyWriteStream.prototype.write = function () { return false; };
   PtyWriteStream.prototype.end = function () { return this; };
   return {
-    isatty: function () { return false; },
+    isatty: function (fd) { return globalThis.__owcTerminalAttached === true && (fd === 0 || fd === 1 || fd === 2); },
     ReadStream: PtyReadStream,
     WriteStream: PtyWriteStream
   };

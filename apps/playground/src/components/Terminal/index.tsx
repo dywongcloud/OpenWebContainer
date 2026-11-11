@@ -48,55 +48,18 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 			term.open(element);
 			fitAddon.fit();
 
-			term.onKey(({ key, domEvent }) => {
-				/* The key is named by the event, never by keyCode alone. A keyCode is shared between a
-			   cursor key and a character on some layouts and in synthetic key events, and reading
-			   40 as ArrowDown turns a `(` typed inside a quoted argument into a request to rewrite
-			   the line, which truncates the command being typed and leaves its quoting unbalanced. */
-			switch (domEvent.key) {
-					case "ArrowUp":
-						onCommandRef.current("\x1b[A");
-						break;
-					case "ArrowDown":
-						onCommandRef.current("\x1b[B");
-						break;
-					case "Enter":
-						onCommandRef.current("\r");
-						break;
-					case "Backspace":
-						onCommandRef.current("\b");
-						break;
-				/* Ctrl-C interrupts and Ctrl-D ends input: without them a REPL cannot be interrupted
-				   or left, because the guest only ever sees keystrokes. */
-				case "c":
-				case "C":
-					if (domEvent.ctrlKey && !domEvent.altKey) {
-						onCommandRef.current("\x03");
-						break;
-					}
-					onCommandRef.current(domEvent.key);
-					break;
-				case "d":
-				case "D":
-					if (domEvent.ctrlKey && !domEvent.altKey) {
-						onCommandRef.current("\x04");
-						break;
-					}
-					onCommandRef.current(domEvent.key);
-					break;
-					default:
-						if (!domEvent.ctrlKey && !domEvent.altKey && (domEvent.key.length === 1 || key.length === 1)) {
-							onCommandRef.current(domEvent.key.length === 1 ? domEvent.key : key);
-						}
-						break;
-				}
+			/* onData is the byte stream a real pty would receive: arrow keys, Tab, Home/End,
+			   Ctrl+letter, Escape, Backspace and Enter all arrive as the sequences a prompt
+			   library decodes. onKey's per-key switch silently dropped most of them. */
+			term.onData((data) => {
+				onCommandRef.current(data);
 			});
-			element.addEventListener("paste", handlePaste);
 			term.attachCustomKeyEventHandler((arg) => {
 				if ((arg.ctrlKey || arg.metaKey) && arg.code === "KeyV" && arg.type === "keydown") {
 					navigator.clipboard.readText().then((text) => {
-						onCommandRef.current(text);
+						if (text) onCommandRef.current(text);
 					});
+					return false;
 				}
 				return true;
 			});
@@ -105,12 +68,6 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 			flushOutput();
 		};
 
-		const handlePaste = (event: ClipboardEvent) => {
-			const text = event.clipboardData?.getData("text");
-			if (text) {
-				onCommandRef.current(text);
-			}
-		};
 
 		const flushOutput = () => {
 			if (!term) return;
@@ -159,7 +116,6 @@ export default function Terminal({ onCommand, output }: TerminalProps) {
 			resizeObserver?.disconnect();
 			window.removeEventListener("resize", safeFit);
 			document.removeEventListener("visibilitychange", safeFit);
-			element.removeEventListener("paste", handlePaste);
 			xtermRef.current = undefined;
 			term?.dispose();
 		};

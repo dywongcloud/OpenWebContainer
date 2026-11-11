@@ -117,6 +117,29 @@ export abstract class Process extends BrowserEventEmitter {
     }
 
     /**
+     * Whether a terminal is attached to this process. A foreground job of an interactive shell has
+     * one; a pipe, a `sh -c <line>` and a silent child have none. Prompt libraries read
+     * process.stdin.isTTY to decide whether a person is typing, so the answer has to follow the
+     * terminal down the chain of children one command starts (`sh` -> `npx` -> `node <bin>`).
+     */
+    hasTerminal(): boolean {
+        return false;
+    }
+
+    /** The terminal this process was started from, if the process that started it owns one. */
+    protected hasParentTerminal(): boolean {
+        const parent = this.parentPid === undefined ? undefined : processOf(this.parentPid);
+        return parent !== undefined && parent.hasTerminal();
+    }
+
+    /** Takes the parent's terminal before this process can print a prompt, so keystrokes reach
+     * the foreground job that asked the question instead of the shell's own line editor. */
+    protected adoptParentTerminal(): void {
+        if (!this.hasTerminal() || this.parentPid === undefined) return;
+        processOf(this.parentPid)?.adoptInteractiveChild(this);
+    }
+
+    /**
      * Process input handling
      */
     writeInput(input: string): void {
@@ -136,8 +159,9 @@ export abstract class Process extends BrowserEventEmitter {
 
     /**
      * Hands this process's terminal input to `child` until the child exits, the way a shell gives
-     * its terminal to a foreground job. Only a process that reads what it is given -- an
-     * interactive REPL -- takes it; every other child leaves the parent's own line editing alone.
+     * its terminal to a foreground job. Every terminal-attached foreground child takes it: an
+     * interactive CLI asking a question reads exactly the keystrokes a REPL does. A piped or
+     * silent child leaves the parent's own line editing alone.
      */
     adoptInteractiveChild(child: Process): void {
         this.interactiveChild = child;
