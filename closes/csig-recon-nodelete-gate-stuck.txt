@@ -1,3 +1,2 @@
-Row: csig-recon-nodelete-gate-stuck
-Witness: 1794371791925-6364-e0b77c0d36918efe
-Status: stale
+csig-recon-nodelete-gate-stuck stale 1794371791925-6364-e0b77c0d36918efe 2026-11-11T04:37:51.519Z
+csig-recon-nodelete-gate-stuck stale 1794400893686-6036-c0bfae40f1303955 2026-11-11T12:42:24.569Z
