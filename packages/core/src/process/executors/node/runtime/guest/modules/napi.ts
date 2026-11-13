@@ -13,5 +13,6 @@ import { NAPI_BETTER_SQLITE3_SRC } from './napi-better-sqlite3';
 import { NAPI_NODE_PTY_SRC } from './napi-node-pty';
 import { NAPI_CANVAS_SRC } from './napi-canvas';
 import { NAPI_SHARP_SRC } from './napi-sharp';
+import { NAPI_NEXT_SWC_SRC } from './napi-next-swc';
 
-export const NAPI_SRCS: string[] = [NAPI_BCRYPT_SRC, NAPI_LEVELDOWN_SRC, NAPI_ROCKSDB_SRC, NAPI_SODIUM_SRC, NAPI_BETTER_SQLITE3_SRC, NAPI_NODE_PTY_SRC, NAPI_CANVAS_SRC, NAPI_SHARP_SRC];
+export const NAPI_SRCS: string[] = [NAPI_BCRYPT_SRC, NAPI_LEVELDOWN_SRC, NAPI_ROCKSDB_SRC, NAPI_SODIUM_SRC, NAPI_BETTER_SQLITE3_SRC, NAPI_NODE_PTY_SRC, NAPI_CANVAS_SRC, NAPI_SHARP_SRC, NAPI_NEXT_SWC_SRC];

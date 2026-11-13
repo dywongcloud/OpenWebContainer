@@ -300,7 +300,9 @@ export class ContainerManager {
             const result = await this.worker.sendMessage({
                 type: 'listFiles',
                 payload: { path }
-            }, 180000);
+            }, this.options.guestBudgetMs !== undefined
+                ? Math.min(Math.max(180000, Math.floor(this.options.guestBudgetMs) + 30000), 2147483647)
+                : 180000);
             if (result.type !== 'fileList') {
                 throw new Error("Invalid response type");
             }

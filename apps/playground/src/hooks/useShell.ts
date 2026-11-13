@@ -57,18 +57,20 @@ export function useShell(container: ContainerManager | null, options: UseShellOp
                 for (const delay of [0, 400, 1500]) {
                     const timer = setTimeout(() => {
                         if (received) return;
-                        try {
-                            process.write('\r');
-                        } catch {
+                        /* A write is a promise to the worker: without a catch a request that
+                           outlives its deadline becomes an unhandled rejection. */
+                        void process.write('\r').catch(() => {
                             /* the shell ended before the line reached it */
-                        }
+                        });
                     }, delay);
                     promptTimers.push(timer);
                 }
 
                 // Execute initial commands if any
                 for (const cmd of initialCommands) {
-                    process.write(cmd + '\r');
+                    void process.write(cmd + '\r').catch((error) => {
+                        console.error('Failed to run initial command:', error);
+                    });
                 }
             } catch (error) {
                 console.error('Failed to initialize shell:', error);
@@ -95,12 +97,10 @@ export function useShell(container: ContainerManager | null, options: UseShellOp
             throw new Error('Shell is not ready');
         }
 
-        try {
-            processRef.current.write(input);
-        } catch (error) {
+        await processRef.current.write(input).catch((error) => {
             console.error('Failed to send command:', error);
             throw error;
-        }
+        });
     }, [ready]);
 
     const clearOutput = useCallback(() => {

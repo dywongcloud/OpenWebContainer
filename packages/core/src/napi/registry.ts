@@ -112,5 +112,16 @@ export const NAPI_SHIMS: readonly NapiShim[] = [
                 'src/build/Release/sharp-wasm32.node'
             ]
         }
+    },
+    {
+        // Next 16.4.6 dist/build/swc/index.js loadNative() requires '@next/swc-<triple>', whose
+        // package main IS the .node file (package.json: main = next-swc.linux-x64-gnu.node). npm
+        // ships that real ELF file, so the listed paths already exist and writeNapiPlaceholders
+        // skips them; their only job is to register the scoped names in NAPI_PACKAGES. Load-only; see
+        // src/napi/next-swc/index.ts. It lets next typegen's installBindings() resolve without
+        // downloading the wasm tarball, and refuses every real compiler call with a named error.
+        name: 'next-swc',
+        binaries: ['next-swc.linux-x64-gnu.node', 'next-swc.linux-x64-musl.node'],
+        packages: { '@next/swc-linux-x64-gnu': ['next-swc.linux-x64-gnu.node'], '@next/swc-linux-x64-musl': ['next-swc.linux-x64-musl.node'] }
     }
 ];

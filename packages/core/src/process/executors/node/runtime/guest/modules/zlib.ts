@@ -446,6 +446,13 @@ BF['zlib'] = function () {
       self._owcParams = codecParamsOption(format, compress, options);
       self._owcChunkSize = chunkOption(format, options);
       self._owcStream = 0;
+      /* Node's zlib objects expose the native codec at _handle, and minizlib -- the gzip
+         reader Next bundles inside its tar -- reaches straight for _handle.close around every
+         _processChunk call. There is no native binding here, but the handle still has to exist
+         and closing it still has to release the host codec this stream opened. */
+      self._handle = {
+        close: function () { closeCodec(self); }
+      };
       flushOptions(format, options);
       self.bytesWritten = 0;
       return self;
@@ -554,6 +561,43 @@ BF['zlib'] = function () {
         return;
       }
       this.write(flushBuffer(kind), '', typeof done === 'function' ? done : undefined);
+    };
+
+    /*
+     * Node zlib classes also carry a synchronous _processChunk(chunk, flushFlag) that runs one
+     * codec step and returns the bytes it produced. minizlib drives exactly that rather than
+     * writing to the stream: it wraps new zlib.Gunzip(...), temporarily replaces Buffer.concat
+     * with the identity so a host's concatenated result comes back as its list of buffers, and
+     * writes each buffer into its own Minipass. Without these two members a .tgz extraction dies
+     * with "cannot read property 'close' of undefined" on the first chunk read.
+     *
+     * The deflate family's flush constants are ops (0 write, 3 flush, 4 finish); brotli and zstd
+     * number the same three steps 0, 1, 2, which is ops for those codecs too. A compress stream
+     * hands one step to the host's open codec and returns its bytes. A decompress stream buffers
+     * its chunks and inflates them once at the finish flag -- the same buffering _transform/_flush
+     * already do, since an inflate of the same bytes does not depend on where they were split.
+     */
+    ZlibStream.prototype._processChunk = function (chunk, flushFlag) {
+      var bytes = typeof chunk === 'string' ? encodeString(chunk, 'utf8')
+        : inputBytes(chunk, 'chunk', CHUNK_INPUT, false);
+      /* minizlib passes a host Z_* flush constant (Z_SYNC_FLUSH=2, Z_FULL_FLUSH=3,
+         Z_FINISH=4, Z_BLOCK=5 ...), not the capability's own op numbers. Treat finish as
+         finish and every other non-zero flag as a flush; mapping only ops.flush would
+         silently downgrade a sync flush to a plain write. */
+      var op = flushFlag === ops.finish ? ops.finish
+        : (typeof flushFlag === 'number' && flushFlag > 0 ? ops.flush : ops.write);
+      if (incremental) {
+        var encoded = callCap('zlib.streamWrite', {
+          id: openCodec(this), data: toBase64(bytes), op: op
+        });
+        return Buf.from(fromBase64(encoded));
+      }
+      this._owcChunks.push(bytes.slice(0));
+      if (op !== ops.finish) return Buf.alloc(0);
+      var input = concatBytes(this._owcChunks);
+      this._owcChunks = [];
+      return runZlib(format, compress, input, this._owcLevel, this._owcDictionary,
+        this._owcParams, this._owcChunkSize, true);
     };
 
     ZlibStream.prototype.close = function (callback) {

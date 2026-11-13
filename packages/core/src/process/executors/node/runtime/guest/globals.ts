@@ -474,7 +474,12 @@ function recordExitFailure(error, viaExit) {
   });
 }
 var exitedByCall = false;
+var hostExitRequested = false;
 proc.exit = function (code) {
+  /* Nothing runs after process.exit() on node. The guest unwinds with a signal instead, so a later
+     call reached from a promise reaction or a catch block is one node would never have run: keep
+     the status the first call chose rather than letting it be replaced. */
+  if (hostExitRequested) throw EXIT_SIGNAL;
   exitCallSite = siteOf(stackTextOf(new Error()));
   /* 'process.exit()' with no argument leaves the status it already had; with one, it is that
      argument validated and coerced exactly as an assignment to 'process.exitCode' is -- which is
@@ -494,6 +499,7 @@ proc.exit = function (code) {
     exitedByCall = true;
     api.emitExit(typeof proc.exitCode === 'number' ? proc.exitCode : 0);
   }
+  hostExitRequested = true;
   host.exit(exitStatusOf(proc.exitCode));
   throw EXIT_SIGNAL;
 };

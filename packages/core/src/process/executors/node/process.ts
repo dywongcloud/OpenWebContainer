@@ -1209,7 +1209,19 @@ const REJECTION_TRACKER_SRC = String.raw`
         cell.handled = true;
       }
     }
-    return nativeThen.call(this, onFulfilled, onRejected);
+    /* process.exit() ends the process where it is called, and node runs nothing after it. Here it
+       unwinds by throwing the exit signal, which the engine turns into a rejection of the promise
+       this reaction belongs to: a .catch() on that promise would otherwise see it and could call
+       process.exit(1) after the first exit had already chosen its status. The signal is not a
+       reason a program's handler may observe, so pass it straight through the reaction. */
+    var guardedReject = onRejected;
+    if (typeof onRejected === 'function') {
+      guardedReject = function (reason) {
+        if (typeof api.isExitSignal === 'function' && api.isExitSignal(reason)) throw reason;
+        return onRejected(reason);
+      };
+    }
+    return nativeThen.call(this, onFulfilled, guardedReject);
   };
 
   /* 'Object.getOwnPropertyNames(Promise.prototype)' is 'catch', 'constructor', 'finally', 'then'

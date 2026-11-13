@@ -23,9 +23,12 @@ export function useContainer() {
             /* A long host-side WebAssembly compile (Next's SWC fallback) is one uninterrupted
                stretch to the guest VM guard; ?budget=<ms> lets a heavy command finish without
                making the default runaway bound longer for everyone. */
-            const budget = Number(new URLSearchParams(window.location.search).get('budget'));
+            /* A non-finite or int32-overflowing budget would disarm the VM guard entirely or
+               wrap the request timer, so clamp it to the same finite window the bridge uses. */
+            const raw = Number(new URLSearchParams(window.location.search).get('budget'));
+            const budget = Number.isFinite(raw) && raw > 0 && raw <= 600000 ? Math.floor(raw) : undefined;
             pageContainer = new ContainerManager({
-                guestBudgetMs: budget > 0 ? budget : undefined,
+                guestBudgetMs: budget,
                 onServerListen: (port) => {
                     console.log('Server listening on port', port);
                     setServers((listening) => Array.from(new Set([...listening, port])));
@@ -41,18 +44,45 @@ export function useContainer() {
            one thread -- must not surface as an unhandled rejection. */
         pageContainer.waitForReady().then(() => {
             setReady(true);
+        }).catch((error) => {
+            console.error('Container failed to initialize:', error);
         });
     }, []);
 
     useEffect(() => {
         if (!containerRef.current || !ready) return
+        /* One poll in flight at a time. A 1s interval keeps issuing listServers while
+           the worker's single thread is busy, so those requests queue behind the long
+           command; skipping ticks until the previous one settles bounds the queue at
+           exactly one. The request's own finite timeout (WorkerBridge) guarantees the
+           flag is released, so the poll can never wedge. */
+        let inFlight = false;
+        let stopped = false;
+        let lastError = '';
+        let lastErrorAt = 0;
         let interval = setInterval(() => {
-            containerRef.current?.listActiveServers().then((resp)=>{
-                let {ports}=resp
-                setServers(ports)
-            }).catch(() => {});
+            const container = containerRef.current;
+            if (!container || inFlight) return;
+            inFlight = true;
+            container.listActiveServers().then((resp)=>{
+                if (!stopped) setServers(resp.ports)
+            }).catch((error: unknown)=>{
+                /* Handled, but not silently dropped: a genuine failure is logged, while
+                   one identical error repeating is throttled so a stuck worker cannot
+                   turn this poll into a console flood of its own. */
+                const message = String((error as Error)?.message ?? error);
+                const now = Date.now();
+                if (message !== lastError || now - lastErrorAt >= 30000) {
+                    lastError = message;
+                    lastErrorAt = now;
+                    console.error('listActiveServers poll failed:', error);
+                }
+            }).finally(()=>{
+                inFlight = false;
+            });
         }, 1000);
         return ()=>{
+            stopped = true;
             clearInterval(interval)
         }
     }, [ready]);

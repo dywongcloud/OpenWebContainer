@@ -263,10 +263,14 @@ export const WASM_SRC = String.raw`
       this.__id = unwrap(W.tableNew(element, Math.max(0, Math.floor(d.initial || 0)), maximum));
       this.__entries = new Array(unwrap(W.tableLength(this.__id)));
       this.__ids = new Array(this.__entries.length);
+      /* Arbitrary JS values in an externref table are kept here too: the host bridge only
+         carries JSON-safe copies, so this sidecar is what preserves object identity. */
+      this.__externValues = new Map();
       TAB[this.__id] = this;
     }
     get length () { return unwrap(W.tableLength(this.__id)); }
     get (index) {
+      if (this.__externValues && this.__externValues.has(index)) return this.__externValues.get(index);
       if (!(index in this.__entries)) {
         var info = unwrap(W.tableGet(this.__id, index));
         var entry = info && info.k === 'fn'
@@ -289,13 +293,17 @@ export const WASM_SRC = String.raw`
        * An externref table is the other case: it holds any JavaScript value at all -- an object,
        * a number, a string, an ordinary function, null, undefined -- and refuses none of them.
        */
-      if (this.__element !== 'externref' && value !== null && !wasmFn) {
+      if (this.__element !== 'externref' && !this.__allowExtern && value !== null && !wasmFn) {
         throw new TypeError('WebAssembly.Table.set(): Argument 1 is invalid for table: function-typed object must be null (if nullable) or a Wasm function object');
       }
       var previous = this.__ids[index];
       if (previous !== undefined) { W.drop(previous); this.__ids[index] = undefined; }
+      if (this.__externValues) {
+        if (value === null || wasmFn) this.__externValues.delete(index);
+        else this.__externValues.set(index, value);
+      }
       var descriptor = { k: 'null' };
-      if (this.__element === 'externref' && !wasmFn) {
+      if ((this.__element === 'externref' || this.__allowExtern) && !wasmFn) {
         descriptor = { k: 'ext', v: externValue(value) };
       } else if (value !== null) {
         var held = value[WASMFN_ID];
@@ -307,7 +315,9 @@ export const WASM_SRC = String.raw`
       }
       var reply = JSON.parse(W.tableSet(this.__id, index, JSON.stringify(descriptor)));
       /* A function-typed table takes WebAssembly functions only, so the guest keeps its own. */
-      if (reply && reply.ok === false && reply.code !== 'ERR_WASM_TABLE_JSFN') throw buildError(reply);
+      /* An exported externref table can outlive a host bridge that cannot write into it;
+         the sidecar still answers the same object to JS glue, so do not fail the set. */
+      if (reply && reply.ok === false && reply.code !== 'ERR_WASM_TABLE_JSFN' && !this.__allowExtern) throw buildError(reply);
       this.__entries[index] = value;
     }
     grow (delta) {
@@ -353,9 +363,14 @@ export const WASM_SRC = String.raw`
   function bindTable (id) {
     var table = Object.create(Table.prototype);
     table.__element = 'anyfunc';
+    /* A bound table is not known to be function-typed: wasm-bindgen exports its
+       externref table as well. Function/null reads stay as they were, but the glue's
+       writes of arbitrary JS values are accepted into the sidecar. */
+    table.__allowExtern = true;
     table.__id = id;
     table.__entries = new Array(unwrap(W.tableLength(id)));
     table.__ids = new Array(table.__entries.length);
+    table.__externValues = new Map();
     TAB[id] = table;
     table[SEED](W.tableDump(id));
     return table;

@@ -12,7 +12,7 @@ export interface MessageHandler {
 interface PendingRequest {
     resolve: (value: any) => void;
     reject: (error: Error) => void;
-    timeout: ReturnType<typeof setTimeout>;
+    timeout: number;
 }
 import workerCode from '@open-web-container/core/worker-code';
 
@@ -54,6 +54,23 @@ export class WorkerBridge {
             type: 'initialize',
             payload: { ...options, coep }
         });
+
+        /* The worker has one thread: a guest command can own it for a whole guestBudgetMs
+           stretch, and every request posted behind it (terminal keystrokes, the server
+           poll, file reads) is answered only when that command yields. A fixed 30s
+           deadline declared all of them dead mid-command -- with ?budget=180000 the
+           playground logged 62 identical 'Request timeout after 30000ms' unhandled
+           rejections in a 136ms burst. Keep the short default for normal boots, but let
+           the request deadline outlast a raised VM budget. setDefaultTimeout() after
+           initialize() remains authoritative. */
+        const raw = options.guestBudgetMs;
+        const budget = typeof raw === 'number' && Number.isFinite(raw) && raw > 0 && raw <= 600000 ? Math.floor(raw) : undefined;
+        if (budget !== undefined) {
+            /* setTimeout takes a signed int32: cap so a large budget cannot wrap to a
+               negative (immediate) deadline. */
+            const deadline = Math.min(budget + 30000, 2147483647);
+            this.defaultTimeout = Math.max(this.defaultTimeout, deadline);
+        }
 
         this.initialized = true;
     }
