@@ -15,6 +15,7 @@ self.onmessage = async function (e: MessageEvent<WorkerMessage>) {
             let { payload } = e.data;
             // Initialize container when worker starts
             container = new OpenWebContainer({ debug: payload.debug,
+                guestBudgetMs: payload.guestBudgetMs,
                 onServerListen:(port)=>{
                     sendWorkerResponse({ type: 'onServerListen', id, payload:{port} });
                 },

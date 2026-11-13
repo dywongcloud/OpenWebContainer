@@ -3545,6 +3545,18 @@ BF.fs = function () {
     }, false);
     Object.setPrototypeOf(stream, streamProtoOf(WriteStream, Writable, writeStreamProto));
     writeStreamProto = true;
+    /* Node's fs.WriteStream has close([callback]) beside end(): Next.js pipes its WASM SWC
+       tarball into a createWriteStream and calls close(cb) when the pipe finishes. Writable has
+       only end(), so without this the fallback download dies with 'TypeError: not a function'. */
+    stream.close = function (callback) {
+      var cb = typeof callback === 'function' ? callback : undefined;
+      var state = stream._writableState;
+      if (state && (state.finished || state.destroyed)) {
+        if (cb) process.nextTick(cb);
+        return;
+      }
+      stream.end(cb);
+    };
     return stream;
   };
 

@@ -33,6 +33,7 @@ export interface WorkerInitOptions {
     debug?: boolean;
     memoryLimit?: number;
     coep?: 'require-corp' | 'credentialless' | 'none';
+    guestBudgetMs?: number;
 }
 
 export interface HttpRequestPayload {

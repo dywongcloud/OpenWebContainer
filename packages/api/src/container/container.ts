@@ -46,7 +46,8 @@ export class ContainerManager {
             await this.worker.initialize({
                 debug: this.options.debug,
                 memoryLimit: this.options.memoryLimit,
-                coep: this.options.coep
+                coep: this.options.coep,
+                guestBudgetMs: this.options.guestBudgetMs
             });
 
             // Set up worker message handlers

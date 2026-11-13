@@ -45,6 +45,7 @@ import {
     scriptList,
     scriptPath
 } from '../../../../../npm/scripts';
+import { runConfigCommand } from '../../../../../npm/config';
 import { nodeSyncRunner, syncRunActive } from '../../pump';
 import type { SyncChildResult } from '../../pump';
 import type { MaybeAsync } from './dispatch';
@@ -3027,6 +3028,12 @@ function npmCommand(shell: SyncShell, args: string[]): ShellStep {
     const [sub, ...rest] = args;
     if (sub === '-v' || sub === '--version' || sub === 'version') {
         return { stdout: NPM_VERSION + '\n', stderr: '', exitCode: 0 };
+    }
+    /* `npm config get registry` is what Next.js asks for with execSync before it downloads its
+       WASM SWC fallback. It reads a setting, never the network, so the synchronous shell can
+       answer it with the same config the asynchronous npm process reads. */
+    if (sub === 'config') {
+        return runConfigCommand(shell.ctx.fileSystem, shell.cwd, shell.env, rest);
     }
     if (sub !== undefined && REMOVE_SUBCOMMANDS.has(sub)) return npmRemove(shell, args);
     if (sub !== undefined && INSTALL_SUBCOMMANDS.has(sub)) {

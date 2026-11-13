@@ -36,6 +36,7 @@ export type ProcessErrorPayload = {
 export interface WorkerInitOptions {
     debug?: boolean;
     memoryLimit?: number;
+    guestBudgetMs?: number;
 }
 export interface HttpRequestPayload {
     id: string;

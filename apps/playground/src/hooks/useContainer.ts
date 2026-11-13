@@ -20,7 +20,12 @@ export function useContainer() {
 
     useEffect(() => {
         if (!pageContainer) {
+            /* A long host-side WebAssembly compile (Next's SWC fallback) is one uninterrupted
+               stretch to the guest VM guard; ?budget=<ms> lets a heavy command finish without
+               making the default runaway bound longer for everyone. */
+            const budget = Number(new URLSearchParams(window.location.search).get('budget'));
             pageContainer = new ContainerManager({
+                guestBudgetMs: budget > 0 ? budget : undefined,
                 onServerListen: (port) => {
                     console.log('Server listening on port', port);
                     setServers((listening) => Array.from(new Set([...listening, port])));
