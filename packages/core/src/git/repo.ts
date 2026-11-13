@@ -63,6 +63,11 @@ export class GitRepo {
     readonly refs: GitRefs;
     readonly env: Record<string, string>;
     readonly input: string | null;
+    /* `ignored()` is called once per worktree file by `git add -A` and `git status`. Each call
+       used to re-read the same .gitignore and info/exclude files for every ancestor of every
+       path, which turned a 361-package scaffold into minutes of synchronous file reads. The
+       contents do not change within one command, so cache them per repo instance. */
+    private ignoreSources = new Map<string, string | undefined>();
 
     constructor(ctx: CommandContext, root: string, gitDir: string) {
         this.ctx = ctx; this.fs = ctx.fs; this.root = root; this.gitDir = gitDir;
@@ -370,17 +375,29 @@ export class GitRepo {
         }
         let ignored = false;
         for (let s = 0; s < sources.length; s++) {
-            const content = this.readText(sources[s]);
+            const source = sources[s];
+            let content: string | undefined;
+            if (this.ignoreSources.has(source)) content = this.ignoreSources.get(source);
+            else { content = this.readText(source); this.ignoreSources.set(source, content); }
             if (content === undefined) continue;
             const sub = s === 0 ? rel : parts.slice(s - 1).join('/');
             for (const raw of content.split('\n')) {
                 const line = raw.trim();
                 if (line === '' || line.startsWith('#')) continue;
                 const negated = line.startsWith('!');
-                const pattern = negated ? line.slice(1) : line;
+                let pattern = negated ? line.slice(1) : line;
+                /* A leading '/' anchors the pattern to the directory of the ignore file that named
+                   it: '/node_modules' and '/.next/' are exactly how create-next-app writes its
+                   .gitignore. Without this the whole installed dependency tree was staged (and
+                   hashed blob by blob), which kept `git add -A` running for minutes. */
+                const anchored = pattern.startsWith('/');
+                if (anchored) pattern = pattern.slice(1);
+                if (pattern === '') continue;
                 const match = pattern.endsWith('/')
                     ? (sub === pattern.slice(0, -1) || sub.startsWith(pattern))
-                    : (sub === pattern || sub.endsWith('/' + pattern) || sub.split('/').includes(pattern));
+                    : anchored
+                        ? (sub === pattern || sub.startsWith(pattern + '/'))
+                        : (sub === pattern || sub.endsWith('/' + pattern) || sub.split('/').includes(pattern));
                 if (match) ignored = !negated;
             }
         }
