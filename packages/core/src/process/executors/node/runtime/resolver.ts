@@ -64,6 +64,13 @@ function withoutLiterals(source: string): string {
     const interpolations: number[] = [];
     let depth = 0;
     let state: 'code' | 'line' | 'block' | 'single' | 'double' | 'template' | 'regex' = 'code';
+    /* A '/' inside a regex character class is a literal slash, not the end of the regex: closing
+       the regex there leaves every quote after it read as code, so a string later in the file can
+       hand its own text to the ESM detector. Next's compiled @vercel/nft bundle has such a class
+       (a glob pattern with escaped slashes) and an "import.meta" object key just after it; without
+       this, require() of that CommonJS bundle was routed to the ESM loader and failed to parse. */
+    let inClass = false;
+    let classFirst = false;
     let preceding = '';
     let i = 0;
     const blank = (ch: string): string => (ch === '\n' ? ch : ' ');
@@ -82,7 +89,7 @@ function withoutLiterals(source: string): string {
                 i += 1;
                 continue;
             }
-            if (ch === '/' && regexCanFollow(preceding)) { state = 'regex'; out.push(' '); i += 1; continue; }
+            if (ch === '/' && regexCanFollow(preceding)) { state = 'regex'; inClass = false; classFirst = false; out.push(' '); i += 1; continue; }
             if (ch === '{') depth += 1;
             else if (ch === '}' && interpolations.length > 0 && depth === 0) {
                 depth = interpolations.pop() ?? 0;
@@ -125,6 +132,19 @@ function withoutLiterals(source: string): string {
         }
         // single, double and regex: a backslash escapes the next character; the closer ends it
         if (ch === '\\') { out.push(' ', next === undefined ? '' : ' '); i += 2; continue; }
+        if (state === 'regex') {
+            /* Inside [ ... ] a ']' is the closer unless it is the first character (or the first
+               after '^'), and a '/' is an ordinary character. Track that here so the regex ends at
+               its real closing slash rather than at one the class matches. */
+            if (!inClass && ch === '[') { inClass = true; classFirst = true; out.push(blank(ch)); i += 1; continue; }
+            if (inClass) {
+                if (ch === ']' && !classFirst) inClass = false;
+                classFirst = false;
+                out.push(blank(ch));
+                i += 1;
+                continue;
+            }
+        }
         const closer = state === 'single' ? "'" : state === 'double' ? '"' : '/';
         if (ch === closer || (state === 'regex' && ch === '\n')) {
             state = 'code';

@@ -210,11 +210,21 @@ BF.buffer = function () {
     return wrapBytes(Uint8Array.prototype.subarray.call(this, start, end));
   };
   Buffer.prototype.subarray = Buffer.prototype.slice;
-  Buffer.prototype.write = function (string, offset, encoding) {
+  Buffer.prototype.write = function (string, offset, length, encoding) {
+    /* Node's signature is write(string[, offset[, length]][, encoding]). A 3-arg call with a string
+       in the third slot is the encoding; a 4-arg call has length in the third slot. Next's trace
+       reporter calls write(str, offset, capacity, 'utf8'). Treating that number as an encoding used
+       to throw "Unknown encoding: 16382". Respect the length cap, which is what Node does: a
+       truncated write returns the byte count actually written. */
     var start = typeof offset === 'number' ? offset : 0;
-    var bytes = encodeString(string, encoding || 'utf8');
+    var cap = this.length - start;
+    var enc = encoding;
+    if (typeof length === 'string') { enc = length; length = undefined; }
+    if (typeof offset === 'string') { enc = offset; start = 0; cap = this.length; }
+    var limit = typeof length === 'number' ? Math.max(0, Math.min(length, cap)) : cap;
+    var bytes = encodeString(string, enc || 'utf8');
     var written = 0;
-    for (var i = 0; i < bytes.length && start + i < this.length; i++) {
+    for (var i = 0; i < bytes.length && i < limit; i++) {
       this[start + i] = bytes[i];
       written++;
     }

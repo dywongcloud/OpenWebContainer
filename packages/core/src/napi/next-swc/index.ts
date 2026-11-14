@@ -13,7 +13,15 @@
  *     types are erased, type-only imports dropped, value imports become require(), and `export
  *     default` becomes `exports.default` with the `__esModule` marker Next's interopDefault() reads.
  *
- * Everything outside that bounded grammar throws a named ERR_OWC_SWC_NATIVE_UNAVAILABLE. Nothing
+ * The lockfile methods are also real: one container is one guest process, so an in-memory table of
+ * held paths plus a file written through the virtual filesystem is an honest advisory lock. Next
+ * reads that file back for a stale `next dev` server, so the content is written, not discarded.
+ *
+ * getTargetTriple() reports the platform the container presents to npm: it installs
+ * @next/swc-linux-x64-gnu, and webpack uses the triple only as a `swc/target/<triple>` define.
+ * No compilation is implied by it.
+ *
+ * Everything else outside that bounded grammar throws a named ERR_OWC_SWC_NATIVE_UNAVAILABLE. Nothing
  * here reports a success it did not produce: `next dev`/`next build` (Turbopack, JSX/TSX, SWC
  * transforms of application code) fail loudly rather than returning empty or unchanged code.
  */
@@ -122,9 +130,57 @@ function transformResult(source: unknown, optionsBuffer: unknown): { code: strin
     return { code: transpileConfig(source, optionsBuffer) };
 }
 
-export function createAddon(): object {
+/**
+ * `lockfile.js` asks for a handle it later hands to lockfileUnlock*, and `readLockfileContent()`
+ * reads the path directly for a stale `next dev` server. Holding the path in a table gives that
+ * handle a meaning without pretending an OS-level flock exists: the container has one guest
+ * process per build and no second process can race it for the same directory.
+ */
+interface LockHost {
+    fs?: {
+        write(path: string, bytes: Uint8Array): void;
+        unlink(path: string): void;
+    };
+}
+
+function lockfileBindings(host: LockHost | undefined) {
+    const held = new Set<string>();
+    function acquire(path: string, content: unknown): { path: string } | null {
+        const key = String(path);
+        if (held.has(key)) return null;
+        held.add(key);
+        if (content !== undefined && host && host.fs) {
+            const bytes = typeof content === 'string'
+                ? new TextEncoder().encode(content)
+                : content instanceof Uint8Array ? content : undefined;
+            if (bytes) {
+                try { host.fs.write(key, bytes); } catch { /* best effort, as on native */ }
+            }
+        }
+        return { path: key };
+    }
+    function release(lockfile: unknown): void {
+        const key = lockfile && typeof (lockfile as { path?: unknown }).path === 'string'
+            ? (lockfile as { path: string }).path : String(lockfile);
+        held.delete(key);
+        if (host && host.fs) {
+            try { host.fs.unlink(key); } catch { /* best effort */ }
+        }
+    }
+    return {
+        lockfileTryAcquireSync: (path: string, content: unknown) => acquire(path, content),
+        lockfileTryAcquire: async (path: string, content: unknown) => acquire(path, content),
+        lockfileUnlockSync: (lockfile: unknown) => { release(lockfile); },
+        lockfileUnlock: async (lockfile: unknown) => { release(lockfile); }
+    };
+}
+
+export function createAddon(host?: LockHost): object {
     const addon: Record<string, unknown> = {};
     for (const name of ENTRY_POINTS) addon[name] = refuse(name);
+    Object.assign(addon, lockfileBindings(host));
+    addon.getTargetTriple = function () { return 'x86_64-unknown-linux-gnu'; };
+    addon.turbopackCacheVersion = function () { return '0.0.0-owc'; };
     /* SWC's binding takes (source, isModule, optionsBuffer): next/dist/build/swc/index.js calls
        bindings.transform(src, isModule, toBuffer(options)) and awaits { code }. */
     addon.transform = async function (source: unknown, _isModule: unknown, optionsBuffer: unknown) {

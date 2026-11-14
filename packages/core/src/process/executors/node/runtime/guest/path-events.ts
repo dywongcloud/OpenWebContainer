@@ -1043,14 +1043,29 @@ BF.events = function () {
       if (emitter === null || emitter === undefined) {
         throw new TypeError("Cannot read properties of " + String(emitter) + " (reading 'on')");
       }
-      if (typeof emitter.on !== 'function') {
+      /* Node's eventTargetAgnosticAddListener/RemoveListener: an EventTarget (AbortSignal,
+         AbortController) has addEventListener/removeEventListener, not on/once/removeListener.
+         next build awaits events.once(controller.signal, 'abort'), so an EventTarget emitter must
+         be accepted here, with its 'error' listener skipped the way Node does: EventTargets have no
+         'error' event semantics. */
+      var eventTarget = typeof emitter.on !== 'function' && typeof emitter.addEventListener === 'function' &&
+        typeof emitter.removeEventListener === 'function';
+      if (!eventTarget && typeof emitter.on !== 'function') {
         reject(invalidArgType('emitter', 'EventEmitter', emitter));
         return;
       }
-      if (typeof emitter.once !== 'function') throw new TypeError('emitter.once is not a function');
+      if (!eventTarget && typeof emitter.once !== 'function') throw new TypeError('emitter.once is not a function');
       if (signal !== undefined && signal !== null && signal.aborted) {
         reject(abortErrorFor(signal));
         return;
+      }
+      function addOnce(target, event, listener) {
+        if (typeof target.once === 'function') target.once(event, listener);
+        else target.addEventListener(event, listener, { once: true });
+      }
+      function removeOnce(target, event, listener) {
+        if (typeof target.removeListener === 'function') target.removeListener(event, listener);
+        else if (typeof target.removeEventListener === 'function') target.removeEventListener(event, listener);
       }
       var onAbort = undefined;
       function detach() {
@@ -1058,24 +1073,24 @@ BF.events = function () {
       }
       var onEvent = function () {
         detach();
-        if (name !== 'error') emitter.removeListener('error', onError);
+        if (name !== 'error' && typeof emitter.once === 'function') removeOnce(emitter, 'error', onError);
         resolve(Array.prototype.slice.call(arguments));
       };
       var onError = function (err) {
         detach();
-        emitter.removeListener(name, onEvent);
+        removeOnce(emitter, name, onEvent);
         reject(err);
       };
       if (signal !== undefined && signal !== null) {
         onAbort = function () {
-          emitter.removeListener(name, onEvent);
-          if (name !== 'error') emitter.removeListener('error', onError);
+          removeOnce(emitter, name, onEvent);
+          if (name !== 'error' && typeof emitter.once === 'function') removeOnce(emitter, 'error', onError);
           reject(abortErrorFor(signal));
         };
         signal.addEventListener('abort', onAbort);
       }
-      emitter.once(name, onEvent);
-      if (name !== 'error') emitter.once('error', onError);
+      addOnce(emitter, name, onEvent);
+      if (name !== 'error' && typeof emitter.once === 'function') addOnce(emitter, 'error', onError);
     });
   };
   /*

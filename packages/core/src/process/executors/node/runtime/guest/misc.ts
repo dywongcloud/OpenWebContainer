@@ -3894,6 +3894,94 @@ BF.crypto = function () {
     });
   }
 
+  /* An AES-GCM CryptoKey carries secret bytes, an algorithm name and a usage list, the three
+     things WebCrypto's encrypt/decrypt check before they do any work. The cipher itself is the
+     same host-backed aes-*-gcm that createCipheriv uses, so a key made here and one imported from
+     raw bytes seal and open the same ciphertext as host Node's subtle crypto does. */
+  function aesGcmKey(key, usage, name) {
+    var state = cryptoKeyState(key);
+    if (state === undefined) throw invalidArgType(name, 'an instance of CryptoKey', key);
+    if (state.type !== 'secret' || String(state.algorithm && state.algorithm.name).toUpperCase() !== 'AES-GCM') {
+      throw notSupported('Algorithm mismatch');
+    }
+    if (state.usages.indexOf(usage) < 0) {
+      var denied = new Error('Key does not support the ' + usage + ' operation');
+      denied.name = 'InvalidAccessError';
+      throw denied;
+    }
+    return state;
+  }
+
+  function aesGcmParameters(algorithm, keyLength) {
+    var bits = keyLength * 8;
+    if (bits !== 128 && bits !== 192 && bits !== 256) throw notSupported('Invalid AES key length');
+    if (algorithm === null || typeof algorithm !== 'object') {
+      throw invalidArgType('algorithm', 'an object with an iv', algorithm);
+    }
+    var iv = Buf.from(bufferSourceBytes(algorithm.iv, 'algorithm.iv'));
+    if (iv.length === 0) throw notSupported('AES-GCM requires a non-empty iv');
+    var tagBits = algorithm.tagLength === undefined ? 128 : Number(algorithm.tagLength);
+    /* Node's authTagLength is bytes, WebCrypto's tagLength is bits, and the tag is appended to
+       the ciphertext: a caller that asks for a shorter tag gets exactly that many bytes back. */
+    if (!(tagBits >= 32 && tagBits <= 128) || tagBits % 8 !== 0) throw notSupported('Invalid tagLength');
+    var aad = algorithm.additionalData === undefined || algorithm.additionalData === null
+      ? undefined : Buf.from(bufferSourceBytes(algorithm.additionalData, 'algorithm.additionalData'));
+    return { cipherName: 'aes-' + bits + '-gcm', iv: iv, tagLength: tagBits / 8, aad: aad };
+  }
+
+  function aesGcmCrypt(usage, algorithm, key, data) {
+    var state = aesGcmKey(key, usage, 'key');
+    var params = aesGcmParameters(algorithm, state.bytes.length);
+    var bytes = Buf.from(bufferSourceBytes(data, 'data'));
+    if (usage === 'encrypt') {
+      var cipher = createCipher('encrypt')(params.cipherName, state.bytes, params.iv,
+        { authTagLength: params.tagLength });
+      if (params.aad !== undefined) cipher.setAAD(params.aad);
+      var body = Buf.concat([Buf.from(cipher.update(bytes)), Buf.from(cipher.final())]);
+      var tag = Buf.from(cipher.getAuthTag());
+      return arrayBufferOf(Buf.concat([body, tag]));
+    }
+    if (bytes.length < params.tagLength) throw notSupported('Data is too short to contain an authentication tag');
+    var sealed = bytes.subarray(0, bytes.length - params.tagLength);
+    var givenTag = bytes.subarray(bytes.length - params.tagLength);
+    var decipher = createCipher('decrypt')(params.cipherName, state.bytes, params.iv,
+      { authTagLength: params.tagLength });
+    decipher.setAuthTag(givenTag);
+    if (params.aad !== undefined) decipher.setAAD(params.aad);
+    var plain = Buf.concat([Buf.from(decipher.update(sealed)), Buf.from(decipher.final())]);
+    return arrayBufferOf(plain);
+  }
+
+  function secretKeyFrom(format, keyData, algorithm, extractable, usages) {
+    if (format !== 'raw') throw notSupported('Unable to import key: format ' + format + ' is not supported');
+    var bytes = Buf.from(bufferSourceBytes(keyData, 'keyData'));
+    var name = String(algorithmName(algorithm)).toUpperCase();
+    var upper = String(algorithmName(algorithm)).toUpperCase();
+    if (name === 'HMAC') {
+      var hash = digestOf(algorithm.hash).name;
+      var key = Object.create(CryptoKey.prototype);
+      KEY_STATE.set(key, {
+        kind: 'crypto-key', type: 'secret', bytes: bytes, extractable: extractable === true,
+        algorithm: { name: 'HMAC', length: bytes.length * 8, hash: { name: hash } },
+        usages: Array.prototype.slice.call(usages)
+      });
+      return key;
+    }
+    if (name !== 'AES-GCM' && name !== 'AES-CBC' && name !== 'AES-CTR' && name !== 'AES-KW') {
+      throw notSupported('Unrecognized algorithm name: ' + upper);
+    }
+    if (bytes.length !== 16 && bytes.length !== 24 && bytes.length !== 32) {
+      throw notSupported('Invalid AES key length');
+    }
+    var aesKey = Object.create(CryptoKey.prototype);
+    KEY_STATE.set(aesKey, {
+      kind: 'crypto-key', type: 'secret', bytes: bytes, extractable: extractable === true,
+      algorithm: { name: name, length: bytes.length * 8 },
+      usages: Array.prototype.slice.call(usages)
+    });
+    return aesKey;
+  }
+
   var subtle = {
     digest: function (algorithm, data) {
       return settled(function () {
@@ -3905,24 +3993,48 @@ BF.crypto = function () {
       });
     },
     importKey: function (format, keyData, algorithm, extractable, usages) {
+      return settled(function () { return secretKeyFrom(format, keyData, algorithm, extractable, usages); });
+    },
+    exportKey: function (format, key) {
       return settled(function () {
-        if (format !== 'raw') throw notSupported('Unable to import key: format ' + format + ' is not supported');
-        if (String(algorithmName(algorithm)).toUpperCase() !== 'HMAC') {
-          throw notSupported('Unrecognized algorithm name: ' + String(algorithmName(algorithm)).toUpperCase());
+        if (format !== 'raw') throw notSupported('Unable to export key: format ' + format + ' is not supported');
+        var state = cryptoKeyState(key);
+        if (state === undefined) throw invalidArgType('key', 'an instance of CryptoKey', key);
+        if (!state.extractable) {
+          var denied = new Error('key is not extractable');
+          denied.name = 'InvalidAccessError';
+          throw denied;
         }
-        var hashName = digestOf(algorithm.hash).name;
-        var bytes = Buf.from(bufferSourceBytes(keyData, 'keyData'));
-        var key = Object.create(CryptoKey.prototype);
-        KEY_STATE.set(key, {
-          kind: 'crypto-key',
-          type: 'secret',
-          bytes: bytes,
-          extractable: extractable === true,
-          algorithm: { name: 'HMAC', length: bytes.length * 8, hash: { name: hashName } },
-          usages: Array.prototype.slice.call(usages)
-        });
-        return key;
+        if (state.type !== 'secret') throw notSupported('Unable to export a non-secret key as raw');
+        return arrayBufferOf(state.bytes);
       });
+    },
+    generateKey: function (algorithm, extractable, usages) {
+      return settled(function () {
+        var name = String(algorithmName(algorithm)).toUpperCase();
+        var list = Array.prototype.slice.call(usages || []);
+        var secretUsages = ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'];
+        for (var i = 0; i < list.length; i++) {
+          if (secretUsages.indexOf(list[i]) < 0) {
+            var bad = new Error('Unsupported key usage: ' + list[i]);
+            bad.name = 'SyntaxError';
+            throw bad;
+          }
+        }
+        if (name === 'AES-GCM' || name === 'AES-CBC' || name === 'AES-CTR' || name === 'AES-KW') {
+          var bits = Number(algorithm && algorithm.length);
+          if (bits !== 128 && bits !== 192 && bits !== 256) throw notSupported('Invalid AES key length');
+          return secretKeyFrom('raw', randomBytes(bits / 8), { name: name }, extractable, list);
+        }
+        if (name === 'HMAC') return secretKeyFrom('raw', randomBytes(32), algorithm, extractable, list);
+        throw notSupported('Unrecognized algorithm name: ' + name);
+      });
+    },
+    encrypt: function (algorithm, key, data) {
+      return settled(function () { return aesGcmCrypt('encrypt', algorithm, key, data); });
+    },
+    decrypt: function (algorithm, key, data) {
+      return settled(function () { return aesGcmCrypt('decrypt', algorithm, key, data); });
     },
     sign: function (algorithm, key, data) {
       return settled(function () {
