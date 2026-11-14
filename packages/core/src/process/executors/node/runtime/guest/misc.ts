@@ -3859,6 +3859,86 @@ BF.crypto = function () {
     return new Promise(function (resolve) { resolve(work()); });
   }
 
+  function domError(name, message, code) {
+    var Ctor = typeof globalThis.DOMException === 'function' ? globalThis.DOMException : null;
+    var err = Ctor ? new Ctor(message, name) : new Error(message);
+    if (!Ctor) err.name = name;
+    if (code !== undefined && err.code !== code) {
+      try { Object.defineProperty(err, 'code', { value: code, configurable: true, enumerable: true, writable: true }); } catch (ignored) {}
+    }
+    return err;
+  }
+
+  function normTypeError(code, message) {
+    var err = new TypeError(message);
+    err.code = code;
+    return err;
+  }
+
+  /* WebIDL: an Algorithm is a dictionary with a required 'name'. A value that is not a dictionary
+     at all, or whose name is not a string, is an unrecognized algorithm; a dictionary with no
+     name is the ERR_MISSING_OPTION that names the field. */
+  function algorithmDict(algorithm) {
+    if (typeof algorithm === 'string') return { name: algorithm, raw: {} };
+    if (algorithm === null || typeof algorithm !== 'object') {
+      throw domError('NotSupportedError', 'Unrecognized algorithm name', 9);
+    }
+    if (algorithm.name === undefined) {
+      throw normTypeError('ERR_MISSING_OPTION',
+        "Failed to normalize algorithm: passed algorithm can not be converted to 'Algorithm' because 'name' is required in 'Algorithm'.");
+    }
+    if (typeof algorithm.name !== 'string') {
+      throw domError('NotSupportedError', 'Unrecognized algorithm name', 9);
+    }
+    return { name: algorithm.name, raw: algorithm };
+  }
+
+  function cryptoKeyArg(value, method, position) {
+    return normTypeError('ERR_INVALID_ARG_TYPE',
+      "Failed to execute '" + method + "' on 'SubtleCrypto': " + position + ' argument is not of type CryptoKey.');
+  }
+
+  function bufferSourceArg(value, method, position) {
+    return normTypeError('ERR_INVALID_ARG_TYPE',
+      "Failed to execute '" + method + "' on 'SubtleCrypto': " + position +
+      ' argument is not instance of ArrayBuffer, Buffer, TypedArray, or DataView.');
+  }
+
+  function aeadIvArg(value) {
+    return normTypeError('ERR_INVALID_ARG_TYPE',
+      "Failed to normalize algorithm: 'iv' of 'AeadParams' (passed algorithm) is not instance of ArrayBuffer, Buffer, TypedArray, or DataView.");
+  }
+
+  /* sequence<KeyUsage>: an iterable is read, a string or a plain array-like object is not. The
+     list is deduplicated in order and every member must be legal for the algorithm. */
+  function usageSequence(value, method, position) {
+    if (value === undefined || value === null || typeof value === 'string' || typeof value !== 'object') {
+      throw normTypeError('ERR_INVALID_ARG_TYPE',
+        "Failed to execute '" + method + "' on 'SubtleCrypto': " + position + ' argument can not be converted to sequence.');
+    }
+    if (Array.isArray(value)) return value.slice();
+    if (typeof Symbol === 'function' && Symbol.iterator && typeof value[Symbol.iterator] === 'function') {
+      var out = [];
+      var it = value[Symbol.iterator]();
+      for (var step = it.next(); !step.done; step = it.next()) out.push(step.value);
+      return out;
+    }
+    throw normTypeError('ERR_INVALID_ARG_TYPE',
+      "Failed to execute '" + method + "' on 'SubtleCrypto': " + position + ' argument can not be converted to sequence.');
+  }
+
+  var AES_USAGES = ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'];
+  var HMAC_USAGES = ['sign', 'verify'];
+  function validUsages(list, allowed, kind, emptyMessage, dedupe) {
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      if (allowed.indexOf(list[i]) < 0) throw domError('SyntaxError', 'Unsupported key usage for ' + kind + ' key', 12);
+      if (!dedupe || out.indexOf(list[i]) < 0) out.push(list[i]);
+    }
+    if (out.length === 0) throw domError('SyntaxError', emptyMessage, 12);
+    return out;
+  }
+
   function CryptoKey() {
     throw new TypeError('Illegal constructor');
   }
@@ -3867,119 +3947,206 @@ BF.crypto = function () {
     return keyStateOf(key, 'crypto-key');
   }
 
+  /* The exposed algorithm and usages are mutable objects, as on host Node, but authorization
+     reads a separate frozen copy. Mutating key.usages must never grant a usage: that was an
+     escalation from a decrypt-only key to an encrypting one. Object identity of the exposed
+     values is stable across reads, which is what a caller sees on the host too. */
   Object.defineProperties(CryptoKey.prototype, {
     type: { get: function () { return cryptoKeyState(this).type; } },
     extractable: { get: function () { return cryptoKeyState(this).extractable; } },
     algorithm: { get: function () { return cryptoKeyState(this).algorithm; } },
     usages: { get: function () { return cryptoKeyState(this).usages; } }
   });
+  if (typeof Symbol === 'function' && Symbol.toStringTag !== undefined) {
+    Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, { value: 'CryptoKey', configurable: true });
+  }
+
+  function makeSecretKey(bytes, name, lengthBits, hashName, extractable, usages) {
+    var key = Object.create(CryptoKey.prototype);
+    var algorithm = name === 'HMAC'
+      ? { name: 'HMAC', length: lengthBits, hash: { name: hashName } }
+      : { name: name, length: lengthBits };
+    KEY_STATE.set(key, {
+      kind: 'crypto-key', type: 'secret', bytes: bytes, extractable: !!extractable,
+      algorithm: algorithm, usages: usages.slice(),
+      authName: name, authUsages: usages.slice(), authHash: hashName
+    });
+    return key;
+  }
 
   function hmacKeyFor(algorithm, key, usage) {
     var state = cryptoKeyState(key);
     if (state === undefined) throw invalidArgType('key', 'an instance of CryptoKey', key);
-    if (String(algorithmName(algorithm)).toUpperCase() !== state.algorithm.name) throw notSupported('Algorithm mismatch');
-    if (state.usages.indexOf(usage) < 0) {
-      var denied = new Error('Key does not support the ' + usage + ' operation');
-      denied.name = 'InvalidAccessError';
-      throw denied;
+    if (state.authName !== 'HMAC') throw domError('InvalidAccessError', 'The requested operation is not valid for the provided key', 15);
+    if (state.authUsages.indexOf(usage) < 0) {
+      throw domError('InvalidAccessError', 'The requested operation is not valid for the provided key', 15);
     }
     return state;
   }
 
   function hmacDigest(state, bytes) {
     return cryptoOp('crypto.hmac', {
-      algorithm: digestOf(state.algorithm.hash).digest,
+      algorithm: digestOf(state.authHash).digest,
       key: state.bytes.toString('base64'),
       data: bytes.toString('base64')
     });
   }
 
-  /* An AES-GCM CryptoKey carries secret bytes, an algorithm name and a usage list, the three
-     things WebCrypto's encrypt/decrypt check before they do any work. The cipher itself is the
-     same host-backed aes-*-gcm that createCipheriv uses, so a key made here and one imported from
-     raw bytes seal and open the same ciphertext as host Node's subtle crypto does. */
-  function aesGcmKey(key, usage, name) {
+  /* An AES-GCM CryptoKey carries secret bytes, an algorithm name and a usage list. The cipher
+     itself is the same host-backed aes-*-gcm that createCipheriv uses, so a key made here and
+     one imported from raw bytes seal and open the same ciphertext as host Node's subtle crypto. */
+  function aesGcmKey(key, usage) {
     var state = cryptoKeyState(key);
-    if (state === undefined) throw invalidArgType(name, 'an instance of CryptoKey', key);
-    if (state.type !== 'secret' || String(state.algorithm && state.algorithm.name).toUpperCase() !== 'AES-GCM') {
-      throw notSupported('Algorithm mismatch');
-    }
-    if (state.usages.indexOf(usage) < 0) {
-      var denied = new Error('Key does not support the ' + usage + ' operation');
-      denied.name = 'InvalidAccessError';
-      throw denied;
+    if (state === undefined) throw cryptoKeyArg(key, usage === 'encrypt' ? 'encrypt' : 'decrypt', '2nd');
+    if (state.type !== 'secret' || state.authName !== 'AES-GCM' || state.authUsages.indexOf(usage) < 0) {
+      throw domError('InvalidAccessError', 'The requested operation is not valid for the provided key', 15);
     }
     return state;
   }
 
-  function aesGcmParameters(algorithm, keyLength) {
-    var bits = keyLength * 8;
-    if (bits !== 128 && bits !== 192 && bits !== 256) throw notSupported('Invalid AES key length');
-    if (algorithm === null || typeof algorithm !== 'object') {
-      throw invalidArgType('algorithm', 'an object with an iv', algorithm);
+  function tagLengthOf(algorithm) {
+    if (algorithm.tagLength === undefined) return 128;
+    var bits = Number(algorithm.tagLength);
+    if (!isFinite(bits)) {
+      throw normTypeError('ERR_INVALID_ARG_TYPE',
+        "Failed to normalize algorithm: 'tagLength' of 'AeadParams' (passed algorithm) is not a finite number.");
     }
-    var iv = Buf.from(bufferSourceBytes(algorithm.iv, 'algorithm.iv'));
-    if (iv.length === 0) throw notSupported('AES-GCM requires a non-empty iv');
-    var tagBits = algorithm.tagLength === undefined ? 128 : Number(algorithm.tagLength);
+    bits = Math.floor(bits);
+    if (bits < 0 || bits > 255) {
+      throw normTypeError('ERR_OUT_OF_RANGE',
+        "Failed to normalize algorithm: 'tagLength' of 'AeadParams' (passed algorithm) is outside the expected range of 0 to 255.");
+    }
+    /* Only these seven widths are legal for AES-GCM; every other value is an OperationError
+       naming the value. Accepting 40 or 48 here used to produce ciphertext host Node refuses. */
+    if ([32, 64, 96, 104, 112, 120, 128].indexOf(bits) < 0) {
+      throw domError('OperationError', bits + ' is not a valid AES-GCM tag length', 0);
+    }
+    return bits;
+  }
+
+  function aesGcmParameters(algorithm, keyLength) {
+    var dict = algorithmDict(algorithm);
+    var name = String(dict.name).toUpperCase();
+    if (name !== 'AES-GCM') {
+      if (name === 'AES-CBC' || name === 'AES-CTR' || name === 'AES-KW') {
+        throw domError('NotSupportedError', 'Unrecognized algorithm name', 9);
+      }
+      throw domError('NotSupportedError', 'Unrecognized algorithm name', 9);
+    }
+    var raw = dict.raw;
+    if (raw.iv === undefined) {
+      throw normTypeError('ERR_MISSING_OPTION',
+        "Failed to normalize algorithm: passed algorithm can not be converted to 'AeadParams' because 'iv' is required in 'AeadParams'.");
+    }
+    if (!(raw.iv instanceof ArrayBuffer || ArrayBuffer.isView(raw.iv))) throw aeadIvArg(raw.iv);
+    var iv = Buf.from(bufferSourceBytes(raw.iv, 'algorithm.iv'));
+    /* Node's WebCrypto requires at least 12 bytes of IV; a shorter one is an OperationError,
+       not an error from the cipher. Letting the host cipher accept 8..11 bytes produced
+       ciphertext that host Node could not decrypt. */
+    if (iv.length < 12) throw domError('OperationError', 'The operation failed for an operation-specific reason', 0);
+    var tagBits = tagLengthOf(raw);
+    var aad;
+    if (raw.additionalData !== undefined) {
+      if (raw.additionalData === null || typeof raw.additionalData === 'number'
+          || !(raw.additionalData instanceof ArrayBuffer || ArrayBuffer.isView(raw.additionalData))) {
+        throw normTypeError('ERR_INVALID_ARG_TYPE',
+          "Failed to normalize algorithm: 'additionalData' of 'AeadParams' (passed algorithm) is not instance of ArrayBuffer, Buffer, TypedArray, or DataView.");
+      }
+      aad = Buf.from(bufferSourceBytes(raw.additionalData, 'algorithm.additionalData'));
+    }
+    var bits = keyLength * 8;
+    if (bits !== 128 && bits !== 192 && bits !== 256) {
+      throw domError('OperationError', 'AES key length must be 128, 192, or 256 bits', 0);
+    }
     /* Node's authTagLength is bytes, WebCrypto's tagLength is bits, and the tag is appended to
        the ciphertext: a caller that asks for a shorter tag gets exactly that many bytes back. */
-    if (!(tagBits >= 32 && tagBits <= 128) || tagBits % 8 !== 0) throw notSupported('Invalid tagLength');
-    var aad = algorithm.additionalData === undefined || algorithm.additionalData === null
-      ? undefined : Buf.from(bufferSourceBytes(algorithm.additionalData, 'algorithm.additionalData'));
     return { cipherName: 'aes-' + bits + '-gcm', iv: iv, tagLength: tagBits / 8, aad: aad };
   }
 
   function aesGcmCrypt(usage, algorithm, key, data) {
-    var state = aesGcmKey(key, usage, 'key');
+    var state = aesGcmKey(key, usage);
     var params = aesGcmParameters(algorithm, state.bytes.length);
-    var bytes = Buf.from(bufferSourceBytes(data, 'data'));
-    if (usage === 'encrypt') {
-      var cipher = createCipher('encrypt')(params.cipherName, state.bytes, params.iv,
-        { authTagLength: params.tagLength });
-      if (params.aad !== undefined) cipher.setAAD(params.aad);
-      var body = Buf.concat([Buf.from(cipher.update(bytes)), Buf.from(cipher.final())]);
-      var tag = Buf.from(cipher.getAuthTag());
-      return arrayBufferOf(Buf.concat([body, tag]));
+    if (!(data instanceof ArrayBuffer || ArrayBuffer.isView(data))) {
+      throw bufferSourceArg(data, usage === 'encrypt' ? 'encrypt' : 'decrypt', '3rd');
     }
-    if (bytes.length < params.tagLength) throw notSupported('Data is too short to contain an authentication tag');
-    var sealed = bytes.subarray(0, bytes.length - params.tagLength);
-    var givenTag = bytes.subarray(bytes.length - params.tagLength);
-    var decipher = createCipher('decrypt')(params.cipherName, state.bytes, params.iv,
-      { authTagLength: params.tagLength });
-    decipher.setAuthTag(givenTag);
-    if (params.aad !== undefined) decipher.setAAD(params.aad);
-    var plain = Buf.concat([Buf.from(decipher.update(sealed)), Buf.from(decipher.final())]);
-    return arrayBufferOf(plain);
+    var bytes = Buf.from(bufferSourceBytes(data, 'data'));
+    try {
+      if (usage === 'encrypt') {
+        var cipher = createCipher('encrypt')(params.cipherName, state.bytes, params.iv,
+          { authTagLength: params.tagLength });
+        if (params.aad !== undefined) cipher.setAAD(params.aad);
+        var body = Buf.concat([Buf.from(cipher.update(bytes)), Buf.from(cipher.final())]);
+        var tag = Buf.from(cipher.getAuthTag());
+        return arrayBufferOf(Buf.concat([body, tag]));
+      }
+      if (bytes.length < params.tagLength) {
+        throw domError('OperationError', 'The operation failed for an operation-specific reason', 0);
+      }
+      var sealed = bytes.subarray(0, bytes.length - params.tagLength);
+      var givenTag = bytes.subarray(bytes.length - params.tagLength);
+      var decipher = createCipher('decrypt')(params.cipherName, state.bytes, params.iv,
+        { authTagLength: params.tagLength });
+      decipher.setAuthTag(givenTag);
+      if (params.aad !== undefined) decipher.setAAD(params.aad);
+      var plain = Buf.concat([Buf.from(decipher.update(sealed)), Buf.from(decipher.final())]);
+      return arrayBufferOf(plain);
+    } catch (err) {
+      /* Every authentication failure is an OperationError DOMException. The host cipher raises a
+         plain Error through the capability envelope, so rebuild it here with the class and the
+         message WebCrypto consumers (including Next's Server Actions) branch on. */
+      if (err && err.name === 'OperationError' && typeof globalThis.DOMException === 'function'
+          && err instanceof globalThis.DOMException) throw err;
+      if (err && err.name === 'TypeError') throw err;
+      throw domError('OperationError', 'The operation failed for an operation-specific reason', 0);
+    }
+  }
+
+  function jwkOf(state) {
+    var alg = state.authName === 'AES-GCM' ? 'A' + state.bytes.length * 8 + 'GCM' : null;
+    if (state.authName === 'HMAC') {
+      alg = state.authHash === 'SHA-1' ? 'HS1' : state.authHash === 'SHA-384' ? 'HS384'
+        : state.authHash === 'SHA-512' ? 'HS512' : 'HS256';
+    }
+    return {
+      key_ops: state.authUsages.slice(),
+      ext: !!state.extractable,
+      alg: alg,
+      kty: 'oct',
+      k: state.bytes.toString('base64url')
+    };
   }
 
   function secretKeyFrom(format, keyData, algorithm, extractable, usages) {
-    if (format !== 'raw') throw notSupported('Unable to import key: format ' + format + ' is not supported');
-    var bytes = Buf.from(bufferSourceBytes(keyData, 'keyData'));
-    var name = String(algorithmName(algorithm)).toUpperCase();
-    var upper = String(algorithmName(algorithm)).toUpperCase();
-    if (name === 'HMAC') {
-      var hash = digestOf(algorithm.hash).name;
-      var key = Object.create(CryptoKey.prototype);
-      KEY_STATE.set(key, {
-        kind: 'crypto-key', type: 'secret', bytes: bytes, extractable: extractable === true,
-        algorithm: { name: 'HMAC', length: bytes.length * 8, hash: { name: hash } },
-        usages: Array.prototype.slice.call(usages)
-      });
-      return key;
+    var dict = algorithmDict(algorithm);
+    var name = String(dict.name).toUpperCase();
+    var isHmac = name === 'HMAC';
+    var allowed = isHmac ? HMAC_USAGES : AES_USAGES;
+    var list = validUsages(usageSequence(usages, 'importKey', '5th'), allowed,
+      isHmac ? 'HMAC' : 'an AES', 'Usages cannot be empty when importing a secret key.', false);
+    var bytes;
+    if (format === 'jwk') {
+      if (keyData === null || typeof keyData !== 'object' || keyData.kty !== 'oct' || typeof keyData.k !== 'string') {
+        throw domError('DataError', 'Invalid JWK', 0);
+      }
+      bytes = Buf.from(keyData.k, 'base64url');
+      if (keyData.ext !== undefined) extractable = !!keyData.ext;
+    } else if (format === 'raw') {
+      bytes = Buf.from(bufferSourceBytes(keyData, 'keyData'));
+    } else {
+      throw domError('NotSupportedError', 'Unable to import ' + name + ' using ' + format + ' format', 9);
+    }
+    if (isHmac) {
+      if (bytes.length === 0) throw domError('DataError', 'Zero-length key is not supported', 0);
+      var hash = digestOf(dict.raw.hash).name;
+      return makeSecretKey(bytes, 'HMAC', bytes.length * 8, hash, extractable, list);
     }
     if (name !== 'AES-GCM' && name !== 'AES-CBC' && name !== 'AES-CTR' && name !== 'AES-KW') {
-      throw notSupported('Unrecognized algorithm name: ' + upper);
+      throw domError('NotSupportedError', 'Unrecognized algorithm name', 9);
     }
     if (bytes.length !== 16 && bytes.length !== 24 && bytes.length !== 32) {
-      throw notSupported('Invalid AES key length');
+      throw domError('DataError', 'Invalid key length', 0);
     }
-    var aesKey = Object.create(CryptoKey.prototype);
-    KEY_STATE.set(aesKey, {
-      kind: 'crypto-key', type: 'secret', bytes: bytes, extractable: extractable === true,
-      algorithm: { name: name, length: bytes.length * 8 },
-      usages: Array.prototype.slice.call(usages)
-    });
-    return aesKey;
+    return makeSecretKey(bytes, name, bytes.length * 8, null, extractable, list);
   }
 
   var subtle = {
@@ -3997,37 +4164,49 @@ BF.crypto = function () {
     },
     exportKey: function (format, key) {
       return settled(function () {
-        if (format !== 'raw') throw notSupported('Unable to export key: format ' + format + ' is not supported');
         var state = cryptoKeyState(key);
-        if (state === undefined) throw invalidArgType('key', 'an instance of CryptoKey', key);
+        if (state === undefined) throw cryptoKeyArg(key, 'exportKey', '2nd');
         if (!state.extractable) {
-          var denied = new Error('key is not extractable');
-          denied.name = 'InvalidAccessError';
-          throw denied;
+          /* Node 24.15 names this one InvalidAccessException (a quirk), not InvalidAccessError. */
+          throw domError('InvalidAccessException', 'key is not extractable', 0);
         }
-        if (state.type !== 'secret') throw notSupported('Unable to export a non-secret key as raw');
-        return arrayBufferOf(state.bytes);
+        if (format === 'raw') return arrayBufferOf(state.bytes);
+        if (format === 'jwk') return jwkOf(state);
+        throw domError('NotSupportedError',
+          'Unable to export ' + state.authName + ' secret key using ' + format + ' format', 9);
       });
     },
     generateKey: function (algorithm, extractable, usages) {
       return settled(function () {
-        var name = String(algorithmName(algorithm)).toUpperCase();
-        var list = Array.prototype.slice.call(usages || []);
-        var secretUsages = ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'];
-        for (var i = 0; i < list.length; i++) {
-          if (secretUsages.indexOf(list[i]) < 0) {
-            var bad = new Error('Unsupported key usage: ' + list[i]);
-            bad.name = 'SyntaxError';
-            throw bad;
+        var dict = algorithmDict(algorithm);
+        var name = String(dict.name).toUpperCase();
+        var isHmac = name === 'HMAC';
+        var list = validUsages(usageSequence(usages, 'generateKey', '3rd'),
+          isHmac ? HMAC_USAGES : AES_USAGES, isHmac ? 'HMAC' : 'an AES',
+          'Usages cannot be empty when creating a key.', true);
+        if (isHmac) {
+          var hash = digestOf(dict.raw.hash).name;
+          var hmacBits;
+          if (dict.raw.length === undefined) {
+            hmacBits = hash === 'SHA-1' || hash === 'SHA-256' ? 512 : 1024;
+          } else {
+            hmacBits = Number(dict.raw.length);
           }
+          if (hmacBits === 0) throw domError('OperationError', 'HmacKeyGenParams.length cannot be 0', 0);
+          return makeSecretKey(randomBytes(Math.ceil(hmacBits / 8)), 'HMAC', hmacBits, hash, extractable, list);
         }
-        if (name === 'AES-GCM' || name === 'AES-CBC' || name === 'AES-CTR' || name === 'AES-KW') {
-          var bits = Number(algorithm && algorithm.length);
-          if (bits !== 128 && bits !== 192 && bits !== 256) throw notSupported('Invalid AES key length');
-          return secretKeyFrom('raw', randomBytes(bits / 8), { name: name }, extractable, list);
+        if (name !== 'AES-GCM' && name !== 'AES-CBC' && name !== 'AES-CTR' && name !== 'AES-KW') {
+          throw domError('NotSupportedError', 'Unrecognized algorithm name', 9);
         }
-        if (name === 'HMAC') return secretKeyFrom('raw', randomBytes(32), algorithm, extractable, list);
-        throw notSupported('Unrecognized algorithm name: ' + name);
+        if (dict.raw.length === undefined) {
+          throw normTypeError('ERR_MISSING_OPTION',
+            "Failed to normalize algorithm: passed algorithm can not be converted to 'AesKeyGenParams' because 'length' is required in 'AesKeyGenParams'.");
+        }
+        var bits = Number(dict.raw.length);
+        if (bits !== 128 && bits !== 192 && bits !== 256) {
+          throw domError('OperationError', 'AES key length must be 128, 192, or 256 bits', 0);
+        }
+        return makeSecretKey(randomBytes(bits / 8), name, bits, null, extractable, list);
       });
     },
     encrypt: function (algorithm, key, data) {
@@ -4056,12 +4235,23 @@ BF.crypto = function () {
     }
   };
 
-  var webcrypto = {
-    CryptoKey: CryptoKey,
-    getRandomValues: getRandomValues,
-    randomUUID: randomUUID,
-    subtle: subtle
-  };
+  /* Node's own properties are non-enumerable: Object.keys(webcrypto) and Object.keys(subtle)
+     are both [] on the host, and their methods read as prototype methods. */
+  Object.keys(subtle).forEach(function (method) {
+    Object.defineProperty(subtle, method, { value: subtle[method], writable: true, configurable: true, enumerable: false });
+  });
+  var webcrypto = {};
+  Object.defineProperties(webcrypto, {
+    getRandomValues: { value: getRandomValues, writable: true, configurable: true },
+    randomUUID: { value: randomUUID, writable: true, configurable: true },
+    subtle: { value: subtle, writable: true, configurable: true }
+  });
+  /* Node exposes CryptoKey as a global, not as a member of webcrypto: on the host
+     Object.keys(webcrypto) and webcrypto.CryptoKey are both empty/undefined. globals.ts installs
+     the global from the builtin, so do it here and keep the webcrypto object's own surface clean. */
+  if (typeof globalThis.CryptoKey === 'undefined') {
+    Object.defineProperty(globalThis, 'CryptoKey', { value: CryptoKey, writable: true, configurable: true, enumerable: false });
+  }
 
   /*
    * createCipheriv and createDecipheriv. The cipher itself runs on the host (@noble/ciphers); the
