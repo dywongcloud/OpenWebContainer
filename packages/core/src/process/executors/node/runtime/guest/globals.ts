@@ -180,6 +180,19 @@ var NAPI_PACKAGES = Object.create(null);
  */
 var NAPI_HOST = (function () {
   var path_ = requireBuiltin('path');
+  /* Next's bundled Babel is loaded through the guest loader, not imported by the neutral-platform
+     shim IIFE. This closure runs in the concatenated bootstrap body, where Module and requireFrom
+     from loader.ts are in scope. */
+  var babelBundle = null;
+  var babelCore = null;
+  function loadBabel() {
+    if (babelBundle === null) {
+      var parent = new Module(host.cwd() + '/x', null);
+      babelBundle = requireFrom(parent, 'next/dist/compiled/babel/bundle.js');
+      babelCore = babelBundle.core();
+    }
+    return babelBundle;
+  }
   function rp (p) {
     return path_.resolve(p);
   }
@@ -253,6 +266,62 @@ var NAPI_HOST = (function () {
       spawn: function (file, args, options) {
         return requireBuiltin('child_process').spawn(file, args, options);
       }
+    },
+    /* Babel is the real TypeScript/JSX compiler behind the next-swc shim. It is loaded lazily so a
+       process that never loads the add-on does not pay for Next's bundled Babel bundle. */
+    babel: {
+      transform: function (source, options) {
+        var bundle = loadBabel();
+        var opts = Object.assign({}, options, { cwd: host.cwd() });
+        var result = babelCore.transformSync(String(source), opts);
+        if (!result || typeof result.code !== 'string') {
+          var err = new Error('ERR_OWC_BABEL_NO_CODE: Next bundled Babel returned no code');
+          err.code = 'ERR_OWC_BABEL_NO_CODE';
+          throw err;
+        }
+        return { code: result.code, map: result.map ? JSON.stringify(result.map) : undefined };
+      },
+      exports: function (p) {
+        var raw;
+        try { raw = requireBuiltin('fs').readFileSync(rp(p)); } catch (readError) { return []; }
+        var text = new TextDecoder().decode(new Uint8Array(raw));
+        var ast;
+        try {
+          ast = loadBabel().parser().parse(text, {
+            sourceType: 'unambiguous',
+            errorRecovery: true,
+            plugins: ['typescript', 'jsx', 'dynamicImport', 'importAttributes', 'classProperties', 'objectRestSpread']
+          });
+        } catch (parseError) {
+          /* A file the bundled parser cannot read contributes no trustworthy named exports. */
+          return [];
+        }
+        var body = ast && ast.program && ast.program.body ? ast.program.body : [];
+        var seen = Object.create(null);
+        var names = [];
+        function addName(name) {
+          if (typeof name === 'string' && name !== '' && !seen[name]) { seen[name] = true; names.push(name); }
+        }
+        for (var i = 0; i < body.length; i++) {
+          var node = body[i];
+          if (!node || node.type !== 'ExportNamedDeclaration' || node.exportKind === 'type') continue;
+          var declaration = node.declaration;
+          if (declaration) {
+            if (declaration.id) addName(declaration.id.name || declaration.id.value);
+            var declarations = declaration.declarations || [];
+            for (var j = 0; j < declarations.length; j++) {
+              var id = declarations[j].id;
+              if (id) addName(id.name || id.value);
+            }
+          }
+          var specifiers = node.specifiers || [];
+          for (var k = 0; k < specifiers.length; k++) {
+            var exported = specifiers[k].exported;
+            if (exported) addName(exported.name || exported.value);
+          }
+        }
+        return names;
+      }
     }
   };
 })();
@@ -279,7 +348,9 @@ function loadNapiAddon(name) {
   var st = JSON.parse(raw);
   if (st.type === 'dir') throw dlopenError(name + ': cannot read file data: Is a directory');
   var shim = napiShimOf(file);
-  if (shim !== undefined) return requireBuiltin('owc:internal/napi/' + shim).createAddon(NAPI_HOST);
+  if (shim !== undefined) {
+    return requireBuiltin('owc:internal/napi/' + shim).createAddon(NAPI_HOST);
+  }
   if (st.size < 64) throw dlopenError(name + ': file too short (this container runs no native code: an add-on is served by a JavaScript shim, registered in src/napi/registry.ts, and a placeholder left by the installer is shorter than any real object file)');
   var head = decodeBase64(host.readBase64(file));
   if (head[0] !== 0x7f || head[1] !== 0x45 || head[2] !== 0x4c || head[3] !== 0x46) throw dlopenError(name + ': invalid ELF header');
