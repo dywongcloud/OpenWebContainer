@@ -131,20 +131,27 @@ function withoutLiterals(source: string): string {
             continue;
         }
         // single, double and regex: a backslash escapes the next character; the closer ends it
-        if (ch === '\\') { out.push(' ', next === undefined ? '' : ' '); i += 2; continue; }
         if (state === 'regex') {
             /* Inside [ ... ] a ']' is the closer unless it is the first character (or the first
-               after '^'), and a '/' is an ordinary character. Track that here so the regex ends at
-               its real closing slash rather than at one the class matches. */
+               after '^'), and a '/' is an ordinary character. An escape consumes its two bytes
+               inside the class too, so [\]] closes at the second ']'. Track that here so the regex
+               ends at its real closing slash rather than at one the class matches. */
+            if (ch === '\\') {
+                if (inClass) classFirst = false;
+                out.push(' ', next === undefined ? '' : ' ');
+                i += 2;
+                continue;
+            }
             if (!inClass && ch === '[') { inClass = true; classFirst = true; out.push(blank(ch)); i += 1; continue; }
             if (inClass) {
                 if (ch === ']' && !classFirst) inClass = false;
-                classFirst = false;
+                else if (ch !== '^' || !classFirst) classFirst = false;
                 out.push(blank(ch));
                 i += 1;
                 continue;
             }
         }
+        if (ch === '\\') { out.push(' ', next === undefined ? '' : ' '); i += 2; continue; }
         const closer = state === 'single' ? "'" : state === 'double' ? '"' : '/';
         if (ch === closer || (state === 'regex' && ch === '\n')) {
             state = 'code';
