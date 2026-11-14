@@ -210,21 +210,75 @@ BF.buffer = function () {
     return wrapBytes(Uint8Array.prototype.subarray.call(this, start, end));
   };
   Buffer.prototype.subarray = Buffer.prototype.slice;
+  /* A write() offset or length is validated against the WHOLE buffer, then the length is capped at
+     the bytes remaining. Node words these as ERR_OUT_OF_RANGE for a non-integer and for a value
+     outside 0..bufferLength, and ERR_INVALID_ARG_TYPE for a non-number; the caller sees the same
+     three here. */
+  function writeOffsetOf(value, name, max) {
+    if (typeof value !== 'number') {
+      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The "' + name + '" argument must be of type number. Received ' + describeArg(value));
+    }
+    if (!isFinite(value) || value !== Math.floor(value)) {
+      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "' + name + '" is out of range. It must be an integer. Received ' + receivedOf(value));
+    }
+    if (value < 0 || value > max) {
+      throw bufErr(RangeError, 'ERR_OUT_OF_RANGE',
+        'The value of "' + name + '" is out of range. It must be >= 0 && <= ' + max + '. Received ' + receivedOf(value));
+    }
+  }
+
   Buffer.prototype.write = function (string, offset, length, encoding) {
-    /* Node's signature is write(string[, offset[, length]][, encoding]). A 3-arg call with a string
-       in the third slot is the encoding; a 4-arg call has length in the third slot. Next's trace
-       reporter calls write(str, offset, capacity, 'utf8'). Treating that number as an encoding used
-       to throw "Unknown encoding: 16382". Respect the length cap, which is what Node does: a
-       truncated write returns the byte count actually written. */
-    var start = typeof offset === 'number' ? offset : 0;
-    var cap = this.length - start;
-    var enc = encoding;
-    if (typeof length === 'string') { enc = length; length = undefined; }
-    if (typeof offset === 'string') { enc = offset; start = 0; cap = this.length; }
-    var limit = typeof length === 'number' ? Math.max(0, Math.min(length, cap)) : cap;
-    var bytes = encodeString(string, enc || 'utf8');
+    /* Node's signature is write(string[, offset[, length]][, encoding]). A 3-arg call with a
+       string in the third slot is the encoding; a 4-arg call has length in the third slot. Next's
+       trace reporter calls write(str, offset, capacity, 'utf8'). Treating that number as an
+       encoding used to throw "Unknown encoding: 16382". */
+    var total = this.length;
+    var start, cap, enc;
+    if (offset === undefined) {
+      start = 0; cap = total; enc = 'utf8';
+    } else if (length === undefined && typeof offset === 'string') {
+      start = 0; cap = total; enc = offset;
+    } else {
+      writeOffsetOf(offset, 'offset', total);
+      start = offset;
+      var remaining = total - start;
+      if (length === undefined) { cap = remaining; enc = encoding; }
+      else if (typeof length === 'string') { cap = remaining; enc = length; }
+      else {
+        writeOffsetOf(length, 'length', total);
+        cap = Math.min(length, remaining);
+        enc = encoding;
+      }
+    }
+    if (typeof string !== 'string') {
+      throw bufErr(TypeError, 'ERR_INVALID_ARG_TYPE', 'argument must be a string');
+    }
+    var name = String(enc === undefined || enc === null || enc === '' ? 'utf8' : enc).toLowerCase();
+    var bytes;
+    try {
+      bytes = encodeString(string, name);
+    } catch (bad) {
+      if (String(bad && bad.message).indexOf('Unknown encoding') === 0) bad.code = 'ERR_UNKNOWN_ENCODING';
+      throw bad;
+    }
+    /* utf8Write stops at the last whole character: a multi-byte character that does not fit is
+       not half-written. Every other encoding truncates at a byte boundary. */
     var written = 0;
-    for (var i = 0; i < bytes.length && i < limit; i++) {
+    if (name === 'utf8' || name === 'utf-8') {
+      var at = 0;
+      while (at < bytes.length) {
+        var lead = bytes[at];
+        var width = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+        if (written + width > cap) break;
+        for (var k = 0; k < width; k++) this[start + written + k] = bytes[at + k];
+        written += width;
+        at += width;
+      }
+      return written;
+    }
+    for (var i = 0; i < bytes.length && i < cap; i++) {
       this[start + i] = bytes[i];
       written++;
     }
