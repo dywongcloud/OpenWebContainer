@@ -103,6 +103,8 @@ interface BabelResult {
 interface BabelHost {
     transform(source: string, options: BabelTransformOptions): BabelResult;
     exports(path: string): string[];
+    /** ESM export names of an in-memory module, including 'default' and '*'. */
+    exportsOfSource?(source: string, filename: string): string[];
 }
 
 interface AddonHost extends LockHost {
@@ -265,6 +267,132 @@ function babelOptionsOf(options: SwcOptions, isModule: unknown): BabelTransformO
     return babelOptions;
 }
 
+/**
+ * Native SWC marks a `'use client'` module compiled for `serverComponents.isReactServerLayer`
+ * with a `__next_internal_client_entry_do_not_use__` block comment carrying its export refs.
+ * next-flight-loader reads it via getRSCModuleInformation(source, true) and replaces the module with
+ * a client-reference proxy. Without the label the loader leaves the real body in the RSC graph,
+ * where `react` resolves to react.react-server.js (no React.Component) and error-boundary.js throws
+ * `TypeError: parent class must be constructor`. Babel does not emit the label, so the shim emits it
+ * here, on the transform output the loader sees.
+ *
+ * Only unambiguous shapes are labelled. An ESM boundary whose refs cannot be forwarded safely
+ * (`export *`, string-named exports, a parse failure, or no refs on a javascript/esm module) emits
+ * NO label, which is exactly the published baseline behaviour: next-flight-loader then keeps the
+ * original module body rather than risking its `export {}` branch, which drops every export when
+ * webpack marks such a module `javascript/esm`. CJS client boundaries (Next's own compiled
+ * `'use client'` modules) get the empty-refs `cjs` label, which the loader turns into
+ * `module.exports = createProxy(resourceKey)`. That proxy answers any named import.
+ */
+const USE_CLIENT_DIRECTIVE = /^(['"])use client\1[ \t]*;?[ \t]*$/;
+const USE_STRICT_DIRECTIVE = /^(['"])use strict\1[ \t]*;?[ \t]*$/;
+/** A plain-identifier ref, usable in next-flight-loader's `export const <ref> = ...` form. */
+const CLIENT_REF_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+/** ESM syntax anywhere in the source. When present, an ambiguous label could make the loader emit
+    `export {}` for a javascript/esm module. Only CJS-shaped sources get the empty-refs `cjs` label.
+    Bounded to the same 4096-char prefix as the directive scan; a later ESM statement cannot change
+    how webpack classifies the module type, but a leading `import`/`export` can. Check the whole
+    source: `import` at any position means webpack may treat the module as `javascript/esm`. */
+const ESM_SYNTAX = /(?:^|[\r\n])\s*(?:import|export)\s/;
+
+/**
+ * Bounded scan of the directive prologue only: an optional shebang, comments, and at most one
+ * leading 'use strict' directive. A whole line that is exactly a 'use client' string expression is
+ * a directive; the same text inside a comment, an assignment, a call or any later statement is not.
+ * Anything ambiguous returns false (no label), so this can never mark a server module as a client
+ * boundary.
+ */
+function hasUseClientDirective(source: string): boolean {
+    const limit = Math.min(source.length, 4096);
+    const space = ' \t\r\n\f\v';
+    let at = 0;
+    if (source.slice(0, 2) === '#!') {
+        const end = source.indexOf('\n', 2);
+        if (end < 0 || end >= limit) return false;
+        at = end + 1;
+    }
+    let sawStrict = false;
+    for (let lines = 0; lines < 64 && at < limit; lines++) {
+        while (at < limit && space.indexOf(source.charAt(at)) >= 0) at++;
+        if (at >= limit) return false;
+        /* Comments are skipped wholesale: a directive-looking string inside one is not a directive. */
+        if (source.slice(at, at + 2) === '//') {
+            const end = source.indexOf('\n', at + 2);
+            if (end < 0 || end >= limit) return false;
+            at = end + 1;
+            continue;
+        }
+        if (source.slice(at, at + 2) === '/*') {
+            const end = source.indexOf('*/', at + 2);
+            if (end < 0 || end + 2 >= limit) return false;
+            at = end + 2;
+            continue;
+        }
+        let end = source.indexOf('\n', at);
+        if (end < 0 || end > limit) end = limit;
+        const line = source.slice(at, end).trim();
+        if (USE_CLIENT_DIRECTIVE.test(line)) return true;
+        if (!sawStrict && USE_STRICT_DIRECTIVE.test(line)) {
+            sawStrict = true;
+            at = end + 1;
+            continue;
+        }
+        /* Any other statement ends the prologue. */
+        return false;
+    }
+    return false;
+}
+
+/**
+ * Returns the client-entry label, or undefined when no label should be emitted. A label is emitted
+ * only for a `'use client'` module compiled for `serverComponents.isReactServerLayer === true`.
+ *
+ * ESM modules with plain-identifier refs get an `auto` label, so next-flight-loader emits
+ * registerClientReference() exports. CJS-shaped client boundaries (Next's own compiled
+ * `'use client'` files, which have no ESM syntax) get the empty-refs `cjs` label, which makes the
+ * loader emit `module.exports = createProxy(resourceKey)`; that proxy answers any named import.
+ *
+ * Anything ambiguous emits NO label, which is the published baseline behaviour. In particular an
+ * ESM-shaped module with `export *`, a string-named export, a parse failure, or no available AST
+ * walker must not get the empty-refs `cjs` label: next-flight-loader would classify a
+ * `javascript/esm` module as 'module', see zero clientRefs, and return `export {}`, dropping every
+ * export. Preserving the original body is strictly safer than that regression.
+ */
+function clientEntryLabel(source: string, options: SwcOptions, host: AddonHost | undefined): string | undefined {
+    const serverComponents = options.serverComponents;
+    if (!serverComponents || typeof serverComponents !== 'object'
+        || (serverComponents as { isReactServerLayer?: unknown }).isReactServerLayer !== true) {
+        return undefined;
+    }
+    if (!hasUseClientDirective(source)) return undefined;
+    const filename = typeof options.filename === 'string' ? options.filename : '';
+    const esm = ESM_SYNTAX.test(source);
+    const babel = host && host.babel;
+    let names: unknown;
+    if (babel && typeof babel.exportsOfSource === 'function') {
+        try { names = babel.exportsOfSource(source, filename); }
+        catch { names = undefined; }
+    }
+    if (Array.isArray(names) && names.length > 0) {
+        if (!names.every((name) => typeof name === 'string' && CLIENT_REF_NAME.test(name))) {
+            /* `export *`, a string-named export, or any other ref the loader cannot forward.
+               Emit NO label: baseline keeps the original body rather than risking `export {}`. */
+            return undefined;
+        }
+        /* All refs are plain identifiers: the loader emits registerClientReference() exports, and
+           no zero-refs `export {}` branch is reachable, so every webpack module type is safe. */
+        return '/* __next_internal_client_entry_do_not_use__ ' + names.join(',') + ' auto */\n';
+    }
+    /* Zero refs: `exportsOfSource` found no ESM export names (a CJS body), or the AST walker is
+       absent or failed. On an ESM-shaped module the empty-refs `cjs` label would make the loader
+       return `export {}` for `javascript/esm` and drop every export. With no label the loader keeps
+       the original body: baseline behaviour, no regression. CJS-shaped client boundaries have no
+       ESM syntax, and there the empty-refs `cjs` label is what native SWC emits; the loader turns
+       it into `module.exports = createProxy(resourceKey)`, which answers any named import. */
+    if (esm) return undefined;
+    return '/* __next_internal_client_entry_do_not_use__  cjs */\n';
+}
+
 interface TransformResult {
     code: string;
     map?: string;
@@ -301,7 +429,10 @@ function transformResult(
     if (!output || typeof output.code !== 'string') {
         return unavailable('transform whose Babel output has no code');
     }
-    return output.map === undefined ? { code: output.code } : { code: output.code, map: output.map };
+    let code = output.code;
+    const label = clientEntryLabel(src, options, host);
+    if (label !== undefined) code = label + code;
+    return output.map === undefined ? { code: code } : { code: code, map: output.map };
 }
 
 /**

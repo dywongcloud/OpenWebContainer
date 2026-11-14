@@ -199,6 +199,54 @@ var NAPI_HOST = (function () {
   function bytes (b) {
     return Buffer.from(b.buffer, b.byteOffset, b.length);
   }
+  /* One ESM export walker serves both getModuleNamedExports (a resource path) and the RSC
+     client-entry label (an in-memory source). The label also needs 'default' and '*' so
+     next-flight-loader can build a proxy with the right shape. */
+  function parseProgram (text) {
+    var ast;
+    try {
+      ast = loadBabel().parser().parse(text, {
+        sourceType: 'unambiguous',
+        errorRecovery: true,
+        plugins: ['typescript', 'jsx', 'dynamicImport', 'importAttributes', 'classProperties', 'objectRestSpread']
+      });
+    } catch (parseError) {
+      /* A file the bundled parser cannot read contributes no trustworthy named exports. */
+      return undefined;
+    }
+    return ast && ast.program ? ast.program : undefined;
+  }
+  function exportNamesOfText (text, includeDefaultAndStar) {
+    var program = parseProgram(text);
+    var body = program && program.body ? program.body : [];
+    var seen = Object.create(null);
+    var names = [];
+    function addName (name) {
+      if (typeof name === 'string' && name !== '' && !seen[name]) { seen[name] = true; names.push(name); }
+    }
+    for (var i = 0; i < body.length; i++) {
+      var node = body[i];
+      if (!node) continue;
+      if (includeDefaultAndStar && node.type === 'ExportDefaultDeclaration') { addName('default'); continue; }
+      if (includeDefaultAndStar && node.type === 'ExportAllDeclaration') { addName('*'); continue; }
+      if (node.type !== 'ExportNamedDeclaration' || node.exportKind === 'type') continue;
+      var declaration = node.declaration;
+      if (declaration) {
+        if (declaration.id) addName(declaration.id.name || declaration.id.value);
+        var declarations = declaration.declarations || [];
+        for (var j = 0; j < declarations.length; j++) {
+          var id = declarations[j].id;
+          if (id) addName(id.name || id.value);
+        }
+      }
+      var specifiers = node.specifiers || [];
+      for (var k = 0; k < specifiers.length; k++) {
+        var exported = specifiers[k].exported;
+        if (exported) addName(exported.name || exported.value);
+      }
+    }
+    return names;
+  }
   return {
     fs: {
       read: function (p) {
@@ -284,43 +332,11 @@ var NAPI_HOST = (function () {
       exports: function (p) {
         var raw;
         try { raw = requireBuiltin('fs').readFileSync(rp(p)); } catch (readError) { return []; }
-        var text = new TextDecoder().decode(new Uint8Array(raw));
-        var ast;
-        try {
-          ast = loadBabel().parser().parse(text, {
-            sourceType: 'unambiguous',
-            errorRecovery: true,
-            plugins: ['typescript', 'jsx', 'dynamicImport', 'importAttributes', 'classProperties', 'objectRestSpread']
-          });
-        } catch (parseError) {
-          /* A file the bundled parser cannot read contributes no trustworthy named exports. */
-          return [];
-        }
-        var body = ast && ast.program && ast.program.body ? ast.program.body : [];
-        var seen = Object.create(null);
-        var names = [];
-        function addName(name) {
-          if (typeof name === 'string' && name !== '' && !seen[name]) { seen[name] = true; names.push(name); }
-        }
-        for (var i = 0; i < body.length; i++) {
-          var node = body[i];
-          if (!node || node.type !== 'ExportNamedDeclaration' || node.exportKind === 'type') continue;
-          var declaration = node.declaration;
-          if (declaration) {
-            if (declaration.id) addName(declaration.id.name || declaration.id.value);
-            var declarations = declaration.declarations || [];
-            for (var j = 0; j < declarations.length; j++) {
-              var id = declarations[j].id;
-              if (id) addName(id.name || id.value);
-            }
-          }
-          var specifiers = node.specifiers || [];
-          for (var k = 0; k < specifiers.length; k++) {
-            var exported = specifiers[k].exported;
-            if (exported) addName(exported.name || exported.value);
-          }
-        }
-        return names;
+        return exportNamesOfText(new TextDecoder().decode(new Uint8Array(raw)), false);
+      },
+      exportsOfSource: function (source, filename) {
+        /* filename is accepted for symmetry with exports(path); the parser needs only the text. */
+        return exportNamesOfText(String(source), true);
       }
     }
   };
