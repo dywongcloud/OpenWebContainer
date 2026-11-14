@@ -18,3 +18,17 @@
   `ReferenceError: 'settleIO' is not defined` while the built worker was fine. When a
   source-level JIT witness must be trusted, export a clean tree from `origin/main`
   (`gh api .../git/trees/main?recursive=1` + blobs) and witness against that.
+
+- A webpack `next build --webpack` inside the QuickJS guest is SLOW, not deadlocked. A
+  witness that logged only `buildModule`/`succeedModule` for the first 5 modules and then
+  every 200th made 150+ modules of steady progress look like a frozen build (`chars=744`
+  constant); log every module, or every 25th, before diagnosing a hang. Absolute timings
+  are unusable when the host is loaded: at load average 58-207 the harness's own 1-second
+  timers took 37-130 s of wall time, and guest time ran ~0.5x wall time. Judge only
+  within-run ratios.
+
+- JIT build/dev harnesses under `/tmp/owc-harness/` write their own `/app/next.config.js`
+  with `config.cache = false` and `experimental.webpackBuildWorker = false`. A stock
+  `npx create-next-app@latest` app has neither, so a build or a rendered dev page from
+  such a harness does not prove the stock app behaves the same. Witness the stock
+  config separately; do not infer a deadlock from a short window.
