@@ -1192,6 +1192,22 @@ function makeStdioStream(fd, writeText) {
         stream.isTTY = true;
         stream.columns = 80;
         stream.rows = 24;
+        /* A tty stream carries the four cursor helpers as well, on its prototype as a host has
+           them: a spinner clears its line with clearLine, moveCursor and cursorTo before it draws
+           the next frame. A piped stream has none of them. The readline builtin is registered after
+           this file runs, so each call resolves it instead of one made as the stream is built. */
+        proto.clearLine = function (dir, callback) {
+            return requireBuiltin('readline').clearLine(this, dir, callback);
+        };
+        proto.clearScreenDown = function (callback) {
+            return requireBuiltin('readline').clearScreenDown(this, callback);
+        };
+        proto.cursorTo = function (x, y, callback) {
+            return requireBuiltin('readline').cursorTo(this, x, y, callback);
+        };
+        proto.moveCursor = function (dx, dy, callback) {
+            return requireBuiltin('readline').moveCursor(this, dx, dy, callback);
+        };
     }
     return stream;
 }
