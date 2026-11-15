@@ -109,10 +109,18 @@
   `await 1`, `await "x"`, `await {then:...}` fire ZERO JS-visible hooks; a
   `Promise.prototype.constructor` getter fires only for real promises; `globalThis.Promise`
   is not read at await time; no promise/job hook is exposed by quickjs-emscripten 0.32.0
-  and `QTS_ExecutePendingJob` returns only a job count, not job identity. FIVE independent
+  and `QTS_ExecutePendingJob` returns only a job count, not job identity. EIGHT independent
   adversarial investigations found NO safe pure-JS shim fix. Sticky-frame, reenter,
   contiguous-job and "exactly one active run" fallbacks all CROSS-CONTAMINATE overlapping
   request chains (one request's auth/session store read by another) — never publish them.
+  The last untried mechanism was a PER-PROMISE WeakMap frame queue instead of the refuted
+  one-global-FIFO (`wf_df7ea81f-069`, 2 lanes x 42/21 cases, 126+ fresh QuickJS contexts):
+  it does fix the one global-FIFO desync (a `.then` on a DIFFERENT promise), but only
+  MOVES it. Measured leaks in BOTH lanes and BOTH the charitable CLEAN and real LITERAL
+  modes: `aAfter:"B"` (request A reads B's store), `bJobFrame:"A"`, `B.start:"A"`,
+  `outsideAfter:"ENTERED"`; leak sites are a `.then` on the SAME promise, a guest
+  `Promise.resolve(shared)` on a shared promise, and any reused promise. Primitive awaits
+  still fire ZERO hooks. NOT_SAFE; do not publish.
   A correct fix needs either an engine-level AsyncContextFrame on each QuickJS job or a
   loader source transform (`await X` -> `await __owcAwait(X)`) with a general parser;
   neither is witnessed. A source transform verified in bare QuickJS still needs a
@@ -132,7 +140,22 @@
   works, but rebuilding would require vendoring the whole upstream
   quickjs-emscripten C tree + generator, a new checked-in .wasm, a pnpm-lock
   override, an FFI export and JS glue, plus a mandatory >=2-overlapping-request
-  regression witness that does not exist. Research workflow wf_9054c518-2eb
-  returned NOT_JUSTIFIED; no code was published from it. Requests serialized in
-  a separate VM is NOT a workaround: even a SINGLE request fails closed
-  (`als-host-hook-challenge.md:190-230`).
+  regression witness that does not exist. A newer variant does NOT remove that:
+  all four npm packages (`quickjs-emscripten`, `@jitl/quickjs-ng-wasmfile-release-
+  asyncify`, `@jitl/quickjs-wasmfile-release-asyncify`, `@jitl/quickjs-singlefile-
+  browser-release-asyncify`) are latest `0.32.0` with `next` dist-tag the OLDER
+  `0.26.1-rc.0`. A quickjs-ng family EXISTS but is also only 0.32.0, and its
+  `ffi.d.ts`/`ffi.d.mts` are byte-identical to the installed original FFI; its WASM
+  has 108 exports and no hook. Upstream quickjs-ng v0.12.1 DOES define
+  `JS_SetPromiseHook` / `JSPromiseHook` in C (header :1117/:1128/:1131) and NO
+  `AsyncContextFrame`, but the published quickjs-emscripten `c/interface.c` wrapper
+  does not surface it. Pure-JS async-context polyfills (`@b9g/async-context`,
+  `als-unhooked`) are built on host `AsyncLocalStorage` and still need a job
+  identity the guest FFI lacks. No polyfill or prebuilt swap is a fix.
+  Research workflow wf_9054c518-2eb returned NOT_JUSTIFIED; no code was published
+  from it. Even a C patch needs tokens on `JSPromiseReactionData` (quickjs.c
+  :52321-52325) as well as `JSJobEntry`, because reactions are enqueued from the
+  RESOLVER's context at `fulfill_or_reject_promise` :52435, and host-invoked
+  nextTick/timer/IO callbacks enter through `QTS_Call`, never
+  `JS_ExecutePendingJob`. Requests serialized in a separate VM is NOT a workaround:
+  even a SINGLE request fails closed (`als-host-hook-challenge.md:190-230`).
