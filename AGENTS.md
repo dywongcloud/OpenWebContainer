@@ -89,11 +89,16 @@
   dev hits below.
 
 - One bounded Pages Router dev witness (`dev-page-pagesfull-result.json`) returned a
-  genuine 1184-byte Next HTML document with `<h1>hello</h1>` and `__NEXT_DATA__`, but
-  its raw `statusLines` contain 13 `TIMEOUT` and 13 `ECONNRESET` before the single
-  `STATUS=200`. Quote the reliability (1/14), not just the successful response. The
-  unfixed control artifact is `dev-page-pages-raw.log` (16 `TypeError: not a function`
-  lines); there is no `dev-page-pages-result.json` — do not cite it.
+  genuine 1184-byte Next HTML document with `<h1>hello</h1>` and `__NEXT_DATA__`,
+  but its raw `statusLines` contain 13 `TIMEOUT` and 13 `ECONNRESET` before the
+  single `STATUS=200`. Quote those, not just the successful response. The raw log
+  shows why they are NOT random flakiness: `✓ Ready in 11.4s`, `○ Compiling / ...`,
+  then A1..A13 each timing out at the client's 50s bound, with NO `✓ Compiled`
+  line; A14 (after ~1030s total) is the first 200. It is a SLOW-COMPILE artifact
+  (see the first bullet), not a 1/14 success rate — but no request succeeded for
+  ~17 minutes, and only Pages Router was witnessed. The unfixed control artifact
+  is `dev-page-pages-raw.log` (16 `TypeError: not a function` lines); there is no
+  `dev-page-pages-result.json` — do not cite it.
 
 - The guest `async_hooks` shim (`runtime/guest/modules/pure-a.ts`) fails **closed** across
   native `await`: QuickJS attaches async continuations with intrinsic `PerformPromiseThen`,
