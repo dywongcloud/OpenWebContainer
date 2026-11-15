@@ -32,3 +32,34 @@
   `npx create-next-app@latest` app has neither, so a build or a rendered dev page from
   such a harness does not prove the stock app behaves the same. Witness the stock
   config separately; do not infer a deadlock from a short window.
+
+- Next 16.4.6 defaults to **Turbopack**: `dist/lib/bundler.js parseBundlerArgs()` returns
+  `Bundler.Turbopack` and sets `TURBOPACK=auto` when no bundler flag is given, so a stock
+  scaffold's `npm run dev` / `npm run build` use Turbopack, not webpack. The published
+  `napi/next-swc` shim has no `turbo.createProject` implementation and refuses
+  `projectNew` (`ERR_OWC_SWC_NATIVE_UNAVAILABLE`). Every witness that passes an explicit
+  `--webpack` covers only that route; do not claim stock dev/build works from it.
+
+- `next build --webpack --experimental-build-mode compile` skips static generation and
+  printed `✓ Compiled successfully in 59.0min` on the published RSC-fixed tree. That is a
+  real green compiler witness, but NOT a green default build: no `Route (app)`, no static
+  generation, no process exit 0. Default `next build` prerenders through `getRSCPayload`,
+  which is the same path that dev hits below.
+
+- The guest `async_hooks` shim (`runtime/guest/modules/pure-a.ts`) fails **closed** across
+  native `await`: QuickJS attaches async continuations with intrinsic `PerformPromiseThen`,
+  which never consults the patched `Promise.prototype.then`. `workAsyncStorage.getStore()`
+  is therefore `undefined` inside Next 16 dev/prerender and throws
+  `Invariant: Expected workStore to be initialized` (an error-payload path; the primary
+  error is the same invariant on the normal `getRSCPayload` path). Measured in bare QuickJS:
+  `await 1`, `await "x"`, `await {then:...}` fire ZERO JS-visible hooks; a
+  `Promise.prototype.constructor` getter fires only for real promises; `globalThis.Promise`
+  is not read at await time; no promise/job hook is exposed by quickjs-emscripten 0.32.0
+  and `QTS_ExecutePendingJob` returns only a job count, not job identity. Three independent
+  adversarial passes found NO safe pure-JS shim fix. Sticky-frame, reenter, contiguous-job
+  and "exactly one active run" fallbacks all CROSS-CONTAMINATE overlapping request chains
+  (one request's auth/session store read by another) — never publish them. A correct fix
+  needs either an engine-level AsyncContextFrame on each QuickJS job or a loader source
+  transform (`await X` -> `await __owcAwait(X)`) with a general parser; neither is
+  witnessed. A source transform verified in bare QuickJS still needs a Next-seeded
+  parser and touches CJS, `new Function`, ESM/TLA and `eval` compile paths.
