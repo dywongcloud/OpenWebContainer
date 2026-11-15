@@ -8,6 +8,8 @@
   even after the source is fixed; this made an interactive-prompt fix look ineffective
   until the bundle was rebuilt. `tsup.config.ts` refuses a mixed bundle when
   `dist/worker.global.js` has other than one `function settleIO(`.
+  `packages/core/dist` is gitignored (`DIST_TRACKED_FILES: 0`), so a fresh clone of
+  `origin/main` does NOT carry the served bundle; rebuild it before any browser witness.
 
 - The playground resolves `@open-web-container/api` from `packages/api/dist/*.js`, not from
   `packages/api/src`. After editing an API source file, run `tsc` in `packages/api` and restart
@@ -31,7 +33,25 @@
   with `config.cache = false` and `experimental.webpackBuildWorker = false`. A stock
   `npx create-next-app@latest` app has neither, so a build or a rendered dev page from
   such a harness does not prove the stock app behaves the same. Witness the stock
-  config separately; do not infer a deadlock from a short window.
+  config separately; do not infer a deadlock from a short window. The gap is wider than
+  those two keys: the recommended-defaults `app-tw` scaffold injects a `turbopack.rules`
+  Tailwind webpack-loader entry into `next.config.ts`, drops `postcss.config.mjs`, and
+  installs `@tailwindcss/turbopack` instead of `@tailwindcss/postcss`. Warranting a
+  stock-config claim needs that generated config, not just removing the harness keys.
+
+- A terminal-attached guest stdio stream (`OWC_TERMINAL=1`) must carry the four
+  `tty.WriteStream.prototype` cursor helpers `clearLine`, `clearScreenDown`, `cursorTo`
+  and `moveCursor`. Host Node 24 has all four; a piped host stream has none. Before
+  `a4845d9` the guest set `isTTY=true` without them, so the real bundled `ora` spinner
+  threw `TypeError: not a function` at `clear -> stop -> stopAndPersist`. In DEFAULT
+  `next build --webpack` that throw is swallowed by `startTypeChecking`'s bare
+  `.catch(() => process.exit(1))`, so the build printed only `Running TypeScript .`
+  and returned to the shell with NO error text — do not diagnose that as a hang or a
+  TypeScript failure. In compile mode it surfaced as `> Build error occurred`.
+  `a4845d9` installs the four methods inside the existing `owcTerminalAttached` guard;
+  each resolves `requireBuiltin('readline')` at CALL TIME because that builtin is
+  registered by a MODULE_SRC which runs after `GLOBALS_SRC` (eager capture holds
+  `undefined` forever — refuted). Piped runs must keep none of the four.
 
 - Next 16.4.6 defaults to **Turbopack**: `dist/lib/bundler.js parseBundlerArgs()` returns
   `Bundler.Turbopack` and sets `TURBOPACK=auto` when no bundler flag is given, so a stock
@@ -39,12 +59,33 @@
   `napi/next-swc` shim has no `turbo.createProject` implementation and refuses
   `projectNew` (`ERR_OWC_SWC_NATIVE_UNAVAILABLE`). Every witness that passes an explicit
   `--webpack` covers only that route; do not claim stock dev/build works from it.
+  `dist/lib/bundler.js:125-126` honours `IS_WEBPACK_TEST` to force webpack for plain
+  scripts, but that is a test-only flag: any competing bundler flag then hard-exits
+  (`process.exit(1)`), it is container-wide if published in `default-env.ts`, and it
+  only routes stock scripts to the SAME `--webpack` path that still hits the ALS
+  invariant below. It is NOT a fix; two independent reviews returned NOT_VIABLE.
 
 - `next build --webpack --experimental-build-mode compile` skips static generation and
   printed `✓ Compiled successfully in 59.0min` on the published RSC-fixed tree. That is a
   real green compiler witness, but NOT a green default build: no `Route (app)`, no static
-  generation, no process exit 0. Default `next build` prerenders through `getRSCPayload`,
-  which is the same path that dev hits below.
+  generation, no process exit 0. A longer bound on that same tree then reached
+  `✓ Compiled successfully in 64.9min`, `Collecting page data using 4 workers` and
+  `> Build error occurred / TypeError: not a function` at the `ora` spinner (the TTY
+  gotcha above). `a4845d9` removed that throw: the compile-mode witness on that tree
+  reached `✓ Compiled successfully in 64.5min` and
+  `✓ Collecting page data using 4 workers in 52ms` with zero `TypeError`. `Route (app)`
+  and process exit 0 were still NOT witnessed by it. `build/index.js:2907-2910` calls
+  `printTreeView` unconditionally, so compile mode CAN print a route table; that would
+  still not be a green DEFAULT build (static generation is skipped at `:1799`).
+  Default `next build` prerenders through `getRSCPayload`, which is the same path that
+  dev hits below.
+
+- One bounded Pages Router dev witness (`dev-page-pagesfull-result.json`) returned a
+  genuine 1184-byte Next HTML document with `<h1>hello</h1>` and `__NEXT_DATA__`, but
+  its raw `statusLines` contain 13 `TIMEOUT` and 13 `ECONNRESET` before the single
+  `STATUS=200`. Quote the reliability (1/14), not just the successful response. The
+  unfixed control artifact is `dev-page-pages-raw.log` (16 `TypeError: not a function`
+  lines); there is no `dev-page-pages-result.json` — do not cite it.
 
 - The guest `async_hooks` shim (`runtime/guest/modules/pure-a.ts`) fails **closed** across
   native `await`: QuickJS attaches async continuations with intrinsic `PerformPromiseThen`,
@@ -55,11 +96,18 @@
   `await 1`, `await "x"`, `await {then:...}` fire ZERO JS-visible hooks; a
   `Promise.prototype.constructor` getter fires only for real promises; `globalThis.Promise`
   is not read at await time; no promise/job hook is exposed by quickjs-emscripten 0.32.0
-  and `QTS_ExecutePendingJob` returns only a job count, not job identity. Three independent
-  adversarial passes found NO safe pure-JS shim fix. Sticky-frame, reenter, contiguous-job
-  and "exactly one active run" fallbacks all CROSS-CONTAMINATE overlapping request chains
-  (one request's auth/session store read by another) — never publish them. A correct fix
-  needs either an engine-level AsyncContextFrame on each QuickJS job or a loader source
-  transform (`await X` -> `await __owcAwait(X)`) with a general parser; neither is
-  witnessed. A source transform verified in bare QuickJS still needs a Next-seeded
-  parser and touches CJS, `new Function`, ESM/TLA and `eval` compile paths.
+  and `QTS_ExecutePendingJob` returns only a job count, not job identity. FIVE independent
+  adversarial investigations found NO safe pure-JS shim fix. Sticky-frame, reenter,
+  contiguous-job and "exactly one active run" fallbacks all CROSS-CONTAMINATE overlapping
+  request chains (one request's auth/session store read by another) — never publish them.
+  A correct fix needs either an engine-level AsyncContextFrame on each QuickJS job or a
+  loader source transform (`await X` -> `await __owcAwait(X)`) with a general parser;
+  neither is witnessed. A source transform verified in bare QuickJS still needs a
+  Next-seeded parser and touches CJS, `new Function`, ESM/TLA and `eval` compile paths;
+  TWO more reviews REFUTED it: `for await` is a `ForOfStatement` with ZERO
+  `AwaitExpression` nodes (11 dev / 9 prod loops stay untransformed). Do NOT "fix" the
+  invariant by defaulting `getStore()` to a benign object: Next 16.4.6 checks BOTH
+  `workAsyncStorage` and `workUnitAsyncStorage` (18 dist files carry the invariant),
+  and the real store holds per-request `route`, `requestId`, `incrementalCache` and
+  dynamic-bailout state. A fresh object fabricates request identity and is faking
+  success. Two independent reviews returned NOT_VIABLE.
