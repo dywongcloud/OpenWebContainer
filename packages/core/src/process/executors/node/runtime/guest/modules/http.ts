@@ -576,6 +576,15 @@ BF['http'] = function () {
     this._commitHead(null);
     return this;
   };
+  /* Node exposes _implicitHeader() on ServerResponse; middleware such as compression and
+     on-headers calls it to materialize the head block before the first body byte, so it can read
+     the built headers and go on writing. Node's own method is exactly writeHead(statusCode).
+     _commitHead builds this._header without putting anything on the wire -- the socket write
+     stays with the one-shot _takeHead() -- and writeHead raises the same ERR_HTTP_HEADERS_SENT
+     as host Node if called again. */
+  ServerResponse.prototype._implicitHeader = function _implicitHeader() {
+    this.writeHead(this.statusCode);
+  };
   /* Builds the status line and headers and holds them: host Node stores the head at writeHead and
      puts it on the wire with the first body byte, so a client cannot read a head whose body does not
      exist yet. length is the body size when known (Content-Length), null means chunked. */
