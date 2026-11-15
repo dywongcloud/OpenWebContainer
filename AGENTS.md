@@ -64,6 +64,14 @@
   (`process.exit(1)`), it is container-wide if published in `default-env.ts`, and it
   only routes stock scripts to the SAME `--webpack` path that still hits the ALS
   invariant below. It is NOT a fix; two independent reviews returned NOT_VIABLE.
+  Both no-flag stock routes are now WITNESSED end-to-end on the published tree
+  (`/tmp/owc-harness/stock-route-result.json` and `stock-build-result.json`):
+  plain `next dev` prints `▲ Next.js 16.4.6 (Turbopack)`, `✓ Ready in 26.7s`
+  then `ERR_OWC_SWC_NATIVE_UNAVAILABLE` at `createProject
+  (.../build/swc/index.js:916:49)`; plain `next build` prints the same banner,
+  `Creating an optimized production build ...`, `> Build error occurred` and the
+  same refusal. Note the dev banner prints Ready BEFORE createProject throws.
+  A `turbo.createProject` implementation cannot be a Babel shim.
 
 - `next build --webpack --experimental-build-mode compile` skips static generation and
   printed `✓ Compiled successfully in 59.0min` on the published RSC-fixed tree. That is a
@@ -110,4 +118,16 @@
   `workAsyncStorage` and `workUnitAsyncStorage` (18 dist files carry the invariant),
   and the real store holds per-request `route`, `requestId`, `incrementalCache` and
   dynamic-bailout state. A fresh object fabricates request identity and is faking
-  success. Two independent reviews returned NOT_VIABLE.
+  success. Two independent reviews returned NOT_VIABLE. The engine-level route named
+  below is also NOT_FEASIBLE in this repo: there is NO vendored QuickJS C source
+  (find for quickjs.c / quickjs.h / interface.c is empty), NO Makefile / CMakeLists
+  / Dockerfile, and NO in-repo C build step; `process.ts:7` pins the prebuilt
+  `@jitl/quickjs-singlefile-browser-release-asyncify` npm binary, whose release
+  WASM exports 110 minified names with ZERO promise/job hooks. Host emcc 5.0.6
+  works, but rebuilding would require vendoring the whole upstream
+  quickjs-emscripten C tree + generator, a new checked-in .wasm, a pnpm-lock
+  override, an FFI export and JS glue, plus a mandatory >=2-overlapping-request
+  regression witness that does not exist. Research workflow wf_9054c518-2eb
+  returned NOT_JUSTIFIED; no code was published from it. Requests serialized in
+  a separate VM is NOT a workaround: even a SINGLE request fails closed
+  (`als-host-hook-challenge.md:190-230`).
