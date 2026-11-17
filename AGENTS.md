@@ -60,10 +60,21 @@
   `projectNew` (`ERR_OWC_SWC_NATIVE_UNAVAILABLE`). Every witness that passes an explicit
   `--webpack` covers only that route; do not claim stock dev/build works from it.
   `dist/lib/bundler.js:125-126` honours `IS_WEBPACK_TEST` to force webpack for plain
-  scripts, but that is a test-only flag: any competing bundler flag then hard-exits
-  (`process.exit(1)`), it is container-wide if published in `default-env.ts`, and it
-  only routes stock scripts to the SAME `--webpack` path that still hits the ALS
-  invariant below. It is NOT a fix; two independent reviews returned NOT_VIABLE.
+  scripts. PRECISION (not a correction): `--webpack` writes the SAME Map key 1
+  (:122-127), so `IS_WEBPACK_TEST=1` plus `--webpack` exits 0 with bundler 1;
+  the existing "any competing bundler flag then hard-exits" claim is still TRUE
+  for the six Turbopack/Rspack sources at :108-121 and :130-135, which make
+  `bundlerFlags.size > 1` and hard-exit at :136-141. `--webpack` was never one of
+  those competitors. Workflow wf_18245b06-757 (3 angles + 3 refuters + judge,
+  VERDICT NO) found a NARROW override mechanically viable for bundler selection
+  but NOT_PUBLISHABLE: it still routes to the SAME `--webpack` path that hits the
+  ALS invariant below, is container-wide if published in `default-env.ts`, and
+  cannot be scoped to only the Next CLI through guest `npm run`. A BOUNDED
+  IN-MEMORY fs-stub simulation of a project `.env` containing `TURBOPACK=1`
+  projected a silent parent/child bundler split (parent EXIT=0, child flag true,
+  from which `ERR_OWC_SWC_NATIVE_UNAVAILABLE` was INFERRED, not witnessed in a
+  real parent CLI). It is strictly dominated by the zero-code `--webpack` flag.
+  No fix.
   Both no-flag stock routes are now WITNESSED end-to-end on the published tree
   (`/tmp/owc-harness/stock-route-result.json` and `stock-build-result.json`):
   plain `next dev` prints `▲ Next.js 16.4.6 (Turbopack)`, `✓ Ready in 26.7s`
@@ -81,10 +92,15 @@
   `> Build error occurred / TypeError: not a function` at the `ora` spinner (the TTY
   gotcha above). `a4845d9` removed that throw: the compile-mode witness on that tree
   reached `✓ Compiled successfully in 64.5min` and
-  `✓ Collecting page data using 4 workers in 52ms` with zero `TypeError`. `Route (app)`
-  and process exit 0 were still NOT witnessed by it. `build/index.js:2907-2910` calls
-  `printTreeView` unconditionally, so compile mode CAN print a route table; that would
-  still not be a green DEFAULT build (static generation is skipped at `:1799`).
+  `✓ Collecting page data using 4 workers in 52ms` with zero `TypeError`, and DID
+  print a `Route (app)` table before returning to a `sh-3.2$` prompt
+  (`/tmp/owc-harness/compile-mode-tty-result.json`: verdict=ROUTE_TABLE,
+  routeTable=true, exitPrompt=true, staticPages=false; the log literally has
+  `Route (app)`). Earlier notes saying "`Route (app)` was NOT witnessed by it" were
+  WRONG. But `exitPrompt` is a shell-prompt regex, NOT a captured numeric process
+  exit 0, and static generation is SKIPPED at `build/index.js:1799`, so this is NOT
+  a green DEFAULT build. `build/index.js:2907-2910` calls `printTreeView`
+  unconditionally, which is why compile mode prints that table.
   Default `next build` prerenders through `getRSCPayload`, which is the same path that
   dev hits below.
 
@@ -121,6 +137,36 @@
   But it then hits the ALS invariant below, so NO `Route (app)` + exit 0 was
   witnessed on any of the three routes (wt-build FAIL, nofn-build FAIL,
   force-dynamic timeout at `Generating static pages (0/2)`).
+  `e581bb6` PUBLISHED a narrow Node `serialization:'json'` parity fix for this
+  one ERR_DATA_CLONE (one file, `child.ts`, +70/-4): guest child_process IPC now
+  runs `JSON.parse(JSON.stringify(message))` and silently drops functions where
+  host Node does, instead of throwing. Verified by wf_6e5a62b4-59f,
+  wf_3f033e9d-983 (PUBLISH_WITH_CHANGES with C1/C2/C3) and final gate
+  wf_b4f213bc-314 (SAFE_TO_PUBLISH 4/4). The two-step dist rebuild from ONE clean
+  revision + Vite `--force` IS in wf_b4f213bc-314 (its bundle lane records the
+  rebuild ordering and live Vite pid 97969); only the REAL-BROWSER values are
+  absent from the three workflow journals (the gate lanes were forbidden from
+  running a browser) and are supported by the e581bb6 commit body and the
+  session transcript: `node -e "console.log(1+1)"` -> literal `2`; a fork/spawn
+  IPC roundtrip returned
+  `PARENT_GOT=CHILD_KEYS=n N=1 FNTYPE=undefined EXIT=0`; `npm --version` -> 11.12.1.
+  A separate bounded JIT witness (`/tmp/owc-harness/cna-corrected-result.json`)
+  re-ran the user's ORIGINAL `npx create-next-app@latest` on this corrected tree:
+  prompt alive, `Creating a new Next.js app in /app/my-app`, `added 362 packages
+  in 91s`, zero Error/ERR_ lines and no ERR_DATA_CLONE — so the IPC change did not
+  regress npm/npx. That harness breaks on `added \d+ packages`, so
+  `Types generated successfully` / `Success!` are NOT claimed for it.
+  It is NOT a Next fix: at COMMIT TIME no `next build`/`next dev` had been run
+  on the corrected tree, and the ALS workStore blocker below is untouched.
+  A FIRST default `next build --webpack` on the corrected tree has SINCE been
+  witnessed; see the bullet below.
+  `cpEncode` still has NO cycle
+  detection (an explicitly 'advanced' circular channel aborts the whole VM),
+  an own `__proto__` key is still lost, and a top-level `toJSON()` returning
+  undefined deliberately posts NO frame and keeps the child alive where host
+  Node kills it with `SyntaxError: "undefined" is not valid JSON`. These are
+  recorded residual gaps, not fixed; the cycle guard is filed as a FOLLOW-UP
+  note on the SAME PRD row, not a separate row.
 
 - *** THE BUILD-PATH `workStore` INVARIANT IS NOW WITNESSED, not just static
   analysis. `/tmp/owc-harness/wt-build-last.txt` (`experimental.workerThreads:true`):
@@ -137,6 +183,29 @@
   build. `primary-error-routes.md` BUILD_PATH_ALSO_BROKEN was static analysis;
   it is now a log observation. Do not claim a green build from any of these.
 
+- *** FIRST DEFAULT `next build --webpack` ON THE CORRECTED TREE (e581bb6) IS
+  WITNESSED ***. `/tmp/owc-harness/corrected-default-build-result.json`
+  (2624s, JIT source import from the clean e581bb6 archive, NON-STOCK harness
+  config cache=false + webpackBuildWorker=false, synthetic App Router app NOT
+  app-tw, deliberately KEEPS the `webpack: function`): `✓ Compiled successfully`,
+  `✓ Collecting page data using 4 workers in 36.5s`, `Generating static pages
+  using 4 workers (0/3)`, dataClone=false, ERR_DATA_CLONE_gone=true. So e581bb6
+  REMOVED the error that killed the prior STANDARD-config default builds on the
+  UNFIXED tree (`default-build-tty` and `nofn-build`, both ERR_DATA_CLONE). It did
+  NOT kill every prior route: `wt-build` (`experimental.workerThreads:true`) had
+  dataClone=false already, and `force-dynamic` timed out with zero ERR_DATA_CLONE
+  lines. This one corrected-tree run proves only its own dataClone=false.
+  But verdict=FAIL: six `InvariantError: Expected workStore to be initialized`
+  at createServerSearchParamsForServerPage -> createServerSearchParamsForMetadata
+  -> createMetadataComponents, for `/`, `/_global-error` and `/_not-found`;
+  no `Route (app)`, no process exit 0, no return-to-shell prompt (the artifact's
+  `exitPrompt:false` is defined as `/sh-3\.2\$/.test(full.slice(-500))`; the log's
+  opening `sh-3.2$` lines are the command echo. The QuickJS ALS gap is
+  now the SINGLE witnessed remaining blocker on the default-build path. NOTE the
+  `green` field in these harness result.json files means only
+  `/Compiled successfully/` matched (see the .mts), NOT a green build. No green
+  dev/build, no build-fixed claim.
+
 - STOCK `npm run dev` (NO bundler flag) in a real `npx create-next-app@latest`
   scaffold is WITNESSED by the user's own :5173 browser session:
   `> next dev` / `▲ Next.js 16.4.6 (Turbopack)` / `- Local:
@@ -151,7 +220,23 @@
   and to use `--webpack`. Two independent reviews returned NOT_VIABLE for
   `IS_WEBPACK_TEST` container-wide (test-only flag, hard-exits on competing
   bundler flags, and routes to the same `--webpack` path that hits the ALS
-  invariant). A `turbo.createProject` implementation cannot be a Babel shim;
+  invariant). A third workflow (wf_18245b06-757) returned NOT_PUBLISHABLE for the
+  narrow variant and VERDICT NO for any bounded route; wf_3f033e9d-983 did not
+  re-litigate the flag. Do NOT claim three independent NOT_VIABLE reviews.
+  Fresh route-hunt wf_18245b06-757 also ruled
+  out the official WASM fallback (`wasm.js` exports exactly 10 names —
+  codeFrameColumns, expandNextJsTemplate, mdxCompile, mdxCompileSync, minify,
+  minifySync, parse, parseSync, transform, transformSync — and ZERO `projectNew`;
+  `dist/build/swc/index.js:1034-1035` and
+  `dev/hot-reloader-turbopack.js:310-312` refuse Turbopack when `bindings.isWasm`),
+  third-party `next-swc-wasm@16.4.6-build.1` (contains a `projectNew` BYTE STRING
+  but no such NAPI export; fails the ELF
+  header check in `globals.ts`, needs shared memory64 + 242 imports + a 159-name
+  private ABI host, and `INSTANTIATE_FAIL napi_register_wasm_v1 is not a function`),
+  and `__INTERNAL_CUSTOM_TURBOPACK_BINDINGS` (needs 25 raw binding functions,
+  19 Project + 3 Endpoint methods and real re-requireable `WrittenEndpoint` chunks,
+  and still faces the workStore invariant). A `turbo.createProject` implementation
+  cannot be a Babel shim;
   the project API Next consumes after createProject is 11+ methods
   (entrypointsSubscribe, updateInfoSubscribe, clientHmrEvents,
   getServerHmrUpdate, getSourceMapSync, getSourceMap, getSourceForAsset,
@@ -165,7 +250,28 @@
   which never consults the patched `Promise.prototype.then`. `workAsyncStorage.getStore()`
   is therefore `undefined` inside Next 16 dev/prerender and throws
   `Invariant: Expected workStore to be initialized` (an error-payload path; the primary
-  error is the same invariant on the normal `getRSCPayload` path). Measured in bare QuickJS:
+  error is the same invariant on the normal `getRSCPayload` path). `getRSCPayload`
+  has EIGHT call sites in `app-render.js`: four foreground/dynamic-render ones —
+  :2108 (DEV `cacheComponents` validation branch, gated by `cacheComponents` at
+  :2098-2100), :2223 (production `cacheComponents && cachedNavigations` staged
+  branch), :2262 (node streams) and :2282 (web streams) — plus four
+  prerender/static-generation ones at :5070, :5422, :5639 and :6013. The call
+  sites THEMSELVES are gated by config, but whichever branch runs, `:1178`
+  unconditionally calls `createMetadataComponents`, which always calls
+  `createServerSearchParamsForMetadata` — at
+  `dist/lib/metadata/metadata.js:60-62` normally, or at
+  `metadata-parallel.js:59-61` when `__NEXT_PARALLEL_ROUTE_METADATA` is set (the
+  impl is chosen in `metadata/index.js:11-16`). That call reaches
+  `dist/server/request/search-params.js:85-89`, which throws `InvariantError:
+  Expected workStore to be initialized` whenever `workAsyncStorage.getStore()` is
+  undefined. Angle B of wf_18245b06-757 was READ-ONLY (no dev server or build
+  started): it STATICALLY checked `cacheComponents:false`, `parallelRouteMetadata`,
+  `testProxy` and `experimental.workerThreads:true` and found none removes that
+  read; `workerThreads` does not move the foreground dev render. Do NOT claim those
+  flags were witnessed failing. `experimental.ppr` is a separate, EARLIER failure:
+  `dist/server/config.js:462-463` throws `HardDeprecatedConfigError` at config
+  validation, before any render path.
+  Measured in bare QuickJS:
   `await 1`, `await "x"`, `await {then:...}` fire ZERO JS-visible hooks; a
   `Promise.prototype.constructor` getter fires only for real promises; `globalThis.Promise`
   is not read at await time; no promise/job hook is exposed by quickjs-emscripten 0.32.0
