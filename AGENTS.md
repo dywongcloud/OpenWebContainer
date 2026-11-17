@@ -100,6 +100,66 @@
   is `dev-page-pages-raw.log` (16 `TypeError: not a function` lines); there is no
   `dev-page-pages-result.json` — do not cite it.
 
+- A DEFAULT `next build --webpack` reaches static generation on the fixed tree
+  (`✓ Compiled successfully in 71.4min`, `✓ Finished TypeScript in 2.2min`,
+  `✓ Collecting page data using 4 workers in 67s`, then `Generating static pages
+  using 4 workers (0/3)`) and then FAILS with `DataCloneError [ERR_DATA_CLONE]`.
+  Cause: `dist/export/index.js:530-545` passes `nextConfig` into the static
+  generation worker. Host `child_process.fork().send()` defaults to
+  `serialization:'json'`, which SILENTLY DROPS function properties; the guest
+  `child.ts cpEncode` threw instead (`dist/lib/worker.js:181`, comment at
+  `:177-180`, documents the difference). *** THE BUG IS NOT HARNESS-INDUCED:
+  Next itself injects `exportPathMap: (defaultMap)=>{...}` into `nextConfig` at
+  `dist/build/index.js:1814-1820,1949-1952`. `/tmp/owc-harness/nofn-build-result.json`
+  removed our `webpack: function` entirely and STILL failed with
+  `ERR_DATA_CLONE: (defaultMap)=>{...` — removing the harness function only
+  changes WHICH function is reported first. A real app with a
+  `webpack`/`rewrites`/`redirects`/`headers` function hits it too.
+  `experimental.workerThreads:true` is the one config-only route PAST this
+  error (Next's own `sanitizeArgs = JSON.parse(JSON.stringify(args))` drops the
+  function): `wt-build-result.json` has dataClone=false.
+  But it then hits the ALS invariant below, so NO `Route (app)` + exit 0 was
+  witnessed on any of the three routes (wt-build FAIL, nofn-build FAIL,
+  force-dynamic timeout at `Generating static pages (0/2)`).
+
+- *** THE BUILD-PATH `workStore` INVARIANT IS NOW WITNESSED, not just static
+  analysis. `/tmp/owc-harness/wt-build-last.txt` (`experimental.workerThreads:true`):
+  `✓ Compiled successfully in 82.7min`, `✓ Finished TypeScript in 56s`,
+  `✓ Collecting page data using 4 workers in 26.6s`, `Generating static pages
+  using 4 workers (0/3)`, then `InvariantError: Invariant: Expected workStore
+  to be initialized. This is a bug in Next.js.` at
+  `createServerSearchParamsForServerPage (/app/.next/server/chunks/430.js:23232:31)`
+  -> `createServerSearchParamsForMetadata` -> `createMetadataComponents` ->
+  `su (app-page.runtime.prod.js:281:12372)`;
+  `Export encountered an error on /_global-error/page: /_global-error, exiting
+  the build.` / `> Build error occurred` / `Error: Call retries were exceeded
+  ... type: 'WorkerError'`. This is the same ALS gap as dev; no green default
+  build. `primary-error-routes.md` BUILD_PATH_ALSO_BROKEN was static analysis;
+  it is now a log observation. Do not claim a green build from any of these.
+
+- STOCK `npm run dev` (NO bundler flag) in a real `npx create-next-app@latest`
+  scaffold is WITNESSED by the user's own :5173 browser session:
+  `> next dev` / `▲ Next.js 16.4.6 (Turbopack)` / `- Local:
+  http://localhost:3000` / `✓ Ready in 17.7s` / `✓ Running next.config.ts
+  took 1522ms`, then `Error: @next/swc: projectNew needs the native SWC
+  compiler, which cannot run in this container ... at createProject
+  (/testtes/node_modules/next/dist/build/swc/index.js:916:49) {
+  code: 'ERR_OWC_SWC_NATIVE_UNAVAILABLE' }`. The banner prints Ready BEFORE
+  createProject throws. JIT control `/tmp/owc-harness/stock-route-result.json`
+  is identical. `npm dev` (without `run`) is a user typo, not a container bug.
+  `dist/build/swc/index.js:1035` itself says Turbopack needs native bindings
+  and to use `--webpack`. Two independent reviews returned NOT_VIABLE for
+  `IS_WEBPACK_TEST` container-wide (test-only flag, hard-exits on competing
+  bundler flags, and routes to the same `--webpack` path that hits the ALS
+  invariant). A `turbo.createProject` implementation cannot be a Babel shim;
+  the project API Next consumes after createProject is 11+ methods
+  (entrypointsSubscribe, updateInfoSubscribe, clientHmrEvents,
+  getServerHmrUpdate, getSourceMapSync, getSourceMap, getSourceForAsset,
+  traceSource, activateLazyChunk, onExit, shutdown).
+  The original user symptom (the `? What is your project named?` prompt dying
+  immediately) IS fixed — the scaffold completes and installs deps.
+  No dev-fixed or build-fixed claim.
+
 - The guest `async_hooks` shim (`runtime/guest/modules/pure-a.ts`) fails **closed** across
   native `await`: QuickJS attaches async continuations with intrinsic `PerformPromiseThen`,
   which never consults the patched `Promise.prototype.then`. `workAsyncStorage.getStore()`
