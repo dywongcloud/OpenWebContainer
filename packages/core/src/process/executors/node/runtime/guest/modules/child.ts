@@ -13,7 +13,8 @@
  * target with the child.ipcAttach capability, and installs process.send / process.connected /
  * process.disconnect (fork, cluster) or parentPort (worker). Messages cross as tagged JSON: undefined,
  * bigint, NaN and Infinity, Date, Map, Set and typed arrays keep their type; functions and symbols throw
- * DataCloneError. A Buffer is the one view that comes back a Uint8Array; every other kind keeps its own. A forked child or cluster worker holds a ref while it has 'message' or 'disconnect'
+ * DataCloneError. A fork or cluster child with the default 'json' IPC serialization instead crosses as
+ * plain JSON: functions and symbols are dropped and Dates, Buffers and views lose their type. A Buffer is the one view that comes back a Uint8Array; every other kind keeps its own. A forked child or cluster worker holds a ref while it has 'message' or 'disconnect'
  * listeners, as Node's refCounted channel does. An uncaught error in a worker thread is sent to the parent
  * as an 'error' event before the thread exits with code 1.
  *
@@ -32,6 +33,7 @@ export const SRC = String.raw`
 var cpState = {
   kind: null,
   data: {},
+  serialization: 'json',
   connected: false,
   held: false,
   port: null,
@@ -411,6 +413,34 @@ function cpEncodeWith(value, list) {
   } finally {
     cpState.transfer = previous;
   }
+}
+
+/* Host child_process IPC defaults to serialization:'json': JSON.stringify drops function, symbol
+   and undefined own properties, puts null in their array slots, converts Date/Buffer/typed arrays
+   and NaN/Infinity/-0, and refuses nested BigInt and circular values with TypeError. Because
+   cpJsonMessage returns JSON.parse(JSON.stringify(message)), a json-channel value reaching
+   cpEncode is acyclic by construction and can never abort it with a cycle. Only worker_threads
+   and a channel explicitly asked for 'advanced' (spawn/exec/execFile opts, fork, cluster,
+   _forkChild's serializationMode) hand cpEncode the raw message; cpEncode has NO cycle
+   detection, so a circular value on an advanced channel aborts the whole QuickJS runtime.
+   That abort is PRE-EXISTING on the published tree, which used cpEncode on EVERY channel. */
+function cpJsonMessage(message) {
+  if (message === undefined) {
+    var missing = new TypeError('The "message" argument must be specified');
+    missing.code = 'ERR_MISSING_ARGS';
+    throw missing;
+  }
+  var kind = typeof message;
+  if (kind === 'function' || kind === 'symbol' || kind === 'bigint') {
+    var shown = kind === 'function' ? 'function ' + String(message.name || '')
+      : 'type ' + kind + ' (' + (kind === 'bigint' ? String(message) + 'n' : String(message)) + ')';
+    var invalid = new TypeError('The "message" argument must be one of type string, object, number, or boolean. Received ' + shown);
+    invalid.code = 'ERR_INVALID_ARG_TYPE';
+    throw invalid;
+  }
+  var text = JSON.stringify(message);
+  if (text === undefined) return undefined;
+  return JSON.parse(text);
 }
 
 /* The bus: what a BroadcastChannel name and a transferred port's link are on the host, which is the
@@ -877,6 +907,13 @@ function cpSpawnCore(child, file, argv, options, extra) {
      has none -- and a child with no IPC stdio leaves the property undefined, as a host does. */
   child.channel = ipc && extra.kind !== 'worker' ? new (cpEE())() : undefined;
   child._cpWorker = extra.kind === 'worker';
+  /* All six spawn paths meet here. An advanced fork/cluster, or spawn/exec/execFile
+     with options.serialization:'advanced', keeps the structured clone; everything
+     else uses the host's default json IPC. The child reads the same mode from ipcData. */
+  var cpSerialization = extra.kind === 'worker'
+    || extra.serialization === 'advanced'
+    || opts.serialization === 'advanced' ? 'advanced' : 'json';
+  child._cpSerialization = cpSerialization;
   child._cpCluster = extra.cluster || null;
   child._cpSpawned = false;
   child._cpExited = false;
@@ -956,7 +993,7 @@ function cpSpawnCore(child, file, argv, options, extra) {
     stdio: stdio.modes,
     ipc: ipc,
     ipcKind: extra.ipcKind || null,
-    ipcData: extra.ipcData || {},
+    ipcData: Object.assign({}, extra.ipcData || {}, { serialization: cpSerialization }),
     token: token,
     kind: extra.kind,
     target: child._cpTarget,
@@ -1228,6 +1265,20 @@ function cpSendToChild(child, message, callback, transferList) {
     });
     return false;
   }
+  if (child._cpSerialization !== 'advanced') {
+    message = cpJsonMessage(message);
+    /* A toJSON that answers undefined makes JSON.stringify answer undefined. This
+       is a DELIBERATE divergence from Node, not host parity: host Node serializes
+       this as the literal undefined frame, which the child cannot parse and dies
+       with SyntaxError: "undefined" is not valid JSON (and ERR_IPC_CHANNEL_CLOSED
+       for the parent). Here the send succeeds and NO frame is posted, so the child
+       stays alive. We choose the silent drop over killing the container process;
+       witness and document it rather than claiming parity. */
+    if (message === undefined) {
+      if (typeof callback === 'function') proc.nextTick(callback, null);
+      return true;
+    }
+  }
   var frame = { t: 'm', v: cpEncodeWith(message, transferList) };
   cpPost(child, function () {
     callCap('child.sendToChild', { pid: child.pid, frame: frame });
@@ -1255,6 +1306,13 @@ function cpChannelSend(message, callback) {
       proc.emit('error', closed);
     });
     return false;
+  }
+  if (cpState.serialization !== 'advanced') {
+    message = cpJsonMessage(message);
+    if (message === undefined) {
+      if (typeof callback === 'function') proc.nextTick(callback, null);
+      return true;
+    }
   }
   callCap('child.sendToParent', { frame: { t: 'm', v: cpEncode(message) } });
   if (typeof callback === 'function') proc.nextTick(callback, null);
@@ -1745,6 +1803,7 @@ function cpForkApi(modulePath, args, options) {
   } else if (args && typeof args === 'object') {
     opts = args;
   }
+  var serialization = opts.serialization === 'advanced' ? 'advanced' : 'json';
   var silent = opts.silent === true;
   var stdio = opts.stdio !== undefined
     ? opts.stdio
@@ -1757,7 +1816,8 @@ function cpForkApi(modulePath, args, options) {
     stdio: stdio,
     timeout: opts.timeout,
     killSignal: opts.killSignal
-  }, { kind: 'fork', ipc: true, ipcKind: 'fork', ipcData: {} });
+  }, { kind: 'fork', ipc: true, ipcKind: 'fork', serialization: serialization,
+       ipcData: { serialization: serialization } });
 }
 
 /* synchronous family: the host runs the child to completion inside one call (child.spawnSync) */
@@ -2156,6 +2216,9 @@ BF['child_process'] = function () {
        descriptor Node reads the channel from is one this container has already attached, so what
        the name does here is the wiring itself. */
     _forkChild: function (fd, serializationMode) {
+      if (serializationMode !== undefined) {
+        cpState.serialization = serializationMode === 'advanced' ? 'advanced' : 'json';
+      }
       cpWireProcess();
     }
   };
@@ -2263,10 +2326,12 @@ BF['cluster'] = function () {
       cpDisconnectChild(worker);
     };
     cluster.workers[id] = worker;
+    var serialization = cluster.settings.serialization === 'advanced' ? 'advanced' : 'json';
     cpSpawnCore(worker, 'node', [proc.argv[1]].concat(proc.argv.slice(2)), {
       env: workerEnv,
       stdio: ['inherit', 'inherit', 'inherit']
-    }, { kind: 'cluster', cluster: cluster, ipc: true, ipcKind: 'cluster', ipcData: { id: id } });
+    }, { kind: 'cluster', cluster: cluster, ipc: true, ipcKind: 'cluster',
+         serialization: serialization, ipcData: { id: id, serialization: serialization } });
     cluster.emit('fork', worker);
     return worker;
   };
@@ -2305,6 +2370,7 @@ BF['cluster'] = function () {
   if (!env || env.OWC_IPC_KIND === undefined) return;
   cpState.kind = String(env.OWC_IPC_KIND);
   cpState.data = JSON.parse(env.OWC_IPC_DATA || '{}');
+  cpState.serialization = cpState.kind === 'worker' || cpState.data.serialization === 'advanced' ? 'advanced' : 'json';
   delete env.OWC_IPC_KIND;
   delete env.OWC_IPC_DATA;
   if (cpState.kind === 'cluster') delete env.NODE_UNIQUE_ID;
